@@ -1,0 +1,40 @@
+[package]
+name = "sglang-radix-tree"
+version = "0.1.0"
+edition = "2024"
+description = "Rust tree core for the Unified Radix Cache"
+license = "Apache-2.0"
+repository = "https://github.com/sgl-project/sglang"
+
+[package.metadata.sglang]
+python-module = "sglang.srt.mem_cache.rust_tree_core.mem_cache"
+debug = false
+features = ["python-extension"]
+torch-compat-header = "torch_2_13_compat.h"
+
+[lib]
+name = "mem_cache"
+crate-type = ["cdylib"]
+
+# Keep this crate in its own workspace until its PyO3 version can be aligned
+# with the root workspace without conflicting native `links = "python"` crates.
+[workspace]
+
+[dependencies]
+hashbrown = "0.16"
+pyo3 = { version = "0.22", optional = true }
+sha2 = "0.10"
+tch = "=0.24.0"
+thiserror = "1"
+
+# Hardware SHA extensions; identical digests.
+[target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+
+[features]
+# Keep the native core as the default so workspace tests do not link a Python
+# extension. Wheel and source builds select python-extension through package
+# metadata; shared white-box tests additionally select inspection.
+default = []
+python-extension = ["dep:pyo3", "pyo3/extension-module", "tch/python-extension"]
+inspection = []

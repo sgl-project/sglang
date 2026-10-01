@@ -3,26 +3,24 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=528, stage="extra-b", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=569, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
-@unittest.skip("Skip for saving ci time")
-class TestDeepseek(CustomTestCase):
+class TestDeepseekMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -32,11 +30,11 @@ class TestDeepseek(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
+                "--disable-overlap-schedule",
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -52,10 +50,18 @@ class TestDeepseek(CustomTestCase):
                 "dynamic",
                 "--eplb-algorithm",
                 "deepseek",
-                "--cuda-graph-bs",
-                "256",
+                "--cuda-graph-bs-decode",
+                "64",  # TODO: increase it to 128 when TBO is supported in draft_extend
                 "--max-running-requests",
-                "2048",
+                "512",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
                 "--disable-radix-cache",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true,"num_threads": 64}',
@@ -64,88 +70,18 @@ class TestDeepseek(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=1200,
             num_threads=1200,
         )
-        metrics = run_eval(args)
-        print(f"Eval accuracy of GSM8K: {metrics=}")
-
-        self.assertGreater(metrics["score"], 0.92)
-
-
-class TestDeepseekMTP(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--enable-dp-attention",
-                    "--dp",
-                    "8",
-                    "--moe-dense-tp-size",
-                    "1",
-                    "--enable-dp-lm-head",
-                    "--moe-a2a-backend",
-                    "deepep",
-                    "--moe-runner-backend",
-                    "deep_gemm",
-                    "--enable-two-batch-overlap",
-                    "--ep-num-redundant-experts",
-                    "32",
-                    "--ep-dispatch-algorithm",
-                    "dynamic",
-                    "--eplb-algorithm",
-                    "deepseek",
-                    "--cuda-graph-bs",
-                    "64",  # TODO: increase it to 128 when TBO is supported in draft_extend
-                    "--max-running-requests",
-                    "512",
-                    "--speculative-algorithm",
-                    "EAGLE",
-                    "--speculative-num-steps",
-                    "1",
-                    "--speculative-eagle-topk",
-                    "1",
-                    "--speculative-num-draft-tokens",
-                    "2",
-                    "--disable-radix-cache",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true,"num_threads": 64}',
-                ],
-            )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=1200,
-            num_threads=1200,
-        )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
         self.assertGreater(metrics["score"], 0.92)
@@ -171,13 +107,12 @@ class TestDeepseekV32TBO(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--enable-two-batch-overlap",
             "--moe-a2a-backend",
             "deepep",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "256",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
@@ -191,7 +126,7 @@ class TestDeepseekV32TBO(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_a_gsm8k(
         self,
@@ -200,12 +135,11 @@ class TestDeepseekV32TBO(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=1200,
             num_threads=1200,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.92)
 

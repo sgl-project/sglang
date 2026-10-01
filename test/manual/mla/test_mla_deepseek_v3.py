@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import is_cuda, is_hip, kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -22,7 +22,9 @@ class TestMLADeepseekV3(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code", "--chunked-prefill-size", "256"]
         if is_cuda():
-            other_args.extend(["--enable-torch-compile", "--cuda-graph-max-bs", "2"])
+            other_args.extend(
+                ["--enable-torch-compile", "--cuda-graph-max-bs-decode", "2"]
+            )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -39,12 +41,11 @@ class TestMLADeepseekV3(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.60)
@@ -59,7 +60,7 @@ class TestMLADeepseekV3DisableFusedFunc(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code", "--chunked-prefill-size", "256"]
         if is_cuda():
-            other_args.extend(["--cuda-graph-max-bs", "2"])
+            other_args.extend(["--cuda-graph-max-bs-decode", "2"])
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -76,12 +77,11 @@ class TestMLADeepseekV3DisableFusedFunc(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.62)
@@ -107,7 +107,7 @@ class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
                     "fa3",
                     "--mem-fraction-static",
                     "0.8",
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "2",
                 ]
             )
@@ -127,12 +127,11 @@ class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.60)
@@ -145,7 +144,7 @@ class TestDeepseekV3MTP(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "2",
             "--disable-radix",
             "--enable-torch-compile",
@@ -180,12 +179,11 @@ class TestDeepseekV3MTP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.60)

@@ -1,0 +1,37 @@
+{
+  "meta": {
+    "device": "NVIDIA GB300",
+    "hidden": 7168,
+    "experts": 896,
+    "latent": 3584,
+    "topk": 16,
+    "routing_dtype": "fp32",
+    "selection": "exact token count; overlap must win all 3 repeats and median speedup must exceed 1%"
+  },
+  "configs": {
+    "736": "overlap",
+    "768": "overlap",
+    "896": "overlap",
+    "960": "overlap",
+    "1280": "overlap",
+    "1536": "overlap",
+    "1792": "overlap",
+    "2048": "overlap",
+    "2304": "overlap",
+    "2560": "overlap",
+    "2816": "overlap",
+    "3328": "overlap",
+    "3584": "overlap",
+    "3840": "overlap",
+    "4352": "overlap",
+    "4608": "overlap",
+    "4864": "overlap",
+    "5632": "overlap",
+    "5888": "overlap",
+    "6144": "overlap",
+    "7424": "overlap",
+    "8448": "overlap",
+    "8704": "overlap",
+    "8960": "overlap"
+  }
+}

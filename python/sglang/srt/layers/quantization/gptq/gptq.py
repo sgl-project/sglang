@@ -22,10 +22,13 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
     GPTQAscendLinearScheme,
+    GPTQIntelAMXLinearScheme,
+    GPTQIntelAMXMoEScheme,
     GPTQLinearScheme,
     GPTQMarlinLinearScheme,
     GPTQMarlinMoEScheme,
     GPTQMoEAscendScheme,
+    GPTQXPULinearScheme,
 )
 
 if TYPE_CHECKING:
@@ -209,10 +212,10 @@ class GPTQAscendConfig(GPTQConfig):
 
         if isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer)
-            return GPTQMoEAscendMethod(self)
+            return GPTQMoEMethod(self)
         if isinstance(layer, LinearBase):
             layer.scheme = self.get_linear_scheme(layer)
-            return GPTQLinearAscendMethod(self)
+            return GPTQLinearMethod(self)
         return None
 
     def get_linear_scheme(self, layer: torch.nn.Module):
@@ -223,6 +226,69 @@ class GPTQAscendConfig(GPTQConfig):
 
         assert isinstance(layer, FusedMoE)
         return GPTQMoEAscendScheme(self)
+
+
+class CPUGPTQConfig(GPTQConfig):
+    """CPU Config class for GPTQ on Intel CPU with AMX."""
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.half, torch.bfloat16]
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[LinearMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, LinearBase):
+            layer.scheme = self.get_linear_scheme(layer)
+            return GPTQLinearMethod(self)
+        if isinstance(layer, FusedMoE):
+            layer.scheme = self.get_moe_scheme(layer)
+            return GPTQMoEMethod(self)
+        return None
+
+    def get_linear_scheme(self, layer: torch.nn.Module):
+        from sglang.srt.layers.linear import LinearBase
+
+        assert isinstance(layer, LinearBase)
+        return GPTQIntelAMXLinearScheme(self)
+
+    def get_moe_scheme(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        assert isinstance(layer, FusedMoE)
+        return GPTQIntelAMXMoEScheme(self)
+
+
+class GPTQXPUConfig(GPTQConfig):
+    """Config class for GPTQ on Intel XPU.
+
+    Dense int4 GPTQ lowers to torch's native
+    ``_weight_int4pack_mm_with_scales_and_zeros`` op (no Marlin on XPU). MoE is
+    out of scope for the dense phase.
+    """
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.half, torch.bfloat16]
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[LinearMethodBase]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            raise NotImplementedError(
+                "GPTQ MoE is not yet supported on XPU (dense-only phase)."
+            )
+        return get_linear_quant_method(
+            self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
+        )
+
+    def get_linear_scheme(self, layer: torch.nn.Module):
+        return GPTQXPULinearScheme(self)
 
 
 class GPTQMarlinConfig(QuantizationConfig):
@@ -286,7 +352,7 @@ class GPTQMarlinConfig(QuantizationConfig):
 
         if (weight_bits, is_sym) not in self.TYPE_MAP:
             raise ValueError(
-                "Unsupported quantization config: " f"bits={weight_bits}, sym={is_sym}"
+                f"Unsupported quantization config: bits={weight_bits}, sym={is_sym}"
             )
 
         # (num_bits, is_sym) -> quant_type
@@ -435,7 +501,7 @@ class GPTQLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_linear_scheme(layer)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
@@ -460,8 +526,7 @@ class GPTQLinearMethod(LinearMethodBase):
         return layer.scheme.apply_weights(layer, x, bias)
 
 
-class GPTQMoEAscendMethod(FusedMoEMethodBase):
-
+class GPTQMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: GPTQConfig):
         super().__init__()
         self.quant_config = quant_config
@@ -475,7 +540,7 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_moe_scheme(layer)
         layer.scheme.create_weights(
             layer=layer,
@@ -527,7 +592,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_linear_scheme(layer)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
@@ -552,10 +617,6 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         return layer.scheme.apply_weights(layer, x, bias)
 
 
-class GPTQLinearAscendMethod(GPTQLinearMethod):
-    """Linear method for GPTQ on Ascend NPU."""
-
-
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
     """MoE Marlin method with quantization."""
 
@@ -571,7 +632,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_moe_scheme(layer)
         layer.scheme.create_weights(
             layer=layer,
@@ -600,18 +661,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
 
 # Register fake implementations for torch.compile support. The decorator is a
 # no-op when the custom op is unavailable on the current platform.
-@register_fake_if_exists("sgl_kernel::gptq_gemm")
-def _(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
-    return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
-
-
 @register_fake_if_exists("sgl_kernel::gptq_marlin_repack")
 def _(b_q_weight, perm, size_k, size_n, num_bits):
     return b_q_weight.new_empty(
         (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
     )
-
-
-@register_fake_if_exists("sgl_kernel::gptq_shuffle")
-def _(q_weight, q_perm, bit):
-    return

@@ -4,11 +4,9 @@ import ipaddress
 import logging
 import os
 import platform
-import signal
 import socket
-import sys
-import threading
 from functools import lru_cache
+from typing import Any
 
 import psutil
 import torch
@@ -16,45 +14,6 @@ import zmq
 
 # use the native logger to avoid circular import
 logger = logging.getLogger(__name__)
-
-
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
-    if parent_pid is None:
-        parent_pid = os.getpid()
-        include_parent = False
-
-    try:
-        itself = psutil.Process(parent_pid)
-    except psutil.NoSuchProcess:
-        return
-
-    children = itself.children(recursive=True)
-    for child in children:
-        if child.pid == skip_pid:
-            continue
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            pass
-
-    if include_parent:
-        try:
-            if parent_pid == os.getpid():
-                itself.kill()
-                sys.exit(0)
-
-            itself.kill()
-
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
 
 
 def add_prefix(name: str, prefix: str) -> str:
@@ -78,36 +37,81 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
-def configure_ipv6(dist_init_addr):
-    addr = dist_init_addr
-    end = addr.find("]")
-    if end == -1:
-        raise ValueError("invalid IPv6 address format: missing ']'")
+def normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:
+    if gpu_ids is None:
+        return None
+    if isinstance(gpu_ids, str):
+        values = [gpu_ids]
+    else:
+        values = list(gpu_ids)
 
-    host = addr[: end + 1]
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(part for part in str(value).replace(",", " ").split() if part)
+    if not tokens:
+        return []
 
-    # this only validates the address without brackets: we still need the below checks.
-    # if it's invalid, immediately raise an error so we know it's not formatting issues.
-    if not is_valid_ipv6_address(host[1:end]):
-        raise ValueError(f"invalid IPv6 address: {host}")
+    parsed: list[int] = []
+    for token in tokens:
+        try:
+            gpu_id = int(token)
+        except ValueError as exc:
+            raise ValueError(
+                f"--gpu-ids contains a non-integer GPU id: {token}"
+            ) from exc
+        if gpu_id < 0:
+            raise ValueError(f"--gpu-ids GPU ids must be non-negative: {gpu_id}")
+        parsed.append(gpu_id)
 
-    port_str = None
-    if len(addr) > end + 1:
-        if addr[end + 1] == ":":
-            port_str = addr[end + 2 :]
-        else:
-            raise ValueError("received IPv6 address format: expected ':' after ']'")
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f"--gpu-ids contains duplicate GPU ids: {parsed}")
+    return parsed
 
-    if not port_str:
+
+def parse_size(size: str) -> tuple[int | None, int | None]:
+    try:
+        parts = size.lower().replace(" ", "").split("x")
+        if len(parts) != 2:
+            raise ValueError
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None, None
+
+
+def parse_tcp_host_port(value: str | None, field_name: str) -> tuple[str, int]:
+    if value is None or not str(value).strip():
+        raise ValueError(f"{field_name} is required")
+
+    addr = str(value).strip()
+    if addr.startswith("tcp://"):
+        addr = addr[len("tcp://") :]
+
+    try:
+        host, port_str = addr.rsplit(":", 1)
+    except ValueError as exc:
         raise ValueError(
-            "a port must be specified in IPv6 address (format: [ipv6]:port)"
-        )
+            f"{field_name} must be formatted as tcp://host:port or host:port"
+        ) from exc
+
+    host = host.strip()
+    port_str = port_str.strip()
+    if not host or not port_str:
+        raise ValueError(f"{field_name} must include both host and port: {value!r}")
 
     try:
         port = int(port_str)
-    except ValueError:
-        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
-    return port, host
+    except ValueError as exc:
+        raise ValueError(f"{field_name} port must be an integer: {port_str}") from exc
+
+    if port < 0 or port > 65535:
+        raise ValueError(f"{field_name} port must be between 0 and 65535: {port}")
+    return host, port
+
+
+def format_tcp_endpoint(host: str, port: int, field_name: str) -> str:
+    if port < 0 or port > 65535:
+        raise ValueError(f"{field_name} port must be between 0 and 65535: {port}")
+    return f"tcp://{host}:{port}"
 
 
 def is_port_available(port):
@@ -320,25 +324,26 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     return value in truthy_values
 
 
-try:
-    import sgl_kernel  # noqa: F401
+@lru_cache(maxsize=1)
+def _is_intel_amx_backend_available():
+    try:
+        import sgl_kernel  # noqa: F401
 
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
-    )
-except:
-    is_intel_amx_backend_available = False
+        return hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+    except Exception:
+        return False
+
 
 try:
-    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
-    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+    is_amx_tile_supported = torch.cpu._is_amx_tile_supported()
 except:
     is_amx_tile_supported = False
 
 
 def cpu_has_amx_support():
-    return is_amx_tile_supported and is_intel_amx_backend_available
+    return is_amx_tile_supported and _is_intel_amx_backend_available()
 
 
 def use_intel_amx_backend(layer):

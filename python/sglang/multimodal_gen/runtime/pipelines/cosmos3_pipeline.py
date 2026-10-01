@@ -11,6 +11,7 @@ import os
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
     Cosmos3DenoisingStage,
@@ -25,7 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-class Cosmos3Pipeline(ComposedPipelineBase):
+class Cosmos3Pipeline(LoRAPipeline, ComposedPipelineBase):
     """Cosmos3 diffusion pipeline shared by T2V, I2V, and T2I.
 
     Text is tokenized and embedded directly inside the transformer; there is
@@ -33,7 +34,10 @@ class Cosmos3Pipeline(ComposedPipelineBase):
     stages from ``batch.data_type`` and ``batch.preprocessed_image``.
     """
 
-    pipeline_name = "Cosmos3OmniDiffusersPipeline"
+    # Canonical ``_class_name`` in newer checkpoints' ``model_index.json``.
+    # Older checkpoints declare ``Cosmos3OmniDiffusersPipeline`` (see the
+    # back-compat alias below).
+    pipeline_name = "Cosmos3OmniPipeline"
     is_video_pipeline = True
 
     _required_config_modules = [
@@ -41,7 +45,17 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         "vae",
         "transformer",
         "scheduler",
+        "sound_tokenizer",
     ]
+
+    def load_modules(self, server_args, loaded_modules=None):
+        # Visual-only Cosmos3 checkpoints ship no sound_tokenizer; require it
+        # only when the checkpoint actually provides one.
+        if "sound_tokenizer" not in self._load_config():
+            self._required_config_modules = [
+                m for m in self._required_config_modules if m != "sound_tokenizer"
+            ]
+        return super().load_modules(server_args, loaded_modules)
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         """Create Cosmos3 pipeline stages.
@@ -58,9 +72,23 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         vae = self.get_module("vae")
         transformer = self.get_module("transformer")
         scheduler = self.get_module("scheduler")
+        sound_tokenizer = self.get_module("sound_tokenizer")
 
-        # Guardrails on by default; opt out with SGLANG_DISABLE_COSMOS3_GUARDRAILS=1.
-        guardrails_on = os.environ.get("SGLANG_DISABLE_COSMOS3_GUARDRAILS", "0") != "1"
+        guardrails_disabled = (
+            os.environ.get("SGLANG_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
+        )
+        guardrails_on = False
+        if not guardrails_disabled:
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
+                is_cosmos_guardrail_available,
+            )
+
+            guardrails_on = is_cosmos_guardrail_available()
+            if not guardrails_on:
+                logger.warning(
+                    "Cosmos3 guardrails disabled because cosmos-guardrail is not "
+                    "installed. Install it with: pip install cosmos-guardrail==0.3.1"
+                )
 
         self.add_stage(Cosmos3ImagePreprocessStage())
         self.add_stage(Cosmos3TokenizationStage(tokenizer=text_tokenizer))
@@ -72,8 +100,16 @@ class Cosmos3Pipeline(ComposedPipelineBase):
             self.add_stage(Cosmos3TextGuardrailStage())
         self.add_stage(Cosmos3LatentPreparationStage(vae, transformer))
         self.add_stage(Cosmos3TimestepPreparationStage(scheduler))
-        self.add_stage(Cosmos3DenoisingStage(transformer, scheduler, server_args))
-        self.add_stage(Cosmos3DecodingStage(vae, guardrails=guardrails_on))
+        self.add_stage(
+            Cosmos3DenoisingStage(
+                transformer, scheduler, server_args=server_args, vae=vae
+            )
+        )
+        self.add_stage(
+            Cosmos3DecodingStage(
+                vae, guardrails=guardrails_on, sound_tokenizer=sound_tokenizer
+            )
+        )
 
         logger.info(
             "Cosmos3 pipeline stages created successfully (guardrails=%s)",
@@ -81,4 +117,15 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         )
 
 
-EntryClass = Cosmos3Pipeline
+class Cosmos3OmniDiffusersPipeline(Cosmos3Pipeline):
+    """Back-compat alias for checkpoints whose ``model_index.json`` still
+    declares the legacy ``_class_name`` ``Cosmos3OmniDiffusersPipeline``.
+
+    Registering both names lets old (Nano/Super) and new (Edge) checkpoints
+    resolve to the same native pipeline.
+    """
+
+    pipeline_name = "Cosmos3OmniDiffusersPipeline"
+
+
+EntryClass = [Cosmos3Pipeline, Cosmos3OmniDiffusersPipeline]

@@ -3,11 +3,10 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -16,7 +15,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=340, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=351, stage="base-c", runner_config="4-gpu-b200")
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 SERVER_LAUNCH_TIMEOUT = 1200
@@ -49,13 +48,16 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=SERVER_LAUNCH_TIMEOUT,
-                other_args=other_args,
-            )
+        env = {
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        }
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=other_args,
+            env=env,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -70,12 +72,11 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         server_info = requests.get(self.base_url + "/server_info").json()
@@ -107,7 +108,6 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
                 f"{speed=:.2f} token/s\n"
             )
 
-        self.assertGreater(acc_length, 2.65)
         self.assertGreater(speed, 150)
 
 

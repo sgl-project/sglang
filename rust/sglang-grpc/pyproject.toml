@@ -1,0 +1,18 @@
+# Standalone dev builds only (`maturin build` / `maturin develop`); the
+# extension ships to users inside the main sglang wheel via setuptools-rust
+# (python/pyproject.toml, target sglang.srt.rust_extensions._grpc). Its shared
+# protocol dependency lives in ../../proto, so standalone builds require a
+# repository checkout. A system protoc is unnecessary; that crate uses a
+# vendored binary.
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "sglang-grpc"
+dynamic = ["version"]
+description = "In-process Rust gRPC server for SGLang"
+requires-python = ">=3.10"
+
+[tool.maturin]
+module-name = "_grpc"

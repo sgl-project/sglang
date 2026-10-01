@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
 import numpy
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -219,29 +219,6 @@ def replace_parameter(
         mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))
 
 
-def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
-    assert a.shape == b.shape
-    assert a.dtype == b.dtype == torch.float8_e4m3fn
-
-    a_u8 = a.view(torch.uint8)
-    b_u8 = b.view(torch.uint8)
-    diff_u8 = (a_u8.to(torch.int16) - b_u8.to(torch.int16)).abs()
-
-    numel = a.numel()
-
-    count_diff_sign = ((a_u8 >= 0) & (b_u8 < 0)).sum().item()
-    count_tiny_diff = (diff_u8 >= 1).sum().item()
-    count_large_diff = (diff_u8 >= 2).sum().item()
-
-    assert (
-        (count_diff_sign == 0)
-        and (count_tiny_diff / numel < 0.005)
-        and (count_large_diff == 0)
-    ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=}"
-
-
-# Match dynamic rules with module name (prefix) and override quantize
-# config if module (prefix) matches a rule
 def override_config(config: QuantizationConfig, prefix: str):
     weight_bits = get_dynamic_override(config, prefix, "bits", config.weight_bits)
     if isinstance(weight_bits, int):
@@ -453,9 +430,9 @@ def quantize_weights(
     zero_points: bool = False,
     ref_zero_points_after_scales: bool = False,
 ):
-    assert (
-        quant_type.is_integer()
-    ), "Floating point quantization may work but has not been tested"
+    assert quant_type.is_integer(), (
+        "Floating point quantization may work but has not been tested"
+    )
     assert not zero_points or group_size is not None, (
         "to have group zero points, group_size must be provided "
         "(-1 group_size is channelwise)"
@@ -555,12 +532,12 @@ def gptq_quantize_weights(
     size_k, _ = w.shape
 
     assert w.is_floating_point(), "w must be float"
-    assert (
-        quant_type in SUPPORTED_GPTQ_QUANT_TYPES
-    ), f"Unsupported gptq type = {quant_type}"
-    assert group_size in SUPPORTED_GROUP_SIZES + [
-        size_k
-    ], f"Unsupported groupsize = {group_size}"
+    assert quant_type in SUPPORTED_GPTQ_QUANT_TYPES, (
+        f"Unsupported gptq type = {quant_type}"
+    )
+    assert group_size in SUPPORTED_GROUP_SIZES + [size_k], (
+        f"Unsupported groupsize = {group_size}"
+    )
 
     w_ref, w_q, w_s, _ = quantize_weights(w, quant_type, group_size)
 
@@ -568,10 +545,10 @@ def gptq_quantize_weights(
     g_idx = torch.empty(0, dtype=torch.int, device=w.device)
     rand_perm = torch.empty(0, dtype=torch.int, device=w.device)
     if act_order:
-        assert (
-            group_size < size_k
-        ), "For act_order, groupsize = {} must be less than size_k = {}".format(
-            group_size, size_k
+        assert group_size < size_k, (
+            "For act_order, groupsize = {} must be less than size_k = {}".format(
+                group_size, size_k
+            )
         )
 
         w_ref, w_q, g_idx, rand_perm = permute_rows(w_q, w_ref, group_size, test_perm)
@@ -608,14 +585,17 @@ def swizzle_blockscale(scale: torch.Tensor):
     round_up_multiple = lambda x, m: (x + m - 1) // m * m
     M_padded = round_up_multiple(M, 128)
     K_padded = round_up_multiple(K, 4)
-    padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
+    # Online weight updates do not necessarily run under a CUDA device context.
+    padded_scale = torch.zeros(
+        (B, M_padded, K_padded), dtype=scale.dtype, device=scale.device
+    )
     padded_scale[:B, :M, :K] = scale
     batches, rows, cols = padded_scale.shape
     assert rows % 128 == 0
     assert cols % 4 == 0
     padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
     swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
-    swizzled_scale = swizzled_scale.contiguous().cuda()
+    swizzled_scale = swizzled_scale.contiguous().to(scale.device)
     return (
         swizzled_scale.reshape(M_padded, K_padded)
         if scale_ndim == 2
@@ -674,23 +654,40 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     )  # packed fp4
     gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
         torch.float8_e4m3fn
-    ).reshape(
-        num_experts, gemm1_rows, hidden_size // 16
-    )  # fp8 scaling factors
+    ).reshape(num_experts, gemm1_rows, hidden_size // 16)  # fp8 scaling factors
 
     gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
         num_experts, hidden_size, intermediate_size // 2
     )  # packed fp4
     gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
         torch.float8_e4m3fn
-    ).reshape(
-        num_experts, hidden_size, intermediate_size // 16
-    )  # fp8 scaling factors
+    ).reshape(num_experts, hidden_size, intermediate_size // 16)  # fp8 scaling factors
 
-    gemm1_weights_fp4_shuffled = []
-    gemm1_scales_fp4_shuffled = []
-    gemm2_weights_fp4_shuffled = []
-    gemm2_scales_fp4_shuffled = []
+    # Pre-allocate output tensors so per-expert shuffles write directly into
+    # contiguous slices instead of building lists + torch.stack().  This avoids
+    # O(num_experts) transient GPU allocations whose freed blocks fragment the
+    # CUDA address space
+    gemm1_weights_fp4_shuffled = torch.empty_like(gemm1_weights_fp4.view(torch.uint8))
+    gemm2_weights_fp4_shuffled = torch.empty_like(gemm2_weights_fp4.view(torch.uint8))
+
+    # Pre-allocate scale output tensors and a reusable scratch buffer for
+    # the permuted input to nvfp4_block_scale_interleave.
+    # nvfp4_block_scale_interleave flattens its input to 1-D, so the
+    # per-expert output size equals the per-expert input numel.
+    def _alloc_scale_buffers(scales):
+        per_expert_shape = scales[0].view(torch.uint8).shape
+        per_expert_numel = scales[0].numel()
+        output = scales.new_empty((num_experts, per_expert_numel), dtype=torch.uint8)
+        scratch = torch.empty(per_expert_shape, dtype=torch.uint8, device=scales.device)
+        return output, scratch
+
+    gemm1_scales_fp4_shuffled, g1s_scratch = _alloc_scale_buffers(
+        gemm1_scales_linear_fp4
+    )
+    gemm2_scales_fp4_shuffled, g2s_scratch = _alloc_scale_buffers(
+        gemm2_scales_linear_fp4
+    )
+
     for i in range(num_experts):
         permute_indices = _maybe_get_cached_w3_w1_permute_indices(
             _cache_permute_indices,
@@ -698,11 +695,9 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             epilogue_tile_m,
             is_gated_act_gemm=is_gated,
         )
-        gemm1_weights_fp4_shuffled.append(
-            gemm1_weights_fp4[i]
-            .view(torch.uint8)[permute_indices.to(gemm1_weights_fp4.device)]
-            .contiguous()
-        )
+        gemm1_weights_fp4_shuffled[i] = gemm1_weights_fp4[i].view(torch.uint8)[
+            permute_indices.to(gemm1_weights_fp4.device)
+        ]
 
         permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
             _cache_permute_indices,
@@ -711,26 +706,23 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             num_elts_per_sf=16,
             is_gated_act_gemm=is_gated,
         )
-        gemm1_scales_fp4_shuffled.append(
-            nvfp4_block_scale_interleave(
-                gemm1_scales_linear_fp4[i]
-                .view(torch.uint8)[
-                    permute_sf_indices.to(gemm1_scales_linear_fp4.device)
-                ]
-                .contiguous()
-            )
+        # Reuse scratch buffer for the permuted scale input
+        torch.index_select(
+            gemm1_scales_linear_fp4[i].view(torch.uint8),
+            0,
+            permute_sf_indices.to(gemm1_scales_linear_fp4.device),
+            out=g1s_scratch,
         )
+        gemm1_scales_fp4_shuffled[i] = nvfp4_block_scale_interleave(g1s_scratch)
 
         permute_indices = get_w2_permute_indices_with_cache(
             _cache_permute_indices,
             gemm2_weights_fp4[i].view(torch.uint8),
             epilogue_tile_m,
         )
-        gemm2_weights_fp4_shuffled.append(
-            gemm2_weights_fp4[i]
-            .view(torch.uint8)[permute_indices.to(gemm2_weights_fp4.device)]
-            .contiguous()
-        )
+        gemm2_weights_fp4_shuffled[i] = gemm2_weights_fp4[i].view(torch.uint8)[
+            permute_indices.to(gemm2_weights_fp4.device)
+        ]
 
         permute_sf_indices = get_w2_permute_indices_with_cache(
             _cache_permute_indices,
@@ -738,30 +730,24 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             epilogue_tile_m,
             num_elts_per_sf=16,
         )
-        gemm2_scales_fp4_shuffled.append(
-            nvfp4_block_scale_interleave(
-                gemm2_scales_linear_fp4[i]
-                .view(torch.uint8)[
-                    permute_sf_indices.to(gemm2_scales_linear_fp4.device)
-                ]
-                .contiguous()
-            )
+        torch.index_select(
+            gemm2_scales_linear_fp4[i].view(torch.uint8),
+            0,
+            permute_sf_indices.to(gemm2_scales_linear_fp4.device),
+            out=g2s_scratch,
         )
+        gemm2_scales_fp4_shuffled[i] = nvfp4_block_scale_interleave(g2s_scratch)
 
-    # Stack weights for all experts
-    gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
-    gemm1_scales_fp4_shuffled = (
-        torch.stack(gemm1_scales_fp4_shuffled)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_experts, gemm1_rows, hidden_size // 16)
-    )
+    del g1s_scratch, g2s_scratch
 
-    gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
-    gemm2_scales_fp4_shuffled = (
-        torch.stack(gemm2_scales_fp4_shuffled)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_experts, hidden_size, intermediate_size // 16)
-    )
+    # Weight outputs stay as uint8 (FP4 packed) — the TRTLLM kernel expects this.
+    gemm1_scales_fp4_shuffled = gemm1_scales_fp4_shuffled.view(
+        torch.float8_e4m3fn
+    ).reshape(num_experts, gemm1_rows, hidden_size // 16)
+
+    gemm2_scales_fp4_shuffled = gemm2_scales_fp4_shuffled.view(
+        torch.float8_e4m3fn
+    ).reshape(num_experts, hidden_size, intermediate_size // 16)
     return (
         gemm1_weights_fp4_shuffled,
         gemm1_scales_fp4_shuffled,

@@ -2,18 +2,15 @@ import logging
 import re
 import threading
 import time
+from typing import Any, Callable
 
 import torch
 import zmq
 
-from sglang.srt.distributed.parallel_state import (
-    get_world_group,
-    get_world_size,
-)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.managers.io_struct import UpdateExpertBackupReq
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.managers.io_struct import UpdateExpertBackupReq, sock_recv, sock_send
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
 PORT_BASE = envs.SGLANG_BACKUP_PORT_BASE.get()
@@ -29,17 +26,22 @@ def extract_layer_and_expert_id(param_name):
 
 
 class ExpertBackupClient:
-    def __init__(self, server_args: ServerArgs, model_runner):
+    def __init__(
+        self,
+        *,
+        model_config,
+        get_model: Callable[[], Any],
+    ):
         context = zmq.Context(2)
-        self.server_args = server_args
-        self.engine_num = server_args.nnodes
-        self.engine_rank = server_args.node_rank
+        parallel = get_parallel()
+        self.engine_num = parallel.nnodes
+        self.engine_rank = parallel.node_rank
         self.recv_list = [None] * self.engine_num
         self.ready_sockets = [None] * self.engine_num
-        self.model_runner = model_runner
-        self.moe_ep_size = model_runner.moe_ep_size
-        self.model_config = model_runner.model_config
-        self.moe_ep_rank = model_runner.moe_ep_rank
+        self._get_model = get_model
+        self.moe_ep_size = parallel.moe_ep_size
+        self.model_config = model_config
+        self.moe_ep_rank = parallel.moe_ep_rank
         self.dram_map_list = [None] * self.engine_num
         self.session_id_list = [None] * self.engine_num
         self.transfer_engine = None
@@ -47,25 +49,25 @@ class ExpertBackupClient:
         self.buffer_size = 0
         self.use_backup = False
         local_ip = get_local_ip_auto()
-        all_ips = [None] * get_world_size()
+        all_ips = [None] * get_parallel().launch_world_size
         torch.distributed.all_gather_object(
-            all_ips, local_ip, group=get_world_group().cpu_group
+            all_ips, local_ip, group=get_parallel().world_group.cpu_group
         )
         logger.info(f"all_ips: {all_ips}")
 
         for i in range(self.engine_num):
             self.recv_list[i] = context.socket(zmq.SUB)
             self.recv_list[i].connect(
-                f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{PORT_BASE + i * 2 + 1}"
+                f"tcp://{all_ips[i * get_parallel().launch_world_size // get_parallel().nnodes]}:{PORT_BASE + i * 2 + 1}"
             )
             self.recv_list[i].setsockopt(zmq.SUBSCRIBE, b"")
 
             # Synchronization channel to notify the manager when this client is ready.
             self.ready_sockets[i] = context.socket(zmq.PUSH)
             self.ready_sockets[i].connect(
-                f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{PORT_BASE + i * 2}"
+                f"tcp://{all_ips[i * get_parallel().launch_world_size // get_parallel().nnodes]}:{PORT_BASE + i * 2}"
             )
-            self.ready_sockets[i].send_pyobj(UpdateExpertBackupReq())
+            sock_send(self.ready_sockets[i], UpdateExpertBackupReq())
 
         self._receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
         self._receive_thread.start()
@@ -73,7 +75,7 @@ class ExpertBackupClient:
     def _receive_loop(self):
         cnt = 0
         while cnt < self.engine_num:
-            response = self.recv_list[cnt].recv_pyobj()
+            response = sock_recv(self.recv_list[cnt])
             self.dram_map_list[response.rank] = response.weight_pointer_map
             self.session_id_list[response.rank] = response.session_id
             self.buffer_size = max(self.buffer_size, response.buffer_size)
@@ -87,7 +89,7 @@ class ExpertBackupClient:
 
         self.transfer_engine = get_mooncake_transfer_engine()
 
-        self.params_dict = dict(self.model_runner.model.named_parameters())
+        self.params_dict = dict(self._get_model().named_parameters())
         for name, param in self.params_dict.items():
             param_data = param.data
             ret_value = self.transfer_engine.engine.register_memory(
@@ -102,7 +104,7 @@ class ExpertBackupClient:
         global_expert_location_metadata = get_global_expert_location_metadata()
         num_experts = (
             self.model_config.hf_config.n_routed_experts
-            + self.server_args.ep_num_redundant_experts
+            + get_exec().moe.ep_num_redundant_experts
         )
         num_local_experts = num_experts // self.moe_ep_size
         for i in range(self.engine_num):
@@ -150,12 +152,10 @@ class ExpertBackupClient:
                         param = param.narrow(
                             0, param.shape[0] // 2, param.shape[0] // 2
                         )
-                    server_ptr_list.append(weight_info["weight_ptr"])
+                    server_ptr_list.append(weight_info.weight_ptr)
                     local_ptr_list.append(param.data_ptr())
-                    assert (
-                        param.numel() * param.element_size() == weight_info["byte_size"]
-                    )
-                    weight_size_list.append(weight_info["byte_size"])
+                    assert param.numel() * param.element_size() == weight_info.byte_size
+                    weight_size_list.append(weight_info.byte_size)
             before_transfer = time.time()
             ret = self.transfer_engine.engine.batch_transfer_sync_read(
                 self.session_id_list[i],

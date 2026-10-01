@@ -21,11 +21,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
     InputValidationStage,
 )
 
-# Patch path for get_global_server_args used by Stage.__init__
-_GLOBAL_ARGS_PATCH = (
-    "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args"
-)
-
 
 def _make_batch(condition_image: Image.Image, width=None, height=None) -> Req:
     """Create a minimal Req with a condition image and optional user dimensions."""
@@ -109,8 +104,7 @@ class TestPreprocessConditionImageResolution(unittest.TestCase):
     """
 
     def setUp(self):
-        with patch(_GLOBAL_ARGS_PATCH, return_value=MagicMock()):
-            self.stage = InputValidationStage()
+        self.stage = InputValidationStage()
 
     def _run(self, config, img_w, img_h, user_w=None, user_h=None):
         """Run preprocess_condition_image and return (batch.width, batch.height)."""
@@ -238,8 +232,7 @@ class TestFlux2ConditionImagePreprocess(unittest.TestCase):
 
 class TestFlux2TI2ISizeResolution(unittest.TestCase):
     def setUp(self):
-        with patch(_GLOBAL_ARGS_PATCH, return_value=MagicMock()):
-            self.stage = InputValidationStage()
+        self.stage = InputValidationStage()
         self.config = _DummyTI2IConfig()
 
     def test_uses_condition_image_size_when_width_height_not_explicit(self):
@@ -269,6 +262,21 @@ class TestFlux2TI2ISizeResolution(unittest.TestCase):
         )
 
         self.assertEqual((batch.width, batch.height), (768, 512))
+
+
+class TestPerRequestTask(unittest.TestCase):
+    def test_image_preprocessing_uses_request_on_video_default(self):
+        config = _DummyTI2IConfig()
+        config.task_type = ModelTaskType.T2V
+        image = Image.new("RGB", (1255, 833))
+        batch = _make_batch(image)
+        batch.task_type = ModelTaskType.I2I
+        InputValidationStage().preprocess_condition_image(
+            batch, _make_server_args(config), image.width, image.height
+        )
+        self.assertEqual((batch.width, batch.height), (1248, 832))
+        self.assertIsInstance(batch.condition_image, list)
+        self.assertEqual(config.task_type, ModelTaskType.T2V)
 
 
 if __name__ == "__main__":

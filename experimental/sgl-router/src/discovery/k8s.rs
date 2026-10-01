@@ -11,10 +11,14 @@ use crate::config::{K8sDiscoveryConfig, K8sDiscoveryMode};
 use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
 use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::discovery::v1::{Endpoint, EndpointSlice};
 use kube::{api::Api, runtime::watcher, Client};
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc;
+
+mod peers;
+
+pub use peers::{peer_address_family, spawn_peer_watch, AddressFamily};
 
 /// Decide which [`WorkerMode`] an `EndpointSlice` should be assigned, based
 /// on the configured discovery mode.
@@ -76,6 +80,13 @@ fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> b
     true
 }
 
+/// A slice's PD version group: the configured label's value, inherited from its
+/// Service. A missing or empty label yields `None`, its own group.
+fn version_group(es: &EndpointSlice, label: Option<&str>) -> Option<String> {
+    let group = es.metadata.labels.as_ref()?.get(label?)?;
+    (!group.is_empty()).then(|| group.clone())
+}
+
 /// Convert an `EndpointSlice` into a list of [`WorkerSpec`]s with the
 /// supplied [`WorkerMode`].
 ///
@@ -112,13 +123,17 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
 
     let mut out = Vec::new();
     for ep in es.endpoints.iter() {
-        let is_ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
-        if !is_ready {
+        if !endpoint_ready(ep) {
             continue;
         }
         let pod_uid: Option<&str> = ep.target_ref.as_ref().and_then(|r| r.uid.as_deref());
         for addr in &ep.addresses {
-            let url = format!("http://{addr}:{port}");
+            let host = if es.address_type == "IPv6" {
+                format!("[{addr}]")
+            } else {
+                addr.clone()
+            };
+            let url = format!("http://{host}:{port}");
             let id = match pod_uid {
                 Some(uid) => WorkerId(format!("{ns}/{uid}")),
                 None => WorkerId(format!("{ns}/{slice_name}/{addr}:{port}")),
@@ -137,11 +152,16 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
                 url,
                 mode,
                 model_ids: Vec::new(),
-                bootstrap_port: None,
+                ..Default::default()
             });
         }
     }
     out
+}
+
+/// Per the EndpointSlice API, an absent `conditions.ready` means ready.
+fn endpoint_ready(ep: &Endpoint) -> bool {
+    ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true)
 }
 
 /// Spawn the k8s discovery task.
@@ -197,7 +217,10 @@ async fn emit_diff(
                     })
                     .await?;
                 }
-                if prev.url != spec.url || prev.model_ids != spec.model_ids {
+                if prev.url != spec.url
+                    || prev.model_ids != spec.model_ids
+                    || prev.version_group != spec.version_group
+                {
                     tx.send(DiscoveryEvent::Removed { id: id.clone() }).await?;
                     tx.send(DiscoveryEvent::Added(spec.clone())).await?;
                 }
@@ -239,8 +262,12 @@ async fn emit_diff(
 ///
 /// The loop returns when the input stream ends (logged at WARN) or when the
 /// consumer drops the receiving end of `tx` (logged at INFO).
-async fn process_events<S>(mut stream: S, tx: mpsc::Sender<DiscoveryEvent>, mode: K8sDiscoveryMode)
-where
+async fn process_events<S>(
+    mut stream: S,
+    tx: mpsc::Sender<DiscoveryEvent>,
+    mode: K8sDiscoveryMode,
+    version_group_label: Option<String>,
+) where
     S: Stream<Item = Result<watcher::Event<EndpointSlice>, watcher::Error>> + Unpin,
 {
     let mut per_slice: HashMap<String, HashMap<WorkerId, WorkerSpec>> = HashMap::new();
@@ -250,14 +277,19 @@ where
     fn workers_for_slice(
         es: &EndpointSlice,
         mode: &K8sDiscoveryMode,
+        version_group_label: Option<&str>,
     ) -> HashMap<WorkerId, WorkerSpec> {
-        match classify_mode(es, mode) {
-            Some(wm) => extract_workers(es, wm)
-                .into_iter()
-                .map(|w| (w.id.clone(), w))
-                .collect(),
-            None => HashMap::new(),
-        }
+        let Some(wm) = classify_mode(es, mode) else {
+            return HashMap::new();
+        };
+        let group = version_group(es, version_group_label);
+        extract_workers(es, wm)
+            .into_iter()
+            .map(|mut w| {
+                w.version_group = group.clone();
+                (w.id.clone(), w)
+            })
+            .collect()
     }
 
     while let Some(event) = stream.next().await {
@@ -268,7 +300,7 @@ where
             }
             Ok(watcher::Event::InitApply(es)) => {
                 let key = slice_key(&es);
-                let workers = workers_for_slice(&es, &mode);
+                let workers = workers_for_slice(&es, &mode, version_group_label.as_deref());
                 if let Some(buf) = init_buffer.as_mut() {
                     buf.insert(key, workers);
                     Ok(())
@@ -288,7 +320,7 @@ where
             }
             Ok(watcher::Event::Apply(es)) => {
                 let key = slice_key(&es);
-                let workers = workers_for_slice(&es, &mode);
+                let workers = workers_for_slice(&es, &mode, version_group_label.as_deref());
                 per_slice.insert(key, workers);
                 emit_diff(&tx, &per_slice, &mut prev_union).await
             }
@@ -310,10 +342,29 @@ where
     tracing::warn!("k8s watcher stream ended; discovery task exiting");
 }
 
-/// Empty `cfg.namespace` triggers a cluster-wide watch via `Api::all(client)`.
+/// An `EndpointSlice` API handle from the default client config.
+///
+/// An empty `namespace` means a cluster-wide watch via `Api::all(client)`.
 /// `Api::namespaced(client, "")` is namespace-scoped to the empty-named
 /// namespace, which is almost never what callers intend.
-///
+async fn endpoint_slice_api(namespace: &str) -> Result<Api<EndpointSlice>, kube::Error> {
+    let client = Client::try_default().await?;
+    Ok(if namespace.is_empty() {
+        Api::all(client)
+    } else {
+        Api::namespaced(client, namespace)
+    })
+}
+
+/// How a watched namespace appears in startup logs.
+fn namespace_display(namespace: &str) -> &str {
+    if namespace.is_empty() {
+        "<all namespaces>"
+    } else {
+        namespace
+    }
+}
+
 /// State is tracked per-slice as `HashMap<SliceKey, HashMap<WorkerId,
 /// WorkerSpec>>`.  K8s auto-shards Services with >100 endpoints and CNIs
 /// often shard per AZ, so multiple `EndpointSlice` objects can exist per
@@ -328,17 +379,19 @@ pub async fn spawn(
     cfg: K8sDiscoveryConfig,
     tx: mpsc::Sender<DiscoveryEvent>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let mode = cfg.mode().context("validate k8s discovery selectors")?;
+    // The mode was resolved + validated at construction (`resolve_mode` in
+    // `Cli::build_discovery`); just destructure it here.
+    // `peer_selector` names sibling routers, not the workers streamed here.
+    let K8sDiscoveryConfig {
+        namespace,
+        mode,
+        peer_selector: _,
+        version_group_label,
+    } = cfg;
 
-    let client = Client::try_default()
+    let api = endpoint_slice_api(&namespace)
         .await
         .context("kube client default config")?;
-
-    let api: Api<EndpointSlice> = if cfg.namespace.is_empty() {
-        Api::all(client)
-    } else {
-        Api::namespaced(client, &cfg.namespace)
-    };
 
     // Plain mode pushes the single selector to the server side so the LIST
     // is already filtered.  PD mode leaves the server-side selector empty
@@ -351,10 +404,37 @@ pub async fn spawn(
     };
     let watcher_cfg = watcher::Config::default().labels(&server_side_selector);
 
+    // Log the resolved namespace + selector(s) at startup. We can't
+    // verify the namespace exists (the router's RBAC covers
+    // endpointslices/services/pods, not namespaces, and a correct
+    // namespace legitimately has zero matching workers until they come
+    // up), so a typo'd `--service-discovery-namespace` silently watches
+    // an empty namespace. Surfacing the watch target here lets an
+    // operator spot the typo in the first log lines instead of only
+    // discovering it via later `no workers available` request failures.
+    let namespace_display = namespace_display(&namespace);
+    match &mode {
+        K8sDiscoveryMode::Plain { label_selector } => tracing::info!(
+            namespace = %namespace_display,
+            label_selector = %label_selector,
+            "k8s discovery starting (plain mode); a wrong namespace or selector matches zero EndpointSlices"
+        ),
+        K8sDiscoveryMode::PdDisaggregation {
+            prefill_selector,
+            decode_selector,
+        } => tracing::info!(
+            namespace = %namespace_display,
+            prefill_selector = %prefill_selector,
+            decode_selector = %decode_selector,
+            version_group_label = version_group_label.as_deref().unwrap_or("<none>"),
+            "k8s discovery starting (PD mode); a wrong namespace or selector matches zero EndpointSlices"
+        ),
+    }
+
     let handle = tokio::spawn(async move {
         let stream = watcher(api, watcher_cfg);
         tokio::pin!(stream);
-        process_events(stream, tx, mode).await;
+        process_events(stream, tx, mode, version_group_label).await;
     });
     Ok(handle)
 }
@@ -362,7 +442,8 @@ pub async fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort};
+    use k8s_openapi::api::core::v1::ObjectReference;
+    use k8s_openapi::api::discovery::v1::{EndpointConditions, EndpointPort};
     use kube::core::ObjectMeta;
 
     /// Helper: build a minimal EndpointSlice with predictable metadata.
@@ -510,6 +591,15 @@ mod tests {
     }
 
     #[test]
+    fn brackets_ipv6_worker_addresses() {
+        let mut slice = make_slice(&["2001:db8::1"], 30000, true);
+        slice.address_type = "IPv6".into();
+        let workers = extract_workers(&slice, WorkerMode::Plain);
+        assert_eq!(workers[0].url, "http://[2001:db8::1]:30000");
+        assert!(url::Url::parse(&workers[0].url).is_ok());
+    }
+
+    #[test]
     fn skips_not_ready_endpoints() {
         let s = make_slice(&["10.0.0.1"], 30000, false);
         assert!(extract_workers(&s, WorkerMode::Plain).is_empty());
@@ -591,7 +681,7 @@ mod tests {
         ];
         let (tx, mut rx) = mpsc::channel(16);
         let stream = futures::stream::iter(events);
-        process_events(stream, tx, plain_mode()).await;
+        process_events(stream, tx, plain_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -619,7 +709,7 @@ mod tests {
             Ok(watcher::Event::InitDone),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, plain_mode()).await;
+        process_events(futures::stream::iter(events), tx, plain_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -653,7 +743,7 @@ mod tests {
         }));
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let handle = tokio::spawn(process_events(events, tx, plain_mode()));
+        let handle = tokio::spawn(process_events(events, tx, plain_mode(), None));
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("process_events must exit promptly when consumer drops")
@@ -672,7 +762,7 @@ mod tests {
             Ok(watcher::Event::Apply(s)),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, plain_mode()).await;
+        process_events(futures::stream::iter(events), tx, plain_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -718,7 +808,7 @@ mod tests {
             Ok(watcher::Event::Apply(unrelated_slice)),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, pd_mode()).await;
+        process_events(futures::stream::iter(events), tx, pd_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -737,6 +827,43 @@ mod tests {
         );
         assert_eq!(added[0].mode, WorkerMode::Prefill);
         assert_eq!(added[0].id.0, "ns/p/10.0.0.1:30000");
+    }
+
+    /// Each slice's label value becomes its workers' version group; a missing
+    /// or empty label yields `None`.
+    #[tokio::test]
+    async fn pd_mode_reads_version_group_from_slice_label() {
+        let events = [
+            ("p-v1", "10.0.0.1", "prefill", "v1"),
+            ("d-v2", "10.0.0.2", "decode", "v2"),
+            ("d-empty", "10.0.0.3", "decode", ""),
+        ]
+        .map(|(name, addr, role, group)| {
+            let labels = [
+                ("app", "sglang"),
+                ("role", role),
+                ("sglang.ai/version-group", group),
+            ];
+            let es = make_slice_full(&[addr], 30000, true, "ns", name, &labels);
+            Ok(watcher::Event::Apply(with_uid(es, &format!("u-{name}"))))
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        let label = Some("sglang.ai/version-group".into());
+        process_events(futures::stream::iter(events), tx, pd_mode(), label).await;
+        let mut groups = Vec::new();
+        while let Ok(DiscoveryEvent::Added(spec)) = rx.try_recv() {
+            groups.push((spec.url, spec.version_group));
+        }
+        groups.sort_unstable();
+        let group = |g: &str| Some(g.to_owned());
+        assert_eq!(
+            groups,
+            [
+                ("http://10.0.0.1:30000".into(), group("v1")),
+                ("http://10.0.0.2:30000".into(), group("v2")),
+                ("http://10.0.0.3:30000".into(), None),
+            ]
+        );
     }
 
     /// End-to-end K8s + PD integration: synthesize EndpointSlice events
@@ -893,7 +1020,7 @@ mod tests {
         ];
         let producer = tokio::spawn(async move {
             let stream = futures::stream::iter(events);
-            process_events(stream, dtx, pd_mode()).await;
+            process_events(stream, dtx, pd_mode(), None).await;
         });
 
         // Poll the registry until all four workers are present with
@@ -956,7 +1083,6 @@ mod tests {
     /// Helper: build a slice where every endpoint carries a synthetic
     /// `target_ref.uid`. The endpoint at position `i` gets `uids[i]`.
     fn make_slice_with_uids(addrs: &[&str], port: i32, uids: &[&str]) -> EndpointSlice {
-        use k8s_openapi::api::core::v1::ObjectReference;
         assert_eq!(addrs.len(), uids.len());
         let endpoints = addrs
             .iter()
@@ -990,7 +1116,7 @@ mod tests {
     }
 
     /// Pod is replaced (same IP, different UID) — router must see this as
-    /// a Removed+Added cycle so the new pod gets fresh CB/active_load
+    /// a Removed+Added cycle so the new pod gets fresh CB/router_inflight_load
     /// state. Without UID-keyed WorkerIds, two consecutive
     /// `process_events` snapshots would dedup by `addr:port` and the
     /// new pod would inherit the dead pod's state.
@@ -1012,6 +1138,7 @@ mod tests {
             ]),
             tx,
             plain_mode(),
+            None,
         )
         .await;
         let mut events = Vec::new();
@@ -1052,5 +1179,135 @@ mod tests {
         );
         // Same URL across both, confirming the IP didn't change.
         assert_eq!(added[0].url, added[1].url);
+    }
+
+    /// End-to-end reconcile: an EndpointSlice flips `ready=true` while the
+    /// engine's `/server_info` is still failing (503) — the production
+    /// race where K8s readiness (cheap `/health`) leads the
+    /// scheduler-backed `/server_info`. The worker registers with empty
+    /// `model_ids` (invisible to routing), and discovery emits no further
+    /// event. The manager's reconcile loop must re-introspect it and move
+    /// it into the model pool once `/server_info` recovers — driven
+    /// through the real `process_events` → manager path.
+    #[tokio::test]
+    async fn k8s_reconcile_recovers_worker_whose_server_info_was_initially_failing() {
+        use crate::discovery::ModelId;
+        use crate::workers::introspect::WorkerIntrospector;
+        use crate::workers::manager::run_with_introspector_and_reconcile;
+        use crate::workers::WorkerRegistry;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+
+        // Fake engine: 503 on /server_info until `ready` flips true, then
+        // serves a valid body advertising model "m".
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_handler = ready.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/server_info",
+            get(move || {
+                let ready = ready_handler.clone();
+                async move {
+                    if ready.load(Ordering::SeqCst) {
+                        Json(json!({"served_model_name": "m"})).into_response()
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }
+                }
+            }),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        // EndpointSlice already marked ready=true (kubelet's /health probe
+        // passed) pointing at the engine whose /server_info is still 503.
+        let slice = with_uid(
+            make_slice_full(&["127.0.0.1"], port as i32, true, "ns", "engine-1", &[]),
+            "u-e1",
+        );
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (dtx, drx) = mpsc::channel::<DiscoveryEvent>(16);
+        // Hold a second sender so the channel stays open after the
+        // producer's single-event stream ends — otherwise the manager
+        // loop would exit before any reconcile tick fires.
+        let dtx_keepalive = dtx.clone();
+        let introspector = Arc::new(WorkerIntrospector::new(Duration::from_millis(300)));
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            drx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            introspector,
+            Duration::from_millis(150),
+        ));
+
+        // Drive the ready=true slice through the real discovery processor.
+        let producer = tokio::spawn(async move {
+            let stream = futures::stream::iter(vec![Ok(watcher::Event::Apply(slice))]);
+            process_events(stream, dtx, plain_mode(), None).await;
+        });
+
+        // No target_ref on the endpoint => id falls back to ns/slice/addr:port.
+        let id = WorkerId(format!("ns/engine-1/127.0.0.1:{port}"));
+        let model = ModelId("m".into());
+
+        // Phase 1: worker is registered but absent from the model pool
+        // while /server_info keeps failing.
+        let stuck = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if w.model_ids.is_empty() && registry.workers_for(&model).is_empty() {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            stuck.is_ok(),
+            "worker should register with empty model_ids while /server_info is failing",
+        );
+
+        // Engine finishes coming up.
+        ready.store(true, Ordering::SeqCst);
+
+        // Phase 2: reconcile re-introspects and the worker joins the pool,
+        // with no further discovery event.
+        let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !registry.workers_for(&model).is_empty() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            recovered.is_ok(),
+            "reconcile must re-introspect the worker and add it to the model pool once \
+             /server_info recovers; registry state: {:?}",
+            registry.get(&id).map(|w| w.model_ids.clone()),
+        );
+
+        drop(dtx_keepalive);
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(1), producer).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), manager_handle).await;
     }
 }

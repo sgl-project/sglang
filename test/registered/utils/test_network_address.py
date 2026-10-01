@@ -3,14 +3,16 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.network import NetworkAddress, is_zmq_endpoint_ipv6
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 # Mock get_device() so ServerArgs tests run on CPU-only CI runners
-_mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
+_mock_device = patch(
+    "sglang.srt.arg_groups.serving_hook.get_device", return_value="cuda"
+)
 _mock_device.start()
 
 
@@ -180,6 +182,22 @@ class TestNetworkAddressParseErrors(unittest.TestCase):
             NetworkAddress.parse(":8000")
 
 
+class TestZmqEndpointIPv6(unittest.TestCase):
+    def test_bracketed_ipv6_endpoint(self):
+        self.assertTrue(is_zmq_endpoint_ipv6("tcp://[::1]:30000"))
+        self.assertTrue(is_zmq_endpoint_ipv6("tcp://[2001:db8::1]:30000"))
+
+    def test_non_ipv6_endpoints(self):
+        self.assertFalse(is_zmq_endpoint_ipv6("tcp://127.0.0.1:30000"))
+        self.assertFalse(is_zmq_endpoint_ipv6("tcp://localhost:30000"))
+        self.assertFalse(is_zmq_endpoint_ipv6("ipc:///tmp/sglang.sock"))
+
+    def test_malformed_or_non_tcp_endpoints(self):
+        self.assertFalse(is_zmq_endpoint_ipv6("tcp://[not-ipv6]:30000"))
+        self.assertFalse(is_zmq_endpoint_ipv6("tcp://[::1:30000"))
+        self.assertFalse(is_zmq_endpoint_ipv6("ipc://[::1]:30000"))
+
+
 class TestNetworkAddressBracketStripping(unittest.TestCase):
     def test_strip_brackets(self):
         na = NetworkAddress("[::1]", 8000)
@@ -228,7 +246,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]:25000"
 
@@ -247,7 +265,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[invalid-ipv6]:25000"
 
@@ -259,7 +277,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1:25000"
 
@@ -271,7 +289,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]"
 
@@ -283,7 +301,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]:abcde"
 
@@ -295,7 +313,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]#25000"
 

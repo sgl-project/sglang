@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import write_results_to_github_step_summary
-from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -29,6 +29,7 @@ class GSM8KAscendMixin(ABC):
     server_cmd = ""
     gsm8k_num_shots = 5
     num_questions = 200
+    gsm8k_parallel = 128
 
     env = {
         **os.environ,
@@ -42,7 +43,6 @@ class GSM8KAscendMixin(ABC):
         "SGLANG_ENBLE_TORCH_COMILE": "1",
         "AUTO_USE_UC_MEMORY": "0",
         "P2P_HCCL_BUFFSIZE": "20",
-        "TRANSFORMERS_VERBOSITY": os.getenv("TRANSFORMERS_VERBOSITY", "error"),
     }
 
     @classmethod
@@ -66,6 +66,14 @@ class GSM8KAscendMixin(ABC):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        from sglang.test.ascend.npu_eval_accuracy_kit import (
+            _is_pr_pipeline,
+            run_npu_pr_smoke,
+        )
+
+        if _is_pr_pipeline:
+            run_npu_pr_smoke(self.base_url)
+            return
         accuracy_threshold = getattr(self, "accuracy", 0.00)
         output_throughput_threshold = getattr(self, "output_throughput", 0.00)
 
@@ -78,26 +86,28 @@ class GSM8KAscendMixin(ABC):
 
         try:
             args = SimpleNamespace(
+                max_tokens=512,
+                base_url=self.base_url,
+                model=self.model,
+                eval_name="gsm8k",
+                api="completion",
+                num_examples=self.num_questions,
+                num_threads=128,
                 num_shots=self.gsm8k_num_shots,
-                data_path=None,
-                num_questions=self.num_questions,
-                max_new_tokens=512,
-                parallel=128,
-                host="http://127.0.0.1",
-                port=int(self.base_url.split(":")[-1]),
             )
             metrics = run_eval(args)
-            model_metrics["accuracy"] = metrics["accuracy"]
+            model_metrics["accuracy"] = metrics["score"]
             model_metrics["output_throughput"] = metrics["output_throughput"]
+            model_metrics["latency"] = metrics["latency"]
             self.assertGreaterEqual(
-                metrics["accuracy"],
+                metrics["score"],
                 accuracy_threshold,
-                f'Accuracy of {self.model} is {str(metrics["accuracy"])}, is lower than {accuracy_threshold}',
+                f"Accuracy of {self.model} is {str(metrics['score'])}, is lower than {accuracy_threshold}",
             )
             self.assertGreaterEqual(
                 metrics["output_throughput"],
                 output_throughput_threshold,
-                f'Output throughput of {self.model} is {str(metrics["output_throughput"])}, is lower than {output_throughput_threshold}',
+                f"Output throughput of {self.model} is {str(metrics['output_throughput'])}, is lower than {output_throughput_threshold}",
             )
         except Exception as e:
             model_metrics["error"] = e

@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=691, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=294, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=691, suite="stage-b-test-1-gpu-large-amd")
 
 
@@ -57,7 +57,6 @@ class TestStreamingSessionEagleV2RetractLargePage(TestStreamingSession):
         "256",
     ]
     env_overrides = [
-        ("SGLANG_ENABLE_SPEC_V2", True),
         ("SGLANG_TEST_RETRACT", True),
         ("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
     ]

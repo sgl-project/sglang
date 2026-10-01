@@ -1,63 +1,103 @@
+pub mod cli;
+pub mod sampling;
 pub mod types;
+pub use cli::Cli;
+pub use sampling::*;
 pub use types::*;
 
-use anyhow::Context as _;
-use anyhow::{anyhow, Result};
-use std::path::Path;
+use anyhow::{anyhow, ensure, Result};
+
+/// Default pod termination grace period when none is declared.
+pub const K8S_DEFAULT_GRACE_SECS: u64 = 30;
+
+/// Maximum shutdown pause; deployments must also allow time to drain in-flight requests.
+/// This is the hard typo gate (an extra digit, seconds confused with milliseconds);
+/// whether a legal drain fits a particular grace period is [`shutdown_drain_advisory`]'s
+/// job, because the operator can raise the budget.
+pub const MAX_SHUTDOWN_DRAIN_SECS: u64 = 1800;
+
+/// A shutdown pause that exhausts the declared or assumed pod grace period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownDrainAdvisory {
+    pub shutdown_drain_secs: u64,
+    /// The budget the drain was compared against.
+    pub termination_grace_secs: u64,
+    /// Whether the operator declared the grace period.
+    pub grace_declared: bool,
+}
+
+/// Warn when the pause leaves no time for in-flight draining.
+/// An undeclared grace period uses the Kubernetes default.
+pub fn shutdown_drain_advisory(
+    shutdown_drain_secs: u64,
+    termination_grace_secs: Option<u64>,
+) -> Option<ShutdownDrainAdvisory> {
+    let grace = termination_grace_secs.unwrap_or(K8S_DEFAULT_GRACE_SECS);
+    (shutdown_drain_secs >= grace).then_some(ShutdownDrainAdvisory {
+        shutdown_drain_secs,
+        termination_grace_secs: grace,
+        grace_declared: termination_grace_secs.is_some(),
+    })
+}
 
 impl Config {
-    pub fn from_path(p: &Path) -> Result<Self> {
-        let raw =
-            std::fs::read_to_string(p).with_context(|| format!("read config {}", p.display()))?;
-        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-        let cfg: Config = match ext {
-            "yaml" | "yml" => serde_yaml::from_str(&raw)
-                .map_err(|e| anyhow!("parse yaml {}: {e}", p.display()))?,
-            "toml" => {
-                toml::from_str(&raw).map_err(|e| anyhow!("parse toml {}: {e}", p.display()))?
-            }
-            other => {
-                return Err(anyhow!(
-                    "unsupported config extension {other:?}; want yaml/yml/toml"
-                ))
-            }
-        };
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    fn validate(&self) -> Result<()> {
-        // Unknown policy names are rejected by serde via `PolicyKind`'s
-        // `rename_all = "snake_case"`; threshold = 0 is rejected by
-        // `NonZeroU32`.  Only fields without a type-system constraint are
-        // checked here.
-        for m in &self.models {
-            if m.id.is_empty() {
-                return Err(anyhow!("model.id must be non-empty"));
-            }
+    /// Validate invariants not enforced by the CLI parser.
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(!self.model.id.is_empty(), "model id must be non-empty");
+        // Policies that read the prompt are checked against the built routing at startup.
+        ensure!(
+            self.model.tokenizer_path.is_some() || self.model.bucket_config.is_none(),
+            "--no-tokenizer is incompatible with --bucket-config"
+        );
+        if let Some(bucket_config) = self.model.bucket_config.as_ref() {
+            validate_bucket_config(bucket_config)?;
         }
-        match &self.discovery.backend {
+        self.model.sampling_overrides.validate()?;
+        ensure!(
+            self.proxy.stream_idle_timeout_secs > 0,
+            "stream_idle_timeout_secs must be greater than zero"
+        );
+        ensure!(
+            self.server.shutdown_drain_secs <= MAX_SHUTDOWN_DRAIN_SECS,
+            "shutdown_drain_secs must be at most {MAX_SHUTDOWN_DRAIN_SECS} (got {}); \
+             past the ceiling a value is a typo rather than a drain. A long but \
+             deliberate drain is fine — declare --termination-grace-secs so startup \
+             can check it against the pod's real budget",
+            self.server.shutdown_drain_secs,
+        );
+        if let Some(cache) = self.model.cache_aware.as_ref() {
+            let ms = cache.bootstrap_timeout_ms;
+            ensure!(
+                ms > 0,
+                "--kv-bootstrap-timeout-ms must be greater than zero; to boot cold, \
+                 leave --kv-peer-selector unset"
+            );
+            ensure!(
+                ms <= MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+                "--kv-bootstrap-timeout-ms {ms} exceeds the {MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms ceiling"
+            );
+            let cap = cache.bootstrap_fetch_timeout_cap_ms;
+            ensure!(
+                (MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS..=MAX_KV_BOOTSTRAP_TIMEOUT_MS)
+                    .contains(&cap),
+                "--kv-bootstrap-fetch-timeout-cap-ms {cap} is out of range \
+                 ({MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS}..={MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms)"
+            );
+        }
+        match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
-                if s.urls.is_empty() {
-                    return Err(anyhow!(
-                        "discovery.static_urls.urls must be a non-empty list"
-                    ));
-                }
-                // Validate every entry up front so typos surface at
-                // config-load with a precise diagnostic instead of as
-                // per-worker introspect failures or as two registry
-                // entries pointing at the same SGLang (trailing-slash
-                // near-duplicates). Dedupe runs against a normalized
-                // form (trimmed + trailing `/` stripped) so
-                // `"http://x:30000"` and `"http://x:30000/"` collide.
+                ensure!(
+                    !s.urls.is_empty(),
+                    "discovery.static_urls.urls must be a non-empty list"
+                );
+                // Normalize URLs before deduplication so trailing slashes cannot register a worker twice.
                 let mut seen = std::collections::HashSet::new();
                 for raw in &s.urls {
                     let trimmed = raw.trim();
-                    if trimmed.is_empty() {
-                        return Err(anyhow!(
-                            "discovery.static_urls.urls contains an empty or whitespace-only entry"
-                        ));
-                    }
+                    ensure!(
+                        !trimmed.is_empty(),
+                        "discovery.static_urls.urls contains an empty or whitespace-only entry"
+                    );
                     let parsed = url::Url::parse(trimmed).map_err(|e| {
                         anyhow!("discovery.static_urls.urls entry {raw:?} is not a valid URL: {e}")
                     })?;
@@ -70,471 +110,514 @@ impl Config {
                         }
                     }
                     let normalized = parsed.as_str().trim_end_matches('/').to_string();
-                    if !seen.insert(normalized.clone()) {
-                        return Err(anyhow!(
-                            "discovery.static_urls.urls contains duplicate entry {raw:?} (normalized: {normalized:?})"
-                        ));
-                    }
+                    ensure!(
+                        seen.insert(normalized.clone()),
+                        "discovery.static_urls.urls contains duplicate entry {raw:?} (normalized: {normalized:?})"
+                    );
                 }
             }
-            DiscoveryBackend::K8s(k) => {
-                // Empty namespace is intentional: triggers `Api::all(client)`
-                // for cluster-wide EndpointSlice watch (see
-                // `discovery::k8s::spawn`). Only validate the selector
-                // combination here.
-                let _ = &k.namespace;
-                k.mode().map_err(|e| anyhow!("{e}"))?;
-            }
+            // Kubernetes selector combinations are validated by `resolve_mode` during construction.
+            DiscoveryBackend::K8s(_) => {}
         }
         Ok(())
     }
+}
+
+fn validate_bucket_config(bucket_config: &BucketConfig) -> Result<()> {
+    ensure!(
+        !bucket_config.buckets.is_empty(),
+        "bucket_config.buckets must be non-empty when configured"
+    );
+    let mut ids = std::collections::HashSet::new();
+    let mut ranks = std::collections::HashSet::new();
+    let mut stage_workers = std::collections::HashSet::new();
+    let mut has_prefill_bucket = false;
+    for bucket in &bucket_config.buckets {
+        has_prefill_bucket |= bucket.stage == BucketStage::Prefill;
+        ensure!(
+            !bucket.id.is_empty() && ids.insert(bucket.id.as_str()),
+            "bucket_config bucket id must be non-empty and unique: {:?}",
+            bucket.id
+        );
+        ensure!(
+            ranks.insert((bucket.stage, bucket.rank)),
+            "bucket_config rank must be unique within each stage: {}",
+            bucket.rank
+        );
+        ensure!(
+            !bucket.worker_ids.is_empty(),
+            "bucket_config bucket {:?} has no worker_ids",
+            bucket.id
+        );
+        let mut worker_ids = std::collections::HashSet::new();
+        for worker_id in &bucket.worker_ids {
+            ensure!(
+                !worker_id.is_empty() && worker_ids.insert(worker_id.as_str()),
+                "bucket_config bucket {:?} has an empty or duplicate worker id",
+                bucket.id
+            );
+            ensure!(
+                stage_workers.insert((bucket.stage, worker_id.as_str())),
+                "bucket_config worker {:?} belongs to more than one {:?} bucket",
+                worker_id,
+                bucket.stage
+            );
+        }
+        validate_range(
+            bucket.min_extend_tokens,
+            bucket.max_extend_tokens,
+            &bucket.id,
+            "extend",
+        )?;
+        validate_range(
+            bucket.min_sequence_tokens,
+            bucket.max_sequence_tokens,
+            &bucket.id,
+            "sequence",
+        )?;
+        ensure!(
+            bucket.max_context_tokens != Some(0),
+            "bucket_config bucket {:?} max_context_tokens must be > 0",
+            bucket.id
+        );
+        ensure!(
+            bucket.ttft_p95_at_capacity_ms != Some(0),
+            "bucket_config bucket {:?} TTFT p95 must be > 0",
+            bucket.id
+        );
+        ensure!(
+            bucket
+                .tps_p05_at_capacity
+                .is_none_or(|value| value.is_finite() && value > 0.0),
+            "bucket_config bucket {:?} TPS p05 must be finite and > 0",
+            bucket.id
+        );
+        ensure!(
+            bucket.max_pending_prefill_tokens != Some(0),
+            "bucket_config bucket {:?} max_pending_prefill_tokens must be > 0",
+            bucket.id
+        );
+        match bucket.stage {
+            BucketStage::Prefill
+                if bucket.min_sequence_tokens.is_some()
+                    || bucket.max_sequence_tokens.is_some()
+                    || bucket.tps_p05_at_capacity.is_some() =>
+            {
+                return Err(anyhow!(
+                    "bucket_config Prefill bucket {:?} contains Decode-only sequence/TPS fields",
+                    bucket.id
+                ));
+            }
+            BucketStage::Decode
+                if bucket.min_extend_tokens.is_some()
+                    || bucket.max_extend_tokens.is_some()
+                    || bucket.ttft_p95_at_capacity_ms.is_some()
+                    || bucket.max_pending_prefill_tokens.is_some() =>
+            {
+                return Err(anyhow!(
+                    "bucket_config Decode bucket {:?} contains Prefill-only extend/TTFT/pending fields",
+                    bucket.id
+                ));
+            }
+            _ => {}
+        }
+    }
+    ensure!(
+        has_prefill_bucket,
+        "bucket_config must contain at least one Prefill bucket; enabling Bucket \
+         routing otherwise leaves every request without a Prefill domain"
+    );
+    Ok(())
+}
+
+fn validate_range(min: Option<u64>, max: Option<u64>, id: &str, name: &str) -> Result<()> {
+    ensure!(
+        min.zip(max).is_none_or(|(min, max)| min <= max),
+        "bucket_config bucket {id:?} has invalid {name} range: min > max"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Write `body` to a temp file with the given extension and load it
-    /// through `Config::from_path`. Failures still surface the offending
-    /// config because each call site passes its body inline.
-    fn load(ext: &str, body: &str) -> Result<Config> {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join(format!("c.{ext}"));
-        std::fs::write(&p, body).unwrap();
-        Config::from_path(&p)
-    }
-
-    #[test]
-    fn loads_minimal_yaml() {
-        let c = load(
-            "yaml",
-            r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models:
-  - id: "qwen3-0.6b"
-    tokenizer_path: "/tmp/qwen.json"
-discovery:
-  backend: static_urls
-  static_urls:
-    urls:
-      - "http://10.0.0.1:30000"
-"#,
-        )
-        .unwrap();
-        assert_eq!(c.server.port, 8090);
-        assert_eq!(c.models[0].id, "qwen3-0.6b");
-        match &c.discovery.backend {
-            DiscoveryBackend::StaticUrls(s) => {
-                assert_eq!(s.urls, vec!["http://10.0.0.1:30000".to_string()])
-            }
-            _ => panic!("expected static_urls backend"),
+    fn cfg(model_id: &str, urls: &[&str]) -> Config {
+        Config {
+            server: ServerConfig::default(),
+            observability: ObservabilityConfig::default(),
+            model: ModelConfig {
+                id: model_id.into(),
+                tokenizer_path: Some("/tmp/tok.json".into()),
+                disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
+                policy: PolicyKind::RoundRobin,
+                decode_policy: DecodePolicyKind::PowerOfTwo,
+                bucket_config: None,
+                circuit_breaker: None,
+                cache_aware: None,
+                sticky: None,
+                affinity: None,
+                fused: None,
+                eligibility: None,
+                sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
+            },
+            discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                urls: urls.iter().map(|s| s.to_string()).collect(),
+            }),
+            proxy: ProxyConfig::default(),
+            router_inflight_load: InflightLoadConfig::default(),
         }
     }
 
     #[test]
-    fn loads_minimal_toml() {
-        let c = load(
-            "toml",
-            r#"
-[server]
-host = "0.0.0.0"
-port = 8090
-[[models]]
-id = "qwen3-0.6b"
-tokenizer_path = "/tmp/qwen.json"
-[discovery]
-backend = "static_urls"
-[discovery.static_urls]
-urls = ["http://10.0.0.1:30000"]
-"#,
-        )
-        .unwrap();
-        assert_eq!(c.server.port, 8090);
-        match &c.discovery.backend {
-            DiscoveryBackend::StaticUrls(s) => {
-                assert_eq!(s.urls, vec!["http://10.0.0.1:30000".to_string()])
-            }
-            _ => panic!("expected static_urls backend"),
-        }
+    fn accepts_minimal_static_config() {
+        cfg("qwen3", &["http://10.0.0.1:30000"]).validate().unwrap();
     }
 
     #[test]
-    fn rejects_missing_discovery_section() {
-        let err = load(
-            "yaml",
-            "server:\n  host: \"0.0.0.0\"\n  port: 8090\nmodels: []\n",
-        )
-        .unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("discovery") || msg.contains("missing"),
-            "got: {err}"
-        );
+    fn disabled_tokenizer_rejects_length_buckets() {
+        let mut c = cfg("qwen3", &["http://10.0.0.1:30000"]);
+        c.model.tokenizer_path = None;
+        c.validate().unwrap();
+        c.model.bucket_config = Some(BucketConfig {
+            buckets: vec![],
+            ttft_slo_policy: SloBucketPolicy::Disabled,
+            tps_slo_policy: SloBucketPolicy::Disabled,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("--no-tokenizer"), "{err}");
     }
 
     #[test]
-    fn rejects_unknown_extension() {
-        let err = load("txt", "").unwrap_err();
-        assert!(err.to_string().contains("yaml") && err.to_string().contains("toml"));
+    fn rejects_empty_model_id() {
+        let err = cfg("", &["http://10.0.0.1:30000"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("model id"), "got: {err}");
     }
 
     #[test]
-    fn loads_static_urls_discovery() {
-        let c = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "qwen3-0.6b"
-tokenizer_path = "/tmp/qwen.json"
-policy = "round_robin"
-[discovery]
-backend = "static_urls"
-[discovery.static_urls]
-urls = ["http://10.0.0.1:30000", "http://10.0.0.2:30000"]
-"#,
-        )
-        .unwrap();
-        match &c.discovery.backend {
-            DiscoveryBackend::StaticUrls(s) => {
-                assert_eq!(
-                    s.urls,
-                    vec![
-                        "http://10.0.0.1:30000".to_string(),
-                        "http://10.0.0.2:30000".to_string(),
-                    ],
-                );
-            }
-            _ => panic!("expected static_urls backend"),
-        }
-        assert_eq!(c.models[0].policy, PolicyKind::RoundRobin);
-    }
-
-    #[test]
-    fn rejects_static_urls_with_empty_list() {
-        let err = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "m"
-tokenizer_path = "/tmp/qwen.json"
-[discovery]
-backend = "static_urls"
-[discovery.static_urls]
-urls = []
-"#,
-        )
-        .unwrap_err()
-        .to_string();
+    fn rejects_empty_static_urls_list() {
+        let err = cfg("qwen3", &[]).validate().unwrap_err().to_string();
         assert!(err.contains("non-empty"), "got: {err}");
     }
 
     #[test]
-    fn rejects_static_urls_with_duplicate_entry() {
-        let err = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "m"
-tokenizer_path = "/tmp/qwen.json"
-[discovery]
-backend = "static_urls"
-[discovery.static_urls]
-urls = ["http://x:30000", "http://x:30000"]
-"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("duplicate"), "got: {err}");
-    }
-
-    #[test]
-    fn rejects_static_urls_with_empty_entry() {
-        let err = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "m"
-tokenizer_path = "/tmp/qwen.json"
-[discovery]
-backend = "static_urls"
-[discovery.static_urls]
-urls = ["http://x:30000", ""]
-"#,
-        )
-        .unwrap_err()
-        .to_string();
+    fn rejects_static_urls_empty_entry() {
+        let err = cfg("qwen3", &["http://x:30000", ""])
+            .validate()
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("empty"), "got: {err}");
     }
 
-    /// Whitespace-only entries are user typos that previously slipped
-    /// through `is_empty()` checks and surfaced as "introspect against
-    /// `   /server_info` failed" at runtime. Catch at load.
     #[test]
-    fn rejects_static_urls_with_whitespace_only_entry() {
-        let err = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "m"
-tokenizer_path = "/tmp/qwen.json"
-[discovery]
-backend = "static_urls"
-[discovery.static_urls]
-urls = ["http://x:30000", "   "]
-"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("whitespace"), "got: {err}");
+    fn rejects_static_urls_whitespace_only_entry() {
+        let err = cfg("qwen3", &["http://x:30000", "   "])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty or whitespace"), "got: {err}");
     }
 
-    /// `"10.0.0.1:30000"` (missing scheme) used to pass validation; the
-    /// scheme/`http://` would only fail (or worse, silently degrade
-    /// because of the `parse_bootstrap_host` localhost fallback) at
-    /// introspect time. Reject at load.
     #[test]
-    fn rejects_static_urls_with_schemeless_entry() {
-        let err = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "m"
-tokenizer_path = "/tmp/qwen.json"
-[discovery]
-backend = "static_urls"
-[discovery.static_urls]
-urls = ["10.0.0.1:30000"]
-"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("not a valid URL") || err.contains("unsupported scheme"),
-            "got: {err}"
-        );
-    }
-
-    /// Non-http(s) schemes are rejected. The router speaks HTTP to
-    /// workers; a `tcp://` or `ws://` entry is almost certainly an
-    /// operator typo.
-    #[test]
-    fn rejects_static_urls_with_non_http_scheme() {
-        let err = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "m"
-tokenizer_path = "/tmp/qwen.json"
-[discovery]
-backend = "static_urls"
-[discovery.static_urls]
-urls = ["ws://x:30000"]
-"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("unsupported scheme"), "got: {err}");
-    }
-
-    /// Trailing-slash near-duplicates collide in the registry but used
-    /// to pass byte-equality dedupe. Normalize before checking so two
-    /// pointers at the same SGLang surface as a config error.
-    #[test]
-    fn rejects_static_urls_with_trailing_slash_near_duplicate() {
-        let err = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "m"
-tokenizer_path = "/tmp/qwen.json"
-[discovery]
-backend = "static_urls"
-[discovery.static_urls]
-urls = ["http://x:30000", "http://x:30000/"]
-"#,
-        )
-        .unwrap_err()
-        .to_string();
+    fn rejects_static_urls_trailing_slash_near_duplicate() {
+        let err = cfg("qwen3", &["http://x:30000", "http://x:30000/"])
+            .validate()
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("duplicate"), "got: {err}");
     }
 
     #[test]
-    fn loads_k8s_discovery() {
-        let c = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "qwen3-0.6b"
-tokenizer_path = "/tmp/qwen.json"
-policy = "round_robin"
-[discovery]
-backend = "k8s"
-[discovery.k8s]
-namespace = "default"
-label_selector = "app=sglang"
-"#,
-        )
-        .unwrap();
-        match &c.discovery.backend {
-            DiscoveryBackend::K8s(k) => {
-                assert_eq!(k.namespace, "default");
-                assert_eq!(k.label_selector.as_deref(), Some("app=sglang"));
-                assert!(k.prefill_selector.is_none());
-                assert!(k.decode_selector.is_none());
-            }
-            _ => panic!("expected k8s backend"),
-        }
-    }
-
-    /// K8s PD selectors drive slice-classification only; per-worker
-    /// bootstrap_port comes from `/server_info` post-discovery
-    /// (`crate::workers::introspect`). This test pins the wire-shape;
-    /// the selector grammar itself is covered in `types.rs`.
-    #[test]
-    fn loads_k8s_pd_discovery_with_prefill_and_decode_selectors() {
-        let c = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "qwen3-0.6b"
-tokenizer_path = "/tmp/qwen.json"
-[discovery]
-backend = "k8s"
-[discovery.k8s]
-namespace = "default"
-prefill_selector = "app=sglang,role=prefill"
-decode_selector = "app=sglang,role=decode"
-"#,
-        )
-        .expect("k8s PD config must load");
-        match &c.discovery.backend {
-            DiscoveryBackend::K8s(k) => {
-                assert_eq!(k.namespace, "default");
-                assert_eq!(
-                    k.prefill_selector.as_deref(),
-                    Some("app=sglang,role=prefill")
-                );
-                assert_eq!(k.decode_selector.as_deref(), Some("app=sglang,role=decode"));
-                assert!(k.label_selector.is_none());
-            }
-            _ => panic!("expected k8s backend"),
-        }
+    fn rejects_static_urls_non_http_scheme() {
+        let err = cfg("qwen3", &["ws://x:30000"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported scheme"), "got: {err}");
     }
 
     #[test]
-    fn rejects_k8s_config_with_no_selector() {
-        let err = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "qwen"
-tokenizer_path = "/tmp/qwen.json"
-[discovery]
-backend = "k8s"
-[discovery.k8s]
-namespace = "default"
-"#,
-        )
-        .unwrap_err();
-        // Pin the specific variant: `ConfigError::NoSelector` ("none were
-        // set"). A bare `contains("selector")` would also pass for
-        // EmptyPdSelector / PartialPdSelectors / IdenticalPdSelectors /
-        // UnsupportedSelectorGrammar — variants that have semantically
-        // different error wording but all mention "selector". A future
-        // regression that returned, say, `PartialPdSelectors` for the
-        // all-None input would be caught here.
-        let msg = err.to_string().to_lowercase();
+    fn rejects_a_worker_reused_by_two_buckets_of_the_same_stage() {
+        let mut config = cfg("qwen3", &["http://x:30000"]);
+        config.model.bucket_config = Some(BucketConfig {
+            buckets: vec![
+                BucketSpec {
+                    id: "p-short".into(),
+                    stage: BucketStage::Prefill,
+                    rank: 10,
+                    worker_ids: vec!["p1".into()],
+                    min_extend_tokens: None,
+                    max_extend_tokens: Some(1_024),
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: None,
+                    max_context_tokens: Some(4_096),
+                    ttft_p95_at_capacity_ms: Some(100),
+                    tps_p05_at_capacity: None,
+                    max_pending_prefill_tokens: None,
+                },
+                BucketSpec {
+                    id: "p-long".into(),
+                    stage: BucketStage::Prefill,
+                    rank: 20,
+                    worker_ids: vec!["p1".into()],
+                    min_extend_tokens: Some(1_025),
+                    max_extend_tokens: None,
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: None,
+                    max_context_tokens: Some(8_192),
+                    ttft_p95_at_capacity_ms: Some(200),
+                    tps_p05_at_capacity: None,
+                    max_pending_prefill_tokens: None,
+                },
+            ],
+            ttft_slo_policy: SloBucketPolicy::SloFirst,
+            tps_slo_policy: SloBucketPolicy::Disabled,
+        });
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("more than one"), "got: {error}");
+    }
+
+    #[test]
+    fn accepts_the_same_rank_in_independent_prefill_and_decode_stages() {
+        let mut config = cfg("qwen3", &["http://x:30000"]);
+        config.model.bucket_config = Some(BucketConfig {
+            buckets: vec![
+                BucketSpec {
+                    id: "p-fast".into(),
+                    stage: BucketStage::Prefill,
+                    rank: 10,
+                    worker_ids: vec!["p1".into()],
+                    min_extend_tokens: None,
+                    max_extend_tokens: None,
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: None,
+                    max_context_tokens: Some(4_096),
+                    ttft_p95_at_capacity_ms: Some(100),
+                    tps_p05_at_capacity: None,
+                    max_pending_prefill_tokens: None,
+                },
+                BucketSpec {
+                    id: "d-fast".into(),
+                    stage: BucketStage::Decode,
+                    rank: 10,
+                    worker_ids: vec!["d1".into()],
+                    min_extend_tokens: None,
+                    max_extend_tokens: None,
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: None,
+                    max_context_tokens: Some(4_096),
+                    ttft_p95_at_capacity_ms: None,
+                    tps_p05_at_capacity: Some(20.0),
+                    max_pending_prefill_tokens: None,
+                },
+            ],
+            ttft_slo_policy: SloBucketPolicy::SloFirst,
+            tps_slo_policy: SloBucketPolicy::SloFirst,
+        });
+
+        config
+            .validate()
+            .expect("Prefill and Decode ranks only need to be unique within their stage");
+    }
+
+    #[test]
+    fn rejects_bucket_config_without_a_prefill_domain() {
+        let mut config = cfg("qwen3", &["http://x:30000"]);
+        config.model.bucket_config = Some(BucketConfig {
+            buckets: vec![BucketSpec {
+                id: "d-only".into(),
+                stage: BucketStage::Decode,
+                rank: 10,
+                worker_ids: vec!["d1".into()],
+                min_extend_tokens: None,
+                max_extend_tokens: None,
+                min_sequence_tokens: None,
+                max_sequence_tokens: None,
+                max_context_tokens: Some(4_096),
+                ttft_p95_at_capacity_ms: None,
+                tps_p05_at_capacity: Some(20.0),
+                max_pending_prefill_tokens: None,
+            }],
+            ttft_slo_policy: SloBucketPolicy::Disabled,
+            tps_slo_policy: SloBucketPolicy::SloFirst,
+        });
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("Prefill bucket"), "got: {error}");
+    }
+
+    #[test]
+    fn rejects_stage_inapplicable_bucket_fields_instead_of_ignoring_them() {
+        let mut prefill = cfg("qwen3", &["http://x:30000"]);
+        prefill.model.bucket_config = Some(BucketConfig {
+            buckets: vec![BucketSpec {
+                id: "p".into(),
+                stage: BucketStage::Prefill,
+                rank: 10,
+                worker_ids: vec!["p1".into()],
+                min_extend_tokens: None,
+                max_extend_tokens: None,
+                min_sequence_tokens: None,
+                max_sequence_tokens: Some(4_096),
+                max_context_tokens: Some(4_096),
+                ttft_p95_at_capacity_ms: Some(100),
+                tps_p05_at_capacity: None,
+                max_pending_prefill_tokens: None,
+            }],
+            ttft_slo_policy: SloBucketPolicy::SloFirst,
+            tps_slo_policy: SloBucketPolicy::Disabled,
+        });
+        let error = prefill.validate().unwrap_err().to_string();
+        assert!(error.contains("Decode-only"), "got: {error}");
+
+        let mut decode = cfg("qwen3", &["http://x:30000"]);
+        decode.model.bucket_config = Some(BucketConfig {
+            buckets: vec![
+                BucketSpec {
+                    id: "p".into(),
+                    stage: BucketStage::Prefill,
+                    rank: 10,
+                    worker_ids: vec!["p1".into()],
+                    min_extend_tokens: None,
+                    max_extend_tokens: None,
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: None,
+                    max_context_tokens: Some(4_096),
+                    ttft_p95_at_capacity_ms: Some(100),
+                    tps_p05_at_capacity: None,
+                    max_pending_prefill_tokens: None,
+                },
+                BucketSpec {
+                    id: "d".into(),
+                    stage: BucketStage::Decode,
+                    rank: 20,
+                    worker_ids: vec!["d1".into()],
+                    min_extend_tokens: Some(1),
+                    max_extend_tokens: None,
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: Some(4_096),
+                    max_context_tokens: Some(4_096),
+                    ttft_p95_at_capacity_ms: None,
+                    tps_p05_at_capacity: Some(20.0),
+                    max_pending_prefill_tokens: None,
+                },
+            ],
+            ttft_slo_policy: SloBucketPolicy::SloFirst,
+            tps_slo_policy: SloBucketPolicy::SloFirst,
+        });
+        let error = decode.validate().unwrap_err().to_string();
+        assert!(error.contains("Prefill-only"), "got: {error}");
+    }
+
+    #[test]
+    fn bucket_json_rejects_unknown_profile_fields() {
+        let raw = r#"{
+          "buckets": [{
+            "id": "p-fast",
+            "stage": "prefill",
+            "rank": 10,
+            "worker_ids": ["p1"],
+            "ttft_p95_at_capcity_ms": 100
+          }]
+        }"#;
+
+        let error = serde_json::from_str::<BucketConfig>(raw)
+            .expect_err("a misspelled capacity profile must fail startup")
+            .to_string();
+        assert!(error.contains("ttft_p95_at_capcity_ms"), "got: {error}");
+    }
+
+    #[test]
+    fn shutdown_drain_advisory_is_silent_below_the_k8s_default_grace() {
+        assert!(shutdown_drain_advisory(29, None).is_none());
+        assert!(shutdown_drain_advisory(0, None).is_none());
+    }
+
+    /// Pinned because this is the one case an operator meets without choosing it:
+    /// an edit to either constant that silenced the warning would change the default
+    /// deployment's behaviour, and should have to say so here.
+    #[test]
+    fn the_default_drain_warns_until_the_grace_period_is_raised() {
+        let advisory = shutdown_drain_advisory(default_shutdown_drain_secs(), None)
+            .expect("the default drain must warn against the assumed k8s grace period");
+        assert_eq!(advisory.termination_grace_secs, K8S_DEFAULT_GRACE_SECS);
         assert!(
-            msg.contains("none were set"),
-            "expected NoSelector wording (\"none were set\"); got: {err}",
+            !advisory.grace_declared,
+            "an assumed budget must not be reported as declared",
+        );
+        // Raising the pod's grace period past the drain is what silences it —
+        // the action the warning asks for has to actually work.
+        assert!(
+            shutdown_drain_advisory(
+                default_shutdown_drain_secs(),
+                Some(K8S_DEFAULT_GRACE_SECS * 2),
+            )
+            .is_none(),
+            "a grace period declared with room for the in-flight drain must silence it",
         );
     }
 
-    // Direct `K8sDiscoveryConfig::mode()` unit tests live alongside the
-    // type in `src/config/types.rs::k8s_discovery_config_tests`.
-    // The tests in this module exercise the `Config::from_path` ↔ K8s
-    // selector wiring, not the selector grammar itself.
+    #[test]
+    fn shutdown_drain_advisory_warns_once_the_drain_consumes_the_whole_grace() {
+        for drain in [K8S_DEFAULT_GRACE_SECS, 120, MAX_SHUTDOWN_DRAIN_SECS] {
+            let advisory = shutdown_drain_advisory(drain, None)
+                .unwrap_or_else(|| panic!("{drain}s must warn"));
+            assert_eq!(advisory.shutdown_drain_secs, drain);
+            assert_eq!(advisory.termination_grace_secs, K8S_DEFAULT_GRACE_SECS);
+            assert!(
+                !advisory.grace_declared,
+                "an undeclared grace period must be reported as assumed, not as fact",
+            );
+        }
+    }
 
     #[test]
-    fn rejects_unknown_policy_name() {
-        let err = load(
-            "yaml",
-            "
-server:
-  host: 0.0.0.0
-  port: 8090
-discovery:
-  backend: static_urls
-  static_urls:
-    urls:
-      - http://x:30000
-models:
-  - id: qwen
-    tokenizer_path: /tmp/qwen.json
-    policy: bogus_policy
-",
-        )
-        .unwrap_err();
-        let msg = err.to_string().to_lowercase();
+    fn shutdown_drain_advisory_respects_a_declared_grace_period() {
         assert!(
-            msg.contains("bogus_policy") || msg.contains("policy"),
-            "got: {err}"
+            shutdown_drain_advisory(60, Some(120)).is_none(),
+            "a drain with room under the declared grace period must not warn",
+        );
+        let advisory = shutdown_drain_advisory(60, Some(60))
+            .expect("a drain consuming the whole declared grace period must warn");
+        assert_eq!(advisory.termination_grace_secs, 60);
+        assert!(
+            advisory.grace_declared,
+            "a declared grace period must be reported as declared",
+        );
+        // ...and declaring a *shorter* budget than the k8s default must be able
+        // to warn about a drain the default would have waved through.
+        assert!(
+            shutdown_drain_advisory(10, Some(10)).is_some(),
+            "a short declared grace period must still be compared against",
+        );
+        assert!(
+            shutdown_drain_advisory(MAX_SHUTDOWN_DRAIN_SECS, Some(3600)).is_none(),
+            "a long drain under a grace period declared to cover it must not warn",
         );
     }
 
     #[test]
-    fn defaults_policy_to_round_robin() {
-        let c = load(
-            "toml",
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "qwen"
-tokenizer_path = "/tmp/qwen.json"
-[discovery]
-backend = "static_urls"
-[discovery.static_urls]
-urls = ["http://x:30000"]
-"#,
-        )
-        .unwrap();
-        assert_eq!(c.models[0].policy, PolicyKind::RoundRobin);
+    fn validate_rejects_a_shutdown_drain_past_the_ceiling() {
+        let mut config = cfg("qwen3-0.6b", &["http://10.0.0.1:30000"]);
+        config.server.shutdown_drain_secs = MAX_SHUTDOWN_DRAIN_SECS;
+        config
+            .validate()
+            .expect("the ceiling itself must remain startable");
+
+        config.server.shutdown_drain_secs = MAX_SHUTDOWN_DRAIN_SECS + 1;
+        let error = config
+            .validate()
+            .expect_err("a drain past the ceiling must fail startup")
+            .to_string();
+        assert!(
+            error.contains("shutdown_drain_secs"),
+            "the error must name the flag to fix: {error}"
+        );
     }
 }

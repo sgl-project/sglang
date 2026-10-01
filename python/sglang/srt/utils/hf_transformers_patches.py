@@ -23,8 +23,11 @@ all patches.  It is safe to import multiple times -- patches are idempotent.
 """
 
 import inspect
+import logging
 
-from sglang.srt.utils import logger
+# Plain logger: importing sglang.srt.utils here pulls torch/transformers/triton
+# into every `import sglang` (this module runs from sglang/__init__.py).
+logger = logging.getLogger(__name__)
 
 _applied = False
 
@@ -53,22 +56,40 @@ def apply_all():
         return
     _applied = True
 
+    _mute_diffusers_torchao_probe()
+
     # v5.4 patches
     _patch_flash_attn_availability()
     _patch_rope_parameters_validation()
+    _patch_layer_types_validation()
     _patch_removed_symbols()
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
-    _patch_nemotron_h_pattern()
 
     # v5 general patches
-    _ensure_clean_up_tokenization_compat()
     _ensure_is_torch_fx_available_compat()
 
     # CI-only: neutralize HF API calls inside tokenizer from_pretrained
     patch_is_base_mistral_in_ci()
 
     logger.debug("transformers compatibility patches applied")
+
+
+def _mute_diffusers_torchao_probe():
+    """Silence diffusers' torchao-Tensor-subclass probe warning.
+
+    diffusers lazily imports its torchao quantizer and warns when the installed
+    torchao has moved the optional Tensor subclasses it probes for. It only
+    affects loading torchao-serialized diffusers checkpoints, which no sglang
+    path does. Set here rather than in ``configure_logger`` because the import
+    can land before logging is configured, and the level sticks whenever the
+    lazy import happens.
+    """
+    import logging
+
+    logging.getLogger("diffusers.quantizers.torchao.torchao_quantizer").setLevel(
+        logging.ERROR
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -136,50 +157,27 @@ def _ensure_gguf_version():
 
 
 def _patch_rope_parameters_validation():
-    """Fix rope_parameters validation for unregistered model types.
-
-    For unregistered model types (e.g. ``deepseek_v32``), the generic
-    ``PretrainedConfig`` lacks a ``rope_parameters`` field so the conversion
-    that injects ``rope_theta`` from the top-level config is skipped.
-    Additionally, ``standardize_rope_params()`` accesses
-    ``self.max_position_embeddings`` during ``__post_init__`` before extra
-    kwargs are set as attributes, causing ``AttributeError``.
-
-    Fix: (1) patch ``from_dict`` to inject ``rope_theta`` into
-    ``rope_scaling``, (2) guard ``standardize_rope_params`` against missing
+    """Guard ``standardize_rope_params()`` against missing
     ``max_position_embeddings``.
 
-    TODO(upstream): remove once unregistered model types handle rope
-    standardization correctly in transformers.
+    For ``PretrainedConfig``, ``standardize_rope_params()`` accesses
+    ``self.max_position_embeddings`` during ``__post_init__`` before extra
+    kwargs are set as attributes, causing ``AttributeError``.
     """
     from transformers import PretrainedConfig
 
-    original = PretrainedConfig.from_dict.__func__
-
-    @classmethod  # type: ignore[misc]
-    def patched(cls, config_dict, **kwargs):
-        rope_scaling = config_dict.get("rope_scaling")
-        rope_theta = config_dict.get("rope_theta")
-        if (
-            isinstance(rope_scaling, dict)
-            and rope_theta is not None
-            and "rope_theta" not in rope_scaling
-        ):
-            config_dict = config_dict.copy()
-            config_dict["rope_scaling"] = {**rope_scaling, "rope_theta": rope_theta}
-        return original(cls, config_dict, **kwargs)
-
-    PretrainedConfig.from_dict = patched
-
-    # standardize_rope_params accesses self.max_position_embeddings before
-    # __post_init__ sets extra kwargs — skip when the attribute is absent.
     if hasattr(PretrainedConfig, "standardize_rope_params"):
         _orig_standardize = PretrainedConfig.standardize_rope_params
 
         def _safe_standardize(self):
-            if not hasattr(self, "max_position_embeddings"):
-                return
-            return _orig_standardize(self)
+            # The call must still run: it resolves `default_rope_type`, which
+            # Pixtral's vision config needs to reach "axial".
+            try:
+                return _orig_standardize(self)
+            except AttributeError as e:
+                if "max_position_embeddings" not in str(e):
+                    raise
+                return None
 
         PretrainedConfig.standardize_rope_params = _safe_standardize
 
@@ -206,35 +204,68 @@ def _patch_flash_attn_availability():
         pass
 
 
+def _patch_layer_types_validation():
+    from transformers import PretrainedConfig
+
+    validators = PretrainedConfig.__class_validators__
+    for index, validator in enumerate(validators):
+        if validator.__name__ != "validate_layer_type":
+            continue
+
+        def validate_layer_type(self, _orig=validator):
+            try:
+                return _orig(self)
+            except ValueError as e:
+                # Step-3.5-Flash lists a `layer_types` entry per main *and*
+                # next-n-predict layer, which `validate_layer_type` rejects.
+                if "must be equal to the number of" not in str(e):
+                    raise
+                num_mtp_layers = getattr(self, "num_nextn_predict_layers", 0) or 0
+                if not num_mtp_layers:
+                    raise
+                # Re-run the original against the wider count, so its other
+                # rules -- per-list vocabularies, legacy remapping -- still hold.
+                num_hidden_layers = self.num_hidden_layers
+                self.num_hidden_layers = num_hidden_layers + num_mtp_layers
+                try:
+                    return _orig(self)
+                finally:
+                    self.num_hidden_layers = num_hidden_layers
+
+        validators[index] = validate_layer_type
+        break
+
+
 def _patch_removed_symbols():
-    """Re-export symbols removed in transformers v5.4.0.
+    """Re-export ``LlamaFlashAttention2``, removed in transformers v5.4.0.
 
-    Remote model code (e.g. DeepSeek-OCR) still imports these.
+    Remote model code (e.g. DeepSeek-OCR) still imports it.
     ``check_imports`` in ``dynamic_module_utils.py`` validates imports at
-    config-load time, so these must exist before any ``from_pretrained``.
-
-    Removed symbols:
-    - ``LlamaFlashAttention2`` -- replaced by unified ``LlamaAttention``
-    - ``is_flash_attn_greater_or_equal_2_10`` -- replaced by
-      ``is_flash_attn_greater_or_equal("2.10.0")``
+    config-load time, so it must exist before any ``from_pretrained``.
 
     TODO(upstream): DeepSeek-OCR / deepseek_vl_v2 remote code needs update.
     """
-    # LlamaFlashAttention2
     try:
         import logging
 
         # Importing modeling_llama triggers a deep import chain:
         #   modeling_llama -> modeling_utils -> quantizers -> torchao
-        # torchao emits a noisy warning about incompatible torch versions
-        # that is irrelevant here — suppress it during this import.
-        _torchao_logger = logging.getLogger("torchao")
-        _prev_level = _torchao_logger.level
-        _torchao_logger.setLevel(logging.ERROR)
+        # torchao emits a noisy warning about incompatible torch versions, and
+        # its register_as_pytree_constant() calls on Enum types make
+        # torch.utils._pytree log a deprecation warning once per Enum and per
+        # rank. Neither is actionable here — suppress both during this import.
+        _muted = [
+            logging.getLogger("torchao"),
+            logging.getLogger("torch.utils._pytree"),
+        ]
+        _prev_levels = [lg.level for lg in _muted]
+        for lg in _muted:
+            lg.setLevel(logging.ERROR)
         try:
             from transformers.models.llama import modeling_llama
         finally:
-            _torchao_logger.setLevel(_prev_level)
+            for lg, level in zip(_muted, _prev_levels):
+                lg.setLevel(level)
 
         if not hasattr(modeling_llama, "LlamaFlashAttention2"):
             if hasattr(modeling_llama, "LlamaAttention"):
@@ -243,23 +274,6 @@ def _patch_removed_symbols():
         logger.warning(
             "Could not import transformers.models.llama.modeling_llama; "
             "LlamaFlashAttention2 compat patch not applied."
-        )
-
-    # is_flash_attn_greater_or_equal_2_10
-    try:
-        import transformers.utils as _u
-
-        if not hasattr(_u, "is_flash_attn_greater_or_equal_2_10"):
-            if hasattr(_u, "is_flash_attn_greater_or_equal"):
-                _u.is_flash_attn_greater_or_equal_2_10 = (
-                    lambda: _u.is_flash_attn_greater_or_equal("2.10.0")
-                )
-            else:
-                _u.is_flash_attn_greater_or_equal_2_10 = lambda: False
-    except ImportError:
-        logger.warning(
-            "Could not import transformers.utils; "
-            "is_flash_attn_greater_or_equal_2_10 compat patch not applied."
         )
 
 
@@ -271,8 +285,10 @@ def _patch_image_processor_kwargs():
     (e.g. KimiVL) that defines ``preprocess()`` without ``**kwargs`` will
     crash with ``TypeError``.
 
-    Fix: wrap ``__call__`` to catch ``TypeError`` and retry with only the
-    kwargs that ``preprocess()`` actually accepts.
+    Fix: wrap ``__call__`` and filter unsupported kwargs before invoking
+    ``preprocess()``.  The accepted-kwargs set is cached per processor class:
+    apart from avoiding the exception/logging slow path, this matters for VLM
+    requests that preprocess many images on the request critical path.
 
     TODO(upstream): KimiVL image_processing_kimi_vl.py needs ``**kwargs``.
     """
@@ -280,30 +296,40 @@ def _patch_image_processor_kwargs():
         from transformers.image_processing_utils import BaseImageProcessor
 
         original = BaseImageProcessor.__call__
+        accepted_kwargs_cache = {}
+        warned_unsupported_kwargs = set()
 
         def safe_call(self, images, *args, **kwargs):
-            try:
-                return original(self, images, *args, **kwargs)
-            except TypeError as e:
-                if "unexpected keyword argument" not in str(e):
-                    raise
+            processor_type = type(self)
+            accepted_kwargs = accepted_kwargs_cache.get(processor_type)
+            if accepted_kwargs is None and processor_type not in accepted_kwargs_cache:
                 sig = inspect.signature(self.preprocess)
                 params = sig.parameters
                 if any(
                     p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
                 ):
-                    raise
-                dropped = {k for k in kwargs if k not in params}
-                if dropped:
+                    accepted_kwargs = None
+                else:
+                    accepted_kwargs = frozenset(params)
+                accepted_kwargs_cache[processor_type] = accepted_kwargs
+
+            if accepted_kwargs is None:
+                return original(self, images, *args, **kwargs)
+
+            dropped = frozenset(kwargs) - accepted_kwargs
+            if dropped:
+                warning_key = (processor_type, dropped)
+                if warning_key not in warned_unsupported_kwargs:
                     logger.warning(
                         "Image processor %s.preprocess() does not accept %s; "
-                        "retrying without them. Update the model's image processor "
-                        "to accept **kwargs.",
-                        type(self).__name__,
-                        dropped,
+                        "filtering them before preprocessing. Update the model's image "
+                        "processor to accept **kwargs.",
+                        processor_type.__name__,
+                        sorted(dropped),
                     )
-                valid = {k: v for k, v in kwargs.items() if k in params}
-                return original(self, images, *args, **valid)
+                    warned_unsupported_kwargs.add(warning_key)
+                kwargs = {k: v for k, v in kwargs.items() if k in accepted_kwargs}
+            return original(self, images, *args, **kwargs)
 
         BaseImageProcessor.__call__ = safe_call
     except ImportError:
@@ -345,76 +371,9 @@ def _patch_image_process_cuda_tensor():
         )
 
 
-def _patch_nemotron_h_pattern():
-    """Fix ``_pattern_to_list()`` crashing on ``-`` in hybrid_override_pattern.
-
-    Nemotron-H models (e.g. NVIDIA-Nemotron-Nano-9B-v2) use patterns like
-    ``M-M-M-MM-M-*-...`` where ``-`` denotes an MLP layer.  The upstream
-    ``_pattern_to_list`` tries to map every character and crashes with
-    ``KeyError: '-'``.  We skip ``-`` (and any other unmapped chars)
-    since ``layers_block_type`` only tracks mamba/moe/attention layers.
-    SGLang reads MLP positions from ``hybrid_override_pattern`` directly.
-
-    TODO(upstream): report to HF transformers.
-    """
-    try:
-        from transformers.models.nemotron_h.configuration_nemotron_h import (
-            NemotronHConfig,
-        )
-
-        @staticmethod
-        def _pattern_to_list(pattern: str) -> list:
-            pattern_mapping = {
-                "M": "mamba",
-                "E": "moe",
-                "*": "attention",
-            }
-            return [
-                pattern_mapping[char] for char in pattern if char in pattern_mapping
-            ]
-
-        NemotronHConfig._pattern_to_list = _pattern_to_list
-    except ImportError:
-        logger.debug(
-            "_patch_nemotron_h_pattern: NemotronHConfig not importable, patch skipped"
-        )
-
-
 # ---------------------------------------------------------------------------
 # v5 general patches
 # ---------------------------------------------------------------------------
-
-
-def _ensure_clean_up_tokenization_compat() -> None:
-    """Re-add ``clean_up_tokenization`` removed in transformers v5.
-
-    Remote-code tokenizers (e.g. InternLM2Tokenizer) call
-    ``self.clean_up_tokenization()`` which was a static method on
-    ``PreTrainedTokenizerBase`` in v4 but removed in v5. Patch it back
-    so existing HuggingFace Hub tokenizer code keeps working.
-    """
-    from transformers import PreTrainedTokenizerBase
-
-    if hasattr(PreTrainedTokenizerBase, "clean_up_tokenization"):
-        return
-
-    @staticmethod
-    def clean_up_tokenization(out_string: str) -> str:
-        out_string = (
-            out_string.replace(" .", ".")
-            .replace(" ?", "?")
-            .replace(" !", "!")
-            .replace(" ,", ",")
-            .replace(" ' ", "'")
-            .replace(" n't", "n't")
-            .replace(" 'm", "'m")
-            .replace(" 's", "'s")
-            .replace(" 've", "'ve")
-            .replace(" 're", "'re")
-        )
-        return out_string
-
-    PreTrainedTokenizerBase.clean_up_tokenization = clean_up_tokenization
 
 
 def _ensure_is_torch_fx_available_compat() -> None:

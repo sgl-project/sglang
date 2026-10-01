@@ -41,7 +41,6 @@ def sana_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Ten
 
 @dataclass
 class SanaPipelineConfig(SpatialImagePipelineConfig):
-
     task_type: ModelTaskType = ModelTaskType.T2I
 
     # should_use_guidance=False disables *embedded* guidance (timestep-conditioned
@@ -52,7 +51,7 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
     # DC-AE does not support tiling or SP VAE decode yet.
     vae_tiling: bool = False
     vae_sp: bool = False
-    vae_precision: str = "bf16"
+    vae_precision: str = "fp32"
 
     dit_config: DiTConfig = field(default_factory=SanaConfig)
     vae_config: VAEConfig = field(default_factory=SanaVAEConfig)
@@ -128,3 +127,30 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
 
     def gather_latents_for_sp(self, latents):
         return latents
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=SanaSamplingParams,
+        pipeline_config_cls=SanaPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers",
+            "Efficient-Large-Model/SANA1.5_4.8B_1024px_diffusers",
+            "Efficient-Large-Model/Sana_1600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_1600M_512px_diffusers",
+            "Efficient-Large-Model/Sana_600M_512px_diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "sana" in hf_id.lower()
+                and "sana-wm" not in hf_id.lower()
+                and "sana_wm" not in hf_id.lower()
+                and "sana-video" not in hf_id.lower()
+                and "sana_video" not in hf_id.lower()
+            )
+        ],
+    )

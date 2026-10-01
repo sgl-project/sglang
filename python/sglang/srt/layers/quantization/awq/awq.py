@@ -33,6 +33,7 @@ from .schemes import (
     AWQLinearScheme,
     AWQMarlinLinearScheme,
     AWQMoEScheme,
+    AWQXPULinearScheme,
 )
 
 if TYPE_CHECKING:
@@ -145,6 +146,8 @@ class AWQConfig(QuantizationConfig):
                 layer.scheme = self.get_linear_scheme(layer)
                 return AWQLinearMethod(self)
             elif isinstance(layer, FusedMoE):
+                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                    return None
                 layer.scheme = self.get_moe_scheme(layer)
                 return AWQMoEMethod(self)
             return None
@@ -192,6 +195,8 @@ class AWQCPUConfig(AWQConfig):
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                return None
             layer.scheme = self.get_moe_scheme(layer)
             return AWQMoEMethod(self)
         return None
@@ -207,6 +212,34 @@ class AWQCPUConfig(AWQConfig):
 
         assert isinstance(layer, FusedMoE)
         return AWQIntelAMXMoEScheme(self)
+
+
+class AWQXPUConfig(AWQConfig):
+    """AWQ int4 dense linear on Intel XPU.
+
+    Lowers to torch's native ``_weight_int4pack_mm_with_scales_and_zeros`` op.
+    MoE is out of scope for the dense phase (mirrors ``GPTQXPUConfig``).
+    """
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[LinearMethodBase]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            raise NotImplementedError(
+                "AWQ MoE is not yet supported on XPU (dense-only phase)."
+            )
+        return super().get_quant_method(layer, prefix)
+
+    def get_linear_scheme(self, layer: torch.nn.Module):
+        from sglang.srt.layers.linear import LinearBase
+
+        assert isinstance(layer, LinearBase)
+        return AWQXPULinearScheme(self)
 
 
 class AWQMarlinConfig(QuantizationConfig):
@@ -343,6 +376,8 @@ class AWQMarlinConfig(QuantizationConfig):
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                return None
             from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
             if not check_moe_marlin_supports_layer(layer, self.group_size):
@@ -433,7 +468,6 @@ class AWQLinearMethod(LinearMethodBase):
 
 
 class AWQMoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quant_config: AWQMarlinConfig):
         self.quant_config = quant_config
         self.quant_type = scalar_types.uint4

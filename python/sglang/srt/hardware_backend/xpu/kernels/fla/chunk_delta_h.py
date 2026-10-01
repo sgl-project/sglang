@@ -4,12 +4,17 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.index import (
+from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
-from sglang.srt.layers.attention.fla.op import exp, make_tensor_descriptor, safe_exp
-from sglang.srt.layers.attention.fla.utils import (
+from sglang.kernels.ops.attention.fla.op import (
+    exp,
+    exp2,
+    make_tensor_descriptor,
+    safe_exp,
+)
+from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
 )
 
@@ -36,8 +41,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
     h,
     initial_state,
     initial_state_indices,
+    stride_init_state,
     cu_seqlens,
     chunk_offsets,
+    track_state,
+    track_chunk_idx,
+    stride_track_state,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -52,13 +61,16 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,  # this arg is kept to align with the triton kernel for CUDA
+    USE_EXP2: tl.constexpr,
+    TRACK_STATE: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         T = eos - bos
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
@@ -105,13 +117,29 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             block_shape=(BT, BV),
         )
 
-    index = tl.load(initial_state_indices + i_n).to(tl.int32)
-    h0 = initial_state + index * stride_h
-    ht = initial_state + index * stride_h
+    # Slot pitch comes from the caller (initial_state.stride(0)): the state pool
+    # may be an envelope-strided view (page-major / unified memory), where the
+    # per-slot pitch spans ALL layers' state, not H*V*K. int64: envelope pitches
+    # overflow an int32 index product.
+    index = tl.load(initial_state_indices + i_n).to(tl.int64)
+    # Padded rows carry the -1 sentinel; without this guard the sentinel
+    # reaches pointer arithmetic and addresses before the state pool.
+    valid_state = index >= 0
+    h0 = initial_state + index * stride_init_state
+    ht = initial_state + index * stride_init_state
     if USE_INITIAL_STATE:
         h0 = h0 + i_h * V * K
     if INPLACE_UPDATE:
         ht = ht + i_h * V * K
+
+    if TRACK_STATE:
+        i_track = tl.load(track_chunk_idx + i_n).to(tl.int32)
+        p_track_base = track_state + (i_n * stride_track_state + i_h * V * K).to(
+            tl.int64
+        )
+    else:
+        i_track = -1
+        p_track_base = track_state
 
     # main recurrence — time is the outer loop
     for i_t in range(NT):
@@ -122,18 +150,20 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
         for k_blk in range(0, K, 64):
             # Load h: from initial_state (i_t==0) or scratch (i_t>0)
             if i_t == 0:
-                if USE_INITIAL_STATE:
+                if USE_INITIAL_STATE and valid_state:
                     p_hs = tl.make_block_ptr(
                         h0, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                     )
                     b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
                 else:
                     b_h = tl.zeros([BV, 64], dtype=tl.float32)
-            else:
+            elif valid_state:
                 p_hs = tl.make_block_ptr(
                     ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                 )
                 b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+            else:
+                b_h = tl.zeros([BV, 64], dtype=tl.float32)
 
             # Store pre-update h to output
             p_ho = tl.make_block_ptr(
@@ -145,6 +175,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
                 (1, 0),
             )
             tl.store(p_ho, b_h.to(p_ho.dtype.element_ty), boundary_check=(0, 1))
+
+            # Mid-sequence checkpoint for the mamba prefix cache: the same
+            # pre-update state, kept in fp32 so the caller rounds only once.
+            if TRACK_STATE and i_t == i_track:
+                p_track = tl.make_block_ptr(
+                    p_track_base, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
+                )
+                tl.store(p_track, b_h, boundary_check=(0, 1))
 
             # Accumulate correction: w_k @ h_k^T
             b_w = w_desc.load([i_t * BT, k_blk])
@@ -175,18 +213,20 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
         for k_blk in range(0, K, 64):
             # Reload h (same source as Phase 1)
             if i_t == 0:
-                if USE_INITIAL_STATE:
+                if USE_INITIAL_STATE and valid_state:
                     p_hs = tl.make_block_ptr(
                         h0, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                     )
                     b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
                 else:
                     b_h = tl.zeros([BV, 64], dtype=tl.float32)
-            else:
+            elif valid_state:
                 p_hs = tl.make_block_ptr(
                     ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                 )
                 b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+            else:
+                b_h = tl.zeros([BV, 64], dtype=tl.float32)
 
             # Gate decay on h
             if USE_G:
@@ -199,14 +239,17 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
                     mask=(o_k1 < K),
                     other=0.0,
                 )
-                b_h *= tl.expand_dims(exp(b_gk_last1), 0)
+                if USE_EXP2:
+                    b_h *= tl.expand_dims(exp2(b_gk_last1), 0)
+                else:
+                    b_h *= tl.expand_dims(exp(b_gk_last1), 0)
 
             # Delta update: h += k^T @ v
             b_k = tl.trans(k_desc.load([i_t * BT, k_blk]))
             b_h += tl.trans(tl.dot(b_k, b_v))
 
             # Save updated h to scratch (initial_state) for next time step
-            if INPLACE_UPDATE:
+            if INPLACE_UPDATE and valid_state:
                 p_hs = tl.make_block_ptr(
                     ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                 )
@@ -224,7 +267,27 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
+    use_exp2: bool = False,
+    inplace_update: bool = True,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not inplace_update:
+        raise NotImplementedError(
+            "GDN multi-item scoring is not supported by the XPU chunk kernel"
+        )
+    assert not (use_exp2 and g is not None), (
+        "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
+    )
+    assert (track_state is None) == (track_chunk_idx is None), (
+        "track_state and track_chunk_idx must be passed together"
+    )
+    if track_state is not None:
+        # The caller rounds once to the pool dtype; a narrower buffer would
+        # silently double-round the snapshot.
+        assert track_state.dtype == torch.float32, (
+            f"track_state must be fp32, got {track_state.dtype}"
+        )
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -261,8 +324,14 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        # Envelope-strided state pools (page-major / unified memory) have a
+        # per-slot pitch != H*V*K; contiguous pools pass exactly H*V*K.
+        stride_init_state=(initial_state.stride(0) if initial_state is not None else 0),
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
+        track_state=track_state,
+        track_chunk_idx=track_chunk_idx,
+        stride_track_state=(track_state.stride(0) if track_state is not None else 0),
         T=T,
         H=H,
         Hg=Hg,
@@ -276,5 +345,7 @@ def chunk_gated_delta_rule_fwd_h(
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
+        USE_EXP2=use_exp2,
+        TRACK_STATE=track_state is not None,
     )
     return h, v_new

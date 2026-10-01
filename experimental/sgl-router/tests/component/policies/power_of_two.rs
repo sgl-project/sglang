@@ -14,7 +14,7 @@ fn worker(id: &str) -> Arc<Worker> {
         url: format!("http://{id}"),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }))
 }
 
@@ -70,4 +70,30 @@ fn single_worker_returns_it() {
     let model_id = ModelId("m".into());
     let ctx = SelectionContext::new(&model_id, None);
     assert_eq!(p.select(&ws, &ctx).unwrap().id.0, "only");
+}
+
+#[test]
+fn all_workers_reachable() {
+    // Ensure all workers are selectable under equal load to prevent an
+    // off-by-one error from skipping any worker during sampling
+    let workers = vec![
+        worker("a"),
+        worker("b"),
+        worker("c"),
+        worker("d"),
+        worker("e"),
+    ];
+    let p = PowerOfTwoChoicesPolicy::new();
+    let model_id = ModelId("m".into());
+    let ctx = SelectionContext::new(&model_id, None);
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..1000 {
+        let w = p.select(&workers, &ctx).unwrap();
+        seen.insert(w.id.0.clone());
+    }
+    assert_eq!(
+        seen.len(),
+        workers.len(),
+        "every worker should be reachable, saw {seen:?}"
+    );
 }

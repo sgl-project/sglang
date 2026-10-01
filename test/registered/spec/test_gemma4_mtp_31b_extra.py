@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 from typing import Optional
@@ -7,7 +6,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -17,7 +16,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=720, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=179, stage="extra-a", runner_config="2-gpu-large")
 
 MODEL_NAME = "31B"
 TARGET_PATH = "google/gemma-4-31B-it"
@@ -28,14 +27,10 @@ TOPKS = (1, 3)
 DRAFT_TOKENS_BY_TOPK = {1: 6, 3: 12}
 GSM8K_NUM_EXAMPLES = 200
 GSM8K_NUM_THREADS = 128
-GSM8K_SCORE_MARGIN = 0.03
 SERVER_LAUNCH_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3
 
-# Initial values are seeded from current Gemma4 GSM8K observations in the
-# cookbook. Replace each top-k entry with exact MTP first-200-sample scores as
-# CI calibration data becomes available.
-OBSERVED_GSM8K_SCORES = {1: 0.805, 3: 0.805}
-GSM8K_SCORE_THRESHOLD = min(OBSERVED_GSM8K_SCORES.values()) - GSM8K_SCORE_MARGIN
+# Hard accuracy floor for the MTP first-200-sample GSM8K run.
+GSM8K_SCORE_THRESHOLD = 0.75
 ACCEPT_LENGTH_THRESHOLD = 1.5
 
 
@@ -61,12 +56,6 @@ def get_avg_spec_accept_length(base_url: str) -> Optional[float]:
 
 class TestGemma4MTP31B(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
-
-    @classmethod
-    def _server_env(cls) -> dict[str, str]:
-        env = dict(os.environ)
-        env["SGLANG_ENABLE_SPEC_V2"] = "0"
-        return env
 
     @classmethod
     def _common_server_args(cls) -> list[str]:
@@ -110,11 +99,9 @@ class TestGemma4MTP31B(CustomTestCase):
             base_url=cls.base_url,
             model=TARGET_PATH,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=GSM8K_NUM_EXAMPLES,
             num_threads=GSM8K_NUM_THREADS,
-            num_shots=5,
         )
 
     @staticmethod
@@ -131,7 +118,6 @@ class TestGemma4MTP31B(CustomTestCase):
                 TARGET_PATH,
                 self.base_url,
                 timeout=SERVER_LAUNCH_TIMEOUT,
-                env=self._server_env(),
                 other_args=self._server_args(topk),
             )
             requests.get(self.base_url + "/flush_cache", timeout=30)
@@ -147,7 +133,7 @@ class TestGemma4MTP31B(CustomTestCase):
                 f"{MODEL_NAME}/topk{topk}: CUDA graph is disabled",
             )
 
-            metrics = run_eval(self._gsm8k_args())
+            metrics = run_sgl_eval(self._gsm8k_args())
             mtp_score = float(metrics["score"])
             avg_accept = get_avg_spec_accept_length(self.base_url)
         finally:

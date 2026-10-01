@@ -51,9 +51,7 @@ class WanT2V_1_3B_SamplingParams(SamplingParams):
 
     # Denoising stage
     guidance_scale: float = 3.0
-    negative_prompt: str = (
-        "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
-    )
+    negative_prompt: str = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     num_inference_steps: int = 50
 
     # Wan T2V 1.3B supported resolutions
@@ -85,9 +83,7 @@ class WanT2V_14B_SamplingParams(SamplingParams):
 
     # Denoising stage
     guidance_scale: float = 5.0
-    negative_prompt: str = (
-        "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
-    )
+    negative_prompt: str = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     num_inference_steps: int = 50
 
     # Wan T2V 14B supported resolutions
@@ -171,7 +167,7 @@ class FastWanT2V480PConfig(WanT2V_1_3B_SamplingParams):
     # dmd_denoising_steps: list[int] | None = field(default_factory=lambda: [1000, 757, 522])
     num_inference_steps: int = 3
     num_frames: int = 61
-    height: int = 448
+    height: int = 480
     width: int = 832
     fps: int = 16
 
