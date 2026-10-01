@@ -337,6 +337,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         def add(ptrs: List[int], lens: List[int]) -> None:
             for ptr, length in zip(ptrs or [], lens or []):
+                if length == 0:
+                    # DSA index-K elision leaves a zero-row placeholder for
+                    # every non-producer layer so the per-layer buffer list
+                    # stays layer-aligned. Those have nothing to register, and
+                    # Mooncake rejects them outright:
+                    #   transfer_engine_impl.cpp: Transfer Engine does not
+                    #   support zero length memory region
+                    continue
+                if ptr == 0 or length < 0:
+                    raise ValueError(
+                        "Invalid non-empty Mooncake registration region: "
+                        f"ptr={ptr}, length={length}"
+                    )
                 if (ptr, length) not in seen:
                     seen.add((ptr, length))
                     regions.append((ptr, length))
@@ -878,6 +891,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
             transfer_blocks = []
+            if item_len == 0:
+                # An elided layer has no bytes to move. Falling through would
+                # queue a zero-length block pointing at the empty allocation
+                # for every transfer, silently.
+                return transfer_blocks
+            if src_ptr == 0 or dst_ptr == 0 or item_len < 0:
+                raise ValueError(
+                    "Invalid non-empty Mooncake KV transfer region: "
+                    f"src_ptr={src_ptr}, dst_ptr={dst_ptr}, item_len={item_len}"
+                )
             if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
                 assert (
                     device_prefill_kv_blocks is not None
@@ -1298,6 +1321,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
         ) -> List[Tuple[int, int, int]]:
+            if token_item_len == 0:
+                # See the sibling helper: elided layers carry no bytes.
+                return []
+            if src_ptr == 0 or dst_ptr == 0 or token_item_len < 0:
+                raise ValueError(
+                    "Invalid non-empty Mooncake KV transfer region: "
+                    f"src_ptr={src_ptr}, dst_ptr={dst_ptr}, "
+                    f"token_item_len={token_item_len}"
+                )
             src_groups, dst_groups = groups
             return [
                 (
