@@ -372,12 +372,35 @@ class TestPrefixValidFp8Kernel(CustomTestCase):
                     self.assertTrue(torch.equal(k, before_k))
                     self.assertTrue(torch.equal(v, before_v))
 
-    def test_gpu_scale_division_at_rounding_boundaries(self):
-        """Tensor division must preserve FP8 bytes even at rounding thresholds."""
+    def test_host_scale_rounding_through_pool(self):
+        """Host-scale reciprocal rounding must not move FP32 values onto FP8 ties."""
+        loc = torch.tensor([[3, -1]], device=DEVICE)
+        lengths = torch.tensor([1], dtype=torch.int32, device=DEVICE)
+        for scale in (10000.0, torch.tensor(10000.0)):
+            with self.subTest(scale_type=type(scale).__name__):
+                pool = _make_pool(65, 8)
+                layer = SimpleNamespace(layer_id=0)
+                k = torch.full(
+                    (2, 1, 65), 29.296873092651367, dtype=torch.float32, device=DEVICE
+                )
+                v = -k
+                before_k, before_v = k.clone(), v.clone()
+                expected_k = pool.k_buffer[0].clone()
+                expected_v = pool.v_buffer[0].clone()
+                expected_k[3] = _eager_quantize(k, scale).view(torch.uint8)[0]
+                expected_v[3] = _eager_quantize(v, scale).view(torch.uint8)[0]
+                pool.set_kv_buffer_prefix_valid(layer, loc, lengths, k, v, scale, scale)
+                self.assertTrue(torch.equal(pool.k_buffer[0], expected_k))
+                self.assertTrue(torch.equal(pool.v_buffer[0], expected_v))
+                self.assertTrue(torch.equal(k, before_k))
+                self.assertTrue(torch.equal(v, before_v))
+
+    def test_scale_division_at_rounding_boundaries(self):
+        """Host and GPU scales must retain their own eager FP8 rounding semantics."""
         loc = torch.tensor([[0]], dtype=torch.int64, device=DEVICE)
         lengths = torch.tensor([1], dtype=torch.int32, device=DEVICE)
         for dtype in (torch.bfloat16, torch.float16, torch.float32):
-            for value in (0.1, 0.3, 0.7, 1.3, 0.625, 1.375, 1e-4, 1e4):
+            for value in (0.1, 0.3, 0.7, 1.3, 0.625, 1.375, 1e-4, 1e4, 2.0**-140):
                 with self.subTest(dtype=dtype, scale=value):
                     scale = torch.nn.Parameter(
                         torch.tensor(value, dtype=torch.float32, device=DEVICE),
@@ -403,42 +426,51 @@ class TestPrefixValidFp8Kernel(CustomTestCase):
                         ).flatten()
                         values = torch.cat((values, -values))
                     else:
-                        # Every finite BF16/FP16 bit pattern, including subnormals.
+                        # Every BF16/FP16 bit pattern, including subnormals and NaNs.
                         values = (
                             torch.arange(65536, dtype=torch.int32, device=DEVICE)
                             .to(torch.int16)
                             .view(dtype)
                         )
-                        values = values[torch.isfinite(values)]
                     k = values.view(1, 1, -1)
                     v = k.flip(-1)
                     k_cache = torch.empty_like(k, dtype=fp8_dtype)
                     v_cache = torch.empty_like(v, dtype=fp8_dtype)
-                    _set_kv_buffer_prefix_valid_impl_fp8(
-                        k,
-                        v,
-                        k_cache,
-                        v_cache,
-                        scale.item(),
-                        scale.item(),
-                        loc,
-                        lengths,
-                        k.shape[-1],
-                        k_scale_is_tensor=True,
-                        v_scale_is_tensor=True,
-                    )
-                    self.assertTrue(
-                        torch.equal(
-                            k_cache.view(torch.uint8),
-                            _eager_quantize(k, scale).view(torch.uint8),
-                        )
-                    )
-                    self.assertTrue(
-                        torch.equal(
-                            v_cache.view(torch.uint8),
-                            _eager_quantize(v, scale).view(torch.uint8),
-                        )
-                    )
+                    for kind, original_scale in (
+                        ("gpu", scale),
+                        ("python", scale.item()),
+                        ("cpu", scale.cpu()),
+                    ):
+                        with self.subTest(scale_kind=kind):
+                            _set_kv_buffer_prefix_valid_impl_fp8(
+                                k,
+                                v,
+                                k_cache,
+                                v_cache,
+                                scale.item(),
+                                scale.item(),
+                                loc,
+                                lengths,
+                                k.shape[-1],
+                                k_scale_is_tensor=kind == "gpu",
+                                v_scale_is_tensor=kind == "gpu",
+                            )
+                            self.assertTrue(
+                                torch.equal(
+                                    k_cache.view(torch.uint8),
+                                    _eager_quantize(k, original_scale).view(
+                                        torch.uint8
+                                    ),
+                                )
+                            )
+                            self.assertTrue(
+                                torch.equal(
+                                    v_cache.view(torch.uint8),
+                                    _eager_quantize(v, original_scale).view(
+                                        torch.uint8
+                                    ),
+                                )
+                            )
 
     def test_gpu_tensor_without_float_shadow_preserves_eager_fallback(self):
         """An unresolved device scale must keep the tensor-aware eager path."""

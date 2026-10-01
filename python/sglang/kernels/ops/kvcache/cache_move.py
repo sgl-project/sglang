@@ -102,7 +102,8 @@ def set_kv_buffer_prefix_valid_tiled_fp8(
         k_scale = k_scale.to(src_k_ptr.dtype.element_ty).to(tl.float32)
         k_val = tl.div_rn(k_val, k_scale)
     else:
-        k_val = k_val / k_scale
+        # Eager host-scalar division multiplies by a rounded FP32 reciprocal.
+        k_val = k_val * tl.div_rn(1.0, k_scale)
     k_val = k_val.to(src_k_ptr.dtype.element_ty).to(dst_k_ptr.dtype.element_ty)
 
     v_val = tl.load(src_v_row_ptr, mask=mask_elem, other=0).to(tl.float32)
@@ -110,7 +111,7 @@ def set_kv_buffer_prefix_valid_tiled_fp8(
         v_scale = v_scale.to(src_v_ptr.dtype.element_ty).to(tl.float32)
         v_val = tl.div_rn(v_val, v_scale)
     else:
-        v_val = v_val / v_scale
+        v_val = v_val * tl.div_rn(1.0, v_scale)
     v_val = v_val.to(src_v_ptr.dtype.element_ty).to(dst_v_ptr.dtype.element_ty)
 
     tl.store(dst_k_row_ptr, k_val, mask=mask_elem)
