@@ -26,6 +26,7 @@ class _Allocator:
     def __init__(self, carries_mamba: bool):
         self._kv = type("_KV", (), {"cpu_copy_carries_mamba": carries_mamba})()
         self.loaded_kv = None
+        self.full_draft_kv_pool = None
 
     def get_kvcache(self):
         return self._kv

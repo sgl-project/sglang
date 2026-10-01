@@ -39,6 +39,9 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # Class-level: SWA and HiSparse allocators do not call this __init__.
+    full_draft_kv_pool: KVCache | None = None
+
     @abc.abstractmethod
     def __init__(
         self,
@@ -64,6 +67,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     @property
     def size_full(self):
         return self.size
+
+    def register_full_draft_kv_pool(self, pool: KVCache) -> None:
+        """Declare a draft KV pool with its own tensors indexed by this allocator's
+        token ids; PD CPU retraction and PD transfer carry it with the target KV."""
+        self.full_draft_kv_pool = pool
 
     # -- scheduler-facing capacity hooks --
     # The scheduler calls these unconditionally, with no allocator-type branches
