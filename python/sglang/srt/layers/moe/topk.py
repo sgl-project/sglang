@@ -2688,8 +2688,10 @@ def select_experts(
                 _packed_kwargs["sqrtsoftplus_log1p"] = True
             if router_logits_partials is not None:
                 _packed_kwargs["router_logits_partials"] = router_logits_partials
-                if num_fused_shared_experts > 0 and not has_per_rank_fused_shared_slots(
-                    num_fused_shared_experts
+                if (
+                    _use_aiter
+                    and num_fused_shared_experts > 0
+                    and not has_per_rank_fused_shared_slots(num_fused_shared_experts)
                 ):
                     # the ROCm decode gate writes the aiter shared columns itself
                     _packed_kwargs["num_shared_append"] = num_fused_shared_experts
