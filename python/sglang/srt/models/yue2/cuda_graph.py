@@ -18,6 +18,12 @@ import torch
 import torch.nn.functional as F
 
 
+# NOTE (yiakwy) : same to 
+#   https://github.com/multimodal-art-projection/YuE/blob/main/src/yue2/cuda_graph.py
+
+# TODO (yiakwy) : switch to Ideogram-4 breakable CUDA graph (BCG) prompt padding.
+
+
 def _fused_enabled() -> bool:
     return os.environ.get("SGLANG_YUE2_FUSED_DECODE", "1") == "1"
 
