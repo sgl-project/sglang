@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
+
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.training_capture.config import (
@@ -68,7 +69,6 @@ class TestCaptureConfiguration(CustomTestCase):
             "dp_size": 2,
             "dcp_size": 2,
             "speculative_algorithm": "DSpark",
-            "disaggregation_mode": "decode",
             "enable_unified_memory": True,
             "enable_single_batch_overlap": True,
             "enable_hisparse": True,
@@ -88,6 +88,28 @@ class TestCaptureConfiguration(CustomTestCase):
                         validate_capture_server_args(self.args)
                 finally:
                     setattr(self.args, name, previous)
+
+    def test_pd_requires_mooncake_ar_and_waits_for_capture_context(self):
+        for role in ("prefill", "decode"):
+            self.args.disaggregation_mode = role
+            self.args.disaggregation_transfer_backend = "mooncake"
+            self.args.optimistic_prefill_attempts = 0
+            validate_capture_server_args(self.args)
+            for name, value in (
+                ("tp_size", 2),
+                ("pp_size", 2),
+                ("speculative_algorithm", "DSPARK"),
+                ("disaggregation_transfer_backend", "nixl"),
+                ("optimistic_prefill_attempts", 1),
+            ):
+                with self.subTest(role=role, option=name):
+                    previous = getattr(self.args, name)
+                    setattr(self.args, name, value)
+                    try:
+                        with self.assertRaisesRegex(ValueError, "PD capture topology"):
+                            validate_capture_server_args(self.args)
+                    finally:
+                        setattr(self.args, name, previous)
 
     def test_tp_static_dspark_does_not_enable_pipeline_speculation(self):
         for tp, pp in ((2, 1), (1, 2), (2, 2)):

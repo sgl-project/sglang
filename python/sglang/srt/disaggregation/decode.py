@@ -1294,6 +1294,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "the Mooncake backend"
                     )
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            if (
+                self.scheduler.tp_worker.training_capture is not None
+                and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+            ):
+                capture_context = (
+                    self.scheduler.tp_worker.training_capture.begin_pd_transfer(
+                        decode_req.req
+                    )
+                )
+                if capture_context is not None:
+                    metadata_kwargs["training_capture_context"] = capture_context
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
             if (
@@ -1976,6 +1987,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     float(output_token_sampling_logprobs[0].item())
                 )
 
+        if decode_req.req.training_capture_context is not None:
+            self.scheduler.tp_worker.training_capture.accept_pd_handoff(
+                decode_req.req,
+                decode_req.kv_receiver.take_training_capture_handoff(),
+            )
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()

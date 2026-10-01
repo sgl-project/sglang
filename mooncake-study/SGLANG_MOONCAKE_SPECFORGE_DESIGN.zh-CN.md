@@ -794,6 +794,43 @@ prefill teacher receipt 或紧凑 buffer 描述
 
 PD 的 TransferEngine KV 交接不是 Store 样本提交，两个完成事件分开定义。P 失败时不能发布只有 decode 部分的 READY。
 
+#### 13.3.1 当前实现: D 统一导出与发布
+
+`pd_capture.py` 实现 D 统一导出路径。当前接入 Mooncake backend、普通 AR、
+TP=PP=DP=1；PD speculative、多 rank PD 和跨节点 RDMA 仍需后续实现与验证。
+不允许 optimistic prefill，因为 P 必须在 forward 前收到 D 的采集上下文。
+
+1. D 在发布 KV 接收地址前，通过原有 Host 配额与 Catalog reservation 申请采集。
+   `begin_pd_transfer(req)` 生成有界 MessagePack `CaptureTransferContext`，作为
+   `MooncakeKVReceiver.send_metadata(..., training_capture_context=...)` 的可选尾帧。
+   未选中的请求保留原有十帧 wire 格式。
+2. 上下文绑定 capture ID、fencing token、dataset/sample/generation ID、bootstrap room、
+   teacher/KV 契约摘要、prompt token 摘要及长度、采样参数摘要。P 校验后只持有
+   首条 teacher 的独立 top-128 IDs、FP32 raw logits 和全词表 LSE，不申请 Catalog
+   lease、不建立 Store client，也不为 prompt 分配整块采集 Host KV。
+   采样摘要忽略 `max_new_tokens`，允许 router 把 P 请求限制为一个生成 token。
+3. P 在采样器运行前采集 raw row，在最终 KV chunk 入队前调用 `finish_handoff(req)`。
+   `PrefillTeacherHandoff` 回传上下文和 P 实际生成的首 token；单条消息最多 16 KiB。
+   Mooncake 在原有 ZMQ 控制连接上先发送 `TRAINING_CAPTURE_V1`，再发送 KV 成功通知。
+   注册的 KV/aux buffer 布局不变。
+4. D 只有在原有 KV/metadata 完成检查通过后才消费 handoff，校验完整上下文、首 token
+   与 teacher 行。`accept_pd_handoff(req, payload)` 从 D 的 canonical slots 导出完整
+   prompt KV，包括已有的有效缓存前缀；首条 teacher 对齐绝对位置 `prompt_length`。
+   后续 decode 复用普通 AR 采集与 manifest-last 发布。只有一个回复 token 时也必须
+   完成这一交接；未计算的最后 token KV 仍以 `kv_valid=0` 表示。
+5. 缺失、损坏、过期代次或不匹配的 handoff 使该采集失败，正常生成继续。相同重复
+   控制消息幂等；冲突重复消息使 handoff 无效；房间清理后的迟到消息不重新建立状态。
+   abort/retract/lease invalidation 使用 D 现有失败与资源回收流程。
+
+两端均传入 `--training-capture-config`，teacher identity、选层和 KV 契约必须一致；
+`journal_directory` 可按 P/D 使用不同本地目录。只有 D 实际连接配置中的 Catalog
+与 Mooncake Store。旧 P 不提供 handoff 时，新 D 不发布该样本；旧 D 不发送上下文时，
+新 P 不采集 teacher。健康检查的 Fake transfer 不参与采集。
+
+`test_training_capture_pd.py` 使用真实 P/D 进程和独立 Mooncake Store reader；测试用
+observer 在在线 forward 中保存完整原始分数与 source KV，不重跑 target 作为回读 oracle。
+Catalog 在该测试中仍是 test double，不能据此宣称生产保留策略或训练消费已验收。
+
 ### 13.4 speculative verify
 
 采集 target verification 的 raw 分数，在 grammar/采样处理前取紧凑结果。只有最终 accepted path 上的行进入样本，排除 draft proposals、rejected branches 和 padding。

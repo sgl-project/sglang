@@ -45,6 +45,7 @@ class CaptureTestRequest(SimpleNamespace):
             origin_input_ids=[3, 4],
             training_capture_attempted=False,
             training_capture_context=None,
+            training_capture_pd=None,
             training_capture_finalize=None,
             training_capture_latency=None,
             time_stats=SimpleNamespace(scheduler_recv_time=0.0),

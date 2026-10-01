@@ -1179,6 +1179,10 @@ class SchedulerDisaggregationPrefillMixin:
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
+            if self.tp_worker.training_capture is not None:
+                req.disagg_kv_sender.training_capture_handoff = (
+                    self.tp_worker.training_capture.finish_handoff(req)
+                )
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request

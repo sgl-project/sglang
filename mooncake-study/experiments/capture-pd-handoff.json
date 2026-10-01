@@ -1,0 +1,282 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "c974e008b0463df64ebfaba61c11585a813e16eb",
+  "feature": "Decode-owned complete PD training capture with a fenced raw first-teacher Mooncake handoff",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "node": "node064",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "gpu_uuid": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "layers": [
+      0,
+      14,
+      27
+    ],
+    "topology": "Separate TP1/PP1 P and D processes sharing the resident H100",
+    "transport": "Mooncake TransferEngine TCP and independent TCP Store segment/reader",
+    "catalog": "HTTP TestCaptureCatalog double",
+    "test_cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python"
+  },
+  "source_sha256": {
+    "python/sglang/srt/training_capture/pd_capture.py": "c10662d1d06ae4beb872530e565e7ad6698dc46335b5d5a03da6ec3f38ae43cd",
+    "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+    "python/sglang/srt/training_capture/coordinator.py": "a94a6e8d20eee5f882e6fe45c5ddb4b7297d20c39221a515181882def84db728",
+    "python/sglang/srt/training_capture/config.py": "22e86d891cbf3634be4a5fe8eb6dd879cfaf6c9fa5626ed8ebd613d47864d829",
+    "python/sglang/srt/managers/schedule_batch.py": "794578dbe890bf83da39d644835054a48e2841375ac3d4cee16f4615da9f4e2a",
+    "python/sglang/srt/disaggregation/decode.py": "5052f7790c00847610f7529b4979211105fa86786ff39fb761018937ee9f4b31",
+    "python/sglang/srt/disaggregation/prefill.py": "49629cf3b69e54107fda74953af3aaa20e54f8abfd17c9a31e34879a5557fefc",
+    "python/sglang/srt/disaggregation/mooncake/conn.py": "286615ad3ce75816892235551dc3cae63a9f99a4bc1c6a5d56ab96677b3c0220",
+    "python/sglang/srt/disaggregation/common/utils.py": "8e4e27b915144f7e3aabeb45099364826dada6ae7152747c6fa8d9b058316758",
+    "python/sglang/test/training_capture_utils.py": "8b22db7f61e3915ba8e4c2bd0cd67f493c8c24cb517eafb812e413cde5a87fc8",
+    "test/registered/unit/training_capture/test_config.py": "34e6385967b77a1aeac4b1e604e9eead24d2fab9b8aa2efe62990b10aa455527",
+    "test/registered/unit/training_capture/test_pd_capture.py": "5ef31125b4ee8dfd321ef251a6ec32c8395eb6be4b40d72ac9a878b823e14be8",
+    "python/sglang/test/pd_capture_server.py": "7dc2b55345e13d40553a619be2914a3fedbb8805f020bb5730eb1907b66c558c",
+    "test/registered/storage/test_training_capture_pd.py": "3eeeed812ba7e0c1b23d74d9f2c1633f5f202d25a06eda19299e38dc7aca590c"
+  },
+  "gpu_source_hashes_match": true,
+  "jobs": [
+    {
+      "job_id": "01790876095591339876-a056ff89ab59",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790876111.693039,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790876095591339876-a056ff89ab59.log",
+      "test_file": "test/registered/unit/training_capture/test_pd_capture.py",
+      "tests_run": 6,
+      "elapsed_seconds": 4.039,
+      "log_sha256": "15a6a17986f3e0ffc41fed9da967f31ae74f63e46d380ea66ee5abe7756e7181"
+    },
+    {
+      "job_id": "01790875741063192285-c66504fa99e8",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790875767.5023417,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790875741063192285-c66504fa99e8.log",
+      "test_file": "test/registered/unit/training_capture/test_config.py",
+      "tests_run": 8,
+      "elapsed_seconds": 0.011,
+      "log_sha256": "24b2a5ffadfc8ce8317f95c02b7ca4a72f0f635a23efc1dc8eb00182a7bbb2d1"
+    },
+    {
+      "job_id": "01790875856643333401-943976b2e554",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790875956.9330509,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790875856643333401-943976b2e554.log",
+      "test_file": "test/registered/unit/training_capture/test_coordinator.py",
+      "tests_run": 46,
+      "elapsed_seconds": 34.745,
+      "log_sha256": "2151bf8c877155f88b30da1fbb879dc80a577408f0e63cdfbc165e1c35315d08"
+    },
+    {
+      "job_id": "01790875857034707540-7591a51286e5",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790875981.4955645,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790875857034707540-7591a51286e5.log",
+      "test_file": "test/registered/unit/training_capture/test_cohort_startup.py",
+      "tests_run": 1,
+      "elapsed_seconds": 13.62,
+      "log_sha256": "519131f92f767599729dd1d1f510e06532024e79e034db495585d14114cca6d5"
+    },
+    {
+      "job_id": "01790876095910444740-e7cf4594419a",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790876122.4752455,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790876095910444740-e7cf4594419a.log",
+      "test_file": "test/registered/unit/disaggregation/test_disaggregation_wire.py",
+      "tests_run": 22,
+      "elapsed_seconds": 0.008,
+      "log_sha256": "e5faddbc99931db75fb8d1de97505e025ef325e777f60d3723e70a711b64bda4"
+    },
+    {
+      "job_id": "01790876096237012712-fa36c1cddfc4",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790876135.0081828,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790876096237012712-fa36c1cddfc4.log",
+      "test_file": "test/registered/unit/disaggregation/test_decode_queue_cleanup.py",
+      "tests_run": 6,
+      "elapsed_seconds": 0.008,
+      "log_sha256": "0ccaa8238eca62012a5168b5359b7c0f85a9db1737d2be16d1424faa2ea5846e"
+    },
+    {
+      "job_id": "01790876096551927410-528c095406d8",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790876280.3203368,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790876096551927410-528c095406d8.log",
+      "test_file": "test/registered/storage/test_training_capture_pd.py",
+      "tests_run": 2,
+      "elapsed_seconds": 134.189,
+      "log_sha256": "93a0ec195fd7506a18e8ed446268b40b2b720b894239efaf9efb4fd5cb7613da"
+    },
+    {
+      "job_id": "01790876561894455242-8d32d8dec801",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790876578.4859283,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790876561894455242-8d32d8dec801.log",
+      "test_file": "test/registered/unit/training_capture/test_pd_capture.py",
+      "tests_run": 7,
+      "elapsed_seconds": 4.525,
+      "scope": "Final rejection guard for unsupported P inputs, including custom logit processors.",
+      "log_sha256": "bb2a413c30f8aa0d0f2cdb18a4ac4fc3c7f6098ec76a9ecf6203261179e8c23d"
+    }
+  ],
+  "runtime": [
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "counters": {
+          "admitted": 8,
+          "considered": 8,
+          "copies_completed": 8,
+          "eager_forwards": 15,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5,
+          "snapshot_built": 5,
+          "writer_started": 8
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "filling": 1,
+          "free": 3,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 1,
+        "states": {
+          "available": 1
+        },
+        "writer_age_seconds": 0
+      },
+      "replay": false
+    },
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "counters": {
+          "admitted": 8,
+          "considered": 8,
+          "copies_completed": 8,
+          "cuda_graph_forwards": 18,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "overlap_forwards": 18,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5,
+          "snapshot_built": 5,
+          "writer_started": 8
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "filling": 1,
+          "free": 3,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 1,
+        "states": {
+          "available": 1
+        },
+        "writer_age_seconds": 0
+      },
+      "replay": true
+    }
+  ],
+  "runtime_assertions": [
+    "Online source KV and saved top-128 scores agree exactly.",
+    "Full-vocabulary LSE agrees within rtol=1e-6 and atol=1e-6.",
+    "Token IDs, logits positions, loss masks, KV validity and complete raw teacher coverage agree.",
+    "Five READY samples per mode: one-token response, chunked prefill, cached prefix, two-request batch.",
+    "Two malformed/missing handoffs per mode fail capture while biased generation completes.",
+    "One stream cancellation per mode produces a failed capture and no READY sample.",
+    "At least one batch has multiple requests; overlap execution includes actual graph replay.",
+    "No target recomputation supplies the reader oracle."
+  ],
+  "checks": {
+    "python_compile_files": 14,
+    "black": "passed",
+    "isort": "passed",
+    "ruff_repository_rules": "F401,F821,UP037 passed",
+    "ruff_new_modules": "All enabled rules passed except I001, whose import ordering is checked by isort.",
+    "registered_tests": "passed",
+    "git_diff_check": "passed",
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "validation_notes": [
+    "The final runtime test cleanup comment/parentheses were reformatted after the passing execution; executable behavior is unchanged.",
+    "After the runtime pass, P admission gained the custom-logit-processor rejection guard. The whole PD unit file then passed seven tests including all unsupported-input exclusions. The ordinary supported runtime path is unchanged.",
+    "Initial real startup exposed FakeKVSender health checks; the fixed path and dedicated regression pass.",
+    "An intermediate integration run published three samples per mode but failed on test-only Catalog dictionary slicing; the final run uses wait_publications and passes all readback/failure assertions.",
+    "Legacy metadata remains ten frames; capture adds one optional frame. Registered KV/aux buffer layout is unchanged."
+  ],
+  "resident_status": {
+    "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+    "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "pid": 1,
+    "mode": "idle_load",
+    "heartbeat_unix": 1790876683.995074,
+    "idle_pid": 21951,
+    "active_job": null,
+    "active_pid": null,
+    "queued": 0,
+    "paused": false,
+    "heartbeat_age_seconds": 0.08870911598205566
+  },
+  "live_serving_or_store_processes_after_tests": 0,
+  "open_scope": [
+    "PD TP/PP/DP and speculative target verification",
+    "PD rebootstrap/retraction/cache-pressure stress",
+    "Cross-node RDMA transport validation",
+    "Production Catalog retention and SpecForge consumer integration",
+    "Trained DSpark quality and P10 workload/SLO acceptance"
+  ]
+}

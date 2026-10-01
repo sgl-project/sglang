@@ -15,6 +15,7 @@ from typing import Any
 
 import msgspec
 import torch
+
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.training_capture.admission import CaptureAdmission
 from sglang.srt.training_capture.catalog import CaptureLease, CatalogConflict
@@ -107,7 +108,7 @@ class CaptureCoordinator:
     ):
         if config_path is None:
             return None
-        from sglang.srt.runtime_context import get_spec
+        from sglang.srt.runtime_context import get_disagg, get_spec
         from sglang.srt.training_capture.metrics import CaptureMetrics
 
         config = None
@@ -146,11 +147,27 @@ class CaptureCoordinator:
             )
         if dp_rank != 0:
             raise ContractError("DP request capture is not yet connected")
+        disaggregation_mode = get_disagg().disaggregation_mode
+        coordinator_type = cls
+        if disaggregation_mode == "prefill":
+            from sglang.srt.training_capture.pd_capture import PrefillCaptureCoordinator
+
+            coordinator = PrefillCaptureCoordinator(
+                config=config, teacher=teacher, kv=kv
+            )
+            atexit.register(coordinator.close)
+            return coordinator
+        if disaggregation_mode == "decode":
+            from sglang.srt.training_capture.pd_capture import DecodeCaptureCoordinator
+
+            coordinator_type = DecodeCaptureCoordinator
         capture_mode = (
             "speculative_accepted_target_path"
             if get_spec().speculative_algorithm == "DSPARK"
             else "autoregressive"
         )
+        if disaggregation_mode == "decode":
+            capture_mode = "pd_autoregressive"
 
         def prepare_local():
             if distributed:
@@ -184,7 +201,7 @@ class CaptureCoordinator:
                     if metrics_labels is not None
                     else None
                 )
-                return cls(
+                return coordinator_type(
                     config=config,
                     teacher=teacher,
                     kv=kv,

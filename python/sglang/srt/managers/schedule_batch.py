@@ -872,6 +872,7 @@ class Req(ReqDllmMixin):
         self.output_ids = array("q")
         self.training_capture_attempted = False
         self.training_capture_context = None
+        self.training_capture_pd = None
         self.training_capture_finalize = None
         self.training_capture_latency = None
         self.training_capture_route = None

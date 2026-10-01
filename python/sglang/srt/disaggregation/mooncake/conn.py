@@ -85,6 +85,7 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    training_capture_context: Optional[bytes] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -118,6 +119,7 @@ class TransferInfo:
                 if len(msg) > 9 and msg[9] != b""
                 else None
             ),
+            training_capture_context=msg[10] if len(msg) > 10 and msg[10] else None,
         )
 
 
@@ -194,6 +196,7 @@ class KVArgsRegisterInfo:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    TRAINING_CAPTURE_HEADER = b"TRAINING_CAPTURE_V1"
 
     def __init__(
         self,
@@ -207,6 +210,8 @@ class MooncakeKVManager(CommonKVManager):
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
+        self.training_capture_lock = threading.Lock()
+        self.training_capture_handoffs: dict[int, Optional[bytes]] = {}
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -1612,6 +1617,38 @@ class MooncakeKVManager(CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
+    def _send_training_capture_handoff(self, remote, dst_port, room, payload):
+        if payload is None:
+            return
+        na = NetworkAddress(remote, dst_port)
+        try:
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [self.TRAINING_CAPTURE_HEADER, str(room).encode("ascii"), payload],
+                is_ipv6=na.is_ipv6,
+            )
+        except zmq.ZMQError:
+            # Missing teacher data excludes the sample on D; KV serving may proceed.
+            logger.warning("Failed to send training capture handoff for room %s", room)
+
+    def _receive_training_capture_handoff(self, msg):
+        from sglang.srt.training_capture.pd_protocol import MAX_HANDOFF_BYTES
+
+        if len(msg) != 3:
+            return
+        try:
+            room = int(msg[1])
+        except ValueError:
+            return
+        payload = msg[2] if len(msg[2]) <= MAX_HANDOFF_BYTES else b""
+        with self.training_capture_lock:
+            if room not in self.training_capture_handoffs:
+                return
+            previous = self.training_capture_handoffs[room]
+            self.training_capture_handoffs[room] = (
+                payload if previous is None or previous == payload else b""
+            )
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1894,6 +1931,14 @@ class MooncakeKVManager(CommonKVManager):
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
+                                    if status == KVPoll.Success:
+                                        # The same socket queues the teacher before KV completion.
+                                        self._send_training_capture_handoff(
+                                            endpoint,
+                                            dst_port,
+                                            room,
+                                            kv_chunk.training_capture_handoff,
+                                        )
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
                                         dst_port,
@@ -2071,6 +2116,9 @@ class MooncakeKVManager(CommonKVManager):
         def decode_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
+                if msg[0] == self.TRAINING_CAPTURE_HEADER:
+                    self._receive_training_capture_handoff(msg)
+                    continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
@@ -2147,6 +2195,7 @@ class MooncakeKVManager(CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        training_capture_handoff: Optional[bytes] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2186,6 +2235,7 @@ class MooncakeKVManager(CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                training_capture_handoff=training_capture_handoff,
             )
         )
 
@@ -2259,6 +2309,16 @@ class MooncakeKVSender(CommonKVSender):
         self.conclude_state = None
         self.init_time = time.time()
         self._init_trace_ctx()
+        self.training_capture_handoff = None
+
+    def get_training_capture_context(self):
+        contexts = {
+            info.training_capture_context
+            for info in self.kv_mgr.transfer_infos.get(self.bootstrap_room, {}).values()
+            if not info.is_dummy
+        }
+        # Missing or conflicting contexts cannot produce a publishable capture.
+        return contexts.pop() if len(contexts) == 1 else None
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -2292,6 +2352,7 @@ class MooncakeKVSender(CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                training_capture_handoff=self.training_capture_handoff,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
@@ -2456,6 +2517,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        training_capture_context: Optional[bytes] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -2466,6 +2528,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
             return
 
         self.chunk_staging_infos = []
+        if training_capture_context is not None:
+            with self.kv_mgr.training_capture_lock:
+                self.kv_mgr.training_capture_handoffs[self.bootstrap_room] = None
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
@@ -2500,6 +2565,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                                 else b""
                             ),
                         ]
+                        + (
+                            [training_capture_context]
+                            if training_capture_context is not None
+                            else []
+                        )
                     )
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
@@ -2510,6 +2580,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
         self.init_time = time.time()
+
+    def take_training_capture_handoff(self):
+        with self.kv_mgr.training_capture_lock:
+            return self.kv_mgr.training_capture_handoffs.pop(self.bootstrap_room, None)
+
+    def clear(self):
+        self.take_training_capture_handoff()
+        super().clear()
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:

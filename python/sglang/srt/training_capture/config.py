@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import msgspec
+
 from sglang.srt.training_capture.protocol import (
     ContractError,
     Digest,
@@ -174,7 +175,14 @@ def validate_capture_server_args(args) -> None:
         "speculative algorithm": args.speculative_algorithm not in (None, "DSPARK"),
         "simulated speculative acceptance": args.speculative_algorithm is not None
         and envs.SGLANG_SIMULATE_ACC_LEN.get() > 0,
-        "PD disaggregation": args.disaggregation_mode != "null",
+        "PD capture topology or backend": args.disaggregation_mode != "null"
+        and (
+            args.tp_size != 1
+            or args.pp_size != 1
+            or args.speculative_algorithm is not None
+            or args.disaggregation_transfer_backend != "mooncake"
+            or args.optimistic_prefill_attempts > 0
+        ),
         "mixed-chunk scheduling": args.enable_mixed_chunk,
         "PDMux": args.enable_pdmux,
         "diffusion language models": args.dllm_algorithm is not None,

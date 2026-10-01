@@ -43,7 +43,8 @@ it does not redefine the goal as the modules already implemented.
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit retract/resume | Real 256-token KV pool eviction, physical slot reuse, failed-capture exclusion and subsequent admission pass in synchronous and overlap/graph modes; automatic AR OOM remains open |
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes in all four synchronous/overlap and eager/graph combinations; failed captures are excluded and fresh capture admission recovers |
-| Deployment coverage | Partial | TP/PP, non-static speculative verify, PD, RDMA and workload SLO gates remain open |
+| PD collection | D-owned complete snapshot with fenced first-teacher handoff over Mooncake control messages | Real TP1 P/D on one H100 passes eager and graph/overlap, source parity, batches, prefix reuse and failed/aborted sample exclusion; broader PD topology and RDMA remain open |
+| Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark and TP1 AR PD have runtime evidence below; combined topologies, PD speculation, RDMA and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
 `/gpfs/users/fuxuanwei-1/dspark-maas-lab/state`):
@@ -2238,6 +2239,60 @@ outcomes, source/log hashes and scope limits are recorded in
 trained checkpoint quality, broader topology validation, PD/RDMA and P10 SLO
 acceptance remain open.
 
+## PD First-Teacher Handoff
+
+The P/D path now selects one publication owner: D. Before publishing destination
+addresses, D reserves the existing bounded Host slot and Catalog capture lease.
+An optional eleventh Mooncake metadata frame binds the room, prompt, target/KV
+contract, sampling parameters, sample/generation and fencing token. P captures
+one owned raw top-128/LSE row before sampling. It opens neither a Store client
+nor a full prompt Host capture arena. The final KV chunk carries an immutable
+handoff, sent over the existing locked control socket before the success
+notification; the registered KV/aux buffer layout is unchanged.
+
+After the normal KV/metadata completion gate, D validates the handoff and first
+output token, exports its complete canonical prompt prefix, and continues the
+ordinary AR ledger. A one-token reply also includes the first teacher row.
+Missing/invalid handoffs fail capture while generation continues. Conflicting
+duplicates poison the handoff, and cleared-room messages cannot retain state.
+Abort/retract and lease invalidation reuse the existing D cleanup path. Fake
+warmup/health-check transfers are explicitly excluded; actual server startup
+found this required guard, and a unit regression now protects it.
+
+The current gate permits Mooncake AR with TP=PP=DP=1 and no optimistic prefill.
+PD speculation, multi-rank PD, cross-node RDMA, and PD cache/rebootstrap stress
+are still open. The design's section 13.3.1 records the wire and ownership
+decision, compatibility behavior and configuration requirements.
+
+The complete `test_training_capture_pd.py` passes both tests in 134.189s on the
+resident H100 (job `01790876096551927410-528c095406d8`). Each mode starts separate
+P and D processes and publishes five samples: one-token response, chunked
+prefill, reused prompt and a two-request batch. A test-only online observer
+retains full raw logits and source KV. The independent Store reader verifies
+KV and top-128 values exactly, full-vocabulary LSE within 1e-6, token IDs,
+positions, loss masks and KV validity. No reference target forward is rerun.
+The overlap case records 18 actual CUDA graph forwards. Missing handoff, stale
+fence and stream cancellation each exclude a sample; generation completes for
+both handoff faults. Both modes report five READY, two handoff failures, one
+abort failure and no quarantined Host slots.
+
+Seven PD unit tests, eight configuration tests, 46 coordinator tests, the real
+Gloo cohort-startup test, 22 existing wire tests and six decode cleanup tests
+also pass as separate files. All fourteen changed Python files compile and
+pass Black, isort and the repository's Ruff F401/F821/UP037 check. New modules
+also pass the broader Ruff rules with import ordering delegated to isort.
+The final test-only cleanup comment was reformatted after execution. A subsequent
+P-side custom-logit-processor exclusion passed the full seven-test PD unit file;
+the supported AR path is unchanged. The synchronized GPU checkout matches all final
+source hashes. Registered-test validation passes. Process inspection finds no
+live serving or Store process; the resident idle workload resumed. The original
+checkout's staged-index digest is unchanged. Detailed results and log/source
+hashes are in `experiments/capture-pd-handoff.json`.
+
+The Catalog remains an HTTP test double and transport is TCP. These results do
+not certify production retention, a production SpecForge consumer, distributed
+PD, RDMA, trained draft quality, or P10 performance acceptance.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -2248,7 +2303,8 @@ acceptance remain open.
 3. Extend P9's real TP2/PP1 and TP1/PP2 Qwen3 capture validation to combined
    TP2/PP2, replicated heads, distributed cancellation/backpressure and additional
    model identities. Complete pipeline speculative collection,
-   PD transfer and cross-node RDMA. Ordinary AR now uses the distributed serving
+   multi-rank/speculative PD and cross-node RDMA. TP1 AR PD now transfers the
+   first teacher row and publishes from D. Ordinary AR uses the distributed serving
    path, and static and confidence-scheduled DSpark capture support TP. The
    target-KV v1 draft remains static by checkpoint contract; the remaining
    capability gates do not constitute implementation of those paths.
