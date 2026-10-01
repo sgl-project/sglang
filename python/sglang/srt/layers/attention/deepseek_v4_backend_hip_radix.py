@@ -662,11 +662,13 @@ class DSV4AttnMetadata:
         self.c0_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
+        # -1 filled like the page indices: identity rows write only their reachable columns,
+        # and the OPUS prefill reads the raw indices without the top-k lengths
         if 1 in self.low_ratios:
-            self.c1_sparse_raw_indices = torch.empty_like(self.c1_sparse_page_indices)
+            self.c1_sparse_raw_indices = torch.full_like(self.c1_sparse_page_indices, -1)
             self.c1_flashmla_metadata = _create_flashmla_metadata()
         if 2 in self.low_ratios:
-            self.c2_sparse_raw_indices = torch.empty_like(self.c2_sparse_page_indices)
+            self.c2_sparse_raw_indices = torch.full_like(self.c2_sparse_page_indices, -1)
             self.c2_flashmla_metadata = _create_flashmla_metadata()
 
 
