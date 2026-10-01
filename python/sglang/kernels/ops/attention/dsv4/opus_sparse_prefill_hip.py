@@ -32,7 +32,9 @@ def _combined_to_csr_kernel(
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     length = tl.load(lens_ptr + row)
-    idx = tl.load(indices_ptr + row * indices_stride + cols, mask=cols < length, other=-1)
+    idx = tl.load(
+        indices_ptr + row * indices_stride + cols, mask=cols < length, other=-1
+    )
     keep = (idx >= row_start) & (idx < row_end)
     dst = tl.cumsum(keep.to(tl.int32), axis=0) - 1
     start = tl.load(indptr_ptr + row)
@@ -48,9 +50,7 @@ def combined_to_csr(
     device = indices.device
     cols = torch.arange(width, device=device, dtype=torch.int32)
     keep = (
-        (cols[None, :] < lens[:, None])
-        & (indices >= row_start)
-        & (indices < row_end)
+        (cols[None, :] < lens[:, None]) & (indices >= row_start) & (indices < row_end)
     )
     indptr = torch.zeros(num_rows + 1, dtype=torch.int32, device=device)
     torch.cumsum(keep.sum(dim=1, dtype=torch.int32), dim=0, out=indptr[1:])

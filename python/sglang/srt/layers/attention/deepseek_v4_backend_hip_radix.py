@@ -141,6 +141,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     target_size = ceil_align(curr_size, multiples_of)
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
 
+
 # OPUS prefill applies from this many query rows; below it the decode kernel splits KV
 # and the dequant is not amortized.
 _OPUS_PREFILL_MIN_TOKENS = 1024
@@ -667,10 +668,14 @@ class DSV4AttnMetadata:
         # -1 filled like the page indices: identity rows write only their reachable columns,
         # and the OPUS prefill reads the raw indices without the top-k lengths
         if 1 in self.low_ratios:
-            self.c1_sparse_raw_indices = torch.full_like(self.c1_sparse_page_indices, -1)
+            self.c1_sparse_raw_indices = torch.full_like(
+                self.c1_sparse_page_indices, -1
+            )
             self.c1_flashmla_metadata = _create_flashmla_metadata()
         if 2 in self.low_ratios:
-            self.c2_sparse_raw_indices = torch.full_like(self.c2_sparse_page_indices, -1)
+            self.c2_sparse_raw_indices = torch.full_like(
+                self.c2_sparse_page_indices, -1
+            )
             self.c2_flashmla_metadata = _create_flashmla_metadata()
 
 

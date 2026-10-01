@@ -21,7 +21,9 @@ def _opus_available() -> bool:
     if not (is_hip() and is_gfx95_supported()):
         return False
     try:
-        from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus  # noqa: F401
+        from aiter.ops.pa_sparse_prefill_opus import (  # noqa: F401
+            pa_sparse_prefill_opus,
+        )
     except ImportError:
         return False
     return True
@@ -90,9 +92,13 @@ class TestOpusSparsePrefill(CustomTestCase):
         )
 
         T, n_c, n_s = 48, 700, 300
-        q = (torch.randn(T, heads, D, generator=gen, device="cuda") * 0.5).to(torch.bfloat16)
+        q = (torch.randn(T, heads, D, generator=gen, device="cuda") * 0.5).to(
+            torch.bfloat16
+        )
         sink = torch.randn(heads, generator=gen, device="cuda") * 0.5
-        swa_kv = (torch.randn(n_s, D, generator=gen, device="cuda") * 0.5).to(torch.bfloat16)
+        swa_kv = (torch.randn(n_s, D, generator=gen, device="cuda") * 0.5).to(
+            torch.bfloat16
+        )
         swa_idx, swa_lens = _padded_lists(T, 128, n_s, gen)
         # every query row sees at least one key, as in prefill (its own SWA row)
         swa_idx[:, 0] = torch.arange(T, device="cuda", dtype=torch.int32) % n_s
@@ -102,7 +108,9 @@ class TestOpusSparsePrefill(CustomTestCase):
             out = opus_sparse_prefill(q, swa_kv, swa_csr, sink, SCALE)
             ref = _attention_reference(q, [(swa_kv, swa_csr)], sink)
         else:
-            c_kv = (torch.randn(n_c, D, generator=gen, device="cuda") * 0.5).to(torch.bfloat16)
+            c_kv = (torch.randn(n_c, D, generator=gen, device="cuda") * 0.5).to(
+                torch.bfloat16
+            )
             c_idx, c_lens = _padded_lists(T, 512, n_c, gen)
             # a row with no compressed history, like a request's first tokens
             c_lens[0] = 0
