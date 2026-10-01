@@ -75,11 +75,28 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     # Tail row -> packed all-gather slot; local tail metadata rows include padding.
     gather_index: Optional[torch.Tensor] = None
     local_index: Optional[torch.Tensor] = None
+    moe_local_token_count: Optional[torch.Tensor] = None
 
 
 class InterleaveCPStrategy(ContextParallelStrategy):
     name = "interleave"
     kind = ContextParallelStrategyKind.INTERLEAVE
+
+    def moe_num_token_non_padded(self, forward_batch):
+        """Mask physical CP padding before the dispatch/combine all-to-alls.
+
+        Attention-TP localization does not split the count over CP ranks.
+        Interleave's valid rows form a prefix of each padded local shard.
+        """
+        metadata = forward_batch.attn_cp_metadata
+        if metadata.moe_local_token_count is None:
+            lengths = metadata.per_rank_logical_token or metadata.per_rank_actual_token
+            metadata.moe_local_token_count = torch.tensor(
+                lengths[self.cp_rank],
+                dtype=torch.int32,
+                device=forward_batch.input_ids.device,
+            )
+        return metadata.moe_local_token_count
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if not forward_batch.forward_mode.is_context_parallel_extend():
