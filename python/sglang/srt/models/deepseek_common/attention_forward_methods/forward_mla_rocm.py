@@ -43,7 +43,7 @@ from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -61,7 +61,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_memory, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -69,6 +69,11 @@ from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+# Resolve architecture once, alongside the existing import-time ROCm capabilities.
+_use_aiter_gfx950 = (
+    _use_aiter_gfx95
+    and torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] == "gfx950"
+)
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -407,6 +412,32 @@ def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
     )
 
 
+def _fuse_bmm_rope_cache(
+    attn: DeepseekV2AttentionMLA,
+    q_nope: torch.Tensor,
+    forward_mode: ForwardMode,
+    q_replicate_active: bool,
+    is_capture_mode: bool = False,
+) -> bool:
+    """Use standalone only for the qualified full-graph target verify shapes."""
+    if q_replicate_active or not _can_fuse_bmm_rope_cat_and_cache(attn):
+        return False
+    return not (
+        is_capture_mode
+        and forward_mode.is_target_verify()
+        and get_exec().graph.cuda_graph_config is not None
+        and get_exec().graph.cuda_graph_config.decode.backend == "full"
+        and _use_aiter_gfx950
+        and not get_memory().enable_hisparse
+        and get_exec().kernel.dsa_decode_backend == "tilelang"
+        and q_nope.dtype == torch.bfloat16
+        and q_nope.shape[1:] == (8, 192)
+        and attn.kv_lora_rank == 512
+        and attn.kv_cache_dtype == "fp8_e4m3"
+        and q_nope.shape[0] == 64
+    )
+
+
 def _fused_bmm_rope_cat_and_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope: torch.Tensor,
@@ -617,8 +648,12 @@ class DeepseekMLARocmForwardMixin:
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
-        fuse_bmm_rope_cache = not q_replicate_active and (
-            _can_fuse_bmm_rope_cat_and_cache(self)
+        fuse_bmm_rope_cache = _fuse_bmm_rope_cache(
+            self,
+            q_nope,
+            forward_batch.forward_mode,
+            q_replicate_active,
+            is_capture_mode=get_is_capture_mode(),
         )
 
         if q_replicate_active:
