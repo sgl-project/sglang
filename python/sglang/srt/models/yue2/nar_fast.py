@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from .protocol import MUSIC_END, chunk_ranges
 
+
 _SGL_KERNEL = None
 
 
@@ -91,8 +92,10 @@ class SessionNAR:
         self.noise = noise
         self.nar_length = noise.shape[0] + 2
         total = self.ar_length + self.nar_length
+
         # Per-layer velocity KV: [AR KV | NAR KV], exact length, no masking.
         shape = (1, total, self.HKV, self.HD)
+        
         self.keys = [torch.empty(shape, device=self.device, dtype=self.dtype)
                      for _ in model.model.layers]
         self.values = [torch.empty(shape, device=self.device, dtype=self.dtype)
