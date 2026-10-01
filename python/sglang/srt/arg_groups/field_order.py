@@ -79,6 +79,7 @@ POSITIONAL_FIELD_ORDER = (
     "pp_max_micro_batch_size",
     "pp_async_batch_depth",
     "dp_size",
+    "attn_dp_size",
     "load_balance_method",
     "prefix_affinity_fallback",
     "prefix_affinity_max_load_skew",

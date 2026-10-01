@@ -107,11 +107,11 @@ class LoadBalanceMethod(Enum):
 
 
 class DPBudget:
-    def __init__(self, dp_size: int):
-        self.dp_size = dp_size
-        self.total_requests = [0] * dp_size
-        self.total_tokens = [0] * dp_size
-        self.last_timestamp = [0.0] * dp_size
+    def __init__(self, num_dp_ranks: int):
+        self.num_dp_ranks = num_dp_ranks
+        self.total_requests = [0] * num_dp_ranks
+        self.total_tokens = [0] * num_dp_ranks
+        self.last_timestamp = [0.0] * num_dp_ranks
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -130,7 +130,7 @@ class DPBudget:
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
             target_rank = min(
-                range(self.dp_size),
+                range(self.num_dp_ranks),
                 key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
         else:
@@ -160,7 +160,7 @@ class DataParallelController:
         self.run_scheduler_process_func = run_scheduler_process_func
 
         # Init inter-process communication
-        self.context = zmq.Context(1 + get_parallel().dp_size)
+        self.context = zmq.Context(1 + get_parallel().num_dp_ranks)
         if get_parallel().node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -190,8 +190,10 @@ class DataParallelController:
             get_parallel().prefix_affinity_disable_token_fallback
         )
 
-        self.launch_dp_size: int = get_parallel().dp_size
-        self.max_dp_size: int = get_parallel().max_ep_size or get_parallel().dp_size
+        self.launch_dp_size: int = get_parallel().num_dp_ranks
+        self.max_dp_size: int = (
+            get_parallel().max_ep_size or get_parallel().num_dp_ranks
+        )
         assert self.max_dp_size >= self.launch_dp_size, (
             f"--max-ep-size ({self.max_dp_size}) must be >= "
             f"--dp ({self.launch_dp_size})."
@@ -201,7 +203,7 @@ class DataParallelController:
             self.max_dp_size - self.launch_dp_size
         )
 
-        self.dp_budget = DPBudget(get_parallel().dp_size)
+        self.dp_budget = DPBudget(get_parallel().num_dp_ranks)
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
             caller="DataParallelController",
@@ -218,7 +220,7 @@ class DataParallelController:
         self._active_workers: list[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
 
-        if get_parallel().enable_dp_attention:
+        if get_parallel().attn_dp_enabled:
             self.launch_dp_attention_schedulers(server_args, port_args)
             # When local control broadcast is enabled, send control messages to
             # every DP group leader (attn_tp_rank=0) so each leader broadcasts
@@ -389,7 +391,7 @@ class DataParallelController:
         threads = []
         sockets = []
         ready_events = []
-        for dp_rank in range(get_parallel().dp_size):
+        for dp_rank in range(get_parallel().num_dp_ranks):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
@@ -592,7 +594,7 @@ class DataParallelController:
             bind_count = (
                 self.max_dp_size
                 if get_exec().moe.elastic_ep_backend is not None
-                else get_parallel().dp_size
+                else get_parallel().num_dp_ranks
             )
             for slot in range(bind_count):
                 worker_port, worker_socket = get_zmq_socket_on_host(
@@ -622,7 +624,7 @@ class DataParallelController:
         dp_rank: int | None,
         worker_ports: list[int] | None = None,
     ):
-        if not get_parallel().enable_dp_attention:
+        if not get_parallel().attn_dp_enabled:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -654,13 +656,12 @@ class DataParallelController:
             for tp_rank in tp_rank_range:
                 rank_port_args = port_args
 
-                if get_parallel().enable_dp_attention:
+                if get_parallel().attn_dp_enabled:
                     # dp attention has different sharding logic
                     _, _, dp_rank, _ = compute_dp_attention_world_info(
-                        get_parallel().enable_dp_attention,
                         tp_rank,
                         get_parallel().tp_size,
-                        get_parallel().dp_size,
+                        get_parallel().attn_dp_size,
                         get_parallel().attn_cp_size,
                     )
                     # compute zmq ports for this dp rank

@@ -156,6 +156,15 @@ impl VettedSnapshot {
         self.dropped_workers
     }
 
+    /// `(carried, structure)`: nodes with at least one surviving carrier vs
+    /// carrier-less interior kept on a path to a carried descendant. Structure
+    /// nodes cannot answer a query but can turn one into a hit-shaped miss, so
+    /// their count is surfaced rather than buried inside `node_count`.
+    pub(crate) fn carrier_counts(&self) -> (usize, usize) {
+        let structure = self.nodes.iter().filter(|n| n.workers.is_empty()).count();
+        (self.nodes.len() - structure, structure)
+    }
+
     /// Graft this snapshot's nodes into `tree`, returning how many were applied.
     ///
     /// Hands over the ids vetting resolved against the live set, the
@@ -260,6 +269,12 @@ impl VettedSnapshot {
     /// cannot seed a watermark for them.
     pub fn covers_any(&self, ranks: &[KvWorkerId]) -> bool {
         ranks.iter().any(|r| self.cursor_for(r).is_some())
+    }
+
+    /// Every rank [`Self::covers_any`] would accept, for checking many ranks
+    /// against one snapshot.
+    pub fn covered_ranks(&self) -> HashSet<&KvWorkerId> {
+        self.cursors.iter().map(|(w, _)| w).collect()
     }
 
     /// Last-applied sequence the producer had for `worker`, or `None` when it
@@ -429,6 +444,7 @@ mod tests {
             workers,
             cursors: vec![],
             nodes,
+            empty_ranks: vec![],
         }
     }
 
@@ -669,6 +685,28 @@ mod tests {
         for (i, rec) in vetted.nodes.iter().enumerate() {
             assert!(rec.parent.is_none_or(|p| (p as usize) < i));
         }
+    }
+
+    /// The graft-observability split: carried nodes are matchable, structure
+    /// nodes are match paths only. And both accessors describe the SURVIVING
+    /// population: a carrier nobody knows is already gone from the count.
+    #[test]
+    fn carrier_counts_split_carrying_nodes_from_kept_structure() {
+        let snap = snapshot(
+            vec![wire_worker("http://a", 0), wire_worker("http://drained", 0)],
+            vec![
+                node(None, 1, vec![]),        // interior on a live path: kept structure
+                node(Some(0), 2, vec![0, 1]), // carried (by both)
+                node(Some(1), 3, vec![1]),    // carried only by the drained worker
+            ],
+        );
+        let vetted = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64)).unwrap();
+        // The drained carrier leaves the worker table; its exclusive node is
+        // pruned as a carrier-less leaf, and the shared node keeps the live
+        // worker as its only carrier.
+        assert_eq!(vetted.worker_count(), 1);
+        assert_eq!(vetted.dropped_workers(), 1);
+        assert_eq!(vetted.carrier_counts(), (1, 1));
     }
 
     /// Pruning must remap parent indices, not just drop entries.

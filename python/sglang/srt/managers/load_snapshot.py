@@ -71,7 +71,7 @@ def should_use_zmq() -> bool:
     ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ`` forces zmq mode for testing.
     """
     return (
-        get_parallel().enable_dp_attention and get_parallel().nnodes > 1
+        get_parallel().attn_dp_enabled and get_parallel().nnodes > 1
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
@@ -106,11 +106,11 @@ def zmq_reader_owner(caller: str) -> bool:
     Rules:
       - Non-zero node_rank: no TokenizerManager, DataParallelController only
         launches schedulers and waits -> nobody owns it.
-      - dp_size == 1: no DataParallelController exists -> tokenizer-side owner
+      - num_dp_ranks == 1: no DataParallelController exists -> tokenizer-side owner
         owns it.
-      - dp_size > 1, load-aware method: DataParallelController polls on every
+      - num_dp_ranks > 1, load-aware method: DataParallelController polls on every
         dispatch via refresh_load_budget() -> DataParallelController owns it.
-      - dp_size > 1, round-robin / other: DataParallelController never reads
+      - num_dp_ranks > 1, round-robin / other: DataParallelController never reads
         load data -> tokenizer-side owner owns it (polls on /v1/loads calls).
 
     The tokenizer-side owner is the ``"MultiTokenizerRouter"`` caller in
@@ -124,10 +124,10 @@ def zmq_reader_owner(caller: str) -> bool:
     if get_parallel().node_rank != 0:
         return False
     if caller == "DataParallelController":
-        return get_parallel().dp_size > 1 and is_load_aware_method(
+        return get_parallel().num_dp_ranks > 1 and is_load_aware_method(
             get_parallel().load_balance_method
         )
-    if get_parallel().dp_size > 1 and (
+    if get_parallel().num_dp_ranks > 1 and (
         is_load_aware_method(get_parallel().load_balance_method)
     ):
         return False
@@ -663,9 +663,9 @@ def create_load_snapshot_reader(port_args, caller: str):
             ``"MultiTokenizerRouter"`` -- determines who binds the zmq PULL
             socket when zmq mode is active.
     """
-    dp_size = get_parallel().dp_size
+    num_dp_ranks = get_parallel().num_dp_ranks
     if zmq_reader_owner(caller):
         return ZmqShmLoadSnapshotReader(
-            _zmq_addr_for(port_args), shm_path_for(port_args.instance_id), dp_size
+            _zmq_addr_for(port_args), shm_path_for(port_args.instance_id), num_dp_ranks
         )
-    return ShmLoadSnapshotReader(shm_path_for(port_args.instance_id), dp_size)
+    return ShmLoadSnapshotReader(shm_path_for(port_args.instance_id), num_dp_ranks)
