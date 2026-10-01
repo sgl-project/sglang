@@ -3444,7 +3444,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        if _is_npu:
+        # NPU decode is #37787's and reads rank-local metadata off the attention
+        # backend. NPU DSA extend gathers the context and needs this; without it
+        # the backend reads its own shard through a full-span page table.
+        if _is_npu and not (self.use_dsa and extend_prefix_lens is not None):
             return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,

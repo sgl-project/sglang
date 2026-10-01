@@ -34,7 +34,10 @@ from sglang.srt.layers.dcp.layout import (
     remap_dcp_sparse_indices,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     is_dcp_mla_decode_phase,
 )
@@ -948,6 +951,21 @@ def forward_dsa_core_npu(
         and not is_dcp_mla_decode_phase(forward_batch)
         and forward_batch.attn_dcp_metadata is not None
     )
+    if (
+        not dcp_extend
+        and get_parallel().dcp_enabled
+        and forward_batch.forward_mode.is_extend()
+        and not is_dcp_mla_decode_phase(forward_batch)
+        and not get_attn_backend().is_draft_worker
+    ):
+        # Without the metadata the backend reads this rank's shard through a
+        # full-span page table and returns plausible output. The merge of
+        # #37787 did exactly that, silently, by returning None for all NPU.
+        raise RuntimeError(
+            "DCP extend on the NPU DSA path has no attn_dcp_metadata; "
+            "prepare_context_parallel_metadata_for_dcp must build it for DSA "
+            "extend on NPU"
+        )
     if dcp_extend:
         # Gather the context so this rank can see all of it; without it the
         # backend reads its own shard with a full-span page table.
