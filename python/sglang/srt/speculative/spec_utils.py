@@ -28,6 +28,10 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.cache_locs import (
     get_target_cache_loc as get_target_cache_loc,
 )
+from sglang.kernels.ops.speculative.draft_proposal import (
+    can_use_fused_draft_proposal,
+    fused_draft_proposal,
+)
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
@@ -185,7 +189,17 @@ def sample_draft_proposal(
     argmax accepts (p(X) = 1), any other X rejects (p(X) = 0) and the residual
     (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
     which is what greedy means. Drop that renorm and this stops holding.
+
+    The eager chain below reduces each row in a single block, so on a draft
+    step -- a few rows, one vocabulary wide -- it runs at a few percent
+    occupancy. fused_draft_proposal computes the same proposal with a
+    vocabulary-split reduction and the same per-element Exp(1) draw.
     """
+    if envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get() and can_use_fused_draft_proposal(
+        next_token_logits, temperatures, top_ks
+    ):
+        return fused_draft_proposal(next_token_logits, temperatures, top_ks)
+
     probs = torch.softmax(next_token_logits / temperatures, dim=-1)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
     if top_ks is not None:
