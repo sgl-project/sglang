@@ -1247,6 +1247,15 @@ class SchedulerDisaggregationPrefillMixin:
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
+        if (
+            _is_npu
+            and self.enable_overlap
+            and self.transfer_backend == TransferBackend.ASCEND
+            and self.kv_checksum_computer is not None
+        ):
+            # Ascend's transfer worker does not wait for the early-send event.
+            # A newly cached chunk can still be in flight on forward_stream.
+            return
 
         # Staging sends into positional grid slots, so the early-send boundary
         # must stay stable across the request's batches: snapshot the at-rest
