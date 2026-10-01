@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -530,7 +531,7 @@ def _launch_fused_gate_sigmoid_mul(
         ),
     }
 
-    if num_tokens >= 1024:
+    if num_tokens >= 1024 or is_batch_invariant_mode_enabled():
         config["num_warps"] = min(config["num_warps"], 8)
 
     use_pdl = is_arch_support_pdl()
