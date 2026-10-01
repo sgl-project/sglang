@@ -383,9 +383,16 @@ class TestDecisionModels(unittest.TestCase):
         request = {"state": {}, "questions": NOUL}
         frames = [Image.new("RGB", (2, 2), color) for color in ("red", "blue")]
         animated = _encoded(frames[0], "GIF", save_all=True, append_images=frames[1:])
-        # A static GIF followed by a truncated frame descriptor, which Pillow's
-        # frame count trips on with struct.error.
-        truncated_frame = _encoded(frames[0], "GIF")[:-1] + b",\0"
+        static_gif = _encoded(frames[0], "GIF")
+        # A static GIF whose trailer is replaced by a truncated next block; counting
+        # frames trips Pillow's parser with struct.error or IndexError.
+        truncated_blocks = [
+            b",\0",
+            b",\0\0\0\0\x02\0\x02\0",
+            b",\0\0\0\0\x02\0\x02\0\0",
+            b"!",
+            b"!\xf9\x01\x01\0",
+        ]
         small = _encoded(Image.new("RGB", (8, 8)))
         padded = small + b"\0" * (11 * 1024 * 1024)
         over_limit = small + b"\0" * (12 * 1024 * 1024 + 1 - len(small))
@@ -406,9 +413,12 @@ class TestDecisionModels(unittest.TestCase):
                 [png, {"type": "image/gif", "data": _b64(animated)}],
                 ["body", "images", 1],
             ),
-            (
-                [{"type": "image/gif", "data": _b64(truncated_frame)}],
-                ["body", "images", 0],
+            *(
+                (
+                    [png, {"type": "image/gif", "data": _b64(static_gif[:-1] + tail)}],
+                    ["body", "images", 1],
+                )
+                for tail in truncated_blocks
             ),
             ([_b64(_png_header(20000, 20000))], ["body", "images", 0]),
             ([_png("red", size=(5000, 4000))], ["body", "images", 0]),
@@ -416,7 +426,7 @@ class TestDecisionModels(unittest.TestCase):
             ([_b64(padded)] * 3, ["body", "images"]),
         ]
         for images, loc in cases:
-            with self.subTest(loc=loc, first=str(images[-1])[:40]):
+            with self.subTest(loc=loc, last=str(images[-1])[-40:]):
                 response = client.post("/v1/jev", json={**request, "images": images})
                 self.assertEqual(response.status_code, 422, response.text)
                 self.assertEqual(response.json()["detail"][0]["loc"], loc)
@@ -431,6 +441,9 @@ class TestDecisionModels(unittest.TestCase):
         self.assertIn("image placeholder", detail["msg"])
         self.assertEqual(detail["loc"], ["body", "questions", "u", "instructions"])
         self.assertEqual(client.post("/v1/jev", json=conflict).status_code, 200)
+        gif = {"type": "image/gif", "data": _b64(static_gif)}
+        response = client.post("/v1/jev", json={**request, "images": [gif]})
+        self.assertEqual(response.status_code, 200, response.text)
 
     def test_answers_follow_the_typesafe_shapes(self):
         questions = {
