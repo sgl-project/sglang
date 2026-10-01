@@ -20,6 +20,7 @@ never does.
     python -m pytest test/registered/kernels/ops/memory/test_write_loc_to_kernel_ids_strided.py -v
 """
 
+import itertools
 import unittest
 
 import torch
@@ -44,25 +45,36 @@ class TestWriteLocToKernelIdsStrided(unittest.TestCase):
         v2p[3] = -1
         return v2p
 
-    def _locs(self, page_size):
+    # Lanes that must resolve to the sink: padding, a tombstoned page, a loc
+    # below the sentinel, a page past the table.
+    SINK_LANES = (0, 7, 11, 12)
+
+    def _locs(self, page_size, dtype=torch.int64):
+        """Every lane kind the kernel tells apart, as `(locs, num_pages)`:
+        non-zero in-page offsets, the -1 padding sink, a tombstoned page, a
+        loc below the sentinel and a page past a `num_pages` table."""
         n = self.ROWS * self.COLS
-        locs = torch.arange(n, dtype=torch.int64, device="cuda") * page_size
+        lane = torch.arange(n, dtype=torch.int64, device="cuda")
+        locs = lane * page_size + lane % page_size
         locs[0] = -1  # the padding sink
-        locs[7] = 3 * page_size  # lands on the tombstoned page
-        return locs.reshape(self.ROWS, self.COLS)
+        locs[7] = 4 * page_size - 1  # the last slot of the tombstoned page 3
+        num_pages = int(locs.max()) // page_size + 4
+        locs[11] = -(page_size + 1)  # below the sentinel
+        locs[12] = (num_pages + 2) * page_size + 1  # past the table
+        return locs.reshape(self.ROWS, self.COLS).to(dtype), num_pages
 
     def _run(self, loc, v2p, page_size, out=None):
         return write_loc_to_kernel_ids(loc=loc, v2p=v2p, page_size=page_size, out=out)
 
     def test_a_column_slice_reads_the_same_ids_as_its_contiguous_copy(self):
-        for page_size in (1, 64):
-            with self.subTest(page_size=page_size):
-                values = self._locs(page_size)
-                v2p = self._v2p(int(values.max()) // page_size + 4)
+        for page_size, dtype in itertools.product((1, 64), (torch.int64, torch.int32)):
+            with self.subTest(page_size=page_size, dtype=dtype):
+                values, num_pages = self._locs(page_size, dtype)
+                v2p = self._v2p(num_pages)
                 backing = torch.full(
                     (self.ROWS, self.COLS + self.PAD),
                     -1,
-                    dtype=torch.int64,
+                    dtype=dtype,
                     device="cuda",
                 )
                 view = backing[:, : self.COLS]
@@ -76,8 +88,8 @@ class TestWriteLocToKernelIdsStrided(unittest.TestCase):
 
     def test_a_column_stride_above_one_is_honoured(self):
         page_size = 1
-        values = self._locs(page_size)
-        v2p = self._v2p(int(values.max()) + 4)
+        values, num_pages = self._locs(page_size)
+        v2p = self._v2p(num_pages)
         backing = torch.empty(
             (self.ROWS, self.COLS * 2), dtype=torch.int64, device="cuda"
         )
@@ -91,8 +103,8 @@ class TestWriteLocToKernelIdsStrided(unittest.TestCase):
 
     def test_out_takes_its_own_row_stride_and_leaves_its_neighbours_alone(self):
         page_size = 64
-        values = self._locs(page_size)
-        v2p = self._v2p(int(values.max()) // page_size + 4)
+        values, num_pages = self._locs(page_size)
+        v2p = self._v2p(num_pages)
         # `out`'s row stride differs from `loc`'s, so one decomposition cannot
         # serve both; each side must use its own.
         loc_backing = torch.full(
@@ -112,19 +124,22 @@ class TestWriteLocToKernelIdsStrided(unittest.TestCase):
         self.assertTrue(bool((dst[:, self.COLS :] == -9).all()))
 
     def test_the_cpu_reference_agrees_on_the_same_strided_input(self):
-        page_size = 64
-        values = self._locs(page_size)
-        v2p = self._v2p(int(values.max()) // page_size + 4)
-        backing = torch.full(
-            (self.ROWS, self.COLS + self.PAD), -1, dtype=torch.int64, device="cuda"
-        )
-        view = backing[:, : self.COLS]
-        view.copy_(values)
+        for page_size, dtype in itertools.product((1, 64), (torch.int64, torch.int32)):
+            with self.subTest(page_size=page_size, dtype=dtype):
+                values, num_pages = self._locs(page_size, dtype)
+                v2p = self._v2p(num_pages)
+                backing = torch.full(
+                    (self.ROWS, self.COLS + self.PAD), -1, dtype=dtype, device="cuda"
+                )
+                view = backing[:, : self.COLS]
+                view.copy_(values)
 
-        cuda_ids = self._run(view, v2p, page_size)
-        cpu_backing = backing.cpu()
-        cpu_ids = self._run(cpu_backing[:, : self.COLS], v2p.cpu(), page_size)
-        self.assertTrue(torch.equal(cuda_ids.cpu(), cpu_ids))
+                cuda_ids = self._run(view, v2p, page_size)
+                cpu_backing = backing.cpu()
+                cpu_ids = self._run(cpu_backing[:, : self.COLS], v2p.cpu(), page_size)
+                self.assertTrue(torch.equal(cuda_ids.cpu(), cpu_ids))
+                sink = cuda_ids.reshape(-1)[list(self.SINK_LANES)]
+                self.assertTrue(bool((sink == 0).all()), f"sink lanes: {sink}")
 
 
 if __name__ == "__main__":
