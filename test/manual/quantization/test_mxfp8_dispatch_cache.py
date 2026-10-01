@@ -1,7 +1,8 @@
-"""CPU-only safety checks for the opt-in metadata-validation cache."""
+"""CPU-only safety checks for the metadata-validation cache."""
 
 import importlib.util
 import unittest
+from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -74,6 +75,58 @@ class DispatchCacheTest(unittest.TestCase):
         for _ in range(2):
             self.cache(*self.args, **self.kwargs)
         self.assertEqual(self.checks, [False, False])
+
+    def test_supported_flashinfer_api_enables_cache(self):
+        for version in ("0.7.0", "0.7.0+cu130"):
+            with self.subTest(version=version):
+                cached = _module.maybe_cache_mxfp8_dispatch(
+                    self.cache.raw_mm,
+                    SimpleNamespace(_cute_dsl_gemm_mxfp8_runner=lambda: None),
+                    version,
+                )
+                self.assertIsInstance(cached, _module.Mxfp8DispatchCache)
+
+    def test_decorated_validation_api_accepts_skip_check(self):
+        def public_api(a, b, a_scale, b_scale):
+            pass
+
+        @wraps(public_api)
+        def decorated(*args, **kwargs):
+            return self.cache.raw_mm(*args, **kwargs)
+
+        cached = _module.maybe_cache_mxfp8_dispatch(
+            decorated,
+            SimpleNamespace(_cute_dsl_gemm_mxfp8_runner=lambda: None),
+            "0.7.0",
+        )
+        self.assertIsInstance(cached, _module.Mxfp8DispatchCache)
+        cached(*self.args, **self.kwargs)
+        cached(*self.args, **self.kwargs)
+        self.assertEqual(self.checks, [False, True])
+
+    def test_unsupported_version_does_not_modify_runner(self):
+        for version in ("0.6.18", "0.7.1", "0.7.0rc1", "0.7.01"):
+            with self.subTest(version=version):
+                factory = lambda: None
+                module = SimpleNamespace(_cute_dsl_gemm_mxfp8_runner=factory)
+                raw = self.cache.raw_mm
+                self.assertIs(
+                    _module.maybe_cache_mxfp8_dispatch(raw, module, version), raw
+                )
+                self.assertIs(module._cute_dsl_gemm_mxfp8_runner, factory)
+
+    def test_missing_private_api_keeps_original_dispatch(self):
+        raw = self.cache.raw_mm
+        for module in (None, SimpleNamespace()):
+            self.assertIs(_module.maybe_cache_mxfp8_dispatch(raw, module, "0.7.0"), raw)
+        unsupported_raw = lambda a, b: None
+        factory = lambda: None
+        module = SimpleNamespace(_cute_dsl_gemm_mxfp8_runner=factory)
+        self.assertIs(
+            _module.maybe_cache_mxfp8_dispatch(unsupported_raw, module, "0.7.0"),
+            unsupported_raw,
+        )
+        self.assertIs(module._cute_dsl_gemm_mxfp8_runner, factory)
 
 
 if __name__ == "__main__":

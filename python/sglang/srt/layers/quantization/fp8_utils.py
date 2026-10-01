@@ -470,20 +470,17 @@ if get_platform().is_blackwell and is_flashinfer_available():
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
 
     _flashinfer_mm_mxfp8_impl = _raw_flashinfer_mm_mxfp8
-    if get_bool_env_var("SGLANG_OPT_MXFP8_DISPATCH_CACHE", "false"):
+    if get_bool_env_var("SGLANG_OPT_MXFP8_DISPATCH_CACHE", "true"):
         import flashinfer
-        from flashinfer.gemm import gemm_base
 
         from sglang.srt.layers.quantization.mxfp8_dispatch_cache import (
-            Mxfp8DispatchCache,
+            maybe_cache_mxfp8_dispatch,
         )
 
-        if not flashinfer.__version__.startswith("0.7.0"):
-            raise RuntimeError(
-                "MXFP8 dispatch cache experiment requires FlashInfer 0.7.0"
-            )
-        _flashinfer_mm_mxfp8_impl = Mxfp8DispatchCache(
-            _raw_flashinfer_mm_mxfp8, gemm_base
+        _flashinfer_mm_mxfp8_impl = maybe_cache_mxfp8_dispatch(
+            _raw_flashinfer_mm_mxfp8,
+            getattr(flashinfer.gemm, "gemm_base", None),
+            flashinfer.__version__,
         )
 
     @lru_cache(maxsize=1)

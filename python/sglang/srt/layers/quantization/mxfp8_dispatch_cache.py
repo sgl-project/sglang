@@ -1,10 +1,35 @@
-"""Opt-in lab experiment for FlashInfer 0.7 MXFP8 host dispatch.
+"""Cache compatible FlashInfer 0.7.0 MXFP8 host dispatch.
 
 Keep FlashInfer's output allocation, autotuner and kernel invocation intact.
 Only reuse the stateless CuTe runner and validation of identical metadata.
 """
 
 from functools import lru_cache
+from inspect import Parameter, signature
+
+
+def maybe_cache_mxfp8_dispatch(raw_mm, gemm_module, version):
+    """Keep unsupported FlashInfer versions and APIs on the original path."""
+    if version.split("+", 1)[0] != "0.7.0" or not callable(
+        getattr(gemm_module, "_cute_dsl_gemm_mxfp8_runner", None)
+    ):
+        return raw_mm
+    try:
+        # FlashInfer's backend-requirement decorator consumes skip_check via
+        # **kwargs; following __wrapped__ would hide this supported argument.
+        parameters = signature(raw_mm, follow_wrapped=False).parameters
+    except (TypeError, ValueError):
+        return raw_mm
+    skip_check = parameters.get("skip_check")
+    accepts_keyword = skip_check is not None and skip_check.kind in (
+        Parameter.POSITIONAL_OR_KEYWORD,
+        Parameter.KEYWORD_ONLY,
+    )
+    if not accepts_keyword and not any(
+        p.kind == Parameter.VAR_KEYWORD for p in parameters.values()
+    ):
+        return raw_mm
+    return Mxfp8DispatchCache(raw_mm, gemm_module)
 
 
 class Mxfp8DispatchCache:
@@ -12,7 +37,7 @@ class Mxfp8DispatchCache:
         self.raw_mm = raw_mm
         self.validated = set()
         factory = gemm_module._cute_dsl_gemm_mxfp8_runner
-        # This experimental process-wide patch only memoizes the stateless
+        # This process-wide patch only memoizes the stateless
         # runner factory. The factory arguments include SM, PDL and output dtype.
         if not hasattr(factory, "cache_info"):
             factory = lru_cache(maxsize=16)(factory)
