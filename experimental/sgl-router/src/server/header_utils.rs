@@ -16,7 +16,7 @@ pub fn should_forward_request_header(name: &HeaderName) -> bool {
             | "x-correlation-id"
             | "traceparent"
             | "tracestate"
-            // Set only by `--dp-aware` chat dispatch, which strips any client copy.
+            // Set by `--dp-aware`; chat dispatch strips the client's copy.
             | "x-data-parallel-rank"
     ) || n.starts_with("x-request-id-")
         || n.starts_with("x-sgl-")
@@ -50,9 +50,6 @@ mod tests {
         )));
         assert!(should_forward_request_header(&HeaderName::from_static(
             "x-request-id-extra"
-        )));
-        assert!(should_forward_request_header(&HeaderName::from_static(
-            "x-data-parallel-rank"
         )));
 
         // Stripped headers

@@ -216,9 +216,7 @@ pub struct RoutingArgs {
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
 
-    /// Also pick the DP rank inside each selected worker that runs several
-    /// (--dp-size / --attn-dp-size): by sticky/session key hash, then deepest
-    /// cached prefix, then fewest in-flight requests.
+    /// Also pick the DP rank inside each selected multi-rank worker.
     #[arg(long)]
     pub dp_aware: bool,
 

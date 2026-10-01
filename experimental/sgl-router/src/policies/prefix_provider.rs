@@ -52,9 +52,7 @@ impl RadixTreePrefixProvider {
         })
     }
 
-    /// Cached prefix depth, in blocks, on each DP rank of `worker_url` that
-    /// holds any of the prompt. Unlike [`Self::match_request_tokens`], ranks
-    /// are kept apart: `--dp-aware` routing picks one of them.
+    /// `(dp_rank, cached prefix blocks)` for each rank of `worker_url`.
     pub fn rank_depths(&self, tokens: &[u32], worker_url: &str) -> Vec<(u32, usize)> {
         let Some(hashes) = self.block_hashes(tokens) else {
             return Vec::new();
@@ -67,8 +65,6 @@ impl RadixTreePrefixProvider {
             .collect()
     }
 
-    /// Block hashes of `tokens` in the workers' hashing scheme; `None` before
-    /// any worker reported a block size, or for a prompt shorter than a block.
     fn block_hashes(&self, tokens: &[u32]) -> Option<Vec<i64>> {
         let block_size = self.block_size_oracle.get()?;
         let hashes = if self.block_size_oracle.is_bigram() {

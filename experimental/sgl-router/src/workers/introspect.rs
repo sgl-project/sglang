@@ -65,11 +65,9 @@ pub struct ServerInfo {
     /// protocol costs throughput and never correctness. Consumed by
     /// `manager::register_one` to set [`crate::workers::WireProtocol`].
     pub enable_http2: Option<bool>,
-    /// Number of DP ranks the engine's DP controller dispatches to, from the
-    /// `/server_info` launch record (`dp_size * attn_dp_size`). `None` when
-    /// the worker reported neither field. Consumed by `manager::register_one`
-    /// to size the worker's per-rank state for `--dp-aware` routing.
-    pub dp_ranks: Option<u32>,
+    /// DP ranks behind the endpoint, mirroring the engine's `num_dp_ranks_of`;
+    /// an absent field counts as 1.
+    pub dp_ranks: u32,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -172,7 +170,10 @@ impl WorkerIntrospector {
             event_config,
             disaggregation_role,
             enable_http2: parsed.enable_http2,
-            dp_ranks: resolve_dp_ranks(parsed.dp_size, parsed.attn_dp_size, worker_url),
+            dp_ranks: parsed
+                .dp_size
+                .unwrap_or(1)
+                .saturating_mul(parsed.attn_dp_size.unwrap_or(1)),
         }
     }
 
@@ -299,34 +300,6 @@ impl Default for WorkerIntrospector {
     }
 }
 
-/// Count the DP ranks an engine dispatches to, mirroring the engine's
-/// `num_dp_ranks_of`: replicas (`dp_size`) times attention-DP groups
-/// (`attn_dp_size`), one of which is 1. An engine that predates `attn_dp_size`
-/// reports attention DP as `dp_size` alone, so an absent field counts as 1.
-/// A zero or overflowing product is a malformed report and is ignored.
-fn resolve_dp_ranks(
-    dp_size: Option<u32>,
-    attn_dp_size: Option<u32>,
-    worker_url: &str,
-) -> Option<u32> {
-    if dp_size.is_none() && attn_dp_size.is_none() {
-        return None;
-    }
-    let ranks = dp_size
-        .unwrap_or(1)
-        .checked_mul(attn_dp_size.unwrap_or(1))
-        .filter(|&ranks| ranks > 0);
-    if ranks.is_none() {
-        warn!(
-            worker_url = %worker_url,
-            ?dp_size,
-            ?attn_dp_size,
-            "introspect: /server_info reports an invalid DP size; treating the worker as single-rank"
-        );
-    }
-    ranks
-}
-
 /// Substitute a wildcard bind host (`*`, `0.0.0.0`, `::`, `[::]`) with
 /// the host parsed from the worker URL — the gateway has to connect to
 /// a routable address.  An unparsable worker URL leaves the host
@@ -411,12 +384,9 @@ struct ServerInfoBody {
     /// predate the flag.
     #[serde(default)]
     enable_http2: Option<bool>,
-    /// `ServerArgs.dp_size`: data-parallel replicas.
     #[serde(default)]
     dp_size: Option<u32>,
-    /// `ServerArgs.attn_dp_size`: attention-DP groups. Absent on SGLang
-    /// versions that express attention DP as `dp_size` plus
-    /// `enable_dp_attention`.
+    /// Absent on engines that express attention DP through `dp_size`.
     #[serde(default)]
     attn_dp_size: Option<u32>,
 }
@@ -800,20 +770,14 @@ mod tests {
         assert_eq!(got.enable_http2, None);
     }
 
-    /// The rank count is `dp_size * attn_dp_size`; an engine that predates
-    /// `attn_dp_size` reports attention DP through `dp_size` alone.
     #[tokio::test]
     async fn fetch_counts_dp_ranks() {
         for (body, want) in [
-            (json!({"dp_size": 1, "attn_dp_size": 8}), Some(8)),
-            (json!({"dp_size": 4, "attn_dp_size": 1}), Some(4)),
-            (json!({"dp_size": 4}), Some(4)),
-            (json!({"dp_size": 0}), None),
-            (json!({}), None),
+            (json!({"dp_size": 1, "attn_dp_size": 8}), 8),
+            (json!({"dp_size": 4}), 4),
         ] {
-            let (url, _shutdown) = spawn_fake_worker(body.clone()).await;
-            let got = fast_introspector().fetch(&url).await;
-            assert_eq!(got.dp_ranks, want, "{body}");
+            let (url, _shutdown) = spawn_fake_worker(body).await;
+            assert_eq!(fast_introspector().fetch(&url).await.dp_ranks, want);
         }
     }
 

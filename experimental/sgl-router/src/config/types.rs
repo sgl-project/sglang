@@ -337,8 +337,7 @@ pub struct ModelConfig {
     pub policy: PolicyKind,
     /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
-    /// Choose a DP rank inside each selected multi-rank worker and send it to
-    /// the engine as `X-Data-Parallel-Rank`. See [`crate::policies::dp_rank`].
+    /// Send a DP rank as `X-Data-Parallel-Rank`; see [`crate::policies::dp_rank`].
     pub dp_aware: bool,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,

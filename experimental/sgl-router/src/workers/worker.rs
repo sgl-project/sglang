@@ -39,59 +39,25 @@ pub enum WireProtocol {
     H2c,
 }
 
-/// Engine facts resolved from `/server_info` before a worker is constructed.
-///
-/// Fixed for the worker's lifetime, like [`WireProtocol`]: both come from the
-/// engine's launch arguments. A bare [`WireProtocol`] converts into a profile
-/// with a single DP rank, which is what an engine that predates the DP fields
-/// on `/server_info` is treated as.
+/// Engine launch facts from `/server_info`; a bare [`WireProtocol`] means one DP rank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineProfile {
     pub protocol: WireProtocol,
-    /// Number of data-parallel ranks the engine's DP controller dispatches
-    /// to (`dp_size * attn_dp_size`), at least 1.
+    /// `dp_size * attn_dp_size`; 0 is treated as 1.
     pub dp_ranks: u32,
-}
-
-impl Default for EngineProfile {
-    fn default() -> Self {
-        Self {
-            protocol: WireProtocol::default(),
-            dp_ranks: 1,
-        }
-    }
 }
 
 impl From<WireProtocol> for EngineProfile {
     fn from(protocol: WireProtocol) -> Self {
         Self {
             protocol,
-            ..Self::default()
+            dp_ranks: 1,
         }
     }
 }
 
-/// Router-local in-flight count per DP rank, for `--dp-aware` rank selection.
-/// One slot per rank; a single-rank engine never has a rank chosen for it.
-#[derive(Debug)]
-struct DpRankLoad {
-    inflight: Arc<[AtomicUsize]>,
-    /// Rotates the starting rank among equally loaded ranks.
-    cursor: AtomicUsize,
-}
-
-impl DpRankLoad {
-    fn new(dp_ranks: u32) -> Self {
-        Self {
-            inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
-            cursor: AtomicUsize::new(0),
-        }
-    }
-}
-
-/// RAII guard holding one in-flight slot on a DP rank. Obtain via
-/// [`Worker::dp_rank_guard`].
-#[must_use = "DpRankGuard must be held for the request's lifetime; dropping it immediately releases the rank slot"]
+/// Holds one router in-flight slot on a DP rank; see [`Worker::dp_rank_guard`].
+#[must_use = "dropping a DpRankGuard releases the rank slot"]
 pub struct DpRankGuard {
     inflight: Arc<[AtomicUsize]>,
     rank: usize,
@@ -255,8 +221,8 @@ pub struct Worker {
     /// PD pairing scope; carried from `WorkerSpec`. See
     /// [`crate::discovery::WorkerSpec`].
     version_group: Option<String>,
-    /// Per-rank in-flight counts; its length is the engine's DP rank count.
-    dp_rank_load: DpRankLoad,
+    /// Router in-flight requests per DP rank; one slot per rank.
+    dp_rank_inflight: Arc<[AtomicUsize]>,
 }
 
 impl Worker {
@@ -293,7 +259,7 @@ impl Worker {
             bootstrap_port: spec.bootstrap_port,
             pooled_at: tokio::time::Instant::now(),
             version_group: spec.version_group,
-            dp_rank_load: DpRankLoad::new(dp_ranks),
+            dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
         }
     }
 
@@ -358,35 +324,19 @@ impl Worker {
         self.protocol
     }
 
-    /// Number of DP ranks the engine dispatches to; 1 for a single-rank engine.
     pub fn dp_ranks(&self) -> u32 {
-        self.dp_rank_load.inflight.len() as u32
+        self.dp_rank_inflight.len() as u32
     }
 
-    /// Requests this router has in flight on DP rank `rank`; 0 for a rank
-    /// the engine does not have.
     pub fn dp_rank_inflight(&self, rank: u32) -> usize {
-        self.dp_rank_load
-            .inflight
-            .get(rank as usize)
-            .map_or(0, |slot| slot.load(Ordering::Relaxed))
+        self.dp_rank_inflight[rank as usize].load(Ordering::Relaxed)
     }
 
-    /// Advances and returns the rotation offset used to break ties between
-    /// equally loaded DP ranks.
-    pub(crate) fn next_dp_rank_offset(&self) -> usize {
-        self.dp_rank_load.cursor.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Claims an in-flight slot on DP rank `rank` until the guard drops.
-    ///
-    /// # Panics
-    /// If `rank` is not below [`Self::dp_ranks`].
     pub fn dp_rank_guard(&self, rank: u32) -> DpRankGuard {
         let rank = rank as usize;
-        self.dp_rank_load.inflight[rank].fetch_add(1, Ordering::Relaxed);
+        self.dp_rank_inflight[rank].fetch_add(1, Ordering::Relaxed);
         DpRankGuard {
-            inflight: Arc::clone(&self.dp_rank_load.inflight),
+            inflight: Arc::clone(&self.dp_rank_inflight),
             rank,
         }
     }

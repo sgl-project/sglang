@@ -55,8 +55,8 @@ impl WorkerRegistry {
     }
 
     /// Add a worker, optionally supplying a circuit-breaker config, and with
-    /// the engine profile (forwarding protocol and DP rank count) resolved
-    /// for it. Pass `None` to use the circuit-breaker default (threshold = 3).
+    /// the engine profile resolved for it. Pass `None` to use the
+    /// circuit-breaker default (threshold = 3).
     ///
     /// Re-adding an existing `WorkerId` is an upsert: the prior entry's
     /// `by_model` memberships are cleared first so a model that the new

@@ -61,10 +61,14 @@ pub(super) async fn forward_chat_request(
     }
     // Only the router chooses DP ranks; a client-supplied rank is never forwarded.
     headers.remove(X_DATA_PARALLEL_RANK);
-    let prefill_rank = pick_dp_rank(ctx, &request, &headers, &prefill, true);
+    let dp_aware = ctx.config.model.dp_aware;
+    let prefill_rank = dp_aware
+        .then(|| prompt_dp_rank(ctx, &request, &headers, &prefill))
+        .flatten();
     let decode_rank = decode
         .as_deref()
-        .and_then(|decode| pick_dp_rank(ctx, &request, &headers, decode, false));
+        .filter(|_| dp_aware)
+        .and_then(|decode| select_dp_rank(decode, None, &[]));
 
     // Track worker occupancy and the prompt's contribution to active load.
     let worker_load_guard = if track_dispatch_timestamps {
@@ -180,56 +184,32 @@ pub(super) async fn forward_chat_request(
     Ok(response)
 }
 
-/// Under `--dp-aware`, pick the DP rank `worker` should run this request on;
-/// `None` when the flag is off or the worker has a single rank.
-///
-/// Only the worker that computes the prompt (`computes_prompt`: plain or
-/// prefill) is steered by affinity and cached prefix; a decode worker
-/// receives its KV cache from prefill, so it is placed by load alone.
-fn pick_dp_rank(
+/// Rank for the worker that computes the prompt; decode gets its KV from
+/// prefill, so it is placed by load alone.
+fn prompt_dp_rank(
     ctx: &AppContext,
     request: &PreparedChatRequest,
     headers: &HeaderMap,
     worker: &Worker,
-    computes_prompt: bool,
 ) -> Option<u32> {
-    if !ctx.config.model.dp_aware || worker.dp_ranks() <= 1 {
+    if worker.dp_ranks() <= 1 {
         return None;
     }
     let model = &ctx.config.model;
-    let affinity_key = computes_prompt
-        .then(|| {
-            let sticky = model.sticky.as_ref().map(|c| c.header_name.as_str());
-            let session = model
-                .affinity
-                .as_ref()
-                .map(|c| c.session_id_header.as_str());
-            [sticky, session]
-                .into_iter()
-                .flatten()
-                .find_map(|name| nonempty_header(headers, name))
-        })
-        .flatten();
-    let prefix_depths = match (
-        affinity_key,
-        &ctx.radix_tree_prefix_provider,
-        &request.tokens,
-    ) {
-        (None, Some(provider), Some(tokens)) if computes_prompt => {
-            provider.rank_depths(&tokens.ids, &worker.url)
-        }
+    let sticky = model.sticky.as_ref().map(|c| c.header_name.as_str());
+    let session = model
+        .affinity
+        .as_ref()
+        .map(|c| c.session_id_header.as_str());
+    let key = [sticky, session]
+        .into_iter()
+        .flatten()
+        .find_map(|name| nonempty_header(headers, name));
+    let prefix_depths = match (key, &ctx.radix_tree_prefix_provider, &request.tokens) {
+        (None, Some(provider), Some(tokens)) => provider.rank_depths(&tokens.ids, &worker.url),
         _ => Vec::new(),
     };
-    let pick = select_dp_rank(worker, affinity_key, &prefix_depths)?;
-    ctx.metrics
-        .record_dp_rank_selection(worker.mode().into(), pick.reason);
-    tracing::debug!(
-        worker_url = %worker.url,
-        dp_rank = pick.rank,
-        reason = pick.reason.as_str(),
-        "selected DP rank",
-    );
-    Some(pick.rank)
+    select_dp_rank(worker, key, &prefix_depths)
 }
 
 fn with_dp_rank(mut headers: HeaderMap, rank: Option<u32>) -> HeaderMap {
@@ -445,7 +425,11 @@ impl DispatchMetrics {
             registry: Arc::clone(&ctx.metrics),
             model: request.model.0.clone(),
             worker_url: response_worker.url.clone(),
-            mode: response_worker.mode().into(),
+            mode: match response_worker.mode() {
+                WorkerMode::Prefill => WorkerModeLabel::Prefill,
+                WorkerMode::Decode => WorkerModeLabel::Decode,
+                WorkerMode::Plain => WorkerModeLabel::Plain,
+            },
             streaming: request.streaming,
             request_started_at,
         }
