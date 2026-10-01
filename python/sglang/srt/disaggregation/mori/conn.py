@@ -293,6 +293,8 @@ class TransferTarget:
 
 class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    # Implements teardown() below, so runtime PD role switching is supported.
+    supports_role_switch = True
 
     # The bootstrap socket carries several message kinds, so the status message
     # is tagged. Mori has always shipped the failure reason with it.
@@ -315,6 +317,9 @@ class MoriKVManager(CommonKVManager):
         self.transfer_lock = threading.Lock()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
+        # Set by teardown() to make worker threads exit (PoC: P<->D role switch).
+        self._stopped = False
+        self._worker_threads: List[threading.Thread] = []
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -325,7 +330,10 @@ class MoriKVManager(CommonKVManager):
             self._wait_poll_ms = envs.SGLANG_MORI_WAIT_POLL_MS.get()
             self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
             for shard, queue in enumerate(self._transfer_queues):
-                threading.Thread(
+                # Track the thread so teardown() can join it: otherwise every
+                # P->D->P flip that re-enters PREFILL leaks _num_shards threads
+                # (each parked forever in FastQueue.get()).
+                t = threading.Thread(
                     target=self._transfer_worker,
                     args=(queue,),
                     daemon=True,
@@ -333,7 +341,9 @@ class MoriKVManager(CommonKVManager):
                         f"mori-xfer-dp{self.system_dp_rank}-"
                         f"tp{self.attn_tp_rank}-s{shard}"
                     ),
-                ).start()
+                )
+                t.start()
+                self._worker_threads.append(t)
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._start_decode_thread()
@@ -420,6 +430,11 @@ class MoriKVManager(CommonKVManager):
     def _transfer_worker(self, queue: FastQueue) -> None:
         while True:
             kv_chunk = queue.get()
+            # teardown() pushes a None sentinel to unblock get() and stop the
+            # worker: FastQueue.get() blocks indefinitely, so checking _stopped
+            # alone can never wake a parked worker during a role switch.
+            if kv_chunk is None:
+                break
             try:
                 self._process_transfer_chunk(kv_chunk)
             except Exception as exc:
@@ -683,11 +698,13 @@ class MoriKVManager(CommonKVManager):
         logger.debug("Room %s marked Failed via ABORT from decode", bootstrap_room)
 
     def _start_bootstrap_thread(self) -> None:
+        recv = self._make_worker_recv(self.server_socket)
+
         def bootstrap_worker():
-            while True:
+            while not self._stopped:
                 try:
-                    msg = self.server_socket.recv_multipart()
-                    if not msg:
+                    msg = recv()
+                    if msg is None:
                         continue
 
                     tag = msg[0]
@@ -705,15 +722,23 @@ class MoriKVManager(CommonKVManager):
                     else:
                         self._handle_transfer_message(payload)
                 except Exception:
+                    if self._stopped:
+                        break
                     logger.exception("Bootstrap worker failed")
 
-        threading.Thread(target=bootstrap_worker, daemon=True).start()
+        t = threading.Thread(target=bootstrap_worker, daemon=True)
+        t.start()
+        self._worker_threads.append(t)
 
     def _start_decode_thread(self) -> None:
+        recv = self._make_worker_recv(self.server_socket)
+
         def decode_worker():
-            while True:
+            while not self._stopped:
                 try:
-                    msg = self.server_socket.recv_multipart()
+                    msg = recv()
+                    if msg is None:
+                        continue
                     if msg and msg[0] == MoriKVManager.AUX_DATA_HEADER:
                         self._handle_aux_data(msg)
                         continue
@@ -732,9 +757,69 @@ class MoriKVManager(CommonKVManager):
                         failure_reason=reason,
                     )
                 except Exception:
+                    if self._stopped:
+                        break
                     logger.exception("Decode status worker failed")
 
-        threading.Thread(target=decode_worker, daemon=True).start()
+        t = threading.Thread(target=decode_worker, daemon=True)
+        t.start()
+        self._worker_threads.append(t)
+
+    def teardown(self) -> None:
+        """Stop worker threads and release transport resources so this
+        KVManager can be discarded during a P<->D role switch.
+
+        The KV cache pool memory is owned by the scheduler and is NOT freed
+        here; only mori-side registrations / sockets / engine are released.
+        """
+        self._stopped = True
+        # Transfer workers (PREFILL role) park in FastQueue.get(), which has no
+        # timeout; push a None sentinel per shard to wake and stop them so the
+        # join below returns instead of leaking the thread.
+        for queue in getattr(self, "_transfer_queues", []):
+            try:
+                queue.put(None)
+            except Exception:
+                logger.exception("Failed to signal mori transfer worker on teardown")
+        # Join workers before touching their sockets: ZMQ sockets aren't
+        # thread-safe, so don't close server_socket while a worker may poll it.
+        for t in self._worker_threads:
+            t.join(timeout=3.0)
+        self._worker_threads = []
+        # Drop the queues so their buffered tasks/senders are released too.
+        self._transfer_queues = []
+        try:
+            self.server_socket.close(linger=0)
+        except Exception:
+            logger.exception("Failed to close mori server_socket during teardown")
+        # destroy() force-closes every socket in the context (incl. per-thread
+        # cached PUSH sockets); plain term() would block waiting on them.
+        try:
+            self._zmq_ctx.destroy(linger=0)
+        except Exception:
+            logger.exception("Failed to destroy mori zmq context during teardown")
+        # Deregister RDMA memory and drop the IOEngine reference.
+        try:
+            for descs in (self.kv_mem_descs, self.aux_mem_descs):
+                for desc in descs:
+                    try:
+                        self.engine.deregister_memory(desc)
+                    except Exception:
+                        pass
+            for component_descs in self.state_mem_descs:
+                for desc in component_descs:
+                    try:
+                        self.engine.deregister_memory(desc)
+                    except Exception:
+                        pass
+        finally:
+            self.kv_mem_descs = []
+            self.aux_mem_descs = []
+            self.state_mem_descs = []
+            self.engine = None
+        logger.info(
+            "MoriKVManager torn down (was role=%s)", self.disaggregation_mode.value
+        )
 
     def _add_remote_peer(self, register_info: KVArgsRegisterInfo) -> None:
         engine_key = register_info.engine_key
@@ -846,6 +931,10 @@ class MoriKVManager(CommonKVManager):
         return grouped_plan.materialize(item_len)
 
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+        )
+
         page_size = self.kv_args.page_size
 
         src_item_len = self.kv_args.kv_item_lens[0]
@@ -861,27 +950,21 @@ class MoriKVManager(CommonKVManager):
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
 
-        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
 
         bytes_per_head_slice = bytes_per_token_dst // dst_heads_per_rank
         if bytes_per_head_slice == 0:
             raise ValueError("Head slice size evaluates to zero")
 
-        src_replication = max(1, prefill_tp_size // total_kv_heads)
-
-        local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
-        dst_tp_rank = peer_info.decode_tp_rank % decode_tp_size
-
-        if prefill_tp_size > decode_tp_size:
-            src_head_start = 0
-            num_heads_to_send = src_heads_per_rank
-            unique_head_idx = local_tp_rank // src_replication
-            dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
-        else:
-            src_head_start = (dst_tp_rank * dst_heads_per_rank) % src_heads_per_rank
-            num_heads_to_send = dst_heads_per_rank
-            dst_head_start = 0
+        src_head_start, num_heads_to_send, dst_head_start, _ = (
+            compute_head_slice_params(
+                prefill_tp_size,
+                decode_tp_size,
+                self.kv_args.engine_rank,
+                peer_info.decode_tp_rank,
+                total_kv_heads,
+            )
+        )
 
         src_head_slice_offset = src_head_start * bytes_per_head_slice
         dst_head_slice_offset = dst_head_start * bytes_per_head_slice
@@ -1197,6 +1280,7 @@ class MoriKVManager(CommonKVManager):
                 "swa_ring",
                 "c128_state",
                 "minimax_index_k",
+                "minimax_dense_kv",
             ):
                 statuses.extend(
                     self._send_swa_dsa_state(
@@ -1324,7 +1408,12 @@ class MoriKVManager(CommonKVManager):
                 f"PD state transfer does not support TP-mismatched non-MLA SWA models "
                 f"(prefill_tp_size={self.attn_tp_size}, decode_tp_size={peer_info.decode_tp_size})"
             )
-        if state_type in ("qsa_pending", "qsa_compressed", "minimax_index_k"):
+        if state_type in (
+            "qsa_pending",
+            "qsa_compressed",
+            "minimax_index_k",
+            "minimax_dense_kv",
+        ):
             if self.pp_size is not None and self.pp_size > 1:
                 # MORI registration does not exchange state_layer_ids. Compact
                 # sparse-state lists therefore cannot be paired safely across
@@ -1360,6 +1449,7 @@ class MoriKVManager(CommonKVManager):
                 "qsa_compressed",
                 "swa_ring",
                 "c128_state",
+                "minimax_dense_kv",
             ):
                 raise RuntimeError(
                     f"{state_type.upper()} state index length mismatch: "

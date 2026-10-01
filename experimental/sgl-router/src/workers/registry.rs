@@ -77,7 +77,7 @@ impl WorkerRegistry {
     /// spec carries an id that already has an entry, the prior entry
     /// stays put — it's the caller's responsibility to decide whether
     /// to evict it (and, importantly, to also clean up sidecar state
-    /// in `KvEventIndex` / `ActiveLoadRegistry` if so). Doing that
+    /// in `KvEventIndex` / `RouterInflightLoadRegistry` if so). Doing that
     /// cleanup here would leak orphan state into those sidecars when
     /// a caller actually wanted to keep the prior entry.
     pub fn add_with_cb(
@@ -123,7 +123,13 @@ impl WorkerRegistry {
                 }
             }
         }
-        let w = Arc::new(Worker::with_cb_config(spec, cb, protocol));
+        let mut w = Worker::with_cb_config(spec, cb, protocol);
+        // An upsert (e.g. bootstrap repair racing the grace expiry) must not reset
+        // live state or extend the bootstrap-port grace.
+        if let Some(prev) = self.by_id.get(&w.id) {
+            w.inherit(&prev);
+        }
+        let w = Arc::new(w);
         let id = w.id.clone();
         self.remove_locked(&id);
         for m in &w.model_ids {
@@ -168,6 +174,7 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
+    /// Workers eligible for selection; excludes prefills still awaiting a bootstrap port.
     pub fn healthy_workers_for(&self, model: &ModelId) -> Vec<Arc<Worker>> {
         // Use `would_allow` (non-mutating) for filtering — `allow()` would
         // claim a half-open probe slot for every enumerated candidate,
@@ -176,6 +183,7 @@ impl WorkerRegistry {
         // [`crate::proxy`].
         self.workers_for(model)
             .into_iter()
+            .filter(|w| !w.awaiting_bootstrap_port())
             .filter(|w| w.breaker.would_allow())
             .collect()
     }
@@ -244,7 +252,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode,
             model_ids: models.iter().map(|m| ModelId((*m).into())).collect(),
-            bootstrap_port: None,
+            ..Default::default()
         }
     }
 
@@ -270,6 +278,36 @@ mod tests {
         let mut ids: Vec<String> = r.all().into_iter().map(|w| w.id.0.clone()).collect();
         ids.sort();
         assert_eq!(ids, vec!["d", "p", "w1"]);
+    }
+
+    #[test]
+    fn upsert_keeps_live_state() {
+        let r = WorkerRegistry::default();
+        let id = WorkerId("p".into());
+        r.add(spec("p", WorkerMode::Prefill, &["m"])).unwrap();
+        let first = r.get(&id).unwrap();
+        let _guard = first.load_guard();
+        r.add(spec("p", WorkerMode::Prefill, &["m"])).unwrap();
+        let second = r.get(&id).unwrap();
+        assert!(Arc::ptr_eq(&second.breaker, &first.breaker));
+        assert_eq!(second.router_inflight_load(), 1);
+    }
+
+    #[test]
+    fn upsert_adopts_a_changed_breaker_config() {
+        let r = WorkerRegistry::default();
+        let cb = CircuitBreakerConfig {
+            cool_down: std::time::Duration::from_secs(60),
+            ..Default::default()
+        };
+        r.add(spec("p", WorkerMode::Prefill, &[])).unwrap();
+        r.add_with_cb(
+            spec("p", WorkerMode::Prefill, &["m"]),
+            Some(cb.clone()),
+            WireProtocol::default(),
+        )
+        .unwrap();
+        assert_eq!(r.get(&WorkerId("p".into())).unwrap().breaker.config(), &cb);
     }
 
     #[test]
@@ -463,7 +501,7 @@ mod tests {
     /// On a rejected upsert with `MixedPdAndPlain`, the registry is
     /// **not** mutated — the prior entry for the rejected id stays
     /// put. Eviction (with the matching `KvEventIndex` /
-    /// `ActiveLoadRegistry` cleanup) is the manager's responsibility;
+    /// `RouterInflightLoadRegistry` cleanup) is the manager's responsibility;
     /// doing it here would leak orphan state in those sidecars.
     #[test]
     fn upsert_rejected_with_mixed_modes_leaves_registry_unchanged() {

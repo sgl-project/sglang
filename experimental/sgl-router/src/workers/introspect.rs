@@ -31,7 +31,7 @@ use serde::Deserialize;
 use tracing::warn;
 use url::Url;
 
-use crate::policies::kv_events::EventConfig;
+use crate::state::kv_events::EventConfig;
 
 /// Default timeout for `/server_info`. Conservative for a small JSON
 /// payload served by SGLang's HTTP server.
@@ -148,7 +148,7 @@ impl WorkerIntrospector {
 
         // EAGLE-family speculative decoding ⇒ the worker hashes KV blocks over
         // token bigrams; the router must mirror that on the selection side.
-        let is_bigram = crate::policies::kv_events::classify_bigram(
+        let is_bigram = crate::state::kv_events::classify_bigram(
             parsed.speculative_algorithm.as_deref(),
             worker_url,
         );

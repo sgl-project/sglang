@@ -19,7 +19,13 @@ export const config = {
         { id: "fp8", label: "FP8" },
         {
           id: "nvfp4",
-          label: "NVFP4",
+          label: "NVFP4 (RDXA)",
+          disabled: (s) => !["gb300", "gb200", "b200", "b300"].includes(s.hw),
+          disableReason: "The NVFP4 W4A4 kernels are Blackwell-only; Hopper cannot serve this checkpoint.",
+        },
+        {
+          id: "nvfp4-nvda",
+          label: "NVFP4 (NVDA)",
           disabled: (s) => !["gb300", "gb200", "b200", "b300"].includes(s.hw),
           disableReason: "The NVFP4 W4A4 kernels are Blackwell-only; Hopper cannot serve this checkpoint.",
         },
@@ -33,8 +39,7 @@ export const config = {
       s.kvDsaPair === pairing &&
       s.mmTransport === "auto" &&
       s.hicache === "off" &&
-      s.bcg === "off" &&
-      s.dcp === "off"
+      s.bcg === "off"
     );
   },
 
@@ -120,19 +125,29 @@ export const config = {
         },
       ],
     },
+    // Parser flags live in one overlay dim so every generated command gets
+    // them without per-cell duplication; the Parsers card toggles derive
+    // on/off from the composed flags. `auto` needs the GLM-5.3 template
+    // detection (v0.5.20+).
     {
-      id: "dcp",
-      title: "Context Parallelism",
-      default: "off",
+      id: "parsers",
+      title: "Parsers",
+      default: "auto",
       options: [
-        { id: "off", label: "Off" },
         {
-          id: "4",
-          label: "DCP 4",
-          disabled: (s) => s.hw !== "gb300",
-          disableReason: "DCP is validated only on 4x GB300 for now.",
-          flags: ["--dcp-size 4", "--dcp-comm-backend a2a", "--dcp-replicate-q-proj"],
-          hints: ["Measured on 4x GB300 with both KV/DSA pairings and full decode graph on the earlier TP4/EP4 recipe; re-measurement on the current command is pending."],
+          id: "auto",
+          label: "Auto (glm45 + glm47)",
+          stripPrefixes: ["--reasoning-parser", "--tool-call-parser"],
+          flags: [
+            "--reasoning-parser auto",
+            "--tool-call-parser auto",
+          ],
+        },
+        {
+          id: "off",
+          label: "Off",
+          stripPrefixes: ["--reasoning-parser", "--tool-call-parser"],
+          flags: [],
         },
       ],
     },
@@ -141,6 +156,7 @@ export const config = {
   modelNames: {
     default: "zai-org/GLM-5.3-Flash",
     nvfp4: "RadixArk/GLM-5.3-Flash-NVFP4",
+    "nvfp4-nvda": "nvidia/GLM-5.3-Flash-NVFP4",
   },
 
   placeholders: {
@@ -191,15 +207,16 @@ sgl-eval run gsm8k \\
     ["aime2026_pct", "AIME 2026", "%"],
   ],
 
-  // Support is not in a public sglang release yet, so the nightly images do
-  // not work; every NVIDIA lane uses the purpose-built CUDA 13 image.
+  // v0.5.20 (= latest) carries GLM-5.3-Flash support (#36507) and the GLM-5.3
+  // template parser detection (#38297) that `--*-parser auto` needs; the old
+  // glm-5.3-flash dev image (2026-09-03) predates #38297 and misdetects.
   dockerImages: {
-    gb300: "lmsysorg/sglang:glm-5.3-flash",
-    h100: "lmsysorg/sglang:glm-5.3-flash",
-    h200: "lmsysorg/sglang:glm-5.3-flash",
-    b200: "lmsysorg/sglang:glm-5.3-flash",
-    b300: "lmsysorg/sglang:glm-5.3-flash",
-    gb200: "lmsysorg/sglang:glm-5.3-flash",
+    gb300: "lmsysorg/sglang:latest",
+    h100: "lmsysorg/sglang:latest",
+    h200: "lmsysorg/sglang:latest",
+    b200: "lmsysorg/sglang:latest",
+    b300: "lmsysorg/sglang:latest",
+    gb200: "lmsysorg/sglang:latest",
   },
 
   github: {
@@ -276,8 +293,8 @@ sgl-eval run gsm8k \\
 
     parsers: {
       items: [
-        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser glm45" },
-        { id: "toolCall", label: "Tool Call Parser", flag: "--tool-call-parser glm47" },
+        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser auto" },
+        { id: "toolCall", label: "Tool Call Parser", flag: "--tool-call-parser auto" },
       ],
     },
 
@@ -322,12 +339,7 @@ sgl-eval run gsm8k \\
             "--speculative-draft-model-path incoai/GLM-5.3-Flash-DFlash2",
             "--speculative-draft-attention-backend fa4",
           ],
-          // DFLASH needs this model's hidden-state capture, which landed on the
-          // GLM-5.3-Flash support branch (PR #36708 into #36507's
-          // xinyuan/glm-5.3-flash-support), not on main — so it postdates the
-          // image the Install accordion pins. Drop this note once #36507 merges
-          // and a published image carries it.
-          note: "⚠️ Needs the GLM-5.3-Flash hidden-state capture from PR #36708. It is merged into the PR #36507 support branch (xinyuan/glm-5.3-flash-support), not into main, so pull that branch at its current head — or add #36708's commit on top of an older checkout — before serving. The lmsysorg/sglang:glm-5.3-flash image alone is not enough.",
+          note: "⚠️ The draft checkpoint incoai/GLM-5.3-Flash-DFlash2 is access-gated: request access on its Hugging Face page, then download it alongside the target before serving.",
           disable: [
             {
               when: { dpAttnOn: [true] },
@@ -347,8 +359,8 @@ sgl-eval run gsm8k \\
       verified: true,
       verificationStatus: (s) =>
         s.bcg !== "off" || s.mmTransport !== "auto" || s.hicache !== "off" ? "unverified" :
-        s.kvDsaPair === "fp8-trtllm" && s.dcp === "off" ? "verified" :
-        ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) && ["off", "4"].includes(s.dcp)
+        s.kvDsaPair === "fp8-trtllm" ? "verified" :
+        s.kvDsaPair === "bf16-tilelang"
           ? "in-progress"
           : "unverified",
       env: [],
@@ -363,8 +375,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -377,8 +387,7 @@ sgl-eval run gsm8k \\
         s.bcg !== "off" ? "unverified" :
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
-        s.hicache === "off" &&
-        s.dcp === "off"
+        s.hicache === "off"
           ? "in-progress"
           : "unverified",
       env: [],
@@ -389,46 +398,31 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     // RadixArk NVFP4 W4A4 checkpoint (ModelOpt 0.46.0, abs-max, group size
     // 16): routed and shared experts plus the dense MLPs are FP4; attention,
-    // router, MTP, embeddings, and the vision tower stay BF16. Validated on
-    // 4x GB300 and 4x B300 with both KV/DSA pairings; the benchmark rows
-    // carry measured speed for both pairings on the current release image.
+    // router, MTP, embeddings, and the vision tower stay BF16. Commands match
+    // the NVFP4 (NVDA) cells. Only the 8x B300 cells are measured.
     {
       match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
-      verified: true,
-      verificationStatus: (s) =>
-        s.bcg !== "off" ? "unverified" :
-        ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
-        s.mmTransport === "auto" &&
-        s.hicache === "off" &&
-        s.dcp === "off"
-          ? "in-progress"
-          : "unverified",
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 4",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend flashinfer_cutlass",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
-        "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -436,34 +430,20 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4" },
       nnodes: 1,
-      verified: true,
-      verificationStatus: (s) =>
-        s.bcg !== "off" ? "unverified" :
-        ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
-        s.mmTransport === "auto" &&
-        s.hicache === "off" &&
-        s.dcp === "off"
-          ? "verified"
-          : "unverified",
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 4",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend flashinfer_cutlass",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
-        "--mem-fraction-static 0.85",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
-    // Same NVFP4 recipe on the remaining Blackwell platforms, at each fp8
-    // cell's TP size (gb200 TP4, b200/b300 TP8). Not measured on this
-    // hardware, so every cell here reports unverified.
     {
       match: { hw: "gb200", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
@@ -473,18 +453,14 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 4",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend flashinfer_cutlass",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
-        "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -498,13 +474,10 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 4",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend flashinfer_cutlass",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
-        "--mem-fraction-static 0.85",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -518,18 +491,14 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 8",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend flashinfer_cutlass",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
-        "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -543,13 +512,10 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 8",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend flashinfer_cutlass",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
-        "--mem-fraction-static 0.85",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -557,24 +523,27 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b300", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        s.bcg === "off" &&
+        s.kvDsaPair === "fp8-trtllm" &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off"
+          ? "verified"
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 8",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend flashinfer_cutlass",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
-        "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -582,19 +551,193 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b300", strategy: "high-throughput", quant: "nvfp4" },
       nnodes: 1,
+      verified: true,
+      verificationStatus: (s) =>
+        s.bcg === "off" &&
+        s.kvDsaPair === "fp8-trtllm" &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off"
+          ? "verified"
+          : "unverified",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 8",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // NVIDIA NVFP4 checkpoint (nvidia/GLM-5.3-Flash-NVFP4, ModelOpt 0.47.0,
+    // group size 16). Same FP8 KV + TRT-LLM DSA and flashinfer_trtllm MoE
+    // recipe as the FP8 Blackwell cells, at each platform's TP size (gb300 /
+    // gb200 TP4, b200 / b300 TP8). Only the 8x B300 cells are measured.
+    {
+      match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4-nvda" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 4",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4-nvda" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 4",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", strategy: "low-latency", quant: "nvfp4-nvda" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 4",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", strategy: "high-throughput", quant: "nvfp4-nvda" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 4",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", strategy: "low-latency", quant: "nvfp4-nvda" },
+      nnodes: 1,
       verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 8",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend flashinfer_cutlass",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
-        "--mem-fraction-static 0.85",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", strategy: "high-throughput", quant: "nvfp4-nvda" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 8",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", strategy: "low-latency", quant: "nvfp4-nvda" },
+      nnodes: 1,
+      verified: true,
+      verificationStatus: (s) =>
+        s.bcg === "off" &&
+        s.kvDsaPair === "fp8-trtllm" &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off"
+          ? "verified"
+          : "unverified",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 8",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", strategy: "high-throughput", quant: "nvfp4-nvda" },
+      nnodes: 1,
+      verified: true,
+      verificationStatus: (s) =>
+        s.bcg === "off" &&
+        s.kvDsaPair === "fp8-trtllm" &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off"
+          ? "verified"
+          : "unverified",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 8",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -623,8 +766,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -646,8 +787,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -675,8 +814,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -697,8 +834,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -721,8 +856,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -742,8 +875,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -766,8 +897,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -787,8 +916,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -809,8 +936,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -827,8 +952,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

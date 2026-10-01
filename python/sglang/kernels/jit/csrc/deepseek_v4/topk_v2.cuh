@@ -250,6 +250,103 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
   // PDL trigger secondary at the end the block typically has no use, so ignore it
 }
 
+#ifdef USE_ROCM
+// Only the ROCm DSA prefill emits this layout today, so CUDA/XPU builds stay
+// unchanged. Nothing below is AMD-specific; the guard can be dropped later.
+
+/**
+ * \brief Parameters of the packed (DSA extend) layout.
+ *
+ * Same addressing as the ragged layout -- every row's window lives inside one
+ * batch-global score buffer starting at `row_starts[i]` -- but the selected
+ * columns are mapped through a page table before they are written out. Prefill
+ * expands one request into many query-token rows, so several score rows share a
+ * page-table row; `row_to_batch[i]` says which one.
+ */
+struct TopKPackedParams {
+  // NOTE: may write. The head of the window is masked in place, see the kernel.
+  float* __restrict__ scores;
+  const int32_t* __restrict__ seq_lens;      // per-row window length
+  const int32_t* __restrict__ row_starts;    // per-row score column offset
+  const int32_t* __restrict__ row_to_batch;  // per-row page-table row; null => identity
+  const int32_t* __restrict__ page_table;
+  int32_t* __restrict__ page_indices;
+  int64_t score_stride;
+  int64_t page_table_stride;
+  uint32_t topk;
+  uint32_t page_bits;
+
+  SGL_DEVICE PageTransform get_transform(uint32_t bx) const {
+    const auto table_row = row_to_batch == nullptr ? bx : static_cast<uint32_t>(row_to_batch[bx]);
+    return {page_table + static_cast<int64_t>(table_row) * page_table_stride, page_bits, nullptr};
+  }
+};
+
+/**
+ * \brief Top-k over packed rows, emitting page-table indices.
+ * \tparam kPDL whether to use PDL to synchronize with the indexer kernel
+ *
+ * Dispatch mirrors `topk_ragged_kernel`: both are prefill kernels, so the level
+ * is picked per row at runtime and only the register and streaming
+ * implementations are instantiated (no plan, no cluster path).
+ */
+template <bool kPDL>
+TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams params) {
+  device::enable_smem_spilling();
+  constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
+  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+  __shared__ int32_t s_topk_indices[kMaxTopK];
+
+  const auto bx = blockIdx.x;
+  const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
+  const auto row_start = static_cast<uint32_t>(params.row_starts[bx]);
+  const auto topk = params.topk;
+  const auto transform = params.get_transform(bx);
+  const auto out = params.page_indices + bx * static_cast<int64_t>(topk);
+  const auto score = params.scores + bx * params.score_stride;
+
+  auto problem = TopKProblem{
+      .in = score + row_start,
+      .out = out,
+      .topk = topk,
+      .seq_len = seq_len,
+  };
+  if (seq_len <= topk) {
+    return trivial_transform<kPDL, TopKMode::PAGE_TABLE>(problem, transform);
+  }
+
+  // Round the window down to a `kVecSize` boundary and mask the <= 3 columns
+  // that pulls in, with the same bias / input_start as `topk_ragged_kernel`.
+  const auto rem = row_start % kVecSize;
+  if (rem != 0) {
+    // The mask has to land after the indexer has retired
+    // Otherwise it may be accidentally overwritten by DG upstream
+    device::PDLWaitPrimary<kPDL>();
+    static_assert(kVecSize <= kBlockSize, "not enough threads ");
+    if (const auto tx = threadIdx.x; tx < rem) {
+      score[row_start - rem + tx] = impl::padding_value();
+    }
+  }
+  using device::topk::broadcast;
+  problem.in -= rem;
+  problem.out = s_topk_indices;  // write into stage buffer in smem first
+  problem.seq_len = seq_len + rem;
+  problem.bias = broadcast(-static_cast<int32_t>(rem));
+  problem.input_start = broadcast(rem);
+
+  if (problem.seq_len <= Register2::kMaxSeqLen) {
+    Register2::forward<kPDL>(problem, &smem);
+  } else if (problem.seq_len <= Register4::kMaxSeqLen) {
+    Register4::forward<kPDL>(problem, &smem);
+  } else {
+    Streaming::forward<kPDL>(problem, &smem);
+  }
+  device::PDLTriggerSecondary<kPDL>();
+  __syncthreads();
+  paged_transform<TopKMode::PAGE_TABLE>(problem, out, transform);
+}
+#endif  // USE_ROCM
+
 /**
  * \brief Main kernel for the short items and epilogue of long items.
  * \tparam kPDL whether to use PDL to synchronize with the cluster kernel (if any)
@@ -328,7 +425,8 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
 #endif
 
 #ifndef SGL_TOPK_V2_MAX_C16_OCC1
-#define SGL_TOPK_V2_MAX_C16_OCC1 7
+// Non-portable clusters require a positive device probe.
+#define SGL_TOPK_V2_MAX_C16_OCC1 0
 #endif
 
 constexpr uint32_t kNumPersistentClusters = SGL_TOPK_V2_MAX_C8_OCC2;
@@ -785,6 +883,94 @@ struct TopKKernel {
         .config({.use_pdl = kUsePDL})
         .launch(topk_ragged_kernel<kUsePDL>, params);
   }
+
+#ifdef USE_ROCM  // see the packed kernel above
+  /**
+   * \brief Packed (DSA extend prefill) variant of `transform_paged`: per-row
+   * window inside one batch-global score buffer, page-table output, no plan.
+   *
+   * `scores` is written in place exactly like `transform_ragged` does, so rows
+   * must not overlap and the buffer must have no consumer after this call.
+   *
+   * `row_to_batch` absent means the page table is indexed by score row; present,
+   * it maps each score row onto the table row of the request it belongs to,
+   * which is what prefill needs (one request expands into many query rows).
+   */
+  static void transform_packed(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView row_starts,
+      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::TensorView page_indices,
+      const uint32_t page_size,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_to_batch) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto L = SymbolicSize{"max_seq_len"};
+    auto S = SymbolicSize{"score_stride"};
+    auto R = SymbolicSize{"page_table_rows"};
+    auto K = SymbolicSize{"topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+
+    TensorMatcher({B, L})  // score
+        .with_strides({S, 1})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(scores);
+    TensorMatcher({B})  // seq_lens
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(seq_lens);
+    TensorMatcher({B})  // row_starts
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(row_starts);
+    TensorMatcher({R, -1})  // page_table
+        .with_strides({-1, 1})
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(page_table);
+    TensorMatcher({B, K})  // page_indices
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(page_indices);
+    const int32_t* row_to_batch_ptr = nullptr;
+    if (row_to_batch.has_value()) {
+      TensorMatcher({B})  // row_to_batch
+          .with_dtype<int32_t>()
+          .with_device(device_)
+          .verify(row_to_batch.value());
+      row_to_batch_ptr = static_cast<const int32_t*>(row_to_batch.value().data_ptr());
+    } else {
+      RuntimeCheck(R.unwrap() == B.unwrap(), "page_table must have one row per score row unless row_to_batch is given");
+    }
+
+    RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    // The kernel masks the head of each window in place, so overlapping rows
+    // would clobber each other.
+    RuntimeCheck(S.unwrap() >= L.unwrap(), "scores rows must not overlap");
+    const auto topk = static_cast<uint32_t>(K.unwrap());
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
+
+    const auto params = TopKPackedParams{
+        .scores = static_cast<float*>(scores.data_ptr()),
+        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+        .row_starts = static_cast<const int32_t*>(row_starts.data_ptr()),
+        .row_to_batch = row_to_batch_ptr,
+        .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
+        .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
+        .score_stride = S.unwrap(),
+        .page_table_stride = page_table.stride(0),
+        .topk = topk,
+        .page_bits = static_cast<uint32_t>(std::countr_zero(page_size)),
+    };
+    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
+        .config({.use_pdl = kUsePDL})
+        .launch(topk_packed_kernel<kUsePDL>, params);
+  }
+#endif  // USE_ROCM
 };
 
 }  // namespace sglang

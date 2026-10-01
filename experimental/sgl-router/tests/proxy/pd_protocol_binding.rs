@@ -32,7 +32,7 @@ use hyper::service::service_fn;
 use hyper::Response as HyperResponse;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -132,7 +132,9 @@ fn config() -> Config {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
+            disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -143,12 +145,13 @@ fn config() -> Config {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     }
 }
 
@@ -171,6 +174,7 @@ fn build_ctx(prefill_url: String, decode_url: String) -> Arc<AppContext> {
                 mode: WorkerMode::Prefill,
                 model_ids: vec![ModelId("tiny".into())],
                 bootstrap_port: Some(8997),
+                ..Default::default()
             },
             None,
             WireProtocol::H2c,
@@ -183,7 +187,7 @@ fn build_ctx(prefill_url: String, decode_url: String) -> Arc<AppContext> {
                 url: decode_url,
                 mode: WorkerMode::Decode,
                 model_ids: vec![ModelId("tiny".into())],
-                bootstrap_port: None,
+                ..Default::default()
             },
             None,
             WireProtocol::Http1,

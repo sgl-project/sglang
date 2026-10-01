@@ -53,7 +53,6 @@ from torch import nn
 
 from sglang.srt.configs.zaya import ZayaConfig
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -77,7 +76,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+from sglang.srt.utils import add_prefix, make_pp_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -830,7 +829,6 @@ class ZayaAttention(nn.Module):
         # divisible by tp_size; the KV-replicated GQA-TP variant (tp_size >
         # num_k_heads) is intentionally rejected with a clear error message
         # because both per-K-head paths assume each rank holds whole K heads.
-        self.tp_rank = get_parallel().tp_rank
         self.tp_size = get_parallel().tp_size
         # The head split, the ``o_proj`` RowParallel all-reduce, and the
         # RadixAttention KV cache are all organized on the *global* TP group,
@@ -844,7 +842,7 @@ class ZayaAttention(nn.Module):
         assert attn_tp_size == self.tp_size, (
             f"ZAYA1 head-parallel attention requires the attention TP group "
             f"({attn_tp_size}) to equal the global TP group ({self.tp_size}); "
-            "DP attention (enable_dp_attention) is not supported for ZAYA1."
+            "attention DP is not supported for ZAYA1."
         )
         assert self.num_q_heads_full % self.tp_size == 0, (
             f"num_attention_heads ({self.num_q_heads_full}) must be divisible "
@@ -874,8 +872,6 @@ class ZayaAttention(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("qkv", prefix),
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
         # RowParallel o_proj: per-rank input is the rank's q heads, full
@@ -888,8 +884,6 @@ class ZayaAttention(nn.Module):
             reduce_results=True,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
         rope_theta = float(getattr(config, "rope_theta", 1_000_000.0))
@@ -1389,7 +1383,7 @@ class ZayaModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1401,7 +1395,7 @@ class ZayaModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: _build_layer(
                 layer_id=idx,
@@ -1409,8 +1403,6 @@ class ZayaModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
 
@@ -1489,7 +1481,7 @@ class ZayaForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.model = ZayaModel(
             config=config,

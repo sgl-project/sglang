@@ -51,6 +51,19 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+To run two engine versions side by side in PD mode (e.g. during a rollout),
+pass `--pd-version-group-label <key>`. A prefill worker is then paired only with
+decode workers that have the same value for that EndpointSlice label (inherited
+from the Service, so use one Service per role and version), so KV never crosses
+versions. Unlabeled workers form their own group.
+
+```bash
+sgl-router --model-id qwen3 --service-discovery \
+  --prefill-selector app=engines-qwen3,role=prefill \
+  --decode-selector app=engines-qwen3,role=decode \
+  --pd-version-group-label sglang.ai/version-group
+```
+
 External KV indexer as the cache-aware signal source:
 
 ```bash
@@ -68,6 +81,33 @@ sgl-router \
 The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
+
+### Reorg routing
+
+Use `--chat-routing reorg` to select the new bucket engine. The existing `--policy`
+and cache/session flags configure its policies; no separate file is required.
+
+```bash
+sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
+  --chat-routing reorg --policy cache_aware
+```
+
+Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
+Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
+settings, external indexers, session headers/timeouts, and `--filter overloaded`
+with `--max-in-flight` retain their existing flags. Unsupported legacy options
+fail at startup. Legacy `--bucket-config` files cannot define complete reorg PD
+buckets and are not accepted on this path.
+
+Omitting `--chat-routing` keeps the existing policies and defaults.
+
+### Optional tokenizer for load-only routing
+
+`--no-tokenizer` skips tokenizer loading for load-only policies such as
+`power_of_two` and `session_aware`, on either routing path. Workers tokenize the
+original messages, and `/v1/tokenize` and `/v1/detokenize` are unavailable.
+Cache-aware routing, prefix-cache terms or filters, and `--bucket-config` still
+require a tokenizer.
 
 ### Fleet-wide sampling contract
 
@@ -168,6 +208,104 @@ What stays the router's to own either way is the enforcement half: the
 queue slot and no engine round-trip — the `sampling_contract_violation` code
 and per-parameter counter, bands, and one contract applied at a shared ingress
 across engines whose own flags the router operator may not control.
+
+## Chat rendering
+
+The router renders chat requests with dynamo-render (`dynamo-renderer`): the model's
+HF Jinja template from `tokenizer_config.json` or a sibling
+`chat_template.jinja`, or dynamo-render's built-in DeepSeek encoder (V4 family, V3.2)
+for template-less models. Cache-aware routing hashes the rendered tokens so its
+prefix queries match the blocks the engine caches. Models the engine encodes in
+code but dynamo-render cannot tokenize here (Inkling) route via raw prompt
+text, as does any model whose template fails to load or render.
+
+Some chats additionally forward the rendered tokens to the engine as
+`input_ids`, retaining the original messages, so the engine skips
+re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's native
+encoder is fixture-verified against SGLang's request normalization, so it
+forwards every chat except multimodal ones and those with caller-provided
+`input_ids`. Renderers without that verification (HF Jinja templates, Kimi-K3)
+forward only plain text chat requests (string `content`, no tools, no template
+kwargs or reasoning controls or historical `reasoning_content`, no assistant
+continuation, no consecutive users or non-leading system turns) and warn
+`UNVERIFIED` at startup; every other request shape is rendered for routing
+only. DeepSeek-V4.1 forwards nothing — its renderer is not verified against
+current SGLang — while routing tokenization keeps working.
+
+Use matching model files on the router and workers, and set
+the same `--default-chat-template-kwargs`, `SGLANG_DEFAULT_THINKING`,
+`SGLANG_DSV4_REASONING_EFFORT`, and `SGLANG_DSV41_REASONING_EFFORT` on both.
+The router reads these render defaults from its own configuration and environment;
+it does not discover the workers' settings. Point `--tokenizer-path` at the workers'
+model snapshot so the V4 effort profile is read from the same
+`encoding/encoding_dsv4.py`.
+
+Set `--disable-input-ids-forwarding` for this router's model when worker-side
+rendering has not been verified to match. This disables router-generated IDs
+for every routing policy; cache-aware routing still renders and tokenizes
+locally, and the original messages reach the workers for engine processing.
+Caller-supplied `input_ids` remain caller-owned and pass through unchanged.
+
+Forwarding logs its assumptions at startup. In particular, disable it when the
+router's render defaults differ from the workers', for worker template overrides
+not reflected in the router's model files, for worker parser overrides such as
+`--tool-call-parser deepseekv32` that select a native encoder over a shipped
+template, or conversation templates with stop strings (the engine's `input_ids`
+path skips those template stops). Disabling forwarding preserves engine behavior
+but does not establish parity for local routing hashes.
+
+Also set `--disable-input-ids-forwarding` for array-only templates: Dynamo may wrap
+string content into arrays differently from the worker. The pinned Dynamo renderer does not expose
+its conversion flag, so the router cannot automatically block these templates.
+Detailed content-format parity coverage follows in #39133.
+
+The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
+with `--locked`, so rendered bytes cannot change without a reviewed diff.
+
+Router tokenization sits on the TTFT path for every chat it renders. Two opt-in
+flags make it cheaper:
+
+- `--tokenizer-backend fast` encodes with fastokens (decoding stays on HF). It
+  needs a `tokenizer.json` and falls back to `hf` when fastokens cannot load it.
+- `--tokenizer-l1-cache-mb N` caches prefix tokenizations at special-token
+  boundaries, so a multi-turn chat encodes only the turns added since the
+  previous request. Boundaries are unconditional, non-normalized, non-stripping
+  special tokens with no overlapping added-token spellings. Unsafe candidates
+  are excluded; if none remain, encoding proceeds without the cache.
+
+On a ~69K-token DeepSeek-V4 chat, `hf` encodes in ~40 ms, `fast` in ~4 ms, and
+a new turn on a cached history in ~0.2 ms. The DeepSeek fixtures check every
+case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
+backend and cache state. `/metrics` exposes only
+`sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
+how much tokenization work the cache reuses.
+
+## DeepSeek V4
+
+Native V4 rendering follows SGLang's serving path (`serving_chat.py`), not
+Dynamo's OpenAI defaults: all declared tools are rendered with SGLang's schema
+defaults, reasoning effort comes from `reasoning` / `reasoning_effort`, and the
+official/preview effort profile is detected from the checkpoint's
+`encoding/encoding_dsv4.py` or overridden by `dsv4_reasoning_effort_profile` in
+`config.json`, as in SGLang. Reference prompts live in `tests/fixtures/deepseek/`
+and are regenerated by `tests/scripts/generate_deepseek_parity.py`.
+
+V4.1 Flash uses Dynamo's separate V4.1 encoder with SGLang's numeric reasoning
+budgets, tool payloads, and `<｜System｜>` markers — for routing tokenization
+only, since V4.1 never forwards `input_ids`. Developer messages and media are
+left to the worker (the pinned encoder renders them differently), and a
+non-default `SGLANG_DSV41_REASONING_EFFORT` still matters for cache-aware
+routing-hash parity.
+
+## Kimi-K3
+
+Kimi-K3 renders through dynamo-render's native XTML formatter with SGLang's
+request semantics (reasoning controls, tools, `response_format`, continuations)
+and the checkpoint's chunked tiktoken encoding. `--tokenizer-path` accepts a
+local `tiktoken.model` or an HF repo id, whose `tiktoken.model`, `config.json`
+and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
+An explicit null `thinking_effort` with thinking enabled is not representable
+in the pinned formatter and falls back to engine-side rendering.
 
 ## HTTP/2
 
