@@ -312,7 +312,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         )
 
     def host_pool_decls(self):
-        # pool_host imports this module; resolve the mirror side lazily.
+        # pool_host imports this module. Resolve the mirror side lazily.
         from sglang.srt.mem_cache.pool_host.qsa import make_qsa_indexer_pool_decl
 
         return (*super().host_pool_decls(), make_qsa_indexer_pool_decl(self))

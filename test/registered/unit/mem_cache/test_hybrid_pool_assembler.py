@@ -945,7 +945,7 @@ class TestHybridMambaDeclaredQsaIndexer(CustomTestCase):
                 ),
             ),
         ):
-            stack = hybrid_pool_assembler.build_hybrid_mamba_stack(
+            group, _, config = hybrid_pool_assembler.build_hybrid_mamba_stack(
                 params=self._params(drafts),
                 decls=kv_pool.host_pool_decls(),
                 mamba_pool=SimpleNamespace(layer_num=2, size=8),
@@ -955,15 +955,15 @@ class TestHybridMambaDeclaredQsaIndexer(CustomTestCase):
                 storage_backend=None,
                 use_mla=False,
             )
-        return stack, seen
+        return group, config, seen
 
     def test_kv_from_sub_pool_and_compressed_keys_from_hybrid(self):
         pool = _qsa_pool_stub(layer_num=2)
-        stack, seen = self._build(
+        group, config, seen = self._build(
             pool, full_mapping={1: 0, 3: 1}, mamba_mapping={0: 0, 2: 1}
         )
 
-        entries = stack.host_pool_group.entries
+        entries = group.entries
         self.assertEqual(
             [e.name for e in entries], [PoolName.KV, PoolName.INDEXER, PoolName.MAMBA]
         )
@@ -975,17 +975,19 @@ class TestHybridMambaDeclaredQsaIndexer(CustomTestCase):
         self.assertEqual(
             [entries[1].layer_mapper(t) for t in range(4)], [None, 0, None, 1]
         )
-        self.assertEqual(stack.sidecars, [pool.host_pool_decls()[1].sidecar_spec()])
+        self.assertEqual(
+            [c.decl.pool_name for c in config.pools], [PoolName.KV, PoolName.INDEXER]
+        )
 
     def test_packed_draft_owner_follows_each_declaration(self):
         pool = _qsa_pool_stub(layer_num=2)
         draft = _qsa_pool_stub(layer_num=1)
-        stack, seen = self._build(
+        group, _, seen = self._build(
             pool, drafts=(draft,), full_mapping={1: 0, 3: 1}, mamba_mapping={0: 0, 2: 1}
         )
 
-        kv, indexer, _ = stack.host_pool_group.entries
-        # The KV mirror packs the draft's full sub-pool; the compressed-key
+        kv, indexer, _ = group.entries
+        # The KV mirror packs the draft's full sub-pool. The compressed-key
         # mirror packs the draft hybrid pool that owns its keys.
         self.assertEqual(kv.packed_draft_device_pools, (draft.full_kv_pool,))
         self.assertEqual(indexer.packed_draft_device_pools, (draft,))
@@ -993,59 +995,6 @@ class TestHybridMambaDeclaredQsaIndexer(CustomTestCase):
         self.assertEqual(indexer.host_pool.layer_num, 3)
         # packed tail: transfer layer 4 -> device layer 2 on both host_pools
         self.assertEqual((kv.layer_mapper(4), indexer.layer_mapper(4)), (2, 2))
-
-    def test_separate_draft_declares_draft_indexer_on_the_hybrid(self):
-        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-
-        draft = _qsa_pool_stub(layer_num=1, size=1024)
-        seen = []
-
-        def dummy_draft_host(*, pool, host_to_device_ratio, page_size, layout, **_):
-            return MLATokenToKVPoolHost(
-                pool,
-                host_to_device_ratio=host_to_device_ratio,
-                host_size=0,
-                page_size=page_size,
-                layout=layout,
-                pin_memory=False,
-                is_dummy=True,
-            )
-
-        tree_cache = SimpleNamespace(
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(size=8192, logical_size=8192),
-                page_size=64,
-            )
-        )
-        with (
-            patch.object(
-                hybrid_pool_assembler, "_build_mha_mla_host_pool", dummy_draft_host
-            ),
-            patch.object(
-                pool_host_qsa, "QSAIndexerPoolHost", _recording_qsa_mirror(seen)
-            ),
-            patch.object(
-                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
-            ),
-            patch.object(
-                hybrid_pool_assembler,
-                "get_memory",
-                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
-            ),
-        ):
-            specs, entries = build_full_draft_pools(
-                draft_kv_pool=draft, tree_cache=tree_cache
-            )
-
-        self.assertEqual(
-            [(s.pool_name, s.indices_from_pool) for s in specs],
-            [(PoolName.DRAFT, PoolName.KV), (PoolName.DRAFT_INDEXER, PoolName.KV)],
-        )
-        self.assertEqual(
-            [(e.name, e.device_pool) for e in entries],
-            [(PoolName.DRAFT, draft.full_kv_pool), (PoolName.DRAFT_INDEXER, draft)],
-        )
-        self.assertIs(seen[0]["anchor_host"], entries[0].host_pool)
 
 
 class TestDeclaredPoolPlanning(CustomTestCase):
@@ -1208,13 +1157,11 @@ class TestHostPoolPreflight(CustomTestCase):
         pool = _qsa_pool_stub(layer_num=1)
         with patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate:
             with self.assertRaisesRegex(ValueError, "multiple"):
-                assemble_host_pools_from_decls(
-                    params=_target_params(page_size=63),
+                prepare_host_pool_config(
                     decls=pool.host_pool_decls(),
                     full_layer_mapping={0: 0},
-                    load_cache_event=None,
-                    storage_backend=None,
-                    use_mla=True,
+                    transfer_layer_id_max=1,
+                    transfer_page_size=63,
                 )
             allocate.assert_not_called()
 
@@ -1226,7 +1173,7 @@ class TestHostPoolPreflight(CustomTestCase):
         ].view(torch.int16)
         with self.assertRaisesRegex(ValueError, "dtype"):
             decl.host_pool_builder.validate(
-                decl=decl, page_size=64, packed_draft_device_pools=()
+                decl=decl, transfer_page_size=64, packed_draft_device_pools=()
             )
 
 

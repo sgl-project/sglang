@@ -4,7 +4,7 @@ Compressed keys hold one group per ``compress_ratio`` full-KV slots at
 ``full_slot // ratio``, so a full-KV page owns a fixed run of groups. The host
 pool moves that run as one byte row per page with the whole-page kernels of
 DeepSeekV4PagedHostPool. The per-request pending ring (index keys of the group
-still being filled) is transient per-request data and is not backed up; a host
+still being filled) is transient per-request data and is not backed up. A host
 restore is page aligned, so the restored prefix ends on a group boundary and
 the ring starts empty.
 """
@@ -43,12 +43,12 @@ class QSAIndexerHostPoolBuilder:
         self,
         *,
         decl: HostPoolDecl,
-        page_size: int,
+        transfer_page_size: int,
         packed_draft_device_pools: tuple[QSATokenToKVPool, ...],
     ) -> None:
         _qsa_device_page_buffers(
             decl=decl,
-            page_size=page_size,
+            page_size=transfer_page_size,
             packed_draft_device_pools=packed_draft_device_pools,
         )
 
@@ -123,7 +123,7 @@ def _qsa_device_page_buffers(
 
 
 class QSAIndexerPoolHost(DeepSeekV4PagedHostPool):
-    """Page rows of compressed keys addressed by full-KV token slots; packed
+    """Page rows of compressed keys addressed by full-KV token slots. Packed
     drafts append their layers after the target's."""
 
     def __init__(

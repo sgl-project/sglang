@@ -41,7 +41,7 @@ def _qsa_pool_stub(*, full_layers, ratio=4, start_layer=0):
 
 
 def test_compressed_key_getter_waits_for_the_layer_transfer():
-    """The indexer reads compressed keys before attention reads full KV; a
+    """The indexer reads compressed keys before attention reads full KV. A
     host restore still in flight must be fenced at this getter too (#39830)."""
     pool = _qsa_pool_stub(full_layers=[7, 11], start_layer=4)
     pool.layer_transfer_counter = Mock()
@@ -63,7 +63,7 @@ def test_host_pool_decls_put_kv_on_the_sub_pool_and_compressed_keys_on_the_hybri
         PoolName.KV,
         PoolName.KV,
     )
-    # kv_heads 1 x head_dim 128 x bf16 = 256 B per group of 4 tokens; one
+    # kv_heads 1 x head_dim 128 x bf16 = 256 B per group of 4 tokens. One
     # 64-token page is 16 groups = 4096 B, the byte row the mirror moves.
     assert indexer.storage_info.bytes_per_token_per_layer == 64
     assert indexer.storage_info.page_bytes(64) == 4096
