@@ -103,6 +103,15 @@ def observe(
             "result_lag": end - len(req.origin_input_ids) - len(req.output_ids),
             "batch_size": len(batch.reqs),
             "cuda_graph": can_run_cuda_graph,
+            "forward_mode": forward_batch.forward_mode.name,
+            "prefill_graph": getattr(
+                forward_batch, "training_capture_test_prefill_graph", None
+            ),
+            "extend_prefix_length": (
+                forward_batch.extend_prefix_lens_cpu[row]
+                if width is None and batch.forward_mode.is_extend()
+                else None
+            ),
             "tp_rank": tp_rank,
             "tp_size": tp_size,
             "pp_rank": pp_rank,

@@ -29,13 +29,14 @@ it does not redefine the goal as the modules already implemented.
 | Raw teacher capture | Unpadded top-128 IDs/values and full-vocabulary LSE before serving processors | Independent online logits observer validates every captured row; serving bias does not leak into teacher scores |
 | KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode |
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Coordinator admission, renewal, expiry, retract, shutdown and publication tests pass; traffic-scale stress remains open |
-| Mooncake adapter | Required hard pin, registered raw buffers, immutable retry verification, exact read length | Real cross-process TCP roundtrip passes; cross-node RDMA is pending |
+| Mooncake adapter | Required hard pin, registered raw buffers, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including complete reads after producer exit; production retention remains open |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Two independent writer processes publish logical head shards through real TCP Store; distributed inference admission and scheduler integration remain open |
 | Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact CUDA source-reuse checks and independent Store writers pass; distributed coordination remains open |
 | Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture matches a full target contract; deployed TP/PP model validation remains open |
 | Startup identity exchange | Bounded JSON over the existing CPU group, phase failure votes and final digest agreement | Real four-process Gloo TP2/PP2 and TP4/PP1 cases pass, including local failures, peer exit and finite waits; distributed request/resource coordination remains open |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
+| Prefill graph collection | Capture uses live request lengths after graph replay and owns compact teacher/KV buffers | Full synchronous/overlap, Breakable and default torch.compile piecewise pass token/request padding, chunked/cached prefixes, batch reuse and post-exit Store parity; distributed/speculative prefill graphs remain open |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production exporter and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
@@ -43,8 +44,8 @@ it does not redefine the goal as the modules already implemented.
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit retract/resume | Real 256-token KV pool eviction, physical slot reuse, failed-capture exclusion and subsequent admission pass in synchronous and overlap/graph modes; automatic AR OOM remains open |
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes in all four synchronous/overlap and eager/graph combinations; failed captures are excluded and fresh capture admission recovers |
-| PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2 passes eager and graph/overlap, exact source parity, batches, prefix reuse and failed/aborted sample exclusion; pipeline speculation and RDMA remain open |
-| Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark, TP/PP AR PD and TP1/TP2 target-KV DSpark PD have runtime evidence below; combined topologies, pipeline speculation, RDMA and workload SLO gates remain open |
+| PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2 and cross-node TP1 RDMA pass eager and graph/overlap, source parity and failure exclusion; pipeline speculation and wider distributed RDMA remain open |
+| Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark, TP/PP AR PD, TP1/TP2 target-KV DSpark PD, single-rank cross-node RDMA and single-GPU AR prefill graphs have runtime evidence below; combined topologies, pipeline speculation and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
 `/gpfs/users/fuxuanwei-1/dspark-maas-lab/state`):
@@ -2620,9 +2621,57 @@ draft. Distributed TP/PP/DP/CP over RDMA, trained draft quality, production
 Catalog/consumer retention and replay, direct trainer GPU reads, replica loss
 recovery and workload SLO acceptance remain open.
 
+## Prefill CUDA Graph Capture
+
+The registered `test_training_capture_prefill_graph.py` exercises the existing
+production capture path with actual prefill graph execution. Test-only
+instrumentation records the forward mode, live prefix length and actual static
+input buffer's address, replay sequence and padded token count; Full graph
+records also expose its four captured request slots. The observer still reads
+raw online logits and selected canonical KV independently of capture tickets.
+No production hook, graph runner or wire format change was needed.
+
+Final runtime job `01790890297579453594-8d280dbea473` passed the complete four-test
+file in **147.374 seconds** on the resident H100. The cases are Full synchronous,
+Full overlap, Breakable overlap and torch.compile piecewise overlap with its
+default `tc_compiler=eager`; all use FlashInfer attention and Full decode graphs.
+The initial cold-kernel run also passed all four cases in 254.476 seconds.
+The shared observer's complete PD target-KV DSpark regression file passed four
+more tests in **327.255 seconds**, job `01790890297887194440-63058c929c37`, with
+D-only and P+D drafts in eager and decode/verify graph modes. Those regression
+cases retain their existing disabled prefill graphs. All eight final tests
+passed; the worker returned to idle load with no live serving/Store processes.
+
+Each case publishes nine samples from a 271-token prompt split at 128/256,
+a cached one-token reply, a cached-prefix extension and two heterogeneous
+three-request batches. Actual graph shapes are `(requests, real, padded)`:
+`(1,15,16)`, `(1,19,32)`, `(1,128,128)` and `(3,113,128)`.
+Observed prefix lengths include 0/128/256/271. Distinct replay calls reuse the
+same input buffer, and Full graphs pad unused request slots. A one-token cached
+extend falls back to eager under the existing padding-factor limit and still
+produces a complete sample.
+
+After each producer exits, a new Store client reads and validates every tensor.
+Across the four cases, **36 snapshots, 792 tensor objects and 53,284,872 tensor
+bytes** match their online source. Selected KV and raw top-128 values are exact;
+top-k membership, full-vocabulary LSE (`rtol=atol=1e-6`), generated token IDs,
+response/loss masks, teacher positions and KV validity all pass. There is no
+target recomputation. Overlap can include a final KV row already executed by
+lookahead; the synchronous case correctly excludes that row.
+
+See [the runbook](experiments/PREFILL_CAPTURE.md) and
+[machine-readable evidence](experiments/capture-prefill-graph.json).
+This is ordinary AR Qwen3 MHA, TP1/PP1, FlashInfer and TCP Store evidence with
+an HTTP Catalog test double. It does not certify distributed/speculative
+prefill graphs, MLA's distinct chunked-prefix graph topology, mixed batches,
+Inductor compilation, production Catalog retention or performance/SLO gates.
+The test-only source observer deliberately synchronizes and copies full logits
+to CPU; these copies are absent from normal serving.
+
 ## Next Implementation
 
-1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
+1. Extend passing single-GPU AR prefill graph coverage to distributed/speculative
+   and mixed-batch execution. Broaden real-request coverage to automatic AR OOM retraction,
    speculative cache eviction, target weight replacement and
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained

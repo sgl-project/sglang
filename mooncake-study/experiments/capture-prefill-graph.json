@@ -1,0 +1,468 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "467cbb86cd7c15989bf7156cb5697f61c27f2d56",
+  "feature": "Prefill CUDA graph capture retains exact online KV/teacher data across padding, cached prefixes, graph-buffer reuse and producer exit",
+  "environment": {
+    "job": "job-fe1ce1dcdea6-20261001023258",
+    "node": "node064",
+    "gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "driver": "535.154.05",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang:v0.5.15",
+    "versions": {
+      "python": "3.12.3",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "sglang-kernel": "0.4.6.post1",
+        "flashinfer-python": "0.6.17",
+        "transformers": "5.12.1"
+      }
+    },
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "dtype": "bfloat16",
+    "selected_layers": [
+      0,
+      14,
+      27
+    ],
+    "tp": 1,
+    "pp": 1,
+    "dp": 1,
+    "attention": "flashinfer",
+    "transport": "tcp",
+    "catalog": "HTTP TestCaptureCatalog double",
+    "store_segment_bytes": 268435456,
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang"
+  },
+  "implementation": [
+    "Registered four-case single-GPU runtime test using the real Mooncake Store and existing producer hooks.",
+    "Test-only load_batch observer records real/padded token counts, input pointer, replay sequence and Full request capacity.",
+    "Online source observer records forward mode and prefix length while retaining raw logits/KV parity assertions. Verify rows do not access ordinary prefill metadata.",
+    "No production capture, graph runner or wire-format change was required."
+  ],
+  "configuration": {
+    "prefill_buckets": [
+      16,
+      32,
+      64,
+      128
+    ],
+    "full_prefill_request_slots": 4,
+    "tc_compiler": "eager",
+    "decode_backend": "full",
+    "decode_buckets": [
+      1,
+      2,
+      4
+    ],
+    "max_total_tokens": 4096,
+    "chunked_prefill_size": 128,
+    "storage_chunk_tokens": 64,
+    "max_sample_tokens": 320,
+    "max_inflight_samples": 4,
+    "max_host_bytes": 67108864,
+    "max_device_bytes": 8388608,
+    "kv_d2h_batch_tokens": 16
+  },
+  "invariants": [
+    "Only real request/token rows enter the snapshot; Full unused request slots and token padding are excluded.",
+    "Requests include intermediate prefill chunks with no response teacher, final prefill teacher, radix hits, cached extension, heterogeneous batches and single-token responses.",
+    "Distinct prefill replay calls reuse the same static input buffer.",
+    "All source observations are from actual online target forwards. No target model runs to reconstruct the training sample.",
+    "After each producer exits, a newly connected Store client validates all manifests and tensor contents, including object digests.",
+    "KV and raw top-128 score values match exactly; vocab IDs are unique/range-valid and select the reference top-k values. Full-vocabulary LSE uses rtol=atol=1e-6.",
+    "Generated tokens, response/loss masks, positions, teacher shifts and KV validity match the online path. Serving logit bias does not enter teacher scores.",
+    "Decode CUDA graphs are enabled concurrently. Overlap results include lookahead only where the actual source contains a committed token's KV."
+  ],
+  "cases": [
+    {
+      "prefill_capture": "breakable",
+      "overlap": true,
+      "samples": 9,
+      "tensor_objects": 198,
+      "tensor_bytes": 13348866,
+      "source_frames": 36,
+      "prefill_replay_frames": 10,
+      "graph_shapes": [
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 1,
+      "producer_exited": true,
+      "capture_counters": {
+        "considered": 10,
+        "excluded_health_check": 1,
+        "admitted": 9,
+        "overlap_forwards": 24,
+        "cuda_graph_forwards": 23,
+        "sealed": 9,
+        "writer_started": 9,
+        "copies_completed": 9,
+        "snapshot_built": 9,
+        "ready": 9,
+        "eager_forwards": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "prefill_capture": "full",
+      "overlap": true,
+      "samples": 9,
+      "tensor_objects": 198,
+      "tensor_bytes": 13348866,
+      "source_frames": 36,
+      "prefill_replay_frames": 10,
+      "graph_shapes": [
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 1,
+      "producer_exited": true,
+      "capture_counters": {
+        "considered": 10,
+        "excluded_health_check": 1,
+        "admitted": 9,
+        "overlap_forwards": 24,
+        "cuda_graph_forwards": 23,
+        "sealed": 9,
+        "writer_started": 9,
+        "copies_completed": 9,
+        "snapshot_built": 9,
+        "ready": 9,
+        "eager_forwards": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "prefill_capture": "full",
+      "overlap": false,
+      "samples": 9,
+      "tensor_objects": 198,
+      "tensor_bytes": 13238274,
+      "source_frames": 27,
+      "prefill_replay_frames": 10,
+      "graph_shapes": [
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 1,
+      "producer_exited": true,
+      "capture_counters": {
+        "considered": 10,
+        "excluded_health_check": 1,
+        "admitted": 9,
+        "cuda_graph_forwards": 18,
+        "sealed": 9,
+        "writer_started": 9,
+        "copies_completed": 9,
+        "snapshot_built": 9,
+        "ready": 9,
+        "eager_forwards": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "prefill_capture": "tc_piecewise",
+      "overlap": true,
+      "samples": 9,
+      "tensor_objects": 198,
+      "tensor_bytes": 13348866,
+      "source_frames": 36,
+      "prefill_replay_frames": 10,
+      "graph_shapes": [
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 1,
+      "producer_exited": true,
+      "capture_counters": {
+        "considered": 10,
+        "excluded_health_check": 1,
+        "admitted": 9,
+        "overlap_forwards": 24,
+        "cuda_graph_forwards": 23,
+        "sealed": 9,
+        "writer_started": 9,
+        "copies_completed": 9,
+        "snapshot_built": 9,
+        "ready": 9,
+        "eager_forwards": 1
+      },
+      "quarantined_host_slots": 0
+    }
+  ],
+  "totals": {
+    "snapshots": 36,
+    "tensor_objects": 792,
+    "tensor_bytes": 53284872
+  },
+  "runs": [
+    {
+      "job_id": "01790890000042745930-98345582220f",
+      "purpose": "Initial complete file, including cold FlashInfer JIT initialization",
+      "tests": 4,
+      "seconds": 254.476,
+      "returncode": 0
+    },
+    {
+      "job_id": "01790890297579453594-8d280dbea473",
+      "purpose": "Final complete file after strengthening distinct-replay reuse proof and isolating verify metadata",
+      "test_file": "test/registered/storage/test_training_capture_prefill_graph.py",
+      "tests": 4,
+      "seconds": 147.374,
+      "returncode": 0,
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-fe1ce1dcdea6-20261001023258-master-0' '-c' 'master' '--' 'python3' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py' '--state-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state' 'submit' '--cwd' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang' '--env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' '--env' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' '--env' 'TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' '--timeout' '2400' '--' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' 'test/registered/storage/test_training_capture_prefill_graph.py' '-v' '-f'",
+      "log": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790890297579453594-8d280dbea473.log",
+      "result": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790890297579453594-8d280dbea473.json"
+    }
+  ],
+  "regression": {
+    "job_id": "01790890297887194440-63058c929c37",
+    "outcome": "completed",
+    "returncode": 0,
+    "finished_unix": 1790890795.2789814,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790890297887194440-63058c929c37.log",
+    "test_file": "test/registered/storage/test_training_capture_pd_dspark.py",
+    "tests": 4,
+    "seconds": 327.255,
+    "command": "'kubectl' 'exec' '-n' 'qiji' 'job-fe1ce1dcdea6-20261001023258-master-0' '-c' 'master' '--' 'python3' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py' '--state-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state' 'submit' '--cwd' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang' '--env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' '--env' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' '--env' 'TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' '--timeout' '1200' '--' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' 'test/registered/storage/test_training_capture_pd_dspark.py' '-v' '-f'",
+    "purpose": "Check the shared observer on target-KV verify paths with D-only or P+D draft workers, eager and decode/verify graphs; prefill graphs remain disabled in these regression cases.",
+    "cases": [
+      {
+        "decode_pp": 1,
+        "decode_tp": 1,
+        "draft_kind": "target_kv",
+        "prefill_draft": false,
+        "prefill_pp": 1,
+        "prefill_tp": 1,
+        "ragged_mode": "static",
+        "replay": false,
+        "capture_counters": {
+          "admitted": 9,
+          "considered": 9,
+          "copies_completed": 9,
+          "eager_forwards": 11,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "pd_handoff_committed": 7,
+          "ready": 6,
+          "sealed": 6,
+          "snapshot_built": 6,
+          "speculative_commits_copied": 12,
+          "speculative_verify_forwards": 11,
+          "writer_started": 9
+        },
+        "quarantined_host_slots": 0
+      },
+      {
+        "decode_pp": 1,
+        "decode_tp": 1,
+        "draft_kind": "target_kv",
+        "prefill_draft": false,
+        "prefill_pp": 1,
+        "prefill_tp": 1,
+        "ragged_mode": "static",
+        "replay": true,
+        "capture_counters": {
+          "admitted": 9,
+          "considered": 9,
+          "copies_completed": 9,
+          "cuda_graph_forwards": 15,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "overlap_forwards": 15,
+          "pd_handoff_committed": 7,
+          "ready": 6,
+          "sealed": 6,
+          "snapshot_built": 6,
+          "speculative_commits_copied": 17,
+          "speculative_verify_forwards": 15,
+          "writer_started": 9
+        },
+        "quarantined_host_slots": 0
+      },
+      {
+        "decode_pp": 1,
+        "decode_tp": 1,
+        "draft_kind": "target_kv",
+        "prefill_draft": true,
+        "prefill_pp": 1,
+        "prefill_tp": 1,
+        "ragged_mode": "static",
+        "replay": false,
+        "capture_counters": {
+          "admitted": 9,
+          "considered": 9,
+          "copies_completed": 9,
+          "eager_forwards": 11,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "pd_handoff_committed": 7,
+          "ready": 6,
+          "sealed": 6,
+          "snapshot_built": 6,
+          "speculative_commits_copied": 12,
+          "speculative_verify_forwards": 11,
+          "writer_started": 9
+        },
+        "quarantined_host_slots": 0
+      },
+      {
+        "decode_pp": 1,
+        "decode_tp": 1,
+        "draft_kind": "target_kv",
+        "prefill_draft": true,
+        "prefill_pp": 1,
+        "prefill_tp": 1,
+        "ragged_mode": "static",
+        "replay": true,
+        "capture_counters": {
+          "admitted": 9,
+          "considered": 9,
+          "copies_completed": 9,
+          "cuda_graph_forwards": 15,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "overlap_forwards": 15,
+          "pd_handoff_committed": 7,
+          "ready": 6,
+          "sealed": 6,
+          "snapshot_built": 6,
+          "speculative_commits_copied": 17,
+          "speculative_verify_forwards": 15,
+          "writer_started": 9
+        },
+        "quarantined_host_slots": 0
+      }
+    ]
+  },
+  "checks": {
+    "final_tests_passed": 8,
+    "black": "4 changed/new Python files pass",
+    "ruff": "I,F pass for all 4 changed/new Python files",
+    "source_sync": "All six recorded source hashes agree between the implementation and GPU checkout.",
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "cleanup": {
+    "active_experiment": null,
+    "queued": 0,
+    "worker_mode": "idle_load",
+    "idle_pid": 24570,
+    "live_process_check": "Only PID 1, idle PID 24570 and inspection commands remained non-zombie; no serving or Mooncake master processes remained.",
+    "gpu_apps": "32284, [No data], 1092 MiB"
+  },
+  "source_hashes": {
+    "python/sglang/test/training_capture_prefill_runtime.py": "27cf07d43217991e0b20f1556b2748c85e59116af4bc11cf07f318a19655392f",
+    "python/sglang/test/training_capture_prefill_server.py": "cc77d33a3f0894db6a7702119bc45acec0293f8cfe819144a916a7d7ccf6d143",
+    "python/sglang/test/dspark_capture_observer.py": "f8641c14df5a0ea30ea2b2d56c005894c9039da501c82e836e87b13be090dab7",
+    "test/registered/storage/test_training_capture_prefill_graph.py": "e01f210f25d0093c8362f5db3372081be24c0afe4c2102d6212ba76c98677a76",
+    "python/sglang/srt/training_capture/coordinator.py": "e74b955334cc58ab98a0e5a903345e52329e81ebed6c9157ace2fd1ba34d2f7e",
+    "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py": "91fdabcdde01d5e9e4409f8a161be8ac58329bc4a0f9c4242e661ae5dc089248"
+  },
+  "limitations": [
+    "Single-rank Qwen3 MHA, ordinary AR and FlashInfer only; distributed/speculative prefill graphs, mixed batches and MLA's distinct chunked-prefix topology remain unverified.",
+    "tc_piecewise uses its default eager compiler, not Inductor.",
+    "The test-only observer synchronizes and copies full raw logits to CPU; timings do not measure production capture overhead.",
+    "TCP Store and a Catalog test double; this lane does not establish production retention, consumer replay, loss/training correctness or SLOs. RDMA has separate evidence artifacts."
+  ]
+}

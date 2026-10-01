@@ -399,6 +399,26 @@ capture = TeacherBatchHandle(ids.to(torch.int32), values.float(), lse, row_map)
 - decode、prefill、abort、请求恰在 prefill 完成等路径都要在 release 前处理。
 - `return_logprob/top_logprobs_num` 不能代替本接口；DSpark 某些服务路径还明确拒绝外部 logprob。
 
+#### 7.3.1 当前 prefill CUDA Graph 验收
+
+现有采集钩子在 graph replay 返回后、sampler 修改 logits 之前运行，使用本轮真实
+request 长度与 canonical KV slots；graph 的 token/request padding 不进入样本。
+`test_training_capture_prefill_graph.py` 已在 H100/Qwen3-0.6B/FlashInfer 上验证
+Full 同步、Full overlap、Breakable overlap 和默认 `tc_compiler=eager` 的
+torch.compile piecewise overlap，四组均同时开启 Full decode graph。
+
+测试包含 128-token 分块、271-token 前缀命中、19→32 token padding、
+三请求 113→128 token padding、Full 的空 request slots，以及不同 replay
+复用同一输入 buffer。每组服务退出后，新 Store client 逐张量读回并校验，
+共 36 个样本的 KV、raw top128、vocab ID、LSE、token、loss mask 和位置均通过。
+原始分数来自实际线上 forward 的测试观测，不额外运行 target 补算。
+
+观测代码仅用于测试，会同步并复制完整 logits 到 CPU，不计入生产采集实现或性能验收。
+此结果限定单卡普通 AR 和 MHA，分布式/推测 prefill graph、MLA 专用前缀图、
+mixed batch 和 Inductor 仍需分别验证。复现步骤与边界见
+[`experiments/PREFILL_CAPTURE.md`](experiments/PREFILL_CAPTURE.md)，原始结果见
+[`experiments/capture-prefill-graph.json`](experiments/capture-prefill-graph.json)。
+
 ### 7.4 选层 KV 导出
 
 `SelectedLayerKVExporter` 接收 request logical positions 到物理 slot 的映射，以及当前 target KV pool。它只导出 contract 中明确选择的层和有效位置。
