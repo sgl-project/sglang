@@ -337,6 +337,8 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+# Real-checkpoint complete-path sweeps on MI355X keep ordinary projection
+# dispatch in BF16 through these last non-winning token counts.
 GLM53_KDA_PTPC_BF16_MAX_M = {
     "qkv_proj": 4095,
     "f_a_proj": 4095,
@@ -346,6 +348,8 @@ GLM53_KDA_PTPC_BF16_MAX_M = {
 GLM53_KDA_PTPC_ALLOWED_K = {
     "o_proj": (1024, 2048),
 }
+# Fusing normalization with quantization removes the standalone quantization
+# cost, so its measured crossover is lower than standalone o_proj PTPC.
 GLM53_KDA_FUSED_O_NORM_MIN_M = {
     1024: 1,
     2048: 256,
@@ -664,6 +668,8 @@ class Glm5NextLinearAttention(nn.Module):
                     )
                 self.fused_qkvbfg_a_proj.quant_method = Glm53KdaSplitPtpcLinearMethod(
                     bf16_max_m=split_bf16_max_m_by_qkv_size[qkv_size],
+                    # Split PTPC won the real-checkpoint sweep through M=16384;
+                    # larger shapes retain the fused BF16 projection.
                     fp8_max_m=16384,
                     qkv_size=self.split_sizes[0],
                     beta_size=self.split_sizes[1],
@@ -762,9 +768,9 @@ class Glm5NextLinearAttention(nn.Module):
         core_attn_out: torch.Tensor,
         norm_gate: torch.Tensor,
     ) -> bool:
-        if not self._ptpc_linear_active(
-            self.o_proj,
-            core_attn_out.numel() // self.o_proj.weight.shape[1],
+        method = getattr(self.o_proj, "quant_method", None)
+        if not (
+            isinstance(method, Glm53KdaPtpcLinearMethod) and method._fp8_ptpc_ready
         ):
             return False
         local_k = self.o_proj.weight.shape[1]

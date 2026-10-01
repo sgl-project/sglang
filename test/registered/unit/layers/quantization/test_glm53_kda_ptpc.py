@@ -356,7 +356,10 @@ class TestGLM53KDAPTPC(CustomTestCase):
         model_module = sys.modules[Glm5NextLinearAttention.__module__]
         attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
         torch.nn.Module.__init__(attention)
-        method = Glm53KdaPtpcLinearMethod("o_proj", bf16_max_m=0)
+        method = Glm53KdaPtpcLinearMethod(
+            "o_proj",
+            bf16_max_m=GLM53_KDA_PTPC_BF16_MAX_M["o_proj"],
+        )
         method._fp8_ptpc_ready = True
         attention.o_proj = _Linear(method)
         attention.o_norm = _Linear()
@@ -370,11 +373,6 @@ class TestGLM53KDAPTPC(CustomTestCase):
 
         with (
             patch.object(
-                Glm5NextLinearAttention,
-                "_ptpc_linear_active",
-                return_value=True,
-            ),
-            patch.object(
                 model_module,
                 "can_use_rms_norm_gated_per_token_fp8",
                 return_value=True,
@@ -385,6 +383,7 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 (1024, 1, True),
                 (2048, 255, False),
                 (2048, 256, True),
+                (2048, 4096, True),
                 (1536, 4096, False),
             ):
                 heads = local_k // 128
