@@ -3502,6 +3502,102 @@ class DeepseekV4DecoderLayer(nn.Module):
             return updated, combined, None
         return self.hc_post(x, residual, post, comb), None, None
 
+    def _can_use_mega_mhc_prefill(self, hidden_states, forward_batch):
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        return (
+            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
+            and self.config.model_type == "deepseek_v41"
+            and hidden_states.is_cuda
+            and get_platform().is_blackwell
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and 4096 <= hidden_states.shape[0] <= 65536
+            and hidden_states.shape[1:] == (4, 5120)
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and get_parallel().attn_dp_size == 1
+            and not get_forward().sp_active
+            and not self.dsa_enable_prefill_cp
+            and not is_in_breakable_cuda_graph()
+            and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+            and not is_batch_invariant_mode_enabled()
+            and all(
+                not norm.cast_x_before_out_mul
+                and norm.variance_size_override is None
+                and norm.weight.dtype == torch.bfloat16
+                and norm.weight.is_contiguous()
+                for norm in (self.input_layernorm, self.post_attention_layernorm)
+            )
+        )
+
+    def forward_hc_pre_from_prev_mega(
+        self,
+        positions,
+        hidden_states,
+        input_ids,
+        forward_batch,
+        input_ids_global,
+        prev_pre,
+        normalized_attn,
+        attn_stats,
+        next_layer,
+    ):
+        """Eager prefill: fuse each post with the next sublayer's stats and norm.
+
+        Engram and the final layer terminate the hand-off. The model captures
+        DSPARK auxiliary states from the materialized residual as usual.
+        """
+        from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
+
+        residual = hidden_states
+        if attn_stats is None:
+            attn_stats = self._hc_mix_stats(
+                residual, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
+        attn_pre, attn_post, attn_comb = attn_stats
+        x = self._hc_combine(
+            residual, prev_pre, self.input_layernorm, normalized=normalized_attn
+        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = self.self_attn(x=x, positions=positions, forward_batch=forward_batch)
+        residual, x, ffn_stats = mhc_mega_boundary(
+            x,
+            residual,
+            attn_pre,
+            attn_post,
+            attn_comb,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.post_attention_layernorm.weight,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.post_attention_layernorm.variance_epsilon,
+            self.hc_sinkhorn_iters,
+        )
+        ffn_pre, ffn_post, ffn_comb = ffn_stats
+        x = self._run_moe_ffn_dp_sync(
+            x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
+        )
+        if next_layer is None:
+            return self.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre, None, None
+        updated, normalized, next_stats = mhc_mega_boundary(
+            x,
+            residual,
+            ffn_pre,
+            ffn_post,
+            ffn_comb,
+            next_layer.hc_attn_fn,
+            next_layer.hc_attn_scale,
+            next_layer.hc_attn_base,
+            next_layer.input_layernorm.weight,
+            next_layer.rms_norm_eps,
+            next_layer.hc_eps,
+            next_layer.input_layernorm.variance_epsilon,
+            next_layer.hc_sinkhorn_iters,
+        )
+        return updated, ffn_pre, normalized, next_stats
+
     def forward_hc_pre_from_prev(
         self,
         positions: torch.Tensor,
@@ -4433,6 +4529,7 @@ class DeepseekV4Model(nn.Module):
         precomputed_attn = None
         combined_attn = None
         normalized_attn = None
+        attn_stats = None
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 combined_attn = None
@@ -4450,6 +4547,7 @@ class DeepseekV4Model(nn.Module):
                     hash_ids = tail.rows(hash_ids)
             engram = self.layers[i].engram
             if engram is not None:
+                attn_stats = None
                 precomputed_attn = None
                 combined_attn = None
                 normalized_attn = None
@@ -4480,6 +4578,35 @@ class DeepseekV4Model(nn.Module):
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
+            if tail is None and self.layers[i]._can_use_mega_mhc_prefill(
+                hidden_states, forward_batch
+            ):
+                next_layer = (
+                    self.layers[i + 1]
+                    if i + 1 < self.end_layer
+                    and self.layers[i + 1].engram is None
+                    and self.layers[i + 1]._can_use_mega_mhc_prefill(
+                        hidden_states, forward_batch
+                    )
+                    else None
+                )
+                with ctx:
+                    hidden_states, prev_pre, normalized_attn, attn_stats = self.layers[
+                        i
+                    ].forward_hc_pre_from_prev_mega(
+                        positions,
+                        hidden_states,
+                        input_ids,
+                        forward_batch,
+                        input_ids_global,
+                        prev_pre,
+                        normalized_attn,
+                        attn_stats,
+                        next_layer,
+                    )
+                precomputed_attn = combined_attn = None
+                continue
+            attn_stats = None
             next_norm = None
             next_input = []
             # The next layer can consume a collapsed input only if no Engram
