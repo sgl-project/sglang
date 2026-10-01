@@ -74,7 +74,7 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         attn_cp_size=parallel.attn_cp_size,
         attn_dp_size=parallel.attn_dp_size,
         index_heads=sparse_cfg["sparse_num_index_heads"],
-        kv_heads=runner.model_config.hf_config.num_key_value_heads,
+        kv_heads=runner.model_config.get_total_num_kv_heads(),
         head_dim=backend.idx_head_dim,
         block_size=backend.block_size_k,
         topk=backend.topk_blocks,
