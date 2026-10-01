@@ -300,21 +300,33 @@ def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.T
 
 
 class DcpSharedPrefix(NamedTuple):
-    """What a batch's prefixes share, by radix node. ``walked`` is each
-    request's prefix length rebuilt from its match; ``union_rows`` counts each
-    shared node once, which is what a deduplicated gather would send."""
+    """What a batch's prefixes share, by radix node.
+
+    ``walked`` is each request's tree-owned prefix rebuilt from its match and
+    ``protected`` is the scheduler's own count of it, so the two disagreeing
+    means the walk is wrong. ``union_rows`` counts a shared node once: the rows
+    a deduplicated gather would send for the tree-owned part.
+    """
 
     walked: List[int]
+    protected: List[int]
     union_rows: int
 
 
-def dcp_shared_prefix(last_nodes: Sequence[object]) -> DcpSharedPrefix:
+def dcp_shared_prefix(
+    last_nodes: Sequence[object], protected_lens: Sequence[int]
+) -> DcpSharedPrefix:
     """Measure prefix sharing across a batch from the radix match alone.
 
-    Each request's prefix is the root-to-``last_node`` path, so two requests
-    share exactly the nodes their paths have in common -- no device read and no
-    index comparison. Duck-typed on ``.parent``/``.value`` to keep this import-
-    free and CPU-testable.
+    A request's tree-owned prefix is its root-to-``last_node`` path, so sharing
+    is the paths' common ancestors -- no device read and no index comparison.
+    Duck-typed on ``.parent``/``.value`` to stay import-free and CPU-testable.
+
+    Only the tree-owned part is shareable. Under ``page_size > 1`` a chunked
+    request also carries a partial page that ``cache_unfinished_req`` keeps in
+    ``prefix_indices`` but not in the tree; it belongs to that request alone, so
+    it is outside both ``walked`` and ``union_rows`` and a dedup must still send
+    it per request.
     """
     seen: Dict[int, int] = {}
     walked: List[int] = []
@@ -326,7 +338,9 @@ def dcp_shared_prefix(last_nodes: Sequence[object]) -> DcpSharedPrefix:
             seen.setdefault(id(node), n)
             node = getattr(node, "parent", None)
         walked.append(rows)
-    return DcpSharedPrefix(walked=walked, union_rows=sum(seen.values()))
+    return DcpSharedPrefix(
+        walked=walked, protected=list(protected_lens), union_rows=sum(seen.values())
+    )
 
 
 class DcpExtendGatherPiece(NamedTuple):

@@ -624,27 +624,31 @@ def _log_dcp_extend_memory(prefix_rows: int, extend_rows: int) -> None:
 def _log_dcp_shared_prefix(forward_batch, row_bytes: int) -> None:
     """Report how much of this gather is one prefix fetched once per request.
 
-    ``walked`` coming from the radix match must equal the scheduler's own
-    prefix lengths; that equality is the whole question, because a deduplicated
-    gather would read sharing off the nodes rather than compare indices.
+    ``walked_ok`` is the design question: sharing read off the radix nodes has
+    to agree with the scheduler's own tree-owned count, or a dedup cannot use
+    it. The gather sends ``prefix``, which also carries each request's private
+    partial page, so the saving is over the tree-owned part only.
     """
     shared = getattr(forward_batch, "npu_dcp_shared_prefix", None)
     if shared is None:
         return
     prefix_lens = list(forward_batch.extend_prefix_lens_cpu)
     sent = sum(prefix_lens)
+    saved = sum(shared.protected) - shared.union_rows
     gib = 1 << 30
     logger.info(
-        "DCP shared prefix: bs=%d prefix=%s walked=%s walked_ok=%s "
-        "sent_rows=%d union_rows=%d saved=%.1f%% (%.2f GiB/layer)",
+        "DCP shared prefix: bs=%d prefix=%s protected=%s walked=%s walked_ok=%s "
+        "sent_rows=%d union_rows=%d private_rows=%d saved=%.1f%% (%.2f GiB/layer)",
         len(prefix_lens),
         prefix_lens,
+        shared.protected,
         shared.walked,
-        shared.walked == prefix_lens,
+        shared.walked == shared.protected,
         sent,
         shared.union_rows,
-        100.0 * (sent - shared.union_rows) / sent if sent else 0.0,
-        (sent - shared.union_rows) * row_bytes / gib,
+        sent - sum(shared.protected),
+        100.0 * saved / sent if sent else 0.0,
+        saved * row_bytes / gib,
     )
 
 

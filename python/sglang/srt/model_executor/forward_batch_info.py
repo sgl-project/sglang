@@ -1040,7 +1040,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 from sglang.srt.layers.dcp.layout import dcp_shared_prefix
 
                 ret.npu_dcp_shared_prefix = dcp_shared_prefix(
-                    [getattr(req, "last_node", None) for req in batch.reqs]
+                    [getattr(req, "last_node", None) for req in batch.reqs],
+                    [req.kv.cache_protected_len for req in batch.reqs],
                 )
         ret._maybe_init_non_generation_fields(batch)
 
