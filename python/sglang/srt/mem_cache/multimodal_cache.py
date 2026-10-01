@@ -112,6 +112,8 @@ class MultiModalStaticCache(MultimodalCache):
         tensor = embedding.embedding
         storage_size = _get_tensor_size(tensor)
         data_size = min(storage_size, tensor.element_size() * tensor.numel())
+        if data_size > self.max_size:
+            return False
         while self.current_size + data_size > self.max_size:
             if not self.mm_cache:
                 return False
