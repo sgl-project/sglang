@@ -4504,6 +4504,7 @@ class DeepseekV4Model(nn.Module):
         if (
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
+            and not is_in_breakable_cuda_graph()
         ):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
@@ -5229,6 +5230,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.capture_aux_hidden_states
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
+            and not is_in_breakable_cuda_graph()
         ):
             tail = get_attn_backend().tail_forward_metadata.late_layer_tail
             input_ids = tail.rows(input_ids)
