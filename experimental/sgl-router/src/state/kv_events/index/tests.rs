@@ -5,6 +5,45 @@ use super::*;
 use crate::state::kv_events::wire::{BlockRemoved, BlockStored};
 use crate::state::load_monitor::engine_reported_load::LoadStat;
 
+/// The manager re-runs `add_worker` for a worker it already knows (its
+/// reconcile loop does so for a worker that advertises no model name), so a
+/// rank the tracker already holds must not buy another sweep: a `Pending`
+/// rank has one in flight, and a resolved one has nothing left to fetch.
+/// Only a rank `remove_worker` forgot registers afresh.
+#[tokio::test]
+async fn register_for_bootstrap_skips_ranks_the_tracker_already_holds() {
+    let index = KvEventIndex::new_with_bootstrap(
+        reqwest::Client::new(),
+        BlockSizeOracle::new(),
+        Arc::new(BootstrapTracker::new(Duration::from_secs(3600))),
+    );
+    let id = worker_id("http://w1:30000", 0);
+    let ranks = std::slice::from_ref(&id);
+
+    let first = index.register_for_bootstrap(ranks);
+    assert_eq!(first.len(), 1, "an untracked rank is registered");
+    assert!(
+        index.register_for_bootstrap(ranks).is_empty(),
+        "a Pending rank already has a sweep",
+    );
+    index.bootstrap.set(&id, BootstrapState::Failed);
+    assert!(
+        index.register_for_bootstrap(ranks).is_empty(),
+        "a resolved rank has nothing left to fetch",
+    );
+    assert_eq!(index.bootstrap.state_of(&id), Some(BootstrapState::Failed));
+
+    index.bootstrap.forget(ranks);
+    let again = index.register_for_bootstrap(ranks);
+    assert_eq!(again.len(), 1, "a forgotten rank registers afresh");
+    assert_ne!(again[0].1, first[0].1, "as a new incarnation");
+
+    assert!(
+        KvEventIndex::new().register_for_bootstrap(ranks).is_empty(),
+        "a disabled tracker registers nothing",
+    );
+}
+
 /// A restarted publisher renumbers from 0, so its cursor MUST be cleared.
 ///
 /// Without this, every post-restart batch has `seq < last_applied` and is
@@ -177,6 +216,8 @@ async fn pump_forget_ranks_drops_held_queue_so_readd_can_bootstrap() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Worker removed, then re-added: fresh incarnation, publisher renumbered.
+    // `remove_worker` forgets the tracker state before it sends `ForgetRanks`.
+    tracker.forget(std::slice::from_ref(&id));
     h.ctrl_tx
         .send(PumpControl::ForgetRanks {
             ranks: vec![id.clone()],

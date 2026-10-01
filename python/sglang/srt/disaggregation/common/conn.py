@@ -200,9 +200,7 @@ class CommonKVManager(BaseKVManager):
         self.dcp_rank = parallel.attn_dcp_rank
         self.attn_dp_size = parallel.attn_dp_size
         self.attn_dp_rank = parallel.attn_dp_rank
-        self.system_dp_size = (
-            1 if get_parallel().enable_dp_attention else get_parallel().dp_size
-        )
+        self.system_dp_size = get_parallel().dp_size
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
@@ -1545,11 +1543,12 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if get_parallel().dp_size > 1 and not req_has_disagg_prefill_dp_rank:
+        if get_parallel().num_dp_ranks > 1 and not req_has_disagg_prefill_dp_rank:
             if get_parallel().load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
             elif (
-                self.kv_mgr.attn_dp_rank != self.bootstrap_room % get_parallel().dp_size
+                self.kv_mgr.attn_dp_rank
+                != self.bootstrap_room % get_parallel().num_dp_ranks
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
                 if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
@@ -1560,7 +1559,7 @@ class CommonKVSender(BaseKVSender):
                         f"follow_bootstrap_room conflict: dispatched to dp_rank "
                         f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
                         f"{self.bootstrap_room} implies dp_rank "
-                        f"{self.bootstrap_room % get_parallel().dp_size}. "
+                        f"{self.bootstrap_room % get_parallel().num_dp_ranks}. "
                         f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
                         f"to allow mixed routing.",
                     )

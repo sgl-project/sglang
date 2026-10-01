@@ -891,9 +891,9 @@
             "icon": "play",
             "pages": [
               "index",
-              "docs/get-started/install",
               "docs/get-started/quickstart",
-              "docs/basic_usage/send_request"
+              "docs/get-started/install",
+              "docs/get-started/examples"
             ]
           }
         ]
@@ -906,6 +906,7 @@
             "icon": "book-open",
             "pages": [
               "docs/basic_usage/overview",
+              "docs/basic_usage/send_request",
               {
                 "group": "OpenAI-Compatible APIs",
                 "pages": [
