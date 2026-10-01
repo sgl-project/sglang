@@ -219,6 +219,7 @@ def run_unittest_files(
     max_attempts: int = 2,
     retry_wait_seconds: int = 60,
     fork_worker_batch_size: int = 1,
+    timeout_overrides: Optional[Dict[str, float]] = None,
 ):
     """
     Run a list of test files.
@@ -236,6 +237,7 @@ def run_unittest_files(
         fork_worker_batch_size: Number of files served by one preloaded fork
                                 worker. Each file still runs in a fresh child
                                 process. One keeps the existing exec behavior.
+        timeout_overrides: Per-file timeouts keyed by path suffix; win over the above.
     """
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
@@ -264,8 +266,9 @@ def run_unittest_files(
             if timeout_per_file is not None
             else derive_timeout_per_file(estimated_time)
         )
-        if isinstance(file, CIRegistry) and file.timeout is not None:
-            file_timeout = file.timeout
+        for suffix, override in (timeout_overrides or {}).items():
+            if filename == suffix or filename.endswith("/" + suffix):
+                file_timeout = override
 
         process = None
         output_lines = []
