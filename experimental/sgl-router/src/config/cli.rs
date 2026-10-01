@@ -3,19 +3,21 @@
 
 //! Grouped CLI options and conversion into a validated [`Config`].
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
 use std::num::NonZeroU32;
 
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
+use crate::config::types::is_selector_empty;
 use crate::config::{
     default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
-    AffinityMode, CacheAwareConfig, CachePrefixProvider, CircuitBreakerConfig, Config,
-    DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
+    AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
+    Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
     InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
+    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -66,9 +68,24 @@ pub struct ModelArgs {
     pub tokenizer_path: Option<String>,
 
     /// Disable generated input_ids; workers tokenize messages, while routing still renders locally.
-    /// Use for worker-only thinking defaults, parser/template overrides, or template stop strings.
+    /// Use for worker parser/template overrides or template stop strings.
     #[arg(long)]
     pub disable_input_ids_forwarding: bool,
+
+    /// Encode backend for router tokenization. fast uses fastokens for encoding and HF for
+    /// decoding, falling back to hf when fastokens cannot load the tokenizer.
+    #[arg(long, value_enum, default_value = "hf", value_name = "BACKEND")]
+    pub tokenizer_backend: TokenizerBackend,
+
+    /// L1 prefix-tokenization cache budget in MiB; 0 disables it. Reuses the tokens of a
+    /// previously encoded prompt up to its deepest shared special-token boundary, so a
+    /// multi-turn chat encodes only its new turns.
+    #[arg(long, default_value_t = 0, value_name = "MB")]
+    pub tokenizer_l1_cache_mb: usize,
+
+    /// Same as SGLang's --default-chat-template-kwargs; must match the workers.
+    #[arg(long, value_name = "JSON")]
+    pub default_chat_template_kwargs: Option<String>,
 
     /// Fleet sampling defaults as JSON, e.g. {"temperature": 1, "top_p": 0.95}.
     /// Accepts temperature, top_p, top_k, min_p, repetition_penalty,
@@ -160,12 +177,29 @@ pub struct DiscoveryArgs {
     /// Decode equality selector terms (key=value or key==value). Requires --prefill-selector.
     #[arg(long, num_args = 1..)]
     pub decode_selector: Vec<String>,
+
+    /// Label selector matching the EndpointSlices of this router's OWN Service
+    /// (the Service's labels, not the pods'), so a booting replica can find
+    /// siblings to pull a cache-aware tree snapshot from, e.g.
+    /// `kubernetes.io/service-name=sgl-router`. Unset disables peer bootstrap
+    /// and every replica starts cold.
+    #[arg(long)]
+    pub kv_peer_selector: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
 pub struct RoutingArgs {
-    /// Routing policy.
-    #[arg(long, value_enum, default_value = "round_robin")]
+    /// Chat routing implementation; --policy selects a policy within it.
+    #[arg(long, value_enum, default_value = "legacy")]
+    pub chat_routing: ChatRoutingKind,
+
+    /// Routing policy (defaults to power_of_two with reorg routing).
+    #[arg(
+        long,
+        value_enum,
+        default_value = "round_robin",
+        default_value_if("chat_routing", "reorg", "power_of_two")
+    )]
     pub policy: PolicyKind,
 
     /// Policy used to select decode workers for PD requests.
@@ -224,6 +258,11 @@ pub struct CacheArgs {
     /// `--kv-indexer-endpoint`; defaults to 32.
     #[arg(long)]
     pub kv_indexer_query_max_inflight: Option<usize>,
+
+    /// Peer-bootstrap deadline in milliseconds. Requires --kv-peer-selector.
+    /// Defaults to 600000 (10 minutes).
+    #[arg(long)]
+    pub kv_bootstrap_timeout_ms: Option<u64>,
 
     /// Minimum cache-hit tokens for a candidate. Defaults to 1024.
     #[arg(long)]
@@ -333,6 +372,20 @@ pub struct AffinityArgs {
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
     pub fn into_config(self) -> Result<Config> {
+        if self.routing.chat_routing == ChatRoutingKind::Reorg {
+            ensure!(
+                self.affinity.affinity_mode != Some(AffinityMode::Soft),
+                "reorg sessions do not support --affinity-mode soft"
+            );
+            ensure!(
+                self.routing.policy != PolicyKind::SessionAware
+                    || (self.affinity.pressure_abs_threshold_tokens.is_none()
+                        && self.affinity.pressure_abs_threshold_ms.is_none()
+                        && self.affinity.pressure_rel_threshold.is_none()
+                        && !self.affinity.disable_pressure_guard),
+                "reorg pressure guard options only apply to cache_aware"
+            );
+        }
         let affinity = self
             .affinity
             .build_config(&self.cache, self.routing.policy)?;
@@ -344,7 +397,27 @@ impl Cli {
             .map(load_bucket_config)
             .transpose()?;
         let circuit_breaker = self.routing.build_circuit_breaker()?;
+        let kv_bootstrap_timeout_ms = self.cache.kv_bootstrap_timeout_ms;
         let cache_aware = self.cache.into_config(self.routing.policy)?;
+        // Peer bootstrap grafts into this router's own radix tree, so it needs
+        // cache-aware over a local tree; checked here because it spans groups.
+        let has_peer_selector = discovery.peer_selector().is_some();
+        ensure!(
+            has_peer_selector || kv_bootstrap_timeout_ms.is_none(),
+            "--kv-bootstrap-timeout-ms requires --kv-peer-selector, which is what \
+             enables peer bootstrap"
+        );
+        if has_peer_selector {
+            match cache_aware.as_ref().map(|c| c.prefix_provider) {
+                None => bail!("--kv-peer-selector requires --policy cache_aware"),
+                Some(p) if p != CachePrefixProvider::RadixTree => bail!(
+                    "--kv-peer-selector requires --cache-prefix-provider radix_tree \
+                     (there is no local tree to bootstrap when an external Indexer is \
+                     the prefix source)"
+                ),
+                _ => {}
+            }
+        }
         let fused = self.routing.build_fused()?;
         let eligibility = self.routing.build_eligibility()?;
         let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
@@ -359,6 +432,14 @@ impl Cli {
                 )
             })
             .transpose()?
+            .unwrap_or_default();
+        let default_chat_template_kwargs = self
+            .model
+            .default_chat_template_kwargs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("--default-chat-template-kwargs must be a JSON object")?
             .unwrap_or_default();
 
         let config = Config {
@@ -379,6 +460,10 @@ impl Cli {
                     .unwrap_or_else(|| self.model.model_id.clone()),
                 id: self.model.model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
+                tokenizer: TokenizerConfig {
+                    backend: self.model.tokenizer_backend,
+                    l1_cache_mb: self.model.tokenizer_l1_cache_mb,
+                },
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
                 bucket_config,
@@ -389,6 +474,7 @@ impl Cli {
                 fused,
                 eligibility,
                 sampling_overrides,
+                default_chat_template_kwargs,
             },
             discovery,
             proxy: ProxyConfig {
@@ -400,6 +486,9 @@ impl Cli {
             },
         };
         config.validate()?;
+        if self.routing.chat_routing == ChatRoutingKind::Reorg {
+            crate::policies_reorg::factory::validate(&config.model)?;
+        }
         Ok(config)
     }
 }
@@ -428,6 +517,14 @@ impl DiscoveryArgs {
                     "--service-discovery-namespace / --selector / --prefill-selector / \
                          --decode-selector require --service-discovery"
                 );
+                // Peer replicas are found through EndpointSlices too, so with
+                // any other backend the flag would be accepted and then
+                // silently ignored.
+                ensure!(
+                    self.kv_peer_selector.is_none(),
+                    "--kv-peer-selector requires --service-discovery (peer replicas are \
+                     found via Kubernetes EndpointSlices)"
+                );
                 DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                     urls: self.worker_urls,
                 })
@@ -438,9 +535,19 @@ impl DiscoveryArgs {
                     join_selector(&self.prefill_selector).as_deref(),
                     join_selector(&self.decode_selector).as_deref(),
                 )?;
+                // An empty selector matches every EndpointSlice in the watched
+                // namespace(s), turning unrelated Services into "siblings".
+                ensure!(
+                    self.kv_peer_selector
+                        .as_deref()
+                        .is_none_or(|s| !is_selector_empty(s)),
+                    "--kv-peer-selector must not be empty: an empty selector matches \
+                     every EndpointSlice in the watched namespace"
+                );
                 DiscoveryBackend::K8s(K8sDiscoveryConfig {
                     namespace: self.service_discovery_namespace.unwrap_or_default(),
                     mode,
+                    peer_selector: self.kv_peer_selector,
                 })
             }
         };
@@ -591,6 +698,9 @@ impl CacheArgs {
         Ok(Some(CacheAwareConfig {
             prefix_provider: cache_prefix_provider,
             kv_indexer_endpoint,
+            bootstrap_timeout_ms: self
+                .kv_bootstrap_timeout_ms
+                .unwrap_or(DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS),
         }))
     }
 }
@@ -821,7 +931,85 @@ fn join_selector(terms: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind};
+    use crate::config::{
+        DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+    };
+
+    #[test]
+    fn chat_routing_selects_policy_implementation_without_another_config() {
+        let base = [
+            "router",
+            "--model-id",
+            "tiny",
+            "--worker-urls",
+            "http://localhost:30000",
+        ];
+        let legacy = Cli::try_parse_from(base).unwrap();
+        assert_eq!(legacy.routing.chat_routing, ChatRoutingKind::Legacy);
+        assert_eq!(
+            legacy.into_config().unwrap().model.policy,
+            PolicyKind::RoundRobin
+        );
+        let reorg = ["--chat-routing", "reorg"];
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(base.iter().chain(reorg.iter()).chain(args))
+                .unwrap()
+                .into_config()
+        };
+        assert_eq!(parse(&[]).unwrap().model.policy, PolicyKind::PowerOfTwo);
+        let cache = parse(&[
+            "--policy",
+            "cache_aware",
+            "--worker-queue-limit",
+            "3",
+            "--kv-indexer-endpoint",
+            "http://localhost:50051",
+        ])
+        .unwrap();
+        assert_eq!(cache.model.affinity.unwrap().worker_queue_limit, Some(3));
+        assert!(cache
+            .model
+            .cache_aware
+            .unwrap()
+            .kv_indexer_endpoint
+            .is_some());
+        let session = parse(&[
+            "--policy",
+            "session_aware",
+            "--session-id-header",
+            "x-session",
+        ])
+        .unwrap();
+        assert_eq!(
+            session.model.affinity.unwrap().session_id_header,
+            "x-session"
+        );
+        assert_eq!(
+            parse(&["--filter", "overloaded", "--max-in-flight", "2"])
+                .unwrap()
+                .model
+                .eligibility
+                .unwrap()
+                .max_in_flight,
+            Some(2)
+        );
+        for args in [
+            vec!["--policy", "round_robin"],
+            vec!["--decode-policy", "legacy_host_affinity"],
+            vec!["--policy", "session_aware", "--stable-pair"],
+            vec!["--policy", "session_aware", "--affinity-mode", "soft"],
+            vec!["--policy", "session_aware", "--pressure-rel-threshold", "2"],
+            vec!["--policy", "cache_aware", "--min-load-choices", "4"],
+            vec![
+                "--filter",
+                "prefix_cache",
+                "--prefix-cache-min-share",
+                "0.2",
+            ],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
 
     /// Parse argv (without the leading binary name) into a `Config`.
     fn into_config(args: &[&str]) -> Result<Config> {
@@ -1049,6 +1237,145 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("require --service-discovery"), "got: {err}");
+    }
+
+    // ---- peer bootstrap ----
+
+    /// k8s discovery + cache-aware, the base every peer-bootstrap config needs.
+    fn peer_cfg(extra: &[&str]) -> Result<Config> {
+        let mut args = vec![
+            "--service-discovery",
+            "--selector",
+            "app=sglang",
+            "--policy",
+            "cache_aware",
+        ];
+        args.extend_from_slice(extra);
+        into_config_owned(with_model(&args))
+    }
+
+    #[test]
+    fn peer_selector_rides_on_the_k8s_backend() {
+        let c = peer_cfg(&[
+            "--kv-peer-selector",
+            "app=sgl-router",
+            "--kv-bootstrap-timeout-ms",
+            "12000",
+        ])
+        .unwrap();
+        match &c.discovery {
+            DiscoveryBackend::K8s(k) => {
+                assert_eq!(k.peer_selector.as_deref(), Some("app=sgl-router"))
+            }
+            _ => panic!("expected k8s backend"),
+        }
+        assert_eq!(
+            c.model.cache_aware.as_ref().unwrap().bootstrap_timeout_ms,
+            12_000,
+        );
+    }
+
+    #[test]
+    fn peer_bootstrap_is_off_by_default() {
+        let c = peer_cfg(&[]).unwrap();
+        match &c.discovery {
+            DiscoveryBackend::K8s(k) => assert!(k.peer_selector.is_none()),
+            _ => panic!("expected k8s backend"),
+        }
+        assert_eq!(
+            c.model.cache_aware.as_ref().unwrap().bootstrap_timeout_ms,
+            DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+        );
+    }
+
+    /// Peers are found through EndpointSlices, so without k8s discovery the
+    /// flag would be accepted and then silently ignored.
+    #[test]
+    fn rejects_peer_selector_without_service_discovery() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://w:30000",
+            "--policy",
+            "cache_aware",
+            "--kv-peer-selector",
+            "app=sgl-router",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires --service-discovery"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_peer_selector_without_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--service-discovery",
+            "--selector",
+            "app=sglang",
+            "--kv-peer-selector",
+            "app=sgl-router",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--policy cache_aware"), "got: {err}");
+    }
+
+    /// With an external Indexer there is no local tree to graft into, so the
+    /// flag would be accepted and then do nothing.
+    #[test]
+    fn rejects_peer_selector_with_an_external_indexer() {
+        let err = peer_cfg(&[
+            "--cache-prefix-provider",
+            "indexer",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+            "--kv-peer-selector",
+            "app=sgl-router",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--cache-prefix-provider radix_tree"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn kv_bootstrap_timeout_bounds() {
+        let parse = |ms: u64| {
+            peer_cfg(&[
+                "--kv-peer-selector",
+                "app=sgl-router",
+                "--kv-bootstrap-timeout-ms",
+                &ms.to_string(),
+            ])
+        };
+        assert!(parse(MAX_KV_BOOTSTRAP_TIMEOUT_MS).is_ok());
+        let err = parse(MAX_KV_BOOTSTRAP_TIMEOUT_MS + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ceiling"), "got: {err}");
+        let err = parse(0).unwrap_err().to_string();
+        assert!(err.contains("greater than zero"), "got: {err}");
+    }
+
+    /// Without a selector the timeout tunes a bootstrap that never runs.
+    #[test]
+    fn rejects_bootstrap_timeout_without_a_peer_selector() {
+        let err = peer_cfg(&["--kv-bootstrap-timeout-ms", "20000"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires --kv-peer-selector"), "got: {err}");
+    }
+
+    /// An empty selector matches every EndpointSlice in the namespace.
+    #[test]
+    fn rejects_an_empty_peer_selector() {
+        for selector in ["", " , "] {
+            let err = peer_cfg(&["--kv-peer-selector", selector])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("must not be empty"), "{selector:?} got: {err}");
+        }
     }
 
     #[test]
@@ -2294,6 +2621,51 @@ mod tests {
         .to_string();
         assert!(err.contains("unknown parameter"), "got: {err}");
     }
+
+    #[test]
+    fn default_chat_template_kwargs_reaches_the_model_config() {
+        let kwargs = serde_json::json!({"thinking": true, "reasoning_effort": "high"});
+        let config = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--default-chat-template-kwargs",
+            &kwargs.to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(config.model.default_chat_template_kwargs).unwrap(),
+            kwargs
+        );
+
+        let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert!(defaults.model.default_chat_template_kwargs.is_empty());
+    }
+
+    #[test]
+    fn malformed_default_chat_template_kwargs_fails_the_launch() {
+        for kwargs in [
+            r#"{"thinking": true"#,
+            "[]",
+            "null",
+            "true",
+            "42",
+            r#""high""#,
+        ] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--default-chat-template-kwargs",
+                kwargs,
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("--default-chat-template-kwargs must be a JSON object"),
+                "kwargs={kwargs}, got: {err}"
+            );
+        }
+    }
+
     #[test]
     fn input_ids_forwarding_can_be_disabled_for_the_model() {
         let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
@@ -2305,6 +2677,29 @@ mod tests {
         ]))
         .unwrap();
         assert!(disabled.model.disable_input_ids_forwarding);
+    }
+
+    #[test]
+    fn tokenizer_backend_and_l1_cache_are_plumbed() {
+        let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(defaults.model.tokenizer, TokenizerConfig::default());
+        assert_eq!(defaults.model.tokenizer.backend, TokenizerBackend::Hf);
+        let fast = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--tokenizer-backend",
+            "fast",
+            "--tokenizer-l1-cache-mb",
+            "4096",
+        ]))
+        .unwrap();
+        assert_eq!(
+            fast.model.tokenizer,
+            TokenizerConfig {
+                backend: TokenizerBackend::Fast,
+                l1_cache_mb: 4096,
+            }
+        );
     }
 
     #[test]

@@ -235,8 +235,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     tensor, output_buffer.tensors[key], num_tokens
                 )
             return
-        if isinstance(output, (list, tuple)) and isinstance(
-            output_buffer, type(output)
+        if (isinstance(output, list) and isinstance(output_buffer, list)) or (
+            isinstance(output, tuple) and isinstance(output_buffer, tuple)
         ):
             if len(output) != len(output_buffer):
                 raise ValueError(

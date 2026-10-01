@@ -16,6 +16,7 @@
 Using mistral-community/pixtral-12b as reference.
 """
 
+from array import array
 from dataclasses import dataclass, fields
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
@@ -137,7 +138,7 @@ class PixtralForConditionalGeneration(nn.Module):
             self.vision_args, dim=self.config.text_config.hidden_size
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -858,7 +859,7 @@ class PixtralHFVisionModel(nn.Module):
 
     DEFAULT_IMAGE_TOKEN_ID = 10
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return self.input_padder.pad_input_tokens(input_ids, mm_inputs)
 
     def __init__(

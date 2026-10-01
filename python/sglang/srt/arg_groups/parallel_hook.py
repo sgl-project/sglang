@@ -29,6 +29,27 @@ from sglang.srt.utils.common import parse_connector_type
 logger = logging.getLogger(__name__)
 
 
+def _boundary_parallelism_overrides(cfg, model_type: str) -> dict:
+    """Resolve the token-row modes the model's forward actually enters."""
+    nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
+    longcat = model_type == "longcat_flash"
+    if nemotron and cfg.attn_cp_size > 1:
+        raise ValueError("Nemotron-H does not support --attn-cp-size > 1")
+    if longcat and cfg.enable_prefill_cp and cfg.attn_cp_size > 1:
+        raise ValueError(
+            "LongCat-Flash does not support --enable-prefill-cp with --attn-cp-size > 1"
+        )
+    if (nemotron or longcat) and cfg.enable_attn_tp_input_scattered:
+        # Neither model enters the input-scattered attention scope. Preserve
+        # their existing ordinary execution and make the effective flag explicit.
+        logger.warning(
+            "Disabling input-scattered attention for %s: its forward does not enter that scope",
+            model_type,
+        )
+        return {"enable_attn_tp_input_scattered": False}
+    return {}
+
+
 def handle_context_parallelism(server_args: Any):
     # Through the registry, not a bare call: an out-of-tree replacement of
     # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
@@ -42,6 +63,13 @@ def handle_context_parallelism(server_args: Any):
         model_config = model_config_of(server_args)
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
+        declare_resolution(
+            server_args,
+            "boundary_parallelism",
+            **_boundary_parallelism_overrides(
+                cfg, model_config.hf_text_config.model_type
+            ),
+        )
         if (
             cfg.enable_prefill_cp
             and model_arch == "DeepseekV32ForCausalLM"
@@ -397,21 +425,6 @@ def handle_elastic_ep(server_args: Any):
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 
     cfg = resolving_view(server_args)
-    if cfg.elastic_ep_rejoin:
-        if cfg.ep_join_mode is None:
-            logger.warning(
-                "--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead."
-            )
-            declare_resolution(
-                server_args,
-                "_handle_elastic_ep",
-                ep_join_mode="recover",
-            )
-        else:
-            assert cfg.ep_join_mode == "recover", (
-                "--elastic-ep-rejoin (deprecated) conflicts with "
-                f"--elastic-ep-join-mode {cfg.ep_join_mode}."
-            )
     if cfg.elastic_ep_backend is not None:
         if cfg.enable_eplb:
             if cfg.eplb_algorithm == "auto":
@@ -538,16 +551,37 @@ def handle_elastic_ep(server_args: Any):
             f"(got pp_size={cfg.pp_size}); WORLD must not span PP stages."
         )
 
-        decode_cuda_graph_disabled = (
-            cfg.cuda_graph_config.decode.backend == Backend.DISABLED
+        decode_backend = cfg.cuda_graph_config.decode.backend
+        assert decode_backend in (Backend.DISABLED, Backend.FULL), (
+            "Elastic EP runtime scale-up supports decode CUDA graph backend "
+            f"'full' or 'disabled' (got {decode_backend!r})."
         )
-        prefill_cuda_graph_disabled = (
-            cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
+        assert cfg.cuda_graph_config.prefill.backend == Backend.DISABLED, (
+            "Elastic EP runtime scale-up requires prefill CUDA graph to be disabled."
         )
-        assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
-            "Elastic EP runtime scale-up requires decode and prefill CUDA "
-            "graphs to be disabled."
-        )
+        if decode_backend == Backend.FULL:
+            assert cfg.device == "cuda", (
+                "Elastic EP CUDA graph recapture requires CUDA "
+                f"(got device={cfg.device!r})."
+            )
+            assert cfg.speculative_algorithm is None, (
+                "Elastic EP CUDA graph recapture does not support speculative decoding."
+            )
+            assert not cfg.is_embedding, (
+                "Elastic EP CUDA graph recapture does not support embedding models."
+            )
+            assert cfg.dllm_algorithm is None, (
+                "Elastic EP CUDA graph recapture does not support diffusion models."
+            )
+            assert not cfg.encoder_only, (
+                "Elastic EP CUDA graph recapture does not support encoder-only models."
+            )
+            assert not cfg.forward_hooks, (
+                "Elastic EP CUDA graph recapture does not support forward hooks."
+            )
+            assert not cfg.enable_pdmux, (
+                "Elastic EP CUDA graph recapture does not support PDMux."
+            )
         assert resolved.enable_dp_attention, (
             "Elastic EP scale-up requires --enable-dp-attention; without it "
             "the TP group is not equivalent to WORLD and the post-scale "
@@ -626,13 +660,6 @@ def handle_eplb_and_dispatch(server_args: Any):
 
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
-    if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
-        raise ValueError(
-            "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use "
-            "--expert-balancedness-report-mode with one of: off, server_log, "
-            "prometheus, both."
-        )
-
     if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):

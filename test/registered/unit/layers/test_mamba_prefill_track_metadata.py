@@ -221,6 +221,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
         )
         runner = SimpleNamespace(
             device="cpu",
+            is_draft_worker=False,
             model_config=SimpleNamespace(
                 requires_mm_token_modalities=False, model_is_mrope=False
             ),

@@ -1,10 +1,11 @@
 //! Frame shaping for the native `/generate` protocol: the cumulative
-//! [`OutputAccumulator`] plus the functions that render [`ChunkEvent`]s /
+//! [`OutputAccumulator`] plus the functions that render [`FrontendOutput`]s /
 //! accumulated state into wire JSON (`meta_info`, logprob tuples, error and
 //! abort frames). No HTTP here — the sibling `native_api` module owns the handlers
 //! and streams; it calls these per frame.
 
-use crate::message::response::{ChunkEvent, ChunkExtras};
+use crate::frontend::FrontendOutput;
+use crate::message::response::ChunkExtras;
 
 /// The text slot of a `[logprob, token_id, text]` tuple: the decoded token when
 /// `return_text_in_logprobs` supplied a text buffer, else `null`.
@@ -159,10 +160,10 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
     serde_json::Value::Array(rows)
 }
 
-/// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`
+/// Format a decoded [`FrontendOutput`] as one SGLang `/generate` frame's JSON. `rid`
 /// (response `meta_info.id`) is passed as a string; the event's numeric `rid` is
 /// just the shard routing key.
-pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
+pub(super) fn frame_value(out: &FrontendOutput, rid: &str) -> serde_json::Value {
     let mut v = serde_json::json!({
         "text": out.text,
         "meta_info": {
@@ -318,7 +319,7 @@ pub(super) fn tag_value(mut v: serde_json::Value, index: Option<usize>) -> Strin
 
 /// One streaming frame's JSON: cumulative ignores `delta`, incremental ships it.
 pub(super) fn stream_frame_string(
-    delta: ChunkEvent,
+    delta: FrontendOutput,
     acc: &OutputAccumulator,
     incremental: bool,
     rid_str: &str,
@@ -344,7 +345,7 @@ pub(super) fn cumulative_frame_string(
 /// Format one streaming frame: the accumulator's cumulative view (default), or this
 /// step's delta with the cumulative token count in `meta_info` (matching Python).
 pub(super) fn stream_frame_value(
-    delta: ChunkEvent,
+    delta: FrontendOutput,
     acc: &OutputAccumulator,
     incremental: bool,
     rid_str: &str,
@@ -358,15 +359,15 @@ pub(super) fn stream_frame_value(
     }
 }
 
-/// Folds per-chunk [`ChunkEvent`] deltas into a cumulative view — used by the drain
+/// Folds per-chunk [`FrontendOutput`] deltas into a cumulative view — used by the drain
 /// loops needing cumulative output (every unary response + the cumulative SGLang
 /// stream; OpenAI streaming forwards deltas and skips this). Holds a single
-/// [`ChunkEvent`] so `snapshot` hands back a **borrow** per frame — no per-frame
+/// [`FrontendOutput`] so `snapshot` hands back a **borrow** per frame — no per-frame
 /// clone of the growing buffers (that added O(T²) atop the wire's inherent O(T²)).
 /// Shared with the [`openai`] submodule.
 #[derive(Default)]
 pub(super) struct OutputAccumulator {
-    out: ChunkEvent,
+    out: FrontendOutput,
     /// Serialized cumulative `output_ids` body (`"1,2,3"`, no brackets), appended per
     /// delta so a frame memcpy's it instead of rebuilding the array — O(T), not O(T²).
     ids_json: String,
@@ -414,7 +415,7 @@ impl OutputAccumulator {
     /// Fold one delta frame in. Output families concatenate; input families and
     /// hidden states are set-once / last-writer-wins (they ride the prefill/final
     /// chunk), matching the Python `meta_info` assignment.
-    pub(super) fn fold(&mut self, d: &ChunkEvent) {
+    pub(super) fn fold(&mut self, d: &FrontendOutput) {
         use std::fmt::Write;
 
         // Grow the memoized serializations alongside the raw cumulative buffers.
@@ -427,7 +428,6 @@ impl OutputAccumulator {
         }
 
         let o = &mut self.out;
-        o.rid.clone_from(&d.rid); // constant across the request; keeps the accumulated view coherent
         o.text.push_str(&d.text);
         o.token_ids.extend_from_slice(&d.token_ids); // token_ids doubles as output_ids
         o.completion_tokens += d.completion_tokens;
@@ -532,12 +532,12 @@ impl OutputAccumulator {
     }
 
     /// Borrow the cumulative output for an intermediate streaming frame.
-    pub(super) fn snapshot(&self) -> &ChunkEvent {
+    pub(super) fn snapshot(&self) -> &FrontendOutput {
         &self.out
     }
 
     /// Consume into the final cumulative output.
-    pub(super) fn into_output(self) -> ChunkEvent {
+    pub(super) fn into_output(self) -> FrontendOutput {
         self.out
     }
 }
@@ -606,12 +606,12 @@ mod tests {
         );
     }
 
-    /// End-to-end: a `ChunkEvent` carrying a prompt-logprob request (first input
+    /// End-to-end: a `FrontendOutput` carrying a prompt-logprob request (first input
     /// logprob is the `NaN` sentinel) formats without panicking and emits
     /// `input_token_logprobs` with a leading `[null, token_id, text]`.
     #[test]
     fn prompt_logprob_frame_emits_null_first() {
-        let out = ChunkEvent {
+        let out = FrontendOutput {
             extras: Some(Box::new(ChunkExtras {
                 in_lp_val: vec![f32::NAN, -0.5],
                 in_lp_idx: vec![10, 20],
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn accumulator_snapshot_is_cumulative() {
         let mut acc = OutputAccumulator::default();
-        acc.fold(&ChunkEvent {
+        acc.fold(&FrontendOutput {
             text: "he".into(),
             token_ids: vec![1, 2],
             completion_tokens: 2,
@@ -643,7 +643,7 @@ mod tests {
             assert_eq!(s.text, "he");
             assert_eq!(s.token_ids, vec![1, 2]);
         }
-        acc.fold(&ChunkEvent {
+        acc.fold(&FrontendOutput {
             text: "llo".into(),
             token_ids: vec![3],
             completion_tokens: 1,
@@ -681,32 +681,28 @@ mod tests {
     #[test]
     fn cumulative_frame_json_matches_serde() {
         let deltas = [
-            ChunkEvent {
-                rid: "7".into(),
+            FrontendOutput {
                 text: String::new(),
                 token_ids: vec![],
                 completion_tokens: 0,
                 prompt_tokens: 128,
                 ..Default::default()
             },
-            ChunkEvent {
-                rid: "7".into(),
+            FrontendOutput {
                 text: "He\"llo\n\t".into(),
                 token_ids: vec![1000],
                 completion_tokens: 1,
                 prompt_tokens: 128,
                 ..Default::default()
             },
-            ChunkEvent {
-                rid: "7".into(),
+            FrontendOutput {
                 text: " 世界 🌍 \\".into(),
                 token_ids: vec![-2, 3],
                 completion_tokens: 2,
                 prompt_tokens: 128,
                 ..Default::default()
             },
-            ChunkEvent {
-                rid: "7".into(),
+            FrontendOutput {
                 text: "!".into(),
                 token_ids: vec![9],
                 completion_tokens: 1,
@@ -752,8 +748,7 @@ mod tests {
             };
             let deltas = [
                 // Prefill: the set-once input families and a null top-k position.
-                ChunkEvent {
-                    rid: "9".into(),
+                FrontendOutput {
                     prompt_tokens: 4,
                     extras: Some(Box::new(ChunkExtras {
                         in_lp_val: vec![f32::NAN, -1.5],
@@ -771,8 +766,7 @@ mod tests {
                     })),
                     ..Default::default()
                 },
-                ChunkEvent {
-                    rid: "9".into(),
+                FrontendOutput {
                     text: "He\"llo".into(),
                     token_ids: vec![100],
                     completion_tokens: 1,
@@ -793,8 +787,7 @@ mod tests {
                     })),
                     ..Default::default()
                 },
-                ChunkEvent {
-                    rid: "9".into(),
+                FrontendOutput {
                     text: " 世界".into(),
                     token_ids: vec![-2, 3],
                     completion_tokens: 2,
@@ -847,8 +840,7 @@ mod tests {
     #[test]
     fn mismatched_logprob_texts_fall_back_to_the_value_path() {
         let mut acc = OutputAccumulator::default();
-        acc.fold(&ChunkEvent {
-            rid: "1".into(),
+        acc.fold(&FrontendOutput {
             extras: Some(Box::new(ChunkExtras {
                 out_lp_val: vec![-0.5],
                 out_lp_idx: vec![5],
@@ -857,8 +849,7 @@ mod tests {
             ..Default::default()
         });
         assert!(cumulative_frame_json(&acc, "1", None).is_some());
-        acc.fold(&ChunkEvent {
-            rid: "1".into(),
+        acc.fold(&FrontendOutput {
             extras: Some(Box::new(ChunkExtras {
                 out_lp_val: vec![-0.25],
                 out_lp_idx: vec![6],

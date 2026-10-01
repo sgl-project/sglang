@@ -31,7 +31,7 @@ import inspect
 import logging
 import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 
 import torch
 import tqdm
@@ -155,6 +155,7 @@ def build_replay_fb_view(
     bs: int,
     raw_bs: int,
     num_tokens: int,
+    global_num_tokens_cpu: Optional[list[int]],
     seq_len_fill_value: int,
     capture_forward_mode: ForwardMode,
     is_encoder_decoder: bool,
@@ -209,6 +210,14 @@ def build_replay_fb_view(
             else buffers.mamba_track_indices[:bs]
         ),
         spec_info=forward_batch.spec_info,
+        lora_ids=(
+            None
+            if forward_batch.lora_ids is None
+            else forward_batch.lora_ids + [None] * (bs - len(forward_batch.lora_ids))
+        ),
+        can_run_decode_cuda_graph=forward_batch.can_run_decode_cuda_graph,
+        global_num_tokens_cpu=global_num_tokens_cpu,
+        dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
     )
 
 
@@ -259,18 +268,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
-        # True if a DSACPLayerCommunicator-style prefill-CP flavor is active
-        # (DSA or MLA). These flavors feed a zigzag-split rank-local layout
-        # into the runner; MHA-arch prefill CP (Qwen3/Qwen2 MoE via PR
-        # #18233) uses the plain LayerCommunicator with an attn_tp-replicated
-        # layout and is intentionally excluded so the attn_tp-local
-        # num_token_non_padded adjustment still runs for it.
+        # True if the DSA or MLA prefill-CP flavor is active. These flavors
+        # feed a zigzag-split rank-local layout into the runner; MHA-arch
+        # prefill CP (Qwen3/Qwen2 MoE via PR #18233) keeps an
+        # attn_tp-replicated layout and is intentionally excluded so the
+        # attn_tp-local num_token_non_padded adjustment still runs for it.
         self.enable_prefill_cp = is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
+        self.dllm_uses_input_embeds = (
+            self.is_dllm and self.dllm_config.requires_separate_context_encoding
+        )
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
             get_spec().speculative_num_steps
@@ -310,6 +321,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
+        if self.dllm_uses_input_embeds:
+            max_requests = min(
+                self.dllm_config.max_running_requests, max(self.capture_bs)
+            )
+            self.capture_bs = sorted(
+                {bs for bs in self.capture_bs if bs <= max_requests} | {max_requests}
+            )
+            self.compile_bs = [bs for bs in self.compile_bs if bs <= max_requests]
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -420,6 +439,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
+            aux_hidden_states_width=self.model_runner.get_aux_hidden_states_width(),
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -562,6 +582,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
+
+    def _global_num_tokens_for_graph(self, num_tokens: int) -> Optional[list[int]]:
+        if self.require_mlp_tp_gather:
+            return [num_tokens] * self.dp_size
+        if self.require_attn_tp_gather:
+            return [num_tokens]
+        return None
 
     def _resolve_attention_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
         variants = self.attention_graph_variants
@@ -838,7 +865,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         export_cuda_graph_capture_trace(
             prof_context,
             runner_name=type(self).__name__,
-            tp_rank=get_parallel().tp_rank,
         )
 
     def capture_prepare(
@@ -881,6 +907,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         mrope_positions = _slot("mrope_positions")
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        aux_hidden_states_buffer = (
+            buffers.aux_hidden_states[:num_tokens]
+            if buffers.aux_hidden_states is not None
+            else None
+        )
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
         bootstrap_room_ids_int = (
             buffers.bootstrap_room_ids_int[:bs]
@@ -907,12 +938,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
-        if self.require_mlp_tp_gather:
-            global_num_tokens_cpu = [num_tokens] * self.dp_size
-        elif self.require_attn_tp_gather:
-            global_num_tokens_cpu = [num_tokens]
-        else:
-            global_num_tokens_cpu = None
+        global_num_tokens_cpu = self._global_num_tokens_for_graph(num_tokens)
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
@@ -961,6 +987,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
+            aux_hidden_states_buffer=aux_hidden_states_buffer,
             orig_seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
@@ -975,6 +1002,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             global_num_tokens_cpu=global_num_tokens_cpu,
+            can_run_decode_cuda_graph=True,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
@@ -1182,8 +1210,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                     )
                 if (
-                    self.model_runner.spec_algorithm.is_dflash_family()
-                    and self.model_runner.is_draft_worker
+                    (
+                        self.dllm_uses_input_embeds
+                        or (
+                            self.model_runner.spec_algorithm.is_dflash_family()
+                            and self.model_runner.is_draft_worker
+                        )
+                    )
                     and "input_embeds" in inspect.signature(forward).parameters
                     and not hasattr(self.model_runner.model, "forward_embed")
                 ):
@@ -1247,6 +1280,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        if self.dllm_uses_input_embeds and forward_batch.input_embeds is None:
+            raise ValueError(
+                "Diffusion graph replay requires prepared input embeddings"
+            )
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
@@ -1289,8 +1326,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         buf[: v.shape[0]].copy_(v)
             if (
                 not is_ragged
-                and self.model_runner.spec_algorithm.is_dflash_family()
-                and self.model_runner.is_draft_worker
+                and (
+                    self.dllm_uses_input_embeds
+                    or (
+                        self.model_runner.spec_algorithm.is_dflash_family()
+                        and self.model_runner.is_draft_worker
+                    )
+                )
                 and forward_batch.input_embeds is not None
             ):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
@@ -1346,8 +1388,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if (
             not is_ragged
-            and self.model_runner.spec_algorithm.is_dflash_family()
-            and self.model_runner.is_draft_worker
+            and (
+                self.dllm_uses_input_embeds
+                or (
+                    self.model_runner.spec_algorithm.is_dflash_family()
+                    and self.model_runner.is_draft_worker
+                )
+            )
             and forward_batch.input_embeds is not None
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
@@ -1374,10 +1421,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bs=bs,
             raw_bs=raw_bs,
             num_tokens=padded_num_tokens,
+            global_num_tokens_cpu=self._global_num_tokens_for_graph(padded_num_tokens),
             seq_len_fill_value=self.seq_len_fill_value,
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
+        if (
+            self.model_runner.lora_manager is not None
+            and self.model_runner.lora_manager.enable_dp_attention
+        ):
+            self.model_runner.lora_manager.prepare_lora_batch(
+                cast(ForwardBatch, fb_view)
+            )
         # Glue-graph fast path: pointer-stable prep (static buffers + pool
         # tensors only) is captured per key; guards keep every python-visible
         # branch inside the backends constant for that key.

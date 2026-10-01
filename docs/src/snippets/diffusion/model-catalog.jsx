@@ -4,6 +4,16 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "Anima",
+      modelIds: ["circlestone-labs/Anima-Base-v1.0-Diffusers"],
+      cookbook: "/cookbook/diffusion/CircleStone/Anima",
+    },
+    {
+      name: "Ming-Image",
+      modelIds: ["inclusionAI/Ming-Image-0.1-Design", "inclusionAI/Ming-Image-0.1-Design-Layer"],
+      cookbook: "/cookbook/diffusion/inclusionAI/Ming-Image",
+    },
+    {
       name: "FLUX",
       modelIds: [
         "black-forest-labs/FLUX.1-dev",
@@ -243,6 +253,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "nvidia/Cosmos3-Edge",
       ],
       cookbook: "/cookbook/diffusion/Cosmos/Cosmos3",
+    },
+    {
+      name: "FLUX 3 Action",
+      modelIds: ["black-forest-labs/flux-3-action-droid"],
+      cookbook: "/cookbook/vla/FLUX/FLUX-3-Action",
     },
     {
       name: "LingBotWorld",

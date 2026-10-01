@@ -130,16 +130,6 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         loc = self.translate_loc_to_hisparse_device(loc)
         return super().get_mla_kv_buffer(layer, loc, dst_dtype)
 
-    def transfer_values_on_device(self, dst_indices, src_indices):
-        transfer_kv_all_layer_mla(
-            src_layers=self.data_ptrs,
-            dst_layers=self.data_ptrs,
-            src_indices=src_indices,
-            dst_indices=dst_indices,
-            item_size=self.bytes_per_token,
-            num_layers=self.layer_num,
-        )
-
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseDevicePool does not support get_cpu_copy")
 
@@ -225,28 +215,6 @@ class HiSparseMHAMainPool(MHATokenToKVPool):
         raw_loc, _, _ = unwrap_write_loc(loc)
         translated = self.translate_loc_to_hisparse_device(raw_loc)
         super().set_kv_buffer(layer, translated, cache_k, cache_v, *args, **kwargs)
-
-    def transfer_values_on_device(
-        self,
-        dst_indices: torch.Tensor,
-        src_indices: torch.Tensor,
-    ) -> None:
-        transfer_kv_all_layer_mla(
-            src_layers=self.k_data_ptrs,
-            dst_layers=self.k_data_ptrs,
-            src_indices=src_indices,
-            dst_indices=dst_indices,
-            item_size=self.bytes_per_token_k,
-            num_layers=self.layer_num,
-        )
-        transfer_kv_all_layer_mla(
-            src_layers=self.v_data_ptrs,
-            dst_layers=self.v_data_ptrs,
-            src_indices=src_indices,
-            dst_indices=dst_indices,
-            item_size=self.bytes_per_token_v,
-            num_layers=self.layer_num,
-        )
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseMHAMainPool does not support get_cpu_copy")

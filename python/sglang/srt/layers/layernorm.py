@@ -209,12 +209,14 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
+            attention_tensor_model_parallel_all_reduce,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
             flashinfer_allreduce_residual_rmsnorm,
         )
+        from sglang.srt.layers.moe.utils import deferred_post_experts_all_reduce
 
         if use_attn_tp_group:
             world_size = get_parallel().attn_tp_size
@@ -246,6 +248,16 @@ def _forward_with_allreduce_fusion(
                 )
                 if fused_result[0] is not None:
                     return fused_result
+                # The kernel declined: all-reduce over the group its workspace
+                # is built on, then add and norm into a new residual tensor, as
+                # the kernel does.
+                if use_attn_tp_group:
+                    x = attention_tensor_model_parallel_all_reduce(x)
+                else:
+                    x = deferred_post_experts_all_reduce(x)
+                if post_residual_addition is None:
+                    residual = residual.clone()
+                return norm_module.forward(x, residual, None)
 
             # For AITER route, preserve correctness when fused path is unavailable.
             if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:

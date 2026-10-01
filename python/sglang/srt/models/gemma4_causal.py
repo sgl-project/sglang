@@ -25,10 +25,12 @@ from transformers import (
 )
 
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
-    gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
+)
+from sglang.kernels.ops.moe.gemma4_routing import (
+    gemma4_fused_routing,
     gemma_routing_post_topk,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
@@ -216,6 +218,7 @@ class Gemma4MoE(nn.Module):
         config: Gemma4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        activation: str = "gelu",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -274,7 +277,7 @@ class Gemma4MoE(nn.Module):
             top_k=config.top_k_experts,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            activation="gelu",
+            activation=activation,
             reduce_results=True,
         )
 

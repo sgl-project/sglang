@@ -318,10 +318,11 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for PreferredSamplingParams {
     module = "sglang.srt.rust_extensions._server"
 )]
 // Lowercase to match the values Python reports for the same field.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DisaggregationMode {
     /// Unified prefill + decode.
+    #[default]
     Null,
     Prefill,
     Decode,
@@ -463,7 +464,7 @@ impl MmSpec {
     fn py_new(
         family: MmFamily,
         feature_shm: bool,
-        image_token_id: i32,
+        image_token_id: i64,
         patch_size: usize,
         merge_size: usize,
         temporal_patch_size: usize,

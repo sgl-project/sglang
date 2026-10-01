@@ -3,10 +3,11 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+from collections.abc import Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
-from typing import Optional
+from typing import Optional, TypeGuard
 
 import torch
 
@@ -33,6 +34,26 @@ _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 _host_memory_budget: ContextVar[Optional[int]] = ContextVar(
     "hicache_host_memory_budget", default=None
 )
+
+
+def uses_shared_host_layout(host_pool: object) -> TypeGuard[HostKVCache]:
+    return (
+        isinstance(host_pool, HostKVCache)
+        and host_pool.shared_allocation_domain is not None
+    )
+
+
+def shared_host_layout_domains(host_pools: Iterable[object]) -> list:
+    domains = []
+    seen = set()
+    for pool in host_pools:
+        if not uses_shared_host_layout(pool):
+            continue
+        domain = pool.shared_allocation_domain
+        if id(domain) not in seen:
+            seen.add(id(domain))
+            domains.append(domain)
+    return domains
 
 
 @contextmanager
@@ -135,6 +156,7 @@ def synchronized(func):
 class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
+    shared_allocation_domain = None
 
     def __init__(
         self,
@@ -322,6 +344,55 @@ class HostKVCache(abc.ABC):
         Backup KV data from the device memory pool to the host memory pool for all layers.
         """
         raise NotImplementedError()
+
+    def get_page_buffer_element_size(self, split_factor: int = 1) -> Optional[int]:
+        """Byte size of one storage element, or None for a logical anchor."""
+        indices = torch.zeros(self.page_size, dtype=torch.int64)
+        meta = (
+            self.get_split_heads_page_buffer_meta(indices, split_factor)
+            if split_factor != 1
+            else self.get_page_buffer_meta(indices)
+        )
+        sizes = meta[1] if meta else None
+        return int(sizes[0]) if sizes else None
+
+    def prepare_transfer_indices(
+        self, host_indices, device_indices, io_backend
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve indices that must remain stable through one L2 submission.
+
+        Normal host pools expose physical indices directly and controllers have
+        already moved them to the backend-required device. Shared compacting
+        pools override this hook and resolve their logical ids while the transfer
+        engine holds a layout lease.
+        """
+        return host_indices, device_indices
+
+    def backup_from_device_all_layer_physical(
+        self, device_pool, host_indices, device_indices, io_backend
+    ) -> None:
+        self.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+
+    def load_to_device_per_layer_physical(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ) -> None:
+        self.load_to_device_per_layer(
+            device_pool,
+            host_indices,
+            device_indices,
+            layer_id,
+            io_backend,
+            is_draft=is_draft,
+        )
 
     @abc.abstractmethod
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:

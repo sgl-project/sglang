@@ -1780,6 +1780,18 @@ class _SGLangPlugin(_FrameworkPlugin):
         if isinstance(value, self.PPProxyTensors):
             return {k: v for k, v in value.tensors.items()}
 
+        from sglang.srt.layers.layer_boundary.output import UnreducedOutput
+        from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput
+
+        # Observe rank-local storage without completing the deferred reduction or
+        # consuming the residual stream. Opaque handoffs and consumed handles have
+        # no tensor to dump.
+        if isinstance(value, UnreducedOutput):
+            return {"": value.partial}
+        if isinstance(value, OwedOutput):
+            tensor = value.contribution.value
+            return {"": tensor} if tensor is not None else {}
+
         return None
 
     def detect_layer_id(self, module: "torch.nn.Module") -> Optional[int]:

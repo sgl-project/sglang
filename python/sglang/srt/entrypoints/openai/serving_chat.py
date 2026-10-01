@@ -94,6 +94,7 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
+    strip_structural_tag_excludes,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
@@ -105,7 +106,10 @@ from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
     process_content_for_template_format,
 )
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import (
+    IQuestQ1ReasoningDetector,
+    ReasoningParser,
+)
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
@@ -1013,6 +1017,16 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        if (
+            request.chat_template_kwargs
+            and "chat_template" in request.chat_template_kwargs
+            and not get_serving().trust_request_chat_template
+        ):
+            return (
+                "Request-supplied chat_template is not allowed. Start the server "
+                "with --trust-request-chat-template to permit it."
+            )
+
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
@@ -1238,6 +1252,7 @@ class OpenAIServingChat(OpenAIServingBase):
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
             return_sampling_mask=request.return_sampling_mask,
+            sampling_logprobs_mode=request.sampling_logprobs_mode,
             stream=request.stream,
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
@@ -1351,6 +1366,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
                 )
+                if (
+                    tool_call_constraint is not None
+                    and tool_call_constraint[0] == "structural_tag"
+                    and self._reasoning_detector is not None
+                ):
+                    # Same ownership rule: the reasoning parser handles think
+                    # tokens, so the grammar must not forbid them in free text.
+                    strip_structural_tag_excludes(
+                        tool_call_constraint[1],
+                        (
+                            self._reasoning_detector.think_start_token,
+                            self._reasoning_detector.think_end_token,
+                        ),
+                    )
                 required_parsed_natively = parser.detector.parses_required_natively()
                 if self.chat_encoding_spec == "kimi_k3":
                     tool_call_stop = parser.detector.eot_token
@@ -1722,6 +1751,7 @@ class OpenAIServingChat(OpenAIServingBase):
         cache_key = None
         if use_cache:
             try:
+                # Key order is part of the key: templates render dicts in their given order.
                 cache_key = orjson.dumps(
                     (
                         getattr(
@@ -1734,7 +1764,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         template_kwargs,
                         encode_kwargs,
                     ),
-                    option=orjson.OPT_SORT_KEYS,
                 )
             except TypeError:
                 pass
@@ -2429,7 +2458,7 @@ class OpenAIServingChat(OpenAIServingBase):
         output_token_logprobs = ret_item["meta_info"]["output_token_logprobs"]
         output_top_logprobs = ret_item["meta_info"].get("output_top_logprobs", None)
         token_logprobs = self._build_token_logprobs_from_raw(
-            output_token_logprobs, output_top_logprobs, use_token_index=True
+            output_token_logprobs, output_top_logprobs
         )
         return ChoiceLogprobs(content=token_logprobs)
 
@@ -2437,7 +2466,6 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         output_token_logprobs: list[Any],
         output_top_logprobs: list[Any] | None,
-        use_token_index: bool = False,
     ) -> list[ChatCompletionTokenLogprob]:
         """Build OpenAI ChatCompletionTokenLogprob from the engine's raw
         ``(logprob, token_id, token_text)`` triples.
@@ -2471,13 +2499,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
             top_logprobs: list[TopLogprob] = []
             if output_top_logprobs:
-                # - Non-streaming (use_token_index=True): output_top_logprobs is
-                #   the full per-position list; take the row for this token.
-                # - Streaming (use_token_index=False): rows are pre-sliced so the
-                #   current chunk holds exactly one row at index 0.
-                top_row_idx = token_idx if use_token_index else 0
-                if top_row_idx < len(output_top_logprobs):
-                    top_row = output_top_logprobs[top_row_idx]
+                # Both callers pass rows aligned with output_token_logprobs.
+                if token_idx < len(output_top_logprobs):
+                    top_row = output_top_logprobs[token_idx]
                     if top_row is not None:
                         for top_logprob, top_id, top_text in top_row:
                             if is_byte_level:
@@ -2543,12 +2567,12 @@ class OpenAIServingChat(OpenAIServingBase):
         # as constraint (mirrors the streaming path). For auto: always try.
         if self.tool_call_parser:
             parser = FunctionCallParser(
-                tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
+                tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+                tool_choice=tool_choice,
             )
-            detector_owns_format = (
-                parser.detector.supports_structural_tag()
-                or parser.detector.parses_required_natively()
-            )
+            detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
             if should_try_parser and parser.has_tool_call(text):
                 try:
@@ -2670,7 +2694,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 n_prev_token:total_output_logprobs
             ]
         token_logprobs = self._build_token_logprobs_from_raw(
-            output_token_logprobs, output_top_logprobs, use_token_index=False
+            output_token_logprobs, output_top_logprobs
         )
         return ChoiceLogprobs(content=token_logprobs)
 
@@ -2823,6 +2847,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.reasoning_effort = "medium" if enabled else "no_think"
             return
 
+        if self.reasoning_parser == "iquest_q1":
+            request.chat_template_kwargs = {
+                **(request.chat_template_kwargs or {}),
+                "thinking": enabled,
+                "enable_thinking": enabled,
+            }
+            return
+
         if self.reasoning_parser == "inkling":
             # Effort-conditioned, not toggled: "none" (0.0) is the off switch.
             if not enabled:
@@ -2880,6 +2912,11 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.reasoning_parser:
             return False
+
+        if self.reasoning_parser == "iquest_q1":
+            return IQuestQ1ReasoningDetector.thinking_enabled(
+                request.chat_template_kwargs or {}
+            )
 
         if self.reasoning_parser == "minimax-m3":
             # M3 template prefills <mm:think> for thinking_mode=enabled, so it never
@@ -2987,11 +3024,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=effective_tools,
                         tool_call_parser=self.tool_call_parser,
                         tokenizer=self.tokenizer_manager.tokenizer,
+                        tool_choice=request.tool_choice,
                     )
-                    use_native_parser = (
-                        probe.detector.supports_structural_tag()
-                        or probe.detector.parses_required_natively()
-                    )
+                    use_native_parser = probe.owns_tool_format()
                 if use_native_parser:
                     parser_dict[index] = probe
                 else:

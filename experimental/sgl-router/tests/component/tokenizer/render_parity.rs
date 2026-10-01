@@ -113,6 +113,7 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             id: model_id.into(),
             tokenizer_path: tokenizer_path.to_str().unwrap().into(),
             disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -123,6 +124,7 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

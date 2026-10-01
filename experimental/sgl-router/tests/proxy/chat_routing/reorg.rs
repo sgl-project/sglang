@@ -678,3 +678,47 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     assert!(cold.captured.lock().unwrap().last_body.is_none());
     assert!(owner.captured.lock().unwrap().last_body.is_some());
 }
+
+#[tokio::test]
+async fn default_pd_groups_apply_configured_inflight_admission() {
+    use sgl_router::config::{EligibilityConfig, FilterKind, PolicyKind};
+    use std::sync::atomic::Ordering;
+
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let mut ctx = context(
+        &[
+            ("p", Stage::Prefill, &prefill),
+            ("d", Stage::Decode, &decode),
+        ],
+        vec![],
+    );
+    let mutable = Arc::get_mut(&mut ctx).unwrap();
+    mutable.config.model.policy = PolicyKind::PowerOfTwo;
+    mutable.config.model.eligibility = Some(EligibilityConfig {
+        filters: vec![FilterKind::Overloaded],
+        max_in_flight: Some(1),
+        min_prefix_share: None,
+    });
+    let state = sgl_router::state::kv_events::KvEventIndex::new();
+    let (resolver, _) =
+        sgl_router::policies_reorg::factory::build_resolver(&mutable.config.model, &state, None)
+            .unwrap();
+    mutable.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
+    let worker = ctx.registry.get(&WorkerId("d".into())).unwrap();
+    let app = build_router(ctx);
+    for (inflight, expected) in [(1, StatusCode::SERVICE_UNAVAILABLE), (0, StatusCode::OK)] {
+        worker.active_requests.store(inflight, Ordering::Relaxed);
+        let response = app.clone().oneshot(request(body("hi"))).await.unwrap();
+        assert_eq!(response.status(), expected);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(
+            prefill.captured.lock().unwrap().last_body.is_some(),
+            expected == StatusCode::OK
+        );
+        assert_eq!(
+            decode.captured.lock().unwrap().last_body.is_some(),
+            expected == StatusCode::OK
+        );
+    }
+}

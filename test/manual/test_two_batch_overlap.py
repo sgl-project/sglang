@@ -10,7 +10,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -71,7 +71,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreater(metrics["score"], 0.5)
 
 

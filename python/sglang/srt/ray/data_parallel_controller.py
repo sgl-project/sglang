@@ -146,10 +146,7 @@ class RayDataParallelController(DataParallelController):
             for node_idx in range(nnodes):
                 bundle_idx = self.bundle_for_node[node_idx]
                 pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
-                    nnodes,
-                    get_parallel().pp_size,
-                    get_parallel().tp_size,
-                    node_rank=node_idx,
+                    node_rank=node_idx
                 )
                 for pp_rank in pp_range:
                     for tp_rank in tp_range:

@@ -54,11 +54,25 @@ def handle_hicache(server_args: Any):
 
     validate_hicache_host_memory_mode(server_args)
 
+    if cfg.disaggregation_decode_host_receive_threshold > 0:
+        # The shared host pool must match KV transfer's per-layer buffers.
+        declare_resolution(
+            server_args, "handle_hicache", hicache_mem_layout="layer_first"
+        )
+
     # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
 
     # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
+    if (
+        cfg.disaggregation_decode_host_receive_threshold > 0
+        and cfg.hicache_mem_layout != "layer_first"
+    ):
+        raise ValueError(
+            f"The resolved HiCache storage layout {cfg.hicache_mem_layout!r} "
+            "cannot share the layer_first decode host pool used by KV transfer"
+        )
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)

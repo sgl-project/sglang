@@ -86,7 +86,7 @@ except ImportError:
     pass
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
+from sglang.kernels.ops.moe.dsv4 import mask_topk_ids
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -99,6 +99,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
     get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
@@ -536,6 +537,8 @@ class TopK(BaseFusedOp):
     """
     Parameters:
     --top_k: The all number of top experts selected per token, including the fused shared expert(s).
+    --layer_id: global index of the owning layer. Required: routed-experts capture and
+      per-layer EPLB state are keyed by it.
     --num_fused_shared_experts: num of shared experts, can be activate both in TP or EP mode.
     --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
     --fused_shared_experts_scaling_factor: scaling factor applied to the fused shared experts'
@@ -547,7 +550,7 @@ class TopK(BaseFusedOp):
         self,
         top_k: int,
         *,
-        layer_id: Optional[int] = None,
+        layer_id: int,
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
@@ -833,6 +836,7 @@ class TopK(BaseFusedOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        dynamic_expert_bias: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
         self.topk_config.torch_native = True
         # [NOTE] XPU device support for topk kernels
@@ -849,6 +853,7 @@ class TopK(BaseFusedOp):
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+            dynamic_expert_bias=dynamic_expert_bias,
         )
 
 
@@ -2050,9 +2055,12 @@ def biased_grouped_topk_gpu(
             and experts_per_group <= 32
             and is_power_of_two(num_experts)
         ):
-            from sgl_kernel import moe_fused_gate
+            # aliased: a plain `import moe_fused_gate` here makes the name local
+            # to the whole function, and the MUSA branch above, which reads the
+            # module-level mate import, raised UnboundLocalError (ruff F823)
+            from sgl_kernel import moe_fused_gate as _sgl_kernel_moe_fused_gate
 
-            return moe_fused_gate(
+            return _sgl_kernel_moe_fused_gate(
                 gating_output.to(torch.float32),
                 correction_bias.to(torch.float32),
                 num_expert_group,
@@ -2239,6 +2247,7 @@ def _post_process_topk_ids(
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
     _fold_pad_into_append = False
+    recorder_was_fused = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2302,10 +2311,34 @@ def _post_process_topk_ids(
         )
         if not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+        if (
+            _is_hip
+            and envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+            and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
+            and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+            and layer_id is not None
+        ):
+            from sglang.srt.eplb.eplb_map_record_fused import (
+                eplb_map_and_record_fused,
+            )
+
+            if get_moe_a2a_backend().is_megamoe():
+                recorder = get_global_expert_distribution_recorder()
+                load_buffer = recorder.get_current_pass_count_buffer(layer_id)
+                if load_buffer is not None:
+                    fused_topk_ids = eplb_map_and_record_fused(
+                        topk_ids,
+                        expert_location_dispatch_info,
+                        load_buffer,
+                        num_token_non_padded,
+                    )
+                    if fused_topk_ids is not None:
+                        topk_ids = fused_topk_ids
+                        recorder_was_fused = True
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if _eplb_remap_enabled():
+        if not recorder_was_fused and _eplb_remap_enabled():
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
@@ -2314,7 +2347,7 @@ def _post_process_topk_ids(
         # That final pass re-zeros after any shared-expert append/remap, so a
         # second zeroing here would be redundant (zeroing is idempotent).
 
-    if recorder_topk_ids is None:
+    if recorder_topk_ids is None and not recorder_was_fused:
         recorder_topk_ids = topk_ids
 
     _aiter_append = num_fused_shared_experts > 0 and _use_aiter
@@ -2527,7 +2560,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts,
+                num_fused_shared_experts=num_fused_shared_experts_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 scoring_func=scoring_func,
@@ -2541,7 +2574,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts,
+                num_fused_shared_experts=num_fused_shared_experts_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
@@ -2712,9 +2745,10 @@ def select_experts(
         padded_rows_masked=padded_rows_masked,
     )
 
-    get_global_expert_distribution_recorder().on_select_experts(
-        topk_ids=recorder_topk_ids
-    )
+    if recorder_topk_ids is not None:
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=recorder_topk_ids
+        )
 
     if packed_topk is not None:
         return StandardTopKOutputPacked(

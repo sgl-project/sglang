@@ -105,7 +105,7 @@ PER_COMMIT_SUITES = {
         "extra-b-test-8-gpu-b300",
     ],
     HWBackend.NPU: [
-        "base-a-test-1-npu-a2",
+        "base-a-test-npu",
         "base-b-test-1-npu-a3",
         "base-b-test-2-npu-a3",
         "base-b-test-4-npu-a3",
@@ -151,6 +151,9 @@ NIGHTLY_SUITES = {
         "nightly-amd-accuracy-8-gpu-mi35x-kimi-k3",
         "nightly-amd-8-gpu-mi35x-qwen38-mxfp4",
         "nightly-amd-8-gpu-mi35x-glm52-fp8",
+        "nightly-amd-8-gpu-mi35x-glm53-flash",
+        "nightly-amd-accuracy-8-gpu-glm53",
+        "nightly-amd-8-gpu-mi35x-glm53",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
