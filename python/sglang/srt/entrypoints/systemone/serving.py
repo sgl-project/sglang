@@ -39,6 +39,8 @@ class SystemOneServing(OpenAIServingDecisions):
     """Answers System One questions with the rendering, label checks, and scoring of /v1/decisions."""
 
     route = "/v1/systemone"
+    name = "systemone"
+    request_model = SystemOneRequest
 
     def _request_id_prefix(self) -> str:
         return "systemone-"

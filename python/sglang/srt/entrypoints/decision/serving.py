@@ -37,20 +37,27 @@ _SUBJECT = "Decision model requests"
 
 
 class TrainedDecisions(OpenAIServingBase):
-    """The prompt source of /v1/decisions for checkpoints trained on their own decision prompt."""
+    """The prompt source of the decision routes for checkpoints trained on their own decision prompt."""
+
+    name = "trained"
+    request_model = JevRequest
 
     def __init__(
-        self, tokenizer_manager, validate_server: Callable[[str], Optional[str]]
+        self, *, tokenizer_manager, validate_server: Callable[[str], Optional[str]]
     ):
         super().__init__(tokenizer_manager)
         self.family = detect_family(tokenizer_manager.tokenizer)
-        # The refusals of the generic decisions route, shared by every prompt source.
+        # The host route's server refusals, shared by every prompt source.
         self.validate_server = validate_server
+
+    @staticmethod
+    def detect(tokenizer) -> bool:
+        return detect_family(tokenizer) is not None
 
     def _request_id_prefix(self) -> str:
         return "decision-model-"
 
-    async def handle_request(self, request: JevRequest, raw_request: Request):
+    async def handle(self, request: JevRequest, raw_request: Request):
         error = self._validate_request(request)
         if error is not None:
             return self.create_error_response(error)
@@ -151,6 +158,10 @@ class TrainedDecisions(OpenAIServingBase):
             ),
         )
         return ORJSONResponse(content=response.model_dump(exclude_none=True))
+
+
+# The prompt sources of decision model checkpoints, for the decision route handlers.
+PROMPT_SOURCES = (TrainedDecisions,)
 
 
 def _unprocessable(error: DecisionInputError) -> ORJSONResponse:
