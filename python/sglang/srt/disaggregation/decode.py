@@ -1713,6 +1713,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.pending_reqs = [
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
+            for decode_req in failed_reqs:
+                if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove

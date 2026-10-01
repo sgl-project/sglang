@@ -3693,19 +3693,29 @@ name = "sglang-grpc"
 version = "0.1.0"
 dependencies = [
  "async-stream",
- "prost",
  "prost-types",
- "protoc-bin-vendored",
  "pyo3",
  "serde_json",
+ "sglang-grpc-types",
  "tokenizers",
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-build",
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "sglang-grpc-types"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "prost-types",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]

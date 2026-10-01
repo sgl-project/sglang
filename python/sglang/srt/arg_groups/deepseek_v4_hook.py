@@ -12,7 +12,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -182,7 +182,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
         incompatible = (
-            ("non-CUDA hardware", not get_platform().is_cuda),
+            (
+                "hardware other than CUDA or gfx950",
+                not (
+                    get_platform().is_cuda
+                    or (get_platform().is_hip and is_gfx95_supported())
+                ),
+            ),
             (
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
