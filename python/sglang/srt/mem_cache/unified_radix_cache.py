@@ -90,6 +90,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_memory,
     get_model,
     get_observability,
@@ -119,6 +120,11 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
+# SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP: after this many consecutive skipped
+# ready-count syncs, run one anyway so its piggybacked reclaim-digest check still
+# runs. Arbitrary; a few seconds at typical scheduler step rates.
+_IDLE_SYNC_MAX_SKIPS = 512
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -264,6 +270,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # Opt-in idle ready-count sync skip and check_hicache_events timer
+        # (SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP / SGLANG_HICACHE_EVENTS_TIMER_STEPS);
+        # resolved in init_hicache.
+        self._idle_sync_skip = False
+        self._idle_sync_skips = 0
+        self._idle_sync_skip_logged = False
+        self._events_timer_steps = 0
+        self._events_timer: dict[str, float] = {}
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -489,6 +503,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self._init_idle_sync_skip()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -2895,6 +2910,107 @@ class UnifiedRadixCache(BasePrefixCache):
             ready_count += 1
         return ready_count
 
+    def _init_idle_sync_skip(self) -> None:
+        """Resolve SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP and the events timer.
+
+        The skip is limited to aggregated serving with one PP stage and no
+        buffer-only mode. A storage backend blocks it per step, because one can
+        be attached at runtime."""
+        self._events_timer_steps = max(0, envs.SGLANG_HICACHE_EVENTS_TIMER_STEPS.get())
+        if not envs.SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP.get():
+            return
+        reasons = []
+        if self.cache_controller is None:
+            reasons.append("no HiCache controller")
+        if self.pp_size > 1:
+            reasons.append(f"pp_size={self.pp_size}")
+        if self.buffer_pipeline is not None:
+            reasons.append("buffer_only host memory mode")
+        disagg_mode = get_disagg().disaggregation_mode
+        if disagg_mode != "null":
+            reasons.append(f"disaggregation_mode={disagg_mode}")
+        if reasons:
+            logger.info(
+                "HiCache idle-sync skip requested (SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP=1) "
+                "but inactive: %s",
+                ", ".join(reasons),
+            )
+            return
+        self._idle_sync_skip = True
+        logger.info(
+            "HiCache idle-sync skip enabled (SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP=1): "
+            "the per-step ready-count all-reduce is skipped while no D<->H ack is "
+            "outstanding and no storage backend is attached (forced every %d skips)",
+            _IDLE_SYNC_MAX_SKIPS,
+        )
+
+    @rank_consensus(same_results=True)
+    def _skip_idle_sync(self) -> bool:
+        """True iff this step's ready-count all-reduce can be skipped.
+
+        With both ack queues empty the all-reduce returns zero ready acks
+        (a MIN over zeros), so skipping changes no state. Every rank returns
+        the same value, because every input is rank-invariant:
+        - The queue lengths: acks are appended in the same order on every rank
+          (issuance is decided by the replicated scheduler and tree). They are
+          popped by all-reduced counts or by full drains at the same call sites.
+        - enable_storage, which a broadcast control request sets.
+        - _idle_sync_skips, which only this method updates.
+        Per-rank completion timing enters only the all-reduced counts, never
+        this decision."""
+        cc = self.cache_controller
+        if (
+            self.enable_storage
+            or cc.ack_write_queue
+            or cc.ack_load_queue
+            or self._idle_sync_skips >= _IDLE_SYNC_MAX_SKIPS
+        ):
+            self._idle_sync_skips = 0
+            return False
+        self._idle_sync_skips += 1
+        if not self._idle_sync_skip_logged:
+            self._idle_sync_skip_logged = True
+            logger.info(
+                "HiCache idle-sync skip engaged: ready-count all-reduce skipped "
+                "(no D<->H ack outstanding)"
+            )
+        return True
+
+    def _record_events_timer(self, synced: bool, t0: float, t_sync: float) -> None:
+        """SGLANG_HICACHE_EVENTS_TIMER_STEPS=N: one log line per N calls of
+        check_hicache_events with its wall time and the ready-count sync's."""
+        now = time.perf_counter()
+        st = self._events_timer
+        if not st:
+            st.update(start=t0, calls=0, synced=0, sync_s=0.0, sync_max=0.0)
+            st.update(call_s=0.0, call_max=0.0)
+        st["calls"] += 1
+        call_s = now - t0
+        st["call_s"] += call_s
+        st["call_max"] = max(st["call_max"], call_s)
+        if synced:
+            sync_s = t_sync - t0
+            st["synced"] += 1
+            st["sync_s"] += sync_s
+            st["sync_max"] = max(st["sync_max"], sync_s)
+        if st["calls"] < self._events_timer_steps:
+            return
+        n, n_sync = st["calls"], st["synced"]
+        logger.info(
+            "HiCache events timer: %d calls in %.1f s, synced %d, skipped %d; "
+            "sync mean %.3f ms max %.3f ms per synced call; "
+            "check_hicache_events mean %.3f ms max %.3f ms per call",
+            n,
+            now - st["start"],
+            n_sync,
+            n - n_sync,
+            1e3 * st["sync_s"] / max(1, n_sync),
+            1e3 * st["sync_max"],
+            1e3 * st["call_s"] / n,
+            1e3 * st["call_max"],
+        )
+        st.clear()
+
     def _sync_hicache_ready_counts(
         self,
     ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
@@ -3134,15 +3250,25 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
 
+        timed = self._events_timer_steps > 0
+        t0 = time.perf_counter() if timed else 0.0
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
-        (
-            write_finish_count,
-            load_finish_count,
-            storage_queue_sizes,
-            extra_pool_names,
-        ) = self._sync_hicache_ready_counts()
+        if self._idle_sync_skip and self._skip_idle_sync():
+            # No ack is outstanding on any rank, so the all-reduce would return 0s.
+            write_finish_count = load_finish_count = 0
+            storage_queue_sizes, extra_pool_names = (), ()
+            synced = False
+        else:
+            (
+                write_finish_count,
+                load_finish_count,
+                storage_queue_sizes,
+                extra_pool_names,
+            ) = self._sync_hicache_ready_counts()
+            synced = True
+        t_sync = time.perf_counter() if timed else 0.0
         self.writing_check(finish_count=write_finish_count)
         self.loading_check(finish_count=load_finish_count)
 
@@ -3169,6 +3295,8 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+        if timed:
+            self._record_events_timer(synced, t0, t_sync)
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

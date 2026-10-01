@@ -749,6 +749,11 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Skip the per-step HiCache ready-count CPU all-reduce while no D<->H
+    # transfer ack is outstanding (aggregated, L2-only, single PP stage).
+    SGLANG_ENABLE_HICACHE_IDLE_SYNC_SKIP = EnvBool(False)
+    # Log check_hicache_events timing once per N calls on every rank (0 = off).
+    SGLANG_HICACHE_EVENTS_TIMER_STEPS = EnvInt(0)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
