@@ -204,8 +204,7 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 4 \
     --speculative-draft-model-quantization unquant \
     --tp 16 \
-    --dp-size 16 \
-    --enable-dp-attention \
+    --attn-dp-size 16 \
     --enable-dp-lm-head \
     --mem-fraction-static 0.8 \
     --cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27 \

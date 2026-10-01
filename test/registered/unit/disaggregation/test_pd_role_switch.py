@@ -307,7 +307,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             disaggregation_mode="prefill",
             disaggregation_decode_host_receive_threshold=0.0,
             enable_pd_role_switch=True,
-            enable_dp_attention=False,
+            attn_dp_size=1,
+            ep_join_mode=None,
             ep_size=1,
             moe_a2a_backend="none",
             pp_size=1,
@@ -331,8 +332,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
 
     def test_reject_dp_attention(self):
         with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(enable_dp_attention=True))
-        self.assertIn("DP attention", str(ctx.exception))
+            self._run(self._sa(attn_dp_size=2))
+        self.assertIn("attention DP", str(ctx.exception))
 
     def test_reject_expert_parallelism(self):
         with self.assertRaises(ValueError) as ctx:

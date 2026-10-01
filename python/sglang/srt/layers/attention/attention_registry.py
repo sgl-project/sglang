@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
+HYBRID_GDN_SM100_BACKENDS = {"triton", "trtllm_mha", "fa4", "flashinfer"}
 
 
 def register_attention_backend(name):
@@ -438,7 +439,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     # GDN models. In particular, quantized KV recipes use it
                     # to expose an FP8 dequant workspace while a different
                     # backend (for example TRT-LLM GenMHA) owns decode.
-                    allowed = {"triton", "trtllm_mha", "fa4", "flashinfer"}
+                    allowed = HYBRID_GDN_SM100_BACKENDS
                 prefill_be = runner.prefill_attention_backend_str
                 decode_be = runner.decode_attention_backend_str
                 assert prefill_be in allowed and decode_be in allowed, (

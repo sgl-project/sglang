@@ -1,7 +1,6 @@
 import logging
 from array import array
 from contextlib import nullcontext
-from functools import partial
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -27,12 +26,12 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
-    PLAIN_RESIDUAL,
+    PLAIN_RESIDUAL_OPS,
     MHCState,
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
@@ -123,7 +122,7 @@ from sglang.srt.utils.common import (
     LazyValue,
     add_prefix,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
     set_weight_attrs,
 )
 
@@ -391,10 +390,8 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         head_shard_size = get_parallel().attn_tp_size
         head_shard_rank = get_parallel().attn_tp_rank
-        _head_shard_rank_getter = partial(getattr, get_parallel(), "attn_tp_rank")
 
         self.hidden_size = hidden_size
         self.config = config
@@ -533,7 +530,7 @@ class Glm5NextLinearAttention(nn.Module):
 
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, _head_shard_rank_getter)},
+            {"weight_loader": sharded_weight_loader(0)},
         )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
@@ -554,7 +551,7 @@ class Glm5NextLinearAttention(nn.Module):
         )
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(2, _head_shard_rank_getter)},
+            {"weight_loader": sharded_weight_loader(2)},
         )
 
         self.o_norm = FusedRMSNormGated(
@@ -740,7 +737,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -780,7 +777,7 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         terminal = layer_id == (1 if is_nextn else config.num_hidden_layers) - 1
-        residual = PLAIN_RESIDUAL
+        residual = PLAIN_RESIDUAL_OPS
         if self.config.mhc:
             residual = MHCState(
                 hc_mult=config.hc_mult,
@@ -793,12 +790,10 @@ class Glm5NextDecoderLayer(nn.Module):
                     else None
                 ),
                 is_last_layer=terminal,
-            ).layer_residual()
+            ).residual_ops()
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
-                declare_attn(
-                    read=residual.attention_read, update=residual.attention_update
-                ),
+                declare_attn(read=residual.attn_readout, update=residual.attn_update),
                 self.input_layernorm,
                 {
                     "qkv_latent_func": self.self_attn.prepare_qkv_latent
@@ -809,15 +804,15 @@ class Glm5NextDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
-                    read=residual.ffn_read,
+                    next_layer_sparse=is_next_layer_sparse,
+                    read=residual.ffn_readout,
                     update=residual.ffn_update,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
                 sparse=is_previous_layer_sparse,
-                next_sparse=self.is_layer_sparse,
+                next_layer_sparse=self.is_layer_sparse,
                 update=residual.ffn_update,
             )
             if layer_id != 0
@@ -933,7 +928,7 @@ class Glm5NextDecoderLayer(nn.Module):
         hidden_states_orig = residual_access.buffer(hidden_states)
 
         hidden_states = self.attn_boundary.prepare(
-            hidden_states, forward_batch, capture_output=capture_output
+            hidden_states, forward_batch, capture=capture_output
         )
 
         hidden_states = self.self_attn(
@@ -941,9 +936,7 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            input_on_attention_tp_slices=(
-                self.attn_boundary.input_on_attention_tp_slices
-            ),
+            input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
             prev_topk_indices=prev_topk_indices,
         )
         if isinstance(hidden_states, tuple):
@@ -1015,7 +1008,7 @@ class Glm5NextModel(nn.Module):
             else None
         )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm5NextDecoderLayer(
                 config=config,
@@ -1024,8 +1017,6 @@ class Glm5NextModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -1189,13 +1180,11 @@ class Glm5NextModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            if self.config.mhc:
-                return PPProxyTensors({"hidden_states": hidden_states})
             return residual_batch.to_pp(hidden_states, forward_batch)
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
 
@@ -1243,7 +1232,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         self.pp_group = get_parallel().pp_group
         self.config = text_config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.use_dsa = is_deepseek_dsa(text_config)
         self.num_fused_shared_experts = 0
