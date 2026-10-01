@@ -26,6 +26,9 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.cp.interleave_boundary import (
+    attn_cp_reduce_scatter,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -43,9 +46,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary.adapters.attention import (
     attn_tp_gather,
     attn_tp_slice,
-)
-from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
-    attn_cp_reduce_scatter,
 )
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,

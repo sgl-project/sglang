@@ -71,6 +71,10 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.interleave_boundary import (
+    attn_cp_gather,
+    attn_cp_reduce_scatter,
+)
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
@@ -99,10 +103,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
-    attn_cp_gather,
-    attn_cp_reduce_scatter,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
