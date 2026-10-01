@@ -117,6 +117,14 @@ def handle_kv4_compatibility(server_args: Any) -> None:
     if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
         return
 
+    # DSA owns a dedicated NVFP4 pool and validates its split TRTLLM backends
+    # in overrides.py. It does not use the generic MLA FP4 pool/backend matrix.
+    if cfg.kv_cache_dtype == "nvfp4":
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        if is_deepseek_dsa(model_config_of(server_args).hf_config):
+            return
+
     uses_mla = use_mla_backend(server_args)
     prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     attention_backend = resolved_view(server_args).attention_backend

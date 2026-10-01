@@ -87,6 +87,7 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
+    is_float4_e2m1fn_x2,
     is_gfx95_supported,
     is_hip,
     is_xpu,
@@ -564,6 +565,16 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_born_q_stash: Optional[Tuple[int, int]] = None
         self._q8kv8_born_q_sentinel: Optional[torch.Tensor] = None
         self._q8kv8_born_q_tbo = get_exec().overlap.enable_two_batch_overlap
+
+        # Per-stream, grow-only compact FP8 outputs for the NVFP4 generation
+        # gather. Every attention layer reuses the same storage in stream order;
+        # keying by stream keeps TBO and CUDA Graph capture streams independent.
+        self._nvfp4_generation_scratch: dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._nvfp4_cuda_graph_scratch: Optional[tuple[torch.Tensor, torch.Tensor]] = (
+            None
+        )
 
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             _validate_flashinfer_sparse_mla_backend,
@@ -1287,6 +1298,27 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            from sglang.kernels.ops.attention.dsa.nvfp4_mla_cache import (
+                preload_nvfp4_mla_gather,
+            )
+
+            # Compile before capture: neither the SGLang JIT nor a cold Triton
+            # fallback may run while a CUDA graph is being recorded.
+            preload_nvfp4_mla_gather()
+            num_pairs = max_num_tokens * self.dsa_index_topk
+            padded_pairs = (
+                (num_pairs + self.real_page_size - 1) // self.real_page_size
+            ) * self.real_page_size
+            self._nvfp4_cuda_graph_scratch = (
+                torch.empty(
+                    (padded_pairs, 1, self.kv_cache_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device=self.device,
+                ),
+                torch.empty(padded_pairs, dtype=torch.int32, device=self.device),
+            )
+
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
@@ -3402,6 +3434,38 @@ class DeepseekSparseAttnBackend(
 
         return o
 
+    def _acquire_nvfp4_generation_scratch(
+        self, num_rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return stable, grow-only FP8 and index scratch for this CUDA stream."""
+        padded_rows = (
+            (num_rows + self.real_page_size - 1) // self.real_page_size
+        ) * self.real_page_size
+        if torch.cuda.is_current_stream_capturing():
+            buffers = self._nvfp4_cuda_graph_scratch
+            if buffers is None or buffers[0].shape[0] < padded_rows:
+                capacity = 0 if buffers is None else buffers[0].shape[0]
+                raise RuntimeError(
+                    "NVFP4 DSA CUDA Graph scratch is undersized: "
+                    f"required={padded_rows}, capacity={capacity}."
+                )
+            return buffers[0][:padded_rows], buffers[1][:num_rows]
+
+        stream_key = torch.cuda.current_stream().cuda_stream
+        buffers = self._nvfp4_generation_scratch.get(stream_key)
+        if buffers is None or buffers[0].shape[0] < padded_rows:
+            fp8_scratch = torch.empty(
+                (padded_rows, 1, self.kv_cache_dim),
+                dtype=torch.float8_e4m3fn,
+                device=self.device,
+            )
+            index_scratch = torch.empty(
+                padded_rows, dtype=torch.int32, device=self.device
+            )
+            buffers = (fp8_scratch, index_scratch)
+            self._nvfp4_generation_scratch[stream_key] = buffers
+        return buffers[0][:padded_rows], buffers[1][:num_rows]
+
     def _forward_trtllm(
         self,
         q: torch.Tensor,
@@ -3424,6 +3488,8 @@ class DeepseekSparseAttnBackend(
         import flashinfer.decode
 
         metadata = self.forward_metadata
+
+        is_nvfp4_cache = is_float4_e2m1fn_x2(self.kv_cache_dtype)
 
         # The BF16 no-RoPE path passes a zero-width q_rope tensor.
         merge_query = q_rope is not None and self.qk_rope_head_dim > 0
@@ -3464,8 +3530,19 @@ class DeepseekSparseAttnBackend(
                         forward_batch, k, k_rope
                     )
             merge_query = False
+        elif is_nvfp4_cache:
+            # The basic NVFP4 path lets forward_absorb_prepare apply RoPE in
+            # BF16.  Keep the persistent KV in BF16 until the pool quantizes it,
+            # while converting only Q to the FP8 format TRTLLM-GEN consumes.
+            assert cos_sin_cache is None, (
+                "NVFP4 DSA currently expects RoPE to be applied before the backend."
+            )
+            assert q_rope is not None and k_rope is not None
+            q = concat_mla_absorb_q_general(q, q_rope).to(torch.float8_e4m3fn)
+            merge_query = False
 
-            # Save KV cache if requested
+        # Save the new main-attention cache row.  The NVFP4 pool packs K here;
+        # the FP8 pool simply scatters the already-quantized tensors.
         if save_kv_cache:
             assert k is not None and k_rope is not None, (
                 "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
@@ -3477,8 +3554,11 @@ class DeepseekSparseAttnBackend(
             )
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
 
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
+        if not is_nvfp4_cache:
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cache = k_cache.view(
+                -1, self.real_page_size, self.kv_cache_dim
+            ).unsqueeze(1)
 
         if merge_query:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -3535,10 +3615,16 @@ class DeepseekSparseAttnBackend(
             sparse_mla_top_k_lens = prepare_trtllm_nope_sparse_metadata(page_table_1)
 
         q_scale = 1.0
+        # NVFP4 gather applies the cache's global dequantization scale before
+        # casting to compact FP8, so no additional K descale belongs in BMM1.
         k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
+            1.0
+            if is_nvfp4_cache
+            else (
+                layer.k_scale_float
+                if getattr(layer, "k_scale_float", None) is not None
+                else 1.0
+            )
         )
         bmm1_scale = q_scale * k_scale * layer.scaling
 
@@ -3548,7 +3634,44 @@ class DeepseekSparseAttnBackend(
         multi_ctas_kv_counter_buffer = self._multi_ctas_kv_counter_for(batch_size)
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
-        kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+        if is_nvfp4_cache:
+            from sglang.kernels.ops.attention.dsa.nvfp4_mla_cache import (
+                gather_dequant_nvfp4_mla_cache,
+                gather_dequant_nvfp4_mla_cache_generation,
+            )
+
+            data_cache, scale_cache, global_scale = (
+                self.token_to_kv_pool.get_nvfp4_mla_buffers(layer.layer_id)
+            )
+            use_context_gather = is_prefill and not (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            if use_context_gather:
+                kv, page_table_1 = gather_dequant_nvfp4_mla_cache(
+                    data_cache,
+                    scale_cache,
+                    page_table_1,
+                    global_scale,
+                    head_dim=self.kv_cache_dim,
+                    page_size=self.real_page_size,
+                )
+            else:
+                output_scratch, index_scratch = self._acquire_nvfp4_generation_scratch(
+                    page_table_1.numel()
+                )
+                kv, page_table_1 = gather_dequant_nvfp4_mla_cache_generation(
+                    data_cache,
+                    scale_cache,
+                    page_table_1,
+                    global_scale,
+                    head_dim=self.kv_cache_dim,
+                    page_size=self.real_page_size,
+                    output=output_scratch,
+                    compact_indices=index_scratch,
+                )
+        else:
+            kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 

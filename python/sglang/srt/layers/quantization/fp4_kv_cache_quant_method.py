@@ -33,6 +33,7 @@ Why do we need attention access rules?
   combination is unsupported.
 """
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -41,7 +42,10 @@ from typing import Iterable, Optional
 import torch
 from torch import Tensor
 
-from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_MAX
+from sglang.srt.layers.quantization.kvfp4_tensor import (
+    E2M1_MAX,
+    MAX_BLOCK_SCALE_FP8,
+)
 from sglang.srt.runtime_context import get_platform
 
 
@@ -565,6 +569,21 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
 
         self.k_scales_gpu.copy_(k_scales_cpu, non_blocking=True)
         self.v_scales_gpu.copy_(v_scales_cpu, non_blocking=True)
+
+    def configure_dsa_mla_scales(self, kv_cache_amax: float = 100.0) -> None:
+        """Use the TensorRT-LLM two-level scale recipe for DSA latent KV.
+
+        Checkpoint ``k_scale`` belongs to the regular FP8/native-MHA cache
+        recipe and can force small MLA values below E4M3's minimum block scale.
+        DSA instead uses a fixed expected amax, matching TensorRT-LLM.
+        """
+        if not math.isfinite(kv_cache_amax) or kv_cache_amax <= 0:
+            raise ValueError("DSA NVFP4 KV-cache amax must be positive and finite")
+        dequant_scale = kv_cache_amax / (MAX_BLOCK_SCALE_FP8 * E2M1_MAX)
+        self.k_scales_gpu.fill_(dequant_scale)
+        self.v_scales_gpu.fill_(dequant_scale)
+        self.k_scales_float = [dequant_scale] * len(self.k_scales_float)
+        self.v_scales_float = [dequant_scale] * len(self.v_scales_float)
 
     def get_bmm_scales(self, layer_id: int) -> tuple[float, float]:
         return self.k_scales_float[layer_id], self.v_scales_float[layer_id]

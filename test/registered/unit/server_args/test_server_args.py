@@ -2635,6 +2635,51 @@ class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
                     finalize_cuda_graph_prefill_max_context(args)
 
 
+class TestNVFP4DSACudaGraphPolicy(CustomTestCase):
+    @staticmethod
+    def _make_args(*, locked: bool):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="nvfp4",
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.FULL, max_bs=8, bs=[1, 8]),
+                prefill=PhaseConfig(backend=Backend.BREAKABLE),
+            ),
+        )
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+        )
+        args._cuda_graph_config_locked = (
+            {(Phase.PREFILL, "backend")} if locked else set()
+        )
+        return args
+
+    def test_implicit_prefill_graph_is_disabled_but_decode_remains_enabled(self):
+        args = self._make_args(locked=False)
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+        ):
+            apply_cuda_graph_compatibility(args)
+        resolved = resolution_result(args, "cuda_graph_config")
+        self.assertEqual(resolved.prefill.backend, Backend.DISABLED)
+        self.assertEqual(resolved.decode.backend, Backend.FULL)
+
+    def test_explicit_prefill_graph_is_rejected(self):
+        args = self._make_args(locked=True)
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            self.assertRaisesRegex(ValueError, "prefill CUDA Graphs"),
+        ):
+            apply_cuda_graph_compatibility(args)
+
+    def test_generic_kv4_matrix_defers_to_dsa_validation(self):
+        args = self._make_args(locked=False)
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+        ):
+            handle_kv4_compatibility(args)
+
+
 class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
     def test_pp_prefill_graph_is_opt_in(self):
         cases = (
