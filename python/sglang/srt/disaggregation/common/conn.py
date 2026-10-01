@@ -1309,6 +1309,13 @@ class CommonKVManager(BaseKVManager):
                 "PD Disaggregation does NOT support PD different TP sizes for "
                 "non-MLA SWA hybrid models with pipeline parallelism yet."
             )
+        # The addresses below assume NHD pages [page_size, heads, head_dim]; HND
+        # and vectorized_5d pages have the same size in another element order.
+        if self.kv_args.swa_kv_cache_layout != "nhd":
+            raise RuntimeError(
+                "Head-sliced PD transfer needs the NHD KV cache layout, got "
+                f"{self.kv_args.swa_kv_cache_layout}"
+            )
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
             resolve_total_kv_heads,

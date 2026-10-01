@@ -662,6 +662,7 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
             state_item_lens=[[item_len] * len(src_ptrs)],
             state_dim_per_tensor=[[]],
             state_layer_ids=[[]],
+            swa_kv_cache_layout="nhd",
         )
         return prefill
 
@@ -806,19 +807,22 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
                 self.assertFalse(memory[src_bytes:].any())
 
     def test_unsliceable_layouts_are_rejected(self):
-        """A unified-memory envelope and SWA heads sharded unlike
-        total_kv_head_num must fail instead of shipping nothing or wrong bytes."""
+        """A unified-memory envelope, SWA heads sharded unlike total_kv_head_num
+        and non-NHD pages must fail instead of shipping nothing or wrong bytes."""
         prefill = object.__new__(CommonKVManager)
         prefill.attn_tp_size = 2
         prefill.pp_size = 1
         prefill.kv_args = SimpleNamespace(
             engine_rank=0, page_size=2, total_kv_head_num=8, prefill_start_layer=0
         )
-        for src_item_lens, dst_item_lens, message in (
-            ([64], [32], "per-layer K/V"),
+        for layout, src_item_lens, dst_item_lens, message in (
+            ("nhd", [64], [32], "per-layer K/V"),
             # One SWA head per rank on both sides, against 8 total KV heads.
-            ([8, 8], [8, 8], "do not split"),
+            ("nhd", [8, 8], [8, 8], "do not split"),
+            # Item lengths that are valid NHD, so only the layout can reject.
+            ("vectorized_5d", [16, 16], [8, 8], "NHD KV cache layout"),
         ):
+            prefill.kv_args.swa_kv_cache_layout = layout
             with self.subTest(message=message):
                 with self.assertRaisesRegex(RuntimeError, message):
                     prefill._get_mha_head_slice_blocks(
