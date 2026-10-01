@@ -59,6 +59,12 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
     apply_routed_scaling_factor: bool = True
+    # Plain (non-swizzled) NVFP4 block scales for the SM120 decode GEMV
+    # fast path; None keeps the CUTLASS-only behavior.
+    w13_blockscale_plain: Optional[torch.Tensor] = None
+    w2_blockscale_plain: Optional[torch.Tensor] = None
+    is_gated: bool = True
+    activation: Optional[str] = None
 
 
 def materialize_swiglu_params_for_cutlass(
@@ -250,6 +256,12 @@ def _prepare_input(
     return x, x_sf, output_dtype, output_col
 
 
+def _sm120_moe_gemv_enabled() -> bool:
+    import os
+
+    return os.environ.get("SGLANG_NEMOTRON_MOE_GEMV", "1") == "1"
+
+
 def _run_flashinfer_cutlass(
     *,
     dispatch_output,
@@ -267,6 +279,53 @@ def _run_flashinfer_cutlass(
     x, x_sf, output_dtype, output_col = _prepare_input(
         dispatch_output, quant_info, runner_config
     )
+
+    # SM120 decode fast path: M=1 NVFP4 non-gated ReLU^2 grouped GEMV.
+    if (
+        quant_info.quant_type == "fp4"
+        and quant_info.w13_blockscale_plain is not None
+        and not runner_config.is_gated
+        and runner_config.activation == "relu2"
+        and x.dim() == 2
+        and x.shape[0] == 1
+        and x_sf is None
+        and x.dtype == torch.bfloat16
+        and quant_info.moe_ep_size == 1
+        and quant_info.moe_tp_size == 1
+        and _sm120_moe_gemv_enabled()
+    ):
+        from sglang.kernels.ops.gemm.sm120_nvfp4_moe_gemv import (
+            nvfp4_moe_gemv_decode,
+            use_nvfp4_moe_gemv,
+        )
+
+        w13 = quant_info.w13_weight
+        w2 = quant_info.w2_weight
+        n1, k1 = w13.shape[1], w13.shape[2] * 2
+        n2, k2 = w2.shape[1], w2.shape[2] * 2
+        if use_nvfp4_moe_gemv(1, n1, k1, n2, k2):
+            qs = quant_info.quant_scales
+            if output is None:
+                output = torch.empty(
+                    1, output_col, dtype=output_dtype, device=x.device
+                )
+            nvfp4_moe_gemv_decode(
+                x,
+                w13,
+                quant_info.w13_blockscale_plain,
+                w2,
+                quant_info.w2_blockscale_plain,
+                qs[2],
+                qs[5],
+                qs[0],
+                qs[3],
+                topk_ids,
+                topk_weights,
+                out=output,
+            )
+            return _maybe_apply_routed_scaling_factor(
+                output, quant_info, runner_config
+            )
 
     if output is None:
         with use_symmetric_memory(
