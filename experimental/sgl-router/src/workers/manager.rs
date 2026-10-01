@@ -7,7 +7,7 @@ use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::state::kv_events::KvEventIndex;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
-use crate::workers::{WireProtocol, WorkerRegistry};
+use crate::workers::{WireProtocol, Worker, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +22,12 @@ use tokio::task::JoinHandle;
 /// interval plus the introspection round-trip; steady state costs one cheap
 /// registry scan per interval. See `reconcile_unresolved_workers` for the
 /// (benign) case of a worker that answers but never advertises a model name.
+/// Prefills whose bootstrap port is unknown are revisited on this interval too.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Faster cadence for prefills held unroutable by the bootstrap-port grace, so
+/// they get several retries before it expires.
+const BOOTSTRAP_PORT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
 ///
@@ -177,10 +182,11 @@ pub async fn run_with_introspector(
 ///   fetching would no-op (registry empty), then the deferred Added
 ///   write would leak the worker indefinitely.
 /// - **Reconcile tick:** every `reconcile_interval`, re-introspects any
-///   registered worker whose `model_ids` are still empty (see
-///   [`reconcile_unresolved_workers`]). Runs on the same loop and shares
-///   `pending` with the discovery events so re-registrations stay
-///   serialized per id against concurrent `Added` / `Removed`.
+///   registered worker whose `model_ids` are still empty or that is a
+///   prefill without a bootstrap port (see [`reconcile_unresolved_workers`]).
+///   Runs on the same loop and shares `pending` with the discovery events so
+///   re-registrations stay serialized per id against concurrent `Added` /
+///   `Removed`.
 pub async fn run_with_introspector_and_reconcile(
     mut rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
@@ -203,11 +209,13 @@ pub async fn run_with_introspector_and_reconcile(
     // interval (no point scanning an empty registry at t=0); `Skip` means
     // a reconcile pass that runs long never builds a backlog of catch-up
     // ticks.
-    let mut reconcile = tokio::time::interval_at(
-        tokio::time::Instant::now() + reconcile_interval,
-        reconcile_interval,
-    );
-    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let ticker = |period| {
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker
+    };
+    let mut reconcile = ticker(reconcile_interval);
+    let mut port_retry = ticker(reconcile_interval.min(BOOTSTRAP_PORT_RETRY_INTERVAL));
 
     loop {
         tokio::select! {
@@ -240,6 +248,18 @@ pub async fn run_with_introspector_and_reconcile(
                     &kv_index,
                     &introspector,
                     &mut pending,
+                    |w| w.model_ids.is_empty() || w.lacks_bootstrap_port(),
+                );
+            }
+            _ = port_retry.tick() => {
+                pending.retain(|_, h| !h.is_finished());
+                reconcile_unresolved_workers(
+                    &registry,
+                    &cfg,
+                    &kv_index,
+                    &introspector,
+                    &mut pending,
+                    Worker::awaiting_bootstrap_port,
                 );
             }
         }
@@ -360,7 +380,8 @@ async fn handle_discovery_event(
     }
 }
 
-/// Re-introspect workers that registered without resolving their model IDs.
+/// Re-introspect the workers matching `unresolved`: those that registered
+/// without resolving their model IDs, or prefills without a bootstrap port.
 ///
 /// A worker lands in the registry with empty `model_ids` when its
 /// introspection failed at `Added` time (e.g. the EndpointSlice flips
@@ -373,27 +394,31 @@ async fn handle_discovery_event(
 ///
 /// This pass re-runs `register_one` (an idempotent registry upsert +
 /// idempotent kv-events subscribe) for each such worker until the
-/// introspection succeeds and the worker joins its model pool. A worker
+/// introspection succeeds and the worker joins its model pool. A portless
+/// prefill is likewise revisited, keeping its model, until the port is
+/// reported (see [`crate::workers::worker::BOOTSTRAP_PORT_GRACE`]). A worker
 /// already being (re-)registered is skipped via `pending`, so a slow
 /// `/server_info` never stacks duplicate tasks for one id; and because
 /// `pending` is shared with the event loop, a `Removed` that arrives
 /// mid-reconcile awaits the in-flight handle before clearing the
 /// registry, so a worker that genuinely left is not resurrected.
 ///
-/// A worker that answers but never advertises a `served_model_name` also
-/// stays in this set and is re-introspected every interval — a benign,
-/// bounded poll, not a leak. It is never escalated, so the per-attempt
-/// logging stays at `debug!`; the introspector emits the `warn!` that
-/// surfaces a persistently failing worker.
+/// A worker that answers but never advertises a `served_model_name` (or,
+/// for a prefill, its bootstrap port) also stays in this set and is
+/// re-introspected every interval — a benign, bounded poll, not a leak.
+/// It is never escalated, so the per-attempt logging stays at `debug!`;
+/// the introspector emits the `warn!` that surfaces a persistently failing
+/// worker.
 fn reconcile_unresolved_workers(
     registry: &Arc<WorkerRegistry>,
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
+    unresolved: impl Fn(&Worker) -> bool,
 ) {
     for worker in registry.all() {
-        if !worker.model_ids.is_empty() {
+        if !unresolved(&worker) {
             continue;
         }
         let id = worker.id.clone();
@@ -405,30 +430,29 @@ fn reconcile_unresolved_workers(
         let registry_t = registry.clone();
         let introspector_t = introspector.clone();
         let worker_url = worker.url.clone();
-        // Rebuild a discovery-shaped spec: empty `model_ids` so `register_one`
-        // re-resolves them; current mode + bootstrap_port as the seed
-        // (`register_one` re-applies any `/server_info` override).
+        // Keep any resolved model so retrying a missing prefill port cannot drop
+        // the worker from its pool when `/server_info` fails.
         let spec = WorkerSpec {
             id: id.clone(),
             url: worker_url.clone(),
             mode: worker.mode(),
-            model_ids: Vec::new(),
+            model_ids: worker.model_ids.clone(),
             bootstrap_port: worker.bootstrap_port(),
+            version_group: worker.version_group().map(str::to_owned),
         };
         // `debug!` not `info!`: this fires every interval for each
         // still-unresolved worker, so info-level would spam for one that is
-        // permanently model-less. The introspector logs the underlying failure
-        // at `warn!` on each attempt, which is the operator-facing signal.
+        // permanently model-less or portless. The introspector logs the
+        // underlying failure at `warn!` on each attempt, which is the
+        // operator-facing signal.
         tracing::debug!(
             worker_id = %id,
             worker_url = %worker_url,
-            "reconcile: re-introspecting worker that registered without model_ids",
+            "reconcile: re-introspecting worker with unresolved model or prefill bootstrap port",
         );
         let cfg_t = cfg.clone();
         let kv_index_t = kv_index.clone();
-        // Safe to go back through the registry upsert only because this worker
-        // is in no model pool: the fresh `Worker` it builds discards a breaker
-        // and load counters that a model-less worker has never accumulated.
+        // The upsert keeps the live load and breaker state of a routable worker.
         let handle = tokio::spawn(async move {
             register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
         });
@@ -469,8 +493,8 @@ fn log_protocol_resolution(worker_url: &str, enable_http2: Option<bool>, clearte
         ),
         // Never read: `/server_info` did not answer, or the engine predates the
         // flag. Distinct from an explicit `false`, and worth saying out loud —
-        // once a worker has a model id `reconcile_unresolved_workers` stops
-        // revisiting it, so this reading is the only one it will ever get.
+        // `reconcile_unresolved_workers` never revisits a fully resolved
+        // worker, so this reading may be the only one it gets.
         (None, _) => tracing::info!(
             worker_url = %worker_url,
             "no --enable-http2 reading from /server_info; using the negotiating \
@@ -531,7 +555,7 @@ async fn register_one(
     let cleartext = dials_cleartext(&worker_url);
     let protocol = resolve_protocol(info.enable_http2, cleartext);
     // Captured before the insert: `reconcile_unresolved_workers` re-runs this
-    // function every interval for a worker that never advertises a model name,
+    // function every interval for a worker missing a model name or prefill port,
     // so logging unconditionally would repeat the same line for the life of the
     // process. Logging only a new or changed resolution keeps the reconcile
     // path quiet, matching why its own progress message stays at `debug!`.
@@ -590,7 +614,7 @@ mod tests {
             observability: Default::default(),
             model: ModelConfig {
                 id: id.into(),
-                tokenizer_path: "/tmp/x".into(),
+                tokenizer_path: Some("/tmp/x".into()),
                 disable_input_ids_forwarding: false,
                 tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
@@ -624,7 +648,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
-            bootstrap_port: None,
+            ..Default::default()
         };
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
@@ -739,7 +763,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -783,7 +807,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -832,7 +856,7 @@ mod tests {
                 url,
                 mode: WorkerMode::Plain,
                 model_ids: Vec::new(),
-                bootstrap_port: None,
+                ..Default::default()
             };
             tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
             let registered = tokio::time::timeout(Duration::from_secs(2), async {
@@ -902,7 +926,7 @@ mod tests {
             url: worker_url.clone(),
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait until the manager has both registered the worker AND
@@ -1003,7 +1027,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait for the manager to land the registry write so the
@@ -1083,7 +1107,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -1201,7 +1225,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1227,6 +1251,64 @@ mod tests {
 
         drop(tx);
         let _ = manager_handle.await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_repairs_portless_prefill_with_known_model() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let (url, _shutdown) = spawn_switchable_worker(
+            json!({"served_model_name": "m", "disaggregation_mode": "prefill",
+                   "disaggregation_bootstrap_port": 8997}),
+            ready.clone(),
+        )
+        .await;
+        let registry = Arc::new(WorkerRegistry::default());
+        let model = ModelId("m".into());
+        let id = WorkerId("warming-prefill".into());
+        let (tx, rx) = mpsc::channel(8);
+        let manager = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(50),
+        ));
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url,
+            mode: WorkerMode::Prefill,
+            model_ids: vec![model.clone()],
+            bootstrap_port: None,
+            version_group: Some("v1".into()),
+        }))
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(3), async {
+            while registry.get(&id).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(registry.workers_for(&model).len(), 1);
+        assert!(registry.healthy_workers_for(&model).is_empty());
+        ready.store(true, Ordering::SeqCst);
+        timeout(Duration::from_secs(3), async {
+            while registry.get(&id).unwrap().bootstrap_port() != Some(8997) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(registry.healthy_workers_for(&model).len(), 1);
+        assert_eq!(registry.get(&id).unwrap().version_group(), Some("v1"));
+        drop(tx);
+        manager.await.unwrap();
     }
 
     /// A worker that registers with empty `model_ids` because
@@ -1264,7 +1346,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
 
@@ -1353,7 +1435,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1477,7 +1559,7 @@ mod tests {
             url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1604,7 +1686,7 @@ mod tests {
             url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1675,7 +1757,7 @@ mod tests {
             url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
