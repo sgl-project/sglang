@@ -58,7 +58,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         url: worker.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());

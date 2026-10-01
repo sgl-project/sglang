@@ -81,7 +81,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             url: worker_url.to_string(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         })
         .expect("test worker accepted");
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());

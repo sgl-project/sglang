@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::common::mock_worker::MockWorker;
 use futures::StreamExt;
@@ -11,6 +14,7 @@ fn pd_ctx(prefill: &str, decode: &str, reorg: bool) -> Arc<AppContext> {
         mode,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: Some(8997),
+        ..Default::default()
     };
     let mut ctx = build_ctx(vec![
         spec("p", prefill, WorkerMode::Prefill),

@@ -174,6 +174,7 @@ fn build_ctx(prefill_url: String, decode_url: String) -> Arc<AppContext> {
                 mode: WorkerMode::Prefill,
                 model_ids: vec![ModelId("tiny".into())],
                 bootstrap_port: Some(8997),
+                ..Default::default()
             },
             None,
             WireProtocol::H2c,
@@ -186,7 +187,7 @@ fn build_ctx(prefill_url: String, decode_url: String) -> Arc<AppContext> {
                 url: decode_url,
                 mode: WorkerMode::Decode,
                 model_ids: vec![ModelId("tiny".into())],
-                bootstrap_port: None,
+                ..Default::default()
             },
             None,
             WireProtocol::Http1,

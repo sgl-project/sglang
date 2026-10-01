@@ -195,7 +195,7 @@ async fn fixture(
                 url: backend.url.clone(),
                 mode: WorkerMode::Plain,
                 model_ids: vec![ModelId("tiny".into())],
-                bootstrap_port: None,
+                ..Default::default()
             })
             .unwrap();
     }
@@ -412,7 +412,7 @@ async fn chat_records_prefill_admission_exhausted_for_out_of_range_primary() {
         url: "http://outsider:30000".into(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }));
     let fixture = fixture(PolicyKind::SessionAware, |_| {
         Arc::new(InvalidPairPolicy {
