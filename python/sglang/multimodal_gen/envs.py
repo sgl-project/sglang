@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D_BF16: bool = False
+    SGLANG_USE_ROCM_AITER_TGEMM: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -485,6 +486,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_ROCM_VAE_CONV2D": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D"),
     # ROCm: use BF16 compute for the Conv2D replacement (implies CONV2D=true)
     "SGLANG_USE_ROCM_VAE_CONV2D_BF16": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D_BF16"),
+    # ROCm: route unquantized bf16/fp16 linears through aiter tgemm, which picks
+    # the backend per (M, N, K) from aiter's bf16_tuned_gemm CSVs
+    "SGLANG_USE_ROCM_AITER_TGEMM": _lazy_bool("SGLANG_USE_ROCM_AITER_TGEMM"),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication
