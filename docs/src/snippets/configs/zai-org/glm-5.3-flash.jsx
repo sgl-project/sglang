@@ -343,7 +343,7 @@ sgl-eval run gsm8k \\
           disable: [
             {
               when: { dpAttnOn: [true] },
-              reason: "DFLASH speculative decoding does not support DP-Attention — the server rejects the combination at startup. Turn DP-Attention off in the Attention card above.",
+              reason: "DFlash2 with DP-Attention is not yet validated for this GLM-5.3-Flash recipe. Turn DP-Attention off in the Attention card above.",
             },
           ],
         },

@@ -100,7 +100,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DFlash draft model (linear block verification)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DFLASH</code> + <code>--speculative-draft-model-path ...</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No DP attention (<code>--attn-dp-size</code> &gt; 1); <code>pp_size == 1</code>; disables overlap scheduler &amp; mixed chunked prefill</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DP attention on CUDA/NPU requires <code>--enable-dp-lm-head</code>; no context parallelism with DP attention; <code>pp_size == 1</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STANDALONE</td>
@@ -528,6 +528,10 @@ print(response.choices[0].message.content)
 ## DFlash Decoding
 
 SGLang also supports **DFLASH** speculative decoding using a dedicated draft model checkpoint. Compared with EAGLE-style tree verification, DFLASH verifies a linear draft block and is configured around a block size / draft window. This path is useful when the target model has a matching DFlash draft checkpoint, such as `meta-llama/Llama-3.1-8B-Instruct` with `z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat`.
+
+DFlash and DFlash2 checkpoints both use `--speculative-algorithm DFLASH`. On CUDA and Ascend NPU, you can use DP attention (`--attn-dp-size` greater than 1) with `--enable-dp-lm-head`. As with DSpark, the draft worker and the target LM head must use the same attention-TP group. With TP8 and attention DP8, each draft worker uses a full local vocabulary head.
+
+DP attention requires `--attn-cp-size 1` and `--pp-size 1`. The draft runs without CUDA graphs. Target verification falls back to eager execution when a DP rank is idle or the round mixes prefill and verification.
 
 Relevant parameters:
 

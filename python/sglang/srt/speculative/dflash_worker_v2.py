@@ -545,6 +545,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
+        self._draft_num_token_non_padded = (
+            torch.empty((), dtype=torch.int32, device=self.device)
+            if enable_num_token_non_padded()
+            else None
+        )
+        self._draft_num_token_non_padded_bs: Optional[int] = None
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
         )
@@ -1003,6 +1009,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._fused_kv_helper = None
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
+        if (
+            self._draft_num_token_non_padded is not None
+            and self._draft_num_token_non_padded_bs != bs
+        ):
+            # This local scalar is read-only during draft forward. Keep its
+            # storage and value across equal-sized batches instead of doing
+            # a host-to-device scalar construction on every decode step.
+            self._draft_num_token_non_padded.fill_(bs * int(self.block_size))
+            self._draft_num_token_non_padded_bs = bs
         cap = (
             0
             if self._draft_block_ids_buf is None
@@ -1298,22 +1313,49 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not get_parallel().attn_dp_enabled:
             return
 
-        tp_group = get_parallel().tp_group
-        tp_size = int(tp_group.world_size)
-        if tp_size <= 1:
-            return
-
         target_model = self._target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
+        embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
         local_w = embed_module.weight.data
         shard = getattr(embed_module, "shard_indices", None)
-        num_org = int(shard.num_org_elements) if shard else local_w.shape[0]
         vocab_size = int(self._target_worker.model_runner.model_config.vocab_size)
+        tp_size = int(getattr(embed_module, "tp_size", 1))
+        if tp_size == 1 and (shard is None or shard.num_added_elements == 0):
+            # DP=TP targets already hold the full table on each rank. Reuse
+            # it, including any trained mask row, rather than gathering one
+            # copy per DP rank and retaining that oversized backing storage.
+            self._full_embed_gpu = local_w[:vocab_size]
+            return
 
-        shard_t = local_w[:num_org].contiguous()
-        parts = [torch.empty_like(shard_t) for _ in range(tp_size)]
-        dist.all_gather(parts, shard_t, group=tp_group.device_group)
-        self._full_embed_gpu = torch.cat(parts, dim=0)[:vocab_size]
+        parts = [local_w]
+        if tp_size > 1:
+            tp_group = (
+                get_parallel().attn_tp_group
+                if embed_module.use_attn_tp_group
+                else get_parallel().tp_group
+            )
+            # Gather equal-sized padded shards: the valid vocabulary length
+            # can differ across ranks, including an entirely padded shard.
+            parts = [torch.empty_like(local_w) for _ in range(tp_size)]
+            dist.all_gather(parts, local_w.contiguous(), group=tp_group.device_group)
+
+        full_weight = local_w.new_empty((embed_module.num_embeddings, local_w.shape[1]))
+        for rank, part in enumerate(parts):
+            indices = embed_module._get_indices(
+                embed_module.num_embeddings_padded,
+                embed_module.org_vocab_size_padded,
+                embed_module.num_embeddings,
+                embed_module.org_vocab_size,
+                rank,
+                tp_size,
+            )
+            full_weight[
+                indices.org_vocab_start_index : indices.org_vocab_end_index
+            ].copy_(part[: indices.num_org_elements])
+            added_offset = indices.num_org_elements_padded
+            full_weight[
+                indices.added_vocab_start_index : indices.added_vocab_end_index
+            ].copy_(part[added_offset : added_offset + indices.num_added_elements])
+        self._full_embed_gpu = full_weight[:vocab_size]
         if get_parallel().tp_rank == 0:
             logger.info(
                 "DFLASH cached full embed on GPU for dp attention: shape=%s",
@@ -2344,13 +2386,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
                 idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
-                    batch, self._target_worker
+                    batch, self._target_worker, force_eager=True
                 )
-                # Force eager: the active ranks run eager verify when any DP
-                # rank is idle (see the idle-guard below); a graph-replaying
-                # idle rank would disagree with them on DP-gather segment
-                # offsets (padded bucket vs raw counts).
-                idle_verify_forward_batch.can_run_decode_cuda_graph = False
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
@@ -2519,7 +2556,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
             else:
                 seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
-                draft_seq_lens_sum = int(prefix_lens.sum().item())
+                draft_seq_lens_sum = int(seq_lens_cpu.sum())
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -2535,11 +2572,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_token_non_padded=(
-                torch.tensor(bs * block_size, dtype=torch.int32, device=device)
-                if enable_num_token_non_padded()
-                else None
-            ),
+            num_token_non_padded=self._draft_num_token_non_padded,
             global_num_token_non_padded_cpu=bs * block_size,
         )
 
@@ -2715,28 +2748,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
             batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
+        # Idle/mixed ranks use raw DP-gather counts, not the graph's padded
+        # buckets. Select eager before prepare_for_verify can load or plan a
+        # graph; disabling it after preparation is already too late.
+        force_eager = get_parallel().attn_dp_enabled and (
+            batch.is_extend_in_batch
+            or (
+                batch.global_num_tokens is not None
+                and min(batch.global_num_tokens) == 0
+            )
+        )
         verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
+            batch, self.target_worker, force_eager=force_eager
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
-
-        # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
-        # counts while a graph-replaying rank assumes the padded bucket, so
-        # their DP-gather segment offsets disagree. Fall back to eager verify
-        # whenever any DP rank is idle this round.
-        if (
-            get_parallel().attn_dp_enabled
-            and verify_forward_batch.original_global_num_tokens_cpu is not None
-            and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
-        ):
-            verify_forward_batch.can_run_decode_cuda_graph = False
-
-        # Mixed-round guard: an extend rank's raw token counts disagree with
-        # the verify batch's spec-scaled counts on the DP-gather layout; run
-        # eager, symmetric with the idle guard above.
-        if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
-            verify_forward_batch.can_run_decode_cuda_graph = False
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,

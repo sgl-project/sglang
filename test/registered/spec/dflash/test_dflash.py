@@ -1,7 +1,10 @@
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 
 import openai
+import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, kill_process_tree
@@ -23,18 +26,13 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1078, stage="base-b", runner_config="1-gpu-small")
+# Registration selects a whole file, so the DP case moves this CUDA suite to
+# two GPUs. Existing cases still launch their original single-GPU topology.
+register_cuda_ci(est_time=1200, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=420, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
-class TestDFlashServerBase(
-    CustomTestCase,
-    MatchedStopMixin,
-    GSM8KMixin,
-    JSONConstrainedMixin,
-    SpecGrammarKit,
-    SpecLogprobKit,
-):
+class _DFlashServerLifecycle:
     max_running_requests = 64
     attention_backend = "triton" if is_hip() else "flashinfer"
     page_size = 1
@@ -95,6 +93,16 @@ class TestDFlashServerBase(
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
+
+class TestDFlashServerBase(
+    _DFlashServerLifecycle,
+    CustomTestCase,
+    MatchedStopMixin,
+    GSM8KMixin,
+    JSONConstrainedMixin,
+    SpecGrammarKit,
+    SpecLogprobKit,
+):
     def test_early_stop(self):
         client = openai.Client(base_url=self.base_url + "/v1", api_key="EMPTY")
         for i in range(8):
@@ -138,6 +146,70 @@ class TestDFlashServerBase(
         print(f"determinism: {outputs=}")
         self.assertEqual(outputs[0], outputs[1])
         assert self.process.poll() is None
+
+
+@unittest.skipIf(is_hip(), "DFLASH DP attention is currently supported on CUDA and NPU")
+class TestDFlashServerDPAttention(_DFlashServerLifecycle, CustomTestCase):
+    # Public native-format small pair; reuse the launch/cleanup above without
+    # running the unrelated accuracy, grammar and stop-condition mixins.
+    model = "Qwen/Qwen3-4B"
+    draft_model = "z-lab/Qwen3-4B-DFlash-b16"
+    max_running_requests = 4
+    disable_overlap = False
+    other_launch_args = [
+        "--tp-size",
+        "2",
+        "--attn-dp-size",
+        "2",
+        "--enable-dp-lm-head",
+        "--context-length",
+        "4096",
+    ]
+
+    def _generate(self, rank, tokens, barrier=None):
+        if barrier is not None:
+            barrier.wait(timeout=30)
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": (
+                    "Count from 1 to 100, separated by commas.\n1, 2, 3,"
+                    if rank == 0
+                    else "List the months of the year in order.\nJanuary, February,"
+                ),
+                "routed_dp_rank": rank,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": tokens,
+                    "ignore_eos": True,
+                },
+            },
+            timeout=180,
+        )
+        response.raise_for_status()
+        result = response.json()
+        self.assertEqual(result["meta_info"]["completion_tokens"], tokens)
+        self.assertGreater(result["meta_info"]["spec_verify_ct"], 0)
+        self.assertTrue(result["text"])
+        return result["text"]
+
+    def test_uneven_dp_requests_match_isolated_greedy_outputs(self):
+        # Follow spec/dspark/test_dspark_dp_spec_prefill_coordination.py's
+        # routed isolated/concurrent comparison. An isolated request leaves its
+        # peer idle; unequal lengths also drain one rank while the other keeps
+        # verifying. Swap the short rank to catch rank-zero-only assumptions.
+        for short_rank in range(2):
+            lengths = [16 if rank == short_rank else 64 for rank in range(2)]
+            expected = [self._generate(rank, lengths[rank]) for rank in range(2)]
+            barrier = threading.Barrier(2)
+            with self.subTest(short_rank=short_rank), ThreadPoolExecutor(2) as pool:
+                futures = [
+                    pool.submit(self._generate, rank, lengths[rank], barrier)
+                    for rank in range(2)
+                ]
+                actual = [future.result(timeout=200) for future in futures]
+                self.assertEqual(actual, expected)
+                self.assertIsNone(self.process.poll())
 
 
 class TestDFlashServerPage256(TestDFlashServerBase):
