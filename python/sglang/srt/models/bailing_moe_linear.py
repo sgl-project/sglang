@@ -78,7 +78,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.common import rank0_log
 
@@ -246,7 +246,6 @@ class BailingMoE(nn.Module):
         self.layer_id = layer_id
 
         self.tp_size = get_parallel().tp_size
-        self.tp_rank = get_parallel().tp_rank
 
         self.top_k = config.num_experts_per_tok
         self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
@@ -830,11 +829,13 @@ class BailingMoELinearDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=is_moe_layer,
-                    next_sparse=is_next_layer_moe_layer,
+                    next_layer_sparse=is_next_layer_moe_layer,
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=is_previous_moe_layer, next_sparse=is_moe_layer)
+            previous=declare_ffn(
+                sparse=is_previous_moe_layer, next_layer_sparse=is_moe_layer
+            )
             if layer_id != 0
             else None,
             terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
@@ -950,11 +951,9 @@ class BailingMoELinearModel(nn.Module):
                 alt_stream=self.alt_stream,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             self.num_layers,
             layer_fn,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -1010,7 +1009,7 @@ class BailingMoELinearModel(nn.Module):
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
             return hidden_states

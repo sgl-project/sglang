@@ -79,14 +79,11 @@ def _bind_threads_if_cpu(*, device: str) -> "Optional[List[int]]":
     from sglang.srt.utils import numa_utils
 
     parallel = get_parallel()
-    # With --enable-dp-attention, dp partitions the existing TP group rather
-    # than spawning additional processes, so dp_size must not be multiplied
-    # into the process count here (unlike regular DP, where dp_size * tp_size *
-    # pp_size is the true worker count).
-    dp_size = 1 if parallel.enable_dp_attention else parallel.dp_size
+    # Attention DP partitions the existing TP group rather than spawning
+    # additional processes, so only the replicas multiply the process count.
     return numa_utils.init_threads_binding(
         numa_index=get_device().gpu_id,
-        world_size=dp_size * parallel.tp_size * parallel.pp_size,
+        world_size=parallel.dp_size * parallel.tp_size * parallel.pp_size,
     )
 
 

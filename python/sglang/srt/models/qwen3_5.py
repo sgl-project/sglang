@@ -60,7 +60,10 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 
 # Layers - Others
-from sglang.srt.layers.layer_boundary.residual.add_norm import Fp8Input, NormQuantRead
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    Fp8Input,
+    NormQuantReadout,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 
 # Layers - Linear
@@ -131,7 +134,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    make_layers,
+    make_pp_layers,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -1097,7 +1100,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
-                    read=NormQuantRead(
+                    read=NormQuantReadout(
                         fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
                     )
                 ),
@@ -1109,13 +1112,13 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
                 {"fusions": boundary_fusions},
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -1132,7 +1135,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs", None),
+            capture_gathered=kwargs.get("captured_last_layer_outputs", None),
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1303,7 +1306,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
-                    read=NormQuantRead(
+                    read=NormQuantReadout(
                         fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
                     )
                 ),
@@ -1315,13 +1318,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
                 {"fusions": boundary_fusions},
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -1536,7 +1539,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+            capture_gathered=captured_last_layer_outputs,
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1688,11 +1691,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                 is_nextn=is_nextn,
             )
 
-        self.layers, self._start_layer, self._end_layer = make_layers(
+        self.layers, self._start_layer, self._end_layer = make_pp_layers(
             config.num_hidden_layers,
             get_layer,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -1770,6 +1771,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
+    def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
     @property
     def start_layer(self) -> int:
         return self._start_layer
@@ -1843,11 +1849,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
 
-        hidden_states = residual_batch.norm(
+        hidden_states = residual_batch.final_norm(
             hidden_states,
             forward_batch,
             self.norm,
-            handoff_norm=self.flashinfer_mnnvl_cutedsl_fusion,
+            finalize_norm=self.flashinfer_mnnvl_cutedsl_fusion,
             skip_empty=True,
         )
 
