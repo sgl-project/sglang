@@ -72,7 +72,7 @@ SGLang's EP integrates diverse, highly efficient backends for different use case
 
 DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode (optimized for prefill workloads with high throughput) and `low_latency` mode (optimized for decode workloads with low latency and CUDA Graph compatibility). MORI backend only supports `normal` mode now. NIXL-EP and PPLX currently operate in low-latency mode with CUDA Graph support (PPLX reuses the DeepEP low-latency masked expert-compute path). Users are recommended to set `--deepep-mode auto` to enable automatic dispatch mode switching during runtime. Setting `--deepep-mode normal` or `--deepep-mode low_latency` is useful for debugging or development purposes.
 
-Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep`, `pplx` and MORI only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported. Note that `pplx` additionally requires `--enable-dp-attention` with at least 2 DP groups (i.e., `tp_size / attention_tp_size > 1`); otherwise pplx-kernels' AllToAll cannot be constructed.
+Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep`, `pplx` and MORI only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported. Note that `pplx` additionally requires DP attention with at least 2 attention DP groups (i.e., `--attn-dp-size` > 1, so `tp_size / attention_tp_size > 1`); otherwise pplx-kernels' AllToAll cannot be constructed.
 
 ### Backends for MoE Computation
 

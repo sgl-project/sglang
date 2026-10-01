@@ -14,6 +14,7 @@ from diffusers.models import ModelMixin
 from diffusers.utils import logging
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_group_coordinator,
     get_decode_parallel_rank,
@@ -1281,6 +1282,7 @@ class AutoencoderKLLegacy(AutoencoderKL):
         self.decoder = ViT3DDecoder(**vit_kwargs)
 
     @torch.no_grad()
+    @cached_vae_encode
     def encode(self, x):
         return self.quant_conv(self.encoder(x))
 
