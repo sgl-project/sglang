@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
 from sglang.srt.training_capture.catalog import CaptureLease, HTTPCaptureCatalog
+from sglang.srt.training_capture.cohort import CaptureCohortAllocator
 from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
 from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
@@ -116,6 +117,7 @@ def prepare_store_rank(rank, root, master, catalog):
         timeout=timedelta(seconds=20),
     )
     kv = make_kv_spec()
+    base, _ = make_snapshot()
     layout = plan_capture_layout(kv, tp_size=4, pp_layer_ranges=[(0, 4)], aux_tp_rank=1)
     partition = layout.partitions[rank]
     config = CaptureConfig(
@@ -178,10 +180,29 @@ def prepare_store_rank(rank, root, master, catalog):
                     {"phase": error.phase, "failed_ranks": error.failed_ranks}
                 )
             else:
+                control = dist.new_group(backend="gloo", timeout=timedelta(seconds=15))
                 try:
                     row = {"phase": "ready", "active": partition.active}
+                    allocator = CaptureCohortAllocator(
+                        group=control,
+                        layout=layout,
+                        config=config,
+                        teacher=base.teacher,
+                        kv=kv,
+                        resources=resource,
+                        timeout_seconds=10,
+                    )
+                    cohort = allocator.reserve()
+                    assert cohort is not None
+                    row.update(
+                        capture_id=cohort.lease.capture_id,
+                        reserved_bytes=cohort.reserved_bytes,
+                        local_bytes=resource.pool.allocated_bytes
+                        if partition.active
+                        else 0,
+                    )
                     if partition.active:
-                        slot = resource.pool.acquire()
+                        slot = cohort.slot
                         complete = False
                         try:
                             payload = slot.storage[:64]
@@ -193,8 +214,14 @@ def prepare_store_rank(rank, root, master, catalog):
                             row.update(key=key, digest=digest)
                         finally:
                             resource.pool.release(slot, transfer_complete=complete)
+                    dist.barrier()
+                    if partition.include_aux:
+                        resource.catalog.fail(
+                            cohort.lease, "transport_fixture_finished"
+                        )
                     results.append(row)
                 finally:
+                    dist.destroy_process_group(control)
                     resource.close()
             assert all(resource.closed for resource in prepared)
             assert all(
@@ -273,6 +300,7 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                 for worker in workers:
                     worker.join(timeout=max(0, deadline - time.monotonic()))
                 self.assertEqual([worker.exitcode for worker in workers], [0] * 4)
+                captures, budgets, local_bytes = set(), set(), 0
                 for rank in range(4):
                     failure, ready = json.loads(
                         (Path(root) / f"rank-{rank}.json").read_bytes()
@@ -282,16 +310,31 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                     )
                     self.assertEqual(ready["phase"], "ready")
                     self.assertEqual(ready["active"], rank != 3)
+                    captures.add(ready["capture_id"])
+                    budgets.add(ready["reserved_bytes"])
+                    local_bytes += ready["local_bytes"]
                     if ready["active"]:
                         payload = store.get_tensor(
                             ready["key"], [64], torch.uint8, ready["digest"]
                         )
                         self.assertEqual(payload.tolist(), [rank + 1] * 64)
-                self.assertFalse(catalog.captures)
+                self.assertEqual(captures, set(catalog.captures))
+                self.assertEqual(len(captures), 1)
+                self.assertEqual(budgets, {local_bytes})
+                record = next(iter(catalog.captures.values()))
+                self.assertEqual(record["begin"]["reserved_bytes"], local_bytes)
+                self.assertEqual(
+                    set(record["begin"]["owners"]),
+                    {"dp0-pp0-tp0", "dp0-pp0-tp1", "dp0-pp0-tp2"},
+                )
+                self.assertEqual(record["state"], "FAILED")
+                self.assertEqual(record["reason"], "transport_fixture_finished")
+                self.assertFalse(catalog.errors)
                 self.assertFalse(catalog.publications)
                 PublicationJournal(str(Path(root) / "journal")).close()
                 print(
-                    "Resource startup: 4 ranks, rollback, 3 registered writes readable after exit",
+                    "Resource startup: 4 ranks, rollback, one capture cohort, "
+                    "3 registered writes readable after exit",
                     flush=True,
                 )
         finally:

@@ -1580,6 +1580,64 @@ then carry the chosen cohort identity along the existing request propagation
 path. Keep control collectives off the inference group's communication sequence;
 capture backpressure or a missing cohort must not block model execution.
 
+## All-Owner Cohort Reservations
+
+`CaptureCohortAllocator` connects the agreed layout and passive rank-local
+resources to one collective Host-slot reservation and Catalog lease. Every rank
+participates, including inactive partitions; only active owners reserve slots,
+and only the aux owner calls Catalog begin. A missing slot rolls back all local
+acquisitions before returning collective backpressure. A ready cohort carries
+one agreed lease/fence, the owner-local slot and conservative local monotonic
+deadlines. The Catalog reservation uses the full owner set and summed registered
+Host arena bytes.
+
+The control protocol uses a dedicated Gloo group, bounded CPU buffers, round and
+phase IDs, policy/lease digests, validation and a final readiness acknowledgement.
+Callback/encoding/allocation failures are voted before peers proceed. A known
+lease is failed by its aux owner during rollback; an uncertain begin or a changed
+response identity relies on Catalog expiry and never authorizes a failure call
+against potentially unrelated credentials. No payload transfer has started, so
+these rollback paths can release their own unused slots. Transport/protocol
+failure poisons the allocator and requires control-group teardown.
+
+Initial four-process job `01790851545598842826-1d444be9275a` passes one test and
+15 subtests in 26.03s. The next job
+`01790851800639073626-da11aed13d05` reproduces a readiness gap: a rank whose local
+clock advances past renewal after validation still returns a cohort. The fix
+checks lease freshness again in the final readiness vote; the regression orders
+that clock advance deterministically without probabilistic timing.
+
+Combined job `01790851973503224161-6d575d5d37e0` passes 12 tests and 56 subtests
+in 149.75s, covering the new allocator, identity/resource startup and real Store
+transport/publication. Cohort cases include TP4 replicated heads, an aux-only PP
+stage, an inactive first-stage leader, backpressure/retry on the same allocator,
+Catalog outage/lost response/changed identity, oversized lease encoding, control
+copy failure, expiry, rank-local decode failure, divergent fences, failed cleanup,
+round mismatch and a late inactive validator. The reservation runs on a background
+thread concurrently with a separate inference-group all-reduce.
+
+The real Store resource test now obtains all three registered slots from the
+cohort before writing rank-specific 64-byte payloads. An independent provider
+reads them exactly after all owners exit, and the aux owner retires the unused
+test capture. These raw transport payloads are not a published training sample;
+the separate owner-write/manifest publication test continues to cover publication.
+
+Final job `01790852181547402156-c2f238cbbe3b` passes 4 tests and 18 subtests in
+87.18s. It constructs the allocator under a meta-device context and verifies
+actual Gloo communication through explicit CPU control buffers. Both new files
+pass Ruff; the Store test retains only its baseline SIM115/PLW1510 diagnostics.
+All three Python files pass formatting and Python 3.10 compilation, local/GPU
+hashes match, and the original staged index is unchanged. Four jobs are terminal
+and the worker has resumed its idle load. Commands, source/log hashes, failure
+reproduction and limitations are in `experiments/capture-cohort-reservations.json`.
+
+This is the background reservation interface, not distributed serving admission.
+Request ticket propagation, a ready-cohort queue, lease renewal, failure agreement
+after request binding, accepted-token delivery and descriptor/receipt exchange
+still need coordinator/scheduler integration. Inference never calls this new
+protocol yet, and TP/PP gates remain closed. The tests use one host, Gloo, a
+Catalog test double and TCP Store; they do not prove multi-GPU inference or RDMA.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1587,8 +1645,9 @@ capture backpressure or a missing cohort must not block model execution.
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
-3. Connect P9's implemented identity/resource startup agreement, layout,
-   partitioned request contexts, rank-local buffers and owner-local Store interface
+3. Connect P9's implemented identity/resource startup agreement, cohort
+   reservations, layout, partitioned request contexts, rank-local buffers and
+   owner-local Store interface
    to distributed request admission/failure agreement, descriptor exchange,
    global teacher scores
    and TP/PP scheduling.

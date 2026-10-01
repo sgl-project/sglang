@@ -1,0 +1,197 @@
+{
+  "purpose": "Reserve all canonical owner Host slots and one shared Catalog lease before binding any serving request.",
+  "source_baseline": "3090c635c15bd84def174ba5f07f0f45a00458f9",
+  "environment_lock": "h100-runtime-lock.json",
+  "jobs": [
+    {
+      "job_id": "01790851545598842826-1d444be9275a",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790851574.7351007,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790851545598842826-1d444be9275a.log",
+      "log_sha256": "fe1a1a22665d53d5ee16466ec0197e8df85c6ee97305ed07dbafc8a4c6f936ce",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_cohort.py"
+      ],
+      "stage": "initial_reservation_protocol",
+      "tests": 1,
+      "subtests": 15,
+      "seconds": 26.03,
+      "tested_source_sha256": {
+        "python/sglang/srt/training_capture/cohort.py": "038b70263b38b97cab97b5c2f37ba79a3db38b8ff85159c854788c0513a3c1f2",
+        "test/registered/unit/training_capture/test_cohort.py": "f76948a59f675d3a5834a5147d3ee5e4bc2b06aa75090e88a60f43566e72c2ba"
+      }
+    },
+    {
+      "job_id": "01790851800639073626-da11aed13d05",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790851829.399862,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790851800639073626-da11aed13d05.log",
+      "log_sha256": "3d044daa2bc64e6c0fdfe0e450bd969229e1ccc990c199684b73c28c8b944808",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_cohort.py"
+      ],
+      "stage": "readiness_renewal_regression_proof",
+      "expected_failure": true,
+      "tests": 1,
+      "failed_subtests": 1,
+      "subtests_passed": 17,
+      "seconds": 25.68,
+      "allocator_source_sha256": "038b70263b38b97cab97b5c2f37ba79a3db38b8ff85159c854788c0513a3c1f2",
+      "failure": "After validation, inactive rank 3's monotonic clock advances by 60 seconds past renew_at (20 seconds). All ranks incorrectly return a ready cohort. The test expects an error record and fails with KeyError('failed_ranks').",
+      "method": "Advance the local clock only after the validation vote completes, deterministically ordering readiness after renewal becomes due."
+    },
+    {
+      "job_id": "01790851973503224161-6d575d5d37e0",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790852126.4058256,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790851973503224161-6d575d5d37e0.log",
+      "log_sha256": "26ab56151cefcca73d0b0260fd1c772d74d75f215df79b4880114d3014c3ccd7",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_cohort.py",
+        "test/registered/unit/training_capture/test_resources.py",
+        "test/registered/unit/training_capture/test_startup.py",
+        "test/registered/storage/test_training_snapshot_mooncake.py"
+      ],
+      "stage": "combined_startup_and_store_regression",
+      "tests": 12,
+      "subtests": 56,
+      "seconds": 149.75,
+      "tested_source_sha256": {
+        "python/sglang/srt/training_capture/cohort.py": "29f4f300e88011b25838c23e56f13a7254c909edf274290c7ab73ef63cb67eba",
+        "test/registered/unit/training_capture/test_cohort.py": "8ca345cbe932c6b4f151acb9f70865aced473efcd8212e3290cd7eb6c724d231",
+        "test/registered/storage/test_training_snapshot_mooncake.py": "bfafc796d71fe2090a150a0feef338959e978ed89706d5d78e3f4f1e060c56fb"
+      },
+      "note": "Before adding explicit device='cpu' to the two control-buffer constructors and testing construction under a meta-device context."
+    },
+    {
+      "job_id": "01790852181547402156-c2f238cbbe3b",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790852272.1188965,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790852181547402156-c2f238cbbe3b.log",
+      "log_sha256": "5043161a6cab3ddc0f9f8215614b6c6d931e20a802751daba3da7d0c4721ebdd",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_cohort.py",
+        "test/registered/storage/test_training_snapshot_mooncake.py"
+      ],
+      "stage": "final_cpu_control_and_store_regression",
+      "tests": 4,
+      "subtests": 18,
+      "seconds": 87.18,
+      "tested_source_sha256": {
+        "python/sglang/srt/training_capture/cohort.py": "96b3fb87e2e76afa08c4ecfcb9b36fee794d5eee330d68f08d3c0bb4679820ef",
+        "test/registered/unit/training_capture/test_cohort.py": "b8c98078c8da4188873213a49e9cbd72f126acf03a8312de557e38f322db0ea3",
+        "test/registered/storage/test_training_snapshot_mooncake.py": "bfafc796d71fe2090a150a0feef338959e978ed89706d5d78e3f4f1e060c56fb"
+      }
+    }
+  ],
+  "protocol": {
+    "version": 1,
+    "header": "Ten int64 CPU values: version, round, phase, error flag, reserved Host bytes, lease byte length, four SHA-256 words.",
+    "phases": [
+      "policy",
+      "slots",
+      "lease",
+      "validation",
+      "ready",
+      "rollback"
+    ],
+    "lease_bytes_per_rank": 4096,
+    "policy_bytes_limit": 1048576,
+    "group": "Dedicated Gloo group, PP-major/TP-minor order, including inactive ranks. Default WORLD is rejected.",
+    "threading": "One background caller per rank and matching call order. A concurrent call is rejected; inference communicates on a separate group.",
+    "capacity": "Only active owners acquire slots. If any is full, release all new reservations and return None everywhere, without Catalog begin.",
+    "catalog": "Only the aux owner calls begin. The request includes all owners and the sum of registered Host arena bytes. Validate returned dataset/sample/generation before using its credentials.",
+    "deadlines": "Every local monotonic anchor precedes the capacity vote and aux begin. Validation and readiness reject leases already due for renewal; caller must recheck before binding/writing.",
+    "rollback": "No CUDA or Store transfer has begun. Release owned unused slots and fail a known matching lease at the aux owner. Report cleanup failure collectively.",
+    "uncertain_begin": "Lost response, invalid response identity, or failure to acknowledge rollback may leave only an unused Catalog reservation. Catalog expiry must reclaim it; no payload objects were produced.",
+    "poisoning": "Transport or round/phase mismatch poisons the allocator. It cannot be reused; tear down the capture control group."
+  },
+  "verification": {
+    "processes": 4,
+    "layouts": [
+      "TP4/PP1 with two canonical KV owners, aux-only rank 1, inactive rank 3",
+      "TP2/PP2 with selected KV only on stage 0 and aux-only rank 3",
+      "TP2/PP2 with inactive first-stage ranks, including admission leader rank 0"
+    ],
+    "scenarios": [
+      "valid replicated layout",
+      "aux-only PP stage",
+      "inactive first-stage leader",
+      "local capacity exhaustion and retry on the same allocator",
+      "local acquire failure",
+      "common-policy disagreement",
+      "Catalog outage before begin",
+      "lost response after begin",
+      "changed response identity",
+      "oversized lease encoding",
+      "control-buffer copy failure",
+      "lease due before validation",
+      "lease due after validation before readiness",
+      "local lease decode failure",
+      "divergent fencing tokens",
+      "failed lease cleanup",
+      "round mismatch",
+      "late inactive validator"
+    ],
+    "isolation": "Run reserve in a background thread concurrently with a WORLD all-reduce; all four inference results equal 6 while the dedicated group admits one cohort.",
+    "device": "Construct allocator under torch.device('meta'); explicit CPU buffers still complete actual Gloo collectives.",
+    "recovery": "Backpressure releases all newly acquired slots. Free the deliberately held slot and retry on the same allocator at round 2, receiving one agreed capture ID.",
+    "real_store": {
+      "protocol": "tcp",
+      "source": "Synthetic local KV behind a mocked source pool; actual resource preparation, registered Host arenas, Gloo cohort allocator and Mooncake SDK.",
+      "startup_failure": "Rank 2's insufficient Host budget rolls resource startup back before cohort creation.",
+      "success": "Three active owners receive their registered slots from one cohort; inactive rank 3 receives metadata only.",
+      "payload_bytes_per_owner": 64,
+      "writes": 3,
+      "verification": "Independent provider reads exact rank-specific bytes after all owner processes exit. Aux retires the unused transport-test lease. The existing independent-owner snapshot publication test also passes.",
+      "limitation": "The three raw transport keys are not Catalog-registered training objects or a published training sample."
+    }
+  },
+  "limits": [
+    "Serving does not call this allocator yet. Ready-cohort queues, request ticket propagation, lease renewal, bound-request cancellation/failure agreement, accepted-token delivery and descriptor/receipt exchange remain to be wired.",
+    "TP/PP gates remain closed; these tests do not validate distributed target inference, PD or cross-node RDMA.",
+    "Readiness cannot prevent lease expiry or process death after confirmation; caller must retain slots through transfer completion and enforce the Catalog fence.",
+    "Callbacks and group teardown require the serving supervisor's watchdog in addition to collective timeouts.",
+    "Catalog is a test double; production expiry/retention and recovery of uncertain reservations are external requirements.",
+    "Existing single-rank runtime inference was not rerun because serving production paths were unchanged."
+  ],
+  "checks": {
+    "new_files_ruff": "pass",
+    "store_test_diagnostics": "Unchanged baseline SIM115 and PLW1510 only.",
+    "format": "pass",
+    "python310_compile": "pass",
+    "diff_check": "pass",
+    "local_gpu_sources_match": true,
+    "original_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "gpu_after_tests": "Four jobs terminal; queue/running empty; resident worker resumed cuda_load.py, PID 61363."
+  },
+  "source_sha256": {
+    "python/sglang/srt/training_capture/cohort.py": "96b3fb87e2e76afa08c4ecfcb9b36fee794d5eee330d68f08d3c0bb4679820ef",
+    "test/registered/unit/training_capture/test_cohort.py": "b8c98078c8da4188873213a49e9cbd72f126acf03a8312de557e38f322db0ea3",
+    "test/registered/storage/test_training_snapshot_mooncake.py": "bfafc796d71fe2090a150a0feef338959e978ed89706d5d78e3f4f1e060c56fb"
+  }
+}

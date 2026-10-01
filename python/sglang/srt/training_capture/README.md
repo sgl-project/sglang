@@ -428,6 +428,48 @@ point, an incomplete capture can fail; caller/Catalog failure and expiry handlin
 must reclaim its registered objects. Replica lifetime must outlive producer
 processes, and a completed owner write does not authorize Store object deletion.
 
+### Collective Reservations
+
+`CaptureCohortAllocator` reserves one complete set of owner-local Host slots
+before a serving request is bound. Construct it after global identity/resource
+startup, using the agreed config, teacher, KV spec, layout and local
+`CaptureResources`. Its Gloo group must be dedicated to background capture
+control, in the layout's PP-major/TP-minor order. The default world group is
+rejected. Every rank, including inactive partitions, calls `reserve()` in the
+same sequence; the call is synchronous and must stay off the inference thread.
+
+The protocol first agrees on the common capture policy. Each active owner then
+acquires a local slot. Missing capacity returns `None` on every rank, after
+releasing all slots acquired in that round, without a Catalog begin. If every
+owner has capacity, only the aux owner calls begin with the complete owner set
+and summed registered Host bytes. All ranks receive and validate one typed
+`CaptureLease`, agree on its identity/fence, and confirm readiness before return.
+Round and phase IDs reject divergent control sequences. CPU control buffers are
+allocated once; each rank's lease payload is bounded to 4096 bytes.
+
+The returned `CaptureCohort` carries the shared lease, local slot (`None` for an
+inactive partition), summed byte reservation and local monotonic deadline/renewal
+time. Each local clock is anchored before the capacity vote, before Catalog begin
+can run. Delays consume the available lease interval conservatively. Validation
+and final confirmation both reject a lease already due for renewal. Callers must
+still check these times before binding or writing: readiness is not a guarantee
+against later expiry or process failure.
+
+On failure, only locally reserved, unused slots are released, and only the aux
+owner reports a known matching lease as failed. A lost begin response or a
+response with changed identity cannot safely be failed using untrusted lease
+credentials; the Catalog must expire that unused reservation. No CUDA/Store
+transfer has begun at this point. Cleanup failure is reported to every peer.
+Transport or control-sequence failure poisons the allocator; stop capture and
+tear down its control group instead of retrying it.
+
+This interface does not start a background queue, renew leases, bind serving
+requests, broadcast accepted tokens or coordinate snapshot publication. The
+runtime coordinator must provide those operations, retain each handed-out slot
+through CUDA and Store completion, and enforce Catalog fencing. In particular,
+an all-PP reservation collective inside `before_forward` would deadlock against
+PP proxy receive/send ordering. The distributed serving gates remain closed.
+
 ### HTTP Contract
 
 `HTTPCaptureCatalog` implements the producer half of the proposed SpecForge
