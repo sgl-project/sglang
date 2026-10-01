@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "fdc93d6a52ea13fa6026ae46aeab6a8ff389a919",
+  "feature": "PP-sharded target-KV binding and source assembly prerequisite for DSpark",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "node": "node064",
+    "gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "distributed_prerequisite_transport": "Four CPU processes with real Gloo all-gather and PP broadcast; local artifact inspection uses rank-contract fixtures",
+    "serving_regression_transport": "One H100, PP1/TP1, actual Mooncake TCP P/D and Store; HTTP Catalog test double"
+  },
+  "implementation": [
+    "Use the full PP-major/TP-minor CPU world group for DP1 target identity/geometry and draft contract/weight agreement.",
+    "Bind only each stage's selected local buffers and derive owning PP ranks from the agreed layout.",
+    "Select each rank's own physical slots, gather canonical logical heads within owner TP groups, then broadcast selected K/V across PP groups.",
+    "Preserve declared layer order, full encoder arithmetic, bounded 1024-row chunks and incremental committed-prefix writes.",
+    "Keep PP speculative serving and capture gates; this change does not add a PP speculative scheduler."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/speculative/dspark_components/dspark_target_kv_inject.py": "724e387676b74acff04186fae33863342104e0d1c6fb99042d290f3a2cd7ac4f",
+    "test/registered/unit/spec/test_dspark_target_kv_pipeline.py": "90abed0587e257b61525e6131a8a997fb31f46bfc1536e9edaa365ab1704b365",
+    "test/registered/unit/spec/test_dspark_target_kv.py": "495892314e73931e1ebafebd18cf1ceb5c882da51d3b7a9b838086264a8d19ee",
+    "test/registered/storage/test_training_capture_pd_dspark.py": "2842b2114bdc99cea4cc3fd1621f3b516178b25f46499ced899f6d79f9d19668"
+  },
+  "gpu_source_hashes_match": true,
+  "distributed_cases": [
+    {
+      "tp": 2,
+      "pp": 2,
+      "kv_heads": 2,
+      "dtype": "bfloat16"
+    },
+    {
+      "tp": 2,
+      "pp": 2,
+      "kv_heads": 1,
+      "dtype": "bfloat16"
+    },
+    {
+      "tp": 1,
+      "pp": 4,
+      "kv_heads": 2,
+      "dtype": "bfloat16"
+    },
+    {
+      "tp": 4,
+      "pp": 1,
+      "kv_heads": 2,
+      "dtype": "bfloat16"
+    },
+    {
+      "tp": 4,
+      "pp": 1,
+      "kv_heads": 8,
+      "dtype": "bfloat16"
+    },
+    {
+      "tp": 2,
+      "pp": 2,
+      "kv_heads": 2,
+      "dtype": "float16"
+    }
+  ],
+  "distributed_checks": [
+    "All ranks match the full logical KV and existing encoder reference with rtol=atol=0.",
+    "Physical slots differ on every rank; noncanonical replicated KV heads contain poisoned values.",
+    "Declared selected layer order is [3, 1]; PP4 stages 0 and 2 own no selected tensors but receive all K/V.",
+    "Two incremental writes cover [0:3) and [3:5), retain local destination slots, and advance state to 5 without rewriting the first prefix.",
+    "All four ranks agree on binding failure at rank 0, invalid draft pool at rank 0, and inconsistent checkpoint digest; valid binding then succeeds on the same groups."
+  ],
+  "failed_attempt": {
+    "job_id": "01790892706407441264-3d78f9044f0f",
+    "outcome": "failed",
+    "returncode": 1,
+    "finished_unix": 1790892730.709932,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790892706407441264-3d78f9044f0f.log",
+    "log_sha256": "56d028d58e7f7bea6378fe4ccc20e327d46aedb253a308b1537d033a5901675f",
+    "reason": "The FP16 fixture still declared the BF16 codec; contract validation rejected it. Corrected the fixture codec and reran the complete file."
+  },
+  "tests": [
+    {
+      "file": "test/registered/unit/spec/test_dspark_target_kv.py",
+      "tests": 23,
+      "seconds": 1.594,
+      "job_id": "01790892729597757210-050ce707853b",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790892743.494387,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790892729597757210-050ce707853b.log",
+      "log_sha256": "9c25c3c92e2861f83026a224f9623d8989deca78d24ce839836ffe238bdeaab8"
+    },
+    {
+      "file": "test/registered/unit/spec/test_dspark_target_kv_pipeline.py",
+      "tests": 1,
+      "seconds": 12.202,
+      "job_id": "01790892785474881224-9cab3ff8a0b4",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790892809.5175223,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790892785474881224-9cab3ff8a0b4.log",
+      "log_sha256": "0663446e1f598d50262a04774f6b137b5f7e6ce22788e4bb3145d996a2b51a7b"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark.py",
+      "tests": 4,
+      "seconds": 327.02,
+      "job_id": "01790892785830354777-0885a8d0fedd",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790893147.4864995,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790892785830354777-0885a8d0fedd.log",
+      "log_sha256": "7a07e3dd09f52807b571afdc775a3341ac95c1f20c2576a4d42e7e2e0b24603a"
+    }
+  ],
+  "limitations": [
+    "PP speculative execution/capture remains gated; proposal/activation relay, accepted-token propagation, shared embedding/output head and request-state alignment remain implementation work.",
+    "New PP source assembly has Gloo CPU evidence, not multi-GPU NCCL or real PP model evidence.",
+    "All ranks must enter projection in the same logical request/position order after target rows are ready; the injector does not establish that scheduling protocol.",
+    "The serving regression validates existing TP1/PP1 behavior with a synthetic KV-input draft and a Catalog test double, not trained quality, production consumer/retention or performance SLOs."
+  ],
+  "serving_cases": [
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 1,
+      "decode_pp": 1,
+      "prefill_draft": false,
+      "replay": false,
+      "draft_kind": "target_kv",
+      "ragged_mode": "static",
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 1,
+      "decode_pp": 1,
+      "prefill_draft": false,
+      "replay": true,
+      "draft_kind": "target_kv",
+      "ragged_mode": "static",
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 1,
+      "decode_pp": 1,
+      "prefill_draft": true,
+      "replay": false,
+      "draft_kind": "target_kv",
+      "ragged_mode": "static",
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 1,
+      "decode_pp": 1,
+      "prefill_draft": true,
+      "replay": true,
+      "draft_kind": "target_kv",
+      "ragged_mode": "static",
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    }
+  ],
+  "cleanup": {
+    "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+    "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "pid": 1,
+    "mode": "idle_load",
+    "heartbeat_unix": 1790893227.4376996,
+    "idle_pid": 36890,
+    "active_job": null,
+    "active_pid": null,
+    "queued": 0,
+    "paused": false,
+    "heartbeat_age_seconds": 0.697737455368042
+  }
+}

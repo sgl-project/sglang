@@ -166,6 +166,41 @@ then writes each rank's local draft context projections. This inference gather
 is separate from training capture, whose owner-local snapshot payloads go
 directly to the Store without gathering through the capture control group.
 
+### Pipeline Source Assembly Prerequisite
+
+The injector can bind PP-sharded target KV and assemble the selected layers.
+This is a dependency for future pipeline speculation; the serving gates above
+remain in place. For DP=1, binding uses the complete PP-major/TP-minor CPU world
+group to agree on target identity, layer ownership, draft contract and weights.
+Stages without selected layers participate in startup and receive assembled KV.
+
+Each stage reads only the selected layers it owns, using its own physical slot
+mapping. Within the owning stage, TP gathering reconstructs global logical heads
+and removes noncanonical replicated copies. Each PP group then broadcasts that
+layer's K/V from its owning stage. All stages receive the checkpoint's declared
+layer order and run the existing encoder without changing projection arithmetic.
+The existing 1024-row chunk limit and incremental committed-prefix state apply.
+No new Mooncake payload or storage interface is needed for this inference path.
+
+Every participating rank must call projection for the same logical request,
+position order and committed prefix, after all target stages have produced those
+rows. Physical slots may differ. This is a caller precondition, not a scheduler
+protocol implemented by the injector. The hot path does not exchange request
+identities or coordinate divergent local projection state.
+
+The four-process Gloo test covers TP2/PP2, TP1/PP4, TP4/PP1, BF16/FP16,
+replicated heads, stages with no selected KV, per-rank slot permutations and
+incremental writes. It also checks coordinated rejection of a target binding
+failure, an invalid draft pool and a mismatched checkpoint digest, followed by
+a valid binding. Target artifact inspection is replaced by explicit rank
+contracts in this test; the startup protocol and tensor collectives are real.
+This does not verify multi-GPU NCCL or PP speculative serving. Proposal and
+activation transport, accepted-token propagation, shared embedding/output-head
+availability and request-state alignment remain required before enabling PP.
+See [the reproduction commands](experiments/PIPELINE_KV.md).
+
+### Disaggregated Context
+
 In PD serving, P transfers the target KV prefix. The target-KV worker's
 `disaggregation_draft_kv_pool` is empty: P need not load a draft, and D rebuilds
 its local draft context from the received target KV before its first proposal.

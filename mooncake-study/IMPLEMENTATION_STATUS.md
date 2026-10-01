@@ -2712,6 +2712,47 @@ prefill graphs with memory pressure. The H100 returned to its idle workload.
 See [the runbook](experiments/AR_PRESSURE.md) and
 [retained evidence](experiments/capture-ar-memory-pressure.json).
 
+## Pipeline Target-KV Source Assembly
+
+`TargetKVInjector` now binds target identity and draft policy across all PP/TP
+ranks for DP=1. It resolves selected-layer ownership from the assembled layout,
+reads each owning stage's local physical slots, reconstructs canonical logical
+heads across TP, and broadcasts each K/V tensor across PP. Stages without
+selected layers receive the full source dictionary. Checkpoint layer order,
+encoder arithmetic, the 1024-row temporary bound and incremental projection
+semantics remain intact. This is an inference dependency; Mooncake capture
+continues to write owner-local payloads directly to the Store.
+
+The complete registered `test_dspark_target_kv_pipeline.py` passed its
+four-process Gloo test in **12.202 seconds**, job
+`01790892785474881224-9cab3ff8a0b4`. Six cases cover TP2/PP2, TP1/PP4 and TP4/PP1,
+BF16/FP16, sharded/replicated heads, per-rank slot permutations and stages with
+no selected layers. Noncanonical replicas contain poisoned values. Full KV and
+encoder outputs match the logical reference exactly, and two incremental writes
+preserve local destination slots. Three coordinated startup failure cases are
+followed by a valid binding on the same groups. Existing target-KV unit coverage
+also passed all **23 tests** in **1.594 seconds**, job
+`01790892729597757210-050ce707853b`.
+
+The complete existing `test_training_capture_pd_dspark.py` passed all **four
+tests** in **327.020 seconds**, job `01790892785830354777-0885a8d0fedd`, on the
+resident H100. It covers TP1/PP1 eager/verify CUDA graphs with AR-only P or
+KV-input drafts on both P and D. Each case publishes six checked snapshots via
+actual Mooncake TCP P/D and Store, using the HTTP Catalog test double. Missing
+and stale handoffs plus cancellation remain excluded. The worker returned to
+its idle workload with no active or queued experiment.
+
+The distributed fixture replaces local model/artifact inspection with explicit
+rank contracts; startup coordination and Gloo tensor transport are real. It does
+not establish multi-GPU NCCL or PP speculative serving. Callers must align
+logical requests/positions and projection state before entering the collectives.
+PP proposal/activation transport, accepted-token propagation and shared
+embedding/output-head availability still need implementation and runtime tests.
+All existing PP speculative capability gates remain. See
+[the runbook](experiments/PIPELINE_KV.md),
+[retained evidence](experiments/pipeline-target-kv.json), and the
+[serving contract](TARGET_KV_DRAFT.md#pipeline-source-assembly-prerequisite).
+
 ## Next Implementation
 
 1. Extend passing single-GPU AR prefill graph coverage to distributed/speculative

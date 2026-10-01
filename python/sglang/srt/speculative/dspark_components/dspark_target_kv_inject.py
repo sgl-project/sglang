@@ -6,6 +6,7 @@ from pathlib import Path
 
 import msgspec
 import torch
+from sglang.srt.distributed import get_world_group
 from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
     validate_target_kv_draft_contract,
 )
@@ -14,7 +15,7 @@ from sglang.srt.training_capture.identity import (
     bind_target_contract,
     local_safetensors_digest,
 )
-from sglang.srt.training_capture.protocol import ContractError
+from sglang.srt.training_capture.protocol import DTYPES, ContractError
 from sglang.srt.training_capture.startup import (
     coordinate_policy_startup,
     coordinate_target_startup,
@@ -43,7 +44,10 @@ class TargetKVInjector:
         self.projected_token_ct = 0
         self.invalidation_ct = 0
         self.tp_group = None
+        self.pp_group = None
         self.head_replicas = {}
+        self.pipeline_sources = {}
+        self.source_dtype = None
 
     @property
     def weight_version(self):
@@ -59,6 +63,12 @@ class TargetKVInjector:
         contract = self.draft_model.target_kv_contract
         group = self.model_runner.tp_group
         self.tp_group = group if group.world_size > 1 else None
+        pipeline = self.model_runner.pp_group
+        self.pp_group = pipeline if pipeline.world_size > 1 else None
+        # A PP binding must inspect every stage, including stages that own no
+        # selected layers. Keep the existing TP-only group when PP is absent.
+        identity_group = get_world_group() if self.pp_group is not None else group
+        distributed = self.tp_group is not None or self.pp_group is not None
         target_args = {
             "model_id": contract.teacher.model_id,
             "selected_layer_ids": contract.kv.selected_layer_ids,
@@ -70,20 +80,21 @@ class TargetKVInjector:
             "expected_weights_revision": contract.teacher.weights_revision,
             "expected_tokenizer_revision": contract.teacher.tokenizer_revision,
         }
-        if self.tp_group is None:
+        layout = None
+        if not distributed:
             teacher, kv = bind_target_contract(**target_args)
         else:
-            teacher, kv, _ = coordinate_target_startup(
-                group=group.cpu_group,
+            teacher, kv, layout = coordinate_target_startup(
+                group=identity_group.cpu_group,
                 build_local=lambda: bind_rank_target_contract(
                     **target_args,
                     tp_rank=group.rank_in_group,
                     tp_size=group.world_size,
-                    pp_rank=0,
-                    pp_size=1,
+                    pp_rank=pipeline.rank_in_group,
+                    pp_size=pipeline.world_size,
                 ),
                 tp_size=group.world_size,
-                pp_size=1,
+                pp_size=pipeline.world_size,
             )
 
         def validate_draft():
@@ -109,34 +120,66 @@ class TargetKVInjector:
             )
             return contract, self.weights_digest
 
-        if self.tp_group is None:
+        if not distributed:
             validate_draft()
         else:
             coordinate_policy_startup(
-                group=group.cpu_group, build_policy=validate_draft
+                group=identity_group.cpu_group, build_policy=validate_draft
             )
         pool = self.model_runner.token_to_kv_pool
         self.sources = {}
+        self.pipeline_sources = {}
+        self.source_dtype = DTYPES[kv.dtype]
         for layer in kv.layers:
-            for component, buffer in (
-                ("k", pool.get_key_buffer(layer.layer_id)),
-                ("v", pool.get_value_buffer(layer.layer_id)),
+            owner = 0
+            if self.pp_group is not None:
+                owner = next(
+                    pp_rank
+                    for pp_rank in range(pipeline.world_size)
+                    if any(
+                        head.layer_id == layer.layer_id
+                        for head in layout.partition(f"dp0-pp{pp_rank}-tp0").heads
+                    )
+                )
+            for component, accessor, dim in (
+                ("k", pool.get_key_buffer, layer.key_head_dim),
+                ("v", pool.get_value_buffer, layer.value_head_dim),
             ):
                 name = f"target_{component}.{layer.layer_id}"
-                self.sources[name] = buffer
+                if owner == pipeline.rank_in_group:
+                    self.sources[name] = accessor(layer.layer_id)
+                if self.pp_group is not None:
+                    self.pipeline_sources[name] = (owner, layer.num_kv_heads, dim)
                 self.head_replicas[name] = max(
                     1, group.world_size // layer.num_kv_heads
                 )
 
     def _select_target_kv(self, locations):
+        """Collect the same logical rows using each rank's own physical slots.
+
+        TP/PP callers must enter with the same request/position order after all
+        target stages have completed those rows. PP transfers full logical heads;
+        the encoder and its numerical order are unchanged.
+        """
         selected = {}
-        for name, buffer in self.sources.items():
-            values = buffer.index_select(0, locations)
-            if self.tp_group is not None:
-                values = self.tp_group.all_gather(values, dim=1)
-                # TP can replicate a logical KV head on adjacent ranks. Keep
-                # the canonical copy before the encoder flattens global heads.
-                values = values[:, :: self.head_replicas[name], :].contiguous()
+        names = self.pipeline_sources if self.pp_group is not None else self.sources
+        for name in names:
+            if name in self.sources:
+                values = self.sources[name].index_select(0, locations)
+                if self.tp_group is not None:
+                    values = self.tp_group.all_gather(values, dim=1)
+                    # TP can replicate a logical KV head on adjacent ranks. Keep
+                    # the canonical copy before the encoder flattens global heads.
+                    values = values[:, :: self.head_replicas[name], :].contiguous()
+            else:
+                _, heads, dim = self.pipeline_sources[name]
+                values = torch.empty(
+                    (locations.numel(), heads, dim),
+                    dtype=self.source_dtype,
+                    device=locations.device,
+                )
+            if self.pp_group is not None:
+                self.pp_group.broadcast(values, src=self.pipeline_sources[name][0])
             selected[name] = values
         return selected
 
