@@ -96,9 +96,7 @@ class TestNemotronAuxCapture(CustomTestCase):
         )
         inputs = torch.tensor([[0.3, -0.5, 0.7, 1.1], [-0.4, 0.9, 0.2, -0.6]])
         with (
-            get_context().override_server_args(
-                tp_size=tp, enable_dp_attention=dp_enabled
-            ),
+            get_context().override_server_args(tp_size=tp),
             get_flags().dp.override(enabled=dp_enabled),
             get_parallel().override(
                 attn_tp_group=group,

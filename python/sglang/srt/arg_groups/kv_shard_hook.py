@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import attn_dp_enabled_of
 from sglang.srt.utils.common import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
@@ -189,11 +190,11 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
                 "(indexer buffers are not striped)."
             )
         if cfg.attn_cp_size <= 1:
-            if cfg.enable_dp_attention:
+            if attn_dp_enabled_of(cfg):
                 raise ValueError(
                     "--enable-kv-cache-sharding for MLA models without "
                     "prefill CP shards across attention-TP and requires plain "
-                    "TP attention; disable --enable-dp-attention."
+                    "TP attention; set --attn-dp-size=1."
                 )
             if cfg.tp_size <= 1:
                 raise ValueError(

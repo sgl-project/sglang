@@ -62,8 +62,10 @@ logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
     get_context,
     get_platform,
+    num_dp_ranks_of,
 )
 from sglang.srt.utils.common import (
     get_quantization_config,
@@ -931,7 +933,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and not prefer_custom_dsv41
         and (get_platform().is_sm90 or get_platform().is_sm100)
         and view.tp_size > 1
-        and not view.enable_dp_attention
+        and not attn_dp_enabled_of(view)
         and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
@@ -1304,8 +1306,8 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    if view.dp_size == 1 and view.ep_join_mode != "scale":
-        return {"enable_dp_attention": False, "enable_dp_lm_head": False}
+    if num_dp_ranks_of(view) == 1 and view.ep_join_mode != "scale":
+        return {"enable_dp_lm_head": False}
     return {}
 
 
@@ -1349,9 +1351,8 @@ def _tp_lm_head_all_to_all_default(view: Any) -> dict:
 
     enable = (
         view.disaggregation_mode == "decode"
-        and view.enable_dp_attention
-        and view.dp_size > 1
-        and view.tp_size == view.dp_size
+        and view.attn_dp_size > 1
+        and view.tp_size == view.attn_dp_size
         and view.attn_cp_size == 1
         and not view.enable_dp_lm_head
     )
@@ -1362,20 +1363,21 @@ def _tp_lm_head_all_to_all_default(view: Any) -> dict:
 def _dp_lm_head_validation(view: Any) -> dict:
     """Require DP attention for DP LM head and TP LM-head all-to-all."""
     if view.enable_dp_lm_head:
-        assert view.enable_dp_attention, (
-            "Please enable dp attention when setting enable_dp_lm_head. "
+        assert attn_dp_enabled_of(view), (
+            "--enable-dp-lm-head requires attention DP (--attn-dp-size)."
         )
     if view.enable_tp_lm_head_all_to_all:
-        assert view.enable_dp_attention, (
-            "Please enable dp attention when setting enable_tp_lm_head_all_to_all."
+        assert attn_dp_enabled_of(view), (
+            "--enable-tp-lm-head-all-to-all requires attention DP (--attn-dp-size)."
         )
         assert not view.enable_dp_lm_head, (
             "--enable-tp-lm-head-all-to-all uses a TP-sharded LM head and is "
             "incompatible with --enable-dp-lm-head."
         )
-        assert view.tp_size == view.dp_size, (
+        assert view.tp_size == view.attn_dp_size, (
             "--enable-tp-lm-head-all-to-all currently requires tp_size == "
-            f"dp_size, got tp_size={view.tp_size}, dp_size={view.dp_size}."
+            f"attn_dp_size, got tp_size={view.tp_size}, "
+            f"attn_dp_size={view.attn_dp_size}."
         )
         assert view.attn_cp_size == 1, (
             "--enable-tp-lm-head-all-to-all currently requires "
