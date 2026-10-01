@@ -188,7 +188,7 @@ class TestDpCpGather(CustomTestCase):
                 attn_cp_rank=cp,
                 attn_tp_rank=tp,
                 attn_dp_size=DP_SIZE,
-                enable_dp_attention=True,
+                attn_dp_enabled=True,
                 attn_cp_size=CP_SIZE,
                 attn_tp_size=attn_tp_size,
                 tp_size=tp_size,
