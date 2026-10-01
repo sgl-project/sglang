@@ -682,6 +682,9 @@ pub struct K8sDiscoveryConfig {
     /// Requires the router's ServiceAccount to have `list`/`watch` on
     /// EndpointSlices in that namespace.
     pub peer_selector: Option<String>,
+    /// EndpointSlice label key whose value is a worker's PD version group.
+    /// Set only in PD mode.
+    pub version_group_label: Option<String>,
 }
 
 /// Validated selector mode. Plain selectors run server-side; PD selectors

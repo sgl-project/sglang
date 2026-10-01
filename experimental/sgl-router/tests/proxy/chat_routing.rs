@@ -71,7 +71,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         url: url.to_string(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     // Per-request worker URLs flow from the registry through
@@ -89,7 +89,7 @@ fn build_ctx_with_janitor(url: &str) -> (Arc<AppContext>, JanitorHandle) {
         url: url.to_string(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -1007,7 +1007,7 @@ async fn unknown_model_with_no_policy_returns_404_model_not_found() {
         url: worker.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("ghost-7b".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
@@ -1179,6 +1179,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
             "/v1/chat/completions",
             &headers,
             body,
+            None,
             None,
             None,
             None,
@@ -1406,7 +1407,7 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
         url: worker.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -1540,7 +1541,7 @@ async fn streaming_active_load_persists_for_body_lifetime() {
         url: worker.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());

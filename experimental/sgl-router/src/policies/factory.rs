@@ -254,7 +254,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("modelA".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 
