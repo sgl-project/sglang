@@ -3693,19 +3693,29 @@ name = "sglang-grpc"
 version = "0.1.0"
 dependencies = [
  "async-stream",
- "prost",
  "prost-types",
- "protoc-bin-vendored",
  "pyo3",
  "serde_json",
+ "sglang-grpc-types",
  "tokenizers",
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-build",
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "sglang-grpc-types"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "prost-types",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]
@@ -3722,6 +3732,24 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+]
+
+[[package]]
+name = "sglang-processor"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "dynamo-parsers",
+ "dynamo-protocols",
+ "dynamo-renderer",
+ "dynamo-tokenizers",
+ "futures",
+ "hf-hub",
+ "minijinja",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -3745,6 +3773,7 @@ dependencies = [
  "rmpv",
  "serde",
  "serde_json",
+ "sglang-processor",
  "thiserror",
  "tokio",
  "tower 0.5.3",
@@ -3780,10 +3809,12 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sglang-grpc-types",
  "sglang-mm",
  "socket2 0.6.5",
  "thiserror",
  "tokio",
+ "tonic",
  "tower 0.5.3",
  "tracing",
  "tracing-appender",

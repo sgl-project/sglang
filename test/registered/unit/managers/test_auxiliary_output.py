@@ -532,7 +532,7 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     scheduler.future_map = object()
     scheduler._relay_forward_payload = Mock()
     scheduler.device_module = SimpleNamespace(Event=Mock(return_value=copy_done))
-    scheduler.enable_dp_attention = False
+    scheduler.attn_dp_enabled = False
     batch = SimpleNamespace(
         forward_mode=SimpleNamespace(
             is_prebuilt=lambda: False,

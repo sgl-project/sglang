@@ -99,7 +99,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
 )
 
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -317,7 +317,6 @@ class BailingMLP(nn.Module):
         self.config = config
         self.swiglu_limit = swiglu_limit
         self.tp_size = tp_size if tp_size is not None else get_parallel().tp_size
-        self.tp_rank = tp_rank if tp_rank is not None else get_parallel().tp_rank
 
         self.intermediate_size = intermediate_size
         self.padded_intermediate_size = padded_intermediate_size or intermediate_size
@@ -465,10 +464,8 @@ class BailingMoE(nn.Module):
         self.alt_stream = alt_stream
 
         self.tp_size = get_parallel().tp_size
-        self.tp_rank = get_parallel().tp_rank
         self.moe_ep_size = get_parallel().moe_ep_size
         self.moe_tp_size = get_parallel().moe_tp_size
-        self.moe_tp_rank = get_parallel().moe_tp_rank
 
         self.top_k = config.num_experts_per_tok
         self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
@@ -1300,11 +1297,9 @@ class BailingMoELinearModel(nn.Module):
                 alt_stream=self.alt_stream,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             self.num_layers,
             layer_fn,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -1425,7 +1420,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        self.tp_size = get_parallel().tp_size
 
         # Determine num_fused_shared_experts
         self.determine_num_fused_shared_experts()
