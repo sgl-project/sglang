@@ -1,0 +1,113 @@
+{
+  "purpose": "Owner-local registered-buffer writes and fenced manifest-last publication of logical head partitions through Mooncake Store",
+  "source_baseline": "cf43739f5d93375babafdcf91183322173e154e8",
+  "environment_lock": "h100-runtime-lock.json",
+  "source_sha256": {
+    "python/sglang/srt/training_capture/protocol.py": "e57f130767eb7ca4aef6dc63a7cfdbaa37cc1d02326a068bc973d818a7bb9d62",
+    "python/sglang/srt/training_capture/snapshot_writer.py": "1d0576fdfc72030c7a521ee6c5ee4316560033065f070bf73469d5f40d081c12",
+    "python/sglang/test/training_capture_utils.py": "1184989d39c7b5bc5bef91bdd54b170834d89b650eacc1edac5430ab1d7218a9",
+    "python/sglang/test/training_capture_partition.py": "42a95682e56b904a467c273a850fc746d74af4aa99266bea29fcf47a6df3040b",
+    "test/registered/unit/training_capture/test_snapshot_writer.py": "a36337ce932e052823462ed69a24ad46df6523a4d116ddae42af94cb2496f86c",
+    "test/registered/storage/test_training_snapshot_mooncake.py": "514db0f87f9d23cc77b6893adbbef64c4bfcc262402b6b9867436ba41d2c23e0"
+  },
+  "interfaces": {
+    "SnapshotWriter.write_partition": "Validates the complete manifest and exactly the local owner's tensors, registers descriptors, waits for Store puts and Catalog WRITTEN ACK, then returns OwnerWriteReceipt.",
+    "OwnerWriteReceipt": [
+      "capture_id",
+      "fencing_token",
+      "owner_id",
+      "manifest_sha256"
+    ],
+    "SnapshotWriter.publish_partitions": "Requires exactly one matching receipt per declared owner; registers the manifest, journals exact bytes, seals against Catalog WRITTEN descriptors, writes the manifest and publishes.",
+    "validate_tensors(owner_id=...)": "Validates full logical coverage plus local checksums, finite values and exact object set; the aux owner also validates tokens, teacher IDs/values, positions and loss masks."
+  },
+  "jobs": [
+    {
+      "job_id": "01790839497863279291-3e45cdeddf54",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790839544.710032,
+      "tests": 102,
+      "subtests": 80,
+      "seconds": 43.25,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture"
+      ],
+      "note": "Broad suite before the final explicit None-owner guard and fixture namespace isolation; affected writer cases rerun in the final job.",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790839497863279291-3e45cdeddf54.log",
+      "log_sha256": "83a307791b333e0fd5c50697e74a6bb24521643254fac3f666c2047050a7457f"
+    },
+    {
+      "job_id": "01790839663116165235-a41cdbec2704",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790839720.6977274,
+      "tests": 15,
+      "subtests": 10,
+      "seconds": 54.36,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_snapshot_writer.py",
+        "test/registered/storage/test_training_snapshot_mooncake.py"
+      ],
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790839663116165235-a41cdbec2704.log",
+      "log_sha256": "2275d2b3b6c291a011dd49f843372a8a2cfa1f55c5abf174b0ae5e00ad11c683"
+    }
+  ],
+  "store_observation": {
+    "owners": [
+      "dp0-pp0-tp1",
+      "dp0-pp0-tp0"
+    ],
+    "aux_owner": "dp0-pp0-tp1",
+    "writer_processes": 2,
+    "writers_exited_before_publish": true,
+    "objects": 32,
+    "tensor_bytes": 4532,
+    "missing_owner_rejected": true,
+    "stale_receipt_rejected": true,
+    "logical_head_reassembly_exact": true,
+    "independent_reader_passed": true,
+    "provider_segment_bytes": 67108864,
+    "protocol": "tcp",
+    "catalog": "HTTP test double",
+    "inference": "synthetic logical TP2 tensor partitions; no distributed model forward"
+  },
+  "assertions": [
+    "Each independent writer registers and puts only its local Host tensors; neither needs another owner's tensor buffers.",
+    "Malformed or incomplete local object sets, unknown owners and invalid aux masks are rejected before Catalog or Store writes.",
+    "Missing, duplicate, foreign-owner, stale-fence, foreign-capture and changed-manifest receipts cannot publish.",
+    "A lost owner WRITTEN response returns no receipt; retry reuses identical immutable Store objects.",
+    "A lost seal response leaves the publication journal recoverable without any owner's original Host buffers.",
+    "The test reader helper reconstructs full token/head tensors by declared logical ranges, independent of descriptor/owner order.",
+    "Both writer processes exit before publication; a separate storage segment retains their objects and a fresh reader process validates them.",
+    "The original registered-arena single-owner Store roundtrip also passes."
+  ],
+  "limits": [
+    "The serving scheduler still rejects TP/PP/DP capture. Distributed admission, synchronized metadata collection, canonical replicated-head ownership, rank-local Host pools and TP/PP model integration remain pending.",
+    "The new interface assumes a coordinator has already assembled and distributed one immutable full manifest; it does not implement that distributed coordinator.",
+    "Owner receipts are trusted producer acknowledgements, not signed Catalog attestations or retention leases. Catalog seal must verify all exact WRITTEN descriptors and the current fence.",
+    "Before a complete receipt set reaches the publication journal, capture failure and object cleanup remain the caller/Catalog's responsibility; producer exit alone does not authorize deletion.",
+    "Real transport is local TCP, not cross-node RDMA. The Catalog is a test double and no production consumer or SLO is certified."
+  ],
+  "checks": {
+    "local_gpu_source_hashes_equal": true,
+    "new_code_ruff_passed": true,
+    "legacy_ruff_codes_unchanged": [
+      "UP035",
+      "RUF007",
+      "SIM115",
+      "PLW1510"
+    ],
+    "original_worktree_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "resident_gpu_idle_resumed": true
+  }
+}

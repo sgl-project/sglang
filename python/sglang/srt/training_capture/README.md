@@ -202,6 +202,36 @@ producer does not authorize deletion of published Store objects.
 
 ## Catalog Producer API
 
+### Partitioned Writes
+
+The writer also exposes the transport/publication boundary needed by a future
+TP/PP capture coordinator. These methods do not enable distributed inference
+capture; the current serving capability gates remain in force.
+
+1. After owner-local D2H completion, the coordinator collects object descriptors
+   and builds one immutable full manifest, including all logical token/head
+   ranges. Every owner receives the same canonical manifest and capture lease.
+2. Each owner calls `write_partition(manifest, local_tensors, lease, owner_id=...)`.
+   It validates complete manifest coverage and exactly that owner's payloads,
+   sends REGISTERED, completes registered-buffer puts, and waits for WRITTEN ACK.
+   The aux owner also checks token/teacher alignment, masks and vocabulary values.
+3. The designated aux coordinator calls
+   `publish_partitions(manifest, receipts, manifest_buffer, lease)` with exactly
+   one `OwnerWriteReceipt` per declared owner. Capture ID, fence, owner and
+   manifest digest must all match. It then registers the manifest and uses the
+   existing journal, seal and manifest-last publication path.
+
+Receipts contain metadata only. They are trusted producer acknowledgements,
+not retention leases or signed Catalog attestations. The Catalog must verify
+every exact WRITTEN descriptor and the current fence at seal. Missing owners,
+duplicate receipts or receipts for a different manifest never reach publication.
+After journaling, recovery requires no original owner buffers. Before that
+point, an incomplete capture can fail; caller/Catalog failure and expiry handling
+must reclaim its registered objects. Replica lifetime must outlive producer
+processes, and a completed owner write does not authorize Store object deletion.
+
+### HTTP Contract
+
 `HTTPCaptureCatalog` implements the producer half of the proposed SpecForge
 Catalog API. It does not implement the Catalog server, distributor, consumer
 leases, checkpoints, or GC. The endpoint is the API base URL. Requests include

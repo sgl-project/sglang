@@ -424,12 +424,19 @@ def validate_tensors(
     tensors: Mapping[str, torch.Tensor],
     *,
     max_tensor_bytes: int = 2 << 30,
+    owner_id: str | None = None,
 ) -> None:
+    """Validate all payloads, or exactly one owner's payloads of a complete manifest."""
     nv = validate_manifest(manifest, max_tensor_bytes=max_tensor_bytes)
-    if set(tensors) != {o.key for o in manifest.objects}:
+    if owner_id is not None and owner_id not in manifest.topology.owners:
+        raise ContractError("unregistered tensor partition owner")
+    objects = [
+        obj for obj in manifest.objects if owner_id is None or obj.owner_id == owner_id
+    ]
+    if set(tensors) != {o.key for o in objects}:
         raise ContractError("tensor object set differs from the manifest")
     aux = {}
-    for obj in manifest.objects:
+    for obj in objects:
         tensor = tensors[obj.key]
         if list(tensor.shape) != obj.shape or tensor.dtype != DTYPES[obj.dtype]:
             raise ContractError("received tensor shape/dtype mismatch")
@@ -439,6 +446,8 @@ def validate_tensors(
             raise ContractError("nonfinite captured values")
         if obj.kind == "aux":
             aux[obj.name] = tensor
+    if owner_id is not None and owner_id != manifest.topology.aux_owner:
+        return
     n, p = manifest.sequence.total_length, manifest.sequence.prompt_length
     vocab = manifest.teacher.vocab_size
     if not ((aux["token_ids"] >= 0) & (aux["token_ids"] < vocab)).all():

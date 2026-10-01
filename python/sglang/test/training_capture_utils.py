@@ -72,17 +72,19 @@ def read_snapshot(store, publication):
     }
     validate_tensors(manifest, tensors)
     packed = {
-        name: torch.cat(
-            [
-                tensors[obj.key]
-                for obj in sorted(
-                    (obj for obj in manifest.objects if obj.name == name),
-                    key=lambda obj: obj.token_range[0] if obj.kind == "kv" else 0,
-                )
-            ]
-        )
-        for name in {obj.name for obj in manifest.objects}
+        obj.name: tensors[obj.key] for obj in manifest.objects if obj.kind == "aux"
     }
+    nv = max(obj.token_range[1] for obj in manifest.objects if obj.kind == "kv")
+    for layer in manifest.kv.layers:
+        for component, dim in (("k", layer.key_head_dim), ("v", layer.value_head_dim)):
+            packed[f"target_{component}.{layer.layer_id}"] = torch.empty(
+                nv, layer.num_kv_heads, dim, dtype=DTYPES[manifest.kv.dtype]
+            )
+    for obj in manifest.objects:
+        if obj.kind == "kv":
+            t0, t1 = obj.token_range
+            h0, h1 = obj.head_range
+            packed[obj.name][t0:t1, h0:h1].copy_(tensors[obj.key])
     return manifest, packed
 
 

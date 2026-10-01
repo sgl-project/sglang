@@ -15,12 +15,26 @@ from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.protocol import (
     DTYPES,
     ContractError,
+    Digest,
+    Identifier,
     Manifest,
+    Positive,
+    StrictStruct,
     canonical_bytes,
     decode_manifest,
     digest_bytes,
+    validate_manifest,
     validate_tensors,
 )
+
+
+class OwnerWriteReceipt(StrictStruct):
+    """Trusted producer acknowledgement, never a Catalog lease or retention proof."""
+
+    capture_id: Identifier
+    fencing_token: Positive
+    owner_id: Identifier
+    manifest_sha256: Digest
 
 
 class PublicationJournal:
@@ -197,6 +211,99 @@ class SnapshotWriter:
             },
         )
         # A lost seal response must also be recoverable from exact metadata bytes.
+        self.journal.save(lease, data)
+        self._seal(manifest, data, lease)
+        return self._publish(manifest, data, manifest_buffer, lease)
+
+    def write_partition(
+        self,
+        manifest: Manifest,
+        tensors: dict[str, torch.Tensor],
+        lease: CaptureLease,
+        *,
+        owner_id: str,
+    ) -> OwnerWriteReceipt:
+        """Write one complete owner partition without publishing a manifest.
+
+        The coordinator first assembles and distributes the same full manifest
+        to all owners. Only metadata is shared; each writer holds its own
+        completed, registered Host buffers. Catalog capture expiry owns cleanup
+        if a writer exits before returning its receipt.
+        """
+        self._check_identity(manifest, lease)
+        if owner_id not in manifest.topology.owners:
+            raise ContractError("unregistered tensor partition owner")
+        validate_tensors(manifest, tensors, owner_id=owner_id)
+        digest = digest_bytes(canonical_bytes(manifest))
+        objects = [obj for obj in manifest.objects if obj.owner_id == owner_id]
+        descriptors = [msgspec.to_builtins(obj) for obj in objects]
+        operation = f"{lease.capture_id}-{owner_id}-{digest}"
+        self.catalog.objects(
+            lease,
+            {
+                "phase": "REGISTERED",
+                "objects": descriptors,
+                "idempotency_key": f"register-partition-{operation}",
+            },
+        )
+        for obj in objects:
+            self.store.put_registered(obj.key, tensors[obj.key], obj.sha256)
+        self.catalog.objects(
+            lease,
+            {
+                "phase": "WRITTEN",
+                "objects": descriptors,
+                "idempotency_key": f"written-partition-{operation}",
+            },
+        )
+        return OwnerWriteReceipt(
+            capture_id=lease.capture_id,
+            fencing_token=lease.fencing_token,
+            owner_id=owner_id,
+            manifest_sha256=digest,
+        )
+
+    def publish_partitions(
+        self,
+        manifest: Manifest,
+        receipts: list[OwnerWriteReceipt],
+        manifest_buffer: torch.Tensor,
+        lease: CaptureLease,
+    ) -> dict:
+        """The aux coordinator publishes only after every owner confirms WRITTEN.
+
+        Receipts bind the entire manifest and current fence, not just a rank.
+        The Catalog must independently verify every WRITTEN descriptor at seal.
+        The durable publication journal then uses the ordinary recovery path.
+        """
+        self._check_identity(manifest, lease)
+        validate_manifest(manifest)
+        data = canonical_bytes(manifest)
+        if len(data) > manifest_buffer.numel() or manifest_buffer.dtype != torch.uint8:
+            raise ContractError("manifest exceeds reserved Host buffer")
+        digest = digest_bytes(data)
+        seen = set()
+        for receipt in receipts:
+            if not isinstance(receipt, OwnerWriteReceipt) or (
+                receipt.capture_id != lease.capture_id
+                or receipt.fencing_token != lease.fencing_token
+                or receipt.manifest_sha256 != digest
+                or receipt.owner_id not in manifest.topology.owners
+                or receipt.owner_id in seen
+            ):
+                raise ContractError("stale, duplicate or mismatched owner receipt")
+            seen.add(receipt.owner_id)
+        if seen != set(manifest.topology.owners):
+            raise ContractError("missing owner write receipts")
+        descriptor = self._manifest_object(manifest, data)
+        self.catalog.objects(
+            lease,
+            {
+                "phase": "REGISTERED",
+                "objects": [descriptor],
+                "idempotency_key": f"register-manifest-{lease.capture_id}-{digest}",
+            },
+        )
         self.journal.save(lease, data)
         self._seal(manifest, data, lease)
         return self._publish(manifest, data, manifest_buffer, lease)

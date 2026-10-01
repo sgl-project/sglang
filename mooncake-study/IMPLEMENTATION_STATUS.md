@@ -31,6 +31,7 @@ it does not redefine the goal as the modules already implemented.
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Coordinator admission, renewal, expiry, retract, shutdown and publication tests pass; traffic-scale stress remains open |
 | Mooncake adapter | Required hard pin, registered raw buffers, immutable retry verification, exact read length | Real cross-process TCP roundtrip passes; cross-node RDMA is pending |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
+| Partition publication | Owner-local writes and fenced all-owner publication receipts | Two independent writer processes publish logical head shards through real TCP Store; distributed inference admission and scheduler integration remain open |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production exporter and trained-model validation still open |
@@ -1170,6 +1171,51 @@ its current specialized SGLang exporter supports EAGLE3. The full HTTP capture
 runtime was not repeated for this loader-only change. Ruff/format/whitespace
 checks pass, GPU source hashes match, and all jobs have terminated.
 
+## Owner-Local Store Publication
+
+`SnapshotWriter.write_partition` now writes exactly one owner's registered
+Host tensors under a complete immutable manifest. It validates logical coverage,
+local object identity/checksums/finite values, and aux semantics on the aux owner.
+It returns `OwnerWriteReceipt` only after Store completion and Catalog WRITTEN
+acknowledgement. The receipt binds capture ID, fencing token, owner and the
+entire manifest digest.
+
+`publish_partitions` requires exactly one matching receipt per expected owner.
+Missing, duplicate, stale, foreign-owner or changed-manifest receipts are rejected
+before publication work. The aux coordinator registers the manifest, persists
+the existing metadata journal, seals against Catalog WRITTEN descriptors, and
+publishes the manifest last. The ordinary recovery path works without original
+owner buffers. No new Catalog endpoint or tensor wire format is introduced.
+
+Job `01790839497863279291-3e45cdeddf54` passes 102 capture tests and
+80 subtests in 43.25s. After the final owner guard and fixture namespace changes,
+job `01790839663116165235-a41cdbec2704` passes the affected writer tests
+and both real Store integration cases: 15 tests and ten subtests in 54.36s.
+Failures cover incomplete/foreign local payloads, invalid response masks,
+receipt mismatches, lost WRITTEN responses and lost seal responses.
+
+The new Store case starts two independent owner processes with disjoint
+registered tensor sets. The logical TP2 fixture assigns aux to tp1, reverses
+owner/descriptor order and splits each selected layer's two KV heads. Both
+writers exit before the coordinator publishes. A separate 64MiB storage segment
+retains all 32 tensor objects (4,532 bytes), and a fresh reader process verifies
+the published sample. The test reader now reconstructs by logical token/head
+ranges; exact comparison against the original full-head tensors passes.
+The previous single-owner registered-arena transport test passes too.
+
+This is a real owner-local TCP publication interface, not TP2 model inference.
+The coordinator that gathers rank-local descriptors, synchronized admission,
+canonical ownership of replicated KV heads, rank-local Host pools, scheduler
+integration and TP/PP numerical/runtime validation are still required. Serving
+capability gates remain unchanged. Receipts are trusted producer ACKs, not
+Catalog retention guarantees; seal must independently check exact WRITTEN
+descriptors. The production Catalog and cross-node RDMA remain outside this run.
+
+Sources match the GPU checkout. New code passes Ruff, existing diagnostics match
+HEAD, and format/whitespace checks pass. All jobs terminated and the H100 resumed
+its idle workload. Commands, observations and source/log hashes are retained in
+[`capture-partition-publication.json`](experiments/capture-partition-publication.json).
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1177,7 +1223,9 @@ checks pass, GPU source hashes match, and all jobs have terminated.
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
-3. Complete P9's topology work: TP/PP, non-static speculative layouts,
+3. Connect P9's owner-local Store interface to distributed capture admission,
+   canonical KV head ownership, rank-local Host pools and TP/PP scheduling.
+   Complete TP/PP runtime validation, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to

@@ -273,6 +273,24 @@ in 461.341s. See
 The workload uses a synthetic draft and forced output tokens; it does not
 measure trained-model quality or service performance.
 
+### Owner-Local Publication
+
+`test/registered/storage/test_training_snapshot_mooncake.py` now includes two
+independent producer processes writing disjoint logical head partitions. It
+uses the real SDK/master and an HTTP Catalog test double. Both writers exit
+before the coordinator publishes; a separate Store segment retains the data.
+Missing-owner and stale receipts are rejected, and a fresh reader validates the
+32 objects while logical-range reassembly exactly matches the original tensors.
+Run it with the existing resident queue:
+
+```bash
+python -m pytest -q -s test/registered/storage/test_training_snapshot_mooncake.py
+```
+
+The retained results are in
+[`capture-partition-publication.json`](capture-partition-publication.json).
+This exercises owner-local storage/publication, not TP/PP inference or RDMA.
+
 ### BF16 Rounding Isolation
 
 The actual fixed-input parity command remains the serving gate. The following
