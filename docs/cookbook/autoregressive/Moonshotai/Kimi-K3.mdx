@@ -105,7 +105,7 @@ SGLang revision `e7f7447333`, which includes
 the [DCP KV-free fix (#38941)](https://github.com/sgl-project/sglang/pull/38941).
 No source overlay is required for DCP.
 
-Keep `SGLANG_K3_KDA_FUSED_BACKEND` unset with this image. The separate fused-KDA
+Keep `SGLANG_ROCM_K3_KDA_FUSED_BACKEND` unset with this image. The separate fused-KDA
 opt-in requires the [deferred-gate fix (#39066)](https://github.com/sgl-project/sglang/pull/39066),
 which is not included in this image. This updated recipe remains **Final
 Verification In Progress**; the recorded speed numbers use their original
@@ -221,7 +221,7 @@ Outside the two verified B300 1×8 `Unified` cells, no cell has a serving round 
 |---|---|---|
 | `AITER_SITUV2_A8W4=1` | unset | SiTU v2 MoE with A8W4 activation quantization, on AITER's GU-interleaved preshuffled weight layout. The performance default the cell ships. |
 | `AITER_SITUV2_A4W4=1` | unset | A4W4 instead, on the generic separated shuffle layout. Numerically correct but slower than A8W4 (530.8 vs 537.3 tok/s median output on 8×MI35x). Setting **both** gives A8W4 precedence — SGLang follows AITER and keeps the GU-interleaved layout. |
-| `SGLANG_K3_KDA_FUSED_BACKEND=aiter` | unset | Opt in to the fused ROCm KDA decode boundary: the `f_b` projection is deferred into the gfx950 FlyDSL kernel so decode fuses `f_b` + convolution + recurrent state update + gated RMSNorm. Any other value (or unset) keeps the unfused KDA path. |
+| `SGLANG_ROCM_K3_KDA_FUSED_BACKEND=aiter` | unset | Opt in to the fused ROCm KDA decode boundary: the `f_b` projection is deferred into the gfx950 FlyDSL kernel so decode fuses `f_b` + convolution + recurrent state update + gated RMSNorm. Any other value (or unset) keeps the unfused KDA path. |
 | `SGLANG_K3_FLYDSL_SOURCE` | `auto` | Which FlyDSL implementation backs the fused decode: `auto` prefers SGLang's vendored kernels and falls back to the AITER module, `sglang` / `aiter` pin one. Leave it alone unless you are bisecting the two. |
 
 The fused KDA backend is fail-closed at two levels: it arms during model init only when the flag is exactly `aiter` **and** the gfx950 FlyDSL kernels are importable, and each decode step re-validates shapes, dtypes, strides, state indices, and output buffers before dispatch — anything unexpected falls back to the stock KDA implementation rather than erroring. Batch size 2 automatically picks a separately validated kernel schedule; every other batch keeps the original build options. Measured on a 69-layer graph the fused boundary is 9.20 → 8.38 µs/layer (−8.9%), with GSM8K 1319 at 0.950.
@@ -437,7 +437,7 @@ Two presets come out of this, at `N = 8k` GPUs:
 | **Peak Capacity (+DCP8)** — `dp = k` + `--dcp-size 8` | Deduplicates the attention-TP group's MLA KV: concurrency ceiling +72% at the same engine throughput, ~1.8× ITL. | Context ≥ ~16K, or per-replica concurrency past 128. |
 
 - **Radix cache** is independent of the preset: for prefix-free traffic (offline batch, evals) switch it off (Playground's **Prefix Cache** card) — one state slot per request instead of 4–5.
-- The fully data-parallel extreme (`--dp-size` = GPU count, attention-TP 1) — the shape behind the 64-GPU sweep's ~3K tok/s per GPU — is not a preset: 288 GB GPUs only, radix forced off, no head-to-head against the preset shape.
+- The fully data-parallel extreme (`--attn-dp-size` = GPU count, attention-TP 1) — the shape behind the 64-GPU sweep's ~3K tok/s per GPU — is not a preset: 288 GB GPUs only, radix forced off, no head-to-head against the preset shape.
 
 The Peak Throughput preset at 32 GPUs on B200/B300 (4 nodes × 8; every node runs the same command with its own `--node-rank`). On GB200/GB300 the same 32-GPU shape uses 8 nodes × 4, and the Playground emits `--nnodes 8`:
 
@@ -447,7 +447,7 @@ sglang serve \
   --trust-remote-code \
   --model-path moonshotai/Kimi-K3 \
   --tp-size 32 --ep-size 32 \
-  --enable-dp-attention --dp-size 4 --enable-dp-lm-head \
+  --attn-dp-size 4 --enable-dp-lm-head \
   --nnodes 4 --node-rank <rank> --dist-init-addr <node0-ip>:20000 \
   --moe-a2a-backend megamoe --moe-runner-backend deep_gemm \
   --kv-cache-dtype fp8_e4m3 \
@@ -460,7 +460,7 @@ sglang serve \
 
 Scale by holding the per-replica shape fixed and moving only the replica count; pool sizing rides the calculator-driven `--mamba-full-memory-ratio`, which folds in DP, DCP, precision, and speculation:
 
-| GPUs | B200/B300 nodes | GB200/GB300 nodes | `--tp-size` / `--ep-size` | `--dp-size` |
+| GPUs | B200/B300 nodes | GB200/GB300 nodes | `--tp-size` / `--ep-size` | `--attn-dp-size` |
 |---|---|---|---|---|
 | 16 | 2×8 | 4×4 | 16 | 2 |
 | 32 | 4×8 | 8×4 | 32 | 4 |

@@ -164,6 +164,21 @@ impl Bucket {
         Ok(())
     }
 
+    /// Whether choosing or serving this bucket reads request tokens: a length
+    /// bound, or a group policy that matches prefixes.
+    pub fn needs_request_tokens(&self) -> bool {
+        let groups: &[&EngineGroup] = match &self.groups {
+            BucketGroups::Plain(group) => &[group],
+            BucketGroups::Pd { prefill, decode } => &[prefill, decode],
+        };
+        self.limits.min.is_some()
+            || self.limits.max.is_some()
+            || self.max_context_tokens.is_some()
+            || groups
+                .iter()
+                .any(|group| group.policy.needs_request_tokens())
+    }
+
     /// Select this bucket's plain engine or complete P/D pair, without dispatching.
     /// A failed group reports its stage; the caller may then try another bucket.
     pub async fn pick_engines(
@@ -268,6 +283,11 @@ impl BucketResolver {
         })
     }
 
+    /// Whether any bucket reads request tokens; startup rejects this under `--no-tokenizer`.
+    pub fn needs_request_tokens(&self) -> bool {
+        self.buckets.iter().any(Bucket::needs_request_tokens)
+    }
+
     /// Return all length-compatible buckets, ordered by unmet SLO preferences,
     /// then input capacity, rank, and ID. Both preferences have equal weight.
     /// The caller tries their groups in order until a complete engine selection succeeds.
@@ -315,5 +335,61 @@ impl BucketResolver {
             (penalty, bucket.input_capacity(), bucket.rank, &bucket.id)
         });
         Ok(buckets)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policies_reorg::power_of_two::PowerOfTwoPolicy;
+    use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+
+    /// A bucket whose group policy reads no tokens, so only the bucket's own
+    /// length fields can make it token-hungry.
+    fn load_only_bucket(id: &str) -> Bucket {
+        let policy: Arc<dyn Policy> =
+            Arc::new(PowerOfTwoPolicy::new(EngineReportedLoadTable::new()));
+        Bucket::new(id, BucketGroups::Plain(EngineGroup::new(policy)))
+    }
+
+    /// `reorg::chat_completions` gates request tokenization on this predicate, so
+    /// every length field [`Bucket::fits`] reads has to keep it true. Drop one and
+    /// a length-bounded bucket would silently select on the request-size estimate
+    /// that [`crate::server::routes::chat`] falls back to without tokens.
+    #[test]
+    fn a_bucket_needs_tokens_for_every_length_field_it_selects_on() {
+        type Mutate = fn(&mut Bucket);
+        assert!(
+            !load_only_bucket("b").needs_request_tokens(),
+            "a load-only bucket selects on nothing that needs tokens"
+        );
+        for (field, mutate) in [
+            (
+                "limits.min",
+                (|b: &mut Bucket| b.limits.min = Some(1)) as Mutate,
+            ),
+            ("limits.max", |b: &mut Bucket| b.limits.max = Some(1)),
+            ("max_context_tokens", |b: &mut Bucket| {
+                b.max_context_tokens = Some(1)
+            }),
+        ] {
+            let mut bucket = load_only_bucket("b");
+            mutate(&mut bucket);
+            assert!(bucket.needs_request_tokens(), "{field}");
+        }
+    }
+
+    /// One bounded bucket makes every request to the model tokenize: the bucket is
+    /// chosen from the token count, so it cannot be known to be irrelevant first.
+    #[test]
+    fn a_resolver_needs_tokens_when_any_bucket_does() {
+        let mut bounded = load_only_bucket("bounded");
+        bounded.limits.max = Some(1);
+        assert!(!BucketResolver::new(vec![load_only_bucket("a")])
+            .unwrap()
+            .needs_request_tokens());
+        assert!(BucketResolver::new(vec![load_only_bucket("a"), bounded])
+            .unwrap()
+            .needs_request_tokens());
     }
 }
