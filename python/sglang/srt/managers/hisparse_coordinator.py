@@ -47,7 +47,7 @@ from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 device_module = get_device_module()
 
@@ -323,6 +323,11 @@ class HiSparseCoordinator:
         )
         self.req_to_host_pool_allocated_len = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
+        )
+        # Speculative target verification restores the immutable staged prefix
+        # from host; generated KV stays in the allocator's resident tail pages.
+        self.spec_prefill_lens = torch.zeros(
+            max_num_req_slots, dtype=torch.int64, device=device
         )
 
         self.write_staging_stream = device_module.Stream()
@@ -638,6 +643,118 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
+        self.spec_prefill_lens[req.kv.req_pool_idx] = allocated_len
+        if (
+            get_spec().speculative_algorithm is not None
+            and not self.is_dsv4_hisparse
+        ):
+            self._preserve_speculative_partial_page(req)
+
+    def _preserve_speculative_partial_page(self, req: Req) -> None:
+        """Keep an unaligned prompt tail in a non-evictable physical page.
+
+        Staging clears prompt mappings. A later alloc_extend must nevertheless
+        extend from a valid last physical location, not slot0. Short prompts
+        retain their ordered buffer and never enter the LRU path during verify.
+        Long prompts use the buffer's already-reserved extra page, which verify
+        never uses for the ordinary decode latest-token special case. Thus this
+        needs no extra allocation outside the scheduler's admission budget.
+        """
+        prefix_len = req.kv.kv_allocated_len
+        tail_len = prefix_len % self.page_size
+        if tail_len == 0:
+            return
+        start = prefix_len - tail_len
+        buffer_start = min(start, self.device_buffer_size)
+        assert buffer_start + tail_len <= int(
+            self.req_device_buffer_size[req.kv.req_pool_idx]
+        )
+        tail = self.req_to_device_buffer[
+            req.kv.req_pool_idx, buffer_start : buffer_start + tail_len
+        ]
+        host_locs = self.req_to_host_pool[req.kv.req_pool_idx, start:prefix_len]
+        for layer_id in range(self.mem_pool_device.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_locs,
+                tail,
+                layer_id,
+                io_backend="kernel",
+            )
+        logical = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, start:prefix_len
+        ]
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[logical] = tail
+
+    def gather_for_verify(
+        self,
+        req_pool_indices: torch.Tensor,
+        query_seq_lens: torch.Tensor,
+        topk_tokens: torch.Tensor,
+        layer_id: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Materialize each verify query before another query can evict its KV.
+
+        Inputs are request-major [batch, queries, top_k]. Prompt misses use the
+        existing swap kernel; accepted/generated and draft KV use their resident
+        mappings. Copy each query's selected rows into independent scratch, then
+        let the ordinary sparse attention kernel consume the whole verify batch.
+        Shapes and control flow are static under graph capture/replay.
+        """
+        assert not self.is_dsv4_hisparse
+        assert not self.enable_prefetch, "Speculative swap must remain synchronous"
+        batch_size, num_queries, top_k = topk_tokens.shape
+        assert top_k == self.top_k
+        assert query_seq_lens.shape == (batch_size, num_queries)
+        cache = self.mem_pool_device.kv_buffer[layer_id]
+        scratch = cache.new_empty((batch_size, num_queries, top_k, *cache.shape[1:]))
+        present = torch.empty_like(topk_tokens, dtype=torch.bool)
+        prefix_lens = self.spec_prefill_lens[req_pool_indices]
+        # No generated token is sent to the host swap kernel. Exclude its
+        # latest-token special case and keep all top_k columns in the short
+        # prompt fast path, even when generated rows occupy earlier columns.
+        swap_lens = (prefix_lens + 1).clamp(min=top_k)
+        real = torch.arange(batch_size, device=topk_tokens.device) < self.num_real_reqs
+        for query in range(num_queries):
+            tokens = topk_tokens[:, query]
+            valid = (
+                real[:, None]
+                & (tokens >= 0)
+                & (tokens < query_seq_lens[:, query, None])
+            )
+            safe_tokens = torch.where(valid, tokens, 0).long()
+            logical = self.req_to_token_pool.req_to_token[
+                req_pool_indices[:, None], safe_tokens
+            ]
+            resident = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                logical
+            ]
+            host_needed = valid & (resident == 0) & (tokens < prefix_lens[:, None])
+            host_tokens = torch.where(host_needed, tokens, -1).to(torch.int32)
+            swapped = self._run_swap_in_kernel(
+                req_pool_indices, swap_lens, host_tokens, layer_id
+            )
+            locations = torch.where(resident > 0, resident, swapped)
+            available = valid & ((resident > 0) | (host_needed & (swapped >= 0)))
+            # The gather finishes before the next swap mutates the same LRU
+            # buffer. Invalid rows use an in-bounds address and are masked out
+            # of the attention page table below.
+            scratch[:, query].copy_(cache[locations.clamp(min=0).long()])
+            present[:, query] = available
+        page_table = torch.arange(
+            batch_size * num_queries * top_k,
+            device=topk_tokens.device,
+            dtype=torch.int32,
+        ).view(batch_size, num_queries, top_k)
+        page_table = torch.where(present, page_table, -1)
+        materialized = scratch.view(batch_size * num_queries * top_k, *cache.shape[1:])
+        # kv_buffer holds the storage dtype (uint8 for FP8 KV). Attention needs
+        # the KV dtype, as get_key_buffer() returns, to pick its kernel and
+        # element width; the raw bytes would be read as BF16 at twice the size.
+        kv_dtype = getattr(self.mem_pool_device, "dtype", cache.dtype)
+        if kv_dtype != cache.dtype:
+            materialized = materialized.view(kv_dtype)
+        return materialized, page_table.view(batch_size * num_queries, top_k)
 
     def _grow_device_buffers(
         self,
@@ -1044,19 +1161,11 @@ class HiSparseCoordinator:
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
-        # extra slots may carry stale mapping entries pointing at buffer slots
-        # we just freed via free_hisparse_indices(all_hi). If left set, the
+        # extra slots may carry mapping entries pointing at buffer slots
+        # released below via free_hisparse_indices(all_hi). If left set, the
         # subsequent release_kv_cache -> allocator.free -> free_hisparse path
         # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv.kv_allocated_len
-
-        # release memory -- only free actually-allocated buffer indices
-        current_cap = int(self.req_device_buffer_size[req.kv.req_pool_idx])
-        if current_cap > 0:
-            side_buf_hi = self.req_to_device_buffer[req.kv.req_pool_idx, :current_cap]
-            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
-            if all_hi.numel() > 0:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :allocated_len
@@ -1064,6 +1173,17 @@ class HiSparseCoordinator:
         compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             allocated_locs
         )
+        # Speculative alloc_extend also owns device pages outside the side
+        # buffer. Collect them before clearing their mappings. Free both sets
+        # together so aliases of the same physical page are deduplicated by
+        # the device allocator, not released twice in separate calls.
+        current_cap = int(self.req_device_buffer_size[req.kv.req_pool_idx])
+        side_buf_hi = self.req_to_device_buffer[req.kv.req_pool_idx, :current_cap]
+        mapped_hi = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            compressed_locs
+        ]
+        all_hi = torch.cat((side_buf_hi, mapped_hi))
+        self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
 
         host_indices = self.mem_pool_host.allocated_host_indices(
