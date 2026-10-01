@@ -94,7 +94,6 @@ if _is_npu:
     fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_npu
 
 
-
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
     return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
@@ -117,7 +116,6 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
-
 
 
 class Qwen3NextSparseMoeBlock(Qwen2MoeSparseMoeBlock):
@@ -163,7 +161,6 @@ class Qwen3NextSparseMoeBlock(Qwen2MoeSparseMoeBlock):
             return super().forward(hs_bf16, forward_batch, defer_finalize)
         finally:
             self._forward_shared_experts = original
-
 
 
 def _moe_accepts_fp8_tuple(mlp) -> bool:
@@ -482,7 +479,9 @@ class Qwen3GatedDeltaNet(nn.Module):
         # block-quantized and takes the bf16 side-output.
         if isinstance(hidden_states, tuple):
             hs_shape = hidden_states[0]
-            hs_qkvz = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvz)
+            hs_qkvz = _select_fused_ar_input_for_linear(
+                hidden_states, self.in_proj_qkvz
+            )
             hs_ba = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_ba)
         else:
             hs_shape = hs_qkvz = hs_ba = hidden_states
