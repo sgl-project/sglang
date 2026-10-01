@@ -867,6 +867,23 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text held for a <tool_call> that never got a name.
+
+        detect_and_parse leaves an incomplete call in the text. Streaming held it
+        waiting for a name, so at the end of the stream it is returned the same
+        way, and its placeholder is dropped so the end-of-stream argument flush
+        does not send ``{}`` for a call that has no name.
+        """
+        if self.current_tool_name_sent or not self._buffer:
+            return StreamingParseResult()
+        text, self._buffer = self._buffer, ""
+        if self.current_tool_id >= 0:
+            del self.prev_tool_call_arr[self.current_tool_id :]
+            del self.streamed_args_for_tool[self.current_tool_id :]
+        self._skipping_undeclared_tool = False
+        return StreamingParseResult(normal_text=text)
+
     def _parse_argument_pairs(
         self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]
     ) -> Dict[str, Any]:
