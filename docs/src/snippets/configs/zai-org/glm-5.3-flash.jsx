@@ -19,7 +19,13 @@ export const config = {
         { id: "fp8", label: "FP8" },
         {
           id: "nvfp4",
-          label: "NVFP4",
+          label: "NVFP4 (RDXA)",
+          disabled: (s) => !["gb300", "gb200", "b200", "b300"].includes(s.hw),
+          disableReason: "The NVFP4 W4A4 kernels are Blackwell-only; Hopper cannot serve this checkpoint.",
+        },
+        {
+          id: "nvfp4-nvda",
+          label: "NVFP4 (NVDA)",
           disabled: (s) => !["gb300", "gb200", "b200", "b300"].includes(s.hw),
           disableReason: "The NVFP4 W4A4 kernels are Blackwell-only; Hopper cannot serve this checkpoint.",
         },
@@ -149,7 +155,8 @@ export const config = {
 
   modelNames: {
     default: "zai-org/GLM-5.3-Flash",
-    nvfp4: "nvidia/GLM-5.3-Flash-NVFP4",
+    nvfp4: "RadixArk/GLM-5.3-Flash-NVFP4",
+    "nvfp4-nvda": "nvidia/GLM-5.3-Flash-NVFP4",
   },
 
   placeholders: {
@@ -395,27 +402,37 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
-    // NVIDIA NVFP4 checkpoint (nvidia/GLM-5.3-Flash-NVFP4, ModelOpt 0.47.0,
-    // group size 16). Same FP8 KV + TRT-LLM DSA and flashinfer_trtllm MoE
-    // recipe as the FP8 Blackwell cells, at each platform's TP size (gb300 /
-    // gb200 TP4, b200 / b300 TP8). Only the 8x B300 cells are measured.
+    // RadixArk NVFP4 W4A4 checkpoint (ModelOpt 0.46.0, abs-max, group size
+    // 16): routed and shared experts plus the dense MLPs are FP4; attention,
+    // router, MTP, embeddings, and the vision tower stay BF16. Validated on
+    // 4x GB300 and 4x B300 with both KV/DSA pairings; the benchmark rows
+    // carry measured speed for both pairings on the current release image.
     {
       match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
+        ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off"
+          ? "in-progress"
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 4",
-        "--dsa-prefill-backend trtllm",
-        "--dsa-decode-backend trtllm",
-        "--kv-cache-dtype fp8_e4m3",
-        "--moe-runner-backend flashinfer_trtllm",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend flashinfer_cutlass",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -423,20 +440,31 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
+        ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off"
+          ? "verified"
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 4",
-        "--dsa-prefill-backend trtllm",
-        "--dsa-decode-backend trtllm",
-        "--kv-cache-dtype fp8_e4m3",
-        "--moe-runner-backend flashinfer_trtllm",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
+    // Same NVFP4 recipe on the remaining Blackwell platforms, at each fp8
+    // cell's TP size (gb200 TP4, b200/b300 TP8). Not measured on this
+    // hardware, so every cell here reports unverified.
     {
       match: { hw: "gb200", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
@@ -446,14 +474,16 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 4",
-        "--dsa-prefill-backend trtllm",
-        "--dsa-decode-backend trtllm",
-        "--kv-cache-dtype fp8_e4m3",
-        "--moe-runner-backend flashinfer_trtllm",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend flashinfer_cutlass",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -467,6 +497,131 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 4",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", strategy: "low-latency", quant: "nvfp4" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", strategy: "high-throughput", quant: "nvfp4" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", strategy: "low-latency", quant: "nvfp4" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", strategy: "high-throughput", quant: "nvfp4" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // NVIDIA NVFP4 checkpoint (nvidia/GLM-5.3-Flash-NVFP4, ModelOpt 0.47.0,
+    // group size 16). Same FP8 KV + TRT-LLM DSA and flashinfer_trtllm MoE
+    // recipe as the FP8 Blackwell cells, at each platform's TP size (gb300 /
+    // gb200 TP4, b200 / b300 TP8). Only the 8x B300 cells are measured.
+    {
+      match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4-nvda" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 4",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4-nvda" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 4",
         "--dsa-prefill-backend trtllm",
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
@@ -476,7 +631,45 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", strategy: "low-latency", quant: "nvfp4" },
+      match: { hw: "gb200", strategy: "low-latency", quant: "nvfp4-nvda" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 4",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", strategy: "high-throughput", quant: "nvfp4-nvda" },
+      nnodes: 1,
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 4",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", strategy: "low-latency", quant: "nvfp4-nvda" },
       nnodes: 1,
       verified: false,
       env: [],
@@ -497,7 +690,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", strategy: "high-throughput", quant: "nvfp4" },
+      match: { hw: "b200", strategy: "high-throughput", quant: "nvfp4-nvda" },
       nnodes: 1,
       verified: false,
       env: [],
@@ -514,7 +707,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b300", strategy: "low-latency", quant: "nvfp4" },
+      match: { hw: "b300", strategy: "low-latency", quant: "nvfp4-nvda" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -542,7 +735,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b300", strategy: "high-throughput", quant: "nvfp4" },
+      match: { hw: "b300", strategy: "high-throughput", quant: "nvfp4-nvda" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
