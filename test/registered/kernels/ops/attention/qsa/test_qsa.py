@@ -943,6 +943,7 @@ def test_qsa_extend_rope_matrix_uses_mrope_coordinates():
         forward_mode=ForwardMode.EXTEND,
         extend_seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
         extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
+        extend_prefix_lens_cpu=[0],
         positions=flat,
         mrope_positions=mrope,
         input_ids=torch.zeros(num_tokens, dtype=torch.int32),
