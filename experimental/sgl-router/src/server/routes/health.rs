@@ -140,12 +140,30 @@ mod tests {
                         url: format!("http://worker-{i}:30000"),
                         mode,
                         model_ids: model.map(|m| ModelId(m.into())).into_iter().collect(),
-                        bootstrap_port: None,
+                        bootstrap_port: (mode == Prefill).then_some(8997),
                     })
                     .unwrap();
             }
             assert_eq!(readyz(State(ctx)).await == StatusCode::OK, ready);
         }
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_portless_prefill() {
+        use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+        let ctx = test_ctx(true, false);
+        for mode in [WorkerMode::Prefill, WorkerMode::Decode] {
+            ctx.registry
+                .add(WorkerSpec {
+                    id: WorkerId(format!("{mode:?}")),
+                    url: format!("http://{mode:?}:30000"),
+                    mode,
+                    model_ids: vec![ModelId(ctx.config.model.id.clone())],
+                    bootstrap_port: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(readyz(State(ctx)).await, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     async fn readyz_status(ctx: Arc<AppContext>) -> StatusCode {
