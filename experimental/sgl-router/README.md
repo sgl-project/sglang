@@ -69,6 +69,52 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+### Peer bootstrap (Kubernetes)
+
+A replica that starts mid-fleet subscribes to each worker's KV topic
+mid-stream, so everything already resident in the engines' caches is invisible
+to it and it routes cache-blind until traffic re-stores those blocks —
+degrading the engines' locality for the whole fleet, once per replica on every
+rolling update. With a peer selector set, a booting replica instead pulls a
+tree snapshot from a warm sibling over `/internal/kv_snapshot` and splices it
+under its own live delta stream, and `/readyz` stays 503 until that bootstrap
+settles. Off unless `--kv-peer-selector` is set; requires `--policy
+cache_aware` with the Router-local radix tree (not an external Indexer) and
+`--service-discovery`, which the CLI enforces.
+
+```bash
+sgl-router \
+  --model-id qwen3 --policy cache_aware \
+  --service-discovery --service-discovery-namespace prod \
+  --selector app=engines-qwen3 \
+  --kv-peer-selector kubernetes.io/service-name=sgl-router
+```
+
+- `--kv-peer-selector` is matched against **EndpointSlice labels** — the
+  router Service's labels plus `kubernetes.io/service-name`, never the pods'
+  labels, so `kubernetes.io/service-name=<router-service>` is the unambiguous
+  choice. A pod-template label matches nothing and every replica boots cold.
+- `--kv-bootstrap-timeout-ms` (default 600000) bounds the whole bootstrap;
+  readiness waits on it, so startup/readiness probes must tolerate a replica
+  staying unready this long.
+- `--kv-bootstrap-fetch-timeout-cap-ms` (default 300000) caps one snapshot
+  fetch within that budget.
+- `--kv-bootstrap-seed-required` (off by default) keeps holding `/readyz` when
+  siblings were present but their tree could not be pulled, bounded at
+  max(3× the bootstrap timeout, 60s) — it delays a failed seed's replica (and
+  with it a rolling update) rather than shipping it cache-blind; it cannot
+  stall a rollout indefinitely.
+
+The deployment needs two things beyond the flags: the router's ServiceAccount
+must hold `get`/`list`/`watch` on `endpointslices` in the watched namespace
+(the worker-discovery Role already grants this), and the pod spec should wire
+`POD_NAME`, `POD_NAMESPACE` and `POD_IP` from the downward API so a replica
+can exclude itself from its own peer list. A rolling update should surge
+(`maxUnavailable: 0`) so new replicas always have warm siblings to copy from.
+`tests/e2e/k8s_integration/manifests/kv-bootstrap.yaml` is a worked example of
+all of it, and the `sgl_router_kv_bootstrap_*` series in
+[monitoring/README.md](monitoring/README.md) make the whole path observable.
+
 ### Reorg routing
 
 Use `--chat-routing reorg` to select the new bucket engine. The existing `--policy`
