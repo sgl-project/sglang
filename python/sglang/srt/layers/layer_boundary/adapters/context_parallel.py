@@ -13,43 +13,17 @@
 # ==============================================================================
 
 
-from typing import Optional
-
 import torch
 
-from sglang.srt.layers.attention.dsa.utils import (
-    dsa_use_prefill_cp,
-)
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
     get_local_dp_buffer,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_parallel
 
 
-def maybe_prefetch_next_full_attention_kv(
-    forward_batch: ForwardBatch,
-    next_full_attention_layer_id: Optional[int],
-) -> None:
-    """Prefetch (owner-broadcast) the next layer's DSA KV under layer split.
-
-    No-op unless the current batch runs DSA prefill-CP and the active KV pool is
-    a layer-sharded pool exposing ``prefetch_kv_buffer`` (i.e.
-    ``LayerSplitDSATokenToKVPool``). Kicking the broadcast off one layer ahead
-    overlaps it with the current layer's attention compute.
-    """
-    if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
-        return
-
-    prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
-    if prefetch_kv_buffer is not None:
-        prefetch_kv_buffer(next_full_attention_layer_id)
-
-
-def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
+def attn_cp_gather(hidden_states: torch.Tensor):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
@@ -61,7 +35,7 @@ def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
     return hidden_states
 
 
-def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
+def attn_cp_reduce_scatter(hidden_states: torch.Tensor):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1

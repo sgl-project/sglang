@@ -148,6 +148,7 @@ mod tests {
                 startup_ready: false,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                metadata: crate::frontend::FrontendMetadata::default(),
             },
         )
     }

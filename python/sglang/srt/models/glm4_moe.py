@@ -46,7 +46,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -97,7 +97,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     is_npu,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -258,7 +258,6 @@ class Glm4MoeAttention(nn.Module):
         self.rope_theta = rope_theta
         self.use_qk_norm = use_qk_norm
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -431,7 +430,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         nn.Module.__init__(self)
         self.top_k = config.num_experts_per_tok
         self.tp_size = get_parallel().tp_size
-        self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
@@ -847,7 +845,7 @@ class Glm4MoeDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -871,12 +869,12 @@ class Glm4MoeDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -946,7 +944,7 @@ class Glm4MoeDecoderLayer(nn.Module):
             hidden_states,
             forward_batch,
             quant_format=self.attn_quant_format,
-            capture_output=capture_output,
+            capture=capture_output,
         )
 
         hidden_states = self.self_attn(
@@ -992,7 +990,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         )
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.postprocess(
+        hidden_states = self.ffn_boundary.finish_complete_output(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -1041,7 +1039,7 @@ class Glm4MoeModel(nn.Module):
             self.pp_group.rank_in_group,
             self.pp_group.world_size,
         )
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm4MoeDecoderLayer(
                 layer_id=idx,
@@ -1051,8 +1049,6 @@ class Glm4MoeModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -1123,7 +1119,7 @@ class Glm4MoeModel(nn.Module):
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
         if len(aux_hidden_states) == 0:
@@ -1141,7 +1137,6 @@ class Glm4MoeForCausalLM(nn.Module):
         nn.Module.__init__(self)
         self.pp_group = get_parallel().pp_group
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()
