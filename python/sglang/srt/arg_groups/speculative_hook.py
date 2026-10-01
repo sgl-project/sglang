@@ -385,6 +385,14 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             speculative_num_draft_tokens=inferred_block_size,
         )
 
+    ratio = cfg.speculative_draft_kv_ratio
+    if not 0 < ratio <= 1:
+        raise ValueError(
+            f"--speculative-draft-kv-ratio must be in (0, 1], got {ratio}."
+        )
+    if ratio < 1:
+        _handle_dflash_draft_kv_ratio(server_args)
+
     if cfg.speculative_draft_window_size is not None:
         draft_tokens = int(cfg.speculative_num_draft_tokens)
         if cfg.speculative_draft_window_size < draft_tokens:
@@ -404,6 +412,59 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+        )
+
+
+def _handle_dflash_draft_kv_ratio(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.device.startswith("cuda"):
+        raise ValueError(
+            "--speculative-draft-kv-ratio below 1 is only supported on CUDA."
+        )
+    unsupported = [
+        flag
+        for flag, enabled in (
+            ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+            ("--enable-unified-memory", cfg.enable_unified_memory),
+            ("--enable-hisparse", cfg.enable_hisparse),
+            ("--disaggregation-mode", cfg.disaggregation_mode != "null"),
+            ("--dcp-size", cfg.dcp_size > 1),
+        )
+        if enabled
+    ]
+    if unsupported:
+        raise ValueError(
+            "--speculative-draft-kv-ratio below 1 does not support "
+            f"{', '.join(unsupported)}."
+        )
+
+    from sglang.srt.speculative.dflash_utils import (
+        get_dflash_attention_sliding_window_size,
+        get_dflash_layer_types,
+    )
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_hf_config = get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+        model_override_args=json.loads(cfg.json_model_override_args),
+    )
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if not layer_types or any(t != "sliding_attention" for t in layer_types):
+        # TODO: support full-attention draft layers
+        raise ValueError(
+            "--speculative-draft-kv-ratio below 1 is not supported yet on a "
+            f"draft with full-attention layers, got layer_types={layer_types}."
+        )
+
+    if cfg.speculative_draft_window_size is None:
+        declare_resolution(
+            server_args,
+            "_handle_dflash_draft_kv_ratio",
+            speculative_draft_window_size=get_dflash_attention_sliding_window_size(
+                draft_hf_config
+            ),
         )
 
 
