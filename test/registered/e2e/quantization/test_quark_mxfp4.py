@@ -220,9 +220,9 @@ class TestNVFP4ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
     tp = 1
 
     def test_gsm8k(self):
-        # Requantized NVFP4 -> MXFP4 observed accuracy: ~0.88
-        # (BF16 Qwen/Qwen3-30B-A3B reference: ~0.94).
-        self._test_gsm8k(accuracy_threshold=0.85)
+        # Requantized NVFP4 -> MXFP4 observed accuracy on MI35x CI: mean ~0.856,
+        # std ~0.018, range 0.802-0.886 (BF16 Qwen/Qwen3-30B-A3B reference: ~0.94).
+        self._test_gsm8k(accuracy_threshold=0.79)
 
 
 @unittest.skipIf(is_in_ci(), "local test only")
@@ -285,8 +285,10 @@ class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
         )
 
     def test_gsm8k(self):
-        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: ~0.948
-        self._test_gsm8k(accuracy_threshold=0.92)
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: ~0.948.
+        # Requantized FP8 -> MXFP4 observed accuracy on MI35x CI: mean ~0.924,
+        # std ~0.009, range 0.900-0.946.
+        self._test_gsm8k(accuracy_threshold=0.89)
 
 
 @unittest.skipIf(is_in_ci(), "local test only")
