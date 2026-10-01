@@ -361,7 +361,7 @@ mod tests {
                     url: (*url).to_string(),
                     mode: WorkerMode::Plain,
                     model_ids: vec![ModelId("stub-model".into())],
-                    bootstrap_port: None,
+                    ..Default::default()
                 })
                 .expect("worker accepted");
         }
@@ -481,6 +481,7 @@ mod tests {
                 mode: WorkerMode::Prefill,
                 model_ids: vec![ModelId("stub-model".into())],
                 bootstrap_port: Some(8998),
+                ..Default::default()
             })
             .expect("prefill accepted");
         ctx.registry
@@ -489,7 +490,7 @@ mod tests {
                 url: d_url.clone(),
                 mode: WorkerMode::Decode,
                 model_ids: vec![ModelId("stub-model".into())],
-                bootstrap_port: None,
+                ..Default::default()
             })
             .expect("decode accepted");
 
