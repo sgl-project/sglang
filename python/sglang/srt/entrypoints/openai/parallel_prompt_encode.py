@@ -20,9 +20,10 @@ only lookahead that could flip (``\s+(?!\S)``) is shadowed by the earlier
 
 Any configuration where that argument does not hold falls back to the original
 encode: slow or wrapped tokenizers, specials added by the post-processor,
-lstrip / rstrip / single_word added tokens, pre-tokenizers that treat the first
-piece of a sequence differently (Metaspace), split_special_tokens, and
-truncation or padding left enabled on the backend.
+post-processors that can rewrite sequence ids, lstrip / rstrip / single_word
+added tokens, pre-tokenizers that treat the first piece of a sequence
+differently (Metaspace), split_special_tokens, and truncation or padding left
+enabled on the backend.
 
 Gated by SGLANG_PARALLEL_PROMPT_ENCODE and SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.
 """
@@ -57,6 +58,12 @@ _SAFE_PRE_TOKENIZERS = {
     "UnicodeScripts",
 }
 
+_ID_PRESERVING_POST_PROCESSORS = {
+    "BertProcessing",
+    "ByteLevel",
+    "RobertaProcessing",
+}
+
 # Pre-token regex for which the intra-gap cut points below were verified.
 _INTRA_SPLIT_REGEX = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|"
@@ -77,6 +84,31 @@ def _pre_tokenizer_safe(cfg):
     if cfg.get("type") == "Sequence":
         return all(_pre_tokenizer_safe(c) for c in cfg.get("pretokenizers", []))
     return cfg.get("type") in _SAFE_PRE_TOKENIZERS
+
+
+def _template_post_processor_safe(cfg):
+    sequences = 0
+    for item in cfg.get("single", []):
+        if not isinstance(item, dict) or len(item) != 1:
+            return False
+        if isinstance(item.get("SpecialToken"), dict):
+            continue
+        sequence = item.get("Sequence")
+        if not isinstance(sequence, dict) or sequence.get("id") != "A":
+            return False
+        sequences += 1
+    return sequences == 1
+
+
+def _post_processor_safe(cfg):
+    if cfg is None:
+        return True
+    processor_type = cfg.get("type")
+    if processor_type == "Sequence":
+        return all(_post_processor_safe(c) for c in cfg.get("processors", []))
+    if processor_type == "TemplateProcessing":
+        return _template_post_processor_safe(cfg)
+    return processor_type in _ID_PRESERVING_POST_PROCESSORS
 
 
 def _intra_cut_safe(cfg):
@@ -136,6 +168,8 @@ def _build_plan(tokenizer):
     except Exception:
         return None
     if not _pre_tokenizer_safe(cfg.get("pre_tokenizer")):
+        return None
+    if not _post_processor_safe(cfg.get("post_processor")):
         return None
     added = backend.get_added_tokens_decoder().values()
     if any(t.lstrip or t.rstrip or t.single_word for t in added):

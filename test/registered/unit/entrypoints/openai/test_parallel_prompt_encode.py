@@ -310,6 +310,25 @@ def _post_processor_adds_bos(backend):
     )
 
 
+def _post_processor_duplicates_sequence(backend):
+    backend.post_processor = processors.TemplateProcessing(
+        single="$A $A", special_tokens=[]
+    )
+
+
+def _post_processor_sequence(backend, duplicate=False):
+    template = "$A $A" if duplicate else "<think> $A"
+    backend.post_processor = processors.Sequence(
+        [
+            processors.ByteLevel(),
+            processors.TemplateProcessing(
+                single=template,
+                special_tokens=[("<think>", backend.token_to_id("<think>"))],
+            ),
+        ]
+    )
+
+
 class _WrappedTokenizer(PreTrainedTokenizerFast):
     def encode(self, text, **kwargs):
         return super().encode(text, **kwargs)
@@ -426,6 +445,24 @@ class TestUnsafeTokenizersFallBack(_EncodeCase):
             _chunk_ids(tokenizer, self.text, all_cuts=True)[0],
             tokenizer.encode(self.text, add_special_tokens=False),
         )
+
+    def test_a_post_processor_that_duplicates_ids_falls_back(self):
+        tok = _tokenizer(_post_processor_duplicates_sequence)
+        text = "hello world " + "<think>hello world</think> " * 2000
+        self.assertIsNone(ppe._plan_for(tok))
+        with unittest.mock.patch.object(
+            ppe, "split_prompt", side_effect=AssertionError("chunked path taken")
+        ):
+            assert ppe.parallel_prompt_encode(
+                tok, text, {"add_special_tokens": False}
+            ) == tok.encode(text, add_special_tokens=False)
+
+    def test_sequence_post_processors_are_checked_recursively(self):
+        safe = _tokenizer(lambda b: _post_processor_sequence(b))
+        unsafe = _tokenizer(lambda b: _post_processor_sequence(b, duplicate=True))
+        self.assertIsNotNone(ppe._plan_for(safe))
+        self.assertIsNone(ppe._plan_for(unsafe))
+        self._assert_original_encode(unsafe)
 
     def test_backend_state_that_rewrites_the_ids_falls_back(self):
         """These three live on the backend, not in the plan, so the helper has
