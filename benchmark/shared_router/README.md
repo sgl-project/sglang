@@ -79,8 +79,12 @@ the table reports the median of the per-repetition P50 statistics.
 Both accuracy pairs had zero request errors and passed the local 0.5 pp loss
 tolerance. Accuracy uses real acceptance, while timing fixes synthetic AL3.51.
 Four-rank untimed traces confirm both fused stages in graph replay. These are
-candidate-first sequential pairs; reverse-order and all-concurrency checks
-remain in progress. Do not add the two gains or claim statistical significance.
+candidate-first sequential pairs. The #42055 native-first confirmation also
+passed: P50 TPOT 2.954854 to 2.921790 ms (-1.119%), output throughput +1.022%.
+It uses three new timing repetitions and reuses the exact-source full GSM8K
+pair above, not a new accuracy score. The positive incremental result occurs
+in both run orders. Public-main reverse-order and remaining all-concurrency
+checks are in progress. Do not add the two gains or claim significance.
 The preparation tree changes only formatting and reproduction support relative
 to the main measured runtime: Python AST is identical, C++/Triton unchanged.
 
@@ -99,6 +103,14 @@ These are native-fallback checks with no observed material regression, not
 evidence of a fusion speedup at these batch sizes. Tail batches can still enter
 the supported small-M path. Other current-main and incremental cases remain
 pending; the historical sweep below cannot substitute for them.
+
+On the #42055 common source, the C8 fallback check completed with P50 TPOT
+5.558282 to 5.572054 ms (+0.248%) and output throughput -0.083%. Full GSM8K
+was 1282 to 1285/1319 with zero errors. Both raw response sets independently
+rescore; all four steady-decode graph traces show zero fused launches. This
+small measured regression is reported, not treated as a fusion gain. One
+co-located pair is insufficient to establish significance or universal
+absence of regression.
 
 ### Completed common-source folded-expert comparison
 

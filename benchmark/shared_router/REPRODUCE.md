@@ -172,6 +172,15 @@ the following probe separately. `TRACE_DIR` must be an absolute, new directory
 visible and writable by the server. It does not need to be the same machine as
 the HTTP client. Do not include this request in performance statistics.
 
+The staged probe below has completed at C1/C2/C4/C8. Do not extrapolate it to
+C16/C32: during qualification a C16 server stalled when the profiler restarted
+between prefill and decode. A single-start, steady-decode probe is being
+validated separately; high-concurrency trace qualification remains pending.
+For readiness detection, `spec_verify_calls_total` is not a live per-step
+counter in the pinned source: it increments when a request finishes. It is
+suitable for the completed-request AL audit, not for triggering a profiler
+while all requests must remain active.
+
 ```bash
 export BASE_URL=http://127.0.0.1:30000 CONC=2
 export TRACE_DIR=/absolute/server-visible/path/candidate-c2-trace
