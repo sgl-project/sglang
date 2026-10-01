@@ -162,7 +162,7 @@ class TestPadComposesWithDerivation(CustomTestCase):
 class TestReadRailTranslatesAtProduction(CustomTestCase):
     """The model-door READ indices (req_to_token-derived, VIRTUAL under the
     unified pool) are translated at their PRODUCTION site -- the cache then
-    holds the kernel-facing result and the pool door never translates."""
+    holds the physical result and the pool door never translates."""
 
     def _fb_for_one_shot(self):
         fb = _make_fb(torch.tensor([1, 2], dtype=torch.int64))

@@ -532,7 +532,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # The write loc before `rebind_write_loc` replaced it with kernel-facing
+    # The write loc before `rebind_write_loc` replaced it with physical
     # ids; a backend re-derives from it into its capture-stable buffer.
     out_cache_loc_virtual: Optional[torch.Tensor] = None
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,

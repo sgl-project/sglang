@@ -39,7 +39,7 @@ Covered here:
     sizes, ragged sequence lengths and a non-identity v2p permutation;
   - lanes past a row's live prefix keep the backend's -1 sentinel (prefix-only
     discipline — the trtllm/flashmla tail contract);
-  - the token-level kernel-facing translate the flashinfer updaters used to apply
+  - the token-level physical translate the flashinfer updaters used to apply
     agrees with the canonical page table (page-affinity of the id space);
   - fa3's fused metadata kernels agree with the same reference, on both the
     page_size == 1 fast path (which is what Kimi-Linear takes: fa3 imposes no
@@ -204,7 +204,7 @@ class TestBlockTable(unittest.TestCase):
             kernel_tokens = (
                 v2p[virt_tokens // page_size] * page_size + virt_tokens % page_size
             )
-            # The block-table entry scaled by page_size must be the kernel-facing id of
+            # The block-table entry scaled by page_size must be the physical id of
             # each page's first token.
             first_of_page = kernel_tokens[::page_size]
             n_pages = (n + page_size - 1) // page_size
@@ -221,7 +221,7 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
     (src_is_read_table=True): the fused kernel copies the canonical
     rows' live prefixes into the capture-stable buffer. Pinned END-TO-END:
     build_kv_read_table -> wrapper -> page_table must equal the python
-    reference of the kernel-facing formula, on both the page_size == 1 / no-SWA fast
+    reference of the physical-id formula, on both the page_size == 1 / no-SWA fast
     path (what Kimi-Linear takes) and the general kernel. The static call
     (no source flag) stays byte-identical to the pre-translator kernel.
     """

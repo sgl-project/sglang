@@ -383,7 +383,7 @@ class FlashAttentionBackend(AttentionBackend):
         if not model_runner.model_config.is_local_attention_model:
             return None
         # Local attention re-translates metadata.page_table through the static
-        # full->swa map, which is meaningless on the unified pool's kernel tables.
+        # full->swa map, which is meaningless on the unified pool's physical tables.
         assert not self.kv_index_translator.is_translating, (
             "--enable-unified-memory does not support local-attention models "
             "on the fa3/fa4 backend."
@@ -749,7 +749,7 @@ class FlashAttentionBackend(AttentionBackend):
             # straight into these capture-stable buffers from the LIVE v2p, so
             # a page relocated by compaction since capture is picked up. Same
             # substitution the eager extend branch makes in its `_unified_read`
-            # fixup; `build_index_table` emits page-granular kernel-facing ids
+            # fixup; `build_index_table` emits page-granular physical ids
             # directly, so there is no `// page_size` to undo.
             self.kv_index_translator.build_index_table(
                 req_pool_indices=forward_batch.req_pool_indices[:bs],
@@ -1208,7 +1208,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if swa_out_cache_loc is not None:
                     # The swa write loc was computed from the still-VIRTUAL
                     # loc at ForwardBatch construction; re-running the
-                    # full->swa map on the kernel-facing loc would be garbage.
+                    # full->swa map on the physical loc would be garbage.
                     metadata.swa_out_cache_loc = (
                         self.kv_index_translator.sliding_window_write_loc_for(
                             swa_out_cache_loc

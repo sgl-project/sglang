@@ -100,7 +100,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
     PER_LAYER_VIEW_MHA_BACKENDS = ("fa3", "fa4", "flashinfer", "trtllm_mha")
     # MLA-family kernels that must never leak into the MHA arm.
     MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "flashmla")
-    # No kernel-facing-id wiring anywhere: must stay rejected until they get one.
+    # No virtual-to-physical id wiring anywhere: must stay rejected until they get one.
     UNWIRED_BACKENDS = ("aiter",)
 
     def test_triton_allowed_on_every_arm(self):
@@ -170,7 +170,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
             for use_mla in (True, False):
                 self.assertFalse(
                     _accepts(backend, use_mla=use_mla),
-                    f"{backend} has no kernel-facing-id wiring and must be rejected",
+                    f"{backend} has no virtual-to-physical id wiring and must be rejected",
                 )
 
     def test_helion_linear_attention_is_kda_only(self):

@@ -2626,7 +2626,7 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
         v2p = a.full_v2p_page_table
         want = v2p[v // self.PS] * self.PS + v % self.PS
         got = a.translate_kv_loc(v)
-        self.assertTrue(torch.equal(got, want), "kernel-facing formula broke at ps=64")
+        self.assertTrue(torch.equal(got, want), "physical-id formula broke at ps=64")
         self.assertTrue(bool((got < 2**31).all().item()))
 
 

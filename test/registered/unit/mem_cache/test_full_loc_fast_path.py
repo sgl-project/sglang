@@ -96,7 +96,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
     def test_full_layer_falls_back_to_generic_loc(self):
         """Bug regression: a 2-arg `KVWriteLoc(loc, swa)` with no explicit
         `full_loc` must fall back to the rebound `loc` -- which IS the full-side
-        kernel-facing id -- instead of failing the full-layer door."""
+        physical id -- instead of failing the full-layer door."""
         pool = self._make_bare_pool()
         rebound_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
         swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
@@ -267,7 +267,7 @@ class _RecordingMLAPool(_RecordingPool):
 
 class TestHybridLinearMLARouting(unittest.TestCase):
     """MLA-side door contract of `HybridLinearKVPool`: `set_mla_kv_buffer`
-    forwards `loc` untouched -- writes are kernel-facing since the ForwardBatch
+    forwards `loc` untouched -- writes are physical since the ForwardBatch
     rebind."""
 
     def _make_bare_pool(self):

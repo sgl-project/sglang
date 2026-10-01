@@ -1722,7 +1722,7 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
     ):
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
-        # entries are already swa-side kernel-facing ids, so the in-place
+        # entries are already swa-side physical ids, so the in-place
         # full->swa translate below must not run on top of them.
         translator = self.attn_backend.kv_index_translator
         use_swa_source = use_sliding_window_kv_pool and translator.reads_are_translated
@@ -2155,7 +2155,7 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         bs = len(seq_lens)
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
-        # entries are already swa-side kernel-facing ids, so the in-place
+        # entries are already swa-side physical ids, so the in-place
         # full->swa translate below must not run on top of them.
         translator = self.attn_backend.kv_index_translator
         use_swa_source = use_sliding_window_kv_pool and translator.reads_are_translated

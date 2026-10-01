@@ -1424,7 +1424,7 @@ def init_unified_mamba_pools(
     # Only HybridLinearKVPool's retraction CPU-copy path uses this hook.
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
     # No full-KV translate hook is wired: both MLA doors now receive
-    # KERNEL-FACING ids -- writes from the ForwardBatch rebind, reads
+    # PHYSICAL ids -- writes from the ForwardBatch rebind, reads
     # translated at their production sites.
 
     logger.info(
@@ -1668,7 +1668,7 @@ class UnifiedSWAKVPool(SWAKVPool):
                 layer_id_override=pool_layer_id,
             )
             return
-        # Full layer: `loc` is already the full-side kernel-facing id, so an
+        # Full layer: `loc` is already the full-side physical id, so an
         # explicit full_loc is a same-space alias -- only triton's captured path
         # passes one (its capture-stable buffer).
         if full_loc is None:
