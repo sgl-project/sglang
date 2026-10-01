@@ -48,6 +48,7 @@ class TestRocmHiSparseOptimizations(CustomTestCase):
                 "resolve_shared_index_layers",
                 "_build_prefetch_groups",
                 "_can_use_separate_copy",
+                "_can_use_batched_prefix",
             }
         ]
         module = ast.Module(
@@ -99,8 +100,10 @@ class TestRocmHiSparseOptimizations(CustomTestCase):
         self.cls = scope["HiSparseCoordinator"]
         self.resolve = scope["resolve_shared_index_layers"]
         self.can_use_separate_copy = scope["_can_use_separate_copy"]
+        self.can_use_batched_prefix = scope["_can_use_batched_prefix"]
 
     def plan(self, **kw):
+        self.last_plan_kwargs = kw
         self.events.append(("plan", kw["skip_io"]))
         kw["top_k_device_locs"].fill_(1)
         if "miss_count" in kw:
@@ -130,6 +133,7 @@ class TestRocmHiSparseOptimizations(CustomTestCase):
         self.aiter.return_value = aiter
         self.gfx95.return_value = gfx95
         c = self.cls()
+        c.enable_batched_prefix = False
         c.is_dsv4_hisparse = dsv4
         c.is_m3_hisparse = m3
         c._separate_copy = hip and aiter and gfx95 and not dsv4 and not m3
@@ -197,6 +201,42 @@ class TestRocmHiSparseOptimizations(CustomTestCase):
         self.run_layer(c, 0)
         self.assertEqual(self.events, [("plan", True), ("copy", False)])
         self.assertEqual(self.copy_blocks, [16])
+        self.assertFalse(c.skip_io)
+        torch.testing.assert_close(
+            c.mem_pool_device.kv_buffer[0, 1], c.mem_pool_host.kv_buffer[0, 2]
+        )
+
+    def test_batched_prefix_gate_requires_qualified_shape_and_hardware(self):
+        base = dict(
+            is_hip_backend=True,
+            use_aiter=True,
+            gfx95=True,
+            is_dsv4_hisparse=False,
+            swap_in_block_size=1024,
+            top_k=2048,
+            device_buffer_size=4096,
+        )
+        self.assertTrue(self.can_use_batched_prefix(**base))
+        for unsupported in (
+            dict(is_hip_backend=False),
+            dict(use_aiter=False),
+            dict(gfx95=False),
+            dict(is_dsv4_hisparse=True),
+            dict(swap_in_block_size=512),
+            dict(top_k=4096),
+            dict(device_buffer_size=8192),
+        ):
+            with self.subTest(**unsupported):
+                self.assertFalse(
+                    self.can_use_batched_prefix(**{**base, **unsupported})
+                )
+
+    def test_batched_prefix_keeps_real_copy_after_planning(self):
+        c = self.fixture(shared=None)
+        c.enable_batched_prefix = True
+        self.run_layer(c, 0)
+        self.assertTrue(self.last_plan_kwargs["batched_prefix"])
+        self.assertEqual(self.events, [("plan", True), ("copy", False)])
         self.assertFalse(c.skip_io)
         torch.testing.assert_close(
             c.mem_pool_device.kv_buffer[0, 1], c.mem_pool_host.kv_buffer[0, 2]

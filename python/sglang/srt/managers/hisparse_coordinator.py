@@ -93,6 +93,30 @@ def _can_use_separate_copy(
     )
 
 
+def _can_use_batched_prefix(
+    *,
+    is_hip_backend: bool,
+    use_aiter: bool,
+    gfx95: bool,
+    is_dsv4_hisparse: bool,
+    swap_in_block_size: int,
+    top_k: int,
+    device_buffer_size: int,
+) -> bool:
+    """Whether the gfx95 wave64 batched-prefix scan is qualified for this pool.
+
+    Unconditional on the qualified path: any disqualifying input falls back to
+    the unbatched per-request scan automatically, with no separate opt-in.
+    """
+    return (
+        is_hip_backend
+        and use_aiter
+        and gfx95
+        and not is_dsv4_hisparse
+        and (swap_in_block_size, top_k, device_buffer_size) == (1024, 2048, 4096)
+    )
+
+
 def resolve_shared_index_layers(
     *,
     hf_text_config,
@@ -256,6 +280,21 @@ class HiSparseCoordinator:
                 "HiSparse planned copies on ROCm gfx95 with AITER require real KV IO; "
                 "disable SGLANG_DEBUG_HISPARSE_SKIP_IO."
             )
+
+        # Batched prefixes are qualified only for the linear gfx95 metadata
+        # planner. The separate real copy still immediately follows planning.
+        # Unconditional on the qualified path: unsupported configurations
+        # (wrong hardware, AITER off, or a swap-in shape other than
+        # 1024/2048/4096) fall back to the unbatched scan automatically.
+        self.enable_batched_prefix = _can_use_batched_prefix(
+            is_hip_backend=_is_hip,
+            use_aiter=envs.SGLANG_USE_AITER.get(),
+            gfx95=is_gfx95_supported(),
+            is_dsv4_hisparse=self.is_dsv4_hisparse,
+            swap_in_block_size=self.swap_in_block_size,
+            top_k=self.top_k,
+            device_buffer_size=self.device_buffer_size,
+        )
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -1077,6 +1116,8 @@ class HiSparseCoordinator:
             else {}
         )
         skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io or separate_copy)
+        if self.enable_batched_prefix:
+            plan["batched_prefix"] = True
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
