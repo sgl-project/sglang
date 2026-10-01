@@ -17,6 +17,7 @@ from typing import Any
 import msgspec
 import torch
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.training_capture.admission import CaptureAdmission
 from sglang.srt.training_capture.catalog import (
     CaptureLease,
     CatalogConflict,
@@ -51,6 +52,7 @@ class CaptureReservation(msgspec.Struct, eq=False):
     context: RequestCaptureContext | None = None
     provenance: Provenance | None = None
     started: float = 0.0
+    queued_at: float = 0.0
 
 
 class CaptureStep(msgspec.Struct, frozen=True):
@@ -191,6 +193,7 @@ class CaptureCoordinator:
         self.disabled_reason = None
         self.closed = False
         self.rng = random.Random(config.sample_seed)
+        self.admission = CaptureAdmission(config.sample_ratio, config.adaptive)
         self.writer_thread = threading.Thread(
             target=self._writer_loop, name="training-snapshot-writer", daemon=True
         )
@@ -216,7 +219,41 @@ class CaptureCoordinator:
                 ),
                 "queued": self.work.qsize(),
                 "host_pool": self.pool.stats(),
+                "admission": self.admission.stats(
+                    time.monotonic(), disabled=self.disabled_reason is not None
+                ),
             }
+
+    def _admission_ratio(self):
+        with self.lock:
+            if self.admission.config is None:
+                return self.config.sample_ratio
+            now = time.monotonic()
+            busy = [
+                record
+                for record in self.records.values()
+                if record.state != "available"
+            ]
+            quarantined = self.pool.stats()["quarantined"]
+            writer_age = max(
+                (
+                    now - record.queued_at
+                    for record in busy
+                    if record.state in ("queued", "writing", "pending_publication")
+                ),
+                default=0.0,
+            )
+            return self.admission.observe(
+                now,
+                occupancy=min(
+                    1.0, (len(busy) + quarantined) / self.config.max_inflight_samples
+                ),
+                writer_age_seconds=max(0.0, writer_age),
+            )
+
+    def _admission_failure(self, reason):
+        with self.lock:
+            self.admission.failure(time.monotonic(), reason)
 
     def _reserve(self):
         slot = self.pool.acquire()
@@ -257,6 +294,7 @@ class CaptureCoordinator:
         except Exception:
             self.pool.release(slot, transfer_complete=True)
             self._count("admission_catalog_error")
+            self._admission_failure("catalog_error")
 
     def _lease_loop(self):
         while not self.stop.is_set():
@@ -289,11 +327,17 @@ class CaptureCoordinator:
                     except CatalogConflict:
                         record.invalid_reason = "capture_lease_rejected"
                         self._count("lease_rejected")
+                        self._admission_failure("lease_rejected")
                     except Exception:
                         record.renew_at = time.monotonic() + 1
                         self._count("lease_renew_error")
+                        self._admission_failure("catalog_error")
             if enabled:
-                self._reserve()
+                self._admission_ratio()
+                with self.lock:
+                    paused = time.monotonic() < self.admission.pause_until
+                if not paused:
+                    self._reserve()
             self.stop.wait(0.1)
 
     def _queue_record(self, record):
@@ -303,6 +347,7 @@ class CaptureCoordinator:
             if record.state == "available" and record in self.available:
                 self.available.remove(record)
             record.state = "queued"
+            record.queued_at = time.monotonic()
             self.work.put_nowait(record)
 
     def _detach(self, req, record):
@@ -323,8 +368,12 @@ class CaptureCoordinator:
         if self.disabled_reason:
             self._count("excluded_disabled")
             return
-        if self.rng.random() >= self.config.sample_ratio:
+        ratio = self._admission_ratio()
+        draw = self.rng.random()
+        if draw >= ratio:
             self._count("sampled_out")
+            if draw < self.config.sample_ratio:
+                self._count("adaptive_sampled_out")
             return
         if req.rid.startswith(HEALTH_CHECK_RID_PREFIX):
             self._count("excluded_health_check")
@@ -791,6 +840,7 @@ class CaptureCoordinator:
                     record.context and record.context.transfer_uncertain
                 )
                 self._count("writer_failed_" + type(error).__name__)
+                self._admission_failure("writer_error")
                 logger.warning(
                     "Training capture write failed: sample_id=%s error=%s",
                     record.lease.sample_id,

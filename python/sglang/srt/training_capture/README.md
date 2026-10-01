@@ -35,9 +35,10 @@ An example for an unquantized Qwen3-0.6B target with layers 0, 14 and 27:
 }
 ```
 
-Use `--disable-overlap-schedule` for the initial ordinary AR collector. The
-configuration is checked before weights load; unsupported TP/PP/DP, speculative,
-PD, mixed-chunk, LoRA, quantized or embedding execution is rejected. Model/pool
+Synchronous and normal overlap scheduling are supported for ordinary AR and
+static DSpark verification. The configuration is checked before weights load;
+unsupported TP/PP/DP, non-static or other speculative algorithms, PD, mixed-chunk,
+LoRA, quantized or embedding execution is rejected. Model/pool
 binding additionally requires a local safetensors target, local tokenizer
 artifacts, standard unscaled RoPE, full attention, and dense unquantized NHD
 BF16/FP16 KV. Initial codecs recognize Qwen3, Qwen2 and Llama implementations;
@@ -64,6 +65,52 @@ registered slot drops capture admission without delaying inference. A request
 abort/retract fails the entire attempt; no partial READY sample is published.
 Counters, Host slot states and the capture disable reason are exposed as
 `training_capture` in SGLang's existing internal-state response.
+
+### Adaptive Admission
+
+Fixed sampling remains the default. Add an `adaptive` object to the capture
+configuration to enable pressure feedback; `sample_ratio` remains the ceiling:
+
+```json
+{
+  "sample_ratio": 0.01,
+  "adaptive": {
+    "interval_seconds": 1.0,
+    "low_watermark": 0.25,
+    "high_watermark": 0.75,
+    "writer_stall_seconds": 10.0,
+    "cooldown_seconds": 5.0
+  }
+}
+```
+
+Occupancy counts active/queued/writing reservations and quarantined slots,
+divided by `max_inflight_samples`. Pre-reserved, available slots do not count as
+busy. At or above the high watermark, the target probability halves at most once
+per interval, down to 1% of the configured ceiling. At or below the low watermark,
+it recovers by 10% of the ceiling per interval. Between the watermarks it holds.
+All limits must be finite, time intervals must be positive, and watermarks must
+satisfy `0 <= low < high <= 1`.
+
+If the oldest queued/writing task exceeds `writer_stall_seconds`, new capture
+admission pauses. Catalog admission/heartbeat failures and writer failures also
+pause admission. Repeated faults or an ongoing stall extend the cooldown; they
+do not repeatedly reduce the ratio within the same adjustment interval. New
+Catalog reservations pause during cooldown, while existing lease renewals and
+writer work continue. Healthy recovery never exceeds the configured ratio;
+`sample_ratio=0` stays zero.
+
+The inference path reads local state only. In-flight samples retain their Host
+arenas and continue toward publication or fenced failure. Admission recovery
+cannot release an uncertain transfer or reuse a quarantined slot. Existing hard
+Host limits, unsupported-request exclusions and permanent disable reasons still
+apply.
+
+`training_capture.admission` exposes configured/target/effective ratios, the last
+control reason, cooldown remaining, observed occupancy/writer age, and decrease,
+recovery, failure and pause counters. `adaptive_sampled_out` counts requests that
+fixed sampling would have selected but the controller excluded. These are local
+pressure signals, not TTFT/TPOT measurements or a latency SLO guarantee.
 
 ## Ownership
 
@@ -156,7 +203,12 @@ pool. Separate Store readback must match K/V and saved logits exactly, include
 valid top-128 IDs, and match full-vocabulary LSE within 1e-5. The test verifies
 readback after producer exit, then runs the same requests on normal serving with
 decode CUDA graphs and compares every captured tensor. This currently covers
-graph replay at batch size one.
+ordinary and padded graph batches; current mode coverage is listed in the
+implementation status document. A final controlled-writer experiment enables
+adaptive admission with normal overlap: generation continues with a spare Host
+slot while new capture is paused, the original snapshot publishes after release,
+and a later request is captured after recovery. Both snapshots are read from the
+real Store and validated. This is a functional test, not a performance benchmark.
 
 A Transformers reference additionally checks teacher logits/LSE and reports KV
 errors. BF16 intermediate KV is sensitive to the target implementation; the

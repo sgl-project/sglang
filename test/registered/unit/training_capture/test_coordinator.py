@@ -1,16 +1,26 @@
 """Bounded admission, background publication and shutdown without CUDA."""
 
 import tempfile
+import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import msgspec
 import torch
+from sglang.srt.training_capture.admission import CaptureAdmission
 from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
-from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
+from sglang.srt.training_capture.config import (
+    AdaptiveCaptureConfig,
+    CaptureConfig,
+    StoreSetup,
+)
 from sglang.srt.training_capture.coordinator import CaptureCoordinator
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
-from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
+from sglang.srt.training_capture.mooncake_store import (
+    MooncakeSnapshotStore,
+    TransportError,
+)
 from sglang.srt.training_capture.teacher import capture_teacher
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -364,6 +374,108 @@ class TestCaptureCoordinator(CustomTestCase):
         self.assertIn(published[0]["manifest_key"], self.sdk.data)
         self.assertFalse(self.catalog.errors)
         self.wait_until(lambda: self.coordinator.stats()["counters"].get("ready") == 1)
+
+    def test_stalled_writer_pauses_admission_and_recovers_after_publication(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        self.coordinator.admission = CaptureAdmission(
+            1.0,
+            AdaptiveCaptureConfig(
+                interval_seconds=0.01, writer_stall_seconds=0.03, cooldown_seconds=0.03
+            ),
+        )
+        entered, release = threading.Event(), threading.Event()
+        original_write = self.coordinator.writer.write
+
+        def blocked_write(*args):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("test did not release writer")
+            return original_write(*args)
+
+        with patch.object(self.coordinator.writer, "write", side_effect=blocked_write):
+            try:
+                req = CaptureTestRequest("stalled", 1)
+                fixture = OverlapCaptureFixture(self.coordinator, req)
+                step = fixture.forward(2)
+                from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+
+                req.output_ids = [10]
+                req.finished_len = 1
+                req.finished_reason = FINISH_LENGTH(1)
+                self.coordinator.after_result(step)
+                self.assertTrue(entered.wait(2))
+                self.wait_until(lambda: self.coordinator._admission_ratio() == 0)
+                skipped = self.request("while-stalled")
+                self.coordinator.before_forward([skipped])
+                self.assertIsNone(skipped.training_capture_context)
+                self.assertEqual(fixture.record.state, "writing")
+                self.assertEqual(fixture.record.slot.state, "filling")
+                self.assertFalse(self.catalog.publications)
+                self.assertEqual(
+                    self.coordinator.stats()["admission"]["reason"], "writer_stall"
+                )
+            finally:
+                release.set()
+            manifest, tensors = read_snapshot(
+                self.store, self.catalog.wait_publications(1)[0]
+            )
+            self.assertEqual(manifest.sequence.response_length, 1)
+            self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10])
+            self.wait_until(lambda: self.coordinator._admission_ratio() == 1)
+            self.wait_until(lambda: len(self.coordinator.available) == 1)
+            following = self.request("after-drain")
+            self.coordinator.before_forward([following])
+            self.assertIsNotNone(following.training_capture_context)
+            self.assertEqual(self.coordinator.stats()["host_pool"]["quarantined"], 0)
+            self.assertGreater(self.coordinator.stats()["admission"]["recoveries"], 0)
+
+    def test_uncertain_write_keeps_quarantine_during_admission_recovery(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        self.coordinator.admission = CaptureAdmission(
+            1.0, AdaptiveCaptureConfig(interval_seconds=0.01, cooldown_seconds=0.05)
+        )
+        with patch.object(
+            self.coordinator.writer, "write", side_effect=TransportError("uncertain")
+        ):
+            fixture = VerifyCaptureFixture(self.coordinator, self.request("uncertain"))
+            result = fixture.accept(fixture.forward(), [[55, 0, 0, 0]], [1])
+            fixture.finish([10, 55], 2)
+            self.coordinator.after_result(result)
+            self.wait_until(lambda: fixture.record.state == "done")
+        self.assertEqual(self.coordinator.stats()["admission"]["failures"], 1)
+        self.assertFalse(self.catalog.publications)
+        self.wait_until(lambda: self.coordinator.pool.stats()["quarantined"] == 1)
+        self.coordinator._admission_ratio()
+        self.assertEqual(self.coordinator.stats()["admission"]["occupied_fraction"], 1)
+        for index in range(20):
+            request = self.request(f"after-error-{index}")
+            self.coordinator.before_forward([request])
+            self.assertIsNone(request.training_capture_context)
+        self.assertEqual(fixture.record.slot.state, "quarantined")
+
+    def test_catalog_failure_pauses_reservation_retry_then_recovers(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        self.coordinator.admission = CaptureAdmission(
+            1.0, AdaptiveCaptureConfig(interval_seconds=0.01, cooldown_seconds=0.2)
+        )
+        with patch.object(
+            self.coordinator.catalog, "begin", side_effect=ConnectionError("offline")
+        ):
+            record = self.coordinator.available[0]
+            record.invalid_reason = "test_recycle"
+            self.coordinator._queue_record(record)
+            self.wait_until(
+                lambda: self.coordinator.stats()["admission"]["failures"] > 0
+            )
+            current = self.coordinator.stats()
+            self.assertEqual(current["admission"]["effective_ratio"], 0)
+            self.assertEqual(current["admission"]["reason"], "catalog_error")
+            self.assertEqual(current["counters"].get("admitted", 0), 0)
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        self.wait_until(lambda: self.coordinator._admission_ratio() == 1)
+        req = self.request("catalog-restored")
+        self.coordinator.before_forward([req])
+        self.assertIsNotNone(req.training_capture_context)
 
     def test_expired_spare_is_removed_and_retraction_never_publishes(self):
         self.wait_until(lambda: len(self.coordinator.available) == 1)

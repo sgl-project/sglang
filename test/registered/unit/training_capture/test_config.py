@@ -128,11 +128,25 @@ class TestCaptureConfiguration(CustomTestCase):
             {"catalog_endpoint": "file:///tmp/catalog"},
             {"journal_directory": "relative/journal"},
             {"unknown_option": True},
+            {"adaptive": {"low_watermark": 0.8, "high_watermark": 0.5}},
+            {"adaptive": {"interval_seconds": 0}},
+            {"adaptive": {"writer_stall_seconds": -1}},
+            {"adaptive": {"cooldown_seconds": 0}},
+            {"adaptive": {"high_watermark": 2}},
+            {"adaptive": {"unknown_option": True}},
         ):
             with self.subTest(override=override):
                 self.path.write_text(json.dumps(self.config | override))
                 with self.assertRaises((ContractError, msgspec.ValidationError)):
                     CaptureConfig.load(str(self.path))
+
+    def test_adaptive_sampling_is_explicit_and_changes_config_identity(self):
+        baseline = CaptureConfig.load(str(self.path))
+        self.assertIsNone(baseline.adaptive)
+        self.path.write_text(json.dumps(self.config | {"adaptive": {}}))
+        adaptive = CaptureConfig.load(str(self.path))
+        self.assertEqual(adaptive.adaptive.writer_stall_seconds, 10.0)
+        self.assertNotEqual(baseline.fingerprint, adaptive.fingerprint)
 
 
 if __name__ == "__main__":

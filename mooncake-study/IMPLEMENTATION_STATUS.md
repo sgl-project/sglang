@@ -387,6 +387,64 @@ relaxed and no speculative numerical-kernel change was applied. The synthetic
 draft's forced proposals and shallow copied target layers are not trained-model
 quality evidence. Commands and scope are in [the experiment guide](experiments/README.md).
 
+Further numerical isolation, still without a BF16 fix:
+
+- `01790813884844574921-b20922f878c7`: the serving outputs are bit-identical
+  between one request at a time and the combined three-request batch on this
+  fixture. Batch shape on the serving side does not explain the current error.
+- `01790814042025040144-658501bff5d3`: same-input QKV, context-K and gate/up
+  projections, and the RoPE cosine/sine tables match exactly. HF versus serving
+  Q/K norm and RoPE outputs differ at BF16 rounding boundaries. Injecting the
+  reference's exact Q/K/V into the real paged-attention backend leaves maximum
+  attention-output differences of 0.0078125 in both layers versus SDPA. These
+  are diagnostic observations, not a passed backbone/logit gate.
+
+## Adaptive Capture Admission
+
+An optional `adaptive` capture-config object now enables local Host-pressure
+feedback. The configured `sample_ratio` is always the upper bound. High occupancy
+halves the target ratio at most once per interval; low occupancy restores it in
+10%-of-ceiling increments, with a hold region between thresholds. Active and
+writing reservations and quarantined slots count as occupied; available leases
+do not. A stalled queued/write task or Catalog/writer failure pauses admission
+until cooldown. Repeated faults extend that pause while existing lease renewals
+and writer work continue. New lease reservation retries respect the cooldown.
+
+The controller changes new-request admission only. It adds no inference-thread
+network operation or CUDA synchronization and cannot recycle uncertain buffers.
+Configured zero sampling and permanent capture-disable reasons remain effective.
+Internal-state metrics expose the target/effective ratio, control reason,
+observed occupancy, writer age, cooldown and adjustment counters. Default fixed
+sampling remains unchanged. Configuration and the exact policy are documented
+in [the producer guide](../python/sglang/srt/training_capture/README.md).
+
+Evidence on the resident H100:
+
+- `01790815223606883581-23f445232546`: 130 tests and 89 subtests passed in
+  27.23s. New tests cover interval limits, watermark hysteresis, zero sampling,
+  cooldown extension, ratio recovery, Catalog failure/retry, a blocked background
+  writer, and preservation of quarantine after an uncertain transport failure.
+  Existing capture, DSpark parity, graph and IPC regressions still pass.
+- `01790814750138717560-19563d4cd671`: the expanded real runtime test passed
+  in 333.124s. Its original 64 snapshots still pass, and the adaptive overlap
+  server adds two validated Mooncake snapshots. The first writer is deliberately
+  paused before Store I/O. With one spare Host slot still available, a second
+  generation completes with identical greedy output but is sampled out by the
+  controller. Releasing the writer publishes the original sample; the ratio
+  returns to 1.0 and the next request is captured. Final state reports two READY
+  samples, one adaptive exclusion, two available reservations, an empty queue
+  and zero quarantined slots. This tests a controlled writer stall with real
+  serving and Store transport, not an actual RDMA/network outage.
+
+New controller/helper files pass full Ruff; touched capture code/tests pass
+Ruff F/I and `git diff --check`. Pre-existing broad-catch/style diagnostics were
+left in place. The original worktree's staged diff hash is unchanged.
+
+This implements P10's initial automatic pressure limit and local observability.
+TTFT/TPOT-aware feedback, Prometheus/dashboard integration, capture-on/off SLO
+benchmarks and production rollout remain open. No production SpecForge Catalog,
+cross-node RDMA or trained-draft quality claim follows from this controller.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, real retraction, cache eviction,
@@ -397,7 +455,7 @@ quality evidence. Commands and scope are in [the experiment guide](experiments/R
 3. Complete P9's topology work: TP/PP, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.
-4. Complete P10's adaptive capture limits, metrics, capture-on/off SLO benchmarks
+4. Complete P10's latency-aware limits, exported metrics, capture-on/off SLO benchmarks
    and rollout/rollback checks. Per-model numerical/runtime validation and
    runtime identity coverage also need expansion beyond the tested combination.
 5. Integrate with the SpecForge-owned production Catalog and consumer when

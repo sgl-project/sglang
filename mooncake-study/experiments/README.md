@@ -90,6 +90,14 @@ fenced Catalog failure and reservation recycling, and rejects quarantined slots.
 The fixture's forced proposal weights are not a trained draft. This extends the
 same command above; allow 900 seconds and retain the job log for evidence.
 
+The command also starts an ordinary overlap server with adaptive admission
+enabled. Its test-only entrypoint holds the first background write using a file
+beside the publication journal. While a spare Host slot remains available, a
+second generation request completes and is excluded from capture by the stalled
+writer's cooldown. Removing the pause lets the original snapshot publish; after
+ratio recovery, a later request produces another validated Store snapshot. This
+exercise adds two completed snapshots and does not measure a latency SLO.
+
 Focused regressions:
 
 ```bash

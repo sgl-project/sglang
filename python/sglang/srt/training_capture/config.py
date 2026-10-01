@@ -30,6 +30,24 @@ class StoreSetup(StrictStruct):
     rdma_devices: str = ""
 
 
+class AdaptiveCaptureConfig(StrictStruct):
+    interval_seconds: Annotated[float, msgspec.Meta(gt=0)] = 1.0
+    low_watermark: Annotated[float, msgspec.Meta(ge=0, lt=1)] = 0.25
+    high_watermark: Annotated[float, msgspec.Meta(gt=0, le=1)] = 0.75
+    writer_stall_seconds: Annotated[float, msgspec.Meta(gt=0)] = 10.0
+    cooldown_seconds: Annotated[float, msgspec.Meta(gt=0)] = 5.0
+
+    def validate(self):
+        if not all(
+            math.isfinite(value) for value in msgspec.to_builtins(self).values()
+        ):
+            raise ContractError("adaptive capture limits must be finite")
+        if self.low_watermark >= self.high_watermark:
+            raise ContractError(
+                "adaptive capture requires low_watermark < high_watermark"
+            )
+
+
 class CaptureConfig(StrictStruct):
     dataset_id: Identifier
     model_id: Text
@@ -44,6 +62,7 @@ class CaptureConfig(StrictStruct):
     catalog_token_env: str | None = None
     sample_ratio: Annotated[float, msgspec.Meta(ge=0, le=1)] = 0.01
     sample_seed: int = 0
+    adaptive: AdaptiveCaptureConfig | None = None
     max_sample_tokens: Annotated[int, msgspec.Meta(ge=2, le=2147483647)] = 8192
     max_inflight_samples: Positive = 4
     max_host_bytes: Positive = 512 << 20
@@ -79,6 +98,8 @@ class CaptureConfig(StrictStruct):
             raise ContractError("capture requires a Catalog HTTP endpoint")
         if not Path(config.journal_directory).is_absolute():
             raise ContractError("capture journal directory must be absolute")
+        if config.adaptive is not None:
+            config.adaptive.validate()
         return config
 
     @property

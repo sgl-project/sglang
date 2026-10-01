@@ -346,6 +346,13 @@ class TestTrainingCaptureRuntime(CustomTestCase):
                 enable_overlap=True,
             )
         self.check_reference(samples)
+        from sglang.test.training_capture_admission_runtime import (
+            exercise_adaptive_capture,
+        )
+
+        exercise_adaptive_capture(
+            self, model_path=self.model_path, directory=self.temporary.name
+        )
 
     def check_graph_replay(self, samples):
         type(self).url = f"http://127.0.0.1:{free_port()}"
