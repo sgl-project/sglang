@@ -85,6 +85,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_lora,
     get_parallel,
     get_serving,
@@ -423,20 +424,26 @@ class TokenizerControlMixin:
             raise RuntimeError(result.message)
         return result
 
-    async def start_expert_distribution_record(self: TokenizerManager):
+    async def _expert_distribution_record(
+        self: TokenizerManager, action: ExpertDistributionReqType
+    ):
+        if get_exec().moe.expert_distribution_recorder_mode is None:
+            raise ValueError(
+                "Expert distribution recording is not enabled. Start the server with "
+                "--expert-distribution-recorder-mode to use this operation."
+            )
         self.auto_create_handle_loop()
-        req = ExpertDistributionReq(action=ExpertDistributionReqType.START_RECORD)
+        req = ExpertDistributionReq(action=action)
         await self.expert_distribution_communicator(req)
+
+    async def start_expert_distribution_record(self: TokenizerManager):
+        await self._expert_distribution_record(ExpertDistributionReqType.START_RECORD)
 
     async def stop_expert_distribution_record(self: TokenizerManager):
-        self.auto_create_handle_loop()
-        req = ExpertDistributionReq(action=ExpertDistributionReqType.STOP_RECORD)
-        await self.expert_distribution_communicator(req)
+        await self._expert_distribution_record(ExpertDistributionReqType.STOP_RECORD)
 
     async def dump_expert_distribution_record(self: TokenizerManager):
-        self.auto_create_handle_loop()
-        req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
-        await self.expert_distribution_communicator(req)
+        await self._expert_distribution_record(ExpertDistributionReqType.DUMP_RECORD)
 
     async def init_weights_update_group(
         self: TokenizerManager,
