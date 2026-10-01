@@ -1,5 +1,6 @@
 """ROCm coverage for the 512-expert softmax router on aiter `topk_gating`."""
 
+import itertools
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +14,8 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 HIDDEN_SIZE = 8192
+# Qwen3.8 and Qwen3.8-Flash-Next.
+HIDDEN_SIZES = (8192, 2560)
 NUM_EXPERTS = 512
 TOPK = 10
 
@@ -48,11 +51,11 @@ class TestQwen38MoeSoftmaxTopKGating(CustomTestCase):
     def test_topk_gating_matches_legacy_launcher(self):
         from aiter.fused_moe import fused_topk as aiter_fused_topk
 
-        for num_tokens in (4, 128, 1024):
-            with self.subTest(num_tokens=num_tokens):
+        for hidden_size, num_tokens in itertools.product(HIDDEN_SIZES, (4, 128, 1024)):
+            with self.subTest(hidden_size=hidden_size, num_tokens=num_tokens):
                 torch.manual_seed(num_tokens)
                 hidden_states = torch.randn(
-                    num_tokens, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+                    num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
                 )
                 router_logits = torch.randn(
                     num_tokens, NUM_EXPERTS, device="cuda", dtype=torch.bfloat16
@@ -121,6 +124,7 @@ class TestQwen38MoeSoftmaxTopKGating(CustomTestCase):
             patch.object(topk_module, "_is_gfx95", True),
         ):
             self.assertTrue(_envelope(logits))
+            self.assertTrue(_envelope(logits, hidden_size=2560))
             self.assertFalse(
                 _envelope(
                     torch.empty(

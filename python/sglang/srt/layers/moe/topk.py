@@ -207,12 +207,13 @@ def _use_aiter_topk_gating_softmax(
     packed_out: Optional[torch.Tensor],
 ) -> bool:
     # fused_topk has no ASM router for (512, 10); topk_gating has an E=512
-    # kernel since aiter#5334. Hidden size 8192 limits this to Qwen3.8.
+    # kernel since aiter#5334. Hidden sizes 8192 (Qwen3.8) and 2560
+    # (Qwen3.8-Flash-Next) limit this to those two models.
     return (
         _use_aiter
         and _use_aiter_topk_gating
         and _is_gfx95
-        and hidden_states.shape[1] == 8192
+        and hidden_states.shape[1] in (2560, 8192)
         and hidden_states.dtype == torch.bfloat16
         and gating_output.shape[1] == 512
         and gating_output.dtype == torch.bfloat16
