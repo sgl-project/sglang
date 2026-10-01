@@ -1,12 +1,15 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import (
     _send_disaggregation_warmup_requests,
+    launch_server,
 )
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -82,6 +85,46 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["json"]["bootstrap_host"], FAKE_BOOTSTRAP_HOST)
             self.assertEqual(kwargs["json"]["bootstrap_room"], dp_rank)
             self.assertFalse(kwargs["ssl"])
+
+
+class TestRustServerSidecarLifecycle(unittest.TestCase):
+    def test_one_sidecar_wraps_the_top_level_rust_launch(self):
+        events = []
+        sidecar = MagicMock()
+        sidecar.stop.side_effect = lambda: events.append("stop")
+        scheduler_init_result = MagicMock()
+        scheduler_init_result.block_until_scheduler_exits.side_effect = lambda: (
+            events.append("block")
+        )
+
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            get_context().override_server_args(
+                grpc_port=30001,
+                sidecar="dynamo.sglang.sidecar",
+                skip_server_warmup=True,
+            ),
+            patch(
+                "sglang.srt.entrypoints.http_server.Engine._launch_subprocesses",
+                return_value=(
+                    None,
+                    None,
+                    None,
+                    scheduler_init_result,
+                    None,
+                    None,
+                ),
+            ),
+            patch(
+                "sglang.srt.entrypoints.sidecar.start_sidecar",
+                side_effect=lambda: (events.append("start"), sidecar)[1],
+            ) as start_sidecar,
+        ):
+            launch_server(SimpleNamespace())
+
+        start_sidecar.assert_called_once_with()
+        sidecar.stop.assert_called_once_with()
+        self.assertEqual(events, ["start", "block", "stop"])
 
 
 if __name__ == "__main__":

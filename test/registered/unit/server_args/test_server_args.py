@@ -3492,14 +3492,6 @@ class TestGrpcServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             handle_deprecated_args(sa)
 
-    def test_sidecar_rejects_rust_server_lifecycle(self):
-        sa = self._args(sidecar="example.sidecar", grpc_port=50051)
-        with (
-            envs.SGLANG_RUST_SERVER.override(True),
-            self.assertRaisesRegex(ValueError, "does not run the Python sidecar"),
-        ):
-            handle_deprecated_args(sa)
-
     def test_sidecar_sets_endpoint_env_before_import_and_calls_main(self):
         main = MagicMock()
 
