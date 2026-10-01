@@ -207,7 +207,12 @@ class SamplingBatchInfo:
         from sglang.srt.managers.schedule_batch import ScheduleBatch
 
         features = get_exec().features
-        # Only scheduler-built batches carry watermark policy; stand-ins skip it.
+        if not isinstance(batch, ScheduleBatch) and (
+            features.watermark_default_enabled or features.watermark_enforce_all
+        ):
+            raise RuntimeError(
+                "default-enabled watermark policy requires a ScheduleBatch"
+            )
         if isinstance(batch, ScheduleBatch) and features.enable_watermark:
             watermark_config = build_watermark_batch_config(
                 reqs,

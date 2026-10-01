@@ -570,19 +570,25 @@ def handle_other_validations(server_args: Any):
                     )
 
     # Validate preferred_sampling_params
-    if cfg.preferred_sampling_params:
-        if isinstance(cfg.preferred_sampling_params, str):
+    preferred_sampling_params = cfg.preferred_sampling_params
+    if preferred_sampling_params:
+        if isinstance(preferred_sampling_params, str):
+            preferred_sampling_params = json.loads(preferred_sampling_params)
             declare_resolution(
                 server_args,
                 "_handle_other_validations",
-                preferred_sampling_params=json.loads(cfg.preferred_sampling_params),
+                preferred_sampling_params=preferred_sampling_params,
+            )
+        if "watermark" in preferred_sampling_params:
+            raise ValueError(
+                "watermark is not supported in --preferred-sampling-params"
             )
 
         # Validate preferred_sampling_params doesn't use tokenizer-dependent features
         if cfg.skip_tokenizer_init:
             from sglang.srt.sampling.sampling_params import SamplingParams
 
-            test_params = SamplingParams(**cfg.preferred_sampling_params)
+            test_params = SamplingParams(**preferred_sampling_params)
             # raises if tokenizer-dependent features used
             test_params.normalize(None)
 

@@ -180,7 +180,7 @@ A detector holding both keys splits the distinct contexts by the coin, scores ea
 
 `WatermarkDetector` implements the [detection rules](#detection) above. Construct it with the same key, key B, mixing probability, and context window that generation used:
 
-A minimal [reference detection server](https://github.com/sgl-project/sglang/tree/main/examples/watermark) exposes the in-tree detector over HTTP and reads keys only from its environment.
+A minimal [reference detection server](https://github.com/sgl-project/sglang/tree/main/examples/watermark) exposes the in-tree detector over HTTP and reads keys only from `--watermark-config`.
 
 ```python
 WatermarkDetector(
@@ -324,7 +324,7 @@ A detector written from scratch instead of reusing this package must implement t
 | JSON schema and regex grammars | Verified | Grammar masking runs before watermark selection; strict outputs remain valid and detectable. |
 | Streaming chat completions | Verified | Streaming and non-streaming requests use the same watermark state and token selection. |
 | Parallel sampling (`n > 1`) | Verified | Each generated choice owns independent request state and history. |
-| Output log probabilities | Verified | Ordinary decode reports the effective distribution after forcing at watermarked positions; unforced positions retain ordinary log probabilities. Speculative decode reports the pre-watermark target distribution. |
+| Output log probabilities | Verified | Ordinary and speculative decode report the pre-watermark target distribution. Logits are cloned only for requests that ask for log probabilities. |
 | Top-k, top-p, and min-p | Verified | The selector reproduces SGLang's combined truncation support before keyed selection. |
 | Maximum-probability gate | Verified | Positions above `max_probability` use ordinary sampling and do not consume the repeated-context budget. |
 | Logit bias and frequency, presence, and repetition penalties | Verified | These transforms run before watermark selection. |
@@ -359,6 +359,8 @@ In speculative decoding, verification clones the target logits before forcing, s
 - A request watermarks at most `min(4,096, per-request token-pool capacity)` distinct contexts; later tokens use ordinary sampling.
 - The hashes are MurmurHash3, a keyed but non-cryptographic mix. There is no indistinguishability or unforgeability guarantee, and anyone holding the key can both detect and forge the watermark.
 - Speculative decoding can accept fewer draft tokens when a draft proposal does not match the watermarked target token. The impact depends on tree width and workload.
+- Mixed batches choose the selector path from the batch-wide maximum top-k. A transient unlimited-top-k request can keep that batch on the full-sort path until its sampling metadata is rebuilt.
+- Retraction reconstructs a conservative distinct-context history. Repeated retractions can reduce later signal and add scheduler-side replay work.
 
 On one single-GPU node of each type with public `Qwen/Qwen3-8B`, TP1, TRT-LLM MHA, ordinary decoding, temperature 1.0, top-p 0.95, unlimited top-k, and 800-token sampled outputs, the fused selector measured the following mean output throughput over three repetitions per cell:
 

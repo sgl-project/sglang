@@ -3343,7 +3343,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ),
                     "resolved_config": self._dump_config_snapshot(),
                     "requests": redact_watermark_secrets(data_to_dump),
-                    "launch_command": redact_watermark_command_line(sys.argv),
+                    "launch_command": redact_watermark_command_line(
+                        sys.argv, self.server_args.watermark_config
+                    ),
                 }
                 with open(filename, "wb") as f:
                     try:

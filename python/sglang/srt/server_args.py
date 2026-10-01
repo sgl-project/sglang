@@ -647,7 +647,9 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # lazy: watermark imports torch, outside server_args' top-level boundary.
     from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
 
-    server_args._launch_command = redact_watermark_command_line(argv)
+    server_args._launch_command = redact_watermark_command_line(
+        argv, raw_args.watermark_config
+    )
     return server_args
 
 

@@ -5,6 +5,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logprob_processor import OutputLogprobProcessor
+from sglang.srt.layers.sampler import Sampler
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.core import (
@@ -199,7 +203,12 @@ def test_watermark_rows_track_filter_and_merge():
 def test_idle_batch_max_top_k_is_merge_identity():
     exec_context = SimpleNamespace(
         deterministic=SimpleNamespace(enable_deterministic_inference=False),
-        features=SimpleNamespace(enable_custom_logit_processor=False),
+        features=SimpleNamespace(
+            enable_custom_logit_processor=False,
+            enable_watermark=False,
+            watermark_default_enabled=False,
+            watermark_enforce_all=False,
+        ),
     )
     with patch(
         "sglang.srt.sampling.sampling_batch_info.get_exec", return_value=exec_context
@@ -207,6 +216,83 @@ def test_idle_batch_max_top_k_is_merge_identity():
         info = SamplingBatchInfo.from_schedule_batch(Mock(reqs=[], device="cpu"), 32)
     assert len(info) == 0
     assert info.max_top_k == 1
+
+
+def test_default_watermark_policy_requires_schedule_batch():
+    exec_context = SimpleNamespace(
+        deterministic=SimpleNamespace(enable_deterministic_inference=False),
+        features=SimpleNamespace(
+            enable_custom_logit_processor=False,
+            enable_watermark=True,
+            watermark_default_enabled=True,
+            watermark_enforce_all=False,
+        ),
+    )
+    with (
+        patch(
+            "sglang.srt.sampling.sampling_batch_info.get_exec",
+            return_value=exec_context,
+        ),
+        pytest.raises(RuntimeError, match="requires a ScheduleBatch"),
+    ):
+        SamplingBatchInfo.from_schedule_batch(Mock(reqs=[], device="cpu"), 32)
+
+
+def test_watermark_logprobs_use_pre_force_distribution():
+    sampling_info = _sampling_info(
+        1,
+        watermark_candidates_host=[True],
+        has_watermark_candidates=True,
+    )
+    sampling_info.top_ks = torch.tensor([2], dtype=torch.int32)
+    sampling_info.max_top_k = 2
+    sampling_info.update_regex_vocab_mask = Mock()
+    sampling_info.apply_logits_bias = Mock()
+
+    sampler = object.__new__(Sampler)
+    torch.nn.Module.__init__(sampler)
+    sampler.rl_on_policy_target = None
+    sampler.enable_deterministic = False
+    sampler.use_log_softmax_logprob = False
+    sampler.use_ascend_backend = False
+    sampler.sampling_mask_max_tokens = 4096
+    sampler.output_logprob_processor = OutputLogprobProcessor()
+
+    runner = object.__new__(ModelRunner)
+    runner._sampling_observer = None
+    runner.sampler = sampler
+    runner.ngram_embedding_manager = Mock()
+    runner.watermark_state = Mock()
+
+    def force_selected_token(logits, *_):
+        logits.fill_(-torch.inf)
+        logits[:, 1] = 0
+
+    runner.watermark_state.force.side_effect = force_selected_token
+    logits_output = LogitsProcessorOutput(
+        next_token_logits=torch.tensor([[3.0, 1.0, -2.0]])
+    )
+    forward_batch = SimpleNamespace(
+        sampling_info=sampling_info,
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        watermark_prompt_tail_ids=[[]],
+        watermark_context_hash_history=[[]],
+        return_logprob=True,
+        top_logprobs_nums=[2],
+        token_ids_logprobs=[[]],
+        positions=torch.tensor([0], dtype=torch.int64),
+        seq_lens=torch.tensor([1], dtype=torch.int64),
+        forward_mode=SimpleNamespace(is_decode=lambda: True),
+    )
+
+    next_token_ids = runner.sample(logits_output, forward_batch)
+
+    expected = torch.log_softmax(torch.tensor([3.0, 1.0, -2.0]), dim=-1)
+    assert next_token_ids.tolist() == [1]
+    torch.testing.assert_close(logits_output.next_token_logprobs, expected[1:2])
+    assert [row.tolist() for row in logits_output.next_token_top_logprobs_idx] == [
+        [0, 1]
+    ]
 
 
 def test_disabled_speculative_batch_skips_watermark_state():

@@ -103,13 +103,23 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
     return value
 
 
-def redact_watermark_command_line(argv: Sequence[str]) -> str:
+def redact_watermark_command_line(
+    argv: Sequence[str], watermark_config: Optional[str] = None
+) -> str:
     result = []
     redact_next = False
     for argument in argv:
         if redact_next:
             result.append("<redacted>")
             redact_next = False
+        elif watermark_config is not None and argument == watermark_config:
+            result.append("<redacted>")
+        elif (
+            watermark_config is not None
+            and "=" in argument
+            and argument.split("=", 1)[1] == watermark_config
+        ):
+            result.append(f"{argument.split('=', 1)[0]}=<redacted>")
         elif argument == "--watermark-config":
             result.append(argument)
             redact_next = True

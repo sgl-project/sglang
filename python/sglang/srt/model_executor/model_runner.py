@@ -2040,6 +2040,11 @@ class ModelRunner:
             watermark_state is not None
             and forward_batch.sampling_info.has_watermark_candidates
         ):
+            logprob_logits = (
+                logits_output.next_token_logits.clone()
+                if forward_batch.return_logprob
+                else None
+            )
             req_pool_indices = forward_batch.req_pool_indices[
                 : logits_output.next_token_logits.shape[0]
             ]
@@ -2053,6 +2058,8 @@ class ModelRunner:
                 req_pool_indices,
                 forward_batch.sampling_info,
             )
+        else:
+            logprob_logits = None
 
         # Sample the next tokens
         next_token_ids = self.sampler(
@@ -2067,6 +2074,7 @@ class ModelRunner:
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
+            logprob_logits=logprob_logits,
         )
         if observer_state is not None:
             logits_output.auxiliary_device_output = observer.after_sample(

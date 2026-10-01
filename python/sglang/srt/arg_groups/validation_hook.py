@@ -19,6 +19,10 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
+from sglang.srt.sampling.watermarking.config import (
+    MAX_WATERMARK_CONTEXT_WINDOW,
+    parse_watermark_key,
+)
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
@@ -37,6 +41,16 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError(
             f"--enable-watermark requires --device cuda, got {cfg.device!r}"
         )
+    if cfg.watermark_key is not None:
+        parse_watermark_key(cfg.watermark_key)
+    if cfg.watermark_key_b is not None:
+        parse_watermark_key(cfg.watermark_key_b)
+    if (
+        isinstance(cfg.watermark_context_window, bool)
+        or not isinstance(cfg.watermark_context_window, int)
+        or not 1 <= cfg.watermark_context_window <= MAX_WATERMARK_CONTEXT_WINDOW
+    ):
+        raise ValueError("watermark context_window must be an integer from 1 to 64")
     if cfg.watermark_key_b is not None and cfg.watermark_key is None:
         raise ValueError("watermark key_b requires a server key")
     if not 0 < cfg.watermark_mixing_probability < 1:

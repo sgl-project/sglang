@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.serving_hook import handle_other_validations
 from sglang.srt.arg_groups.validation_hook import check_watermark_server_args
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.tokenizer_manager import (
@@ -324,17 +325,58 @@ def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):
     assert secret_b not in command
     assert "/run/secrets/watermark.json" not in command
 
+    for option in ("--watermark-conf", "--watermark-c", "--watermark"):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--enable-watermark",
+                option,
+                inline_config,
+            ]
+        )
+        assert secret not in server_args.launch_command
+        assert secret_b not in server_args.launch_command
+
     server_args = prepare_server_args(
         [
             "--model-path",
             "dummy",
             "--enable-watermark",
-            "--watermark-config",
-            inline_config,
+            f"--watermark-conf={inline_config}",
         ]
     )
     assert secret not in server_args.launch_command
     assert secret_b not in server_args.launch_command
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("watermark_key", "not-hex", "only hex digits"),
+        ("watermark_key_b", "not-hex", "only hex digits"),
+        ("watermark_context_window", 0, "integer from 1 to 64"),
+        ("watermark_context_window", 65, "integer from 1 to 64"),
+    ],
+)
+def test_direct_server_args_validate_watermark_fields(field, value, match):
+    fields = {"watermark_key": _KEY, field: value}
+    server_args = ServerArgs(
+        model_path="dummy", device="cuda", enable_watermark=True, **fields
+    )
+    with pytest.raises(ValueError, match=match):
+        check_watermark_server_args(server_args)
+
+
+def test_preferred_sampling_params_reject_watermark():
+    server_args = ServerArgs(
+        model_path="dummy",
+        preferred_sampling_params=json.dumps(
+            {"temperature": 0.8, "watermark": {"enabled": False}}
+        ),
+    )
+    with pytest.raises(ValueError, match="not supported"):
+        handle_other_validations(server_args)
 
 
 def test_config_file_security_guards(tmp_path, caplog):
