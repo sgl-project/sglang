@@ -1,6 +1,8 @@
 """Position and lifetime invariants for request-owned capture ledgers."""
 
+import threading
 import unittest
+from unittest.mock import patch
 
 import torch
 from sglang.srt.training_capture.context import RequestCaptureContext
@@ -8,6 +10,7 @@ from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.protocol import ContractError, validate_tensors
 from sglang.srt.training_capture.teacher import capture_teacher
+from sglang.srt.training_capture.topology import plan_capture_layout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.training_capture_utils import Registrar, make_snapshot
@@ -112,6 +115,85 @@ class TestCaptureContext(CustomTestCase):
         self.context.abort("request_retracted")
         with self.assertRaises(ContractError):
             self.snapshot()
+
+    def test_cancellation_after_seal_prevents_later_snapshot_preparation(self):
+        """Sealed data still awaits publication and must remain cancellable."""
+        self.context.export_kv(self.exporter, torch.tensor([1, 3]), end=2)
+        self.context.record_teacher(self.rows, row=0, position=2)
+        self.context.commit_token(position=2, token_id=5)
+        self.context.seal("length")
+        self.context.abort("peer_failed")
+        with self.assertRaises(ContractError):
+            self.snapshot()
+
+    def test_cancel_during_copy_wait_never_returns_prepared_descriptors(self):
+        """A writer already waiting for copies must observe a concurrent cancel."""
+        for partitioned in (False, True):
+            with self.subTest(partitioned=partitioned):
+                partition = (
+                    plan_capture_layout(
+                        self.manifest.kv, tp_size=1, pp_layer_ranges=[(0, 4)]
+                    ).partitions[0]
+                    if partitioned
+                    else None
+                )
+                context = RequestCaptureContext(
+                    slot=self.slot,
+                    prompt_ids=(3, 4),
+                    max_tokens=8,
+                    vocab_size=256,
+                    partition=partition,
+                )
+                context.export_kv(self.exporter, torch.tensor([1, 3]), end=2)
+                context.record_teacher(self.rows, row=0, position=2)
+                context.commit_token(position=2, token_id=5)
+                context.seal("length")
+                waiting, release = threading.Event(), threading.Event()
+                returned, errors = [], []
+
+                def wait_for_copies(waiting=waiting, release=release):
+                    waiting.set()
+                    if not release.wait(timeout=5):
+                        raise TimeoutError("test did not release the copy wait")
+
+                def prepare(
+                    context=context,
+                    returned=returned,
+                    errors=errors,
+                    partitioned=partitioned,
+                ):
+                    try:
+                        method = (
+                            context.prepare_partition
+                            if partitioned
+                            else context.snapshot
+                        )
+                        returned.append(
+                            method(
+                                dataset_id=self.manifest.dataset_id,
+                                sample_id=self.manifest.sample_id,
+                                generation_id=self.manifest.generation_id,
+                                teacher=self.manifest.teacher,
+                                kv=self.manifest.kv,
+                                provenance=self.manifest.provenance,
+                            )
+                        )
+                    except (ContractError, TimeoutError) as error:
+                        errors.append(error)
+
+                with patch.object(context, "wait_for_copies", wait_for_copies):
+                    worker = threading.Thread(target=prepare, daemon=True)
+                    worker.start()
+                    try:
+                        self.assertTrue(waiting.wait(timeout=5))
+                        context.abort("peer_failed")
+                    finally:
+                        release.set()
+                        worker.join(timeout=5)
+                    self.assertFalse(worker.is_alive())
+                self.assertEqual(len(returned), 0)
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], ContractError)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timezone
 
 import msgspec
@@ -48,6 +49,7 @@ class SnapshotMetadata(msgspec.Struct, frozen=True, kw_only=True):
 class PreparedSnapshotPartition(msgspec.Struct, frozen=True, kw_only=True):
     owner_id: Identifier
     metadata_sha256: Digest
+    token_ids_sha256: Digest
     valid_kv_tokens: int
     objects: tuple[TensorDescriptor, ...]
 
@@ -82,6 +84,7 @@ def prepare_snapshot_partition(
     *,
     valid_kv_tokens: int,
     partition: CapturePartition,
+    token_ids: Sequence[int] | None = None,
 ) -> tuple[PreparedSnapshotPartition, dict[str, torch.Tensor]]:
     """Describe only owner-local completed Host views, without copying payloads."""
     sequence, kv = metadata.sequence, metadata.kv
@@ -95,6 +98,28 @@ def prepare_snapshot_partition(
     n, r = sequence.total_length, sequence.response_length
     if valid_kv_tokens not in (n - 1, n):
         raise ContractError("only the final token may lack KV")
+    if token_ids is None:
+        if not partition.include_aux:
+            raise ContractError(
+                "KV-only owners must provide their committed token ledger"
+            )
+        tokens = buffers["token_ids"][:n]
+    else:
+        if len(token_ids) != n or any(
+            type(token) is not int or not 0 <= token < metadata.teacher.vocab_size
+            for token in token_ids
+        ):
+            raise ContractError("committed tokens differ from the sequence contract")
+        tokens = torch.tensor(token_ids, dtype=torch.int32)
+    if tokens.dtype != torch.int32 or tuple(tokens.shape) != (n,):
+        raise ContractError(
+            "token ledger requires exactly one int32 value per position"
+        )
+    token_digest = digest_bytes(tensor_bytes(tokens))
+    if partition.include_aux and token_digest != digest_bytes(
+        tensor_bytes(buffers["token_ids"][:n])
+    ):
+        raise ContractError("aux token payload differs from the committed token ledger")
     prefix = f"draft-data/{metadata.dataset_id}/{metadata.sample_id}/{metadata.generation_id}/"
     objects = []
     tensors = {}
@@ -147,6 +172,7 @@ def prepare_snapshot_partition(
         PreparedSnapshotPartition(
             owner_id=partition.owner_id,
             metadata_sha256=digest_bytes(canonical_bytes(metadata)),
+            token_ids_sha256=token_digest,
             valid_kv_tokens=valid_kv_tokens,
             objects=tuple(objects),
         ),
@@ -170,7 +196,7 @@ def assemble_snapshot(
     ):
         raise ContractError("snapshot topology differs from the ownership plan")
     fingerprint = digest_bytes(canonical_bytes(metadata))
-    seen, validity, objects = set(), set(), []
+    seen, validity, token_digests, objects = set(), set(), set(), []
     for prepared in partitions:
         if (
             prepared.owner_id in seen
@@ -190,9 +216,15 @@ def assemble_snapshot(
                 raise ContractError("object differs from canonical owner head ranges")
         seen.add(prepared.owner_id)
         validity.add(prepared.valid_kv_tokens)
+        token_digests.add(prepared.token_ids_sha256)
         objects.extend(prepared.objects)
     if seen != set(topology.owners) or len(validity) != 1:
         raise ContractError("incomplete owners or inconsistent KV validity")
+    aux_token_digests = {
+        obj.sha256 for obj in objects if obj.kind == "aux" and obj.name == "token_ids"
+    }
+    if len(token_digests) != 1 or token_digests != aux_token_digests:
+        raise ContractError("owners disagree on the committed token sequence")
     manifest = Manifest(
         dataset_id=metadata.dataset_id,
         sample_id=metadata.sample_id,

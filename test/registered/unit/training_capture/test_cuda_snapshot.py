@@ -7,7 +7,6 @@ import torch
 from sglang.srt.training_capture.context import RequestCaptureContext
 from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
-from sglang.srt.training_capture.kv_staging import KVStaging
 from sglang.srt.training_capture.protocol import CaptureError, ContractError
 from sglang.srt.training_capture.teacher import capture_teacher
 from sglang.srt.training_capture.topology import plan_capture_layout
@@ -48,23 +47,31 @@ class TestCudaSnapshot(CustomTestCase):
         indices = torch.tensor([7, 1, 15, 3, 8], device="cuda", dtype=torch.int32)
         expected = {name: source[indices].cpu() for name, source in sources.items()}
         exporter = SelectedLayerKVExporter(kv, sources, partition=partition)
-        staging = KVStaging(slot.device_tensors, slot.tensors)
-        stream, event = torch.cuda.Stream(), torch.cuda.Event()
+        context = RequestCaptureContext(
+            slot=slot,
+            prompt_ids=(3, 4),
+            max_tokens=8,
+            vocab_size=256,
+            partition=partition,
+        )
+        stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         try:
             with torch.cuda.stream(stream):
                 for position in range(5):
-                    staging.export(
+                    context.export_kv(
                         exporter,
                         indices[position : position + 1],
-                        start=position,
                         end=position + 1,
                     )
+                    if position >= 1:
+                        context.commit_token(
+                            position=position + 1, token_id=position + 9
+                        )
                     for source in sources.values():
                         source[indices[position]] = 77
-                staging.flush()
-                event.record(stream)
-            event.synchronize()
+            context.seal("length")
+            context.wait_for_copies()
             self.assertEqual(set(slot.tensors), set(sources))
             self.assertEqual(slot.manifest_buffer.numel(), 0)
             for name, reference in expected.items():

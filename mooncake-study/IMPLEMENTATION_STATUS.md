@@ -1483,6 +1483,103 @@ a transport-failed process group must be torn down. Real Store verification uses
 TCP on one host, synthetic local KV and a Catalog test double, not RDMA or
 distributed target inference.
 
+## Partitioned Request Contexts
+
+Request capture now accepts the same canonical partition as its Host pool and
+exporter. A KV-only owner maintains its own committed token ledger and exports
+only its local heads, without allocating or accessing aux tensors. An aux-only
+owner records the computed prefix from its target forward and captures teacher,
+position, token and mask payloads. Ownership violations, wrong local head counts,
+commits ahead of the known prefix and foreign Host slots are rejected.
+
+The request context preserves existing D2H event/staging ownership and handles
+incremental decode or accepted verify prefixes. Trimming excludes lookahead KV
+and teacher rows from the final sequence; sealing flushes a non-full staging
+tail. `prepare_partition` waits for local copy completion and returns owner-local
+descriptors/views. Partitioned contexts cannot call the full-snapshot API.
+Cancellation now also invalidates a sealed context before preparation. The
+writer rechecks the state after copy waits and descriptor construction, so a
+cancellation during those operations cannot return a new preparation. This does
+not revoke already prepared descriptors or authorize deletion of Store objects;
+the coordinator must still discard pending work and enforce Catalog fencing.
+
+`PreparedSnapshotPartition` now carries `token_ids_sha256`. Every owner must
+attest the same committed sequence and it must match the aux token descriptor.
+KV-only callers of `prepare_snapshot_partition` supply their token ledger;
+an aux caller may derive it from the completed buffer. A request context always
+supplies its ledger, so mutation of the aux token buffer after commit is rejected
+before descriptor publication. Equal sequence lengths and complete head coverage
+cannot hide owners recording different token sequences. The public manifest
+format is unchanged; the internal preparation interface requires the new field.
+
+The shared partition fixture now builds its snapshots through real request
+contexts instead of directly filling every Host payload. The real Store tests
+therefore exercise context-produced partitions, immutable owner-local writes,
+manifest-last publication and independent readback after owner process exit.
+These are synthetic generation traces, not distributed model inference.
+
+Focused job `01790848359214920602-5137e5a99376` passes 22 tests and
+44 subtests in 10.77s. The initial broader job
+`01790848472723190114-741413eb67ab` passes 153 tests and 219 subtests in
+167.85s. After the cancellation race fix, broader job
+`01790849253038327309-27b60e9cf0aa` passes 154 tests and 221 subtests in
+168.00s. CPU traces use TP4/PP2 canonical owners and an aux-only last stage,
+non-contiguous source slots, chunked prefill, decode and accepted verify suffixes.
+They overwrite source slots immediately, validate exact reconstructed tensors,
+reject equal-length divergent replies and reject a mutated aux token payload.
+The CUDA partition test now runs through the request context, including source
+reuse, bounded staging, finalization outside the forward stream and copy wait.
+
+Pre-fix job `01790848556130153660-3f04d25f410e` loads unmodified baseline
+context/assembly code and reproduces acceptance of cancelled sealed data and
+inconsistent token digests. Job `01790849252707648740-3733fc91063b` reproduces the
+copy-wait race against the context before its final state guard: both full and
+partitioned preparation return data after an event-controlled cancellation.
+These are expected failures; the final broader run includes their passing tests.
+
+The initial full runtime job `01790848473067409649-d7a6f870aaf3` passes in
+463.088s with 90 READY samples. The post-race-fix run
+`01790849253418715081-7baf3ab8ddf6` reaches 90 READY samples but fails its final
+Catalog error assertion. Terminating the preceding serving process interrupts a
+background HTTP POST; the test Catalog incorrectly treats the incomplete body
+as malformed JSON and poisons the following lifecycle scenario. The fixture now
+discards EOF/reset before body completion without invoking a Catalog operation;
+fully received malformed JSON still reports an error. This changes only the
+test HTTP service, not production Catalog semantics.
+
+Job `01790850082603955905-f5635c5b2911` reproduces the fixture failure against
+the unmodified baseline using socket half-close with zero/partial body bytes.
+The corrected fixture and real Store regression job
+`01790850082937982590-e6dd4fdf539f` passes 5 tests and 2 subtests in 71.45s.
+Full runtime rerun `01790850083292972978-08c808f42f47` passes in 461.962s with
+90 READY samples, including both lifecycle scenarios. Final fixture-source job
+`01790850209530978134-285b91f3b36a` passes 2 tests and 2 subtests in 11.26s.
+
+Source/log hashes, terminal results, failure reproductions and coverage limits
+are recorded in `experiments/capture-partition-context.json`. Ruff passes for
+eight changed/new files; the Catalog fixture retains only its two baseline
+diagnostics (BLE001 and C408). All nine Python files pass formatting and Python
+3.10 compilation. Local/GPU source hashes match, `git diff --check` passes, and
+the original root's staged index remains unchanged. All eleven jobs are terminal;
+the resident worker has resumed its idle workload.
+
+This is the owner-local state required by distributed admission. It does not
+wire cross-rank request decisions, accepted-token transport, abort propagation,
+descriptor exchange or TP/PP scheduler hooks. The existing distributed serving
+gates remain closed. A prepared token digest detects inconsistent trusted
+producer ledgers; it is not proof that arbitrary KV bytes came from the stated
+tokens. Runtime source mapping and target execution still require end-to-end
+verification on the intended multi-GPU topology.
+
+The next admission integration must respect PP's ordering:
+`scheduler_pp_mixin.py` receives the upstream proxy before launching a local
+forward, while the upstream stage sends that proxy only after its own forward.
+An all-PP collective inside `before_forward` would therefore deadlock. Prepare
+multi-owner lease/Host-slot cohorts in a dedicated background control group,
+then carry the chosen cohort identity along the existing request propagation
+path. Keep control collectives off the inference group's communication sequence;
+capture backpressure or a missing cohort must not block model execution.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1491,8 +1588,9 @@ distributed target inference.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
 3. Connect P9's implemented identity/resource startup agreement, layout,
-   rank-local buffers and owner-local Store interface to distributed request
-   admission/failure agreement, descriptor exchange, global teacher scores
+   partitioned request contexts, rank-local buffers and owner-local Store interface
+   to distributed request admission/failure agreement, descriptor exchange,
+   global teacher scores
    and TP/PP scheduling.
    Complete TP/PP runtime validation, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do

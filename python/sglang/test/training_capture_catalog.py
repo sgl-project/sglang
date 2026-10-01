@@ -25,9 +25,15 @@ class TestCaptureCatalog:
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 try:
-                    payload = json.loads(
-                        self.rfile.read(int(self.headers["Content-Length"]))
-                    )
+                    content_length = int(self.headers["Content-Length"])
+                    try:
+                        body = self.rfile.read(content_length)
+                    except ConnectionResetError:
+                        return
+                    if len(body) != content_length:
+                        # Serving teardown can disconnect during a background POST.
+                        return
+                    payload = json.loads(body)
                     with catalog.condition:
                         result = catalog.handle(self.path, payload)
                         catalog.condition.notify_all()

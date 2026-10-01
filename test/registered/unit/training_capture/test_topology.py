@@ -227,6 +227,11 @@ class TestPartitionAssembly(CustomTestCase):
             PreparedSnapshotPartition(
                 owner_id=owner,
                 metadata_sha256=digest_bytes(canonical_bytes(self.metadata)),
+                token_ids_sha256=next(
+                    obj.sha256
+                    for obj in self.manifest.objects
+                    if obj.name == "token_ids"
+                ),
                 valid_kv_tokens=5,
                 objects=tuple(
                     obj for obj in self.manifest.objects if obj.owner_id == owner
@@ -253,6 +258,23 @@ class TestPartitionAssembly(CustomTestCase):
             ],
         ):
             with self.subTest(parts=parts), self.assertRaises(ContractError):
+                assemble_snapshot(self.metadata, parts, layout=self.layout)
+
+    def test_equal_lengths_cannot_hide_different_committed_tokens(self):
+        for parts in (
+            [
+                msgspec.structs.replace(self.prepared[0], token_ids_sha256="0" * 64),
+                self.prepared[1],
+            ],
+            [
+                msgspec.structs.replace(part, token_ids_sha256="0" * 64)
+                for part in self.prepared
+            ],
+        ):
+            with (
+                self.subTest(parts=parts),
+                self.assertRaisesRegex(ContractError, "token sequence"),
+            ):
                 assemble_snapshot(self.metadata, parts, layout=self.layout)
 
     def test_full_coverage_cannot_hide_swapped_owner_head_identity(self):

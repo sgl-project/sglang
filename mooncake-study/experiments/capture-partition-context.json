@@ -1,0 +1,319 @@
+{
+  "purpose": "Collect canonical owner-local KV/aux state, bind all owners to one accepted token sequence, and reject preparation cancelled during D2H waits.",
+  "source_baseline": "8b3eca2168cdda6362e092d41fc734a3d3d3a790",
+  "environment_lock": "h100-runtime-lock.json",
+  "jobs": [
+    {
+      "job_id": "01790848359214920602-5137e5a99376",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790848373.3134303,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790848359214920602-5137e5a99376.log",
+      "log_sha256": "389d0f4ee70f7ad671c00456c5df5a098108b3b81777d66970f10166f55b839a",
+      "stage": "initial_focused",
+      "tests": 22,
+      "subtests": 44,
+      "seconds": 10.77,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_context.py",
+        "test/registered/unit/training_capture/test_partition_context.py",
+        "test/registered/unit/training_capture/test_cuda_snapshot.py",
+        "test/registered/unit/training_capture/test_topology.py",
+        "test/registered/unit/training_capture/test_protocol.py"
+      ],
+      "note": "Initial checks before adding the later token-divergence and cancellation regression cases."
+    },
+    {
+      "job_id": "01790848472723190114-741413eb67ab",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790848644.031729,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790848472723190114-741413eb67ab.log",
+      "log_sha256": "e0f614060e6454392c0fedb4eb2d6307b63000a32081ee1ea638d93c106f0a8c",
+      "stage": "initial_unit_and_real_store",
+      "tests": 153,
+      "subtests": 219,
+      "seconds": 167.85,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture",
+        "test/registered/unit/spec/test_dspark_target_kv.py",
+        "test/registered/storage/test_training_snapshot_mooncake.py"
+      ],
+      "source_version": "partition_before_final_state_guard"
+    },
+    {
+      "job_id": "01790848473067409649-d7a6f870aaf3",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790849118.2888644,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790848473067409649-d7a6f870aaf3.log",
+      "log_sha256": "be57449f1c3f066a8096848ad47a846914a08d4641b57d5f2f79cce3ff447293",
+      "stage": "initial_full_runtime",
+      "tests": 1,
+      "seconds": 463.088,
+      "published_snapshots": 90,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      ],
+      "source_version": "partition_before_final_state_guard"
+    },
+    {
+      "job_id": "01790848556130153660-3f04d25f410e",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790849129.3316782,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790848556130153660-3f04d25f410e.log",
+      "log_sha256": "26999f03ca583e7cb6e529feeb9e2f238aa347ec9f4fe763e22acfa80fe27d6c",
+      "stage": "baseline_regression_proof",
+      "expected_failure": true,
+      "tests": 2,
+      "failed_subtests": 2,
+      "runner_errors": 1,
+      "seconds": 0.018,
+      "baseline": "8b3eca2168cdda6362e092d41fc734a3d3d3a790",
+      "tests_run": [
+        "TestCaptureContext.test_cancellation_after_seal_prevents_later_snapshot_preparation",
+        "TestPartitionAssembly.test_equal_lengths_cannot_hide_different_committed_tokens"
+      ],
+      "method": "Load unmodified baseline context.py and snapshot.py in isolated in-memory modules; run current tests with baseline RequestCaptureContext and assemble_snapshot.",
+      "failure": "ContractError is not raised for cancellation after seal or inconsistent token digests. CustomTestCase retry wraps the cancellation assertion as a runner error."
+    },
+    {
+      "job_id": "01790849252707648740-3733fc91063b",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790849264.5529668,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790849252707648740-3733fc91063b.log",
+      "log_sha256": "98005923950e36186925d5edf8dfa136a3d70399ecea255b213a8dcf97c5d751",
+      "stage": "copy_wait_race_regression_proof",
+      "expected_failure": true,
+      "tests": 1,
+      "failed_subtests": 2,
+      "seconds": 0.01,
+      "context_source_sha256": "320a2c083a0ce2850eb988fca9834a65a9f5916a77cac4dc764dc6cf12668463",
+      "test": "TestCaptureContext.test_cancel_during_copy_wait_never_returns_prepared_descriptors",
+      "method": "Load context.py before its final state guard in an isolated in-memory module. Events order the writer's copy wait, concurrent abort, and wait release.",
+      "failure": "Full snapshot and partition preparation each return one result after cancellation; both assertions require zero results."
+    },
+    {
+      "job_id": "01790849253038327309-27b60e9cf0aa",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790849435.176752,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790849253038327309-27b60e9cf0aa.log",
+      "log_sha256": "13a00b9d921929a60f43e73493c40a3e200a4dccd2bab996ad96f6621a091192",
+      "stage": "final_partition_unit_and_real_store",
+      "tests": 154,
+      "subtests": 221,
+      "seconds": 168,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture",
+        "test/registered/unit/spec/test_dspark_target_kv.py",
+        "test/registered/storage/test_training_snapshot_mooncake.py"
+      ],
+      "source_version": "partition_with_final_state_guard"
+    },
+    {
+      "job_id": "01790849253418715081-7baf3ab8ddf6",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790849908.3250139,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790849253418715081-7baf3ab8ddf6.log",
+      "log_sha256": "2e2b4b023b499bae217f65dfe73e1f8b589c5a60ef9db2f2d27e67fcf11658db",
+      "stage": "full_runtime_catalog_disconnect_failure",
+      "expected_failure": false,
+      "tests": 1,
+      "seconds": 461.492,
+      "published_snapshots": 90,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      ],
+      "source_version": "partition_with_final_state_guard",
+      "failure": "After stopping the eager lifecycle producer, the test Catalog interprets a disconnected POST's incomplete body as malformed JSON. Its errors list persists into the graph lifecycle case, causing the final assertFalse(catalog.errors) to fail.",
+      "fixture_source": "8b3eca2168cdda6362e092d41fc734a3d3d3a790:python/sglang/test/training_capture_catalog.py"
+    },
+    {
+      "job_id": "01790850082603955905-f5635c5b2911",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790850095.4135547,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790850082603955905-f5635c5b2911.log",
+      "log_sha256": "151593e09c4b83183bfda28e35e6f7f52dbf4931479e551e3c7c2d4ac726d840",
+      "stage": "catalog_disconnect_baseline",
+      "expected_failure": true,
+      "tests": 2,
+      "failed_subtests": 2,
+      "runner_errors": 1,
+      "seconds": 1.027,
+      "baseline": "8b3eca2168cdda6362e092d41fc734a3d3d3a790:python/sglang/test/training_capture_catalog.py",
+      "method": "Load the original Catalog fixture into an isolated in-memory module and run TestCatalogFixture against it.",
+      "failure": "Zero/partial request bodies followed by a write-side half-close receive HTTP 409 and leave JSONDecodeError records. The fully sent malformed-body negative control still passes."
+    },
+    {
+      "job_id": "01790850082937982590-e6dd4fdf539f",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790850169.334304,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790850082937982590-e6dd4fdf539f.log",
+      "log_sha256": "3f50dee5cfa295d18e0542333827f4269fec879fa883ec2aeace060f388bb5da",
+      "stage": "catalog_fixture_and_real_store",
+      "tests": 5,
+      "subtests": 2,
+      "seconds": 71.45,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_catalog_fixture.py",
+        "test/registered/storage/test_training_snapshot_mooncake.py"
+      ],
+      "source_version": "catalog_fixture_during_first_checks",
+      "note": "The test's dict(...) expression was subsequently changed to a dict literal to satisfy Ruff; the fixture implementation is unchanged."
+    },
+    {
+      "job_id": "01790850083292972978-08c808f42f47",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790850642.655901,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790850083292972978-08c808f42f47.log",
+      "log_sha256": "cb95d70c955db5f7825d2d53a242fc9fe22eafb7299ba694707a425f30c6b1ff",
+      "stage": "full_runtime_after_catalog_fixture_fix",
+      "tests": 1,
+      "seconds": 461.962,
+      "published_snapshots": 90,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      ],
+      "source_version": "final"
+    },
+    {
+      "job_id": "01790850209530978134-285b91f3b36a",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790850656.4458458,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790850209530978134-285b91f3b36a.log",
+      "log_sha256": "4627b097d7ddc7238054cdaf409064984b1e3d1d15ebc2cc5d2d1401218f9055",
+      "stage": "catalog_fixture_final_source",
+      "tests": 2,
+      "subtests": 2,
+      "seconds": 11.26,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_catalog_fixture.py"
+      ],
+      "source_version": "final"
+    }
+  ],
+  "source_versions": {
+    "partition_before_final_state_guard": {
+      "python/sglang/srt/training_capture/context.py": "320a2c083a0ce2850eb988fca9834a65a9f5916a77cac4dc764dc6cf12668463",
+      "python/sglang/srt/training_capture/snapshot.py": "367c25a94e52c260c8c0dd622312cc40cadbf238adc27ebce46a9d83f115a4b1",
+      "python/sglang/test/training_capture_partition.py": "8d1f348a12a75ba0f230fe887cb6655766d5f4ced93a3555fb1cbbc9b25fb685",
+      "test/registered/unit/training_capture/test_context.py": "b177c499408e4a7875b4411fd1ebd1c58875a6a0c2d11841766f9250db5610b0",
+      "test/registered/unit/training_capture/test_partition_context.py": "199f355eb79493643822a00cb2138820959bd587c783aa52b903e0fdee5c2d3e",
+      "test/registered/unit/training_capture/test_cuda_snapshot.py": "3e326f4a4377a021e8fd2e907009c8782d8b59ef5468d265fd55099ad0b77cd5",
+      "test/registered/unit/training_capture/test_topology.py": "62cd40b1f9a5fa54f347b04ec61255c081252a0d5be8e7fdb6c930f39cf89e00"
+    },
+    "partition_with_final_state_guard": {
+      "python/sglang/srt/training_capture/context.py": "0621c1750fb8de0aebbcb5f112d9937d7634cb170aba2564d5849e52503252a5",
+      "python/sglang/srt/training_capture/snapshot.py": "367c25a94e52c260c8c0dd622312cc40cadbf238adc27ebce46a9d83f115a4b1",
+      "python/sglang/test/training_capture_partition.py": "8d1f348a12a75ba0f230fe887cb6655766d5f4ced93a3555fb1cbbc9b25fb685",
+      "test/registered/unit/training_capture/test_context.py": "d2eaf2aa876aa14ccf0d086d631bf1c959496d1fd7ad51d0f06159765c20b93a",
+      "test/registered/unit/training_capture/test_partition_context.py": "199f355eb79493643822a00cb2138820959bd587c783aa52b903e0fdee5c2d3e",
+      "test/registered/unit/training_capture/test_cuda_snapshot.py": "3e326f4a4377a021e8fd2e907009c8782d8b59ef5468d265fd55099ad0b77cd5",
+      "test/registered/unit/training_capture/test_topology.py": "62cd40b1f9a5fa54f347b04ec61255c081252a0d5be8e7fdb6c930f39cf89e00"
+    },
+    "catalog_fixture_during_first_checks": {
+      "python/sglang/test/training_capture_catalog.py": "7ba4a71efb52c75dc7fd92f64bf810ec3a9b6333d7cab5d1837785ff7563160b",
+      "test/registered/unit/training_capture/test_catalog_fixture.py": "0892e279442e6c84ad4131989396b690756958bb438b3f01ac7a8f2c08ec14d7"
+    },
+    "final": {
+      "python/sglang/srt/training_capture/context.py": "0621c1750fb8de0aebbcb5f112d9937d7634cb170aba2564d5849e52503252a5",
+      "python/sglang/srt/training_capture/snapshot.py": "367c25a94e52c260c8c0dd622312cc40cadbf238adc27ebce46a9d83f115a4b1",
+      "python/sglang/test/training_capture_partition.py": "8d1f348a12a75ba0f230fe887cb6655766d5f4ced93a3555fb1cbbc9b25fb685",
+      "test/registered/unit/training_capture/test_context.py": "d2eaf2aa876aa14ccf0d086d631bf1c959496d1fd7ad51d0f06159765c20b93a",
+      "test/registered/unit/training_capture/test_partition_context.py": "199f355eb79493643822a00cb2138820959bd587c783aa52b903e0fdee5c2d3e",
+      "test/registered/unit/training_capture/test_cuda_snapshot.py": "3e326f4a4377a021e8fd2e907009c8782d8b59ef5468d265fd55099ad0b77cd5",
+      "test/registered/unit/training_capture/test_topology.py": "62cd40b1f9a5fa54f347b04ec61255c081252a0d5be8e7fdb6c930f39cf89e00",
+      "python/sglang/test/training_capture_catalog.py": "7ba4a71efb52c75dc7fd92f64bf810ec3a9b6333d7cab5d1837785ff7563160b",
+      "test/registered/unit/training_capture/test_catalog_fixture.py": "f33670775545072195bc1bfb09425aea6cf9edd203a835831d36eb4248afb51c"
+    }
+  },
+  "protocol": {
+    "partition_context": "Every active owner retains the accepted token ledger and local KV prefix. Only the aux owner accesses token/position/mask/teacher tensors; only KV owners enqueue selected-layer exports.",
+    "sequence_agreement": "PreparedSnapshotPartition.token_ids_sha256 hashes the int32 accepted token sequence. All owner digests must equal the aux token descriptor SHA-256; equal sequence lengths alone are insufficient.",
+    "aux_integrity": "Context preparation supplies its committed ledger explicitly and rejects a mutated aux token buffer.",
+    "cancellation": "abort invalidates collecting or sealed contexts. Snapshot/partition preparation rechecks state after copy waits and descriptor construction.",
+    "buffer_lifetime": "Completion events and bounded KV staging remain owned by the request. Sealing flushes a partial staging tail; preparation never extends a Host slot lease.",
+    "schema": "Public Manifest unchanged. The internal prepared partition record requires token_ids_sha256; KV-only preparation callers must supply token_ids."
+  },
+  "verification": {
+    "cpu_trace": "TP4/PP2 with canonical KV owners on stage 0 and an aux-only owner on stage 1; chunked prefill, decode and accepted verify prefixes.",
+    "source_reuse": "Noncontiguous source slots are overwritten immediately after export enqueue. Reconstructed KV tensors must match the original source values exactly.",
+    "speculative_tail": "Lookahead KV and teacher rows beyond the terminal accepted prefix are trimmed. Batched staging includes a non-full tail.",
+    "cuda_trace": "Canonical TP rank 2's KV-only request context copies through bounded staging, immediately reuses source slots, finalizes outside the forward stream, and waits before checking exact Host values.",
+    "real_store": "Shared fixture now builds synthetic partitions through RequestCaptureContext. Independent owner processes register and publish their own payloads to a real TCP Mooncake Store; readback occurs after owner exit.",
+    "runtime": "Single H100, Qwen3-0.6B, real TCP Store, HTTP Catalog test double, AR/static DSpark, graph/overlap modes, KV memory pressure, cache eviction and retract/resume. Synthetic draft checkpoints are used.",
+    "catalog_fixture": "Zero/partial HTTP bodies followed by a socket half-close must leave no operation/error and must not poison the next producer. Complete invalid JSON still returns 409 and records the error."
+  },
+  "limits": [
+    "Distributed serving gates remain closed. Cross-rank admission, accepted-token transport, failure propagation, descriptor/receipt exchange and TP/PP scheduler integration are still required.",
+    "Trusted owner ledgers and matching digests do not prove arbitrary KV bytes were computed from the stated sequence.",
+    "Cancellation cannot revoke already prepared descriptors, completed Store writes or published samples. The coordinator must discard pending work and enforce Catalog fencing.",
+    "Synthetic partition traces and one-H100 inference do not validate multi-GPU target execution, RDMA, PD, production Catalog retention or trained draft quality."
+  ],
+  "next_integration": {
+    "ordering": "PP stages receive upstream proxy tensors before entering forward; upstream sends proxy only after forward. An all-PP collective in before_forward would deadlock.",
+    "admission": "Prepare multi-owner lease/Host-slot cohorts in a separate background control group, then carry the selected cohort ID through request propagation.",
+    "nonblocking": "Missing capacity or control failure must disable/drop capture without blocking inference; use a communication sequence separate from inference groups."
+  },
+  "checks": {
+    "ruff": "Eight changed/new source files pass; the Catalog fixture has only its two unchanged baseline diagnostics (BLE001, C408).",
+    "python310_compile": "pass",
+    "format": "pass",
+    "diff_check": "pass",
+    "local_gpu_sources_match": true,
+    "original_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "gpu_after_tests": "All eleven submitted jobs are terminal, queue/running directories are empty, and the resident worker resumed cuda_load.py (PID 48809). Three baseline reproduction jobs failed as expected; one integration run exposed the Catalog fixture bug before its fix."
+  },
+  "source_sha256": {
+    "python/sglang/srt/training_capture/context.py": "0621c1750fb8de0aebbcb5f112d9937d7634cb170aba2564d5849e52503252a5",
+    "python/sglang/srt/training_capture/snapshot.py": "367c25a94e52c260c8c0dd622312cc40cadbf238adc27ebce46a9d83f115a4b1",
+    "python/sglang/test/training_capture_partition.py": "8d1f348a12a75ba0f230fe887cb6655766d5f4ced93a3555fb1cbbc9b25fb685",
+    "test/registered/unit/training_capture/test_context.py": "d2eaf2aa876aa14ccf0d086d631bf1c959496d1fd7ad51d0f06159765c20b93a",
+    "test/registered/unit/training_capture/test_partition_context.py": "199f355eb79493643822a00cb2138820959bd587c783aa52b903e0fdee5c2d3e",
+    "test/registered/unit/training_capture/test_cuda_snapshot.py": "3e326f4a4377a021e8fd2e907009c8782d8b59ef5468d265fd55099ad0b77cd5",
+    "test/registered/unit/training_capture/test_topology.py": "62cd40b1f9a5fa54f347b04ec61255c081252a0d5be8e7fdb6c930f39cf89e00",
+    "python/sglang/test/training_capture_catalog.py": "7ba4a71efb52c75dc7fd92f64bf810ec3a9b6333d7cab5d1837785ff7563160b",
+    "test/registered/unit/training_capture/test_catalog_fixture.py": "f33670775545072195bc1bfb09425aea6cf9edd203a835831d36eb4248afb51c"
+  }
+}

@@ -8,9 +8,14 @@ import torch
 from sglang.srt.training_capture.host_pool import HostSlot
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.kv_staging import KVStaging
-from sglang.srt.training_capture.protocol import ContractError, SequenceInfo
-from sglang.srt.training_capture.snapshot import SnapshotMetadata, build_snapshot
+from sglang.srt.training_capture.protocol import ContractError, SequenceInfo, aux_specs
+from sglang.srt.training_capture.snapshot import (
+    SnapshotMetadata,
+    build_snapshot,
+    prepare_snapshot_partition,
+)
 from sglang.srt.training_capture.teacher import TeacherRows
+from sglang.srt.training_capture.topology import CapturePartition
 
 
 class RequestCaptureContext:
@@ -28,6 +33,7 @@ class RequestCaptureContext:
         prompt_ids: tuple[int, ...],
         max_tokens: int,
         vocab_size: int,
+        partition: CapturePartition | None = None,
     ):
         if not prompt_ids or len(prompt_ids) >= max_tokens:
             raise ContractError(
@@ -35,6 +41,29 @@ class RequestCaptureContext:
             )
         if any(not 0 <= token < vocab_size for token in prompt_ids):
             raise ContractError("prompt token outside target vocabulary")
+        self.partition = partition
+        self.owns_aux = partition is None or partition.include_aux
+        self.owns_kv = partition is None or bool(partition.heads)
+        if partition is not None:
+            expected = (
+                set(aux_specs(max_tokens, max_tokens)) if self.owns_aux else set()
+            )
+            for heads in partition.heads:
+                for component in ("k", "v"):
+                    name = f"target_{component}.{heads.layer_id}"
+                    expected.add(name)
+                    value = slot.tensors.get(name)
+                    if (
+                        value is None
+                        or value.ndim != 3
+                        or value.shape[0] < max_tokens
+                        or value.shape[1] != heads.end - heads.start
+                    ):
+                        raise ContractError(
+                            "request buffers differ from local KV ownership"
+                        )
+            if not partition.active or set(slot.tensors) != expected:
+                raise ContractError("request buffers differ from partition ownership")
         self.slot = slot
         self.prompt_length = len(prompt_ids)
         self.token_ids = list(prompt_ids)
@@ -54,13 +83,20 @@ class RequestCaptureContext:
         self.state = "COLLECTING"
         self.failure_reason = None
         self.sequence = None
-        self.slot.tensors["position_ids"][:max_tokens].copy_(torch.arange(max_tokens))
-        self.slot.tensors["loss_mask"][:max_tokens].zero_()
-        self.slot.tensors["kv_valid"][:max_tokens].zero_()
+        if self.owns_aux:
+            self.slot.tensors["position_ids"][:max_tokens].copy_(
+                torch.arange(max_tokens)
+            )
+            self.slot.tensors["loss_mask"][:max_tokens].zero_()
+            self.slot.tensors["kv_valid"][:max_tokens].zero_()
 
     def _collecting(self):
         if self.state != "COLLECTING":
             raise ContractError("capture is no longer collecting")
+
+    def _sealed(self):
+        if self.state != "SEALED":
+            raise ContractError("only a sealed request can prepare a snapshot")
 
     def _record_completion(self, device):
         if device.type == "cuda":
@@ -80,6 +116,8 @@ class RequestCaptureContext:
         self, exporter: SelectedLayerKVExporter, slots: torch.Tensor, *, end: int
     ):
         self._collecting()
+        if not self.owns_kv:
+            raise ContractError("aux-only context cannot export KV payloads")
         if not self.kv_end <= end <= self.max_tokens:
             raise ContractError("KV positions retracted or exceeded capture capacity")
         if end == self.kv_end:
@@ -97,8 +135,19 @@ class RequestCaptureContext:
             self._record_completion(exporter.device)
         self.kv_end = end
 
+    def record_kv_progress(self, *, end: int):
+        """Aux-only owner records the computed prefix from its target forward."""
+        self._collecting()
+        if self.owns_kv or not self.kv_end <= end <= self.max_tokens:
+            raise ContractError(
+                "KV owners must advance through completed export enqueue"
+            )
+        self.kv_end = end
+
     def record_positions(self, positions: torch.Tensor, *, start: int):
         self._collecting()
+        if not self.owns_aux:
+            raise ContractError("only the aux owner records position payloads")
         end = start + positions.numel()
         if positions.ndim != 1 or not 0 <= start < end <= self.kv_end:
             raise ContractError("forward positions do not cover the exported KV range")
@@ -122,6 +171,8 @@ class RequestCaptureContext:
         self, rows: TeacherRows, *, row: int, position: int, count: int
     ):
         self._collecting()
+        if not self.owns_aux:
+            raise ContractError("only the aux owner records teacher payloads")
         if (
             count < 1
             or position != self.prompt_length + self.teacher_rows
@@ -157,18 +208,21 @@ class RequestCaptureContext:
         response_length = n - self.prompt_length
         if (
             response_length < 1
-            or response_length > self.teacher_rows
+            or (self.owns_aux and response_length > self.teacher_rows)
             or self.kv_end < n - 1
         ):
             raise ContractError("terminal output has incomplete teacher or KV coverage")
-        self.teacher_rows = response_length
+        if self.owns_aux:
+            self.teacher_rows = response_length
         self.kv_end = min(self.kv_end, n)
 
     def commit_token(self, *, position: int, token_id: int):
         self._collecting()
         if (
             position != len(self.token_ids)
-            or position >= self.prompt_length + self.teacher_rows
+            or position >= self.max_tokens
+            or position > self.kv_end
+            or (self.owns_aux and position >= self.prompt_length + self.teacher_rows)
         ):
             raise ContractError("accepted token has no matching teacher row")
         if not 0 <= token_id < self.vocab_size:
@@ -207,14 +261,19 @@ class RequestCaptureContext:
         self._collecting()
         n = len(self.token_ids)
         r = n - self.prompt_length
-        if not r or r != self.teacher_rows or self.kv_end not in (n - 1, n):
+        if (
+            not r
+            or (self.owns_aux and r != self.teacher_rows)
+            or self.kv_end not in (n - 1, n)
+        ):
             raise ContractError("cannot seal an incomplete response or KV prefix")
         self._flush_kv()
-        self.slot.tensors["token_ids"][:n].copy_(
-            torch.tensor(self.token_ids, dtype=torch.int32)
-        )
-        self.slot.tensors["loss_mask"][self.prompt_length : n] = 1
-        self.slot.tensors["kv_valid"][: self.kv_end] = 1
+        if self.owns_aux:
+            self.slot.tensors["token_ids"][:n].copy_(
+                torch.tensor(self.token_ids, dtype=torch.int32)
+            )
+            self.slot.tensors["loss_mask"][self.prompt_length : n] = 1
+            self.slot.tensors["kv_valid"][: self.kv_end] = 1
         self.sequence = SequenceInfo(
             prompt_length=self.prompt_length,
             response_length=r,
@@ -239,7 +298,7 @@ class RequestCaptureContext:
                 self._record_completion(staging.device)
 
     def abort(self, reason: str):
-        if self.state == "COLLECTING":
+        if self.state in ("COLLECTING", "SEALED"):
             self.state = "FAILED"
             self.failure_reason = reason
 
@@ -254,11 +313,33 @@ class RequestCaptureContext:
                 raise
 
     def snapshot(self, **metadata):
-        if self.state != "SEALED":
-            raise ContractError("only a sealed request can form a snapshot")
+        if self.partition is not None:
+            raise ContractError(
+                "partitioned requests require coordinated snapshot assembly"
+            )
+        self._sealed()
         self.wait_for_copies()
-        return build_snapshot(
+        result = build_snapshot(
             SnapshotMetadata(sequence=self.sequence, **metadata),
             self.slot.tensors,
             valid_kv_tokens=self.kv_end,
         )
+        self._sealed()
+        return result
+
+    def prepare_partition(self, **metadata):
+        if self.partition is None:
+            raise ContractError(
+                "partition preparation requires a sealed partitioned request"
+            )
+        self._sealed()
+        self.wait_for_copies()
+        result = prepare_snapshot_partition(
+            SnapshotMetadata(sequence=self.sequence, **metadata),
+            self.slot.tensors,
+            valid_kv_tokens=self.kv_end,
+            partition=self.partition,
+            token_ids=self.token_ids,
+        )
+        self._sealed()
+        return result

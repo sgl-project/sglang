@@ -6,10 +6,13 @@ import socket
 from pathlib import Path
 
 import msgspec
+import torch
 from safetensors.torch import load_file
 
 from sglang.srt.training_capture.catalog import CaptureLease, HTTPCaptureCatalog
+from sglang.srt.training_capture.context import RequestCaptureContext
 from sglang.srt.training_capture.host_pool import HostBufferPool
+from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.protocol import (
     canonical_bytes,
@@ -19,12 +22,12 @@ from sglang.srt.training_capture.protocol import (
 from sglang.srt.training_capture.snapshot import (
     SnapshotMetadata,
     assemble_snapshot,
-    prepare_snapshot_partition,
 )
 from sglang.srt.training_capture.snapshot_writer import (
     PublicationJournal,
     SnapshotWriter,
 )
+from sglang.srt.training_capture.teacher import TeacherRows
 from sglang.srt.training_capture.topology import plan_capture_layout
 from sglang.test.training_capture_utils import Registrar, make_snapshot
 
@@ -47,6 +50,13 @@ def make_partitioned_snapshot():
             layout.topology, owners=list(reversed(layout.topology.owners))
         ),
     )
+    packed = {
+        obj.name: original[obj.key]
+        for obj in original_manifest.objects
+        if obj.kind == "aux"
+    }
+    tokens = packed["token_ids"].tolist()
+    valid = metadata.sequence.total_length - 1
     prepared, tensors = [], {}
     for partition in reversed(layout.partitions):
         pool = HostBufferPool(
@@ -60,21 +70,54 @@ def make_partitioned_snapshot():
         )
         slot = pool.acquire()
         try:
+            context = RequestCaptureContext(
+                slot=slot,
+                prompt_ids=tuple(tokens[: metadata.sequence.prompt_length]),
+                max_tokens=metadata.sequence.total_length,
+                vocab_size=metadata.teacher.vocab_size,
+                partition=partition,
+            )
             ranges = {part.layer_id: part for part in partition.heads}
+            sources = {
+                name: torch.empty_like(tensor[:valid])
+                for name, tensor in slot.tensors.items()
+                if name.startswith("target_")
+            }
             for obj in original_manifest.objects:
-                if obj.kind == "aux" and partition.include_aux:
-                    slot.tensors[obj.name][: obj.shape[0]].copy_(original[obj.key])
-                elif obj.kind == "kv" and obj.layer_id in ranges:
+                if obj.kind == "kv" and obj.layer_id in ranges:
                     heads = ranges[obj.layer_id]
                     start, end = obj.token_range
-                    slot.tensors[obj.name][start:end].copy_(
+                    sources[obj.name][start:end].copy_(
                         original[obj.key][:, heads.start : heads.end]
                     )
-            part, payloads = prepare_snapshot_partition(
-                metadata,
-                slot.tensors,
-                valid_kv_tokens=metadata.sequence.total_length - 1,
-                partition=partition,
+            if sources:
+                context.export_kv(
+                    SelectedLayerKVExporter(metadata.kv, sources, partition=partition),
+                    torch.arange(valid),
+                    end=valid,
+                )
+            else:
+                context.record_kv_progress(end=valid)
+            if partition.include_aux:
+                context.record_teacher_range(
+                    TeacherRows(
+                        packed["teacher_topk_ids"],
+                        packed["teacher_topk_logits"],
+                        packed["teacher_logsumexp"],
+                    ),
+                    row=0,
+                    position=metadata.sequence.prompt_length,
+                    count=metadata.sequence.response_length,
+                )
+            for position in range(metadata.sequence.prompt_length, len(tokens)):
+                context.commit_token(position=position, token_id=tokens[position])
+            context.seal(metadata.sequence.stop_reason)
+            part, payloads = context.prepare_partition(
+                **{
+                    name: getattr(metadata, name)
+                    for name in SnapshotMetadata.__struct_fields__
+                    if name != "sequence"
+                }
             )
             prepared.append(
                 msgspec.structs.replace(part, objects=tuple(reversed(part.objects)))

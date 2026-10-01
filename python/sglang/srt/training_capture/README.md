@@ -339,9 +339,14 @@ capture; the current serving capability gates remain in force.
    its local selected layers and head count. Source pool tensors already have
    the rank-local head axis; no tensor gather is performed.
 3. After local D2H completion, call `prepare_snapshot_partition` with the same
-   `SnapshotMetadata` on every owner. It returns local registered tensor views
-   and metadata-only `PreparedSnapshotPartition`. The coordinator collects these
-   descriptions and calls `assemble_snapshot(metadata, parts, layout=layout)`.
+   `SnapshotMetadata` on every owner. KV-only owners must also supply their
+   committed `token_ids` ledger; the aux owner may use its completed token buffer.
+   It returns local registered tensor views and metadata-only
+   `PreparedSnapshotPartition`. Each partition includes a `token_ids_sha256` that
+   must agree with every other owner and with the aux `token_ids` descriptor.
+   Equal lengths and valid KV ranges are insufficient to establish one sequence.
+   The coordinator collects these descriptions and calls
+   `assemble_snapshot(metadata, parts, layout=layout)`.
    Assembly checks exact expected owners, metadata identity, canonical head
    ranges, complete coverage and consistent final-token validity. Every owner
    then receives the same immutable full manifest and capture lease.
@@ -366,13 +371,52 @@ collective protocol. An aux-only owner allocates no KV/device staging and must
 skip construction of a KV exporter. Non-aux owners allocate no aux or manifest
 capacity. Host and device budgets are enforced independently per rank.
 
+### Owner-Local Requests
+
+Pass the same partition to `RequestCaptureContext(..., partition=...)` after
+request admission. It validates the Host slot's local tensor set and KV head
+counts before use. All active owners retain the request's committed token ledger;
+only the aux owner writes token, position, mask and teacher payloads. Inactive
+partitions cannot create a request context.
+
+KV owners advance through `export_kv`, preserving the existing D2H events,
+bounded staging and source-slot reuse rules. An aux-only owner calls
+`record_kv_progress(end=...)` with the computed prefix from its target forward;
+that API cannot bypass KV export on a KV owner. Only the aux owner may call
+`record_positions` or `record_teacher[_range]`. Every owner observes and commits
+the same accepted target path in order; a commit cannot exceed its known KV
+prefix or capacity. Aux commits additionally require matching teacher rows.
+
+Trim lookahead/verify suffixes with `trim_terminal_prefix`, then call `seal` on
+every owner. Sealing flushes any staged KV tail, validates local coverage and
+forms the sequence metadata; only aux writes masks and final token payloads.
+In the background writer, `prepare_partition(**metadata)` waits for CUDA
+completion and returns the local descriptors/views, binding the committed token
+ledger to `token_ids_sha256`. The caller supplies identical global metadata on
+every owner. The aux token buffer must still match its own ledger, and assembly
+requires the same sequence digest from every owner. The digest is an internal
+partition field, not a new public manifest field; all producers must use the
+matching preparation/assembly interface.
+
+`snapshot()` remains the complete, unpartitioned context API. Partitioned
+contexts must use coordinated assembly. `abort` can invalidate collecting or
+sealed contexts. Preparation rechecks cancellation after copy waits and descriptor
+construction before returning a result. This does not revoke already
+prepared descriptors, Store writes or published samples. The request coordinator
+must discard pending preparations and enforce the Catalog fence on cancellation.
+
+These request contexts are exercised with canonical TP shards, an aux-only PP
+stage, source reuse, incremental decode and accepted verify prefixes. Runtime
+distribution of accepted tokens, admission decisions and aborts is still pending;
+constructing a partitioned context alone does not enable distributed serving.
+
 Preparation and assembly are background work after CUDA completion. Their views
 do not extend a buffer lease: each owner retains its Host slot until its Store
 writes complete, and the coordinator retains the manifest buffer until
 publication completes. Existing uncertain-transfer quarantine rules still apply.
-These APIs do not exchange per-sample descriptors between processes. Distributed
-resource/admission agreement, sample metadata transport, failure coordination
-and scheduler wiring remain required.
+These APIs do not exchange per-sample descriptors between processes. Connecting
+resource readiness to distributed request admission, sample metadata transport,
+failure coordination and scheduler wiring remains required.
 The planner covers ordinary dense TP/PP, not context parallelism or sparse KV.
 
 Receipts contain metadata only. They are trusted producer acknowledgements,
