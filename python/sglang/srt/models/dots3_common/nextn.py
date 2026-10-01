@@ -146,7 +146,6 @@ class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.fuse_qkv_a_g_proj = True
