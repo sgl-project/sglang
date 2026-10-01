@@ -99,7 +99,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -163,7 +163,6 @@ class MultiHeadRMSNorm(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_world = get_parallel().attn_tp_size
-        self.tp_rank = get_parallel().attn_tp_rank
         self.num_heads = num_heads
         self.num_heads_per_tp = num_heads // self.tp_world
         self.head_dim = head_dim
@@ -422,7 +421,6 @@ class MiniMaxM3MoE(nn.Module):
         self.layer_id = layer_id
 
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_parallel().moe_ep_size
             self.top_k = config.num_experts_per_tok
 
     @staticmethod
@@ -564,7 +562,6 @@ class MiniMaxM3Attention(nn.Module):
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_size = attn_tp_size
-        self.attn_tp_rank = attn_tp_rank
 
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -1446,11 +1443,9 @@ class MiniMaxM3Model(nn.Module):
                 prefix=prefix,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             layer_fn,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:

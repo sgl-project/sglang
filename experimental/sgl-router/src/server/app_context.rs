@@ -38,6 +38,16 @@ pub enum ChatRouting {
     Reorg(HashMap<ModelId, BucketResolver>),
 }
 
+impl ChatRouting {
+    /// Whether the built routing reads request tokens; `legacy` holds the legacy policies.
+    pub fn needs_request_tokens(&self, legacy: &PolicyRegistry) -> bool {
+        match self {
+            Self::Legacy => legacy.needs_request_tokens(),
+            Self::Reorg(resolvers) => resolvers.values().any(BucketResolver::needs_request_tokens),
+        }
+    }
+}
+
 pub struct AppContext {
     pub config: Config,
     pub tokenizers: Arc<TokenizerRegistry>,
@@ -137,6 +147,15 @@ impl AppContext {
         }
     }
 
+    /// Readiness conditions 3 and 4, via
+    /// [`BootstrapTracker::admit_ready`](crate::state::kv_events::BootstrapTracker::admit_ready).
+    /// Always true when this router holds no KV index.
+    pub fn kv_bootstrap_admit_ready(&self) -> bool {
+        self.kv_index
+            .as_ref()
+            .is_none_or(|idx| idx.bootstrap().admit_ready())
+    }
+
     /// Report bootstrap as finished, unless the pod has already begun draining.
     /// The `DRAINING` state is a one-way door (see [`Self::mark_not_ready`]),
     /// and a compare-exchange is what enforces it: a plain store would let any
@@ -188,7 +207,7 @@ impl AppContext {
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
                     id: "stub-model".into(),
-                    tokenizer_path: "stub".into(),
+                    tokenizer_path: Some("stub".into()),
                     disable_input_ids_forwarding: false,
                     tokenizer: Default::default(),
                     policy: crate::config::PolicyKind::RoundRobin,

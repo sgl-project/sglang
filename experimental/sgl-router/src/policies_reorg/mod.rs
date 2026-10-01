@@ -96,6 +96,12 @@ pub trait Policy: Send + Sync + Debug {
         true
     }
 
+    /// Whether picks read request tokens (prefix matching). Load-only policies
+    /// work from the request-size estimate when no tokenizer is loaded.
+    fn needs_request_tokens(&self) -> bool {
+        false
+    }
+
     /// Runs on a miss within the same candidates; never on an admission rejection.
     fn fallback(&self) -> Option<&dyn Policy> {
         None
