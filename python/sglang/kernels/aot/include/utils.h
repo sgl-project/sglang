@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <ATen/Tensor.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
@@ -347,6 +348,10 @@ inline bool getEnvEnablePDL() {
 #else
 #define WARP_SIZE 32
 #endif
+
+inline int get_current_warp_size() {
+  return at::cuda::getCurrentDeviceProperties()->warpSize;
+}
 #endif
 
 #ifdef USE_ROCM
