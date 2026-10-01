@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=16, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 import sys
 import types
@@ -533,6 +533,7 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
         global_spec=None,
         layer_quant_config=None,
         is_prequantized=True,
+        model_type="qwen3_5_moe_text",
     ) -> QuarkConfig:
         config = _bare_config()
         config.quant_config = {
@@ -546,15 +547,34 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
         config.dequantization_config = None
         config.num_hidden_layers = self._NUM_HIDDEN_LAYERS
         config.num_nextn_predict_layers = self._NUM_NEXTN
+        # What amd/Qwen3.8-2.4T-A95B-Quark-MXFP4 reports; the conversion is
+        # offered on the Qwen3.5 MoE architectures only.
+        config.model_type = model_type
+        # Normally built in __init__, which _bare_config skips; get_quant_method
+        # records every layer it quantizes in it.
+        config._online_quantized_layers = set()
         return config
 
     @staticmethod
+    def _moe_layer(has_fused_shared=True):
+        """A FusedMoE stand-in that answers the two things the gate reads.
+
+        `_has_fused_shared` is an instance attribute, so a class spec does not
+        carry it and it has to be set explicitly.
+        """
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        layer = MagicMock(spec=FusedMoE)
+        layer._has_fused_shared = has_fused_shared
+        return layer
+
+    @staticmethod
     @contextmanager
-    def _online_quant_available(use_aiter=True, gfx95=True, flag=True):
+    def _online_quant_available(use_aiter=True, gfx95=True, flag=True, rocm=True):
         """Pretend this is an aiter + gfx95 build with the opt-in flag set."""
         with (
             envs.SGLANG_USE_AITER.override(use_aiter),
-            patch.object(quark_config_mod, "is_hip", return_value=True),
+            patch.object(quark_config_mod, "is_hip", return_value=rocm),
             patch.object(quark_config_mod, "is_gfx95_supported", return_value=gfx95),
             envs.SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4.override(flag),
         ):
@@ -622,6 +642,7 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
             "no_aiter": {"use_aiter": False},
             "not_gfx95": {"gfx95": False},
             "flag_unset": {"flag": False},
+            "not_rocm": {"rocm": False},
         }
         for name, kwargs in cases.items():
             with self.subTest(name), self._online_quant_available(**kwargs):
@@ -633,6 +654,68 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
                 is_prequantized=False,
             )
             self.assertFalse(not_prequantized.shared_expert_online_mxfp4_supported())
+
+    def test_a_cuda_build_is_not_blamed_on_aiter(self):
+        # is_hip() is checked before SGLANG_USE_AITER: on a CUDA build the aiter
+        # flag is meaningless, so naming it would send the user after the wrong
+        # fix. Both are unset here, and the ROCm reason has to win.
+        config = self._config(
+            exclude_layers=["model.layers.0.mlp.shared_expert.gate_proj"]
+        )
+        with (
+            self._online_quant_available(rocm=False, use_aiter=False),
+            patch.object(quark_config_mod.logger, "warning_once") as warn,
+        ):
+            self.assertFalse(config.shared_expert_online_mxfp4_supported())
+        self.assertIn("not a ROCm build", warn.call_args[0][0])
+
+    def test_only_the_qwen_moe_architectures_are_supported(self):
+        # can_fuse_shared_expert() is also reached from DeepSeek's
+        # quant_blocks_shared_experts_fusion(), and "shared_expert" in layer
+        # matches DeepSeek's mlp.shared_experts.* too. Without the model_type
+        # gate this flag would silently enable fusion for a model family it was
+        # never measured on.
+        excluded = ["model.layers.0.mlp.shared_expert.gate_proj"]
+        for model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            with self.subTest(model_type), self._online_quant_available():
+                config = self._config(exclude_layers=excluded, model_type=model_type)
+                self.assertTrue(config.shared_expert_online_mxfp4_supported())
+
+        for model_type in ("deepseek_v3", "deepseek_v32", "qwen3_moe", None):
+            with self.subTest(model_type), self._online_quant_available():
+                config = self._config(exclude_layers=excluded, model_type=model_type)
+                self.assertFalse(config.shared_expert_online_mxfp4_supported())
+                # And the pre-existing refusal is what such a checkpoint gets.
+                self.assertFalse(config.can_fuse_shared_expert())
+
+    def test_non_mxfp4_moe_layer_override_falls_back_instead_of_raising(self):
+        # A per-layer entry sending some later MoE layer elsewhere is visible up
+        # front, so it is reported here as a warning and fallback rather than as
+        # a NotImplementedError part way through loading.
+        config = self._config(
+            exclude_layers=["model.layers.0.mlp.shared_expert.gate_proj"],
+            layer_quant_config={"model.layers.3.mlp.experts": _FP8_MOE_SPEC},
+        )
+        with self._online_quant_available():
+            self.assertFalse(config.shared_expert_online_mxfp4_supported())
+            self.assertFalse(config.shared_expert_needs_online_mxfp4())
+            # The layer that is routed elsewhere no longer brings startup down.
+            self.assertIsNotNone(
+                config.get_quant_method(self._moe_layer(), "model.layers.3.mlp.experts")
+            )
+
+    def test_an_mxfp4_moe_layer_override_is_not_mistaken_for_a_refusal(self):
+        # The scan must only reject entries that are not MXFP4, and must ignore
+        # the shared expert's own entry, which is the tensor being converted.
+        config = self._config(
+            exclude_layers=["model.layers.0.mlp.shared_expert.gate_proj"],
+            layer_quant_config={
+                "model.layers.3.mlp.experts": _MXFP4_MOE_SPEC,
+                "model.layers.3.mlp.shared_experts.gate_proj": _FP8_MOE_SPEC,
+            },
+        )
+        with self._online_quant_available():
+            self.assertTrue(config.shared_expert_online_mxfp4_supported())
 
     def test_non_mxfp4_global_spec_is_not_supported(self):
         # Only QuarkW4A4MXFp4MoE can do the conversion, and unmatched names
@@ -696,7 +779,7 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
         )
         with self._online_quant_available():
             scheme = config.get_moe_scheme(
-                torch.nn.Module(), "model.layers.0.mlp.experts"
+                self._moe_layer(), "model.layers.0.mlp.experts"
             )
         self.assertIsInstance(scheme, QuarkW4A4MXFp4MoE)
         self.assertTrue(scheme.quantize_shared_expert_online)
@@ -705,7 +788,25 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
         config = self._config(exclude_layers=[])
         with self._online_quant_available():
             scheme = config.get_moe_scheme(
-                torch.nn.Module(), "model.layers.0.mlp.experts"
+                self._moe_layer(), "model.layers.0.mlp.experts"
+            )
+        self.assertFalse(scheme.quantize_shared_expert_online)
+
+    def test_moe_scheme_not_told_when_this_layer_has_no_fused_slot(self):
+        # The model-wide answer says "convert", but fusion can still be off for
+        # an individual layer: --disable-shared-experts-fusion, a DeepEP / MoRI
+        # a2a backend, a mismatched shared-expert intermediate size, or per-rank
+        # shared slots at moe_ep_size > 1. Nothing is copied into a fused slot
+        # then, so the scheme must not claim to be converting one -- that log
+        # line is what someone greps when chasing an accuracy difference.
+        config = self._config(
+            exclude_layers=["model.layers.0.mlp.shared_expert.gate_proj"]
+        )
+        with self._online_quant_available():
+            self.assertTrue(config.shared_expert_needs_online_mxfp4())
+            scheme = config.get_moe_scheme(
+                self._moe_layer(has_fused_shared=False),
+                "model.layers.0.mlp.experts",
             )
         self.assertFalse(scheme.quantize_shared_expert_online)
 
@@ -715,18 +816,37 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
         # different scheme must fail loudly, not serve corrupted weights.
         # Checked in get_quant_method rather than get_moe_scheme: block-FP8 MoE
         # layers are dispatched to Fp8MoEMethod and never reach the latter.
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
         config = self._config(
             exclude_layers=["model.layers.0.mlp.shared_expert.gate_proj"],
             layer_quant_config={"model.layers.3.mlp.experts": _FP8_MOE_SPEC},
         )
-        with self._online_quant_available():
-            self.assertTrue(config.shared_expert_needs_online_mxfp4())
+        # The up-front scan in shared_expert_online_mxfp4_supported() already
+        # rejects this config, so reach past it to pin the backstop itself.
+        with (
+            self._online_quant_available(),
+            patch.object(config, "shared_expert_needs_online_mxfp4", return_value=True),
+        ):
             with self.assertRaisesRegex(NotImplementedError, "W4A4 MXFP4 MoE scheme"):
+                config.get_quant_method(self._moe_layer(), "model.layers.3.mlp.experts")
+
+    def test_a_layer_without_a_fused_slot_does_not_raise(self):
+        # Same mixed config, but this layer never gets a shared slot, so no
+        # BF16 tensor can reach its buffers and a hard startup failure would be
+        # wrong. It loads through its own scheme instead.
+        config = self._config(
+            exclude_layers=["model.layers.0.mlp.shared_expert.gate_proj"],
+            layer_quant_config={"model.layers.3.mlp.experts": _FP8_MOE_SPEC},
+        )
+        with (
+            self._online_quant_available(),
+            patch.object(config, "shared_expert_needs_online_mxfp4", return_value=True),
+        ):
+            self.assertIsNotNone(
                 config.get_quant_method(
-                    MagicMock(spec=FusedMoE), "model.layers.3.mlp.experts"
+                    self._moe_layer(has_fused_shared=False),
+                    "model.layers.3.mlp.experts",
                 )
+            )
 
     def test_block_fp8_moe_layer_raises_before_the_fp8_dispatch(self):
         # The per-tensor case above would also be caught by a check inside
@@ -735,19 +855,17 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
         # BF16 shared expert would land in an FP8 buffer unconverted. The first
         # assertion pins that this spec really does take that branch, so the
         # test fails if the guard ever moves back into get_moe_scheme.
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
         self.assertIsNotNone(QuarkConfig._get_block_fp8_config(_BLOCK_FP8_MOE_SPEC, {}))
         config = self._config(
             exclude_layers=["model.layers.0.mlp.shared_expert.gate_proj"],
             layer_quant_config={"model.layers.3.mlp.experts": _BLOCK_FP8_MOE_SPEC},
         )
-        with self._online_quant_available():
-            self.assertTrue(config.shared_expert_needs_online_mxfp4())
+        with (
+            self._online_quant_available(),
+            patch.object(config, "shared_expert_needs_online_mxfp4", return_value=True),
+        ):
             with self.assertRaisesRegex(NotImplementedError, "W4A4 MXFP4 MoE scheme"):
-                config.get_quant_method(
-                    MagicMock(spec=FusedMoE), "model.layers.3.mlp.experts"
-                )
+                config.get_quant_method(self._moe_layer(), "model.layers.3.mlp.experts")
 
 
 if __name__ == "__main__":

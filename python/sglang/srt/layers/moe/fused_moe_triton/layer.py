@@ -909,8 +909,7 @@ class FusedMoE(torch.nn.Module):
             or expert_id < self._num_local_routed
             or shard_id not in ("w1", "w2", "w3")
             or not getattr(scheme, "quantize_shared_expert_online", False)
-            or loaded_weight.dtype
-            not in (torch.bfloat16, torch.float16, torch.float32)
+            or loaded_weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
         ):
             return False
 

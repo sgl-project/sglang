@@ -129,7 +129,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         if self.quantize_shared_expert_online:
             logger.warning_once(
                 "Quantizing the BF16 shared expert to MXFP4 while loading so it can be fused "
-                "into the routed experts. Beware that this optimization may degrade prediction "
+                "into the routed experts. Its weights and its input activations are then both "
+                "quantized to MXFP4 by the shared W4A4 grouped GEMM, where the standalone path "
+                "it replaces ran in BF16. Beware that this optimization may degrade prediction "
                 "quality - please validate your model accuracy. Unset "
                 "SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4 to keep the shared expert standalone."
             )

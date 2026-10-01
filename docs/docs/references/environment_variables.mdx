@@ -1849,7 +1849,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantize the shared expert of a Quark MXFP4 checkpoint to MXFP4 while loading, so it can be fused into the routed experts. Applies to checkpoints that exclude the shared expert from quantization (e.g. <code>amd/Qwen3.8-2.4T-A95B-Quark-MXFP4</code>), which otherwise fall back to a standalone shared expert. Requires gfx95x (MI355X) and <code>SGLANG_USE_AITER=1</code>. The shared expert is rounded to FP4, so validate accuracy for your model.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantize the shared expert of a Quark MXFP4 checkpoint to MXFP4 while loading, so it can be fused into the routed experts. Applies to checkpoints that exclude the shared expert from quantization (e.g. <code>amd/Qwen3.8-2.4T-A95B-Quark-MXFP4</code>), which otherwise fall back to a standalone shared expert. Requires gfx95x (MI355X) and <code>SGLANG_USE_AITER=1</code>. The fused slot runs through the routed experts' W4A4 grouped GEMM, so the shared expert's weights <em>and</em> its input activations are quantized to MXFP4, where the standalone path it replaces ran in BF16; validate accuracy for your model.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
