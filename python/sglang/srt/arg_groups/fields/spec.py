@@ -39,6 +39,10 @@ class Spec(msgspec.Struct):
             aliases=["--speculative-draft-model"],
         ),
     ] = None
+    speculative_boundary_reduction: A[
+        Literal["ar", "rs", "rsv", "rs+rsv"],
+        Arg(no_cli=True, resolvable=True),
+    ] = "rs+rsv"
     speculative_draft_model_revision: A[
         Optional[str],
         "The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",

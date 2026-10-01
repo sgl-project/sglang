@@ -2,7 +2,7 @@
 
 The public surface is small (see "Public API" below). The class owns:
 
-* the FlexKV ``KVManager`` (server-client mode when ``dp_size > 1`` or
+* the FlexKV ``KVManager`` (server-client mode when ``num_dp_ranks > 1`` or
   multi-instance; in-process otherwise — handled by FlexKV itself);
 * the per-rank ``KVTPClient`` that registers this rank's GPU KV cache
   with the FlexKV TransferManager;

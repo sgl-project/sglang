@@ -14,9 +14,8 @@ SERVER_LAUNCH_TIMEOUT = 3600
 
 HIGH_THROUGHPUT_ARGS = [
     "--trust-remote-code",
-    "--dp",
+    "--attn-dp-size",
     "4",
-    "--enable-dp-attention",
     "--moe-a2a-backend",
     "megamoe",
     "--mem-fraction-static",
