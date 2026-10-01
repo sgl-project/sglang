@@ -685,9 +685,8 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _inc_hit_count(self, node: TreeNode, first_insert: bool):
-        if first_insert:
-            node.hit_count += 1
+    def _inc_hit_count(self, node: TreeNode):
+        node.hit_count += 1
 
     def _insert_helper(
         self,
@@ -718,15 +717,15 @@ class RadixCache(BasePrefixCache):
             key = key[prefix_len:]
             value = value[prefix_len:]
 
-            first_insert = total_prefix_length > inserted_len
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
-                self._inc_hit_count(new_node, first_insert)
                 node = new_node
             else:
                 node.priority = max(node.priority, priority)
-                self._inc_hit_count(node, first_insert)
+            # Nodes this request already inserted were counted back then.
+            if total_prefix_length > inserted_len:
+                self._inc_hit_count(node)
             if len(key):
                 child_key = key.child_key(self.page_size)
 
@@ -735,7 +734,8 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            self._inc_hit_count(new_node, total_prefix_length + len(key) > inserted_len)
+            if total_prefix_length + len(key) > inserted_len:
+                self._inc_hit_count(new_node)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)

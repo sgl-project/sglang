@@ -1491,9 +1491,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Increment hit count; check whether a write backup should be fired.
-    pub fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_, first_insert: bool) -> bool {
+    pub fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_) -> bool {
         let node = self.arena.node_mut(node_id);
-        if node.evicted() || !first_insert {
+        if node.evicted() {
             return false;
         }
         if self.is_write_back {
@@ -1860,8 +1860,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             }
         }
 
+        // Nodes this request already inserted were counted back then.
         let node_end = state.total_prefix_length + prefix_len;
-        if self.inc_hit_count_and_check_(node_id, node_end > state.inserted_len) {
+        if node_end > state.inserted_len && self.inc_hit_count_and_check_(node_id) {
             let backup = self
                 .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ false);
             state.pending_actions.push(CacheAction::BackupKV(backup));
@@ -1968,10 +1969,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> bool {
         if state.is_new_leaf {
             // The new leaf runs to the end of the aligned key.
-            return self.inc_hit_count_and_check_(
-                target_node_id,
-                state.aligned_key_len > state.inserted_len,
-            );
+            return state.aligned_key_len > state.inserted_len
+                && self.inc_hit_count_and_check_(target_node_id);
         }
 
         let node = self.arena.node(target_node_id);
