@@ -1474,7 +1474,13 @@ class Req(ReqDllmMixin):
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
-            return min(self.kv.kv_committed_len, len(self.origin_input_ids))
+            # Never below cache_protected_len: a retracted request's re-prefill
+            # inserts its earlier output into the tree, and those slots are the
+            # tree's, not overallocated ones to free.
+            return min(
+                self.kv.kv_committed_len,
+                max(len(self.origin_input_ids), self.kv.cache_protected_len),
+            )
         return self.kv.kv_committed_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
