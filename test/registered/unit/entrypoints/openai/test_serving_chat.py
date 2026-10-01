@@ -1207,6 +1207,144 @@ class ServingChatTestCase(CustomTestCase):
             second_tools, [tool.function.model_dump() for tool in req.tools]
         )
 
+    def test_glm47_constraint_is_scoped_to_active_tools(self):
+        """A request with tool use disabled must not get a GLM47 tool grammar.
+
+        Grammar termination ends generation without consulting ``ignore_eos``.
+        """
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "glm47"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "add",
+                "parameters": {"type": "object"},
+            },
+        }
+        requests = (
+            ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            ),
+            ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+                tools=[tool],
+                tool_choice="none",
+            ),
+        )
+
+        for request in requests:
+            with (
+                self.subTest(tool_choice=request.tool_choice),
+                patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+                ) as parser_cls,
+            ):
+                result = self.chat._process_messages(request, is_multimodal=False)
+
+                parser_cls.assert_not_called()
+                self.assertIsNone(result.tool_call_constraint)
+
+    def test_glm47_constraint_remains_enabled_for_non_strict_auto_tools(self):
+        """Non-strict tools with tool_choice=auto keep the GLM47 grammar."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "glm47"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "add",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as parser_cls:
+            parser = parser_cls.return_value
+            parser.get_structure_constraint.return_value = (
+                "full_assistant_ebnf",
+                "root ::= assistant_turn",
+            )
+
+            result = self.chat._process_messages(request, is_multimodal=False)
+
+            parser_cls.assert_called_once()
+            parser.get_structure_constraint.assert_called_once()
+            self.assertEqual(
+                result.tool_call_constraint,
+                ("full_assistant_ebnf", "root ::= assistant_turn"),
+            )
+
+    def test_glm47_constraint_includes_message_tools(self):
+        import xgrammar as xgr
+
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "glm47"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(
+                [bytes([i]) for i in range(256)], vocab_type=xgr.VocabType.RAW
+            ),
+            max_threads=1,
+        )
+        message_tool = {
+            "type": "function",
+            "function": {"name": "message_tool", "parameters": {"type": "object"}},
+        }
+        top_level_tool = {
+            "type": "function",
+            "function": {"name": "top_level_tool", "parameters": {"type": "object"}},
+        }
+        named = ToolChoice(function=ToolChoiceFuncName(name="message_tool"))
+        for role in ("system", "developer"):
+            for tools in (None, [], [top_level_tool]):
+                for choice in ("auto", "required", named, "none"):
+                    with self.subTest(role=role, tools=tools, choice=choice):
+                        request = ChatCompletionRequest(
+                            model="x",
+                            messages=[
+                                {"role": role, "content": "", "tools": [message_tool]},
+                                {"role": "user", "content": "Use message_tool."},
+                            ],
+                            tools=tools,
+                            tool_choice=choice,
+                            chat_template_kwargs={"enable_thinking": False},
+                        )
+                        result = self.chat._process_messages(
+                            request, is_multimodal=False
+                        )
+                        if choice == "none":
+                            self.assertIsNone(result.tool_call_constraint)
+                            continue
+                        self.assertIsNotNone(result.tool_call_constraint)
+                        kind, ebnf = result.tool_call_constraint
+                        self.assertEqual(kind, "full_assistant_ebnf")
+                        grammar = compiler.compile_grammar(xgr.Grammar.from_ebnf(ebnf))
+                        for name, allowed in (
+                            ("message_tool", True),
+                            ("top_level_tool", bool(tools) and choice != named),
+                            ("unknown_tool", False),
+                        ):
+                            matcher = xgr.GrammarMatcher(grammar)
+                            accepted = (
+                                matcher.accept_string(f"<tool_call>{name}</tool_call>")
+                                and matcher.is_completed()
+                            )
+                            self.assertEqual(accepted, allowed, name)
+
     def test_xgrammar_tag_omits_reasoning_when_parser_owns_it(self):
         """ReasonerGrammarBackend owns the thinking prefix when a parser is set."""
         self.template_manager.chat_template_name = None
