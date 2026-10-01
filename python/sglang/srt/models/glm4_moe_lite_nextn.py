@@ -123,7 +123,7 @@ class Glm4MoeLiteModelNextN(nn.Module):
 
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = residual_batch.norm(
+            hidden_states = residual_batch.final_norm(
                 hidden_states, forward_batch, self.shared_head.norm
             )
 
@@ -142,7 +142,6 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         if is_npu() and get_spec().speculative_draft_model_quantization is None:
             quant_config = None
         self.quant_config = quant_config

@@ -294,8 +294,6 @@ class IQuestQ1Attention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            kv_tp_rank=attn_tp_rank,
-            kv_tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
