@@ -405,8 +405,7 @@ sgl-eval run gsm8k \\
     // RadixArk NVFP4 W4A4 checkpoint (ModelOpt 0.46.0, abs-max, group size
     // 16): routed and shared experts plus the dense MLPs are FP4; attention,
     // router, MTP, embeddings, and the vision tower stay BF16. Commands match
-    // the NVFP4 (NVDA) cells; the GB300 benchmark rows were measured on the
-    // earlier flashinfer_cutlass command, so every cell reports unverified.
+    // the NVFP4 (NVDA) cells. Only the 8x B300 cells are measured.
     {
       match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
@@ -524,7 +523,14 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b300", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        s.bcg === "off" &&
+        s.kvDsaPair === "fp8-trtllm" &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off"
+          ? "verified"
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -545,7 +551,14 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b300", strategy: "high-throughput", quant: "nvfp4" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        s.bcg === "off" &&
+        s.kvDsaPair === "fp8-trtllm" &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off"
+          ? "verified"
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
