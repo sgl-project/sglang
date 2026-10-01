@@ -368,7 +368,12 @@ def _build_prefill_table(
 def _row_pair_ids(rows_per_request: List[int], *, device: torch.device) -> torch.Tensor:
     """[rows] int32: one id per consecutive row pair of a request, never across two.
     DeepGEMM's schedule walks back over equal ids to a row's request start once per
-    row, quadratic in a request's rows; per-pair ids bound the walk to one step."""
+    row, quadratic in a request's rows; per-pair ids bound the walk to one step.
+
+    Pairs, not larger groups, because DeepGEMM's paged scheduler has BLOCK_Q == 2:
+    the ids only have to delimit what it already groups, and its page table is
+    indexed by Q row rather than by the id value, so the ids never address anything.
+    A wider BLOCK_Q would need the pair width here to follow it."""
     counts = async_h2d(rows_per_request, dtype=torch.int64, device=device)
     rows = sum(rows_per_request)
     row = torch.arange(rows, device=device)
