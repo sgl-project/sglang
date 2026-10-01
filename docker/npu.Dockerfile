@@ -26,11 +26,8 @@ ARG DEVICE_TYPE
 ARG MODELSCOPE_VERSION=""
 ARG EVALSCOPE_VERSION=""
 
+# memfabric-hybrid / memcache-hybrid version, installed from the pip index (no OBS bucket download)
 ARG MF_VERSION="1.2.1"
-ARG MF_WHEEL_URL_AARCH64="https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/v1.2.1/20260923.4/memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
-ARG MF_WHEEL_URL_X86_64="https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/v1.2.1/20260923.4/memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
-ARG MC_WHEEL_URL_AARCH64="https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/memcache/v1.2.1/20260923.4/memcache_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
-ARG MC_WHEEL_URL_X86_64="https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/memcache/v1.2.1/20260923.4/memcache_hybrid-1.2.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
 
 # memfabric-zbal: 950 与 a3 使用不同版本
 ARG ZBAL_VERSION_950="1.2.21004.post1"
@@ -77,25 +74,17 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
-### Install MemFabric and MemCache (按 TARGETARCH 直接取对应架构的 OBS wheel)
+### Install MemFabric and MemCache
 RUN set -eux; \
-    case "$TARGETARCH" in \
-      arm64) \
-        MF_URL="$MF_WHEEL_URL_AARCH64"; \
-        MC_URL="$MC_WHEEL_URL_AARCH64"; \
-        ;; \
-      amd64) \
-        MF_URL="$MF_WHEEL_URL_X86_64"; \
-        MC_URL="$MC_WHEEL_URL_X86_64"; \
-        ;; \
-      *) \
-        echo "Unsupported architecture: $TARGETARCH" >&2; \
-        exit 1; \
-        ;; \
+    case "$DEVICE_TYPE" in \
+      950) MF_SOC_VERSION="A5" ;; \
+      a3)  MF_SOC_VERSION="A3" ;; \
+      *)   echo "Unsupported DEVICE_TYPE for mfcli kernel install: $DEVICE_TYPE" >&2; \
+           exit 1 ;; \
     esac; \
-    ${PIP_INSTALL} "$MF_URL" --force-reinstall; \
-    mfcli kernel install; \
-    ${PIP_INSTALL} "$MC_URL" --force-reinstall --no-deps
+    ${PIP_INSTALL} memfabric-hybrid==${MF_VERSION}; \
+    mfcli kernel install --soc-version "$MF_SOC_VERSION"; \
+    ${PIP_INSTALL} memcache-hybrid==${MF_VERSION}
 
 ### Install memfabric-zbal
 RUN if [ "$DEVICE_TYPE" = "950" ]; then ZBAL_PKG="memfabric-zbal==${ZBAL_VERSION_950}"; \
@@ -126,7 +115,7 @@ RUN . /etc/environment_new && \
 RUN . /etc/environment_new && \
     ${PIP_INSTALL} pybind11 && \
     if [ "$TARGETARCH" = "arm64" ]; then \
-        ${PIP_INSTALL} https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ta/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl; \
+        ${PIP_INSTALL} https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com:443/Triton-ascend/3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl?AccessKeyId=HPUAAPJN7IAXFCS2GDSQ&Expires=1806290330&Signature=eRq3VKjwgP/tTkObtsho%2BzIsmJM%3D; \
     elif [ "$TARGETARCH" = "amd64" ]; then \
         ${PIP_INSTALL} https://github.com/triton-lang/triton-ascend/releases/download/v3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl; \
     else \
@@ -137,7 +126,6 @@ RUN . /etc/environment_new && \
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch ${SGLANG_TAG} /sgl-workspace/sglang && \
     cd /sgl-workspace/sglang/python && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && \
-    sed -i '/"memfabric-hybrid==1.1.4"/d; /"memfabric-zbal==1.1.2"/d' pyproject.toml && \
     ${PIP_INSTALL} -v -e .[all_npu]
 
 ENV ASCEND_HOME_PATH=/usr/local/Ascend/cann-${CANN_VERSION}
