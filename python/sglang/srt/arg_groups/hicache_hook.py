@@ -170,6 +170,10 @@ def resolve_layout_io_compatibility(server_args: Any):
 
 def resolve_storage_layout_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.hicache_storage_backend == "mooncake" and cfg.dcp_size > 1:
+        # DCP MLA pages support Mooncake multi-buffer transfers. Keep startup
+        # and runtime attachment on the same requested host layout.
+        return
     if (
         cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
         or cfg.hicache_mem_layout != "layer_first"

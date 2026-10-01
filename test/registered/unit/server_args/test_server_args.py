@@ -2155,6 +2155,42 @@ class TestHiCacheArgs(CustomTestCase):
                 "expected_mem_layout": "page_first_direct",
             },
             {
+                "name": "dcp_mooncake_layer_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_mem_layout": "layer_first",
+                    "hicache_io_backend": "kernel",
+                    "dcp_size": 2,
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "layer_first",
+            },
+            {
+                "name": "dcp_mooncake_page_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_mem_layout": "page_first",
+                    "hicache_io_backend": "kernel",
+                    "dcp_size": 2,
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "dcp_mooncake_page_first_direct",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_mem_layout": "page_first_direct",
+                    "hicache_io_backend": "direct",
+                    "dcp_size": 2,
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
                 "name": "fa3_kernel_with_explicit_decode_backend",
                 "overrides": {
                     "enable_hierarchical_cache": True,
@@ -2172,7 +2208,11 @@ class TestHiCacheArgs(CustomTestCase):
         for case in cases:
             with self.subTest(case=case["name"]):
                 args = self._make_args(**case["overrides"])
-                handle_hicache(args)
+                with patch(
+                    "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                    return_value=True,
+                ):
+                    handle_hicache(args)
                 self._assert_hicache_fields(
                     args,
                     expected_io_backend=case["expected_io_backend"],
