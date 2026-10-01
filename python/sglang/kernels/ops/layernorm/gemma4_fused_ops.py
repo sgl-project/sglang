@@ -12,6 +12,40 @@ import triton.language as tl
 
 
 @triton.jit
+def _gemma_residual_scalar_kernel(X, R, S, Y, N: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(X + offsets, offsets < N, other=0).to(tl.float32)
+    residual = tl.load(R + offsets, offsets < N, other=0).to(tl.float32)
+    scalar = tl.load(S).to(tl.float32)
+    # PyTorch materializes the BF16 addition before applying the layer scalar.
+    summed = (residual + x).to(tl.bfloat16).to(tl.float32)
+    tl.store(Y + offsets, (summed * scalar).to(tl.bfloat16), offsets < N)
+
+
+def gemma_residual_scalar(
+    x: torch.Tensor, residual: torch.Tensor, scalar: torch.Tensor
+) -> torch.Tensor:
+    """Fuse BF16 residual addition and scalar multiplication with both roundings."""
+    assert x.is_cuda and x.device == residual.device == scalar.device
+    assert x.dtype == residual.dtype == scalar.dtype == torch.bfloat16
+    assert x.is_contiguous() and residual.is_contiguous()
+    assert x.shape == residual.shape and scalar.numel() == 1
+    out = torch.empty_like(x)
+    if x.numel():
+        _gemma_residual_scalar_kernel[(triton.cdiv(x.numel(), 1024),)](
+            x,
+            residual,
+            scalar,
+            out,
+            x.numel(),
+            1024,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return out
+
+
+@triton.jit
 def _gemma_rmsnorm_residual_kernel(
     X_ptr,
     W_ptr,

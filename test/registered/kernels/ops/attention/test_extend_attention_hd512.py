@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.bidirectional_bmm_attention import (
+    _copy_bmm_output,
     bidirectional_bmm_attention,
 )
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
@@ -19,6 +20,28 @@ register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b
     "Exercises the data-center Blackwell HD512 launch configuration",
 )
 class TestExtendAttentionHD512(CustomTestCase):
+    def test_output_conversion_and_existing_buffer(self):
+        for m, d, padding in [(33, 256, 17), (256, 256, 0), (256, 512, 0)]:
+            with self.subTest(m=m, d=d, padding=padding):
+                source = torch.randn(16, m, d, device="cuda")
+                backing = torch.full(
+                    (m, 16 * d + padding), 123.0, device="cuda", dtype=torch.bfloat16
+                )
+                output = backing[:, : 16 * d].view(m, 16, d)
+                _copy_bmm_output(source, output)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = _copy_bmm_output(source, output)
+                for scale in (1.0, -10.0, 0.0):
+                    source.mul_(scale)
+                    graph.replay()
+                    self.assertEqual(actual.data_ptr(), output.data_ptr())
+                    torch.testing.assert_close(
+                        actual, source.bfloat16().transpose(0, 1), rtol=0, atol=0
+                    )
+                    if padding:
+                        self.assertTrue(bool((backing[:, 16 * d :] == 123).all()))
+
     def _check(self, prefix_lens, extend_lens, *, graph=False):
         torch.manual_seed(42)
         hq, hk, dim = 16, 2, 512
@@ -168,16 +191,29 @@ class TestExtendAttentionHD512(CustomTestCase):
                         (capacity + 7,), 2**30, device="cuda", dtype=torch.int64
                     )
                     indptr = torch.tensor([7, 7], device="cuda", dtype=torch.int32)
+                    output_buffer = torch.empty(
+                        canvas, 16, dim, device="cuda", dtype=torch.bfloat16
+                    )
 
                     def run():
                         return bidirectional_bmm_attention(
-                            q, k, v, pool_k, pool_v, indices, indptr, capacity, scale
+                            q,
+                            k,
+                            v,
+                            pool_k,
+                            pool_v,
+                            indices,
+                            indptr,
+                            capacity,
+                            scale,
+                            out=output_buffer,
                         )
 
                     run()
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
                         output = run()
+                    self.assertEqual(output.data_ptr(), output_buffer.data_ptr())
                     for prefix in sorted(
                         {
                             0,

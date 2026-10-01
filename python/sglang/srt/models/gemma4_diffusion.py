@@ -21,7 +21,10 @@ import torch
 from torch import nn
 from transformers import PreTrainedModel
 
-from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma_qkv_rmsnorm
+from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
+    gemma_qkv_rmsnorm,
+    gemma_residual_scalar,
+)
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -321,13 +324,25 @@ class DiffusionGemmaDecoderLayer(nn.Module):
         h2 = self.post_feedforward_layernorm_2(self.moe(moe_in, router_logits))
 
         hidden_states = self.post_feedforward_layernorm(h1 + h2)
-        hidden_states = residual + hidden_states
 
         scalar = (
             self.encoder_layer_scalar
             if not forward_batch.forward_mode.is_dllm_extend()
             else self.layer_scalar
         )
+        if (
+            forward_batch.forward_mode.is_dllm_extend()
+            and hidden_states.is_cuda
+            and hidden_states.dtype == residual.dtype == scalar.dtype == torch.bfloat16
+            and hidden_states.device == residual.device == scalar.device
+            and hidden_states.is_contiguous()
+            and residual.is_contiguous()
+            and hidden_states.shape == residual.shape
+            and scalar.numel() == 1
+            and torch.cuda.get_device_capability(hidden_states.device)[0] == 10
+        ):
+            return gemma_residual_scalar(hidden_states, residual, scalar)
+        hidden_states = residual + hidden_states
         return hidden_states * scalar
 
 

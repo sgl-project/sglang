@@ -110,10 +110,12 @@ def _denoiser_write_probabilities(
     TEMPERATURES,
     NORMALIZER,
     PROBABILITIES,
+    SOFT_PROBABILITIES,
     VOCAB: tl.constexpr,
     CANVAS: tl.constexpr,
     ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
+    WRITE_SOFT: tl.constexpr,
 ):
     row = tl.program_id(0)
     j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -125,13 +127,28 @@ def _denoiser_write_probabilities(
     ).to(tl.float32)
     p = tl.exp(tl.div_rn(raw, temp) - mx - logz)
     tl.store(PROBABILITIES + row.to(tl.int64) * VOCAB + j, p, mask=j < VOCAB)
+    if WRITE_SOFT:
+        tl.store(
+            SOFT_PROBABILITIES + row.to(tl.int64) * VOCAB + j,
+            p.to(tl.bfloat16),
+            mask=j < VOCAB,
+        )
 
 
-def denoiser_statistics(logits: torch.Tensor, temperatures: torch.Tensor):
+def denoiser_statistics(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    soft_probabilities: torch.Tensor | None = None,
+):
     """Return FP32 probabilities/entropy and raw-logit argmax for [B, M, V]."""
     assert logits.dtype == temperatures.dtype == torch.float32
     assert logits.is_contiguous() and temperatures.is_contiguous()
     assert logits.ndim == 3 and temperatures.shape == (logits.shape[0],)
+    if soft_probabilities is not None:
+        assert soft_probabilities.shape == logits.shape
+        assert soft_probabilities.dtype == torch.bfloat16
+        assert soft_probabilities.device == logits.device
+        assert soft_probabilities.is_contiguous()
     block = 4096
     batch, canvas, vocab = logits.shape
     rows = batch * canvas
@@ -172,10 +189,12 @@ def denoiser_statistics(logits: torch.Tensor, temperatures: torch.Tensor):
         temperatures,
         normalizer,
         probabilities,
+        soft_probabilities if soft_probabilities is not None else probabilities,
         vocab,
         canvas,
         rows,
         block,
+        soft_probabilities is not None,
         num_warps=4,
         enable_fp_fusion=False,
     )

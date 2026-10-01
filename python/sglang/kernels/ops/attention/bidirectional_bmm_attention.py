@@ -60,7 +60,38 @@ def _masked_softmax(
     tl.store(P + row * N + c, p, mask=c < N)
 
 
-def bidirectional_bmm_attention(q, k, v, pk, pv, ids, ptr, cap, scale=1.0):
+@triton.jit
+def _bmm_output_copy(
+    INPUT,
+    OUTPUT,
+    M: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    OUTPUT_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = x < M * H * D
+    d = x % D
+    h = x // D % H
+    m = x // (D * H)
+    value = tl.load(INPUT + (h * M + m) * D + d, valid, other=0)
+    tl.store(OUTPUT + m * OUTPUT_STRIDE + h * D + d, value.to(tl.bfloat16), valid)
+
+
+def _copy_bmm_output(source, output):
+    """Round FP32 head-major values into an existing BF16 token-major buffer."""
+    m, h, d = output.shape
+    assert source.is_contiguous() and source.numel() == output.numel()
+    assert source.dtype == torch.float32 and output.dtype == torch.bfloat16
+    assert output.stride(2) == 1 and output.stride(1) == d
+    _bmm_output_copy[(triton.cdiv(output.numel(), 2048),)](
+        source, output, m, h, d, output.stride(0), 2048, num_warps=4
+    )
+    return output
+
+
+def bidirectional_bmm_attention(q, k, v, pk, pv, ids, ptr, cap, scale=1.0, out=None):
     # K/V canvas and the last two pool dimensions must be contiguous. Q may
     # retain the token stride of a packed QKV projection.
     assert k.is_contiguous() and v.is_contiguous()
@@ -103,5 +134,8 @@ def bidirectional_bmm_attention(q, k, v, pk, pv, ids, ptr, cap, scale=1.0):
         triton.next_power_of_2(n),
         num_warps=4 if n <= 2048 else 16,
     )
-    out = torch.bmm(probs, vals, out_dtype=torch.float32).bfloat16()
-    return out.reshape(hq, m, d).transpose(0, 1).contiguous()
+    result = torch.bmm(probs, vals, out_dtype=torch.float32)
+    if out is None:
+        out = torch.empty((m, hq, d), device=q.device, dtype=q.dtype)
+    assert out.shape == (m, hq, d)
+    return _copy_bmm_output(result, out)

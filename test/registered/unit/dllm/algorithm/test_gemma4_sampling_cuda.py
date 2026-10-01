@@ -17,6 +17,39 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestGemma4SamplingCUDA(CustomTestCase):
+    def test_optional_bf16_statistics_output_graph_reuse(self):
+        from sglang.kernels.ops.sampling.denoiser_statistics import denoiser_statistics
+
+        for shape in [(2, 33, 65537), (1, 256, 262144)]:
+            with self.subTest(shape=shape):
+                logits = torch.randn(shape, device="cuda") * 10
+                temperatures = torch.linspace(0.4, 0.8, shape[0], device="cuda")
+                soft = torch.empty_like(logits, dtype=torch.bfloat16)
+                denoiser_statistics(logits, temperatures, soft)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = denoiser_statistics(logits, temperatures, soft)
+                for value in (1.0, -1.0, 0.0):
+                    logits.mul_(value)
+                    temperatures.copy_(temperatures.flip(0))
+                    graph.replay()
+                    expected = denoiser_statistics(logits, temperatures)
+                    for got, want in zip(actual, expected):
+                        torch.testing.assert_close(got, want, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        soft, expected[0].bfloat16(), rtol=0, atol=0
+                    )
+
+    def test_optional_bf16_statistics_fallback(self):
+        logits = torch.randn(1, 8, 257, device="cuda")
+        temperatures = torch.tensor([0.4], device="cuda")
+        soft = torch.full_like(logits, float("nan"), dtype=torch.bfloat16)
+        actual = _denoiser_statistics_cuda(logits, temperatures, soft)
+        expected = _denoiser_statistics_cuda(logits, temperatures)
+        for got, want in zip(actual, expected):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+        torch.testing.assert_close(soft, actual[0].bfloat16(), rtol=0, atol=0)
+
     def test_exponential_race_exact_ids_and_generator_state(self):
         for scale in (1.0, 10.0, 30.0):
             with self.subTest(scale=scale):

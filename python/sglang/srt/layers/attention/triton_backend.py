@@ -1849,7 +1849,7 @@ class TritonAttnBackend(AttentionBackend):
                 capture_capacity = get_dllm_bmm_capture_prefix_capacity()
                 if capture_capacity is not None:
                     prefix_capacity = min(prefix_capacity, capture_capacity)
-            result = bidirectional_bmm_attention(
+            bidirectional_bmm_attention(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
                 v.contiguous(),
@@ -1859,8 +1859,8 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indptr,
                 prefix_capacity,
                 scale=layer.scaling,
+                out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             )
-            o.copy_(result.view_as(o))
             return o
 
         self.extend_attention_fwd(
