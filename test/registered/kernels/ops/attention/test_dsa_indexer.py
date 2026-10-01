@@ -943,15 +943,25 @@ class TestDSAIndexer(CustomTestCase):
         self.assertEqual(indexer.layer_id, self.config["layer_id"])
 
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_paged_mqa_logits_fn")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_mqa_logits_fn")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn")
     @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
-    def test_forward_extend_mode(self, mock_act_quant, mock_deep_gemm):
+    def test_forward_extend_mode(
+        self,
+        mock_act_quant,
+        mock_resolve_metadata,
+        mock_resolve_mqa_logits,
+        mock_resolve_paged_mqa_logits,
+        mock_deep_gemm,
+    ):
         """Test indexer forward pass in extend mode."""
         if not self.supports_fp8:
             self.skipTest("FP8 requires Hopper GPU or newer")
 
         # Setup mocks
         mock_deep_gemm.get_num_sms.return_value = 132
-        mock_deep_gemm.get_paged_mqa_logits_metadata.return_value = MagicMock()
+        mock_resolve_metadata.return_value = MagicMock(return_value=MagicMock())
 
         def mock_quant(x, *args, **kwargs):
             # Return FP8 tensor and scale
@@ -972,7 +982,7 @@ class TestDSAIndexer(CustomTestCase):
                 num_queries, max_kv_len, dtype=torch.float32, device="cuda"
             )
 
-        mock_deep_gemm.fp8_mqa_logits.side_effect = mock_mqa_logits
+        mock_resolve_mqa_logits.return_value = mock_mqa_logits
 
         # Also mock the paged version for completeness
         def mock_paged_mqa_logits(q, kv, weights, *args, **kwargs):
@@ -980,7 +990,7 @@ class TestDSAIndexer(CustomTestCase):
             seq_len = 128
             return torch.randn(batch_size, seq_len, dtype=torch.float32, device="cuda")
 
-        mock_deep_gemm.fp8_paged_mqa_logits.side_effect = mock_paged_mqa_logits
+        mock_resolve_paged_mqa_logits.return_value = mock_paged_mqa_logits
 
         self._init_model_runner()
 
@@ -1025,15 +1035,23 @@ class TestDSAIndexer(CustomTestCase):
         )
 
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_paged_mqa_logits_fn")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn")
     @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
-    def test_forward_decode_mode(self, mock_act_quant, mock_deep_gemm):
+    def test_forward_decode_mode(
+        self,
+        mock_act_quant,
+        mock_resolve_metadata,
+        mock_resolve_paged_mqa_logits,
+        mock_deep_gemm,
+    ):
         """Test indexer forward pass in decode mode."""
         if not self.supports_fp8:
             self.skipTest("FP8 requires Hopper GPU or newer")
 
         # Setup mocks
         mock_deep_gemm.get_num_sms.return_value = 132
-        mock_deep_gemm.get_paged_mqa_logits_metadata.return_value = MagicMock()
+        mock_resolve_metadata.return_value = MagicMock(return_value=MagicMock())
 
         def mock_quant(x, *args, **kwargs):
             return x.to(torch.float8_e4m3fn), torch.ones(
@@ -1052,7 +1070,7 @@ class TestDSAIndexer(CustomTestCase):
             )
             return logits
 
-        mock_deep_gemm.fp8_paged_mqa_logits.side_effect = mock_paged_mqa_logits
+        mock_resolve_paged_mqa_logits.return_value = mock_paged_mqa_logits
 
         self._init_model_runner()
 
