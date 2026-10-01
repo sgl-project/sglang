@@ -280,14 +280,15 @@ def handle_data_parallelism(server_args: Any):
         )
     if _graph_pool_is_pausable(server_args):
         _disable_nccl_graph_buffer_registration(
-            "torch_memory_saver replaces the graph pool's physical memory on "
-            "release/resume and registered buffers keep the released pages"
+            "graph replay can hang once torch_memory_saver resume remaps the "
+            "graph pool, leaving the capture-time registrations on released pages"
         )
 
 
 def _graph_pool_is_pausable(server_args: Any) -> bool:
-    """Whether CUDA graphs are captured into the torch_memory_saver region
-    that `release_memory_occupation(tags=["cuda_graph"])` pauses."""
+    """Whether CUDA graphs are captured into torch_memory_saver memory, which
+    release/resume of the `cuda_graph` tag remaps to new physical pages at the
+    same virtual addresses."""
     return bool(
         resolving_view(server_args).enable_memory_saver
         and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
@@ -309,9 +310,10 @@ def _disable_nccl_graph_buffer_registration(reason: str) -> None:
     deployment; disabling the registration removes the hang while dedicated
     all-to-all buffers alone do not.
 
-    Registered buffers also hang the TP group when the graph pool is pausable:
-    torch_memory_saver resume maps new physical pages under the capture-time
-    registrations.
+    A pausable graph pool breaks the registrations too: torch_memory_saver
+    resume keeps the pool's virtual addresses but maps new physical pages,
+    while NCCL's capture-time registrations still point at the released pages,
+    so graph replay can hang (fzyzcjy/torch_memory_saver#88).
 
     Must run before the schedulers create their NCCL communicators, which
     inherit this environment. An explicit setting wins.
