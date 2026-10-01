@@ -2,10 +2,11 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     _resolve_fused_scale,
@@ -30,7 +31,7 @@ def _valid_rows(loc_2d: torch.Tensor, commit_lens: torch.Tensor):
     return src, dst
 
 
-def _eager_quantize(x: torch.Tensor, scale: float) -> torch.Tensor:
+def _eager_quantize(x: torch.Tensor, scale: float | torch.Tensor) -> torch.Tensor:
     result = x.clone()
     result.div_(scale)
     return result.to(fp8_dtype)
@@ -56,6 +57,90 @@ def _make_pool(
 
 
 class TestPrefixValidFp8Kernel(CustomTestCase):
+    def test_dflash_constructor_initializes_fp8_prefix_scales(self):
+        """A real FP8 draft must initialize scales and reach the fused writer."""
+        from transformers import LlamaConfig
+
+        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8KVCacheMethod
+        from sglang.srt.models.dflash import DFlashAttention
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        config = LlamaConfig(
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=64,
+            max_position_embeddings=128,
+        )
+        with (
+            get_context().override_server_args(tp_size=1),
+            get_parallel().override(tp_rank=0),
+        ):
+            with torch.device(DEVICE):
+                plain = DFlashAttention(config, layer_id=0).attn
+            self.assertIsNone(plain.quant_method)
+            self.assertIsNone(plain.k_scale)
+            self.assertIsNone(plain.v_scale)
+
+            for loaded_scales in (None, (0.625, 1.375)):
+                with self.subTest(loaded_scales=loaded_scales):
+                    with torch.device(DEVICE):
+                        layer = DFlashAttention(
+                            config, layer_id=0, quant_config=Fp8Config()
+                        ).attn
+                    self.assertIsInstance(layer.quant_method, Fp8KVCacheMethod)
+                    for scale in (layer.k_scale, layer.v_scale):
+                        self.assertIsInstance(scale, torch.nn.Parameter)
+                        self.assertTrue(scale.is_cuda)
+                        self.assertEqual(scale.dtype, torch.float32)
+                        self.assertEqual(scale.ndim, 0)
+                        self.assertEqual(scale.item(), -1.0)
+                    if loaded_scales is not None:
+                        with torch.no_grad():
+                            layer.k_scale.fill_(loaded_scales[0])
+                            layer.v_scale.fill_(loaded_scales[1])
+                    layer.quant_method.process_weights_after_loading(layer)
+                    factor = 2 if loaded_scales and is_fp8_fnuz() else 1
+                    expected_scales = tuple(
+                        value * factor for value in (loaded_scales or (1.0, 1.0))
+                    )
+                    self.assertEqual(
+                        (layer.k_scale_float, layer.v_scale_float), expected_scales
+                    )
+                    self.assertEqual(
+                        (layer.k_scale.item(), layer.v_scale.item()), expected_scales
+                    )
+
+                    pool = _make_pool(64, 8)
+                    loc = torch.tensor([[2, 5, -1]], device=DEVICE)
+                    lengths = torch.tensor([2], dtype=torch.int32, device=DEVICE)
+                    k = torch.linspace(-2, 2, 192, device=DEVICE).to(torch.bfloat16)
+                    k = k.view(3, 1, 64)
+                    v = k.flip(-1)
+                    before_k, before_v = k.clone(), v.clone()
+                    expected_k = pool.k_buffer[0].clone()
+                    expected_v = pool.v_buffer[0].clone()
+                    expected_k[[2, 5]] = _eager_quantize(k, layer.k_scale).view(
+                        torch.uint8
+                    )[:2]
+                    expected_v[[2, 5]] = _eager_quantize(v, layer.v_scale).view(
+                        torch.uint8
+                    )[:2]
+                    # The fused implementation and GPU stores run unmocked.
+                    with patch(
+                        "sglang.srt.mem_cache.memory_pool._set_kv_buffer_prefix_valid_impl",
+                        side_effect=AssertionError("FP8 draft took the eager fallback"),
+                    ):
+                        pool.set_kv_buffer_prefix_valid(
+                            layer, loc, lengths, k, v, layer.k_scale, layer.v_scale
+                        )
+                    self.assertTrue(torch.equal(pool.k_buffer[0], expected_k))
+                    self.assertTrue(torch.equal(pool.v_buffer[0], expected_v))
+                    self.assertTrue(torch.equal(k, before_k))
+                    self.assertTrue(torch.equal(v, before_v))
+
     def test_matches_eager_bytes_and_preserves_uncommitted_slots(self):
         """A fused register-only rewrite must preserve the eager FP8 bytes.
 
@@ -204,8 +289,8 @@ class TestPrefixValidFp8Kernel(CustomTestCase):
         k_before, v_before = k.clone(), v.clone()
         expected_k = pool.k_buffer[0].clone()
         expected_v = pool.v_buffer[0].clone()
-        expected_k[[2, 7]] = _eager_quantize(k, k_scale).view(torch.uint8)[:2]
-        expected_v[[2, 7]] = _eager_quantize(v, v_scale).view(torch.uint8)[:2]
+        expected_k[[2, 7]] = _eager_quantize(k, layer_k_scale).view(torch.uint8)[:2]
+        expected_v[[2, 7]] = _eager_quantize(v, layer_v_scale).view(torch.uint8)[:2]
 
         pool.set_kv_buffer_prefix_valid(
             layer,
@@ -221,6 +306,139 @@ class TestPrefixValidFp8Kernel(CustomTestCase):
         self.assertTrue(torch.equal(pool.v_buffer[0], expected_v))
         self.assertTrue(torch.equal(k, k_before))
         self.assertTrue(torch.equal(v, v_before))
+
+    def test_scale_kind_preserves_eager_division(self):
+        """GPU scalar divisors round differently from host scalars before division.
+
+        Compare against the original scale operands, including the BF16 0.1
+        counterexample. Mixed scale kinds must retain independent K/V semantics.
+        """
+        row_dim = 65
+        loc = torch.tensor([[2, -1, -1], [5, 1, -1]], device=DEVICE)
+        lengths = torch.tensor([1, 2], dtype=torch.int32, device=DEVICE)
+        src, dst = _valid_rows(loc, lengths)
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            for k_kind, v_kind in (
+                ("gpu", "gpu"),
+                ("gpu", "python"),
+                ("python", "gpu"),
+                ("cpu", "gpu"),
+                ("gpu", "cpu"),
+            ):
+                with self.subTest(dtype=dtype, k_kind=k_kind, v_kind=v_kind):
+                    pool = _make_pool(row_dim, 8)
+                    k_scale = torch.nn.Parameter(
+                        torch.tensor(0.1, dtype=torch.float32, device=DEVICE),
+                        requires_grad=False,
+                    )
+                    v_scale = torch.nn.Parameter(
+                        torch.tensor(0.3, dtype=torch.float32, device=DEVICE),
+                        requires_grad=False,
+                    )
+                    layer = SimpleNamespace(
+                        layer_id=0,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        k_scale_float=k_scale.item(),
+                        v_scale_float=v_scale.item(),
+                    )
+                    k_arg = {
+                        "gpu": k_scale,
+                        "python": layer.k_scale_float,
+                        "cpu": k_scale.cpu(),
+                    }[k_kind]
+                    v_arg = {
+                        "gpu": v_scale,
+                        "python": layer.v_scale_float,
+                        "cpu": v_scale.cpu(),
+                    }[v_kind]
+                    k = (
+                        torch.linspace(-2, 2, 6 * row_dim, device=DEVICE)
+                        .to(dtype)
+                        .view(6, 1, row_dim)
+                    )
+                    k[:, :, 0] = 0.0966796875
+                    v = k.flip(-1)
+                    before_k, before_v = k.clone(), v.clone()
+                    expected_k = pool.k_buffer[0].clone()
+                    expected_v = pool.v_buffer[0].clone()
+                    expected_k[dst] = _eager_quantize(k, k_arg).view(torch.uint8)[src]
+                    expected_v[dst] = _eager_quantize(v, v_arg).view(torch.uint8)[src]
+                    pool.set_kv_buffer_prefix_valid(
+                        layer, loc, lengths, k, v, k_arg, v_arg
+                    )
+                    self.assertTrue(torch.equal(pool.k_buffer[0], expected_k))
+                    self.assertTrue(torch.equal(pool.v_buffer[0], expected_v))
+                    self.assertTrue(torch.equal(k, before_k))
+                    self.assertTrue(torch.equal(v, before_v))
+
+    def test_gpu_scale_division_at_rounding_boundaries(self):
+        """Tensor division must preserve FP8 bytes even at rounding thresholds."""
+        loc = torch.tensor([[0]], dtype=torch.int64, device=DEVICE)
+        lengths = torch.tensor([1], dtype=torch.int32, device=DEVICE)
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            for value in (0.1, 0.3, 0.7, 1.3, 0.625, 1.375, 1e-4, 1e4):
+                with self.subTest(dtype=dtype, scale=value):
+                    scale = torch.nn.Parameter(
+                        torch.tensor(value, dtype=torch.float32, device=DEVICE),
+                        requires_grad=False,
+                    )
+                    if dtype == torch.float32:
+                        fp8 = (
+                            torch.arange(127, dtype=torch.uint8, device=DEVICE)
+                            .view(fp8_dtype)
+                            .float()
+                        )
+                        mid = (fp8[:-1] + fp8[1:]) * 0.5 * scale
+                        values = torch.stack(
+                            (
+                                torch.nextafter(
+                                    mid, torch.full_like(mid, -float("inf"))
+                                ),
+                                mid,
+                                torch.nextafter(
+                                    mid, torch.full_like(mid, float("inf"))
+                                ),
+                            )
+                        ).flatten()
+                        values = torch.cat((values, -values))
+                    else:
+                        # Every finite BF16/FP16 bit pattern, including subnormals.
+                        values = (
+                            torch.arange(65536, dtype=torch.int32, device=DEVICE)
+                            .to(torch.int16)
+                            .view(dtype)
+                        )
+                        values = values[torch.isfinite(values)]
+                    k = values.view(1, 1, -1)
+                    v = k.flip(-1)
+                    k_cache = torch.empty_like(k, dtype=fp8_dtype)
+                    v_cache = torch.empty_like(v, dtype=fp8_dtype)
+                    _set_kv_buffer_prefix_valid_impl_fp8(
+                        k,
+                        v,
+                        k_cache,
+                        v_cache,
+                        scale.item(),
+                        scale.item(),
+                        loc,
+                        lengths,
+                        k.shape[-1],
+                        k_scale_is_tensor=True,
+                        v_scale_is_tensor=True,
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            k_cache.view(torch.uint8),
+                            _eager_quantize(k, scale).view(torch.uint8),
+                        )
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            v_cache.view(torch.uint8),
+                            _eager_quantize(v, scale).view(torch.uint8),
+                        )
+                    )
 
     def test_gpu_tensor_without_float_shadow_preserves_eager_fallback(self):
         """An unresolved device scale must keep the tensor-aware eager path."""
@@ -327,6 +545,7 @@ class TestResolveFusedScale(CustomTestCase):
         """Only synchronization-free scalar forms may enter the fused kernel."""
         layer_scale = torch.tensor(0.5, dtype=torch.float32, device=DEVICE)
         unrelated_scale = torch.tensor(0.75, dtype=torch.float32, device=DEVICE)
+        vector_scale = layer_scale.view(1)
 
         cases = (
             (0.25, None, None, 0.25),
@@ -335,6 +554,8 @@ class TestResolveFusedScale(CustomTestCase):
             (layer_scale, layer_scale, 0.5, 0.5),
             (unrelated_scale, layer_scale, 0.5, None),
             (None, None, 0.5, None),
+            (vector_scale, vector_scale, 0.5, None),
+            (torch.tensor([0.5]), None, None, None),
         )
         for scale, owner, shadow, expected in cases:
             with self.subTest(

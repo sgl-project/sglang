@@ -282,6 +282,8 @@ def _set_kv_buffer_prefix_valid_impl_fp8(
     loc_2d: torch.Tensor,
     commit_lens: torch.Tensor,
     row_dim: int,
+    k_scale_is_tensor: bool = False,
+    v_scale_is_tensor: bool = False,
 ) -> None:
     if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
         return
@@ -328,6 +330,8 @@ def _set_kv_buffer_prefix_valid_impl_fp8(
         int(loc_2d.shape[1]),
         ROW_ELEMS=row_dim,
         ELEMS_PER_TILE=elems_per_tile,
+        K_SCALE_IS_TENSOR=k_scale_is_tensor,
+        V_SCALE_IS_TENSOR=v_scale_is_tensor,
         num_warps=num_warps,
         num_stages=2,
     )
@@ -343,13 +347,15 @@ def _resolve_fused_scale(
 
     if (
         isinstance(scale, torch.Tensor)
-        and scale.numel() == 1
+        and scale.ndim == 0
         and scale.device.type == "cpu"
     ):
         return float(scale.item())
 
     if (
-        scale is not None
+        isinstance(scale, torch.Tensor)
+        and scale.ndim == 0
+        and scale.is_cuda
         and scale is layer_scale
         and isinstance(layer_scale_float, (float, int))
     ):
@@ -3149,6 +3155,8 @@ class MHATokenToKVPool(KVCache):
                 loc_2d,
                 commit_lens,
                 row_dim=self.row_dim,
+                k_scale_is_tensor=isinstance(k_scale, torch.Tensor) and k_scale.is_cuda,
+                v_scale_is_tensor=isinstance(v_scale, torch.Tensor) and v_scale.is_cuda,
             )
             return
 

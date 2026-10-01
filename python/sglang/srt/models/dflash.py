@@ -316,6 +316,7 @@ class DFlashAttention(nn.Module):
             layer_id=layer_id,
             sliding_window_size=self.sliding_window_size,
             attn_type=self.attn_type,
+            quant_config=quant_config,
         )
 
     def forward_prepare_npu(self, positions, hidden_states):
