@@ -19,6 +19,12 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.mem_cache.hicache_rank_shard import (
+    KV,
+    RankShardSpec,
+    log_once,
+    shard_summary,
+)
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -82,10 +88,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         *,
         pool_label: str = "kv",
         is_dummy: bool = False,
+        rank_shard: Optional[RankShardSpec] = None,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self._is_dummy = is_dummy
+        # SGLANG_ENABLE_HICACHE_RANK_SHARD: this rank stores only its host layers.
+        self.rank_shard = None if is_dummy else rank_shard
 
         if is_dummy:
             self._init_dummy(
@@ -146,6 +155,34 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 buffer for pool in device_pools for buffer in pool.kv_buffer
             ]
         self._init_write_back_staging_buffers()
+        if self.rank_shard is not None:
+            # size_per_token sized the (shared) token capacity; bytes moved per
+            # token on this rank are only its own layers.
+            self.size_per_token = (
+                self.kv_cache_dim * self.dtype.itemsize * self.shard_layer_num
+            )
+            logger.info(
+                "HiCache rank shard: kv host pool on rank %d of %d holds %d of %d "
+                "layers per page, %d tokens (%.2f GB)",
+                self.rank_shard.rank,
+                self.rank_shard.size,
+                self.shard_layer_num,
+                self.layer_num,
+                self.size,
+                self.size * self.size_per_token / 1e9,
+            )
+
+    def rank_shard_summary(self) -> str:
+        return shard_summary("kv", self)
+
+    def rank_shard_exchange_rows(self, device_pool, layer_id, *, is_draft=False):
+        """(owner rank, device page rows) of one transfer layer to broadcast."""
+        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        buffer = device_pool.kv_buffer[0 if is_draft else layer_id]
+        rows = buffer.view(torch.uint8).view(
+            -1, self.page_size * self.token_stride_size
+        )
+        return self.rank_shard.owner(KV, host_layer_id), rows
 
     def _init_dummy(
         self,
@@ -239,6 +276,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.kv_lora_rank + self.qk_rope_head_dim
         )
         size_per_token = self.kv_cache_dim * self.dtype.itemsize * self.layer_num
+        self.shard_layer_num = self.layer_num
+        if self.rank_shard is not None:
+            spec = self.rank_shard
+            self.shard_host_layer_ids = spec.owned_layers(KV, self.layer_num)
+            self._shard_local_layer = {
+                h: i for i, h in enumerate(self.shard_host_layer_ids)
+            }
+            self.shard_layer_num = len(self.shard_host_layer_ids)
+            if not spec.keep_capacity:
+                # Same token capacity on every rank: size by the largest shard.
+                size_per_token = (
+                    self.kv_cache_dim
+                    * self.dtype.itemsize
+                    * spec.max_owned(KV, self.layer_num)
+                )
         if (
             self.layout == "page_first_kv_split"
             and self.device_pool.index_head_dim is not None
@@ -281,7 +333,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif self.layout == "page_first_direct":
             dims = (
                 self.page_num,
-                self.layer_num,
+                self.shard_layer_num,
                 self.page_size,
                 1,
                 self.kv_cache_dim,
@@ -374,7 +426,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
-        self.layout_dim = self.token_stride_size * self.layer_num
+        self.layout_dim = self.token_stride_size * self.shard_layer_num
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         buffer = alloc_func(
@@ -657,6 +709,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
+        if self.rank_shard is not None:
+            host_layer_id = self._shard_local_layer.get(host_layer_id)
+            if host_layer_id is None:
+                return  # another rank loads this layer; the exchange brings it
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -932,6 +988,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
+                if self.rank_shard is not None:
+                    device_kv_buffers = [
+                        device_kv_buffers[h] for h in self.shard_host_layer_ids
+                    ]
+                    log_once(
+                        "d2h-kv",
+                        "HiCache rank shard engaged: kv backups copy %d of %d layers "
+                        "per page on rank %d",
+                        self.shard_layer_num,
+                        self.layer_num,
+                        self.rank_shard.rank,
+                    )
                 for chunk_device_indices, chunk_host_indices in self.d2h_issue_chunks(
                     device_indices, host_indices, slots_per_page=self.page_size
                 ):
@@ -980,6 +1048,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        assert self.rank_shard is None, "rank-sharded host pool has no full pages"
         assert self.dcp_size == 1, (
             "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
             "need dcp_rank-scoped keys); --hicache-storage-backend with "
@@ -1012,6 +1081,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        assert self.rank_shard is None, "rank-sharded host pool has no full pages"
         if self.layout == "layer_first":
             self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
                 self.layer_num,

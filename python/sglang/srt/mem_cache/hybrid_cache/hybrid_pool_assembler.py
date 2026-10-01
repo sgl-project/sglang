@@ -140,6 +140,7 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
+    rank_shard: Any = None,
 ):
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
@@ -149,6 +150,8 @@ def build_kv_host_pool(
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if mtp_draft_device_pools:
         kwargs["mtp_draft_device_pools"] = mtp_draft_device_pools
+    if rank_shard is not None:
+        kwargs["rank_shard"] = rank_shard
     parallel = get_parallel()
     if parallel.dcp_enabled:
         assert use_mla, (
@@ -996,12 +999,19 @@ def build_anchor_sidecar_stack(
     mtp_draft_device_pools = tuple(
         pool for pool in params.mtp_draft_device_pools if pool.index_k_with_scale_buffer
     )
+    rank_shard = None
+    if use_mla and sidecar_pool_name == PoolName.INDEXER:
+        # SGLANG_ENABLE_HICACHE_RANK_SHARD (DSA: the indexer pool follows the anchor).
+        from sglang.srt.mem_cache.hicache_rank_shard import resolve_rank_shard_spec
+
+        rank_shard = resolve_rank_shard_spec(kv_pool)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        rank_shard=rank_shard,
     )
     sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool)
     # Expose packed MTP tail layers to the controller's flat transfer builder.

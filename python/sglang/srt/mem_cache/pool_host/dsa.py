@@ -15,6 +15,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
+from sglang.srt.mem_cache.hicache_rank_shard import INDEXER, log_once, shard_summary
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -74,6 +75,17 @@ class DSAIndexerPoolHost(HostKVCache):
         self.target_layer_num = self._effective_host_layer_num()
         self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
+        # SGLANG_ENABLE_HICACHE_RANK_SHARD follows the anchor: own host layers only.
+        self.rank_shard = None if is_dummy else anchor_host.rank_shard
+        self.shard_layer_num = self.layer_num
+        if self.rank_shard is not None:
+            self.shard_host_layer_ids = self.rank_shard.owned_layers(
+                INDEXER, self.layer_num
+            )
+            self._shard_local_layer = {
+                h: i for i, h in enumerate(self.shard_host_layer_ids)
+            }
+            self.shard_layer_num = len(self.shard_host_layer_ids)
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
@@ -88,10 +100,12 @@ class DSAIndexerPoolHost(HostKVCache):
         self.indexer_page_stride_size = (
             self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
         )
-        self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
+        self.indexer_layout_dim = self.indexer_page_stride_size * self.shard_layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
         self.size_per_token = (
-            self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
+            self.indexer_size_per_token
+            * self.shard_layer_num
+            * self.indexer_dtype.itemsize
         )
 
         self.can_use_jit = False
@@ -108,7 +122,9 @@ class DSAIndexerPoolHost(HostKVCache):
             self.clear()
             return
 
-        buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
+        buf_elem_size = (
+            self.page_num * self.shard_layer_num * self.indexer_page_stride_size
+        )
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
         available_bytes = host_memory_budget_bytes()
         if requested_bytes > available_bytes:
@@ -142,8 +158,21 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def get_size_per_token(self):
         return (
-            self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
+            self.indexer_size_per_token
+            * self.shard_layer_num
+            * self.indexer_dtype.itemsize
         )
+
+    def rank_shard_summary(self) -> str:
+        return shard_summary("indexer", self)
+
+    def rank_shard_exchange_rows(self, device_pool, layer_id, *, is_draft=False):
+        """(owner rank, device page rows) of one transfer layer to broadcast."""
+        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        buffer = device_pool.index_k_with_scale_buffer[0 if is_draft else layer_id]
+        rows = buffer.view(torch.uint8).view(buffer.shape[0], -1)
+        assert rows.shape[1] == self.indexer_page_stride_size, rows.shape
+        return self.rank_shard.owner(INDEXER, host_layer_id), rows
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
@@ -179,7 +208,7 @@ class DSAIndexerPoolHost(HostKVCache):
             self.index_k_with_scale_buffer = alloc_func(
                 (
                     self.indexer_page_num,
-                    self.layer_num,
+                    self.shard_layer_num,
                     1,
                     self.indexer_page_stride_size,
                 ),
@@ -249,6 +278,10 @@ class DSAIndexerPoolHost(HostKVCache):
         )
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        if self.rank_shard is not None:
+            host_layer_id = self._shard_local_layer.get(host_layer_id)
+            if host_layer_id is None:
+                return  # another rank loads this layer; the exchange brings it
         device_layer_id = 0 if is_draft else layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
@@ -424,11 +457,22 @@ class DSAIndexerPoolHost(HostKVCache):
                     page_size=1,
                 )
             elif self.layout == "page_first_direct":
+                src_buffers = self.packed_device_index_buffers
+                if self.rank_shard is not None:
+                    src_buffers = [src_buffers[h] for h in self.shard_host_layer_ids]
+                    log_once(
+                        "d2h-indexer",
+                        "HiCache rank shard engaged: indexer backups copy %d of %d "
+                        "layers per page on rank %d",
+                        self.shard_layer_num,
+                        self.layer_num,
+                        self.rank_shard.rank,
+                    )
                 for chunk_device_indices, chunk_host_indices in self.d2h_issue_chunks(
                     device_page_indices, host_page_indices, slots_per_page=1
                 ):
                     transfer_kv_all_layer_direct_lf_pf(
-                        src_ptrs=self.packed_device_index_buffers,
+                        src_ptrs=src_buffers,
                         dst_ptrs=[self.index_k_with_scale_buffer],
                         src_indices=chunk_device_indices,
                         dst_indices=chunk_host_indices,
@@ -440,6 +484,7 @@ class DSAIndexerPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        assert self.rank_shard is None, "rank-sharded host pool has no full pages"
         page_idx = int(index) // self.page_size
         if self.layout == "layer_first":
             data_page = self.index_k_with_scale_buffer[:, page_idx : page_idx + 1, :]
@@ -460,6 +505,7 @@ class DSAIndexerPoolHost(HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        assert self.rank_shard is None, "rank-sharded host pool has no full pages"
         page_idx = int(index) // self.page_size
         if self.layout == "layer_first":
             self.index_k_with_scale_buffer[:, page_idx : page_idx + 1, :] = (
