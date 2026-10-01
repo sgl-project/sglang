@@ -5,9 +5,10 @@ import torch
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=6, suite="stage-b-test-1-gpu-small-amd")
 
 
 def _reference_split(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):

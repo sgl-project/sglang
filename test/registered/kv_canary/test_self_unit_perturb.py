@@ -27,13 +27,16 @@ from sglang.srt.kv_canary.perturb.utils import (
     flip_first_byte_in_source,
     pick_target_group,
 )
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
+    add_unified_child,
     make_buffer_group,
     make_forward_batch,
-    make_radix_cache,
     make_req_to_token_pool,
+    make_unified_radix_cache,
+    make_unified_radix_chain,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -441,7 +444,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             outer_step_counter_getter=lambda: 10,
             sweep_interval=1,
         )
-        manager.attach_radix_cache(make_radix_cache([[], [3]], device=device))
+        manager.attach_radix_cache(make_unified_radix_chain([[3]], device=device))
 
         snapshot = source.tensor.clone()
         with (
@@ -462,9 +465,9 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
         """Verify unused-cache perturbation chooses only unlocked radix-cache slots."""
         device = DEFAULT_DEVICE
         group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
-        cache = make_radix_cache([[], [1, 2], [3]], device=device)
-        locked_node = next(iter(cache.root_node.children.values()))
-        locked_node.lock_ref = 1
+        cache = make_unified_radix_cache()
+        locked_node = add_unified_child(cache, [1, 2], lock_ref=1, device=device)
+        add_unified_child(cache, [3], parent=locked_node, device=device)
 
         with patch.object(torch, "randint", return_value=torch.tensor(0)):
             slot = real_kv_unused_cache_module._pick_sweep_slot_for_group(
@@ -482,7 +485,8 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
         group = make_buffer_group(
             kind=PoolKind.SWA, has_real_kv=True, swa_index_lut=lut
         )
-        cache = make_radix_cache([[], [1]], device=device)
+        cache = make_unified_radix_cache((ComponentType.FULL, ComponentType.SWA))
+        add_unified_child(cache, [1], swa_value=[1], device=device)
 
         with patch.object(torch, "randint", return_value=torch.tensor(0)):
             slot = real_kv_unused_cache_module._pick_sweep_slot_for_group(

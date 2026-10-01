@@ -8,6 +8,7 @@ import torch
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    deployment_attn_dp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -98,8 +99,8 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.require_mlp_tp_gather = require_mlp_tp_gather()
         self.require_mlp_sync = require_mlp_sync()
         self.require_attn_tp_gather = require_attn_tp_gather()
-        self.tp_size = self.model_runner.ps.tp_size
-        self.attn_dp_size = self.model_runner.ps.attn_dp_size
+        self.tp_size = self.model_runner.tp_size
+        self.attn_dp_size = deployment_attn_dp_size()
         self.pp_size = get_parallel().pp_size
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk
@@ -111,6 +112,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []
         self.enable_pdmux = False
         self.record_nolora_graph = False
+        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -247,8 +249,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
-        del forward, stream_idx, variant_label
+        del forward, stream_idx, variant_label, attention_variant
         buffers = self.buffers
         request_bs = size
         expanded_bs = request_bs * self.captured_req_width

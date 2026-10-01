@@ -1,0 +1,137 @@
+name: Publish Renderer Docker Image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v[0-9]+.*"]
+    paths:
+      - "rust/sglang-renderer/**"
+      - "rust/Cargo.toml"
+      - "rust/Cargo.lock"
+      - "rust/rust-toolchain.toml"
+      - "docker/renderer.Dockerfile"
+      - "LICENSE"
+      - ".github/workflows/release-docker-renderer.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.image.outputs.publish }}
+      repo: ${{ steps.image.outputs.repo }}
+      tag: ${{ steps.image.outputs.tag }}
+    steps:
+      - name: Select image destination
+        id: image
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$ ]]; then
+              echo "Skipping non-final release tag $GITHUB_REF_NAME"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "repo=lmsysorg/sglang" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}-renderer" >> "$GITHUB_OUTPUT"
+          else
+            echo "repo=lmsysorg/sglang-staging" >> "$GITHUB_OUTPUT"
+            echo "tag=renderer-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    environment: ${{ github.ref_type == 'tag' && 'prod' || null }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      IMAGE_REPO: ${{ needs.prepare.outputs.repo }}
+      IMAGE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run renderer tests
+        run: |
+          docker buildx build . -f docker/renderer.Dockerfile \
+            --platform ${{ matrix.platform }} --target test --progress=plain
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push by digest
+        run: |
+          BUILD_COMMIT=$(git rev-parse HEAD)
+          BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          docker buildx build . -f docker/renderer.Dockerfile \
+            --platform ${{ matrix.platform }} --target runtime --progress=plain \
+            --build-arg "SGLANG_BUILD_COMMIT=${BUILD_COMMIT}" \
+            --build-arg "SGLANG_BUILD_URL=${BUILD_URL}" \
+            --build-arg "SGLANG_IMAGE_TAG=${IMAGE_REPO}:${IMAGE_TAG}" \
+            --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file /tmp/renderer-metadata.json
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/renderer-metadata.json'))['containerimage.digest'])")
+          docker run --rm "${IMAGE_REPO}@${DIGEST}" --help
+          mkdir -p /tmp/renderer-digests
+          echo "$DIGEST" > "/tmp/renderer-digests/${{ matrix.arch }}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: renderer-digest-${{ matrix.arch }}
+          path: /tmp/renderer-digests/${{ matrix.arch }}
+          retention-days: 7
+
+  publish:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish == 'true'
+    environment: ${{ github.ref_type == 'tag' && 'prod' || null }}
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE_REPO: ${{ needs.prepare.outputs.repo }}
+      IMAGE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/renderer-digests
+          pattern: renderer-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish multi-architecture tag
+        run: |
+          AMD64_DIGEST=$(cat /tmp/renderer-digests/amd64)
+          ARM64_DIGEST=$(cat /tmp/renderer-digests/arm64)
+          docker buildx imagetools create \
+            -t "${IMAGE_REPO}:${IMAGE_TAG}" \
+            "${IMAGE_REPO}@${AMD64_DIGEST}" \
+            "${IMAGE_REPO}@${ARM64_DIGEST}"
+          docker buildx imagetools inspect "${IMAGE_REPO}:${IMAGE_TAG}"

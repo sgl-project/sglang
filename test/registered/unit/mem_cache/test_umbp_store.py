@@ -12,6 +12,7 @@ from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import mori.umbp  # noqa: F401
+import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -43,8 +44,9 @@ class MockHostKVCache:
         total_bytes = num_pages * 2 * element_size  # K+V for each page
         self._buffer = (ctypes.c_char * total_bytes)()
         self._buffer_ptr = ctypes.addressof(self._buffer)
-        self.kv_buffer = MagicMock()
-        self.kv_buffer.data_ptr.return_value = self._buffer_ptr
+        self.kv_buffer = torch.frombuffer(
+            self._buffer, dtype=torch.uint8, count=total_bytes
+        )
 
     def get_page_buffer_meta(self, indices):
         """Return (ptr_list, element_size_list) for MHA page_first layout.

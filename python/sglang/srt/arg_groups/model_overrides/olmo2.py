@@ -1,7 +1,4 @@
-"""Config-time override declarations for olmo2.
-
-Architectures: Olmo2ForCausalLM.
-"""
+"""Config-time override declarations for olmo2."""
 
 import logging
 from typing import Any, Dict

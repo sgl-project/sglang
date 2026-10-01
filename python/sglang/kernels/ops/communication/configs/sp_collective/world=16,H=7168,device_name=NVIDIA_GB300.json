@@ -1,0 +1,203 @@
+{
+  "source": {
+    "date": "2026-09-01",
+    "device": "NVIDIA GB300",
+    "nodes": 4,
+    "gpus_per_node": 4,
+    "push_slot_bytes": 33554432,
+    "raw_results": [
+      "world16-raw.json"
+    ]
+  },
+  "selection": {
+    "rule": "nearest global-token bucket at or below the workload",
+    "fallback": "nccl",
+    "note": "Fresh world-16 GB300 sweep. Each candidate was correctness-checked against NCCL; custom is selected only when its measured latency is strictly lower. Push candidates are limited to the default 256 KiB per-rank workspace. Attention-residual fusion was not tuned."
+  },
+  "configs": {
+    "reduce_scatter": {
+      "16": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 128
+      },
+      "32": {
+        "strategy": "push",
+        "num_blocks": 4,
+        "block_size": 512
+      },
+      "64": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "128": {
+        "strategy": "push",
+        "num_blocks": 16,
+        "block_size": 256
+      },
+      "256": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "512": {
+        "strategy": "pull",
+        "num_blocks": 32,
+        "block_size": 1024
+      },
+      "1024": {
+        "strategy": "pull",
+        "num_blocks": 96,
+        "block_size": 1024
+      },
+      "2048": {
+        "strategy": "pull",
+        "num_blocks": 96,
+        "block_size": 1024
+      },
+      "4096": {
+        "strategy": "pull",
+        "num_blocks": 32,
+        "block_size": 1024
+      },
+      "8192": {
+        "strategy": "pull",
+        "num_blocks": 64,
+        "block_size": 1024
+      },
+      "16384": {
+        "strategy": "pull",
+        "num_blocks": 32,
+        "block_size": 1024
+      }
+    },
+    "all_gather": {
+      "16": {
+        "strategy": "direct",
+        "num_blocks": 64,
+        "block_size": 1024
+      },
+      "32": {
+        "strategy": "push",
+        "num_blocks": 4,
+        "block_size": 256
+      },
+      "64": {
+        "strategy": "push",
+        "num_blocks": 32,
+        "block_size": 128
+      },
+      "128": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 256
+      },
+      "256": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 256
+      },
+      "512": {
+        "strategy": "direct",
+        "num_blocks": 1,
+        "block_size": 1024
+      },
+      "1024": {
+        "strategy": "direct",
+        "num_blocks": 1,
+        "block_size": 1024
+      },
+      "2048": {
+        "strategy": "direct",
+        "num_blocks": 1,
+        "block_size": 1024
+      },
+      "4096": {
+        "strategy": "direct",
+        "num_blocks": 1,
+        "block_size": 1024
+      },
+      "8192": {
+        "strategy": "direct",
+        "num_blocks": 1,
+        "block_size": 1024
+      },
+      "16384": {
+        "strategy": "direct",
+        "num_blocks": 8,
+        "block_size": 512
+      }
+    },
+    "reduce_scatter_attn_res": {
+      "16": {
+        "strategy": "separate"
+      },
+      "32": {
+        "strategy": "separate"
+      },
+      "64": {
+        "strategy": "separate"
+      },
+      "128": {
+        "strategy": "separate"
+      },
+      "256": {
+        "strategy": "separate"
+      },
+      "512": {
+        "strategy": "separate"
+      },
+      "1024": {
+        "strategy": "separate"
+      },
+      "2048": {
+        "strategy": "separate"
+      },
+      "4096": {
+        "strategy": "separate"
+      },
+      "8192": {
+        "strategy": "separate"
+      },
+      "16384": {
+        "strategy": "separate"
+      }
+    },
+    "attn_res_all_gather": {
+      "16": {
+        "strategy": "separate"
+      },
+      "32": {
+        "strategy": "separate"
+      },
+      "64": {
+        "strategy": "separate"
+      },
+      "128": {
+        "strategy": "separate"
+      },
+      "256": {
+        "strategy": "separate"
+      },
+      "512": {
+        "strategy": "separate"
+      },
+      "1024": {
+        "strategy": "separate"
+      },
+      "2048": {
+        "strategy": "separate"
+      },
+      "4096": {
+        "strategy": "separate"
+      },
+      "8192": {
+        "strategy": "separate"
+      },
+      "16384": {
+        "strategy": "separate"
+      }
+    }
+  }
+}

@@ -275,7 +275,7 @@ def cutlass_fused_experts_fp8(
     if swiglu_limit is None:
         silu_and_mul(c1, intermediate)
     else:
-        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
 
         silu_and_mul_clamp(c1, intermediate, swiglu_limit)
 

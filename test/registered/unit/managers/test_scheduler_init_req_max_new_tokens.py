@@ -2,8 +2,12 @@ import logging
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -16,7 +20,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
     Rules enforced when clipping a request's max_new_tokens:
       1. context: input_len + max_new_tokens < max_req_len
       2. admission budget (PrefillAdder):
-         ceil_page(input_len) + max_new_tokens + page_size < max_total_num_tokens
+         ceil_page(input_len) + max_new_tokens + page_size * shard_widening
+         < max_total_num_tokens * shard_widening
       3. env limit: <= SGLANG_MAX_NEW_TOKENS_LIMIT when set and positive
       4. never above the requested value
       5. min_new_tokens <= max_new_tokens afterwards
@@ -38,9 +43,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         cls._scheduler_logger.setLevel(cls._old_level)
 
     def setUp(self):
-        # The scheduler scales the budget by the live DCP size
-        # (`get_parallel().attn_dcp_size`), so the double states a topology
-        # rather than publishing a config it does not otherwise need.
+        # Tests use an unsharded topology unless they explicitly override it.
         cm = get_parallel().override(attn_dcp_size=1)
         cm.__enter__()
         self.addCleanup(cm.__exit__, None, None, None)
@@ -50,12 +53,24 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         max_req_len: int = 128,
         max_total_num_tokens: int = 1024,
         page_size: int = 1,
+        kv_shard_widening: int = 1,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
+        scheduler.kv_shard_widening = kv_shard_widening
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
+        scheduler.sliding_window_size = None
+        scheduler.chunked_prefill_size = None
+        scheduler.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+            size=max_total_num_tokens,
+            dtype=torch.int64,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        scheduler.token_to_kv_pool_allocator.page_size = page_size
         return scheduler
 
     def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):
@@ -76,6 +91,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
 
         input_len = len(req.origin_input_ids)
         page_size = scheduler.page_size
+        shard_widening = scheduler.kv_shard_widening
         paged_input_len = -(-input_len // page_size) * page_size
         limit = scheduler.max_new_tokens_limit
         limit_active = limit is not None and limit > 0
@@ -83,7 +99,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         def satisfies_rules(candidate: int) -> bool:
             context_ok = input_len + candidate < scheduler.max_req_len
             budget_ok = (
-                paged_input_len + candidate + page_size < scheduler.max_total_num_tokens
+                paged_input_len + candidate + page_size * shard_widening
+                < scheduler.max_total_num_tokens * shard_widening
             )
             limit_ok = not limit_active or candidate <= limit
             requested_ok = requested is None or candidate <= requested
@@ -144,6 +161,36 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 max_total_num_tokens - paged_input_len - page_size - 1,
             )
 
+    def test_dcp_budget_is_already_in_logical_tokens(self):
+        with get_parallel().override(attn_dcp_size=4):
+            scheduler = self._new_scheduler(max_total_num_tokens=24, page_size=4)
+            req = self._new_req(max_new_tokens=64, input_len=8)
+
+            self.assertEqual(self._init_and_check(scheduler, req), 11)
+
+    def test_sharded_budget_reserves_one_page_per_shard(self):
+        max_total_num_tokens, page_size, input_len, shard_widening = 8, 4, 8, 3
+        scheduler = self._new_scheduler(
+            max_req_len=128,
+            max_total_num_tokens=max_total_num_tokens,
+            page_size=page_size,
+            kv_shard_widening=shard_widening,
+        )
+        req = self._new_req(max_new_tokens=64, input_len=input_len)
+
+        max_new_tokens = self._init_and_check(scheduler, req)
+
+        widened_capacity = max_total_num_tokens * shard_widening
+        per_req_overhead = page_size * shard_widening
+        self.assertEqual(
+            max_new_tokens,
+            widened_capacity - input_len - per_req_overhead - 1,
+        )
+        self.assertLess(
+            input_len + max_new_tokens + per_req_overhead,
+            widened_capacity,
+        )
+
     def test_min_new_tokens_clamped_to_limit(self):
         with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):
             scheduler = self._new_scheduler()
@@ -179,6 +226,37 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                                         max_new_tokens=requested, input_len=input_len
                                     )
                                     self._init_and_check(scheduler, req)
+
+    def test_unified_budget_rounds_prompt_and_decode_together(self):
+        bundle = init_unified_swa_pools(
+            device="cpu",
+            kv_cache_dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            v_head_dim=4,
+            swa_head_num=1,
+            swa_head_dim=4,
+            swa_v_head_dim=4,
+            page_size=4,
+            start_layer=0,
+            end_layer=2,
+            swa_attention_layer_ids=[1],
+            full_attention_layer_ids=[0],
+            total_bytes=384,
+            enable_memory_saver=False,
+            need_sort=False,
+            lazy_compaction=True,
+        )
+        scheduler = self._new_scheduler(page_size=4)
+        scheduler.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
+        scheduler.sliding_window_size = 4
+        scheduler.chunked_prefill_size = 4
+        scheduler.max_new_tokens_limit = None
+        for prompt_len in (4, 5, 6, 7):
+            with self.subTest(prompt_len=prompt_len):
+                req = self._new_req(max_new_tokens=1, input_len=prompt_len)
+                scheduler.init_req_max_new_tokens(req)
+                self.assertEqual(req.sampling_params.max_new_tokens, 1)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,8 @@
 # ==============================================================================
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/multimodal/evs.py
 
+from array import array
+
 import torch
 
 
@@ -122,8 +124,7 @@ def tokens_per_frame(
 
 
 def replace_offsets_with_tokens_per_frame(
-    *,
-    pre_chunked_input_ids: list[int],
+    pre_chunked_input_ids: list[int] | array,
     num_tokens_per_frame: list[int],
     frame_offsets_inclusive: list[tuple[int, int]],
     filler_token_id: int,
@@ -157,12 +158,13 @@ def replace_offsets_with_tokens_per_frame(
     ...     filler_token_id=0,
     ... ) ==                      [0, 1, 4, 0, 0, 0, 0, 5, 9, 10]
     """
-    assert isinstance(pre_chunked_input_ids, list)
+    # Encoder metadata uses lists; model padding can replace it with packed tokens.
+    assert isinstance(pre_chunked_input_ids, (list, array))
     ids = pre_chunked_input_ids
 
     if len(frame_offsets_inclusive) == 1:
         """There might be no frame separators, in which case there will be one contiguous span of tokens"""
-        final = ids[0 : frame_offsets_inclusive[0][0]]
+        final = list(ids[0 : frame_offsets_inclusive[0][0]])
         frames = [filler_token_id] * sum(num_tokens_per_frame)
         final.extend(frames)
     else:

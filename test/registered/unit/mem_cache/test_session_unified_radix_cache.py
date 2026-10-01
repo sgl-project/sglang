@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -18,8 +19,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
 
@@ -83,34 +85,40 @@ def match_len(cache, token_ids) -> int:
 def register(cache, token_ids, session_id, generation=None):
     if generation is None:
         generation = cache.ensure_session_generation(session_id)
+    leaf = cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+    ).last_device_node
     cache.session_refs.register_session_ref(
         SimpleNamespace(
             session_id=session_id,
             session_generation=generation,
             session=None,
-            last_node=cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", token_ids)))
-            ).last_device_node,
             origin_input_ids=array("q", token_ids),
             output_ids=array("q"),
             extra_key=None,
-        )
+        ),
+        leaf=leaf,
     )
-
-
-class TestRadixCacheSessionRemoval(CustomTestCase):
-    def test_plain_radix_cache_does_not_enable_session_references(self):
-        cache = RadixCache(make_params(enable_session=True))
-
-        self.assertFalse(hasattr(cache, "enable_session_radix_cache"))
-        self.assertFalse(hasattr(cache, "register_session_ref"))
-        self.assertFalse(hasattr(cache, "open_radix_session"))
 
 
 class TestSessionUnifiedRadixCache(CustomTestCase):
     def setUp(self):
         self.cache = UnifiedRadixCache(make_params(enable_session=True))
         self.full = self.cache.components[ComponentType.FULL]
+
+    def test_explicit_rust_selection_uses_python_session_semantics(self):
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            cache = UnifiedRadixCache(make_params(enable_session=True))
+        self.assertEqual(cache._tree_core_backend, "python")
+        self.assertIsInstance(cache.tree_core, UnifiedTreeCore)
+        leaf = insert(cache, [1, 2, 3, 4])
+        generation = cache.open_radix_session("fallback")
+        register(cache, [1, 2, 3, 4], "fallback", generation)
+        full = cache.components[ComponentType.FULL]
+        self.assertEqual(full.session_ref(leaf), 1)
+        cache.release_radix_session("fallback")
+        self.assertEqual(full.session_ref(leaf), 0)
+        cache.sanity_check()
 
     def test_register_and_release_update_full_component_reference(self):
         leaf = insert(self.cache, [1, 2, 3, 4])

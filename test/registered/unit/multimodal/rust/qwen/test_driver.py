@@ -94,12 +94,16 @@ class TestNativeDriverErrorPaths(CustomTestCase):
         self.assertEqual(len(grids), 1)
         self.assertEqual(len(offsets), 1)
 
-    def test_missing_text_and_input_ids_rejected(self):
-        for input_ids in (None, []):
-            with self.subTest(input_ids=input_ids):
-                self.assert_rejected(
-                    input_ids, [image_bytes(80, 80)], "without text or input_ids"
-                )
+    def test_missing_input_ids_rejected(self):
+        """The driver never tokenizes: a prompt reaches it as ids (the
+        tokenizer pool runs first for text), so a request with no ids is
+        rejected at the binding when absent and by the driver when empty."""
+        self.assert_rejected(
+            None, [image_bytes(80, 80)], "native parity API requires input_ids"
+        )
+        self.assert_rejected(
+            [], [image_bytes(80, 80)], "multimodal request without input_ids"
+        )
 
     def test_image_free_request_rejected(self):
         self.assert_rejected(IMAGE_IDS, [], "image sources")

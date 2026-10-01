@@ -1,4 +1,4 @@
-"""Run the shared UnifiedRadixCache unit suite with the Rust TreeCore."""
+"""Run the shared suite requesting Rust, including centralized Python fallbacks."""
 
 import unittest
 
@@ -22,7 +22,7 @@ class RustBackendSuite(unittest.TestSuite):
 
 
 def load_tests(loader, standard_tests, pattern):
-    """Reuse the exact cache-level suite while swapping only its test factory."""
+    """Reuse the cache suite and its production backend compatibility resolver."""
     return RustBackendSuite(loader.loadTestsFromModule(shared_suite))
 
 

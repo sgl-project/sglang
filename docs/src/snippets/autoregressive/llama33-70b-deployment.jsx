@@ -8,7 +8,8 @@ export const Llama33Deployment = () => {
         { id: 'mi300x', label: 'MI300X', default: true },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
-        { id: 'xeon', label: 'XEON', default: false }
+        { id: 'xeon', label: 'XEON', default: false },
+        { id: 'arc_b', label: 'BMG', default: false }
       ]
     },
     quantization: {
@@ -35,7 +36,7 @@ export const Llama33Deployment = () => {
       ...options.quantization,
       items: options.quantization.items.map(item => ({
         ...item,
-        disabled: values.hardware === 'xeon' && item.id === 'fp8'
+        disabled: (values.hardware === 'xeon' && item.id === 'fp8') || (values.hardware === 'arc_b' && item.id !== 'bf16')
       }))
     }
   });
@@ -74,6 +75,9 @@ export const Llama33Deployment = () => {
       if (optionName === 'hardware' && value === 'xeon') {
         next.quantization = 'bf16';
       }
+      if (optionName === 'hardware' && value === 'arc_b') {
+        next.quantization = 'bf16';
+      }
       return next;
     });
   };
@@ -83,7 +87,7 @@ export const Llama33Deployment = () => {
     const { hardware, quantization, toolcall } = values;
 
     // Select model based on quantization
-    const modelPath = quantization === 'fp8' && hardware !== 'xeon'
+    const modelPath = quantization === 'fp8' && hardware !== 'xeon' && hardware !== 'arc_b'
       ? 'amd/Llama-3.3-70B-Instruct-FP8-KV'
       : 'meta-llama/Llama-3.3-70B-Instruct';
 
@@ -94,6 +98,9 @@ export const Llama33Deployment = () => {
       cmd += `  --device cpu \\\n`;
       cmd += `  --disable-overlap-schedule \\\n`;
       cmd += `  --tp 6`;
+    } else if (hardware === 'arc_b') {
+      cmd += `  --device xpu \\\n`;
+      cmd += `  --tp 8`;
     } else {
       cmd += `  --tp 1`;
     }

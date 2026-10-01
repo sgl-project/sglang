@@ -16,7 +16,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestPlatformPrefillCPDeprecation(CustomTestCase):
     def test_platform_cp_rejected_before_model_lookup(self):
-        for platform in ("is_hip", "is_npu", "is_musa"):
+        for platform in ("is_hip", "is_musa"):
             facts = dict(is_hip=False, is_npu=False, is_musa=False)
             facts[platform] = True
             for strategy in (None, "zigzag", "interleave"):
@@ -31,7 +31,7 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
                             validate_prefill_cp_platform(args)
 
     def test_context_parallel_handler_rejects_before_model_lookup(self):
-        for platform in ("is_hip", "is_npu", "is_musa"):
+        for platform in ("is_hip", "is_musa"):
             facts = dict(is_hip=False, is_npu=False, is_musa=False)
             facts[platform] = True
             with self.subTest(platform=platform), override_platform(**facts):
@@ -44,7 +44,7 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
                     handle_context_parallelism(args)
 
     def test_resolution_rejects_even_dummy_models(self):
-        for platform in ("is_hip", "is_npu", "is_musa"):
+        for platform in ("is_hip", "is_musa"):
             facts = dict(is_hip=False, is_npu=False, is_musa=False)
             facts[platform] = True
             for model_path in ("dummy", "none", "missing-model-must-not-be-loaded"):
@@ -59,7 +59,7 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
                             args.resolve_once()
 
     def test_non_cp_and_decode_cp_are_not_rejected(self):
-        for platform in ("is_hip", "is_npu", "is_musa"):
+        for platform in ("is_hip", "is_musa"):
             facts = dict(is_hip=False, is_npu=False, is_musa=False)
             facts[platform] = True
             for dcp_size in (1, 2):

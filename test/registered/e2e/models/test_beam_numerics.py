@@ -10,7 +10,6 @@ and the batch-one compiled decode path against the eager oracle.
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -212,15 +211,7 @@ class TestBeamNumerics(CustomTestCase):
                 moe_tp_rank=0,
                 moe_ep_size=1,
                 moe_ep_rank=0,
-            ),
-            patch("sglang.srt.layers.moe.topk.get_tp_group", new=lambda: group),
-            patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer.get_tp_group",
-                new=lambda: group,
-            ),
-            patch(
-                "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe.get_tp_group",
-                new=lambda: group,
+                tp_group=group,
             ),
             set_default_torch_dtype(torch.bfloat16),
             torch.device("cuda"),

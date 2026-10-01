@@ -154,6 +154,9 @@ def test_overrides_take_the_worker_pools_processor_clone():
 # explicitly so that adding a processor forces a decision instead of silently
 # leaving it at one-worker speed.
 _NO_WORKER_POOL_ROUTE = {
+    # Runs its own image preprocessing to keep the raw token ids the Engram
+    # hasher needs; the shared chain would re-tokenize them.
+    "deepseek_v41.py",
     "dots_note_omni.py",
     "inkling.py",
     "lightonocr.py",

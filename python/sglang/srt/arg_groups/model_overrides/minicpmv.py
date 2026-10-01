@@ -1,7 +1,4 @@
-"""Config-time override declarations for minicpmv.
-
-Architectures: MiniCPMV4_6ForConditionalGeneration.
-"""
+"""Config-time override declarations for minicpmv."""
 
 from typing import Any
 

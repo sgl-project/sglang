@@ -76,6 +76,9 @@ jobs:
       - name: Check cookbook authoring contracts
         run: node docs/scripts/check_cookbook_configs.mjs
 
+      - name: Test PR health action
+        run: node --test .github/actions/check-pr-test-health/action.test.cjs
+
       - name: Cache mint
         uses: actions/cache@v4
         with:

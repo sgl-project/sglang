@@ -51,6 +51,16 @@ runtime:
   decode_bootstrap_port: 9001
   lb_port: 8000
   mem_fraction_static: 0.90
+  # MTP captures three graphs where the non-MTP sibling captures one: target
+  # verify 6.53 GB, draft decode 7.71 GB, draft extend 1.76 GB. At the same
+  # 0.90 that leaves 11.46 GB free after init against the sibling's 25.07 GB.
+  # Concurrency 256 spends the rest, and the DSA metadata kernels, which Triton
+  # first loads onto the device mid-serving, have nothing left to load into.
+  # The module load fails as hipErrorLaunchOutOfResources and ROCr aborts the
+  # queues, killing the schedulers on TP2 and TP3. 0.85 returns about 10 GB on
+  # decode only; prefill and every other emitted value are unchanged.
+  wide_ep:
+    decode_mem_fraction_static: 0.85
   page_size: 256
   max_running_requests: 256
   chunked_prefill_size: 8192

@@ -45,10 +45,10 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_component_precision,
     resolve_decode_precision,
 )
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
 )
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
@@ -137,7 +137,11 @@ def _should_use_channels_last_3d(
     if component_type not in (
         "vae",
         "video_vae",
-    ) or not (current_platform.is_cuda() or current_platform.is_rocm()):
+    ) or not (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_xpu()
+    ):
         return False
 
     override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)

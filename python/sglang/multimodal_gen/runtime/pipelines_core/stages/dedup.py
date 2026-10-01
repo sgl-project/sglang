@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_cache_group
+
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -91,16 +93,19 @@ class StageDedupMixin:
 
         results: list[Req | None] = [None] * len(batches)
 
-        for _, group in self._group_requests_by_fingerprint(
+        groups = self._group_requests_by_fingerprint(
             batches, lambda batch: self.build_dedup_fingerprint(batch, server_args)
-        ):
-            first_index, first_batch = group[0]
-            first_result = self(first_batch, server_args)
-            results[first_index] = first_result
+        )
+        # a single computed request needs no group memo or cache-hit collective
+        with conditioning_cache_group(enabled=len(groups) > 1):
+            for _, group in groups:
+                first_index, first_batch = group[0]
+                first_result = self(first_batch, server_args)
+                results[first_index] = first_result
 
-            for index, batch in group[1:]:
-                copy_outputs(first_result, batch)
-                results[index] = batch
+                for index, batch in group[1:]:
+                    copy_outputs(first_result, batch)
+                    results[index] = batch
 
         return [result for result in results if result is not None]
 

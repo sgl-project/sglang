@@ -28,7 +28,7 @@ if _is_cuda:
         moe_sum_reduce_triton,
     )
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
-    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+    from sglang.kernels.ops.moe.virtual_experts import (
         _align_block_size_jit as moe_align_block_size,
     )
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (

@@ -41,16 +41,16 @@ def _accelerator_name() -> Optional[str]:
     return get_device_name()
 
 
-@lru_cache(maxsize=1)
-def _num_accelerators_per_dp_rank(
-    tp_size: int,
-    pp_size: int,
-    dp_size: int,
-    enable_dp_attention: bool,
-) -> int:
-    num_accelerators = tp_size * pp_size
-    if enable_dp_attention:
-        num_accelerators //= dp_size
+def _num_accelerators_per_dp_rank() -> int:
+    """Accelerators behind one DP rank.
+
+    Not cached: the arguments were the cache key, so an ``lru_cache`` here
+    would freeze the first answer past a post-publish override.
+    """
+    parallel = get_parallel()
+    num_accelerators = parallel.tp_size * parallel.pp_size
+    if parallel.enable_dp_attention:
+        num_accelerators //= parallel.dp_size
     return num_accelerators
 
 
@@ -145,11 +145,6 @@ async def get_loads(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": __version__,
         "accelerator": _accelerator_name(),
-        "num_accelerators": _num_accelerators_per_dp_rank(
-            get_parallel().tp_size,
-            get_parallel().pp_size,
-            get_parallel().dp_size,
-            get_parallel().enable_dp_attention,
-        ),
+        "num_accelerators": _num_accelerators_per_dp_rank(),
         "loads": loads,
     }

@@ -235,6 +235,7 @@ class _FakeQwenProcessor:
 
 def _text_encoding_stage(processor, encoder):
     stage = object.__new__(LingBotVideoTextEncodingStage)
+    stage._component_residency_manager = None
     stage.text_encoders = [encoder]
     stage.tokenizers = [processor]
     stage.token_length = 128

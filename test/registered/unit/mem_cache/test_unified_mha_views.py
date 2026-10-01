@@ -51,6 +51,7 @@ _ROW = _H * _D  # row elements
 _DTYPE = torch.bfloat16
 _ITEM = _DTYPE.itemsize
 _BLOCKS = 2 * _L
+_HAS_FP8 = hasattr(torch, "float8_e4m3fn")
 
 
 def _mha_spec(head_dim=_D, v_head_dim=None, layer_num=_L, grow="down"):
@@ -344,18 +345,29 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
             "envelope move did not relocate exactly the named pages",
         )
 
-    def test_transfer_entry_points_fail_loud(self):
-        """PD / CPU-copy entry points assume per-layer buffers indexed by TOKEN
-        id and would silently mis-index the row space, so each must raise."""
+    def test_prefix_valid_entry_point_fails_loud(self):
+        """Prefix-valid writes still assume token-major buffer indexing."""
         _, pool = _make_pool_and_kv(1)
         with self.assertRaises(NotImplementedError):
-            pool.get_contiguous_buf_infos()
-        with self.assertRaises(NotImplementedError):
-            pool.get_cpu_copy(torch.tensor([1]))
-        with self.assertRaises(NotImplementedError):
-            pool.load_cpu_copy(None, torch.tensor([1]))
-        with self.assertRaises(NotImplementedError):
             pool.set_kv_buffer_prefix_valid()
+
+    def test_pd_registration_is_one_whole_envelope(self):
+        """PD registers ONE region -- the whole raw buffer -- with the page
+        envelope as the item, so the transfer engine addresses it as
+        `raw_ptr + physical_page * page_envelope_bytes`. Per-layer regions
+        would be wrong here: the per-layer views overlap inside the envelope
+        and index in kernel-facing ids, not token ids."""
+        kv, pool = _make_pool_and_kv(1)
+        ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+        self.assertEqual(len(ptrs), 1)
+        self.assertEqual(len(lens), 1)
+        self.assertEqual(len(item_lens), 1)
+        self.assertEqual(ptrs[0], kv._raw.data_ptr())
+        self.assertEqual(lens[0], kv._raw.numel())
+        self.assertEqual(item_lens[0], pool._page_bytes)
+        # The whole addressable page range must fit the registered region, or
+        # the last page's write would run off the end of the RDMA mapping.
+        self.assertLessEqual(pool._num_pages * item_lens[0], lens[0])
 
     def test_hnd_env_cannot_hijack_layout(self):
         """SGLANG_USE_HND_KVCACHE must not flip this pool's layout: HND indexes
@@ -420,6 +432,36 @@ class TestFactoryViews(unittest.TestCase):
         self.assertEqual(b.token_to_kv_pool.full_kv_pool.k_buffer[0].dim(), 3)
         self.assertEqual(b.token_to_kv_pool.swa_kv_pool.k_buffer[0].dim(), 3)
         self.assertGreater(pool.view_tail_pad_bytes, 0)
+
+    @unittest.skipUnless(_HAS_FP8, "requires torch.float8_e4m3fn")
+    def test_swa_factory_preserves_fp8_logical_dtype(self):
+        from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+
+        b = init_unified_swa_pools(
+            device="cpu",
+            kv_cache_dtype=torch.float8_e4m3fn,
+            head_num=2,
+            head_dim=8,
+            v_head_dim=8,
+            swa_head_num=2,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
+            page_size=1,
+            start_layer=0,
+            end_layer=4,
+            swa_attention_layer_ids=[1, 3],
+            full_attention_layer_ids=[0, 2],
+            full_max_total_num_tokens=64,
+            swa_max_total_num_tokens=32,
+            enable_memory_saver=False,
+            need_sort=False,
+        )
+
+        self.assertEqual(b.token_to_kv_pool.dtype, torch.float8_e4m3fn)
+        for pool in (b.token_to_kv_pool.full_kv_pool, b.token_to_kv_pool.swa_kv_pool):
+            self.assertEqual(pool.dtype, torch.float8_e4m3fn)
+            self.assertEqual(pool.store_dtype, torch.uint8)
+            self.assertEqual(pool.k_buffer[0].dtype, torch.uint8)
 
     def test_rebind_emits_kernel_facing_full_and_build_derives_swa(self):
         """rebind_write_loc rebinds out_cache_loc to FULL-kernel-facing ids, and

@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 
 import eic
 import torch
@@ -145,12 +145,6 @@ class FlexibleKVCacheMemoryPool:
             )
             return
         self.free_data_addr.add(self.data_ptr_to_index[data_ptr])
-
-    def check_data_ptr_allocated(self, data_ptr):
-        return data_ptr in self.data_ptr_to_index
-
-    def left_count(self):
-        return len(self.free_data_addr)
 
 
 class EICStorage(HiCacheStorage):
@@ -434,16 +428,6 @@ class EICStorage(HiCacheStorage):
 
     def clear(self) -> None:
         return
-
-    # Not used for now
-    def _filter_kv_cache(self, total_len) -> Tuple[int, int]:
-        mean_len = total_len // self.world_size
-        remainder = total_len % self.world_size
-        tp_keys_len = mean_len + (1 if self.rank < remainder else 0)
-        start = self.rank * mean_len + min(self.rank, remainder)
-        end = start + tp_keys_len
-        logger.debug(f"start: {start}, end: {end}, tp_keys_len: {tp_keys_len}")
-        return start, end
 
     def zero_copy_batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
         logger.debug(f"eic zero copy set {len(keys)} keys")

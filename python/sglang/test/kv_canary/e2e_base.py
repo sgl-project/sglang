@@ -73,6 +73,12 @@ class CanaryE2EBase(CapturedServerE2EBase):
     # test methods send N sequential batches so the SWA allocator's full→swa index mapping
     # diverges from identity. Default 1 keeps MHA tests fast.
     workload_n_batches: ClassVar[int] = 1
+    # Default workload for send_parallel_requests, tuned for the CUDA-kernel canary
+    # path; a slower backend retunes its own subclass here instead of passing sizes at
+    # every call site.
+    default_parallel_n: ClassVar[int] = 8
+    default_max_new_tokens: ClassVar[int] = 2048
+    default_request_timeout: ClassVar[float] = 240.0
 
     _cfg: ClassVar[Optional[_ModeConfig]] = None
 
@@ -121,14 +127,24 @@ class CanaryE2EBase(CapturedServerE2EBase):
 
     def send_parallel_requests(
         self,
-        n: int = 8,
+        n: Optional[int] = None,
         *,
         assert_all_success: bool = True,
-        max_new_tokens: int = 2048,
-        timeout: float = 240.0,
+        max_new_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
         ignore_eos: Optional[bool] = None,
     ) -> list[dict]:
-        """Fan out n parallel /generate requests; return list of response dicts."""
+        """Fan out n parallel /generate requests; return list of response dicts.
+
+        Unset sizes fall back to the ``default_*`` class attributes, so a subclass can
+        retune the whole workload for its backend in one place.
+        """
+        if n is None:
+            n = self.default_parallel_n
+        if max_new_tokens is None:
+            max_new_tokens = self.default_max_new_tokens
+        if timeout is None:
+            timeout = self.default_request_timeout
         if ignore_eos is None:
             ignore_eos = self.model_mode == "swa"
         results = post_parallel_generate(

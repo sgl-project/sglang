@@ -11,10 +11,8 @@ from typing import (
 
 import torch
 
-from sglang.srt.sampling.sampling_observer import (
-    DeviceAuxiliaryOutput,
-    SamplingObserver,
-)
+from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
+from sglang.srt.sampling.sampling_observer import SamplingObserver
 
 
 @runtime_checkable

@@ -175,7 +175,6 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         scheduler.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(model_config=SimpleNamespace(context_len=4096))
         )
-        scheduler.ps = SimpleNamespace(gpu_id=0)
         scheduler.nccl_port = 0
         scheduler.spec_algorithm = SimpleNamespace(
             is_none=lambda: False,

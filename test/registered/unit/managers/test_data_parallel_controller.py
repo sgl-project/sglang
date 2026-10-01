@@ -1,16 +1,17 @@
 """DPBudget + DataParallelController dispatch tests.
 
-`total_tokens` (the most complex algorithm) is exercised end-to-end in
-test/registered/disaggregation/test_disaggregation_dp_attention.py; its
-tie-break on `total_requests` transitively covers that state.
+The e2e counterpart, over the real scheduler load-report path, is
+test/registered/disaggregation/test_disaggregation_dp_attention.py.
 
 Fragility: scheduler tests bypass `DataParallelController.__init__` via
 `__new__` and inject only the attrs the schedulers read (`workers`, `status`,
 `_active_workers`, `round_robin_counter`, `dp_budget`). Update `_make_controller`
 if a scheduler starts reading another attr. `maybe_external_dp_rank_routing`
-is exercised as the real method, no mock.
+is exercised as the real method, no mock. The refresh-throttle tests inject
+`load_snapshot_reader` and `_last_refresh_time` on top of those.
 """
 
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -277,6 +278,78 @@ class TestStatusAwarenessInconsistency(CustomTestCase):
         ctl.total_requests_scheduler(_req())
         # Current behaviour: still dispatches to the inactive worker.
         ctl.workers[2].send_pyobj.assert_called_once()
+
+
+class TestRefreshLoadBudgetThrottle(CustomTestCase):
+    @staticmethod
+    def _controller_with_reader(dp_size, snapshots):
+        ctl = _make_controller(dp_size)
+        ctl.load_snapshot_reader = MagicMock()
+        ctl.load_snapshot_reader.read_all.return_value = snapshots
+        return ctl
+
+    def test_throttled_refresh_spreads_a_burst_across_ranks(self):
+        idle = [_load(dp_rank=i, timestamp=1.0, num_total_tokens=0) for i in range(4)]
+        ctl = self._controller_with_reader(dp_size=4, snapshots=idle)
+        # A refresh stamp in the future keeps every call inside the window, so
+        # the burst runs entirely on speculative counters.
+        ctl._last_refresh_time = time.perf_counter() + 3600.0
+
+        for _ in range(8):
+            ctl.refresh_load_budget()
+            ctl.total_tokens_scheduler(_req(input_ids=[0] * 100))
+
+        ctl.load_snapshot_reader.read_all.assert_not_called()
+        self.assertEqual(
+            ctl.dp_budget.total_tokens,
+            [200, 200, 200, 200],
+            "speculative increments should spread the burst evenly",
+        )
+        for i, worker in enumerate(ctl.workers):
+            self.assertEqual(
+                worker.send_pyobj.call_count, 2, f"worker {i} should get 2 of 8 reqs"
+            )
+
+    def test_refresh_outside_window_overwrites_speculative_increments(self):
+        reported = [
+            _load(dp_rank=0, timestamp=2.0, num_total_tokens=10),
+            _load(dp_rank=1, timestamp=2.0, num_total_tokens=20),
+        ]
+        ctl = self._controller_with_reader(dp_size=2, snapshots=reported)
+        ctl._last_refresh_time = 0.0  # window has long passed
+        ctl.dp_budget.total_tokens = [999, 999]
+
+        ctl.refresh_load_budget()
+
+        ctl.load_snapshot_reader.read_all.assert_called_once()
+        self.assertEqual(
+            ctl.dp_budget.total_tokens,
+            [10, 20],
+            "a fresh snapshot must replace the speculative state",
+        )
+        self.assertGreater(ctl._last_refresh_time, 0.0)
+
+    def test_unchanged_snapshot_does_not_reset_the_burst(self):
+        frozen = [_load(dp_rank=i, timestamp=1.0, num_total_tokens=0) for i in range(2)]
+        ctl = self._controller_with_reader(dp_size=2, snapshots=frozen)
+        ctl._last_refresh_time = 0.0
+        ctl.refresh_load_budget()  # adopts timestamp 1.0
+
+        for _ in range(4):
+            ctl.total_tokens_scheduler(_req(input_ids=[0] * 50))
+        after_burst = list(ctl.dp_budget.total_tokens)
+
+        ctl._last_refresh_time = 0.0  # let the next refresh through the throttle
+        ctl.refresh_load_budget()  # same timestamp -> update_budget skips it
+
+        self.assertEqual(
+            after_burst, [100, 100], "burst should have spread over both ranks"
+        )
+        self.assertEqual(
+            ctl.dp_budget.total_tokens,
+            after_burst,
+            "a stale-timestamp snapshot must not wipe the speculative state",
+        )
 
 
 if __name__ == "__main__":

@@ -117,7 +117,9 @@ def _commit_disagg_handoff(
     replayed_boundary: bool = False,
 ) -> None:
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-    queue.scheduler = SimpleNamespace(batch_result_processor=processor)
+    queue.scheduler = SimpleNamespace(
+        batch_result_processor=processor, kv_checksum_computer=None
+    )
     queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
     queue.metadata_buffers = SimpleNamespace(
         get_buf=lambda _: (

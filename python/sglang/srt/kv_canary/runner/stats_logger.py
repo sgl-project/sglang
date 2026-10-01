@@ -24,7 +24,7 @@ class PeriodicCanaryStatsLogger:
         active_tags: tuple[CanaryLaunchTag, ...],
         outer_step_counter_getter: Callable[[], int],
         sweep_orchestrator: SweepOrchestrator,
-        d2h_stream: torch.cuda.Stream,
+        d2h_stream: torch.Stream,
     ) -> None:
         self._config = config
         self._device_state = device_state

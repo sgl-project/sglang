@@ -6,16 +6,14 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.ops.attention.dsv4 import (
-    linear_bf16_fp32,
-    triton_create_paged_compress_data,
-)
+from sglang.kernels.ops.attention.dsv4 import triton_create_paged_compress_data
 from sglang.kernels.ops.attention.dsv4.compress_old import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
 )
+from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
@@ -442,7 +440,6 @@ class Compressor(BaseFusedOp):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-
         kv_score = self._compute_wkv_gate(x)
 
         # CUDA path: delegate to backend

@@ -3,10 +3,6 @@ pub mod server;
 pub mod tokenizers;
 pub(crate) mod utils;
 
-pub mod proto {
-    tonic::include_proto!("sglang.runtime.v1");
-}
-
 use pyo3::prelude::*;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;

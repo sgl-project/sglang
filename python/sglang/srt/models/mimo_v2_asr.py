@@ -7,6 +7,7 @@ state_dict aligns 1:1 with ``self.named_parameters()``.
 """
 
 import logging
+from array import array
 from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
@@ -56,7 +57,7 @@ class MiMoV2ASRForCausalLM(MiMoForCausalLM, AudioEncoderMixin):
         super().__init__(config, quant_config=quant_config, prefix=prefix)
         self.build_audio_encoder(MiMoAudioEncoderConfig(**config.audio_config))
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

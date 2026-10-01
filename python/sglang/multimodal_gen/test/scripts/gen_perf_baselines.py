@@ -1,6 +1,7 @@
 import argparse
 import inspect
 import json
+import math
 import os
 import re
 import sys
@@ -137,6 +138,9 @@ def _run_case(case: DiffusionTestCase) -> dict:
         perf = PerformanceSummary.from_req_perf_record(
             rec, BASELINE_CONFIG.step_fractions
         )
+        for name, value in (("load", ctx.load_time_ms), ("E2E", perf.e2e_ms)):
+            if value is None or not (math.isfinite(value) and value > 0):
+                raise ValueError(f"{case.id}: {name} duration missing or invalid")
         if case.server_args.modality == "video" and sp.num_frames and sp.num_frames > 0:
             if "per_frame_generation" not in perf.stage_metrics:
                 perf.stage_metrics["per_frame_generation"] = perf.e2e_ms / sp.num_frames
@@ -147,6 +151,7 @@ def _run_case(case: DiffusionTestCase) -> dict:
                 str(k): round(v, 2) for k, v in perf.all_denoise_steps.items()
             },
             "expected_e2e_ms": round(perf.e2e_ms, 2),
+            "expected_load_ms": round(ctx.load_time_ms, 2),
             "expected_avg_denoise_ms": round(perf.avg_denoise_ms, 2),
             "expected_median_denoise_ms": round(perf.median_denoise_ms, 2),
         }

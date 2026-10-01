@@ -193,6 +193,39 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         self.assertEqual(config.steps_computation_policy, "static")
         self.assertEqual(config.num_inference_steps, 8)
 
+    def test_request_dmd_knobs_reach_cache_dit_config(self):
+        self.stage._maybe_enable_cache_dit(
+            8,
+            _batch(
+                enable_cache_dit=True,
+                cache_dit_params={
+                    "enable_dmd": True,
+                    "dmd_history": 8,
+                    "dmd_svd_precision": "high",
+                },
+            ),
+        )
+        (config,) = self.enable_calls
+        self.assertTrue(config.enable_dmd)
+        self.assertEqual(config.dmd_history, 8)
+        self.assertEqual(config.dmd_svd_precision, "high")
+        # untouched knobs keep their env defaults
+        self.assertEqual(config.dmd_rank, 0)
+
+    def test_secondary_inherits_request_primary_dmd(self):
+        self.stage._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
+            {"enable_dmd": True, "secondary": {"dmd_rank": 4}}
+        )
+        primary = self.stage._build_cache_dit_config(
+            10, steps_computation_mask=None, scm_policy="dynamic"
+        )
+        secondary = self.stage._build_cache_dit_config(
+            10, steps_computation_mask=None, scm_policy="dynamic", secondary=True
+        )
+        self.assertTrue(primary.enable_dmd)
+        self.assertTrue(secondary.enable_dmd)  # inherited from primary
+        self.assertEqual(secondary.dmd_rank, 4)
+
     def test_invalid_request_params_raise(self):
         with self.assertRaisesRegex(ValueError, "Unknown cache_dit_params keys"):
             self.stage._maybe_enable_cache_dit(

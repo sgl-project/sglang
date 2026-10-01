@@ -1,7 +1,4 @@
-"""Config-time override declarations for lfm2.
-
-Architectures: Lfm2ForCausalLM, Lfm2MoeForCausalLM.
-"""
+"""Config-time override declarations for lfm2."""
 
 from typing import Any
 

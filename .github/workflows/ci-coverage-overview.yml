@@ -63,10 +63,28 @@ jobs:
         run: |
           python scripts/ci/utils/ci_coverage_report.py --section by-suite
 
+  by-gpu-count:
+    name: Tests by GPU Count
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate Tests by GPU Count Report
+        run: |
+          python scripts/ci/utils/ci_coverage_report.py --section by-gpu-count
+
   unit-test-coverage:
     name: Unit Test Code Coverage
     runs-on: 1-gpu-h100
-    timeout-minutes: 30
+    # ~6 min install + ~22 min of tests, and the suite keeps growing
+    # (7.7k collected items in Aug, 11k now).
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -88,13 +106,19 @@ jobs:
           pip install -e "python/[test]"
 
       - name: Run unit tests with coverage
-        timeout-minutes: 10
+        # Non-gating on purpose: running the whole tree in one process
+        # cross-contaminates tests that CI proper runs one file per
+        # process. `| tee` used to hide that by accident; pipefail plus an
+        # explicit `|| echo` makes it deliberate and reports the counts.
+        timeout-minutes: 45
         run: |
+          set -o pipefail
           pytest test/registered/unit/ \
             --cov --cov-config=.coveragerc \
             --cov-report=term-missing:skip-covered \
             --continue-on-collection-errors \
-            -v | tee coverage_output.txt
+            -v | tee coverage_output.txt \
+            || echo "pytest exited $? -- reported below, not gating this job"
 
       - name: Write coverage to summary
         if: always()
@@ -106,7 +130,8 @@ jobs:
 
           # Test result line (e.g., "== 42 passed, 1 failed in 23.5s ==")
           echo '```' >> $GITHUB_STEP_SUMMARY
-          grep -E '^=+.*passed' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true
+          grep -E '^=+.*passed' coverage_output.txt >> $GITHUB_STEP_SUMMARY \
+            || echo "pytest did not reach its summary line (step killed or crashed)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           # Coverage total, reformatted
           awk '/^TOTAL / { for(i=1;i<=NF;i++) if($i~/^[0-9]+$/ || $i~/^[0-9]+%$/) a[++n]=$i; if(n>=3) printf "TOTAL   Stmts: %s   Miss: %s   Cover: %s\n", a[1], a[2], a[3] }' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true

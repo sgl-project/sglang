@@ -10,6 +10,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.ltx_audio import LTXAudioVAEConfig
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
 LATENT_DOWNSAMPLE_FACTOR = 4
@@ -868,6 +869,7 @@ class AutoencoderKLLTX2Audio(ParallelTiledVAE):
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder(x)
 
+    @cached_vae_encode
     def encode(self, x: torch.Tensor, return_dict: bool = True):
         if self.use_slicing and x.shape[0] > 1:
             encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]

@@ -32,8 +32,10 @@
 //   h_per_chunk is an optional preallocated per-chunk state output.
 //
 // Build (torch cpp_extension JIT):
-//   -O3 -std=c++20 -gencode arch=compute_103a,code=sm_103a -use_fast_math
-//   -lineinfo, link -lcuda (cuTensorMapEncodeTiled). sm_103a (GB300) only.
+//   -O3 -std=c++20 -gencode arch=compute_{100a,103a},code=sm_{100a,103a}
+//   (the device's arch) -use_fast_math -lineinfo, link -lcuda
+//   (cuTensorMapEncodeTiled). Only the tcgen05 cta_group::1 subset that sm_100a
+//   and sm_103a share is used, so both B200 and B300 run it.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -149,6 +151,9 @@ static __device__ __forceinline__ uint32_t ld_acq_b32(const uint32_t* ptr) {
 // read the published factor tensors via TMA)
 static __device__ __forceinline__ void fence_async_global() {
   asm volatile("fence.proxy.async.global;");
+}
+static __device__ __forceinline__ void fence_async_shared() {
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 }
 
 // ---- tcgen05 (TMEM lifecycle, ld/st, MMA, fences) ----
@@ -1524,6 +1529,7 @@ __device__ static void chain_body(
       // after the TMA through mb_pre)
       ptx::mbar_wait_parity(&S.mb_pre, q2 & 1);
       widen_map_tf32(bL, pL, vc, ch);
+      ptx::fence_async_shared();
       ptx::tcgen05_fence_before_thread_sync();
       __syncthreads();
       if (tid == 0) {
@@ -3175,7 +3181,7 @@ static CUtensorMap enc2dgb(void* ptr, uint64_t rows, uint64_t cols) {
 
 // Cached workspace, keyed by (device, T, nc_tot, H, npieces, N). The factor
 // tensors are torch allocations (caching allocator -> stream-safe reuse,
-// freed with the process). The CUDA tensor maps encode over these tensors'
+// freed when the cache is cleared). The CUDA tensor maps encode over these tensors'
 // data pointers, which are stable for the cache entry's lifetime — so the
 // maps are encoded ONCE here rather than per call (this IS the
 // (pointer, shape) tensor-map cache; a fresh encode is only host-cheap ~us,
@@ -3184,6 +3190,9 @@ static CUtensorMap enc2dgb(void* ptr, uint64_t rows, uint64_t cols) {
 // lower-triangular cells, the TMA-read upper cells must stay zero.
 // The gate map is the exception: g is a CALLER tensor, so its pointer is only
 // stable while the allocator hands back the same block. One-entry memo.
+// Serving sees a new (T, N) on almost every batch and an entry is ~400 MiB at
+// 16K tokens and 16 heads, so the cache is cleared at kMaxWorkspaces entries.
+constexpr size_t kMaxWorkspaces = 4;
 struct Workspace {
   torch::Tensor P, u0, kdec, qdec, aqk_h, aqk_l, gC, pieceL, piecec, pflags;
   torch::Tensor h0z;         // zeros initial state (lazy)
@@ -3316,11 +3325,12 @@ static Route pick_route(const std::vector<int64_t>& cu, int64_t T, int64_t H, bo
 
 static Workspace&
 get_workspace(const torch::Device& dev, int64_t T, int64_t nc, int64_t H, int64_t npieces, int64_t N) {
-  // guarded by the GIL (single writer); entries live for the process
+  // guarded by the GIL (single writer)
   static std::map<std::array<int64_t, 6>, Workspace> cache;
   const std::array<int64_t, 6> key{dev.index(), T, nc, H, npieces, N};
   auto it = cache.find(key);
   if (it != cache.end()) return it->second;
+  if (cache.size() >= kMaxWorkspaces) cache.clear();
   Workspace ws;
   const auto ob = torch::TensorOptions().dtype(torch::kBFloat16).device(dev);
   const auto of = torch::TensorOptions().dtype(torch::kFloat).device(dev);

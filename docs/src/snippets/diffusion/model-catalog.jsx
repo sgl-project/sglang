@@ -4,6 +4,16 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "Anima",
+      modelIds: ["circlestone-labs/Anima-Base-v1.0-Diffusers"],
+      cookbook: "/cookbook/diffusion/CircleStone/Anima",
+    },
+    {
+      name: "Ming-Image",
+      modelIds: ["inclusionAI/Ming-Image-0.1-Design", "inclusionAI/Ming-Image-0.1-Design-Layer"],
+      cookbook: "/cookbook/diffusion/inclusionAI/Ming-Image",
+    },
+    {
       name: "FLUX",
       modelIds: [
         "black-forest-labs/FLUX.1-dev",
@@ -24,6 +34,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "Qwen/Qwen-Image-2512",
       ],
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
+    },
+    {
+      name: "Qwen-Image 2.1",
+      modelIds: ["Qwen/Qwen-Image-2.1"],
+      cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
     },
     {
       name: "Qwen-Image Edit / Layered",
@@ -191,6 +206,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-4-step-distilled-preview",
     },
     {
+      name: "VDN-H3",
+      modelIds: ["OpenVDN/vdn-minimax-h3"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill",
+    },
+    {
       name: "MOVA",
       modelIds: ["OpenMOSS-Team/MOVA-360p", "OpenMOSS-Team/MOVA-720p"],
       note: "Resolved by the MOVA resolution detector.",
@@ -233,6 +253,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "nvidia/Cosmos3-Edge",
       ],
       cookbook: "/cookbook/diffusion/Cosmos/Cosmos3",
+    },
+    {
+      name: "FLUX 3 Action",
+      modelIds: ["black-forest-labs/flux-3-action-droid"],
+      cookbook: "/cookbook/vla/FLUX/FLUX-3-Action",
     },
     {
       name: "LingBotWorld",

@@ -66,6 +66,7 @@ class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
     env = {
         "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
+        "DEEPEP_HYBRID_DEPLOYMENT": "1",
         "HCCL_BUFFSIZE": "2100",
         "HCCL_OP_EXPANSION_MODE": "AIV",
         "TRANSFORMERS_VERBOSITY": "error",

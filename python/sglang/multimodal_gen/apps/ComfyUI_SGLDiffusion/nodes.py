@@ -10,6 +10,16 @@ import folder_paths
 import torch
 
 from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
+
+
+def _enable_gguf_in_diffusion_models() -> None:
+    """Let SGLDUNETLoader list ``.gguf`` DiTs. Quantization lives in the file."""
+    entry = folder_paths.folder_names_and_paths.get("diffusion_models")
+    if entry is not None and len(entry) >= 2 and isinstance(entry[1], set):
+        entry[1].add(".gguf")
+
+
+_enable_gguf_in_diffusion_models()
 from .utils import (
     convert_b64_to_tensor_image,
     convert_video_to_comfy_video,
@@ -25,7 +35,14 @@ class SGLDOptions:
             "required": {},
             "optional": {
                 "model_type": (
-                    ["auto-detect", "qwen_image", "qwen_image_edit", "flux", "lumina2"],
+                    [
+                        "auto-detect",
+                        "qwen_image",
+                        "qwen_image_edit",
+                        "flux",
+                        "lumina2",
+                        "minimax_h3",
+                    ],
                     {"default": "auto-detect"},
                 ),
                 "enable_torch_compile": (
@@ -61,6 +78,25 @@ class SGLDOptions:
                     "STRING",
                     {"default": ""},
                 ),
+                "dit_layerwise_offload": (
+                    "BOOLEAN",
+                    {"default": False},
+                ),
+                "enable_cache_dit": (
+                    "BOOLEAN",
+                    {"default": False},
+                ),
+                "quantization": (
+                    "STRING",
+                    {"default": ""},
+                ),
+                "transformer_weights_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                    },
+                ),
             },
         }
 
@@ -82,6 +118,10 @@ class SGLDOptions:
         dp_degree: int = 1,
         enable_cfg_parallel: bool = False,
         attention_backend: str = "",
+        dit_layerwise_offload: bool = False,
+        enable_cache_dit: bool = False,
+        quantization: str = "",
+        transformer_weights_path: str = "",
     ):
         """
         Build a dictionary of SGLang Diffusion runtime options.
@@ -89,7 +129,12 @@ class SGLDOptions:
         # Convert -1 to None for optional parameters (matching ServerArgs defaults)
         ulysses_degree = None if ulysses_degree == -1 else ulysses_degree
         ring_degree = None if ring_degree == -1 else ring_degree
+        tp_size = None if tp_size == -1 else tp_size
+        sp_degree = None if sp_degree == -1 else sp_degree
         attention_backend = None if attention_backend == "" else attention_backend
+        # dp_degree is a leftover alias; ServerArgs only has dp_size.
+        if dp_degree not in (None, 1) and dp_size in (None, 1):
+            dp_size = dp_degree
 
         options = {
             "model_type": model_type,
@@ -100,10 +145,20 @@ class SGLDOptions:
             "ulysses_degree": ulysses_degree,
             "ring_degree": ring_degree,
             "dp_size": dp_size,
-            "dp_degree": dp_degree,
             "enable_cfg_parallel": enable_cfg_parallel,
             "attention_backend": attention_backend,
+            "dit_layerwise_offload": dit_layerwise_offload,
         }
+        if enable_cache_dit:
+            options["enable_cache_dit"] = True
+        quantization = (quantization or "").strip()
+        if quantization:
+            options["quantization"] = quantization
+        transformer_weights_path = (transformer_weights_path or "").strip()
+        if transformer_weights_path:
+            # Same selector as `sglang serve --transformer-weights-path`:
+            # local .gguf, owner/repo/path/file.gguf, or owner/repo:QUANT.
+            options["transformer_weights_path"] = transformer_weights_path
 
         # Strip None to keep payload clean
         options = {k: v for k, v in options.items() if v is not None}
@@ -165,7 +220,7 @@ class SGLDLoraLoader:
 
 class SGLDUNETLoader:
     def __init__(self):
-        self.generator = SGLDiffusionGenerator()
+        self.generator = SGLDiffusionGenerator.shared()
 
     @classmethod
     def INPUT_TYPES(s):

@@ -62,7 +62,6 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
         merged_experts_fused_moe_lora_add,
     )
     from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
@@ -73,6 +72,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
         maybe_overlap_staged_shared_add,
     )
+    from sglang.srt.runtime_context import get_parallel
     from sglang.srt.utils.common import next_power_of_2
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
@@ -195,7 +195,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
             topk_weights=topk_weights,
         )
 
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
         direct_down_output = torch.empty(
             hidden_states.shape[0],
             hidden_states.shape[1],
@@ -365,13 +367,13 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
     from sglang.srt.layers.dp_attention import is_allocation_symmetric
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.runtime_context import get_parallel
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
         "experimental_sgl_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
@@ -464,7 +466,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
     )
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
         direct_down_output = torch.empty(
             hidden_states.shape[0],
             hidden_states.shape[1],
@@ -611,7 +615,6 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
@@ -622,6 +625,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
+    from sglang.srt.runtime_context import get_parallel
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
         "experimental_sgl_trtllm BF16 LoRA currently supports the gated SwiGLU path only."
@@ -720,7 +724,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
     elif routing_method_type == RoutingMethodType.DeepSeekV3:
         routing_method_type = RoutingMethodType.TopK
 
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
         direct_down_output = torch.empty(
             hidden_states.shape[0],
             hidden_states.shape[1],

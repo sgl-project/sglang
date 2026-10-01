@@ -2,14 +2,10 @@
 Unit tests for sglang.srt.constrained.base_grammar_backend.
 
 Test Coverage:
-- GrammarStats: default values, mutable default isolation
-- BaseGrammarObject: default behavior
-- InvalidGrammarObject: error message
 - BaseGrammarBackend: caching, dispatch routing, unsupported fallback,
   thread pool execution, cache hit/miss
 - create_grammar_backend: factory routing, "none" backend, invalid name,
   custom registry, reasoner wrapping
-- register_grammar_backend: registration and lookup
 
 Usage:
     python -m pytest test_base_grammar_backend.py -v
@@ -34,44 +30,6 @@ from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
-
-
-class TestGrammarStats(unittest.TestCase):
-    """Test GrammarStats dataclass."""
-
-    def test_defaults(self):
-        stats = GrammarStats()
-        self.assertIsNone(stats.compilation_time)
-        self.assertIsNone(stats.schema_count)
-        self.assertIsNone(stats.ebnf_size)
-        self.assertFalse(stats.is_cache_hit)
-        self.assertFalse(stats.is_grammar_aborted)
-        self.assertEqual(stats.tree_traversal_time, [])
-        self.assertIsNone(stats.dispatch_type)
-        self.assertEqual(stats.num_timeout, 0)
-
-    def test_tree_traversal_time_mutable_default(self):
-        """Ensure each instance gets its own list."""
-        s1 = GrammarStats()
-        s2 = GrammarStats()
-        s1.tree_traversal_time.append(0.1)
-        self.assertEqual(len(s2.tree_traversal_time), 0)
-
-
-class TestBaseGrammarObject(unittest.TestCase):
-    """Test BaseGrammarObject base class."""
-
-
-class TestInvalidGrammarObject(unittest.TestCase):
-    """Test InvalidGrammarObject."""
-
-    def test_default_error_message(self):
-        obj = InvalidGrammarObject()
-        self.assertEqual(obj.error_message, "Unknown grammar error")
-
-    def test_custom_error_message(self):
-        obj = InvalidGrammarObject("Regex compilation failed")
-        self.assertEqual(obj.error_message, "Regex compilation failed")
 
 
 class TestBaseGrammarBackend(unittest.TestCase):
@@ -206,24 +164,6 @@ class TestBaseGrammarBackend(unittest.TestCase):
         self.assertIsInstance(result2.result(timeout=5), InvalidGrammarObject)
 
 
-class TestRegisterGrammarBackend(unittest.TestCase):
-    """Test grammar backend registry."""
-
-    def setUp(self):
-        self._saved = dict(GRAMMAR_BACKEND_REGISTRY)
-
-    def tearDown(self):
-        GRAMMAR_BACKEND_REGISTRY.clear()
-        GRAMMAR_BACKEND_REGISTRY.update(self._saved)
-
-    def test_overwrite_registration(self):
-        register_grammar_backend("dup", lambda *a: "first")
-        register_grammar_backend("dup", lambda *a: "second")
-        self.assertEqual(
-            GRAMMAR_BACKEND_REGISTRY["dup"](None, None, None, None), "second"
-        )
-
-
 class TestCreateGrammarBackend(unittest.TestCase):
     """Test create_grammar_backend factory function."""
 
@@ -259,6 +199,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
             "enable_strict_thinking": enable_strict_thinking,
             "constrained_json_whitespace_pattern": None,
             "constrained_json_disable_any_whitespace": False,
+            "constrained_json_max_whitespace_cnt": None,
         }
         published.update(fields)
         self._publish(**published)
@@ -313,32 +254,6 @@ class TestCreateGrammarBackend(unittest.TestCase):
         # Custom backends return early, no reasoner wrapping applied
         self.assertIs(result, mock_inner)
 
-    @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
-    def test_outlines_backend(self, mock_outlines_cls):
-        mock_backend = MagicMock(spec=BaseGrammarBackend)
-        mock_outlines_cls.return_value = mock_backend
-        args = self._make_server_args(
-            "outlines", constrained_json_whitespace_pattern=r"\s*"
-        )
-
-        result = create_grammar_backend(args, "tok", 32000)
-        mock_outlines_cls.assert_called_once_with("tok", whitespace_pattern=r"\s*")
-        self.assertIs(result, mock_backend)
-
-    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
-    def test_xgrammar_backend(self, mock_xgrammar_cls):
-        mock_backend = MagicMock(spec=BaseGrammarBackend)
-        mock_xgrammar_cls.return_value = mock_backend
-        args = self._make_server_args(
-            "xgrammar", constrained_json_disable_any_whitespace=True
-        )
-
-        result = create_grammar_backend(args, "tok", 32000, {1, 2})
-        mock_xgrammar_cls.assert_called_once_with(
-            "tok", vocab_size=32000, model_eos_token_ids=[1, 2], any_whitespace=False
-        )
-        self.assertIs(result, mock_backend)
-
     @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
     def test_xgrammar_unsupported_tokenizer_falls_back_to_none(self, mock_xgrammar_cls):
         from sglang.srt.constrained.xgrammar_backend import TokenizerNotSupportedError
@@ -360,26 +275,6 @@ class TestCreateGrammarBackend(unittest.TestCase):
         # declaration on it, and the runtime fallback to "none" lives in the bag
         # (asserted above). The two are meant to differ here.
         self.assertEqual(resolution_result(server_args, "grammar_backend"), "xgrammar")
-
-    @patch("sglang.srt.constrained.llguidance_backend.GuidanceBackend")
-    def test_llguidance_backend(self, mock_guidance_cls):
-        mock_backend = MagicMock(spec=BaseGrammarBackend)
-        mock_guidance_cls.return_value = mock_backend
-        args = self._make_server_args(
-            "llguidance",
-            constrained_json_disable_any_whitespace=False,
-            constrained_json_whitespace_pattern=r"\s+",
-        )
-
-        result = create_grammar_backend(args, "tok", 32000, {1, 2})
-        mock_guidance_cls.assert_called_once_with(
-            tokenizer="tok",
-            any_whitespace=True,
-            whitespace_pattern=r"\s+",
-            n_vocab=32000,
-            eos_token_ids={1, 2},
-        )
-        self.assertIs(result, mock_backend)
 
     @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
     def test_reasoner_wrapping_on_builtin_backend(self, mock_outlines_cls):

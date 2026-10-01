@@ -13,7 +13,7 @@ from typing import Tuple
 
 import torch
 
-from sglang.kernels.ops.diffusion.ext.loader import load_extension_with_recovery
+from sglang.srt.utils.cpp_extension_loader import load_extension_with_recovery
 
 _abs_path = os.path.dirname(os.path.abspath(__file__))
 _custom_rasterizer_kernel = None

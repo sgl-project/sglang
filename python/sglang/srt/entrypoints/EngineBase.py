@@ -46,6 +46,16 @@ class EngineBase(ABC):
         pass
 
     @abstractmethod
+    def begin_weight_update(self, selector: str = "all"):
+        """Open a weight-update session; update_weights_from_* must run inside one."""
+        pass
+
+    @abstractmethod
+    def end_weight_update(self):
+        """Close the weight-update session and finalize quantized weights."""
+        pass
+
+    @abstractmethod
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],

@@ -1,7 +1,4 @@
-"""Config-time override declarations for minimax_m2.
-
-Architectures: MiniMaxM2ForCausalLM.
-"""
+"""Config-time override declarations for minimax_m2."""
 
 import logging
 from typing import Any

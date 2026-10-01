@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     MeshGenerationsRequest,
     MeshListResponse,
@@ -54,6 +55,7 @@ def _build_sampling_params_from_request(
     server_args = get_global_server_args()
     sampling_kwargs: Dict[str, Any] = {
         "request_id": request_id,
+        "task_type": ModelTaskType.I2M,
         "prompt": req.prompt,
         "num_frames": 1,
         "image_path": [image_path] if image_path else None,

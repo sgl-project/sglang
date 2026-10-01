@@ -33,6 +33,10 @@ from sglang.kernels.ops.attention.cute_utils import (
     fence_before_tma_store,
     simple_tma_copy,
 )
+from sglang.kernels.ops.attention.linear.tma import (
+    make_chunk_tma_args,
+    make_recurrent_state_tma_args,
+)
 
 
 class Sm100KdaChunkHKernel:
@@ -61,45 +65,6 @@ class Sm100KdaChunkHKernel:
         self.num_warps = 10
 
     @cute.jit
-    def _make_bf16_tma_args(
-        self,
-        tensor: cute.Tensor,
-        dim: cutlass.Constexpr[int],
-        op: cpasync.TmaCopyOp,
-        stages: cutlass.Constexpr[int],
-    ):
-        swizzle_128B = cute.make_swizzle(3, 4, 3)
-        slayout = cute.make_layout(
-            (self.BT, 1, (64, dim // 64), stages),
-            stride=(64, 0, (1, self.BT * 64), self.BT * dim),
-        )
-        slayout = cute.make_composed_layout(swizzle_128B, 0, slayout)
-        atom, tma_tensor = cpasync.make_tiled_tma_atom(
-            op,
-            cute.logical_divide(tensor, (None, None, 64)),
-            slayout,
-            cta_tiler=(self.BT, 1, dim),
-        )
-        return atom, tma_tensor, slayout
-
-    @cute.jit
-    def _make_h_tma_args(self, tensor: cute.Tensor, op: cpasync.TmaCopyOp):
-        num_elems = 128 // (tensor.element_type.width // 8)
-        swizzle_128B = cute.make_swizzle(3, 4, 3)
-        slayout = cute.make_layout(
-            (1, 1, self.V_dim, (num_elems, self.K_dim // num_elems)),
-            stride=(0, 0, num_elems, (1, self.V_dim * num_elems)),
-        )
-        slayout = cute.make_composed_layout(swizzle_128B, 0, slayout)
-        atom, tma_tensor = cpasync.make_tiled_tma_atom(
-            op,
-            cute.logical_divide(tensor, (None, None, None, num_elems)),
-            slayout,
-            cta_tiler=(1, 1, self.V_dim, self.K_dim),
-        )
-        return atom, tma_tensor, slayout
-
-    @cute.jit
     def __call__(
         self,
         K: cute.Tensor,  # KDA: this is `kg`, the per-channel pre-scaled key [T, Hv, K]
@@ -118,13 +83,13 @@ class Sm100KdaChunkHKernel:
         tma_g2s = cpasync.CopyBulkTensorTileG2SOp()
         tma_s2g = cpasync.CopyBulkTensorTileS2GOp()
 
-        K_args = self._make_bf16_tma_args(K, self.K_dim, tma_g2s, self.num_stages)
-        V_args = self._make_bf16_tma_args(V, self.V_dim, tma_g2s, self.num_stages)
-        W_args = self._make_bf16_tma_args(W, self.K_dim, tma_g2s, self.num_stages)
-        V_new_args = self._make_bf16_tma_args(V_new, self.V_dim, tma_s2g, 1)
-        H0_args = self._make_h_tma_args(h0, tma_g2s)
-        HT_args = self._make_h_tma_args(ht, tma_s2g)
-        H_args = self._make_h_tma_args(h, tma_s2g)
+        K_args = make_chunk_tma_args(K, self.K_dim, tma_g2s, self.num_stages, self.BT)
+        V_args = make_chunk_tma_args(V, self.V_dim, tma_g2s, self.num_stages, self.BT)
+        W_args = make_chunk_tma_args(W, self.K_dim, tma_g2s, self.num_stages, self.BT)
+        V_new_args = make_chunk_tma_args(V_new, self.V_dim, tma_s2g, 1, self.BT)
+        H0_args = make_recurrent_state_tma_args(h0, tma_g2s, self.K_dim, self.V_dim)
+        HT_args = make_recurrent_state_tma_args(ht, tma_s2g, self.K_dim, self.V_dim)
+        H_args = make_recurrent_state_tma_args(h, tma_s2g, self.K_dim, self.V_dim)
 
         # h0/ht may be the full state pool ([num_slots, ...]) rather than a
         # per-sequence gather, so the sequence count comes from cu_seqlens and

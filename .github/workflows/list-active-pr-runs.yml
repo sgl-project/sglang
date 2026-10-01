@@ -127,23 +127,23 @@ jobs:
           # Get unique PR numbers (exclude NO_PR entries)
           pr_numbers=$(cut -d'|' -f1 < "$pr_data_file" | grep -v '^NO_PR$' | sort -u || true)
 
-          # Separate high priority and normal PRs
-          high_priority_prs=()
+          # Separate highest-priority and normal PRs
+          highest_priority_prs=()
           normal_prs=()
 
           for pr_num in $pr_numbers; do
             labels=$(gh pr view "$pr_num" --repo "$REPO" --json labels \
               | jq -r '.labels[].name' 2>/dev/null || true)
 
-            if echo "$labels" | grep -Fxq "high priority"; then
-              high_priority_prs+=($pr_num)
+            if echo "$labels" | grep -Fxq "highest-priority"; then
+              highest_priority_prs+=($pr_num)
             else
               normal_prs+=($pr_num)
             fi
           done
 
-          # Combine: high priority first, then normal
-          sorted_pr_numbers=("${high_priority_prs[@]}" "${normal_prs[@]}")
+          # Combine: highest-priority first, then normal
+          sorted_pr_numbers=("${highest_priority_prs[@]}" "${normal_prs[@]}")
 
           pr_count=0
           total_running=0
@@ -170,8 +170,8 @@ jobs:
 
             # Add priority indicator
             priority_indicator=""
-            if echo "$pr_labels" | grep -q "high priority"; then
-              priority_indicator="🔴 [HIGH PRIORITY] "
+            if echo "$pr_info" | jq -e '[.labels[].name] | index("highest-priority")' >/dev/null; then
+              priority_indicator="🔴 [HIGHEST PRIORITY] "
             fi
 
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -24,6 +24,7 @@
 """Inference-only Qwen2-Audio model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
@@ -100,7 +101,7 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         )
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:

@@ -35,6 +35,17 @@ runtime:
   max_running_requests: 256
   chunked_prefill_size: 8192
   swa_full_tokens_ratio: 0.1
+  # At concurrency 256 seven of the eight decode ranks abort on the same RCCL
+  # kernel with HSA_STATUS_ERROR_OUT_OF_RESOURCES. The abort reports 112 GB
+  # free, but that is free device memory, not the resource that ran out: decode
+  # finishes init with 13.85 GB of headroom against the ~25 GB its passing
+  # siblings keep, and the draft model's extra streams and queues are allocated
+  # out of what is left. GPU_MAX_HW_QUEUES=8 was tried first and ruled out --
+  # the queue ids moved from 0/1 to 0/1/8, so it took effect, and the abort was
+  # unchanged. Every other MTP recipe on this hardware already runs decode at
+  # 0.85; this was the only one left at 0.90. Prefill is unchanged.
+  wide_ep:
+    decode_mem_fraction_static: 0.85
 
 # MTP / EAGLE speculative decoding (NextN head from the base model). Applied to
 # both prefill and decode. Flags mirror
