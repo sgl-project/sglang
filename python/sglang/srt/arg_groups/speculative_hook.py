@@ -580,6 +580,149 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
+def _handle_mamba_attn_hybrid(server_args: ServerArgs) -> None:
+    """Server-args handling for the H-Spec (mamba_attn_hybrid) drafter.
+
+    Mirrors the Ascend vLLM-side PR's contract: PP != 1 and DP/CP attention
+    are rejected, and the verify block size is inferred from the speculators
+    checkpoint config (`speculative_tokens + 1`) unless set explicitly.
+    """
+    cfg = resolving_view(server_args)
+    device_ok = cfg.device.startswith("cuda") or cfg.device == "npu"
+    if not device_ok:
+        raise ValueError(
+            "MAMBA_ATTN_HYBRID speculative decoding only supports CUDA or NPU "
+            f"devices, got device={cfg.device!r}."
+        )
+    if cfg.enable_dp_attention:
+        raise ValueError(
+            "Currently MAMBA_ATTN_HYBRID speculative decoding does not support "
+            "dp attention."
+        )
+    if cfg.attn_cp_size > 1:
+        raise ValueError(
+            "MAMBA_ATTN_HYBRID does not support context parallel topologies."
+        )
+    if cfg.pp_size != 1:
+        raise ValueError("MAMBA_ATTN_HYBRID does not support pipeline parallelism.")
+    if cfg.speculative_draft_model_path is None:
+        raise ValueError(
+            "MAMBA_ATTN_HYBRID speculative decoding requires setting "
+            "--speculative-draft-model-path."
+        )
+
+    if cfg.speculative_num_steps is None:
+        declare_resolution(
+            server_args,
+            "_handle_mamba_attn_hybrid",
+            speculative_num_steps=1,
+        )
+    elif int(cfg.speculative_num_steps) != 1:
+        logger.warning(
+            "MAMBA_ATTN_HYBRID only supports speculative_num_steps == 1; "
+            "overriding speculative_num_steps=%s to 1.",
+            cfg.speculative_num_steps,
+        )
+        declare_resolution(
+            server_args,
+            "_handle_mamba_attn_hybrid",
+            speculative_num_steps=1,
+        )
+
+    if cfg.speculative_eagle_topk is None:
+        declare_resolution(
+            server_args,
+            "_handle_mamba_attn_hybrid",
+            speculative_eagle_topk=1,
+        )
+    elif int(cfg.speculative_eagle_topk) != 1:
+        logger.warning(
+            "MAMBA_ATTN_HYBRID only supports speculative_eagle_topk == 1; "
+            "overriding speculative_eagle_topk=%s to 1.",
+            cfg.speculative_eagle_topk,
+        )
+        declare_resolution(
+            server_args,
+            "_handle_mamba_attn_hybrid",
+            speculative_eagle_topk=1,
+        )
+
+    if cfg.speculative_dflash_block_size is not None:
+        if int(cfg.speculative_dflash_block_size) <= 0:
+            raise ValueError(
+                "MAMBA_ATTN_HYBRID requires --speculative-dflash-block-size to "
+                f"be positive, got {cfg.speculative_dflash_block_size}."
+            )
+        declare_resolution(
+            server_args,
+            "_handle_mamba_attn_hybrid",
+            speculative_num_draft_tokens=int(cfg.speculative_dflash_block_size),
+        )
+
+    if cfg.speculative_num_draft_tokens is None:
+        inferred_block_size = None
+        try:
+            from sglang.srt.utils.hf_transformers_utils import get_config
+
+            draft_config_dict = get_config(
+                cfg.speculative_draft_model_path,
+                trust_remote_code=cfg.trust_remote_code,
+                revision=cfg.speculative_draft_model_revision,
+            ).to_dict()
+            methods = (draft_config_dict.get("speculators_config") or {}).get(
+                "proposal_methods"
+            ) or []
+            speculative_tokens = (methods[0] or {}).get("speculative_tokens")
+            if speculative_tokens is not None:
+                inferred_block_size = int(speculative_tokens) + 1
+        except Exception as e:
+            logger.warning(
+                "Failed to infer the MAMBA_ATTN_HYBRID block size from the "
+                "speculators draft config: %s",
+                e,
+            )
+        if inferred_block_size is None:
+            raise ValueError(
+                "MAMBA_ATTN_HYBRID could not infer the verify block size from "
+                "the speculators draft config; set "
+                "--speculative-num-draft-tokens (= 1 + drafted tokens) explicitly."
+            )
+        declare_resolution(
+            server_args,
+            "_handle_mamba_attn_hybrid",
+            speculative_num_draft_tokens=inferred_block_size,
+        )
+
+    if cfg.speculative_draft_window_size is not None:
+        raise ValueError(
+            "MAMBA_ATTN_HYBRID does not support --speculative-draft-window-size: "
+            "its attention sub-layers reuse the target KV pool in place, so the "
+            "draft has no separate windowed cache to compact."
+        )
+
+    if cfg.max_running_requests is None:
+        declare_resolution(
+            server_args,
+            "_handle_mamba_attn_hybrid",
+            max_running_requests=48,
+        )
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You "
+            "can override this by explicitly setting --max-running-requests."
+        )
+
+    if cfg.enable_mixed_chunk:
+        declare_resolution(
+            server_args,
+            "_handle_mamba_attn_hybrid",
+            enable_mixed_chunk=False,
+        )
+        logger.warning(
+            "Mixed chunked prefill is disabled because of using mamba_attn_hybrid "
+            "speculative decoding."
+        )
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")

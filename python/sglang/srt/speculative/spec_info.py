@@ -39,6 +39,7 @@ class SpeculativeAlgorithm(Enum):
     DFLASH = auto()
     UNO = auto()
     DSPARK = auto()
+    MAMBA_ATTN_HYBRID = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -123,8 +124,11 @@ class SpeculativeAlgorithm(Enum):
     def is_dspark(self) -> bool:
         return self == SpeculativeAlgorithm.DSPARK
 
+    def is_mamba_attn_hybrid(self) -> bool:
+        return self == SpeculativeAlgorithm.MAMBA_ATTN_HYBRID
+
     def is_dflash_family(self) -> bool:
-        return self.is_dflash() or self.is_dspark()
+        return self.is_dflash() or self.is_dspark() or self.is_mamba_attn_hybrid()
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -239,6 +243,7 @@ class SpeculativeAlgorithm(Enum):
         from sglang.srt.arg_groups.speculative_hook import (
             _handle_dflash,
             _handle_dspark,
+            _handle_mamba_attn_hybrid,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
@@ -257,6 +262,8 @@ class SpeculativeAlgorithm(Enum):
             _handle_uno(server_args)
         elif self.is_dspark():
             _handle_dspark(server_args)
+        elif self.is_mamba_attn_hybrid():
+            _handle_mamba_attn_hybrid(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
         elif self.is_eagle() or self.is_standalone():
@@ -314,6 +321,11 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
+
+        if self.is_mamba_attn_hybrid():
+            from sglang.srt.speculative.hspec_worker_v2 import HSpecWorkerV2
+
+            return HSpecWorkerV2
 
         if self.is_uno():
             from sglang.srt.speculative.uno_worker_v2 import UnoWorkerV2

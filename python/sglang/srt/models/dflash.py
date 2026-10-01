@@ -321,8 +321,11 @@ class DFlashAttention(nn.Module):
     def forward_prepare_npu(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.attn.layer_id == 0:
-            self.rotary_emb.get_cos_sin_with_position(positions)
+        # Each sublayer owns its rotary_emb instance; position_cos/sin are
+        # per-instance buffers, so every layer must refresh them for the
+        # current positions (a layer_id==0 guard leaves later sublayers with
+        # stale/None phases and breaks attention against the prefix KV).
+        self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
             qkv,
             self.rotary_emb.position_sin,
