@@ -104,6 +104,7 @@ class CaptureCohortService:
         self.wake = threading.Event()
         self.records: dict[str, CaptureHandle] = {}
         self.stopping = False
+        self.admission_ready = True
         self.error: Exception | None = None
         self.thread: threading.Thread | None = None
         shape = (allocator.config.max_inflight_samples + 1, STATE_COLUMNS)
@@ -125,7 +126,12 @@ class CaptureCohortService:
     def claim(self, request_sha256: str) -> CaptureTicket | None:
         fingerprint = msgspec.convert(request_sha256, type=Digest)
         with self.lock:
-            if self.allocator.rank != 0 or self.stopping or self.error is not None:
+            if (
+                self.allocator.rank != 0
+                or self.stopping
+                or self.error is not None
+                or not self.admission_ready
+            ):
                 return None
             now = time.monotonic()
             for handle in self.records.values():
@@ -146,6 +152,14 @@ class CaptureCohortService:
                     self.wake.set()
                     return ticket
         return None
+
+    def set_admission_ready(self, ready: bool):
+        """Pause new tickets until every rank's writer/supervisor is ready."""
+        if type(ready) is not bool:
+            raise ContractError("admission readiness must be boolean")
+        with self.lock:
+            self.admission_ready = ready
+            self.wake.set()
 
     def bind(self, ticket: CaptureTicket, request_sha256: str) -> CaptureHandle | None:
         ticket = msgspec.convert(msgspec.to_builtins(ticket), type=CaptureTicket)
@@ -341,6 +355,7 @@ class CaptureCohortService:
             now = time.monotonic()
             self.frame.zero_()
             self.frame[0, 0] = int(self.stopping)
+            self.frame[0, 1] = int(self.admission_ready)
             ledger = []
             for index, handle in enumerate(self.records.values(), start=1):
                 cohort = handle.cohort
@@ -433,6 +448,7 @@ class CaptureCohortService:
                     handle.ticket is None
                     and handle.invalid_reason is None
                     and not self.stopping
+                    and all(frame[0][1] for frame in frames)
                 )
 
         for index, handle in enumerate(handles, start=1):

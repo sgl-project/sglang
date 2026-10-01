@@ -20,7 +20,7 @@ from sglang.srt.training_capture.protocol import (
     digest_bytes,
 )
 
-_VERSION = 3
+_VERSION = 4
 _LEASE_BYTES = 4096
 STATE_COLUMNS = 14
 _PHASES = (

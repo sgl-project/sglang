@@ -309,6 +309,12 @@ def bind_rank_target_contract(
             "model/tokenizer artifacts differ from the configured immutable revisions"
         )
     processor = model.logits_processor
+    if (
+        tp_size > 1
+        and pp_rank == pp_size - 1
+        and not getattr(processor, "do_tensor_parallel_all_gather", False)
+    ):
+        raise ContractError("teacher capture requires global TP logits before sampling")
     transform = canonical_bytes(
         {
             "logit_scale": processor.logit_scale,

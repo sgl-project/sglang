@@ -52,6 +52,7 @@ from sglang.srt.training_capture.topology import plan_capture_layout
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.training_capture_catalog import TestCaptureCatalog
+from sglang.test.training_capture_cohort_runtime import cohort_runtime_worker
 from sglang.test.training_capture_partition import (
     make_cohort_context,
     make_partitioned_snapshot,
@@ -753,6 +754,106 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                     )
                     print("Writer actors: " + reader.stdout, flush=True)
                 self.assertFalse(catalog.errors)
+        finally:
+            for worker in workers:
+                if worker.pid is not None and worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+                    if worker.is_alive():
+                        worker.kill()
+                        worker.join(timeout=5)
+            catalog.close()
+            store.close()
+
+    @unittest.skipUnless(dist.is_gloo_available(), "Gloo required")
+    def test_cohort_collectors_preserve_worker_data_and_committed_history(self):
+        store = connect(self.master_address, segment_bytes=64 << 20)
+        catalog = TestCaptureCatalog()
+        workers = []
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                context = mp.get_context("spawn")
+                workers = [
+                    context.Process(
+                        target=cohort_runtime_worker,
+                        args=(rank, root, self.master_address, catalog.endpoint),
+                    )
+                    for rank in range(4)
+                ]
+                for worker in workers:
+                    worker.start()
+                deadline = time.monotonic() + 180
+                for worker in workers:
+                    worker.join(timeout=max(0, deadline - time.monotonic()))
+                self.assertEqual([worker.exitcode for worker in workers], [0] * 4)
+                results = [
+                    json.loads((Path(root) / f"rank-{rank}.json").read_bytes())
+                    for rank in range(4)
+                ]
+                expected_states = {
+                    row["capture_id"]: row["expected"]
+                    for case in results[0]
+                    for row in case["samples"]
+                }
+                for rank_results in results:
+                    self.assertEqual(
+                        {
+                            row["capture_id"]: row["expected"]
+                            for case in rank_results
+                            for row in case["samples"]
+                        },
+                        expected_states,
+                    )
+                    for case in rank_results:
+                        writer = case["stats"]["cohort_writer"]
+                        self.assertTrue(writer["stopping"])
+                        self.assertEqual(writer["pending"], 0)
+                        self.assertIsNone(writer["error"])
+                publications = catalog.wait_publications(9)
+                self.assertEqual(len(catalog.publications), 9)
+                for capture_id, state in expected_states.items():
+                    self.assertEqual(catalog.captures[capture_id]["state"], state)
+                base, expected = make_snapshot(response_length=4)
+                for publication in publications:
+                    manifest, actual = read_snapshot(store, publication)
+                    for obj in base.objects:
+                        observed = actual[obj.name]
+                        if obj.kind == "kv":
+                            observed = observed[obj.token_range[0] : obj.token_range[1]]
+                        torch.testing.assert_close(
+                            observed, expected[obj.key], rtol=0, atol=0
+                        )
+                    print(
+                        f"Cohort collector: {manifest.dataset_id} "
+                        f"objects={len(manifest.objects)} "
+                        f"tensor_bytes={manifest.total_tensor_bytes}",
+                        flush=True,
+                    )
+                reader = subprocess.run(
+                    [
+                        sys.executable,
+                        __file__,
+                        "--reader",
+                        "--master",
+                        self.master_address,
+                        "--manifest-key",
+                        publications[0]["manifest_key"],
+                        "--manifest-size",
+                        str(publications[0]["manifest_nbytes"]),
+                        "--manifest-sha256",
+                        publications[0]["manifest_sha256"],
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertEqual(reader.returncode, 0, reader.stdout + reader.stderr)
+                self.assertIn('"validated_tensor_bytes": 4532', reader.stdout)
+                self.assertFalse(catalog.errors)
+                print(
+                    "Cohort collector independent reader: " + reader.stdout, flush=True
+                )
         finally:
             for worker in workers:
                 if worker.pid is not None and worker.is_alive():

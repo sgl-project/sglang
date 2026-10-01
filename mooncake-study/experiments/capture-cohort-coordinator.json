@@ -1,0 +1,211 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "212267171b00ce90422af6d3b4c20f287d7d0747",
+  "feature": "Cohort request coordinator and owner-aware AR/static-verify collection",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "namespace": "qiji",
+    "container": "master",
+    "resident_gpu": "one H100 80GB",
+    "control_backend": "dedicated Gloo",
+    "store_transport": "TCP",
+    "catalog": "TestCaptureCatalog HTTP double",
+    "distributed_fixture_tensors": "CPU",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "host_python": "3.10.12",
+    "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "submit_prefix": [
+      "kubectl",
+      "exec",
+      "-n",
+      "qiji",
+      "job-fe1ce1dcdea6-20261001023258-master-0",
+      "-c",
+      "master",
+      "--",
+      "python3",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+      "--state-dir",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "submit",
+      "--cwd",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+      "--env",
+      "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+      "--env",
+      "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ]
+  },
+  "source_sha256": {
+    "python/sglang/srt/managers/tp_worker.py": "dea29ea14c46855363c1a6231c0cbe70b2240938b91ce3a3f7cc5c78f9de239a",
+    "python/sglang/srt/training_capture/cohort.py": "6bd093ee9a219970b08023d279852b07caaacf288f2f617236b6b2e1c7d5af56",
+    "python/sglang/srt/training_capture/cohort_service.py": "8786cb5288c2bfdede5d0e49c90b957339c77df5ebb6114fc612bffaf592875a",
+    "python/sglang/srt/training_capture/context.py": "f796e2b83dcfa7f83bb536e4460e9a6b5fe1563b1772a4ad4152bf905a1b1871",
+    "python/sglang/srt/training_capture/coordinator.py": "47aa51cba5e3cac4e11ff105b30d32352934b64612e6aa9f74bf6d54b06731a2",
+    "python/sglang/srt/training_capture/identity.py": "47f91ad994b716d27454eace428d9d0a5ce7468c5708e4dd3d3e385119c8ac24",
+    "python/sglang/srt/training_capture/cohort_coordinator.py": "354c46d7e87112c63ffeb8511f230d2c8f5d78c1a17b192fc57e8d39d5e7870d",
+    "python/sglang/test/training_capture_cohort_runtime.py": "2a92b779374925ed70d1d33fad772c87af43a9a03e0423416e95ea65eb3fb63b",
+    "test/registered/unit/training_capture/test_cohort_coordinator.py": "325c9cf84b63c20573dce7c4e392e598a634fcc7fb70cd83c326146dd6a766b0",
+    "test/registered/unit/training_capture/test_partition_context.py": "01eda02cad236c460a23c7938ee13c0dfae7184d8219a746862487d095bd3d61",
+    "test/registered/unit/training_capture/test_identity.py": "c4614d0be0e8988e85b18025e01ac24e36297008bc31820b027055fff0ebf37f",
+    "test/registered/storage/test_training_snapshot_mooncake.py": "2ca01656f520d60d13477b906f442707bf7063cbaa22807840b8c38ac01450af"
+  },
+  "jobs": [
+    {
+      "job_id": "01790861357939372557-108b29b2efad",
+      "outcome": "completed",
+      "returncode": 0,
+      "tests_passed": 69,
+      "subtests_passed": 80,
+      "elapsed_seconds": 76.7,
+      "scope": "Existing collector/context, ownership, identity and cohort control/writer regression before the two new coordinator lifecycle cases.",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_coordinator.py",
+        "test/registered/unit/training_capture/test_context.py",
+        "test/registered/unit/training_capture/test_partition_context.py",
+        "test/registered/unit/training_capture/test_identity.py",
+        "test/registered/unit/training_capture/test_cohort_service.py",
+        "test/registered/unit/training_capture/test_cohort_exchange.py",
+        "test/registered/unit/training_capture/test_cohort_writer.py"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790861357939372557-108b29b2efad.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790861357939372557-108b29b2efad.log",
+      "log_sha256": "a72f354c5619f5b91a9829dc19538628eef3b2a0b37ae17f1ff5d6c325dbf735"
+    },
+    {
+      "job_id": "01790861976063787084-787874e36bee",
+      "outcome": "completed",
+      "returncode": 0,
+      "tests_passed": 1,
+      "subtests_passed": 0,
+      "elapsed_seconds": 44.41,
+      "scope": "Four Gloo processes, synthetic worker forwards, five scenarios and real TCP Mooncake publication.",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/storage/test_training_snapshot_mooncake.py::TestTrainingSnapshotMooncake::test_cohort_collectors_preserve_worker_data_and_committed_history"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790861976063787084-787874e36bee.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790861976063787084-787874e36bee.log",
+      "log_sha256": "a5e096305fe10424d02732374e91cd85fb3356a8e2e3bb6c1c3341765421f2a4"
+    },
+    {
+      "job_id": "01790862297292945734-6d1f99f3704f",
+      "outcome": "completed",
+      "returncode": 0,
+      "tests_passed": 2,
+      "subtests_passed": 0,
+      "elapsed_seconds": 11.43,
+      "scope": "Standalone coordinator lifecycle tests: post-bind failure and copy-gated rejected handoff.",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_cohort_coordinator.py"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790862297292945734-6d1f99f3704f.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790862297292945734-6d1f99f3704f.log",
+      "log_sha256": "05389ef655f74d1d178f1c20466d228e793edd6cdaaa2e19bc4ff8528e02936f"
+    },
+    {
+      "job_id": "01790862297626550169-f85c64a064dc",
+      "outcome": "completed",
+      "returncode": 0,
+      "tests_passed": 5,
+      "subtests_passed": 0,
+      "elapsed_seconds": 10.16,
+      "scope": "Standalone partition contexts, including inactive ownership without a Host slot.",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_partition_context.py"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790862297626550169-f85c64a064dc.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790862297626550169-f85c64a064dc.log",
+      "log_sha256": "dc161c720504856fd5cc592520ca8c7527a6eb1bf258ac55f2f8845cfe89b71c"
+    },
+    {
+      "job_id": "01790862375707774981-4ef3a154c620",
+      "outcome": "completed",
+      "returncode": 0,
+      "tests_passed": 1,
+      "subtests_passed": 0,
+      "elapsed_seconds": 463.159,
+      "scope": "Single-H100 real SGLang serving regression: AR, static DSpark, overlap, CUDA Graph, prefix reuse, cancellation/retraction, memory pressure, adaptive/latency capture and numerical checks; 90 READY samples.",
+      "command": [
+        "python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790862375707774981-4ef3a154c620.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790862375707774981-4ef3a154c620.log",
+      "log_sha256": "b0b071da2531d31c4e0268b27fd05ee5676e0dbdcbc250062fcb44934f54d647"
+    },
+    {
+      "job_id": "01790862443347339497-93a1489bba02",
+      "outcome": "completed",
+      "returncode": 0,
+      "tests_passed": 7,
+      "subtests_passed": 31,
+      "elapsed_seconds": 10.27,
+      "scope": "Standalone identity contract checks, including required global vocabulary gather on the last TP stage.",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_identity.py"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790862443347339497-93a1489bba02.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790862443347339497-93a1489bba02.log",
+      "log_sha256": "7a24accee985f9ebb97f7e7187a32d656fddd858a33594c89d5b9d74926de4b8"
+    }
+  ],
+  "verification": {
+    "producer_processes": 4,
+    "collector_cases": [
+      "TP2/PP2",
+      "replicated KV heads with aux-only and inactive ranks",
+      "inactive ingress waits for aux recovery readiness",
+      "static verify committed path",
+      "one-rank cancellation"
+    ],
+    "requests_per_case": 2,
+    "cohort_publications": 9,
+    "cancelled_samples_not_published": 1,
+    "reader_objects_per_sample": 32,
+    "reader_tensor_bytes_per_sample": 4532,
+    "all_reconstructed_tensors_exact": true,
+    "producer_exit_before_readers": true,
+    "sampler_logits_mutation_isolated": true,
+    "source_kv_reuse_isolated": true,
+    "cohort_control_protocol": 4,
+    "single_gpu_runtime_ready_samples": 90,
+    "changed_tests_run_standalone": true,
+    "gpu_sources_match_final": true,
+    "format": "12 files pass Ruff format --check",
+    "lint": "No new diagnostics; 19 existing TP worker annotation diagnostics, 9 existing coordinator BLE001 diagnostics and 2 existing Store test diagnostics match HEAD",
+    "compile": "12 files pass host Python 3.10 py_compile",
+    "original_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "limitations": [
+    "Distributed serving factory and CLI gates remain unchanged; dedicated group construction and coordinated activation/rollback still need integration",
+    "Four-rank test uses synthetic CPU model forwards; single-H100 runtime regression does not exercise distributed coordinator/model inference",
+    "No multi-GPU TP/PP, multi-node or RDMA validation",
+    "Catalog double does not establish production retention/reconciliation",
+    "No trained draft quality or performance SLO compliance claim"
+  ]
+}

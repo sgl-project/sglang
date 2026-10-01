@@ -18,6 +18,7 @@ import torch
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.training_capture.admission import CaptureAdmission
 from sglang.srt.training_capture.catalog import CaptureLease, CatalogConflict
+from sglang.srt.training_capture.cohort_service import CaptureHandle
 from sglang.srt.training_capture.config import CaptureConfig
 from sglang.srt.training_capture.context import RequestCaptureContext
 from sglang.srt.training_capture.host_pool import HostSlot
@@ -40,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 class CaptureReservation(msgspec.Struct, eq=False):
     lease: CaptureLease
-    slot: HostSlot
+    slot: HostSlot | None
     deadline: float
     renew_at: float
     state: str = "available"
@@ -49,6 +50,8 @@ class CaptureReservation(msgspec.Struct, eq=False):
     provenance: Provenance | None = None
     started: float = 0.0
     queued_at: float = 0.0
+    cohort_handle: CaptureHandle | None = None
+    execution_sha256: str | None = None
 
 
 class CaptureStep(msgspec.Struct, frozen=True):
@@ -70,7 +73,7 @@ class VerifyCaptureStep(msgspec.Struct, frozen=True):
 
 class VerifyCaptureBatch(msgspec.Struct, frozen=True):
     steps: tuple[VerifyCaptureStep, ...]
-    teacher: TeacherRows
+    teacher: TeacherRows | None
     input_tokens: torch.Tensor
     positions: torch.Tensor
     cache_locs: torch.Tensor
@@ -513,36 +516,7 @@ class CaptureCoordinator:
                 max_tokens=self.config.max_sample_tokens,
                 vocab_size=self.teacher.vocab_size,
             )
-            params = req.sampling_params
-            sampling = {
-                "temperature": params.temperature,
-                "top_p": params.top_p,
-                "top_k": params.top_k,
-                "min_p": params.min_p,
-                "max_new_tokens": params.max_new_tokens,
-                "min_new_tokens": params.min_new_tokens,
-                "frequency_penalty": params.frequency_penalty,
-                "presence_penalty": params.presence_penalty,
-                "repetition_penalty": params.repetition_penalty,
-                "ignore_eos": params.ignore_eos,
-                "logit_bias": params.logit_bias,
-                "stop_token_ids": sorted(params.stop_token_ids or []),
-                "stop_strs": params.stop_strs,
-                "stop_regex_strs": params.stop_regex_strs,
-                "grammar": {
-                    "json_schema": params.json_schema,
-                    "regex": params.regex,
-                    "ebnf": params.ebnf,
-                    "structural_tag": params.structural_tag,
-                },
-            }
-            record.provenance = Provenance(
-                capture_mode=self.capture_mode,
-                producer_revision=self.config.producer_revision,
-                capture_config_sha256=self.config.fingerprint,
-                sampling_config=sampling,
-                trace_id=hashlib.sha256(req.rid.encode()).hexdigest(),
-            )
+            record.provenance = self._provenance(req)
             req.training_capture_context = record
             req.training_capture_finalize = self.on_release
             self.requests[record.lease.capture_id] = req
@@ -551,6 +525,38 @@ class CaptureCoordinator:
             record.invalid_reason = "admission_invalid_request"
             self._queue_record(record)
             self._count("admission_invalid_request")
+
+    def _provenance(self, req, *, config_sha256=None):
+        params = req.sampling_params
+        sampling = {
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "top_k": params.top_k,
+            "min_p": params.min_p,
+            "max_new_tokens": params.max_new_tokens,
+            "min_new_tokens": params.min_new_tokens,
+            "frequency_penalty": params.frequency_penalty,
+            "presence_penalty": params.presence_penalty,
+            "repetition_penalty": params.repetition_penalty,
+            "ignore_eos": params.ignore_eos,
+            "logit_bias": params.logit_bias,
+            "stop_token_ids": sorted(params.stop_token_ids or []),
+            "stop_strs": params.stop_strs,
+            "stop_regex_strs": params.stop_regex_strs,
+            "grammar": {
+                "json_schema": params.json_schema,
+                "regex": params.regex,
+                "ebnf": params.ebnf,
+                "structural_tag": params.structural_tag,
+            },
+        }
+        return Provenance(
+            capture_mode=self.capture_mode,
+            producer_revision=self.config.producer_revision,
+            capture_config_sha256=config_sha256 or self.config.fingerprint,
+            sampling_config=sampling,
+            trace_id=hashlib.sha256(req.rid.encode()).hexdigest(),
+        )
 
     def before_forward(self, reqs):
         for req in list(self.requests.values()):
@@ -585,23 +591,27 @@ class CaptureCoordinator:
                     if record.invalid_reason:
                         raise ContractError(record.invalid_reason)
                     end = int(batch.seq_lens_cpu[row])
-                    slots = self.req_to_token.req_to_token[
-                        req.req_pool_idx, context.kv_end : end
-                    ].clone()
-                    context.export_kv(self.exporter, slots, end=end)
+                    if context.owns_kv:
+                        slots = self.req_to_token.req_to_token[
+                            req.req_pool_idx, context.kv_end : end
+                        ].clone()
+                        context.export_kv(self.exporter, slots, end=end)
+                    else:
+                        context.record_kv_progress(end=end)
                     # Cached prefix positions are canonical for the validated codec;
                     # freshly computed positions are copied from the actual forward.
-                    context.record_positions(
-                        forward_batch.positions[offset : offset + extend_len],
-                        start=end - extend_len,
-                    )
+                    if context.owns_aux:
+                        context.record_positions(
+                            forward_batch.positions[offset : offset + extend_len],
+                            start=end - extend_len,
+                        )
                     prediction = end if end >= context.prompt_length else None
                     if self.enable_overlap and end == context.max_tokens:
                         # This lookahead forwarded the last possible output token;
                         # its prediction cannot belong to the bounded sample.
                         prediction = None
                     steps.append(CaptureStep(req, record, prediction))
-                    if prediction is not None:
+                    if prediction is not None and context.owns_aux:
                         teacher_indices.append(row)
                         teacher_records.append((req, record, prediction))
                 except Exception:
@@ -647,10 +657,15 @@ class CaptureCoordinator:
         if not steps:
             return None
         try:
+            owns_aux = steps[0].reservation.context.owns_aux
             if (
                 width < 1
                 or forward_batch.input_ids.numel() != len(batch.reqs) * width
-                or logits_output.next_token_logits.shape[0] != len(batch.reqs) * width
+                or (
+                    owns_aux
+                    and logits_output.next_token_logits.shape[0]
+                    != len(batch.reqs) * width
+                )
             ):
                 raise ContractError("capture requires a dense linear verify layout")
             indices = torch.tensor(
@@ -664,8 +679,14 @@ class CaptureCoordinator:
             )
             ticket = VerifyCaptureBatch(
                 steps=steps,
-                teacher=capture_teacher(
-                    logits_output.next_token_logits, self.teacher.vocab_size, indices
+                teacher=(
+                    capture_teacher(
+                        logits_output.next_token_logits,
+                        self.teacher.vocab_size,
+                        indices,
+                    )
+                    if owns_aux
+                    else None
                 ),
                 input_tokens=forward_batch.input_ids.index_select(0, indices).view(
                     -1, width
@@ -739,15 +760,19 @@ class CaptureCoordinator:
                     position=start,
                     tokens=[inputs[selected_row][0]] + outputs[step.batch_row][:count],
                 )
-                context.export_kv(
-                    self.exporter,
-                    ticket.cache_locs[selected_row, :kv_count],
-                    end=start + kv_count,
-                )
-                context.record_positions(
-                    ticket.positions[selected_row, :kv_count], start=start
-                )
-                if teacher_count:
+                if context.owns_kv:
+                    context.export_kv(
+                        self.exporter,
+                        ticket.cache_locs[selected_row, :kv_count],
+                        end=start + kv_count,
+                    )
+                else:
+                    context.record_kv_progress(end=start + kv_count)
+                if context.owns_aux:
+                    context.record_positions(
+                        ticket.positions[selected_row, :kv_count], start=start
+                    )
+                if teacher_count and context.owns_aux:
                     context.record_teacher_range(
                         ticket.teacher,
                         row=selected_row * ticket.width,

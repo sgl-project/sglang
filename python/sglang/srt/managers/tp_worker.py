@@ -690,11 +690,16 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
-            return GenerationBatchResult(
+            batch_result = GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+            if self.training_capture is not None and batch is not None:
+                batch_result.training_capture = self.training_capture.after_forward(
+                    batch, forward_batch, None, can_run_cuda_graph=can_run_cuda_graph
+                )
+            return batch_result
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:

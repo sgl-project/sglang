@@ -184,6 +184,34 @@ class TestPartitionContext(CustomTestCase):
     def test_same_lengths_from_different_local_generations_cannot_assemble(self):
         self.run_trace(verify=False, divergent=True)
 
+    def test_inactive_rank_checks_committed_prefix_without_allocating_payloads(self):
+        base, _ = make_snapshot()
+        layout = plan_capture_layout(
+            base.kv, tp_size=4, pp_layer_ranges=[(0, 4)], aux_tp_rank=1
+        )
+        context = RequestCaptureContext(
+            slot=None,
+            prompt_ids=(3, 4),
+            max_tokens=8,
+            vocab_size=256,
+            partition=layout.partitions[3],
+        )
+        with self.assertRaises(ContractError):
+            context.commit_token(position=2, token_id=5)
+        context.record_kv_progress(end=2)
+        context.commit_token(position=2, token_id=5)
+        context.observe_tokens(position=3, tokens=[6, 7])
+        context.record_kv_progress(end=4)
+        context.commit_token(position=3, token_id=6)
+        context.trim_terminal_prefix()
+        context.seal("length")
+        self.assertEqual(context.token_ids, [3, 4, 5, 6])
+        self.assertEqual(context.sequence.response_length, 2)
+        self.assertIsNone(context.slot)
+        with self.assertRaises(ContractError):
+            context.prepare_partition()
+        context.wait_for_copies()
+
     def test_owners_cannot_forge_payload_progress_or_use_another_partition_slot(self):
         base, _ = make_snapshot()
         layout = plan_capture_layout(

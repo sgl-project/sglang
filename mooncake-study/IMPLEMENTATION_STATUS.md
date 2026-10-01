@@ -1906,6 +1906,79 @@ need Catalog reconciliation; this actor retains ownership rather than guessing
 a failed publication. No production Catalog, cross-node RDMA, trained quality or
 performance SLO result is established by this change.
 
+## Cohort Request Collection
+
+`CohortCaptureCoordinator` connects the request router, partitioned collection
+contexts and completed-context writer actor. A routed request takes ownership
+of its bound cohort before any forward copies. Each rank tracks the committed
+request history; only KV owners export their local selected-layer/head slices,
+and only aux captures teacher scores and auxiliary tensors. Inactive ranks keep
+a token/KV-progress ledger without allocating a Host slot. Successful finalization
+detaches the request and passes its immutable metadata/context to a bounded
+background handoff queue. Failure still fences copies before returning ownership.
+
+The shared AR/static-verify collector now honors local payload ownership.
+Non-last PP workers call the collector after forward, before source KV can be
+reused. PP result reconstruction does not preserve the process-local forward
+ticket, so the cohort coordinator reads the scheduler's committed request history
+after normal result processing. The last-stage model contract requires the
+existing TP vocabulary gather before sampling; capture adds no model-forward
+collective and stores raw pre-sampler top-128 rows plus their vocabulary IDs.
+All ranks use the common startup-policy fingerprint in provenance, excluding
+rank-local paths, addresses and buffer budgets.
+
+The cohort control protocol is version 4. Admission readiness is now voted by
+every rank. An inactive ingress cannot select a request while aux is still
+recovering its publication journal. Pausing admission does not release existing
+bound handles. Coordinator close first detaches collecting requests and drains
+the handoff thread, then closes writer and cohort service before resources. An
+incomplete close retains the coordinator and registered buffers; the caller
+continues to own the dedicated control group.
+
+Job `01790861976063787084-787874e36bee` passed the real TCP Mooncake integration
+in 44.41s. Four Gloo processes run five collector scenarios: TP2/PP2, replicated
+KV heads with an aux-only and an inactive rank, inactive PP ingress with delayed
+aux startup, dense static verify commits, and cancellation on one rank. Each
+scenario routes two actual `Req` objects through msgpack and the request router;
+ranks complete them in opposite order. The worker callback is the real
+`TpModelWorker.forward_batch_generation`; model forwards are synthetic CPU
+fixtures. A simulated sampler overwrites logits after capture, and request KV
+buffers are zeroed immediately after finalization.
+
+Nine complete samples publish; the cancelled sample fails. After every producer
+exits, the parent compares all reconstructed KV and auxiliary tensors exactly
+to the fixture. A separate reader also validates a sample's 32 objects and
+4532 tensor bytes. This establishes collection, ownership and publication with
+real Store transport, not distributed target-model inference.
+
+Baseline job `01790861357939372557-108b29b2efad` passed 69 tests and 80 subtests
+in 76.70s. Two new coordinator lifecycle tests pass independently in job
+`01790862297292945734-6d1f99f3704f` (11.43s), covering failure after bind and
+copy-gated rejection of writer handoff. Five partition-context cases pass
+independently in job `01790862297626550169-f85c64a064dc` (10.16s), including
+the inactive rank's committed-prefix checks without payload allocation.
+
+The standalone identity suite passed seven tests and 31 subtests in job
+`01790862443347339497-93a1489bba02` (10.27s). Real SGLang serving on the resident
+H100 also passed in job `01790862375707774981-4ef3a154c620` (463.159s), producing
+90 READY samples across the existing AR/static-DSpark, overlap, CUDA Graph,
+prefix reuse, cancellation/retraction, memory-pressure and adaptive/latency
+capture scenarios. This is a regression of the shared collector and worker
+changes; it still uses the existing single-rank serving coordinator.
+
+All 12 changed/added Python files format and compile on host Python 3.10. Ruff
+diagnostics match the pre-existing TP worker, single-rank coordinator and Store
+test baselines; the other nine files pass. Final files match the tested GPU
+checkout. Commands, log hashes, source hashes and validation limits are recorded
+in `experiments/capture-cohort-coordinator.json`.
+
+The distributed serving factory and CLI gate remain unchanged. The next
+integration must construct and own a dedicated control group, coordinate
+startup/activation failures, and validate real TP/PP scheduling. The four-rank
+fixtures above do not establish CUDA TP/PP inference, multi-node RDMA,
+production Catalog retention/reconciliation, trained draft quality or SLO
+compliance.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1915,12 +1988,11 @@ performance SLO result is established by this change.
    checkpoints, complete exporter compatibility and artifact/quality validation.
 3. Connect P9's implemented identity/resource startup agreement, cohort
    reservations and background lifecycle, scheduler ticket routing, descriptor
-   and receipt agreement, completed-context writer actors, layout,
-   partitioned request contexts, rank-local buffers and
-   owner-local Store interface
-   to distributed request admission/failure agreement,
-   global teacher scores
-   and TP/PP scheduling.
+   and receipt agreement, completed-context writer actors and the cohort request
+   coordinator to the serving factory, dedicated control-group lifecycle and
+   coordinated activation/rollback. Collection and publication now pass the
+   four-rank synthetic-forward/real-Store cases; real global teacher scores and
+   TP/PP model scheduling still need end-to-end validation.
    Complete TP/PP runtime validation, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.

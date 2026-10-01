@@ -48,7 +48,9 @@ class TestTargetIdentity(CustomTestCase):
         model = type("Qwen3ForCausalLM", (), {})()
         model.pp_group = SimpleNamespace(world_size=pp_size, rank_in_group=pp_rank)
         model.logits_processor = SimpleNamespace(
-            logit_scale=None, final_logit_softcapping=None
+            logit_scale=None,
+            final_logit_softcapping=None,
+            do_tensor_parallel_all_gather=tp_size > 1,
         )
         layers, buffers = [object() for _ in range(6)], {}
         for layer in range(start, end):
@@ -115,6 +117,18 @@ class TestTargetIdentity(CustomTestCase):
 
     def ranks(self):
         return [self.bind(tp_rank=tp, pp_rank=pp) for pp in range(3) for tp in range(4)]
+
+    def test_last_stage_requires_global_teacher_logits(self):
+        args = self.model_args(tp_rank=1, tp_size=4, pp_rank=2, pp_size=3)
+        args["model"].logits_processor.do_tensor_parallel_all_gather = False
+        with self.assertRaisesRegex(ContractError, "global TP logits"):
+            bind_rank_target_contract(
+                **args, tp_rank=1, tp_size=4, pp_rank=2, pp_size=3
+            )
+        # An earlier stage exports KV without producing vocabulary logits.
+        args = self.model_args(tp_rank=1, tp_size=4, pp_rank=0, pp_size=3)
+        args["model"].logits_processor.do_tensor_parallel_all_gather = False
+        bind_rank_target_contract(**args, tp_rank=1, tp_size=4, pp_rank=0, pp_size=3)
 
     def test_global_contract_matches_single_rank_across_tp_and_pp(self):
         ranks = [

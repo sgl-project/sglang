@@ -29,7 +29,7 @@ class RequestCaptureContext:
     def __init__(
         self,
         *,
-        slot: HostSlot,
+        slot: HostSlot | None,
         prompt_ids: tuple[int, ...],
         max_tokens: int,
         vocab_size: int,
@@ -44,7 +44,10 @@ class RequestCaptureContext:
         self.partition = partition
         self.owns_aux = partition is None or partition.include_aux
         self.owns_kv = partition is None or bool(partition.heads)
-        if partition is not None:
+        active = partition is None or partition.active
+        if active != (slot is not None):
+            raise ContractError("context storage differs from payload ownership")
+        if partition is not None and active:
             expected = (
                 set(aux_specs(max_tokens, max_tokens)) if self.owns_aux else set()
             )
@@ -76,7 +79,7 @@ class RequestCaptureContext:
         self.last_stream = None
         self.kv_staging = (
             KVStaging(slot.device_tensors, slot.tensors)
-            if slot.device_tensors is not None
+            if slot is not None and slot.device_tensors is not None
             else None
         )
         self.transfer_uncertain = False
@@ -136,7 +139,7 @@ class RequestCaptureContext:
         self.kv_end = end
 
     def record_kv_progress(self, *, end: int):
-        """Aux-only owner records the computed prefix from its target forward."""
+        """A rank without KV payload records its locally computed prefix."""
         self._collecting()
         if self.owns_kv or not self.kv_end <= end <= self.max_tokens:
             raise ContractError(
@@ -328,9 +331,9 @@ class RequestCaptureContext:
         return result
 
     def prepare_partition(self, **metadata):
-        if self.partition is None:
+        if self.partition is None or not self.partition.active:
             raise ContractError(
-                "partition preparation requires a sealed partitioned request"
+                "partition preparation requires an active partitioned request"
             )
         self._sealed()
         self.wait_for_copies()
