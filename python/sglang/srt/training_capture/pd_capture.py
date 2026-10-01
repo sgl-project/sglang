@@ -26,6 +26,7 @@ from sglang.srt.training_capture.teacher import TeacherRows, capture_teacher
 class PrefillCaptureState(msgspec.Struct):
     context: CaptureTransferContext
     teacher: TeacherRows | None = None
+    handoff: bytes | None = None
     failed: bool = False
 
 
@@ -82,7 +83,7 @@ class PrefillCaptureCoordinator:
     def after_forward(
         self, batch, forward_batch, logits_output, *, can_run_cuda_graph=False
     ):
-        if self.disabled_reason:
+        if self.disabled_reason or logits_output is None:
             return
         offset = 0
         for row, req in enumerate(batch.reqs):
@@ -104,33 +105,88 @@ class PrefillCaptureCoordinator:
                             [row], device=logits_output.next_token_logits.device
                         ),
                     )
+                    state.handoff = None
                     self.counters["pd_teacher_copied"] += 1
                 except Exception:  # noqa: BLE001 - Never publish a partial handoff.
                     state.failed = True
                     self.counters["pd_teacher_failed"] += 1
             offset += count
 
-    def finish_handoff(self, req):
-        state = req.training_capture_pd
-        req.training_capture_pd = None
-        if (
-            state is None
-            or state.failed
-            or self.disabled_reason
-            or state.teacher is None
-        ):
-            return None
-        try:
+    def _encode_handoff(self, state, output_token_id):
+        if state.handoff is None:
             rows = state.teacher
+            if rows is None:
+                raise ContractError("prefill teacher is missing")
             handoff = PrefillTeacherHandoff(
                 context=state.context,
-                output_token_id=int(req.output_ids[0]),
+                output_token_id=output_token_id,
                 topk_ids=rows.token_ids[0].cpu().tolist(),
                 topk_logits=rows.logits[0].cpu().tolist(),
                 logsumexp=float(rows.logsumexp[0].cpu()),
             )
             handoff.teacher_rows(self.teacher.vocab_size)
-            payload = encode_handoff(handoff)
+            state.handoff = encode_handoff(handoff)
+            state.teacher = None
+        else:
+            handoff = decode_handoff(state.handoff, PrefillTeacherHandoff)
+            if handoff.output_token_id != output_token_id:
+                raise ContractError("PP handoff does not match the committed token")
+        return state.handoff
+
+    def pack_pp_handoffs(self, batch, next_token_ids):
+        """Attach bounded immutable rows to the existing PP output circulation."""
+        payloads = [None] * len(batch.reqs)
+        for row, req in enumerate(batch.reqs):
+            state = req.training_capture_pd
+            if (
+                state is None
+                or state.failed
+                or self.disabled_reason
+                or int(batch.seq_lens_cpu[row]) != len(req.origin_input_ids)
+            ):
+                continue
+            try:
+                payloads[row] = self._encode_handoff(state, int(next_token_ids[row]))
+            except Exception:  # noqa: BLE001 - Teacher failure cannot stop PP output.
+                state.failed = True
+                self.counters["pd_pp_handoff_failed"] += 1
+        return tuple(payloads) if any(payloads) else None
+
+    def accept_pp_handoffs(self, batch, payloads):
+        for row, req in enumerate(batch.reqs):
+            state = req.training_capture_pd
+            if (
+                state is None
+                or state.failed
+                or self.disabled_reason
+                or int(batch.seq_lens_cpu[row]) != len(req.origin_input_ids)
+            ):
+                continue
+            try:
+                if not isinstance(payloads, (tuple, list)) or len(payloads) != len(
+                    batch.reqs
+                ):
+                    raise ContractError("missing or misaligned PP teacher rows")
+                payload = payloads[row]
+                handoff = decode_handoff(payload, PrefillTeacherHandoff)
+                if handoff.context != state.context or (
+                    state.handoff is not None and state.handoff != payload
+                ):
+                    raise ContractError("PP teacher belongs to another capture")
+                handoff.teacher_rows(self.teacher.vocab_size)
+                state.handoff, state.teacher = payload, None
+                self.counters["pd_pp_handoff_received"] += 1
+            except Exception:  # noqa: BLE001 - The final KV send omits a bad handoff.
+                state.failed = True
+                self.counters["pd_pp_handoff_failed"] += 1
+
+    def finish_handoff(self, req):
+        state = req.training_capture_pd
+        req.training_capture_pd = None
+        if state is None or state.failed or self.disabled_reason:
+            return None
+        try:
+            payload = self._encode_handoff(state, int(req.output_ids[0]))
             self.counters["pd_handoff_ready"] += 1
             return payload
         except Exception:  # noqa: BLE001 - Missing handoff is rejected by decode.

@@ -1,0 +1,883 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "1c26dfd1dfe2f4ce2a7eaa2c5337ebfaa80108eb",
+  "feature": "Pipeline-parallel decode-owned PD capture with bounded teacher circulation and metadata-aware transfer consensus",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "resident_node": "node064",
+    "resident_gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "temporary_node": "node199",
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "layers": [
+      0,
+      14,
+      27
+    ],
+    "versions": {
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+      "sglang-kernel": "0.4.6.post1",
+      "flashinfer-python": "0.6.17",
+      "transformers": "5.12.1"
+    },
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang:v0.5.15",
+    "transport": "Actual Mooncake TransferEngine TCP and independent TCP Store segment/reader",
+    "catalog": "HTTP TestCaptureCatalog double",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "dependency_adjustment": "Removed only the temporary container's preinstalled flashinfer-cubin/flashinfer-jit-cache 0.6.12, so the shared 0.6.17 runtime is consistent.",
+    "temporary_job": "job-d1c8e138f33a-20261002023845",
+    "temporary_gpus": [
+      "GPU-776781c5-2156-1fae-4763-7fdba75de0d4",
+      "GPU-cbb33d72-ecf6-a5c7-d747-e11663842649"
+    ],
+    "topology": "PP2 P and PP2 or PP1 D share the temporary pair; TP2 PD and ordinary distributed regressions use the same pair. TP1/PP1 PD and units use the resident H100."
+  },
+  "implementation": [
+    "Last P stage owns raw first-teacher scores and encodes a bounded immutable handoff on the existing sampled-output ring. Each stage validates context, alignment and the final committed token.",
+    "Encoded handoffs release GPU teacher storage; a fresh terminal prefill invalidates the source's previous encoded row.",
+    "D reuses the existing cohort selected-layer/head ownership and all-owner receipts. Only the aux owner stores teacher metadata.",
+    "PP consensus applies the existing metadata readiness gate before attention TP/CP reductions, preventing early consumption by one stage while another waits for its bootstrap-room metadata.",
+    "Capture is allowed for AR Mooncake PD with PP; existing backend permits matching P/D PP sizes or D PP=1. DP/CP, speculation and optimistic-prefill capture gates remain."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/training_capture/pd_capture.py": "81fb0550f2ea923aeda71add0c5f29955f00a7bb0e8c917880bfbb4315be81db",
+    "python/sglang/srt/training_capture/config.py": "64398cc7806d4788ec16e2b4d886db0ae23cc32c5709460c874d8deb066a33aa",
+    "python/sglang/srt/managers/scheduler_pp_mixin.py": "e8d1e30e752bdac1d0c72c204aa17772207fe630a247638d918f674d34416520",
+    "python/sglang/test/dspark_capture_observer.py": "923ae8e859423e6e67a7e5aea0e4740c6e021d8162f64a274787c4005ca0aeed",
+    "python/sglang/test/pd_capture_server.py": "9167aeb590fdee856accc0caefd9bab1403bd115b0c5bd1594ae7e6c72842e1d",
+    "python/sglang/test/pd_capture_runtime.py": "c728ce0d2d07f4e8b4f01e50b4361b276ea889fc5a56a88fd5718070f3b73358",
+    "test/registered/unit/training_capture/test_config.py": "5a09590c1e23cb1a9bcea6980fadf45366836348b699b23413bcf42094e4abaf",
+    "test/registered/unit/training_capture/test_pd_capture.py": "679dfc178d9541eebb89bc90032b8b5df9b13b62761bdf823d3c47450170d226",
+    "test/registered/storage/test_training_capture_pd_pp.py": "011e33796a42a5dbe62c4e60b1731c7c76dedd541d43bd9b54c456a332f59933",
+    "test/registered/storage/test_training_capture_pd_pp_reduce.py": "f586cba84c29fd989bebdb66634b33ed5552fa0bacbfb12db010faafd65f97e3",
+    "python/sglang/srt/disaggregation/utils.py": "55b2e4593512c3205388cad8808d9fe94d839ab4b29f85a27741ee71555b2bfd",
+    "test/registered/unit/disaggregation/test_pp_transfer_readiness.py": "cd3ad34d2a8fcde6b690c70e68fa7179f9ea452bbce2279e5a470031bf43561d"
+  },
+  "gpu_source_hashes_match": true,
+  "tests": [
+    {
+      "job_id": "01790881142863148251-c19c9285b7cf",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790881162.8999908,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790881142863148251-c19c9285b7cf.log",
+      "test_file": "test/registered/unit/training_capture/test_pd_capture.py",
+      "tests_run": 11,
+      "elapsed_seconds": 8.005,
+      "log_sha256": "2850e3d10e6f3b68913633a8b673ee44386b529c5711fbff3825dc60b67fc467",
+      "runtime": []
+    },
+    {
+      "job_id": "01790881143195212716-74f033ae68ef",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790881174.4331074,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790881143195212716-74f033ae68ef.log",
+      "test_file": "test/registered/unit/disaggregation/test_pp_transfer_readiness.py",
+      "tests_run": 3,
+      "elapsed_seconds": 0.003,
+      "log_sha256": "1e7b90cda267ad672d90381c4408f51ea4db65e6fbaf8d7a6af2f133515afe3c",
+      "runtime": []
+    },
+    {
+      "job_id": "01790881143534301252-20209fd6065a",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790881186.9676576,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790881143534301252-20209fd6065a.log",
+      "test_file": "test/registered/unit/disaggregation/test_decode_queue_cleanup.py",
+      "tests_run": 6,
+      "elapsed_seconds": 0.007,
+      "log_sha256": "917e3bd1625c341ad615d7cb71ad20020eb3bd7eb762b6e7432694ce78bf31d3",
+      "runtime": []
+    },
+    {
+      "job_id": "01790881143875810138-942f39afc611",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790881197.7482152,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790881143875810138-942f39afc611.log",
+      "test_file": "test/registered/unit/training_capture/test_config.py",
+      "tests_run": 8,
+      "elapsed_seconds": 0.009,
+      "log_sha256": "4d717ef143b93289e50ea3df2e1d83798c21a7da0680f44b9d0184463d467cac",
+      "runtime": []
+    },
+    {
+      "job_id": "01790881144186614863-8601cb4721c5",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790881209.5307198,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790881144186614863-8601cb4721c5.log",
+      "test_file": "test/registered/unit/managers/test_pp_cp_rank_offsets.py",
+      "tests_run": 2,
+      "elapsed_seconds": 0.003,
+      "log_sha256": "a582685d21a9b03129dd8d6d525a9b22a4e3e710541aa746ffe58d9d5b9d811f",
+      "runtime": []
+    },
+    {
+      "job_id": "01790881205899308444-cdc89b07fbae",
+      "outcome": "completed",
+      "returncode": 0,
+      "test_file": "test/registered/storage/test_training_capture_pd.py",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790881205899308444-cdc89b07fbae.log",
+      "tests_run": 2,
+      "elapsed_seconds": 134.186,
+      "log_sha256": "c7e960916b141f8e4afab0d75f32b759dc5bb46d81eab5a96d39341c71be8989",
+      "runtime": [
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "counters": {
+              "admitted": 8,
+              "considered": 8,
+              "copies_completed": 8,
+              "eager_forwards": 14,
+              "failed_pd_handoff_failed": 2,
+              "failed_request_aborted_or_retracted": 1,
+              "pd_handoff_committed": 6,
+              "ready": 5,
+              "sealed": 5,
+              "snapshot_built": 5,
+              "writer_started": 8
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "filling": 1,
+              "free": 3,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "reservations": 1,
+            "states": {
+              "available": 1
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "prefill_tp": 1,
+          "replay": false
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "counters": {
+              "admitted": 8,
+              "considered": 8,
+              "copies_completed": 8,
+              "cuda_graph_forwards": 17,
+              "failed_pd_handoff_failed": 2,
+              "failed_request_aborted_or_retracted": 1,
+              "overlap_forwards": 17,
+              "pd_handoff_committed": 6,
+              "ready": 5,
+              "sealed": 5,
+              "snapshot_built": 5,
+              "writer_started": 8
+            },
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "filling": 1,
+              "free": 3,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "reservations": 1,
+            "states": {
+              "available": 1
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "prefill_tp": 1,
+          "replay": true
+        }
+      ]
+    },
+    {
+      "outcome": "completed",
+      "returncode": 0,
+      "test_file": "test/registered/storage/test_training_capture_pd_pp.py",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-matching-readiness-20261001.log",
+      "tests_run": 2,
+      "elapsed_seconds": 144.554,
+      "log_sha256": "a74fbe985d7753e31df357084cc9ff48af945c3de4d3a484db5e9a2ce78bf960",
+      "runtime": [
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "stored": 5,
+                "submitted": 8
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 8,
+              "eager_forwards": 13,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "pd_handoff_committed": 6,
+              "ready": 0,
+              "sealed": 5
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 8,
+              "bound": 8,
+              "cancelled": 1,
+              "considered": 9,
+              "excluded": 1,
+              "selected": 8
+            },
+            "reservations": 3,
+            "states": {
+              "available": 3,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 2,
+          "decode_tp": 1,
+          "prefill_pp": 2,
+          "prefill_tp": 1,
+          "replay": false
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "stored": 5,
+                "submitted": 8
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 8,
+              "cuda_graph_forwards": 13,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "pd_handoff_committed": 6,
+              "ready": 0,
+              "sealed": 5
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 8,
+              "bound": 8,
+              "cancelled": 1,
+              "considered": 9,
+              "excluded": 1,
+              "selected": 8
+            },
+            "reservations": 3,
+            "states": {
+              "available": 3,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 2,
+          "decode_tp": 1,
+          "prefill_pp": 2,
+          "prefill_tp": 1,
+          "replay": true
+        }
+      ]
+    },
+    {
+      "outcome": "completed",
+      "returncode": 0,
+      "test_file": "test/registered/storage/test_training_capture_pd_pp_reduce.py",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-reduce-20261001.log",
+      "tests_run": 2,
+      "elapsed_seconds": 136.074,
+      "log_sha256": "6d09bfb26d6d7393865850aa373e2e30dcebdb0129639ae5c21fd9aa99f9b946",
+      "runtime": [
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "counters": {
+              "admitted": 8,
+              "considered": 8,
+              "copies_completed": 8,
+              "eager_forwards": 14,
+              "failed_pd_handoff_failed": 2,
+              "failed_request_aborted_or_retracted": 1,
+              "pd_handoff_committed": 6,
+              "ready": 5,
+              "sealed": 5,
+              "snapshot_built": 5,
+              "writer_started": 8
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "filling": 2,
+              "free": 2,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "reservations": 2,
+            "states": {
+              "available": 2
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 2,
+          "prefill_tp": 1,
+          "replay": false
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "counters": {
+              "admitted": 8,
+              "considered": 8,
+              "copies_completed": 8,
+              "cuda_graph_forwards": 17,
+              "failed_pd_handoff_failed": 2,
+              "failed_request_aborted_or_retracted": 1,
+              "overlap_forwards": 17,
+              "pd_handoff_committed": 6,
+              "ready": 5,
+              "sealed": 5,
+              "snapshot_built": 5,
+              "writer_started": 8
+            },
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "filling": 1,
+              "free": 3,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "reservations": 1,
+            "states": {
+              "available": 1
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 2,
+          "prefill_tp": 1,
+          "replay": true
+        }
+      ]
+    },
+    {
+      "outcome": "completed",
+      "returncode": 0,
+      "test_file": "test/registered/storage/test_training_capture_pd_tp.py",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-tp-regression-20261001.log",
+      "tests_run": 2,
+      "elapsed_seconds": 169.943,
+      "log_sha256": "448f2ef80993dc34327503692c9952a08d069b0df1128c6ecdc0e12efc6056b6",
+      "runtime": [
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "published": 5,
+                "submitted": 8
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 8,
+              "eager_forwards": 13,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "pd_handoff_committed": 6,
+              "ready": 5,
+              "sealed": 5
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 11556864,
+              "device_allocated_bytes": 393216,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 8,
+              "bound": 8,
+              "cancelled": 1,
+              "considered": 9,
+              "excluded": 1,
+              "selected": 8
+            },
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 2,
+          "prefill_pp": 1,
+          "prefill_tp": 2,
+          "replay": false
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "published": 5,
+                "submitted": 8
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 8,
+              "cuda_graph_forwards": 16,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "overlap_forwards": 16,
+              "pd_handoff_committed": 6,
+              "ready": 5,
+              "sealed": 5
+            },
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "host_pool": {
+              "allocated_bytes": 11556864,
+              "device_allocated_bytes": 393216,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 8,
+              "bound": 8,
+              "cancelled": 1,
+              "considered": 9,
+              "excluded": 1,
+              "selected": 8
+            },
+            "reservations": 3,
+            "states": {
+              "available": 3,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 2,
+          "prefill_pp": 1,
+          "prefill_tp": 2,
+          "replay": true
+        }
+      ]
+    },
+    {
+      "outcome": "completed",
+      "returncode": 0,
+      "test_file": "test/registered/storage/test_training_capture_distributed.py",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-distributed-regression-20261001.log",
+      "tests_run": 4,
+      "elapsed_seconds": 432.993,
+      "log_sha256": "1eb4b6bf09c4a9826df90a8e38ab629519ac1139936a8f0797f9ee6cbb8e7f23",
+      "runtime": [
+        {
+          "mode": "cap-accept",
+          "graph_overlap": false,
+          "tp_size": 2,
+          "counters": {
+            "admitted": 3,
+            "eager_forwards": 10,
+            "speculative_verify_forwards": 7,
+            "speculative_commits_copied": 10,
+            "sealed": 3,
+            "ready": 3
+          },
+          "quarantined": 0
+        },
+        {
+          "mode": "cap-accept",
+          "graph_overlap": true,
+          "tp_size": 2,
+          "counters": {
+            "admitted": 3,
+            "overlap_forwards": 12,
+            "eager_forwards": 3,
+            "speculative_verify_forwards": 9,
+            "cuda_graph_forwards": 9,
+            "speculative_commits_copied": 13,
+            "sealed": 3,
+            "ready": 3
+          },
+          "quarantined": 0
+        },
+        {
+          "mode": "compact",
+          "graph_overlap": false,
+          "tp_size": 2,
+          "counters": {
+            "admitted": 3,
+            "eager_forwards": 10,
+            "speculative_verify_forwards": 7,
+            "speculative_commits_copied": 10,
+            "sealed": 3,
+            "ready": 3
+          },
+          "quarantined": 0
+        },
+        {
+          "mode": "compact",
+          "graph_overlap": true,
+          "tp_size": 2,
+          "counters": {
+            "admitted": 3,
+            "overlap_forwards": 12,
+            "eager_forwards": 3,
+            "speculative_verify_forwards": 9,
+            "cuda_graph_forwards": 9,
+            "speculative_commits_copied": 13,
+            "sealed": 3,
+            "ready": 3
+          },
+          "quarantined": 0
+        }
+      ]
+    }
+  ],
+  "failed_attempts": [
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-matching-20261001.log",
+      "log_sha256": "67ae2bcf06734aa75dbd5aa49308dd420bbac8aa3f03ad9a012a2d5fa3385b92",
+      "tests_run": 1,
+      "elapsed_seconds": 141.955,
+      "returncode": 1,
+      "reason": "First PP2/PP2 sample never published; PP0 sealed its shard but the Catalog remained CAPTURING."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-matching-stages-20261001.log",
+      "log_sha256": "d3da4f3f33ed77da95ef8691338464f727b3b7e594c700b7ec7caa1f43184a03",
+      "tests_run": 1,
+      "elapsed_seconds": 113.263,
+      "returncode": 1,
+      "reason": "Per-stage diagnostics isolated PP1: admitted but no boundary import; PP0 waited for the other owner."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-transfer-diagnostic-20261001.log",
+      "log_sha256": "79b8897160041f2d8ea296849765e90fc145ce0b93fd97a1501c6eaaf15a8389",
+      "tests_run": 1,
+      "elapsed_seconds": 113.277,
+      "returncode": 1,
+      "reason": "KV receiver Success preceded PP1 metadata readiness. PP0 consumed the rid; PP1 deferred then could not re-enter PP consensus."
+    }
+  ],
+  "verification": [
+    "Each of four PD test files runs eager and actual CUDA Graph requests; PP stages use non-overlap as required by serving, single-stage graph D also uses overlap.",
+    "Eight PD cases publish 40 complete snapshots and exclude 24 selected missing/stale handoff or stream-abort attempts.",
+    "Online prefill/decode source observations verify exact KV, raw top128 scores and vocabulary IDs, LSE with 1e-6 tolerance, tokens, positions, masks and validity without recomputing target outputs.",
+    "Unit regressions cover metadata arriving after KV Success, metadata gating before TP/CP reductions, and failed/fake transfers that must not wait.",
+    "Final D rank 0 runtime assertions require drained capture work and zero quarantined Host slots; all-owner receipt agreement is exercised by complete PP snapshot readback and single-source-stage stale-message exclusion.",
+    "Black/isort, repository Ruff F401/F821/UP037, Python compilation and registered-test validation pass for all 12 changed Python files. New tests/helpers also pass broader Ruff with I001 delegated to isort.",
+    "The complete four-test ordinary distributed file passes, including TP/PP AR, target-KV DSpark and cap-accept/compact ragged DSpark across eager and graph/overlap modes."
+  ],
+  "limitations": [
+    "Correctness uses Qwen3-0.6B, real local TCP TransferEngine and TCP Store, plus an HTTP Catalog test double.",
+    "Combined TP2/PP2 serving, deployed replicated heads, PD speculation, DP/CP, more model identities and cross-node RDMA remain unvalidated or unimplemented.",
+    "P PP1 -> D PP2 expansion is rejected by the existing Mooncake PP transfer topology contract.",
+    "Observers perform synchronous source reads for correctness; these timings do not establish production latency, throughput or SLO acceptance.",
+    "Production Catalog retention, consumer replay, production-exported trained drafts and training quality remain outside this evidence."
+  ],
+  "reproduction": {
+    "resident_submit_prefix": [
+      "kubectl",
+      "exec",
+      "-n",
+      "qiji",
+      "job-fe1ce1dcdea6-20261001023258-master-0",
+      "-c",
+      "master",
+      "--",
+      "python3",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+      "--state-dir",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "submit",
+      "--cwd",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+      "--env",
+      "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+      "--env",
+      "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ],
+    "temporary_exec_prefix": [
+      "kubectl",
+      "exec",
+      "-n",
+      "qiji",
+      "job-d1c8e138f33a-20261002023845-master-0",
+      "-c",
+      "master",
+      "--",
+      "env",
+      "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+      "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+      "timeout",
+      "--signal=TERM",
+      "--kill-after=30s",
+      "600",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python"
+    ],
+    "unit_suffix": [
+      "--timeout",
+      "120",
+      "--",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+      "<test_file>",
+      "-v"
+    ],
+    "single_gpu_storage_suffix": [
+      "--env",
+      "TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+      "--timeout",
+      "480",
+      "--",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+      "test/registered/storage/test_training_capture_pd.py",
+      "-v"
+    ],
+    "temporary_storage_suffix": [
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/<test_file>",
+      "-v",
+      "-f"
+    ],
+    "distributed_regression_command": "'kubectl' 'exec' '-n' 'qiji' 'job-d1c8e138f33a-20261002023845-master-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' 'timeout' '--signal=TERM' '--kill-after=30s' '900' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/test/registered/storage/test_training_capture_distributed.py' '-v' '-f' > /gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-distributed-regression-20261001.log 2>&1"
+  },
+  "passing_test_count": 42,
+  "cleanup": {
+    "temporary_job_deleted": true,
+    "temporary_pod_not_found_confirmed": true,
+    "temporary_no_live_serving_or_store_before_deletion": true,
+    "resident": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790882237.0302782,
+      "idle_pid": 40807,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.5452055931091309
+    },
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "original_staged_index_unchanged": true
+  }
+}

@@ -7,6 +7,8 @@ from pathlib import Path
 import torch
 
 from sglang.srt.distributed import (
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -38,6 +40,9 @@ def observe(
     ) / "capture-reference"
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
+    pp_rank = get_pipeline_model_parallel_rank()
+    if get_pipeline_model_parallel_world_size() > 1:
+        root = root / f"pp{pp_rank}"
     if tp_size > 1:
         root = root / f"tp{tp_rank}"
     root.mkdir(parents=True, exist_ok=True)
@@ -72,8 +77,16 @@ def observe(
                     assert history[position] == token
             tokens = history[:end]
             assert len(tokens) == end
-            predictions = [end] if end >= len(req.origin_input_ids) else []
-            logits = logits_output.next_token_logits[row : row + len(predictions)]
+            predictions = (
+                [end]
+                if end >= len(req.origin_input_ids) and logits_output is not None
+                else []
+            )
+            logits = (
+                logits_output.next_token_logits[row : row + len(predictions)]
+                if logits_output is not None
+                else None
+            )
         else:
             start = end
             slots = forward_batch.out_cache_loc[region]
@@ -92,22 +105,31 @@ def observe(
             "cuda_graph": can_run_cuda_graph,
             "tp_rank": tp_rank,
             "tp_size": tp_size,
+            "pp_rank": pp_rank,
             "verify_count": count if width is not None else None,
             "verify_width": width,
-            "verify_padding": forward_batch.input_ids.numel() - sum(lengths)
-            if lengths is not None
-            else 0,
+            "verify_padding": (
+                forward_batch.input_ids.numel() - sum(lengths)
+                if lengths is not None
+                else 0
+            ),
             "tokens": tokens,
             "kv_start": start,
             "kv_slots": slots.long().cpu(),
-            "kv": {
-                name: buffer[slots.long()].cpu()
-                for name, buffer in coordinator.exporter.buffers.items()
-            }
-            if coordinator.exporter is not None
-            else {},
+            "kv": (
+                {
+                    name: buffer[slots.long()].cpu()
+                    for name, buffer in coordinator.exporter.buffers.items()
+                }
+                if coordinator.exporter is not None
+                else {}
+            ),
             "predictions": predictions,
-            "logits": logits[:, : coordinator.teacher.vocab_size].float().cpu(),
+            "logits": (
+                logits[:, : coordinator.teacher.vocab_size].float().cpu()
+                if logits is not None
+                else torch.empty(0, coordinator.teacher.vocab_size)
+            ),
         }
         path = root / f"{next(_sequence):06d}.pt"
         if width is None:

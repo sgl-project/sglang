@@ -2353,6 +2353,71 @@ This extends TCP correctness coverage. It does not certify PD PP/speculation,
 DP, RDMA, deployed TP4 replicated heads, production Catalog retention, trained
 draft quality or workload performance acceptance.
 
+## PP PD Teacher Circulation And Transfer Readiness
+
+AR Mooncake PD capture now supports pipeline stages. Only the last P stage
+captures the raw first-teacher row. It encodes a bounded immutable handoff into
+the existing sampled-output ring, where each P stage validates the capture
+context and batch alignment before attaching it to its final KV transfer.
+Encoding releases the owned GPU teacher; recomputing the final prefill replaces
+the cached message. D reuses cohort ownership: each stage exports its selected
+global layers, the last stage's aux owner stores teacher metadata, and all-owner
+receipts gate publication. Serving KV/aux buffer registration is unchanged.
+
+This also fixes a PP transfer-readiness race exposed by the first real request.
+The old PP consensus checked receiver Success without checking metadata.
+PP0 consumed the request while PP1's bootstrap-room metadata was still zero;
+PP1 deferred the import and could never form another intersection after PP0
+removed the request. PP consensus now applies the existing metadata gate before
+the attention TP/CP reductions. No stage consumes a successful transfer until
+all stages have its metadata. Failed and fake transfers retain their behavior.
+Three failed diagnostic attempts and the final passing runs are retained in
+`experiments/capture-pd-pp.json` with log hashes.
+
+The following separate files pass against real Qwen3-0.6B P/D workers and an
+independent Mooncake TCP Store reader:
+
+| Test File | P / D Topology | Tests | Seconds |
+| --- | --- | --- | --- |
+| `test_training_capture_pd_pp.py` | PP2 / PP2, TP1 | 2 | 144.554 |
+| `test_training_capture_pd_pp_reduce.py` | PP2 / PP1, TP1 | 2 | 136.074 |
+| `test_training_capture_pd.py` | PP1 / PP1, TP1 | 2 | 134.186 |
+| `test_training_capture_pd_tp.py` | TP2 / TP2, PP1 | 2 | 169.943 |
+
+The eight eager/graph cases publish 40 complete snapshots and exclude 24
+selected missing-handoff, stale-handoff and cancelled requests. Source KV,
+raw top-128 scores/IDs, full-vocabulary LSE, token IDs, positions, loss mask and
+validity are compared with online observations, without rerunning the target.
+Coverage includes a one-token response, chunked prefill, prefix reuse and an
+actual two-request decode batch. PP disables overlap as required by serving;
+the single-stage D graph cases exercise overlap. Runtime assertions require
+D rank 0 to report zero Host quarantines and drained work after cancellation.
+
+Thirty unit tests pass across five separate files: 11 PD capture tests,
+three PP metadata-readiness tests, six decode cleanup tests, eight configuration
+tests and two PP/CP rank-offset tests. They cover delayed metadata, reduction
+ordering, failed/fake transfers, bounded PP teacher messages, malformed/misaligned
+rows, foreign contexts, first-token mismatches and recomputed teacher ownership.
+
+The complete `test_training_capture_distributed.py` regression file also passes
+four tests in 432.993 seconds: ordinary TP/PP, target-KV DSpark, and cap-accept
+and compact ragged DSpark under eager and graph/overlap execution. The final
+total is 42 passing tests. All 12 changed Python files pass Black, isort,
+repository Ruff checks and compilation; registered-test validation passes.
+New helpers/tests also pass broader Ruff with import ordering handled by isort.
+The GPU checkout matches the final source hashes.
+
+The temporary two-H100 job `job-d1c8e138f33a-20261002023845` was deleted after
+verifying no live serving/Store processes remained; its pod is NotFound.
+The resident H100 has no active or queued experiment and has resumed idle load.
+The original checkout's staged-index digest is unchanged. Commands, counters,
+source/log hashes and cleanup observations are in `experiments/capture-pd-pp.json`.
+
+The existing Mooncake transport permits matching P/D PP sizes or D PP=1.
+P PP1 to D PP2 is still unsupported by that transport. The runtime evidence
+does not certify combined TP2/PP2, PD speculation, DP/CP, cross-node RDMA,
+production Catalog retention, trained draft quality or performance acceptance.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -2363,8 +2428,9 @@ draft quality or workload performance acceptance.
 3. Extend P9's real TP2/PP1 and TP1/PP2 Qwen3 capture validation to combined
    TP2/PP2, replicated heads, distributed cancellation/backpressure and additional
    model identities. Complete pipeline speculative collection,
-   pipeline/speculative PD and cross-node RDMA. AR PD now transfers the
-   first teacher row and publishes from D across matching/asymmetric TP groups.
+   speculative PD and cross-node RDMA. AR PD now transfers the
+   first teacher row and publishes from D across matching/asymmetric TP groups
+   and matching/reduced PP groups supported by the Mooncake transport.
    Ordinary AR uses the distributed serving
    path, and static and confidence-scheduled DSpark capture support TP. The
    target-KV v1 draft remains static by checkpoint contract; the remaining

@@ -102,7 +102,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
         kill_process_tree(process.pid)
         process.wait(timeout=20)
 
-    def launch(self, role, root, *, replay, tp_size):
+    def launch(self, role, root, *, replay, tp_size, pp_size):
         folder = root / role
         folder.mkdir()
         config = {
@@ -144,6 +144,8 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     role,
                     "--tp-size",
                     str(tp_size),
+                    "--pp-size",
+                    str(pp_size),
                     "--disaggregation-transfer-backend",
                     "mooncake",
                     "--disaggregation-bootstrap-port",
@@ -171,7 +173,11 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     "1",
                     "2",
                     "4",
-                    *([] if replay else ["--disable-overlap-schedule"]),
+                    *(
+                        []
+                        if replay and pp_size == 1
+                        else ["--disable-overlap-schedule"]
+                    ),
                 ],
             )
         self.addCleanup(self.stop_process, process)
@@ -217,7 +223,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
             "internal_states"
         ][0]["training_capture"]
 
-    def abort_capture(self, rid, *, decode_tp):
+    def abort_capture(self, rid, *, distributed):
         before = self.capture_state()
         self.bootstrap_room += 1
         payload = {
@@ -265,9 +271,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     self.fail("PD stream ended before cancellation")
             self.assertEqual(prefill.result().status_code, 200)
         with self.catalog.condition:
-            reason = (
-                "cohort_failed" if decode_tp > 1 else "request_aborted_or_retracted"
-            )
+            reason = "cohort_failed" if distributed else "request_aborted_or_retracted"
             self.assertTrue(
                 self.catalog.condition.wait_for(
                     lambda: any(
@@ -291,7 +295,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
             state["counters"]["admitted"], before["counters"]["admitted"] + 1
         )
         self.assertEqual(state["host_pool"]["quarantined"], 0)
-        if decode_tp > 1:
+        if distributed:
             self.assertGreater(
                 state["request_router"].get("cancelled", 0),
                 before["request_router"].get("cancelled", 0),
@@ -303,15 +307,17 @@ class PDCaptureRuntimeBase(CustomTestCase):
             )
         return state
 
-    def exercise(self, *, replay, prefill_tp=1, decode_tp=1):
-        root = self.root / f"p{prefill_tp}-d{decode_tp}-replay-{replay}"
+    def exercise(self, *, replay, prefill_tp=1, decode_tp=1, prefill_pp=1, decode_pp=1):
+        root = self.root / (
+            f"p{prefill_tp}x{prefill_pp}-d{decode_tp}x{decode_pp}-replay-{replay}"
+        )
         root.mkdir()
         self.bootstrap_port, self.bootstrap_room = free_port(), 5000
         prefill, self.prefill_url = self.launch(
-            "prefill", root, replay=replay, tp_size=prefill_tp
+            "prefill", root, replay=replay, tp_size=prefill_tp, pp_size=prefill_pp
         )
         decode, self.decode_url = self.launch(
-            "decode", root, replay=replay, tp_size=decode_tp
+            "decode", root, replay=replay, tp_size=decode_tp, pp_size=decode_pp
         )
         first = len(self.catalog.publications)
         responses = {}
@@ -342,6 +348,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
         for publication in publications[first:]:
             manifest, tensors = read_snapshot(self.reader, publication)
             self.assertEqual(manifest.topology.tp_size, decode_tp)
+            self.assertEqual(manifest.topology.pp_size, decode_pp)
             tokens, result = responses.pop(manifest.provenance.trace_id)
             self.assertEqual(
                 tensors["token_ids"].tolist(), tokens + result["output_ids"]
@@ -368,7 +375,9 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     )
                 )
             self.assertEqual(len(self.catalog.publications), first + expected)
-        state = self.abort_capture(f"abort-{replay}", decode_tp=decode_tp)
+        state = self.abort_capture(
+            f"abort-{replay}", distributed=decode_tp > 1 or decode_pp > 1
+        )
         self.assertEqual(len(self.catalog.publications), first + expected)
         self.assertGreaterEqual(state["counters"]["pd_handoff_committed"], expected + 1)
         self.assertGreaterEqual(state["counters"]["failed_pd_handoff_failed"], 1)
@@ -379,6 +388,8 @@ class PDCaptureRuntimeBase(CustomTestCase):
                 {
                     "prefill_tp": prefill_tp,
                     "decode_tp": decode_tp,
+                    "prefill_pp": prefill_pp,
+                    "decode_pp": decode_pp,
                     "replay": replay,
                     "capture": state,
                 },

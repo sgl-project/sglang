@@ -94,11 +94,10 @@ class TestCaptureConfiguration(CustomTestCase):
             self.args.disaggregation_mode = role
             self.args.disaggregation_transfer_backend = "mooncake"
             self.args.optimistic_prefill_attempts = 0
-            for tp in (1, 2, 4):
-                self.args.tp_size = tp
+            for tp, pp in ((1, 1), (2, 1), (4, 1), (1, 2), (2, 2)):
+                self.args.tp_size, self.args.pp_size = tp, pp
                 validate_capture_server_args(self.args)
             for name, value in (
-                ("pp_size", 2),
                 ("speculative_algorithm", "DSPARK"),
                 ("disaggregation_transfer_backend", "nixl"),
                 ("optimistic_prefill_attempts", 1),

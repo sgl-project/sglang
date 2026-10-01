@@ -6,7 +6,7 @@ import time
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import msgspec
 import numpy as np
@@ -425,6 +425,114 @@ class TestPDCapture(CustomTestCase):
                     torch.testing.assert_close(
                         objects[obj.key], expected, rtol=0, atol=0
                     )
+
+    def test_recomputed_prefill_replaces_cached_pp_teacher(self):
+        _, wire = self.begin()
+        req = self.prefill_request(wire)
+        batch = SimpleNamespace(reqs=[req], seq_lens_cpu=[2])
+        forward = SimpleNamespace(extend_seq_lens_cpu=[2], positions=torch.arange(2))
+        logits = torch.arange(256).float().reshape(1, -1)
+        payloads = []
+        for raw in (logits, -logits):
+            self.prefill.after_forward(
+                batch, forward, SimpleNamespace(next_token_logits=raw)
+            )
+            payload = self.prefill.pack_pp_handoffs(batch, torch.tensor([10]))[0]
+            rows = decode_handoff(payload, PrefillTeacherHandoff).teacher_rows(256)
+            torch.testing.assert_close(rows.logits, raw.topk(128).values)
+            torch.testing.assert_close(rows.token_ids, raw.topk(128).indices.int())
+            payloads.append(payload)
+        self.assertNotEqual(*payloads)
+        req.output_ids = [10]
+        self.assertEqual(self.prefill.finish_handoff(req), payloads[-1])
+
+    def test_pp_output_circulates_owned_teacher_before_final_kv_send(self):
+        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        _, wire = self.begin()
+        source, receiver = self.prefill_request(wire), self.prefill_request(wire)
+        other = CaptureTestRequest("unselected")
+        batch = SimpleNamespace(
+            reqs=[other, source], seq_lens_cpu=[1, 2], return_logprob=False
+        )
+        received_batch = SimpleNamespace(
+            reqs=[other, receiver],
+            seq_lens_cpu=[1, 2],
+            return_logprob=False,
+            req_pool_indices=torch.tensor([0, 1]),
+            input_ids=torch.tensor([3, 4]),
+        )
+        forward = SimpleNamespace(
+            extend_seq_lens_cpu=[1, 2], positions=torch.tensor([0, 0, 1])
+        )
+        self.prefill.after_forward(received_batch, forward, None)
+        self.assertFalse(receiver.training_capture_pd.failed)
+        logits = torch.randn(2, 256, generator=torch.Generator().manual_seed(901))
+        raw = logits[1].clone()
+        self.prefill.after_forward(
+            batch, forward, SimpleNamespace(next_token_logits=logits)
+        )
+        scheduler = SimpleNamespace(
+            tp_worker=SimpleNamespace(training_capture=self.prefill),
+            future_map=SimpleNamespace(stash=Mock()),
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="prefill"),
+        ):
+            packet = SchedulerPPMixin._pp_prepare_tensor_dict(
+                scheduler, SimpleNamespace(next_token_ids=torch.tensor([5, 10])), batch
+            )
+            payloads = packet["training_capture_pd_handoffs"]
+            self.assertIsNone(payloads[0])
+            self.assertLessEqual(len(payloads[1]), MAX_HANDOFF_BYTES)
+            logits.fill_(-1000)
+            result = SchedulerPPMixin._pp_prep_batch_result(
+                scheduler,
+                received_batch,
+                SimpleNamespace(can_run_cuda_graph=False),
+                PPProxyTensors(packet),
+            )
+        self.assertEqual(result.next_token_ids.tolist(), [5, 10])
+        self.assertIsNone(source.training_capture_pd.teacher)
+        self.assertIsNone(receiver.training_capture_pd.teacher)
+        source.output_ids = receiver.output_ids = [10]
+        self.assertEqual(self.prefill.finish_handoff(source), payloads[1])
+        self.assertEqual(self.prefill.finish_handoff(receiver), payloads[1])
+        row = decode_handoff(payloads[1], PrefillTeacherHandoff).teacher_rows(256)
+        torch.testing.assert_close(row.logits[0], raw.topk(128).values, rtol=0, atol=0)
+
+    def test_pp_missing_misaligned_or_foreign_teacher_cannot_finish_handoff(self):
+        _, wire = self.begin()
+        payload, _ = self.handoff(wire)
+        handoff = decode_handoff(payload, PrefillTeacherHandoff)
+        stale = encode_handoff(
+            msgspec.structs.replace(
+                handoff,
+                context=msgspec.structs.replace(
+                    handoff.context, fencing_token=handoff.context.fencing_token + 1
+                ),
+            )
+        )
+        for packet in (None, (), (None,), (payload, payload), (stale,), (b"bad",)):
+            with self.subTest(packet=packet is None or len(packet)):
+                req = self.prefill_request(wire)
+                self.prefill.accept_pp_handoffs(
+                    SimpleNamespace(reqs=[req], seq_lens_cpu=[2]), packet
+                )
+                self.assertTrue(req.training_capture_pd.failed)
+                req.output_ids = [10]
+                self.assertIsNone(self.prefill.finish_handoff(req))
+                self.assertFalse(req.finished())
+        req = self.prefill_request(wire)
+        batch = SimpleNamespace(reqs=[req], seq_lens_cpu=[1])
+        self.prefill.accept_pp_handoffs(batch, None)
+        self.assertFalse(req.training_capture_pd.failed)
+        batch.seq_lens_cpu = [2]
+        self.prefill.accept_pp_handoffs(batch, (payload,))
+        req.output_ids = [11]
+        self.assertIsNone(self.prefill.finish_handoff(req))
 
 
 if __name__ == "__main__":

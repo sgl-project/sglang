@@ -797,8 +797,10 @@ PD 的 TransferEngine KV 交接不是 Store 样本提交，两个完成事件分
 #### 13.3.1 当前实现: D 统一导出与发布
 
 `pd_capture.py` 实现 D 统一导出路径。当前接入 Mooncake backend、普通 AR、
-PP=DP=1，支持 TP 分片；PD speculative、PD pipeline parallel 和跨节点 RDMA
+DP=1，支持 TP 分片与 PP；PD speculative 和跨节点 RDMA
 仍需后续实现与验证。P/D 的 TP 数可以不同，模型必须满足全局 teacher/KV 契约。
+PP 遵守现有 Mooncake 传输约束：P/D 的 PP 数相同，或 D 的 PP 数为 1；
+P=PP1、D=PP2 等展开拓扑仍不受底层传输支持。
 不允许 optimistic prefill，因为 P 必须在 forward 前收到 D 的采集上下文。
 
 1. D 在发布 KV 接收地址前，通过原有 Host 配额与 Catalog reservation 申请采集。
@@ -837,6 +839,19 @@ P 的 raw logits 必须已完成全词表 TP gather。P 对所有非 dummy 接�
 各自导入首条边界；P2→D1 时 D 的 mailbox 对相同 handoff 去重，冲突 handoff 作废。
 teacher/KV 契约摘要使用全局模型身份与 KV 几何，不包含 P/D 本地 TP 分片布局。
 
+PP 场景中只有 P 的最后一级持有 raw logits。`pack_pp_handoffs(batch, next_token_ids)`
+将选中请求的有界 teacher 消息附加到现有 sampled-output 环路；其他级在
+`accept_pp_handoffs(batch, payloads)` 中检查 batch 对齐、完整上下文和消息一致性。
+各级最终发送 KV 时再检查首 token，一起交给对应 D 级。消息编码后释放 GPU teacher，
+重新执行 final prefill 时重建消息，不沿用旧分数。这个环路不引入新的通信组或
+额外 Store client，也不改变已注册的 serving KV/aux buffer 布局。
+
+D 的 PP 完成共识必须包含 metadata readiness：先在 attention TP/CP 组中检查
+bootstrap-room 元数据已经落地，再求 PP 交集，之后才允许各级消费请求。
+否则先完成的级会移除请求，元数据晚到的级无法再次形成交集，造成采集与生成停滞。
+D 各级只导出所属全局层，最后一级的 aux owner 保存 teacher；完整分片收齐后发布。
+PP 的 CUDA Graph 路径仍遵守 serving 要求，关闭 overlap schedule。
+
 两端均传入 `--training-capture-config`，teacher identity、选层和 KV 契约必须一致；
 `journal_directory` 可按 P/D 使用不同本地目录。只有 D 实际连接配置中的 Catalog
 与 Mooncake Store。旧 P 不提供 handoff 时，新 D 不发布该样本；旧 D 不发送上下文时，
@@ -845,6 +860,9 @@ teacher/KV 契约摘要使用全局模型身份与 KV 几何，不包含 P/D 本
 `test_training_capture_pd.py`、`test_training_capture_pd_tp.py`、
 `test_training_capture_pd_tp_expand.py` 和 `test_training_capture_pd_tp_reduce.py`
 分别覆盖 P1→D1、P2→D2、P1→D2、P2→D1，均使用真实 P/D 进程和独立 Store reader。
+`test_training_capture_pd_pp.py` 和 `test_training_capture_pd_pp_reduce.py`
+分别覆盖 PP2→PP2 与 PP2→PP1 的 eager/graph 执行，包含首 token、chunked prefill、
+缓存复用、实际 decode batch、单级 stale handoff 与取消。
 测试用 observer 在在线 forward 中按 rank 保存完整原始分数与 source KV，
 不重跑 target 作为回读 oracle。指定的双请求在测试服务器的 ready queue 会合后
 再调度，以保证实际 batch 覆盖；这个约束不进入生产调度器。

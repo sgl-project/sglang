@@ -177,8 +177,7 @@ def validate_capture_server_args(args) -> None:
         and envs.SGLANG_SIMULATE_ACC_LEN.get() > 0,
         "PD capture topology or backend": args.disaggregation_mode != "null"
         and (
-            args.pp_size != 1
-            or args.speculative_algorithm is not None
+            args.speculative_algorithm is not None
             or args.disaggregation_transfer_backend != "mooncake"
             or args.optimistic_prefill_attempts > 0
         ),

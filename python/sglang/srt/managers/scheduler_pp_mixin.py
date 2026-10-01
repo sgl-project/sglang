@@ -1019,6 +1019,15 @@ class SchedulerPPMixin:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
+        if (
+            get_disagg().disaggregation_mode == "prefill"
+            and self.tp_worker.training_capture is not None
+        ):
+            handoffs = self.tp_worker.training_capture.pack_pp_handoffs(
+                batch, result.next_token_ids
+            )
+            if handoffs is not None:
+                tensor_dict["training_capture_pd_handoffs"] = handoffs
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1158,6 +1167,13 @@ class SchedulerPPMixin:
             batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
         )
         batch.input_ids = None
+        if (
+            get_disagg().disaggregation_mode == "prefill"
+            and self.tp_worker.training_capture is not None
+        ):
+            self.tp_worker.training_capture.accept_pp_handoffs(
+                batch, pp_outputs.tensors.get("training_capture_pd_handoffs")
+            )
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1318,7 +1334,11 @@ class SchedulerPPMixin:
         return result, event
 
     def get_rids(
-        self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group
+        self: Scheduler,
+        req_queue: List[Req],
+        is_send: bool,
+        *poll_statuses_group,
+        metadata_buffers=None,
     ):
         """
         Used by PP, get the required rids with the given poll statuses.
@@ -1327,6 +1347,9 @@ class SchedulerPPMixin:
             [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            decode_reqs=req_queue if metadata_buffers is not None else None,
+            metadata_buffers=metadata_buffers,
+            server_args=self.server_args if metadata_buffers is not None else None,
         )
         rids: List = []
         for poll_statuses in poll_statuses_group:
@@ -1410,12 +1433,14 @@ class SchedulerPPMixin:
         return good_rids, bad_rids
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
+        # Include metadata readiness before PP consensus. Once one stage consumes
+        # a rid, a later stage cannot defer it and form a second intersection.
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
                 self.disagg_decode_transfer_queue.queue,
                 False,
                 [KVPoll.Success, KVPoll.Failed],
+                metadata_buffers=self.disagg_decode_transfer_queue.metadata_buffers,
             )
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
@@ -1427,6 +1452,7 @@ class SchedulerPPMixin:
                 self.disagg_decode_transfer_queue.queue,
                 False,
                 [KVPoll.Success, KVPoll.Failed],
+                metadata_buffers=self.disagg_decode_transfer_queue.metadata_buffers,
             )
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
