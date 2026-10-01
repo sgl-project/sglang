@@ -19,6 +19,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.topk import TopKOutputFormat, biased_grouped_topk_impl
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
@@ -80,12 +81,12 @@ def loader_model(params):
     return model
 
 
-def fp8_config(preset="FP8_DYNAMIC", ignore=()):
+def fp8_config(preset="FP8_DYNAMIC", ignore=(), group_name=None):
     return CompressedTensorsConfig.from_config(
         {
             "format": "float-quantized",
             "config_groups": {
-                preset: preset_name_to_scheme(
+                group_name or preset: preset_name_to_scheme(
                     preset, targets=["Linear", "lm_head"]
                 ).model_dump()
             },
@@ -104,6 +105,56 @@ class _LoadedExpert:
 
 
 class TestBeamConfig(CustomTestCase):
+    def test_bf16_and_fp8_reject_unvalidated_moe_runners(self):
+        from sglang.srt.runtime_context import get_flags
+
+        for quant in (None, fp8_config()):
+            for backend in (
+                MoeRunnerBackend.FLASHINFER_TRTLLM,
+                MoeRunnerBackend.FLASHINFER_CUTLASS,
+                MoeRunnerBackend.DEEP_GEMM,
+            ):
+                with (
+                    self.subTest(quant=quant, backend=backend),
+                    get_context().override_server_args(),
+                    get_flags().moe.override(
+                        runner_backend=backend, a2a_backend=MoeA2ABackend.NONE
+                    ),
+                    get_parallel().override(moe_tp_size=1, moe_ep_size=1),
+                    self.assertRaisesRegex(ValueError, "auto or triton"),
+                ):
+                    BeamMoE(tiny_config(), 1, quant_config=quant)
+
+    def test_unsupported_quantization_fails_before_allocation(self):
+        # Other FP8 layouts must not pass merely because they use the same exporter.
+        mixed = fp8_config().config
+        mixed["config_groups"]["other"] = preset_name_to_scheme(
+            "FP8", targets=["model.layers.1.mlp.experts"]
+        ).model_dump()
+        for quant in (
+            Fp8Config(),
+            Fp8Config(is_checkpoint_fp8_serialized=True),
+            W8A8Fp8Config(is_checkpoint_fp8_serialized=True),
+            ModelOptFp8Config(is_checkpoint_fp8_serialized=True),
+            fp8_config("FP8"),
+            fp8_config("W8A8"),
+            CompressedTensorsConfig.from_config(mixed),
+            CompressedTensorsConfig.from_config(
+                fp8_config().config
+                | {"linear_fp8_config": {"activation_scheme": "static"}}
+            ),
+            CompressedTensorsConfig.from_config(
+                {"format": "float-quantized", "config_groups": {}, "ignore": []}
+            ),
+        ):
+            with (
+                self.subTest(quant=quant),
+                patch("sglang.srt.models.beam.BeamModel") as model,
+            ):
+                with self.assertRaisesRegex(NotImplementedError, "FP8_DYNAMIC"):
+                    BeamForCausalLM(tiny_config(), quant_config=quant)
+                model.assert_not_called()
+
     def test_unsupported_attention_and_head_parallelism_fail_before_allocation(self):
         for field in ("enable_dp_attention", "enable_dp_lm_head"):
             with (
@@ -572,11 +623,6 @@ class TestBeamLoading(CustomTestCase):
         self.addCleanup(override.restore)
 
     def test_fp8_model_uses_shared_methods_and_loads_scales(self):
-        class CustomFp8Config(Fp8Config):
-            @classmethod
-            def get_name(cls):
-                return "custom_fp8"
-
         config = tiny_config(
             vocab_size=64,
             num_hidden_layers=2,
@@ -585,21 +631,8 @@ class TestBeamLoading(CustomTestCase):
         )
         self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
         torch.set_default_dtype(torch.bfloat16)
-        for quant in (
-            None,
-            Fp8Config(),
-            W8A8Fp8Config(),
-            Fp8Config(is_checkpoint_fp8_serialized=True),
-            CustomFp8Config(is_checkpoint_fp8_serialized=True),
-            Fp8Config(is_checkpoint_fp8_serialized=True, activation_scheme="static"),
-            W8A8Fp8Config(is_checkpoint_fp8_serialized=True),
-            ModelOptFp8Config(
-                is_checkpoint_fp8_serialized=True,
-                packed_modules_mapping=BeamForCausalLM.packed_modules_mapping,
-            ),
-            fp8_config(),
-            fp8_config("FP8"),
-        ):
+        # Exporters may use arbitrary group names for the FP8_DYNAMIC recipe.
+        for quant in (None, fp8_config(group_name="group_0")):
             with (
                 self.subTest(quant=quant),
                 get_parallel().override(
@@ -624,10 +657,7 @@ class TestBeamLoading(CustomTestCase):
                 model = BeamForCausalLM(config, quant_config=quant)
                 dense, sparse = model.model.layers
                 experts = sparse.mlp.experts
-                serialized = quant is not None and getattr(
-                    quant, "is_checkpoint_fp8_serialized", True
-                )
-                dtype = torch.float8_e4m3fn if serialized else torch.bfloat16
+                dtype = torch.float8_e4m3fn if quant is not None else torch.bfloat16
                 for layer in (dense, sparse):
                     for proj in ("qkv_proj", "gate_proj", "o_proj"):
                         self.assertEqual(
@@ -638,12 +668,8 @@ class TestBeamLoading(CustomTestCase):
                     dense.mlp.down_proj.weight,
                 ):
                     self.assertEqual(param.dtype, dtype)
-                # W8A8 quantizes experts as they load, so it allocates FP8 up front.
-                expert_dtype = (
-                    torch.float8_e4m3fn if isinstance(quant, W8A8Fp8Config) else dtype
-                )
-                self.assertEqual(experts.w13_weight.dtype, expert_dtype)
-                self.assertEqual(experts.w2_weight.dtype, expert_dtype)
+                self.assertEqual(experts.w13_weight.dtype, dtype)
+                self.assertEqual(experts.w2_weight.dtype, dtype)
                 self.assertEqual(model.model.embed_tokens.weight.dtype, torch.bfloat16)
                 self.assertEqual(sparse.mlp.gate.weight.dtype, torch.float32)
                 self.assertEqual(
@@ -681,12 +707,6 @@ class TestBeamLoading(CustomTestCase):
                 self.assertNotIsInstance(
                     experts.quant_method, BeamUnquantizedFusedMoEMethod
                 )
-                if not serialized:
-                    continue
-                channelwise = isinstance(quant, W8A8Fp8Config) or (
-                    isinstance(quant, CompressedTensorsConfig)
-                    and "FP8_DYNAMIC" in quant.config["config_groups"]
-                )
                 weights = []
                 for name, width, value in (
                     ("0.self_attn.q_proj", 384, 1),
@@ -708,17 +728,12 @@ class TestBeamLoading(CustomTestCase):
                         (
                             f"{prefix}.weight_scale",
                             torch.full(
-                                (width, 1) if channelwise else (1,),
+                                (width, 1),
                                 value / 16,
                                 dtype=torch.float32,
                             ),
                         )
                     )
-                    if (
-                        getattr(dense.self_attn.qkv_proj, "input_scale", None)
-                        is not None
-                    ):
-                        weights.append((f"{prefix}.input_scale", torch.tensor([0.125])))
                 model.load_weights(weights)
                 for layer, expected in (
                     (dense.self_attn.qkv_proj, [1] * 384 + [2] * 64 + [3] * 64),
@@ -727,35 +742,31 @@ class TestBeamLoading(CustomTestCase):
                     torch.testing.assert_close(
                         layer.weight.float()[:, 0], torch.tensor(expected).float()
                     )
-                    scales = expected if channelwise else list(dict.fromkeys(expected))
                     torch.testing.assert_close(
-                        layer.weight_scale.flatten(), torch.tensor(scales).float() / 16
+                        layer.weight_scale.flatten(),
+                        torch.tensor(expected).float() / 16,
                     )
                 torch.testing.assert_close(
                     experts.w13_weight[0].float()[:, 0],
                     torch.tensor([6] * 32 + [7] * 32).float(),
                 )
-                scales = [6] * 32 + [7] * 32 if channelwise else [6, 7]
                 torch.testing.assert_close(
                     experts.w13_weight_scale[0].flatten(),
-                    torch.tensor(scales).float() / 16,
+                    torch.tensor([6] * 32 + [7] * 32).float() / 16,
                 )
-                if getattr(experts, "w13_input_scale", None) is not None:
-                    self.assertEqual(experts.w13_input_scale[0].item(), 0.125)
-                if isinstance(quant, CompressedTensorsConfig):
-                    self.assertEqual(model.lm_head.weight.dtype, dtype)
-                    scales = torch.full_like(model.lm_head.weight_scale, 0.25)
-                    model.load_weights(
-                        [
-                            ("lm_head.weight", torch.full((64, 24), 9, dtype=dtype)),
-                            ("lm_head.weight_scale", scales),
-                        ]
-                    )
-                    torch.testing.assert_close(
-                        model.lm_head.weight.float(),
-                        torch.full((64, 24), 9.0, dtype=torch.float32),
-                    )
-                    torch.testing.assert_close(model.lm_head.weight_scale, scales)
+                self.assertEqual(model.lm_head.weight.dtype, dtype)
+                scales = torch.full_like(model.lm_head.weight_scale, 0.25)
+                model.load_weights(
+                    [
+                        ("lm_head.weight", torch.full((64, 24), 9, dtype=dtype)),
+                        ("lm_head.weight_scale", scales),
+                    ]
+                )
+                torch.testing.assert_close(
+                    model.lm_head.weight.float(),
+                    torch.full((64, 24), 9.0, dtype=torch.float32),
+                )
+                torch.testing.assert_close(model.lm_head.weight_scale, scales)
 
     def test_fp8_exclusions_use_unpacked_projection_names(self):
         ignored = [

@@ -3761,6 +3761,8 @@ class TestBeamOverrides(CustomTestCase):
             (nvfp4, {"moe_runner_backend": "flashinfer_cutlass"}, {}),
             (nvfp4, {"moe_a2a_backend": "deepep"}, {}),
         ]
+        # Defaults must not force TRTLLM for other formats, even those rejected
+        # later by Beam's checkpoint validation.
         for method in ("fp8", "w8a8_fp8", "modelopt_fp8"):
             cases.extend(
                 [

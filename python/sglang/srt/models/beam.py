@@ -43,6 +43,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
@@ -157,13 +158,18 @@ class BeamMoE(nn.Module):
         self.tp_size = get_parallel().moe_tp_size
         self.ep_size = get_parallel().moe_ep_size
         backend = get_moe_runner_backend()
-        supported_runner = (
-            backend.is_auto() or backend.is_triton() or backend.is_flashinfer_trtllm()
-        )
-        if not supported_runner or not get_moe_a2a_backend().is_none():
+        supported_runners = {
+            "bf16": ("auto", "triton"),
+            "fp8_dynamic": ("auto", "triton"),
+            "nvfp4": ("flashinfer_trtllm",),
+        }.get(get_beam_quantization(quant_config), ())
+        if (
+            backend.value not in supported_runners
+            or not get_moe_a2a_backend().is_none()
+        ):
             raise ValueError(
-                "Beam supports the auto, triton, or flashinfer_trtllm MoE runner, "
-                "with no MoE all-to-all"
+                "Beam supports the auto or triton MoE runner for BF16/FP8_DYNAMIC "
+                "and flashinfer_trtllm for NVFP4, with no MoE all-to-all"
             )
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -204,11 +210,7 @@ class BeamMoE(nn.Module):
             routing_method_type=RoutingMethodType.DeepSeekV3,
             quant_config=quant_config,
             quant_method=(
-                BeamUnquantizedFusedMoEMethod(
-                    use_flashinfer_trtllm_moe=backend.is_flashinfer_trtllm()
-                )
-                if quant_config is None
-                else None
+                BeamUnquantizedFusedMoEMethod() if quant_config is None else None
             ),
             prefix=add_prefix("experts", prefix),
         )
@@ -484,6 +486,48 @@ class BeamModel(nn.Module):
         return self.norm(hidden_states)
 
 
+def get_beam_quantization(quant_config: Optional[QuantizationConfig]) -> Optional[str]:
+    """Identify supported formats for validation, independently of layer dispatch."""
+    if quant_config is None:
+        return "bf16"
+    if quant_config.get_name() == "compressed_tensors":
+        if quant_config.quant_format == "nvfp4-pack-quantized":
+            return "nvfp4"
+        if (
+            quant_config.quant_format != "float-quantized"
+            or quant_config.linear_fp8_config is not None
+        ):
+            return None
+        for scheme in quant_config.target_scheme_map.values():
+            weights = scheme.get("weights")
+            activations = scheme.get("input_activations")
+            if not (
+                all(
+                    q is not None
+                    and q.type == "float"
+                    and q.num_bits == 8
+                    and q.symmetric
+                    for q in (weights, activations)
+                )
+                and weights.strategy == "channel"
+                and not weights.dynamic
+                and activations.strategy == "token"
+                and activations.dynamic is True
+                and (scheme.get("format") or quant_config.quant_format)
+                == "float-quantized"
+            ):
+                return None
+        return "fp8_dynamic" if quant_config.target_scheme_map else None
+    if (
+        isinstance(quant_config, ModelOptFp4Config)
+        and quant_config.is_checkpoint_nvfp4_serialized
+        and not quant_config.is_awq
+        and not quant_config.is_w4a16
+    ):
+        return "nvfp4"
+    return None
+
+
 class BeamForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -497,6 +541,12 @@ class BeamForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        if get_beam_quantization(quant_config) is None:
+            raise NotImplementedError(
+                "Beam supports BF16, compressed-tensors FP8_DYNAMIC (per-channel "
+                "weights and dynamic per-token activations), or serialized W4A4 "
+                "NVFP4 from compressed-tensors or ModelOpt"
+            )
         if get_parallel().enable_dp_attention or get_parallel().enable_dp_lm_head:
             raise NotImplementedError(
                 "Beam does not yet support attention data parallelism or a "

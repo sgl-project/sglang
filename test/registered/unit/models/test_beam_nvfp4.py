@@ -84,6 +84,19 @@ class TestBeamNvfp4(CustomTestCase):
         ):
             BeamForCausalLM(BeamConfig(), quant_config=modelopt_quant_config())
 
+    def test_modelopt_variants_without_nvfp4_activations_are_rejected(self):
+        for quant in (
+            modelopt_quant_config("W4A16_NVFP4"),
+            modelopt_quant_config("NVFP4_AWQ"),
+            ModelOptFp4Config(),
+        ):
+            with (
+                self.subTest(quant=quant),
+                get_context().override_server_args(attention_backend="trtllm_mha"),
+                self.assertRaisesRegex(NotImplementedError, "W4A4 NVFP4"),
+            ):
+                BeamForCausalLM(BeamConfig(), quant_config=quant)
+
     def test_modelopt_export_keeps_non_expert_modules_in_source_precision(self):
         quant = modelopt_quant_config()
         quant.packed_modules_mapping = BeamForCausalLM.packed_modules_mapping
@@ -157,26 +170,24 @@ class TestBeamNvfp4(CustomTestCase):
                     torch.tensor([expected_scale]),
                 )
 
-    def test_nvfp4_scheme_rejects_incompatible_runner(self):
+    def test_nvfp4_requires_the_trtllm_moe_runner(self):
         config = BeamConfig(hidden_size=16, num_experts=16, moe_intermediate_size=16)
-        with (
-            get_context().override_server_args(),
-            get_flags().moe.override(
-                runner_backend=MoeRunnerBackend.TRITON,
-                a2a_backend=MoeA2ABackend.NONE,
-            ),
-            get_parallel().override(
-                tp_size=1,
-                tp_rank=0,
-                moe_tp_size=1,
-                moe_tp_rank=0,
-                moe_ep_size=1,
-                moe_ep_rank=0,
-            ),
-            override_platform(is_blackwell=True),
-            self.assertRaisesRegex(ValueError, "NVFP4 MoE requires"),
-        ):
-            BeamMoE(config, 0, quant_config=nvfp4_quant_config())
+        for quant in (nvfp4_quant_config(), modelopt_quant_config()):
+            for backend in (
+                MoeRunnerBackend.AUTO,
+                MoeRunnerBackend.TRITON,
+                MoeRunnerBackend.FLASHINFER_CUTLASS,
+            ):
+                with (
+                    self.subTest(quant=quant, backend=backend),
+                    get_context().override_server_args(),
+                    get_flags().moe.override(
+                        runner_backend=backend, a2a_backend=MoeA2ABackend.NONE
+                    ),
+                    get_parallel().override(moe_tp_size=1, moe_ep_size=1),
+                    self.assertRaisesRegex(ValueError, "flashinfer_trtllm for NVFP4"),
+                ):
+                    BeamMoE(config, 0, quant_config=quant)
 
 
 if __name__ == "__main__":
