@@ -299,6 +299,36 @@ def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.T
     return buf[:rows]
 
 
+class DcpSharedPrefix(NamedTuple):
+    """What a batch's prefixes share, by radix node. ``walked`` is each
+    request's prefix length rebuilt from its match; ``union_rows`` counts each
+    shared node once, which is what a deduplicated gather would send."""
+
+    walked: List[int]
+    union_rows: int
+
+
+def dcp_shared_prefix(last_nodes: Sequence[object]) -> DcpSharedPrefix:
+    """Measure prefix sharing across a batch from the radix match alone.
+
+    Each request's prefix is the root-to-``last_node`` path, so two requests
+    share exactly the nodes their paths have in common -- no device read and no
+    index comparison. Duck-typed on ``.parent``/``.value`` to keep this import-
+    free and CPU-testable.
+    """
+    seen: Dict[int, int] = {}
+    walked: List[int] = []
+    for last_node in last_nodes:
+        node, rows = last_node, 0
+        while node is not None and getattr(node, "value", None) is not None:
+            n = len(node.value)
+            rows += n
+            seen.setdefault(id(node), n)
+            node = getattr(node, "parent", None)
+        walked.append(rows)
+    return DcpSharedPrefix(walked=walked, union_rows=sum(seen.values()))
+
+
 class DcpExtendGatherPiece(NamedTuple):
     """One collective of the extend gather. The all-gather lays the sends out
     rank-major, this chunk's own KV follows, and ``index`` maps output rows

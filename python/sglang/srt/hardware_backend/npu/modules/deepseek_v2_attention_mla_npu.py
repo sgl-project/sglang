@@ -621,6 +621,33 @@ def _log_dcp_extend_memory(prefix_rows: int, extend_rows: int) -> None:
     _last_dcp_extend_rows = (prefix_rows, extend_rows)
 
 
+def _log_dcp_shared_prefix(forward_batch, row_bytes: int) -> None:
+    """Report how much of this gather is one prefix fetched once per request.
+
+    ``walked`` coming from the radix match must equal the scheduler's own
+    prefix lengths; that equality is the whole question, because a deduplicated
+    gather would read sharing off the nodes rather than compare indices.
+    """
+    shared = getattr(forward_batch, "npu_dcp_shared_prefix", None)
+    if shared is None:
+        return
+    prefix_lens = list(forward_batch.extend_prefix_lens_cpu)
+    sent = sum(prefix_lens)
+    gib = 1 << 30
+    logger.info(
+        "DCP shared prefix: bs=%d prefix=%s walked=%s walked_ok=%s "
+        "sent_rows=%d union_rows=%d saved=%.1f%% (%.2f GiB/layer)",
+        len(prefix_lens),
+        prefix_lens,
+        shared.walked,
+        shared.walked == prefix_lens,
+        sent,
+        shared.union_rows,
+        100.0 * (sent - shared.union_rows) / sent if sent else 0.0,
+        (sent - shared.union_rows) * row_bytes / gib,
+    )
+
+
 def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
     """Lay this rank's per-request shards out at their padded send offsets."""
     send = shards.new_empty((plan.send_rows, *shards.shape[1:]))
@@ -773,6 +800,9 @@ def _dcp_gather_extend_kv_npu(
                 sum(forward_batch.extend_prefix_lens_cpu),
                 sum(forward_batch.extend_seq_lens_cpu),
             )
+        _log_dcp_shared_prefix(
+            forward_batch, (k_nope.shape[-1] + k_pe.shape[-1]) * k_nope.element_size()
+        )
 
     pool = get_token_to_kv_pool()
     total_rows = plan.pieces[-1].out_end if plan.pieces else 0

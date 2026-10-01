@@ -1034,6 +1034,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # per write in _resolve_dcp_write, and doing both corrupts the write.
         if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
+            if envs.SGLANG_DEBUG_NPU_DCP_SHARED_PREFIX.get():
+                # Measured here because the gather only ever sees lengths; the
+                # radix nodes that say what is shared live on the requests.
+                from sglang.srt.layers.dcp.layout import dcp_shared_prefix
+
+                ret.npu_dcp_shared_prefix = dcp_shared_prefix(
+                    [getattr(req, "last_node", None) for req in batch.reqs]
+                )
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device

@@ -1003,6 +1003,9 @@ class Envs:
     SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
+    # DCP extend on NPU: log how much of a batch's gathered prefix is the same
+    # radix nodes fetched once per request. Probe for a deduplicated gather.
+    SGLANG_DEBUG_NPU_DCP_SHARED_PREFIX = EnvBool(False)
     # DCP extend on NPU: rows per prefix-gather collective, capping the scratch.
     # <= 0 gathers the whole prefix in one.
     SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
