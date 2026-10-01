@@ -1033,17 +1033,12 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.batch_overlap.two_batch_overlap import (
             MaybeTboDeepEPDispatcher,
         )
-        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-            is_in_tc_piecewise_cuda_graph,
-        )
 
         # The hooks must surround the complete dispatch, including its receive
         # wait. Fused EP bypasses these hooks. An eager/piecewise graph break
         # must not split the side-stream event record from its wait.
-        return (
-            isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
-            and not is_in_breakable_cuda_graph()
-            and not is_in_tc_piecewise_cuda_graph()
+        return (isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)) and (
+            not is_in_breakable_cuda_graph()
         )
 
     def _forward_unfused(

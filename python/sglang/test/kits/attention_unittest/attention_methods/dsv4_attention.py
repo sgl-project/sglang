@@ -312,7 +312,7 @@ class MockDSV4ModelRunner:
         max_context_len: int,
         swa_size: int,
         disable_cuda_graph: bool = True,
-        disable_piecewise_cuda_graph: bool = True,
+        disable_prefill_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
         compression_ratios: list[int] = None,
     ):
@@ -358,8 +358,8 @@ class MockDSV4ModelRunner:
                 prefill=PhaseConfig(
                     backend=(
                         Backend.DISABLED
-                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
-                        else Backend.TC_PIECEWISE
+                        if (disable_cuda_graph or disable_prefill_cuda_graph)
+                        else Backend.BREAKABLE
                     ),
                 ),
             ),
@@ -694,7 +694,7 @@ def build_dsv4_attention_fixture(
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
     disable_cuda_graph: bool = True,
-    disable_piecewise_cuda_graph: bool = True,
+    disable_prefill_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     compression_ratios: list[int] = None,
 ) -> DSV4AttentionFixture:
@@ -731,7 +731,7 @@ def build_dsv4_attention_fixture(
         max_context_len=max_context_len,
         swa_size=swa_size,
         disable_cuda_graph=disable_cuda_graph,
-        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+        disable_prefill_cuda_graph=disable_prefill_cuda_graph,
         runner_batch_size=runner_batch_size,
         compression_ratios=compression_ratios,
     )

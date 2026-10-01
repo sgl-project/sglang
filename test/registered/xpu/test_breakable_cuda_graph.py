@@ -79,7 +79,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         intermediate = torch.zeros(4, device=self.device)
         y = torch.zeros(4, device=self.device)
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def eager_op(src):
             return src * 2.0
 
@@ -102,11 +102,11 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         x = torch.zeros(4, device=self.device)
         y = torch.zeros(4, device=self.device)
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def add_one(src):
             return src + 1.0
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def double(src):
             return src * 2.0
 
@@ -125,24 +125,10 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         get_device_module().synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 16.0, device=self.device)))
 
-    def test_eager_on_graph_disabled(self):
-        """@eager_on_graph(enable=False) should be a no-op passthrough."""
-
-        @self.eager_on_graph(enable=False)
-        def my_fn(x):
-            return x + 1.0
-
-        # Should just be the original function
-        t = torch.tensor([1.0, 2.0], device=self.device)
-        result = my_fn(t)
-        self.assertTrue(
-            torch.allclose(result, torch.tensor([2.0, 3.0], device=self.device))
-        )
-
     def test_eager_on_graph_outside_capture(self):
         """@eager_on_graph called outside capture should run the function directly."""
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def my_fn(x):
             return x + 1.0
 
@@ -157,7 +143,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         x = torch.zeros(4, device=self.device)
         y = torch.zeros(4, device=self.device)
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def scale(src):
             return src * 3.0
 
@@ -184,7 +170,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         x = torch.zeros(4, device=self.device)
         y = torch.zeros(4, device=self.device)
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def scale(src):
             return src * 3.0
 

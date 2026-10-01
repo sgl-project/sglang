@@ -28,11 +28,6 @@ Backend selection comes from cuda_graph_config.prefill:
                       zero-length sentinels. bs > slots falls back to eager.
                       Attention metadata is refreshed out-of-graph against the
                       slot-padded batch before capture/replay.
-  - "tc_piecewise" — TcPiecewiseCudaGraphBackend: torch.compile
-                      wraps the model; per-shape compiled/captured pieces live
-                      in torch.compile's internal cache. Multi-request prefill
-                      is supported.
-  - "disabled"     — handled at the model_runner level; runner not constructed.
 """
 
 from __future__ import annotations
@@ -111,10 +106,6 @@ from sglang.srt.model_executor.runner_backend_utils import (
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     BCG_FAILURE_HINT,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    TCPCG_FAILURE_HINT,
-    set_tc_piecewise_forward_context,
 )
 from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
@@ -246,11 +237,9 @@ class _ChunkedPrefixCaptureBuffers:
 def prefill_failure_msg(backend_name: str) -> str:
     """Render PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG with a backend-specific
     numbered suggestion list. The runner is only constructed for BREAKABLE
-    or TC_PIECEWISE; other values fall back to a generic OOM-style list."""
+    ; other values fall back to a generic OOM-style list."""
     if backend_name == Backend.BREAKABLE:
         hint = BCG_FAILURE_HINT
-    elif backend_name == Backend.TC_PIECEWISE:
-        hint = TCPCG_FAILURE_HINT
     else:
         hint = (
             "1. disable the prefill CUDA graph by --cuda-graph-backend-prefill=disabled\n"
@@ -319,7 +308,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
         )
         # bs in prefill carries the captured shape (token count for
-        # tc_piecewise) — one shape knob per phase.
+        # full) — one shape knob per phase.
         capture_tokens = prefill_config.bs
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = sorted(capture_tokens)
@@ -333,13 +322,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max_context_size=self.max_context_size,
             table_width=model_runner.req_to_token_pool.req_to_token.shape[1],
         )
-        if (
-            self.prefill_backend_name == Backend.TC_PIECEWISE
-            and self.max_context_size is not None
-        ):
-            # TODO(SYChen123): Plumb max_seq_len_override through TcPiecewise
-            # metadata preparation before enabling the fixed context limit here.
-            self._ignore_max_context_size("tc_piecewise prefill CUDA graph")
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
@@ -418,47 +400,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             source=self.buffers,
         )
 
-        self.attention_layers = self.model_runner.attention_layers
-        self.mha_companion_layers = self.model_runner.mha_companion_layers
-        self.has_mha_companion_layers = any(
-            layer is not None for layer in self.mha_companion_layers
-        )
-        self.moe_layers = self.model_runner.moe_layers
-        self.moe_fusions = self.model_runner.moe_fusions
-        self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
+        self.has_mha_companion_layers = self.model_runner.has_mha_companion_layers
 
         self.dp_size = get_parallel().dp_size
         self.require_mlp_tp_gather = require_mlp_tp_gather()
         self.require_attn_tp_gather = require_attn_tp_gather()
 
         # --- backend ---------------------------------------------------
-        # TcPiecewise resolves by running a compile pass that calls back into
-        # capture_prepare / _run_forward, so these fields must exist first.
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
         self.static_draft_hidden_states: Optional[torch.Tensor] = None
         self.layer_model = None
         self._capture_req_slots = 1
-        # Same rationale: _run_compile_pass runs a dummy _run_forward before
-        # resolve_prefill_backend returns, and that forward reads
-        # self._is_full_backend. The compile-pass backend is never Full, so
-        # default False; the assignment below sets the real value once the
-        # backend type is known.
         self._is_full_backend = False
         # Same ordering requirement: capture_prepare reads this.
         self._capture_lora = False
         self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
-        # TcPiecewise does its compile pass during backend construction.
-        # Wrap only that path with the prefill CUDA graph failure hint.
-        try:
-            self.backend = resolve_prefill_backend(self)
-        except RuntimeError as e:
-            if self.prefill_backend_name != Backend.TC_PIECEWISE:
-                raise
-            raise RuntimeError(
-                f"Capture prefill CUDA graph failed: {e}\n"
-                f"{prefill_failure_msg(self.prefill_backend_name)}"
-            ) from e
+        self.backend = resolve_prefill_backend(self)
 
         self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
         if self._is_full_backend:
@@ -580,7 +538,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # contract under BCG: capture-time builds a per-bucket metadata
         # object the backend then refreshes in place at replay. We honor
         # the contract only when the backend is Breakable; FullCG and
-        # TC_PIECEWISE use the eager init_forward_metadata path.
+        # Breakable uses the eager init_forward_metadata path.
         if isinstance(self.backend, BreakableCudaGraphBackend):
             self.use_captured_attn_metadata = model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         else:
@@ -661,15 +619,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.model_config.vocab_size, rows=rows
         )
 
-    def _uses_eager_prefill_tail(self) -> bool:
-        return self.prefill_backend_name in (Backend.BREAKABLE, Backend.FULL)
-
     def _prefill_logits_buffer_rows(self, forward_batch: ForwardBatch) -> int:
         if not forward_batch.return_logprob:
             return forward_batch.batch_size
-        assert self._uses_eager_prefill_tail(), (
-            "Prefill return_logprob requires an eager logits tail."
-        )
 
         global_num_tokens = forward_batch.global_num_tokens_for_logprob_cpu
         if global_num_tokens is not None:
@@ -725,45 +677,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     @contextmanager
     def _prefill_forward_context(
         self,
-        forward_batch: ForwardBatch,
         *,
-        num_tokens: Optional[int] = None,
         raw_num_tokens: Optional[int] = None,
     ):
-        with (
-            forward_context(
-                ForwardContext(
-                    attn_backend=self.model_runner.attn_backend,
-                    full_graph=self._is_full_backend,
-                    raw_num_tokens=raw_num_tokens,
-                )
-            ),
-            set_tc_piecewise_forward_context(
-                forward_batch,
-                self.attention_layers,
-                self.quant_config,
-                self.moe_layers,
-                self.moe_fusions,
-                dsa_indexers=self.dsa_indexers,
-                mha_companion_layers=self.mha_companion_layers,
-                num_tokens=num_tokens,
-                raw_num_tokens=raw_num_tokens,
+        with forward_context(
+            ForwardContext(
+                attn_backend=self.model_runner.attn_backend,
                 full_graph=self._is_full_backend,
-            ),
+                raw_num_tokens=raw_num_tokens,
+            )
         ):
             yield
 
     @torch.no_grad()
     def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
-        """Run forward inside the prefill set_tc_piecewise_forward_context.
+        """Capture the transformer body with prefill graph policy.
 
         BCG path: captures only the inner layer_model.forward (transformer
         stack), excluding the outer model.forward tail (logits_processor /
         pooler). The captured output is bs=1 hidden states; replay then runs
         the outer tail eagerly with live multi-req metadata.
-
-        TC_PIECEWISE path: captures the outer model.forward; torch.compile
-        FX-traces produce bs-invariant kernels.
 
         ``@torch.no_grad`` mirrors the decorator on the outer
         ``*ForCausalLM.forward``. For BCG, calling ``layer_model.forward``
@@ -781,115 +714,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         set_is_extend_in_batch(False)
 
-        with self._prefill_forward_context(forward_batch):
+        with self._prefill_forward_context():
             pp_proxy_tensors = self._capture_pp_proxy_tensors(num_tokens)
-            if self._uses_eager_prefill_tail():
-                # BCG / Full: capture the transformer body only.
-                positions = self._get_layer_model_positions(forward_batch)
-                input_ids = forward_batch.input_ids
-                kwargs = _build_layer_model_forward_kwargs(
-                    self.layer_model, forward_batch, pp_proxy_tensors
-                )
-                if pp_proxy_tensors is not None:
-                    input_ids = None
-                    for embeds_name in ("input_embeds", "inputs_embeds"):
-                        if embeds_name in kwargs:
-                            kwargs[embeds_name] = None
-                            break
-                return self.layer_model.forward(
-                    input_ids,
-                    positions,
-                    forward_batch,
-                    **kwargs,
-                )
-            # tc_piecewise: compile/capture the outer model.forward path.
-            pp_kwargs = self.model_runner._pp_kwargs(pp_proxy_tensors)
-            return self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
+            # BCG / Full: capture the transformer body only.
+            positions = self._get_layer_model_positions(forward_batch)
+            input_ids = forward_batch.input_ids
+            kwargs = _build_layer_model_forward_kwargs(
+                self.layer_model, forward_batch, pp_proxy_tensors
+            )
+            if pp_proxy_tensors is not None:
+                input_ids = None
+                for embeds_name in ("input_embeds", "inputs_embeds"):
+                    if embeds_name in kwargs:
+                        kwargs[embeds_name] = None
+                        break
+            return self.layer_model.forward(
+                input_ids,
+                positions,
                 forward_batch,
-                **pp_kwargs,
+                **kwargs,
             )
-
-    def _run_dummy_forward(self, num_tokens: int) -> None:
-        """Build a dummy ForwardBatch at this shape, init attn metadata,
-        run forward once. Used by TcPiecewiseCudaGraphBackend.prepare
-        for both the JIT-activate forward (single shape, before
-        torch.compile install) and the compile-loop pass (every shape,
-        inside enable_torch_compile_warmup).
-        """
-        fb, attn_backend = self.capture_prepare(num_tokens)
-        attn_backend.init_forward_metadata(fb)
-        self._run_forward(fb, num_tokens)
-
-    def run_dummy_multimodal_deepstack_forward(
-        self, language_model: torch.nn.Module, num_tokens: int
-    ) -> bool:
-        """Warm the tensor-valued deepstack branch before serving requests.
-
-        The regular PCG dummy is text-only. Qwen3-VL only provides
-        ``input_deepstack_embeds`` after visual encoding, so leaving this
-        branch cold makes the first image request synchronously recompile the
-        language model. The model/signature checks keep this a no-op for
-        non-deepstack architectures.
-        """
-        if (
-            "input_deepstack_embeds"
-            not in inspect.signature(language_model.forward).parameters
-        ):
-            return False
-
-        num_deepstack = getattr(self.model_runner.model, "num_deepstack_embeddings", 0)
-        if num_deepstack <= 0:
-            return False
-
-        hidden_size = (
-            getattr(getattr(language_model, "config", None), "hidden_size", None)
-            or self.model_runner.model_config.hidden_size
-        )
-        fb, attn_backend = self.capture_prepare(num_tokens)
-        attn_backend.init_forward_metadata(fb)
-        deepstack_embeds = torch.zeros(
-            (num_tokens, hidden_size * num_deepstack),
-            dtype=self.model_runner.dtype,
-            device=self.device,
-        )
-        torch._dynamo.maybe_mark_dynamic(deepstack_embeds, 0)
-
-        fb.dp_local_start_pos = fb.dp_local_num_tokens = None
-        set_dp_buffer_len(
-            fb.global_dp_buffer_len,
-            num_tokens,
-            fb.dp_padding_mode.is_max_len(),
-            fb.global_num_tokens_cpu,
-        )
-        set_is_extend_in_batch(False)
-
-        with (
-            forward_context(
-                ForwardContext(
-                    attn_backend=self.model_runner.attn_backend,
-                    full_graph=self._is_full_backend,
-                    raw_num_tokens=None,
-                )
-            ),
-            set_tc_piecewise_forward_context(
-                fb,
-                self.attention_layers,
-                self.quant_config,
-                self.moe_layers,
-                self.moe_fusions,
-                dsa_indexers=self.dsa_indexers,
-            ),
-        ):
-            language_model.forward(
-                fb.input_ids,
-                self._get_layer_model_positions(fb),
-                fb,
-                input_embeds=fb.input_embeds,
-                input_deepstack_embeds=deepstack_embeds,
-            )
-        return True
 
     def _has_inactive_dp_rank(self, forward_batch: ForwardBatch) -> bool:
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
@@ -1150,7 +994,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """Capture-time metadata init for the BCG-with-captured-metadata
         contract. For opt-in backends (DSV4), call the BCG-specific entry
         and stash the returned per-bucket metadata object; otherwise fall
-        back to the generic eager init that BCG/TC_PIECEWISE use today."""
+        back to the generic eager init that BCG use today."""
         attn_backend = self.model_runner.attn_backend
         with forward_context(ForwardContext(attn_backend=attn_backend)):
             if not self.use_captured_attn_metadata:
@@ -1271,15 +1115,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # flag is FullCG-only, so this is inert for the BreakableCG vote path.
         if self._has_uncapturable_chunked_prefix(prefix_lens):
             return False
-        # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:
             return False
         if (
             capture_hidden_mode is not None
             and self.capture_hidden_mode < capture_hidden_mode
         ):
-            return False
-        if return_logprob and not self._uses_eager_prefill_tail():
             return False
         if self.max_context_size is not None:
             if (
@@ -2021,8 +1862,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             tail_batch.mm_input_embeds = forward_batch.mm_input_embeds
         try:
             with self._prefill_forward_context(
-                static_forward_batch,
-                num_tokens=static_num_tokens,
                 raw_num_tokens=raw_num_tokens,
             ):
                 return self.model_runner.model.forward(
@@ -2033,27 +1872,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
         finally:
             self.layer_model.forward = original_layer_forward
-
-    def _execute_tc_piecewise(
-        self,
-        static_forward_batch: ForwardBatch,
-        static_num_tokens: int,
-        raw_num_tokens: int,
-        **kwargs,
-    ):
-        assert self.max_context_size is None, (
-            "tc_piecewise replay does not support a fixed prefill context size"
-        )
-        with self._prefill_forward_context(
-            static_forward_batch,
-            num_tokens=static_num_tokens,
-            raw_num_tokens=raw_num_tokens,
-        ):
-            return self.backend.replay(
-                ShapeKey(size=static_num_tokens),
-                static_forward_batch,
-                **kwargs,
-            )
 
     def _trim_logits_output(
         self, output: LogitsProcessorOutput
@@ -2134,20 +1952,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     raw_num_tokens,
                     **kwargs,
                 )
-            elif self._uses_eager_prefill_tail():
+            else:
                 output = self._execute_body_capture(
                     forward_batch,
                     static_forward_batch,
                     static_num_tokens,
                     raw_num_tokens,
                     shape_key,
-                    **kwargs,
-                )
-            else:
-                output = self._execute_tc_piecewise(
-                    static_forward_batch,
-                    static_num_tokens,
-                    raw_num_tokens,
                     **kwargs,
                 )
             return self._finalize_execute_output(output)

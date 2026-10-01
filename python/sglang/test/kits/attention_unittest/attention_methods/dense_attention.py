@@ -314,7 +314,7 @@ class MockModelRunner(ModelRunner):
         max_context_len: int,
         head_dim: int,
         disable_cuda_graph: bool = True,
-        disable_piecewise_cuda_graph: bool = True,
+        disable_prefill_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
@@ -361,8 +361,8 @@ class MockModelRunner(ModelRunner):
                 prefill=PhaseConfig(
                     backend=(
                         Backend.DISABLED
-                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
-                        else Backend.TC_PIECEWISE
+                        if (disable_cuda_graph or disable_prefill_cuda_graph)
+                        else Backend.BREAKABLE
                     ),
                 ),
             ),
@@ -971,7 +971,7 @@ def build_dense_attention_fixture(
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
     disable_cuda_graph: bool = True,
-    disable_piecewise_cuda_graph: bool = True,
+    disable_prefill_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
 ) -> DenseAttentionFixture:
@@ -995,7 +995,7 @@ def build_dense_attention_fixture(
         max_context_len=max_context_len,
         head_dim=head_dim,
         disable_cuda_graph=disable_cuda_graph,
-        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+        disable_prefill_cuda_graph=disable_prefill_cuda_graph,
         runner_batch_size=runner_batch_size,
     )
     try:

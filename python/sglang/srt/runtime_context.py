@@ -2001,7 +2001,6 @@ def cutedsl_moe_max_num_tokens() -> int:
     resolution pipeline uses. Max over the prefill bound, the piecewise-prefill
     capture, and the decode/verify bound.
     """
-    from sglang.srt.model_executor.cuda_graph_config import Backend
 
     spec = get_spec()
     num_tokens_per_req = (
@@ -2009,8 +2008,6 @@ def cutedsl_moe_max_num_tokens() -> int:
     )
     prefill_tokens = get_schedule().max_prefill_tokens
     cg_config = get_exec().graph.cuda_graph_config
-    if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
-        prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
     decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
     return max(prefill_tokens, decode_max_bs * num_tokens_per_req)
 

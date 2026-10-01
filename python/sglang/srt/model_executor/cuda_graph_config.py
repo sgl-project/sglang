@@ -40,8 +40,6 @@ class Phase:
 class Backend:
     """CUDA graph capture backends a phase can use."""
 
-    # Temporary internal name while unreachable legacy branches are removed.
-    TC_PIECEWISE = "tc_piecewise"
     FULL = "full"
     BREAKABLE = "breakable"
     DISABLED = "disabled"
@@ -90,8 +88,6 @@ ALLOWED_KEYS_PER_PHASE = {
 class PhaseConfig:
     """Per-phase CUDA graph settings."""
 
-    # Internal compatibility only; rejected by both configuration parsers.
-    tc_compiler: str = "eager"
     backend: str = Backend.DISABLED
     max_bs: Optional[int] = None
     bs: Optional[List[int]] = None

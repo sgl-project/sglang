@@ -10,13 +10,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
-from sglang.srt.compilation.compile_phase import (
-    get_pcg_capture_stream,
-    is_in_torch_compile_warmup,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
@@ -1151,12 +1144,6 @@ class PyMscclppCommunicator:
         # mscclpp must not be used during any piecewise CUDA graph phase
         # (compile, capture, or replay) as it changes the allreduce dispatch
         # path and triggers recompilation.
-        if (
-            is_in_tc_piecewise_cuda_graph()
-            or is_in_torch_compile_warmup()
-            or get_pcg_capture_stream() is not None
-        ):
-            return False
         return True
 
     def should_mscclpp_allgather(
@@ -1180,12 +1167,6 @@ class PyMscclppCommunicator:
         output_nbytes = output_tensor.numel() * output_tensor.element_size()
         config = self._get_allgather_tuned_config(output_nbytes)
         if config is None or not config.supports_dtype(input_tensor.dtype):
-            return False
-        if (
-            is_in_tc_piecewise_cuda_graph()
-            or is_in_torch_compile_warmup()
-            or get_pcg_capture_stream() is not None
-        ):
             return False
         return True
 

@@ -88,11 +88,6 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
@@ -808,11 +803,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 fused_out[:, self._fused_in_proj_qkvz_width :],
             )
 
-        if (
-            _is_cpu
-            or _is_npu
-            or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-        ):
+        if (_is_cpu) or (_is_npu):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -855,10 +846,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         hs_qkvz = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvz)
         seq_len = hs_bf16.shape[0]
 
-        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
-            DUAL_STREAM_TOKEN_THRESHOLD = 0
-        else:
-            DUAL_STREAM_TOKEN_THRESHOLD = 1024
+        DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
         if (
             self.alt_stream is not None

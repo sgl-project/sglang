@@ -16,7 +16,6 @@
 """Inference-only MiniMax M2 model compatible with HuggingFace weights."""
 
 import logging
-from contextlib import nullcontext
 from functools import lru_cache
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
@@ -65,11 +64,6 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
-)
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -646,12 +640,8 @@ class MiniMaxM2MoE(nn.Module):
         hidden_states = state.hidden_states_mlp_input
 
         if router_logits is not None:
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(
-                    self.layer_id
-                )
+            ctx = get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
             )
             with ctx:
                 state.topk_weights_local, state.topk_idx_local, _ = self.topk(
@@ -684,12 +674,8 @@ class MiniMaxM2MoE(nn.Module):
     def op_dispatch_b(self, state):
         """Dispatch B operation for TBO - complete async dispatch"""
         if self.ep_size > 1:
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(
-                    self.layer_id
-                )
+            ctx = get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
             )
             with ctx:
                 state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
@@ -1158,11 +1144,7 @@ class MiniMaxM2Model(nn.Module):
             )
         else:
             for i in range(self.start_layer, self.end_layer):
-                ctx = (
-                    nullcontext()
-                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                    else get_global_expert_distribution_recorder().with_current_layer(i)
-                )
+                ctx = get_global_expert_distribution_recorder().with_current_layer(i)
                 with ctx:
                     layer = self.layers[i]
                     hidden_states = layer(

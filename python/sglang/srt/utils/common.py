@@ -3923,11 +3923,8 @@ def dispose_tensor(x: torch.Tensor):
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
         is_in_breakable_cuda_graph,
     )
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-        is_in_tc_piecewise_cuda_graph,
-    )
 
-    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+    if is_in_breakable_cuda_graph():
         return
 
     if get_flags().capture.disable_dispose_tensor:

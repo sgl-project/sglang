@@ -221,10 +221,7 @@ def _copy_output(dst: Any, src: Any) -> Any:
 
 
 def eager_on_graph(
-    fn: Optional[Callable] = None,
-    capture_stub: Optional[Callable] = None,
-    *,
-    enable: Optional[bool] = None,
+    fn: Optional[Callable] = None, *, capture_stub: Optional[Callable] = None
 ):
     """Record an eager call between captured segments.
 
@@ -232,12 +229,6 @@ def eager_on_graph(
     on replay. All other arguments retain their capture-time identity; tensors
     must therefore use the static buffers owned by the graph runner.
     """
-
-    # Transitional support while model callers migrate to the bare decorator.
-    if isinstance(fn, bool):
-        enable, fn = fn, None
-    if enable is False:
-        return lambda inner: inner
 
     def decorator(inner: Callable):
         signature = inspect.signature(inner)

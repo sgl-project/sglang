@@ -308,7 +308,7 @@ class MockMamba2ModelRunner(ModelRunner):
         device: str,
         max_context_len: int,
         disable_cuda_graph: bool = True,
-        disable_piecewise_cuda_graph: bool = True,
+        disable_prefill_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
@@ -351,8 +351,8 @@ class MockMamba2ModelRunner(ModelRunner):
                 prefill=PhaseConfig(
                     backend=(
                         Backend.DISABLED
-                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
-                        else Backend.TC_PIECEWISE
+                        if (disable_cuda_graph or disable_prefill_cuda_graph)
+                        else Backend.BREAKABLE
                     ),
                 ),
             ),
@@ -679,7 +679,7 @@ def build_mamba2_attention_fixture(
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
     disable_cuda_graph: bool = True,
-    disable_piecewise_cuda_graph: bool = True,
+    disable_prefill_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
 ) -> Mamba2AttentionFixture:
@@ -695,7 +695,7 @@ def build_mamba2_attention_fixture(
         device=device,
         max_context_len=max_context_len,
         disable_cuda_graph=disable_cuda_graph,
-        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+        disable_prefill_cuda_graph=disable_prefill_cuda_graph,
         runner_batch_size=runner_batch_size,
     )
     try:

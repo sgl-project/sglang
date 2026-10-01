@@ -131,9 +131,7 @@ from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     is_post_capture_kv_active,
 )
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
-    AttentionAndMoeLayers,
     ModelLayerInfo,
-    compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
@@ -1506,10 +1504,6 @@ class ModelRunner:
         )
 
         return DecodeCudaGraphRunner
-
-    def get_cuda_graph_layers(self, layer_model) -> AttentionAndMoeLayers:
-        """Return the model layers used by prefill CUDA graph execution."""
-        return compute_attention_and_moe_layers(layer_model)
 
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None

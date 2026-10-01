@@ -30,7 +30,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (  # noqa: F
     get_batch_sizes_to_capture,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner  # noqa: F401
-from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (  # noqa: F401
     DecodeCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner  # noqa: F401
@@ -38,9 +38,6 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (  # noqa
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey  # noqa: F401
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (  # noqa: F401
-    TCPCG_FAILURE_HINT,
-)
 from sglang.srt.model_executor.runner_utils import (  # noqa: F401
     DecodeInputBuffers,
     DeepEPCudaGraphRunnerAdapter,

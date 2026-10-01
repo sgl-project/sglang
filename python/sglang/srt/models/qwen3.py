@@ -22,11 +22,6 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
@@ -413,16 +408,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(
             hidden_states,
             forward_batch,
-            cache=(
-                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
-                if _is_npu
-                and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                and (
-                    hasattr(self.mlp.gate_up_proj, "weight")
-                    and hasattr(self.mlp.down_proj, "weight")
-                )
-                else None
-            ),
+            cache=(None),
         )
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)

@@ -297,7 +297,7 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
     @unittest.skipIf(
         is_hip(),
         "split-op extend runner exercises the piecewise-CUDA-graph path "
-        "(TcPiecewiseForwardContext.num_tokens), which is not wired on ROCm.",
+        "(prefill runner token buffers), which is not wired on ROCm.",
     )
     def test_runner_mode_split_op_extend_cases(self):
         for case, static_num_tokens in self.SPLIT_OP_CASES:

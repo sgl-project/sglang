@@ -93,10 +93,6 @@ class SRTPlatform(DeviceMixin):
         """
         return "inductor"
 
-    def get_piecewise_backend_cls(self) -> type:
-        """Return the piecewise compilation backend class for this platform."""
-        raise NotImplementedError
-
     def get_speculative_cache_locs_fn(
         self,
     ) -> Optional[Callable[..., torch.Tensor]]:
@@ -133,14 +129,6 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports device graph capture and replay.
         Controls CUDA graph (CudaGraphRunner) for the decode path.
         OOT platforms that support graph-style capture should return True.
-        """
-        return False
-
-    def support_piecewise_cuda_graph(self) -> bool:
-        """Whether this platform supports piecewise CUDA graph.
-
-        Controls PiecewiseCudaGraphRunner for the prefill/extend path
-        (torch.compile backend).
         """
         return False
 

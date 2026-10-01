@@ -64,10 +64,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.model_loader.weight_utils import (
     RUNAI_STREAMER_TENSOR_ATTR,
     default_weight_loader,
@@ -92,7 +88,6 @@ from sglang.srt.utils import (
     is_npu,
     make_layers,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -329,12 +324,9 @@ class GptOssSparseMoeBlock(nn.Module):
         else:
             router_input = hidden_states
 
-        if is_in_tc_piecewise_cuda_graph():
-            final_hidden_states = moe_impl(self.layer_id, hidden_states)
-        else:
-            router_logits, _ = self.router(router_input)
-            topk_output = self.topk(router_input, router_logits)
-            final_hidden_states = self.experts(hidden_states, topk_output)
+        router_logits, _ = self.router(router_input)
+        topk_output = self.topk(router_input, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
 
         final_hidden_states = reduce_moe_output(final_hidden_states)
 
@@ -351,16 +343,6 @@ class GptOssSparseMoeBlock(nn.Module):
         else:
             ans = final_hidden_states.view(num_tokens, hidden_dim_unpadded)
         return ans
-
-
-@register_custom_op(out_shape="hidden_states")
-def moe_impl(layer_id: int, hidden_states: torch.Tensor) -> torch.Tensor:
-    forward_context = get_tc_piecewise_forward_context()
-    moe_fusion = forward_context.moe_fusions[layer_id]
-    router_logits, _ = moe_fusion.router(hidden_states)
-    topk_output = moe_fusion.topk(hidden_states, router_logits)
-    final_hidden_states = moe_fusion.experts(hidden_states, topk_output)
-    return final_hidden_states
 
 
 class GptOssAttention(nn.Module):

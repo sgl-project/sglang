@@ -5,9 +5,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from torch import nn
+
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
-    compute_attention_and_moe_layers,
+    compute_attention_layer_info,
     resolve_layer_indices,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -16,8 +18,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
-class TestComputeAttentionAndMoeLayers(CustomTestCase):
-    def test_deepseek_mla_registers_mha_companion(self):
+class TestComputeAttentionLayerInfo(CustomTestCase):
+    def test_deepseek_mla_detects_mha_companion(self):
         attn_mqa = SimpleNamespace()
         attn_mha = SimpleNamespace()
         layer_model = SimpleNamespace(
@@ -28,27 +30,49 @@ class TestComputeAttentionAndMoeLayers(CustomTestCase):
             ]
         )
 
-        attention_layers, _, _, _, mha_companion_layers = (
-            compute_attention_and_moe_layers(layer_model)
+        attention_layer_count, has_mha_companion_layers = compute_attention_layer_info(
+            layer_model
         )
 
-        self.assertEqual(attention_layers, [attn_mqa])
-        self.assertEqual(mha_companion_layers, [attn_mha])
+        self.assertEqual(attention_layer_count, 1)
+        self.assertTrue(has_mha_companion_layers)
         self.assertNotIn("_pcg_mha_companion", vars(attn_mqa))
 
-    def test_pipeline_placeholders_preserve_global_layer_ids(self):
+    def test_pipeline_placeholders_do_not_count_as_attention(self):
         local_attention = SimpleNamespace()
         layer_model = SimpleNamespace(
             layers=[SimpleNamespace(), SimpleNamespace()]
             + [SimpleNamespace(self_attn=SimpleNamespace(attn=local_attention))]
         )
 
-        attention_layers, _, _, _, mha_companion_layers = (
-            compute_attention_and_moe_layers(layer_model)
+        attention_layer_count, has_mha_companion_layers = compute_attention_layer_info(
+            layer_model
         )
 
-        self.assertEqual(attention_layers, [None, None, local_attention])
-        self.assertEqual(mha_companion_layers, [None, None, None])
+        self.assertEqual(attention_layer_count, 1)
+        self.assertFalse(has_mha_companion_layers)
+
+    def test_loop_attention_counts_executions(self):
+        attention = nn.Identity()
+        layer_model = SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(
+                        attn=nn.ModuleList([attention, attention])
+                    )
+                )
+            ]
+        )
+        self.assertEqual(compute_attention_layer_info(layer_model), (2, False))
+
+    def test_module_dict_skips_non_attention_layers(self):
+        supported = nn.Module()
+        supported.self_attn = nn.Module()
+        supported.self_attn.attn = nn.Identity()
+        layer_model = SimpleNamespace(
+            layers=nn.ModuleDict({"local": supported, "placeholder": nn.Identity()})
+        )
+        self.assertEqual(compute_attention_layer_info(layer_model), (1, False))
 
 
 NUM_LAYERS = 36

@@ -116,20 +116,3 @@ def test_replay_does_not_retain_capture_or_serving_batches():
     del batch
     gc.collect()
     assert live_ref() is None
-
-
-@pytest.mark.parametrize(
-    "decorator", [bcg.eager_on_graph(True), bcg.eager_on_graph(enable=True)]
-)
-def test_legacy_decorator_replays(decorator):
-    increment = decorator(lambda x: x + 1)
-    with recording_capture() as (graph, _):
-        output = increment(torch.tensor(2))
-    graph._break_fns[0](None)
-    assert output.item() == 3
-
-
-def test_legacy_disabled_decorator_is_identity():
-    fn = lambda x: x + 1
-    assert bcg.eager_on_graph(False)(fn) is fn
-    assert bcg.eager_on_graph(enable=False)(fn) is fn

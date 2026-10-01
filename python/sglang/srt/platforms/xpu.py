@@ -99,6 +99,3 @@ class XpuSRTPlatform(XpuDeviceMixin, SRTPlatform):
 
     def support_cuda_graph(self) -> bool:
         return True
-
-    def support_piecewise_cuda_graph(self) -> bool:
-        return True

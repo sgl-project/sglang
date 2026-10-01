@@ -45,16 +45,12 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
-from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import (
     all_gather_single,
     reduce_scatter_single,
     set_global_tcp_store,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     derive_parallel_widths,
@@ -176,7 +172,6 @@ def _register_group(group: "GroupCoordinator") -> None:
 
 
 @register_custom_op(mutates_args=["tensor"])
-@register_split_op()
 def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -826,21 +821,6 @@ class GroupCoordinator:
             total_bytes = input_.numel() * input_.element_size()
             use_1stage_ar = total_bytes <= 128 * 1024
 
-        if (
-            getattr(ca_comm, "_IS_CAPTURING", False)
-            and not torch.cuda.is_current_stream_capturing()
-            and is_in_tc_piecewise_cuda_graph()
-        ):
-            if not hasattr(ca_comm, "fused_ar_rms"):
-                return None
-            return ca_comm.fused_ar_rms(
-                input_,
-                residual_inp_,
-                w=weight_,
-                eps=eps,
-                registered=False,
-                use_1stage=use_1stage_ar,
-            )
         fused_outputs = ca_comm.custom_fused_ar_rms(
             input_,
             residual_inp_,
@@ -958,9 +938,6 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             return "torch_symm_mem"
-        if is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
-            # For piecewise cuda graph, we use pynccl outplace allreduce
-            return "pynccl"
         return None
 
     def _can_use_flashinfer_allreduce(self, input_: torch.Tensor) -> bool:
@@ -1160,11 +1137,7 @@ class GroupCoordinator:
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
                     ca_comm.reduce_scatter(input, output, registered=True)
-            elif is_in_tc_piecewise_cuda_graph():
-                ca_comm.reduce_scatter(input, output, registered=False)
-            else:
-                # True CUDA graph warmup: avoid a different host collective.
-                output.zero_()
+            output.zero_()
             return True
         ca_comm.reduce_scatter(input, output, registered=False)
         return True
@@ -1279,11 +1252,7 @@ class GroupCoordinator:
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
-                elif is_in_tc_piecewise_cuda_graph():
-                    ca_comm.all_gather_unreg(input, out=output, dim=0)
-                else:
-                    # True CUDA graph warmup: avoid a different host collective.
-                    output.zero_()
+                output.zero_()
                 return
             else:
                 ca_comm.all_gather_unreg(input, out=output, dim=0)

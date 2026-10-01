@@ -27,7 +27,6 @@
 """Inference-only xLLM K2MoE and MoVA models compatible with HF weights."""
 
 import math
-from contextlib import nullcontext
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
@@ -75,11 +74,6 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
-)
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -1634,11 +1628,7 @@ class XllmModel(nn.Module):
             )
 
         for i in range(self.start_layer, self.end_layer):
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(i)
-            )
+            ctx = get_global_expert_distribution_recorder().with_current_layer(i)
             with ctx:
                 layer = self.layers[i]
                 hidden_states = layer(positions, hidden_states, forward_batch)

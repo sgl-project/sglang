@@ -23,7 +23,7 @@ class RocmDeviceMixin(CudaDeviceMixin):
 class RocmSRTPlatform(RocmDeviceMixin, SRTPlatform):
     """Default in-tree ROCm SRT platform.
 
-    Capability flags (supports_fp8, support_cuda_graph, support_piecewise_cuda_graph)
+    Capability flags (supports_fp8, support_cuda_graph)
     keep the conservative SRTPlatform defaults rather than mirroring CudaSRTPlatform.
     They are currently only consulted in OOT branches gated on is_out_of_tree(),
     so the defaults are behaviorally inert for the in-tree ROCm path. A follow-up

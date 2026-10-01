@@ -8,7 +8,6 @@ Two test classes:
 """
 
 import unittest
-from unittest.mock import patch
 
 import torch
 
@@ -69,7 +68,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         intermediate = torch.zeros(4, device=self.device)
         y = torch.zeros(4, device=self.device)
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def eager_op(src):
             return src * 2.0
 
@@ -92,11 +91,11 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         x = torch.zeros(4, device=self.device)
         y = torch.zeros(4, device=self.device)
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def add_one(src):
             return src + 1.0
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def double(src):
             return src * 2.0
 
@@ -115,24 +114,10 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 16.0, device=self.device)))
 
-    def test_eager_on_graph_disabled(self):
-        """@eager_on_graph(enable=False) should be a no-op passthrough."""
-
-        @self.eager_on_graph(enable=False)
-        def my_fn(x):
-            return x + 1.0
-
-        # Should just be the original function
-        t = torch.tensor([1.0, 2.0], device=self.device)
-        result = my_fn(t)
-        self.assertTrue(
-            torch.allclose(result, torch.tensor([2.0, 3.0], device=self.device))
-        )
-
     def test_eager_on_graph_outside_capture(self):
         """@eager_on_graph called outside capture should run the function directly."""
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def my_fn(x):
             return x + 1.0
 
@@ -147,7 +132,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         x = torch.zeros(4, device=self.device)
         y = torch.zeros(4, device=self.device)
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def scale(src):
             return src * 3.0
 
@@ -175,7 +160,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         y = torch.zeros(4, device=self.device)
         stream = torch.cuda.Stream(self.device)
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def identity(src):
             return src
 
@@ -199,7 +184,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         x = torch.zeros(4, device=self.device)
         y = torch.zeros(4, device=self.device)
 
-        @self.eager_on_graph(enable=True)
+        @self.eager_on_graph
         def scale(src):
             return src * 3.0
 
@@ -215,56 +200,6 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             any(cell.cell_contents is broken for cell in replay_closure),
             "eager output bridge buffer must be strongly captured",
         )
-
-    def test_attention_narrows_padded_positions(self):
-        from sglang.srt.layers.radix_attention import unified_attention_with_output
-
-        num_tokens = 3
-        padded_num_tokens = 5
-        forward_batch = SimpleNamespace(
-            global_num_token_non_padded_cpu=num_tokens,
-            out_cache_loc=torch.arange(padded_num_tokens, device=self.device),
-            positions=torch.arange(padded_num_tokens, device=self.device),
-        )
-        context = SimpleNamespace(
-            forward_batch=forward_batch,
-            attention_layers=[object()],
-            mha_companion_layers=None,
-            num_tokens=padded_num_tokens,
-            raw_num_tokens=num_tokens,
-        )
-        observed = {}
-
-        def attention_forward(query, key, value, layer, batch, save_kv_cache):
-            observed["positions"] = batch.positions.clone()
-            observed["out_cache_loc"] = batch.out_cache_loc.clone()
-            return torch.ones_like(query)
-
-        output = torch.full((padded_num_tokens, 2), float("nan"), device=self.device)
-        with (
-            patch(
-                "sglang.srt.layers.radix_attention.get_tc_piecewise_forward_context",
-                return_value=context,
-            ),
-            patch(
-                "sglang.srt.layers.radix_attention.get_attn_backend",
-                return_value=SimpleNamespace(forward=attention_forward),
-            ),
-        ):
-            unified_attention_with_output(
-                torch.zeros((padded_num_tokens, 2), device=self.device),
-                torch.zeros((padded_num_tokens, 1, 2), device=self.device),
-                torch.zeros((padded_num_tokens, 1, 2), device=self.device),
-                output,
-                True,
-                0,
-            )
-
-        expected = torch.arange(num_tokens, device=self.device)
-        torch.testing.assert_close(observed["positions"], expected)
-        torch.testing.assert_close(observed["out_cache_loc"], expected)
-        self.assertEqual(forward_batch.positions.shape[0], padded_num_tokens)
-        self.assertEqual(forward_batch.out_cache_loc.shape[0], padded_num_tokens)
 
 
 class TestCopyOutput(CustomTestCase):
