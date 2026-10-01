@@ -59,6 +59,7 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -341,6 +342,15 @@ class MLP2(nn.Module):
         use_tensor_parallel = use_tensor_parallel and not use_data_parallel
         tp_size = get_parallel().attn_tp_size if use_tensor_parallel else 1
         tp_rank = get_parallel().attn_tp_rank if use_tensor_parallel else 0
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=False,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
         if isinstance(self.quant_config, ModelSlimConfig):
             self.fc0 = ReplicatedLinear(
                 dims[0],
