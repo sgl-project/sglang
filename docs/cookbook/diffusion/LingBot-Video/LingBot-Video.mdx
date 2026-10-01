@@ -160,7 +160,7 @@ sglang generate \
   --output-path outputs
 ```
 
-Image conditioning does not support sequence parallelism yet. Serve with `--ulysses-degree 1 --ring-degree 1` for image-to-video requests; the server raises an error rather than generating a corrupted clip.
+Image conditioning does not support sequence parallelism yet. Serve with `--sp-degree 1` for image-to-video requests, or shard with `--tp-size 8` as in 6.1; the server raises an error rather than generating a corrupted clip.
 
 ### 5.3 Text-to-image
 

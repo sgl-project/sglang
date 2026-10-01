@@ -22,7 +22,7 @@ class LingBotVideoDenoisingStage(DenoisingStage):
         if batch.extra.get(COND_LATENT_KEY) is not None and self._sp_world_size() > 1:
             raise ValueError(
                 "LingBot-Video image conditioning does not support sequence "
-                "parallelism yet; run with --ulysses-degree 1 --ring-degree 1."
+                "parallelism yet; run with --sp-degree 1."
             )
         batch.latents = apply_cond_latent(batch, batch.latents)
         return super()._prepare_denoising_loop(batch, server_args)
