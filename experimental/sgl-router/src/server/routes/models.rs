@@ -49,7 +49,7 @@ mod tests {
         let mut ctx = crate::server::app_context::AppContext::stub();
         ctx.config.model = crate::config::ModelConfig {
             id: "qwen3".into(),
-            tokenizer_path: "x".into(),
+            tokenizer_path: Some("x".into()),
             disable_input_ids_forwarding: false,
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,

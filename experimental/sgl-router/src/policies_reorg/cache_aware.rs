@@ -401,6 +401,10 @@ impl Policy for CacheAwarePolicy {
         stage != Stage::Decode
     }
 
+    fn needs_request_tokens(&self) -> bool {
+        true
+    }
+
     fn pick<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],

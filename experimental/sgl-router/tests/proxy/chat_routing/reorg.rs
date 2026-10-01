@@ -798,7 +798,7 @@ async fn load_only_routing_forwards_messages_without_a_tokenizer() {
         let mut ctx = context(workers, vec![]);
         let mutable = Arc::get_mut(&mut ctx).unwrap();
         mutable.config.model.policy = PolicyKind::PowerOfTwo;
-        mutable.config.model.tokenizer_path = "none".into();
+        mutable.config.model.tokenizer_path = None;
         mutable.tokenizers =
             Arc::new(TokenizerRegistry::load_from_config(&mutable.config).unwrap());
         if reorg {
@@ -826,6 +826,33 @@ async fn load_only_routing_forwards_messages_without_a_tokenizer() {
         assert!(
             forwarded.get("input_ids").is_none(),
             "reorg={reorg} pd={pd}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_prefix_reading_routing_needs_request_tokens() {
+    for (policy, needs) in [
+        (PolicyKind::PowerOfTwo, false),
+        (PolicyKind::SessionAware, false),
+        (PolicyKind::CacheAware, true),
+    ] {
+        let mut cfg = config_for("");
+        cfg.model.policy = policy;
+        let legacy = build_policy_registry(&cfg).unwrap();
+        assert_eq!(
+            ChatRouting::Legacy.needs_request_tokens(&legacy),
+            needs,
+            "legacy {policy:?}"
+        );
+        let state = sgl_router::state::kv_events::KvEventIndex::new();
+        let (resolver, _) =
+            sgl_router::policies_reorg::factory::build_resolver(&cfg.model, &state, None).unwrap();
+        let reorg = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
+        assert_eq!(
+            reorg.needs_request_tokens(&PolicyRegistry::default()),
+            needs,
+            "reorg {policy:?}"
         );
     }
 }

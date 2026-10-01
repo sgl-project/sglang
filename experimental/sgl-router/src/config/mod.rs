@@ -44,14 +44,15 @@ impl Config {
     /// Validate invariants not enforced by the CLI parser.
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(!self.model.id.is_empty(), "model id must be non-empty");
+        // Policies that read the prompt are checked against the built routing at startup.
+        ensure!(
+            self.model.tokenizer_path.is_some() || self.model.bucket_config.is_none(),
+            "--no-tokenizer is incompatible with --bucket-config"
+        );
         if let Some(bucket_config) = self.model.bucket_config.as_ref() {
             validate_bucket_config(bucket_config)?;
         }
         self.model.sampling_overrides.validate()?;
-        ensure!(
-            !(self.model.tokenizer_disabled() && self.model.requires_tokenizer()),
-            "--tokenizer-path none is incompatible with cache-aware, prefix-cache, or length-based routing"
-        );
         ensure!(
             self.proxy.stream_idle_timeout_secs > 0,
             "stream_idle_timeout_secs must be greater than zero"
@@ -247,7 +248,7 @@ mod tests {
             observability: ObservabilityConfig::default(),
             model: ModelConfig {
                 id: model_id.into(),
-                tokenizer_path: "/tmp/tok.json".into(),
+                tokenizer_path: Some("/tmp/tok.json".into()),
                 disable_input_ids_forwarding: false,
                 tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
@@ -276,37 +277,17 @@ mod tests {
     }
 
     #[test]
-    fn disabled_tokenizer_is_limited_to_load_only_routing() {
-        fn fuse(model: &mut ModelConfig, kind: ScoreTermKind) {
-            model.policy = PolicyKind::FusedScore;
-            model.fused = Some(vec![FusedTerm { kind, weight: None }]);
-        }
-        type Mutate = fn(&mut ModelConfig);
-        let cases: [(Mutate, bool); 7] = [
-            (|_| {}, false),
-            (|m| m.policy = PolicyKind::PowerOfTwo, false),
-            (|m| m.policy = PolicyKind::CacheAware, true),
-            // The default fuse includes prefix_cache.
-            (|m| m.policy = PolicyKind::FusedScore, true),
-            (|m| fuse(m, ScoreTermKind::LoadBased), false),
-            (|m| fuse(m, ScoreTermKind::PrefixCache), true),
-            (
-                |m| {
-                    m.eligibility = Some(EligibilityConfig {
-                        filters: vec![FilterKind::PrefixCache],
-                        ..Default::default()
-                    })
-                },
-                true,
-            ),
-        ];
-        for (i, (mutate, requires)) in cases.into_iter().enumerate() {
-            let mut c = cfg("qwen3", &["http://10.0.0.1:30000"]);
-            c.model.tokenizer_path = "none".into();
-            mutate(&mut c.model);
-            assert_eq!(c.model.requires_tokenizer(), requires, "case {i}");
-            assert_eq!(c.validate().is_ok(), !requires, "case {i}");
-        }
+    fn disabled_tokenizer_rejects_length_buckets() {
+        let mut c = cfg("qwen3", &["http://10.0.0.1:30000"]);
+        c.model.tokenizer_path = None;
+        c.validate().unwrap();
+        c.model.bucket_config = Some(BucketConfig {
+            buckets: vec![],
+            ttft_slo_policy: SloBucketPolicy::Disabled,
+            tps_slo_policy: SloBucketPolicy::Disabled,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("--no-tokenizer"), "{err}");
     }
 
     #[test]
