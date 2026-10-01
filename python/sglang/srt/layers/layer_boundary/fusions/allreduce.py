@@ -128,9 +128,7 @@ def attn_input_fusions(plan, read=NORM_QUANT_READOUT) -> Tuple[Callable, ...]:
     given = plan.fusions.attn_input_fusions(plan) if plan.fusions else ()
     if not hasattr(plan.norm, "forward_with_allreduce_fusion"):
         return given
-    declares_quant = (
-        isinstance(read, NormQuantReadout)
-    )
+    declares_quant = isinstance(read, NormQuantReadout)
     fuses_quant = (
         isinstance(read, NormQuantReadout)
         and read.fp8_input is not None

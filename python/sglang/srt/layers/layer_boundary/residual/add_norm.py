@@ -332,9 +332,9 @@ class NormQuantReadout:
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         if residual.shape[0] == 0:
             return residual, residual
-        return _norm_quant_kernel(
-            quant_format or self.quant_format, self.keeps_bf16
-        )(norm, residual, None, None)
+        return _norm_quant_kernel(quant_format or self.quant_format, self.keeps_bf16)(
+            norm, residual, None, None
+        )
 
     def update_and_read(
         self,
@@ -349,9 +349,9 @@ class NormQuantReadout:
             return self.read(update.update(hidden_states, residual), norm, quant_format)
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
-        return _norm_quant_kernel(
-            quant_format or self.quant_format, self.keeps_bf16
-        )(norm, hidden_states, residual, post_residual_addition)
+        return _norm_quant_kernel(quant_format or self.quant_format, self.keeps_bf16)(
+            norm, hidden_states, residual, post_residual_addition
+        )
 
 
 @dataclass(frozen=True)
