@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -24,6 +25,13 @@ class PPDSparkDraftWork:
     batch: ScheduleBatch
     draft_input: object
     pp_outputs: Optional[PPProxyTensors] = None
+
+
+def snapshot_pp_dspark_batch(batch: ScheduleBatch) -> ScheduleBatch:
+    snapshot = copy.copy(batch)
+    snapshot.reqs = batch.reqs[:]
+    snapshot.req_pool_indices = batch.req_pool_indices.clone()
+    return snapshot
 
 
 class PPDSparkDraftCoordinator:
@@ -113,7 +121,7 @@ class PPDSparkDraftCoordinator:
     ) -> None:
         self._pending.append(
             PPDSparkDraftWork(
-                batch=batch,
+                batch=snapshot_pp_dspark_batch(batch),
                 draft_input=draft_input,
                 pp_outputs=pp_outputs,
             )

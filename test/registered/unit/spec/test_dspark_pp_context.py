@@ -56,9 +56,12 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 class TestDSparkPPContext(CustomTestCase):
     def test_forward_snapshot_copies_draft_counts_only_for_replicated_dspark(self):
         snapshot = SimpleNamespace()
+        req = object()
         batch = SimpleNamespace(
+            reqs=[req],
             spec_algorithm=SimpleNamespace(is_none=lambda: False),
             req_pool_indices=torch.tensor([3]),
+            orig_seq_lens=torch.tensor([7]),
             draft_global_num_tokens=[1, 2],
             draft_global_num_tokens_for_logprob=[1, 2],
             copy=Mock(return_value=snapshot),
@@ -78,6 +81,10 @@ class TestDSparkPPContext(CustomTestCase):
             result = _pp_snapshot_forward_batch(batch)
             self.assertEqual(result.draft_global_num_tokens, [1, 2])
             self.assertEqual(result.draft_global_num_tokens_for_logprob, [1, 2])
+            self.assertTrue(torch.equal(result.orig_seq_lens, torch.tensor([7])))
+            self.assertIsNot(result.reqs, batch.reqs)
+            self.assertIs(result.reqs[0], req)
+            self.assertIsNot(result.req_pool_indices, batch.req_pool_indices)
 
     def test_idle_verify_without_ragged_layout_uses_target_verify_mode(self):
         target_worker = Mock()
@@ -387,7 +394,11 @@ class TestDSparkPPContext(CustomTestCase):
             pp_group=SimpleNamespace(is_last_rank=True),
         )
         coordinator = PPDSparkDraftCoordinator(scheduler)
-        batch = object()
+        batch = SimpleNamespace(
+            reqs=[],
+            req_pool_indices=torch.tensor([3]),
+            orig_seq_lens=torch.tensor([7]),
+        )
 
         with patch(
             "sglang.srt.managers.scheduler_components.pp_dspark_draft.get_spec",
@@ -398,15 +409,23 @@ class TestDSparkPPContext(CustomTestCase):
         scheduler.model_worker.prepare_pp_draft.assert_not_called()
         self.assertEqual(len(coordinator._pending), 1)
         work = coordinator._pending[0]
-        self.assertIs(work.batch, batch)
+        self.assertIsNot(work.batch, batch)
+        self.assertTrue(torch.equal(work.batch.orig_seq_lens, torch.tensor([7])))
         self.assertIs(work.draft_input, next_draft_input)
+
+        batch.orig_seq_lens = None
+        self.assertTrue(torch.equal(work.batch.orig_seq_lens, torch.tensor([7])))
 
     def test_first_rank_defers_relayed_bubble_proposals(self):
         scheduler = SimpleNamespace(
             pp_group=SimpleNamespace(is_first_rank=True),
         )
         coordinator = PPDSparkDraftCoordinator(scheduler)
-        batch = object()
+        batch = SimpleNamespace(
+            reqs=[],
+            req_pool_indices=torch.tensor([3]),
+            orig_seq_lens=torch.tensor([7]),
+        )
         draft_input = object()
         outputs = PPProxyTensors({})
 
@@ -418,12 +437,12 @@ class TestDSparkPPContext(CustomTestCase):
 
         self.assertEqual(len(coordinator._pending), 1)
         work = coordinator._pending[0]
-        self.assertIs(work.batch, batch)
+        self.assertIsNot(work.batch, batch)
         self.assertIs(work.draft_input, draft_input)
         self.assertIs(work.pp_outputs, outputs)
 
     def test_last_rank_drains_bubble_draft_as_typed_message(self):
-        batch = object()
+        batch = SimpleNamespace(reqs=[], req_pool_indices=torch.tensor([3]))
         draft_input = object()
         proposal = {"identities": [(1, 2, 3)]}
         event = Mock()
@@ -454,8 +473,11 @@ class TestDSparkPPContext(CustomTestCase):
         ):
             coordinator.drain()
 
-        scheduler.model_worker.prepare_pp_draft.assert_called_once_with(
-            batch, draft_input
+        draft_batch = scheduler.model_worker.prepare_pp_draft.call_args.args[0]
+        self.assertIsNot(draft_batch, batch)
+        self.assertIs(
+            scheduler.model_worker.prepare_pp_draft.call_args.args[1],
+            draft_input,
         )
         args, kwargs = scheduler._pp_send_dict_to_next_stage.call_args
         self.assertEqual(kwargs["msg_type"], "dspark_draft")
@@ -463,7 +485,7 @@ class TestDSparkPPContext(CustomTestCase):
         self.assertEqual(coordinator._send_work, ["send-work"])
 
     def test_first_rank_drains_and_installs_both_owner_proposals(self):
-        batch = object()
+        batch = SimpleNamespace(reqs=[], req_pool_indices=torch.tensor([3]))
         draft_input = object()
         outputs = PPProxyTensors({})
         local = {"identities": [(0, 0, 1)]}

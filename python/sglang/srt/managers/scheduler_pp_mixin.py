@@ -20,6 +20,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload, resolve_forward_inpu
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.pp_dspark_draft import (
     PPDSparkDraftCoordinator,
+    snapshot_pp_dspark_batch,
 )
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -66,13 +67,15 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
     if batch.spec_algorithm.is_none():
         return None
-    fwd_batch = batch.copy()
-    fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
     if get_spec().speculative_dspark_pp_replicated_draft:
+        fwd_batch = snapshot_pp_dspark_batch(batch)
         fwd_batch.draft_global_num_tokens = batch.draft_global_num_tokens
         fwd_batch.draft_global_num_tokens_for_logprob = (
             batch.draft_global_num_tokens_for_logprob
         )
+    else:
+        fwd_batch = batch.copy()
+        fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
     return fwd_batch
 
 
