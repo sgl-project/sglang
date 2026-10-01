@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import attn_dp_enabled_of, num_dp_ranks_of
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -74,11 +75,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.disaggregation_transfer_backend not in (
             "mooncake",
             "nixl",
+            "ascend",
             "fake",
         ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake, nixl, or fake for synthetic benchmarking, got "
+                "mooncake, nixl, ascend, or fake for synthetic benchmarking, got "
                 f"{cfg.disaggregation_transfer_backend!r}."
             )
 
@@ -101,7 +103,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     f"(--speculative-algorithm {cfg.speculative_algorithm})"
                 )
 
-            if resolved_view(server_args).enable_dp_attention:
+            if attn_dp_enabled_of(resolved_view(server_args)):
                 logger.warning(
                     "EXPERIMENTAL: Decode radix cache with DP attention. "
                     "Requires prefix-aware DP rank routing for optimal cache hits."
@@ -127,7 +129,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.disaggregation_decode_extra_slots is None:
             extra_slots = 0
             if cfg.max_running_requests is not None:
-                per_worker = cfg.max_running_requests // max(1, cfg.dp_size)
+                per_worker = cfg.max_running_requests // num_dp_ranks_of(cfg)
                 if per_worker <= 32:
                     extra_slots = per_worker * 2
             declare_resolution(
@@ -159,8 +161,8 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.enable_pd_role_switch:
             view = resolved_view(server_args)
             unsupported = []
-            if view.enable_dp_attention:
-                unsupported.append("DP attention (--enable-dp-attention)")
+            if attn_dp_enabled_of(view):
+                unsupported.append(f"attention DP (--attn-dp-size {view.attn_dp_size})")
             if view.ep_size > 1:
                 unsupported.append(f"expert parallelism (--ep-size {view.ep_size})")
             if view.moe_a2a_backend != "none":

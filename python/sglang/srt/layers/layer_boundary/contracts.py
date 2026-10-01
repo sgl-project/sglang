@@ -22,28 +22,29 @@ import torch
 from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.layers.layer_boundary.layout import Layout, SumGroup, TokenAxis
 from sglang.srt.layers.layer_boundary.output import OutputTransform
-from sglang.srt.layers.layer_boundary.residual import StageRead, StageUpdate
-from sglang.srt.layers.layer_boundary.residual.add_norm import ADD, NORM_READ
+from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
+from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READOUT, PLAIN_ADD
 
 
 class ProducerReduction(Enum):
     """Describe compute's cooperation with its output boundary.
 
-    PARTIAL is attention-only: finish() publishes its partial sum. SCOPED
-    follows exit() flags for an FFN or single-stage mixer. LOCAL_TAIL is FFN-only:
+    ALWAYS_PARTIAL is attention-only: finish() publishes its partial sum. EXIT_SCOPED
+    follows exit() flags for an FFN or single-stage mixer. TAIL_AFTER_SUM is FFN-only:
     compute adds a replicated component after its internal sum, so the
     boundary never defers that sum to the next layer. A selected reduce-scatter
     still applies, so compute must add the tail only when it completes the sum.
     """
 
-    PARTIAL = auto()
-    SCOPED = auto()
+    ALWAYS_PARTIAL = auto()
+    EXIT_SCOPED = auto()
     # A replicated component is added after the sum inside compute.
-    LOCAL_TAIL = auto()
+    TAIL_AFTER_SUM = auto()
 
 
-class HandoffRows(Enum):
-    """A required layer/branch handoff, independent of compute's input rows."""
+class ExitRows(Enum):
+    """The rows a layer or branch must leave its output on, independent of
+    compute's input rows."""
 
     ATTENTION = auto()
     TBO_SPLIT = auto()
@@ -56,12 +57,12 @@ class BatchVariant(Enum):
     SEQUENCE_PARALLEL = auto()
 
 
-class StageInput(msgspec.Struct, frozen=True):
+class InputContract(msgspec.Struct, frozen=True):
     """Declare the consumer's input rows and read operation.
 
     Fields:
         layout: Token sharding required by compute.
-        gathers_itself: Token axes compute can gather internally; the boundary
+        gathered_by_compute: Token axes compute can gather internally; the boundary
             may hand it input still sharded over those axes.
         read: Operation that derives input from the updated residual.
     """
@@ -69,23 +70,23 @@ class StageInput(msgspec.Struct, frozen=True):
     layout: Layout
     # Token axes the consumer gathers over itself when its input arrives
     # sharded over them.
-    gathers_itself: FrozenSet[TokenAxis] = frozenset()
+    gathered_by_compute: FrozenSet[TokenAxis] = frozenset()
     # How the consumer reads its input from the residual.
-    read: StageRead = NORM_READ
+    read: ResidualReadout = NORM_READOUT
 
 
-class StageOutput(msgspec.Struct, frozen=True):
+class OutputContract(msgspec.Struct, frozen=True):
     """Declare producer rows and permitted reduction handoffs at construction.
 
     Fields:
         layout: Token sharding of the producer contribution.
         group: Named sum group, or None when there is no reduction.
-        always_leaves: Compute always returns a partial sum.
-        leaves_for_next_layer: Compute can skip reduction under the exit scope
+        always_partial: Compute always returns a partial sum.
+        may_defer_to_next: Compute can skip reduction under the exit scope
             and let the following layer complete it.
-        leaves_for_reduce_scatter: Compute can leave reduction to a fixed-size
+        may_reduce_scatter: Compute can leave reduction to a fixed-size
             reduce-scatter selected by the boundary.
-        leaves_for_reduce_scatterv: Compute can leave reduction to the selected
+        may_reduce_scatterv: Compute can leave reduction to the selected
             variable-size attention-DP combine.
         update: Producer residual operation; None on an arrival contract that
             declares capabilities and obtains the actual update from the stream.
@@ -100,20 +101,20 @@ class StageOutput(msgspec.Struct, frozen=True):
     group: Optional[SumGroup] = None
     # The producer never reduces its output, e.g. a row-parallel projection
     # built with reduce_results=False.
-    always_leaves: bool = False
+    always_partial: bool = False
     # Otherwise it leaves the sum only when the boundary publishes the flag for
     # it: fuse_mlp_allreduce, or mlp_reduce_scatter.
-    leaves_for_next_layer: bool = False
-    leaves_for_reduce_scatter: bool = False
+    may_defer_to_next: bool = False
+    may_reduce_scatter: bool = False
     # Whether the selected attention-DP combine may complete this sum.
-    leaves_for_reduce_scatterv: bool = False
+    may_reduce_scatterv: bool = False
     # How the producer's output is written into the residual. An arrival
     # description has no producer object; its edge declares capabilities only.
-    update: Optional[StageUpdate] = ADD
+    update: Optional[ResidualUpdate] = PLAIN_ADD
     transform: Optional[OutputTransform] = None
 
 
-class StageDecl(msgspec.Struct, frozen=True):
+class StageContract(msgspec.Struct, frozen=True):
     """Resolved input and output contracts for one stage and batch variant.
 
     Fields:
@@ -121,11 +122,11 @@ class StageDecl(msgspec.Struct, frozen=True):
         output: Producer row, reduction and residual-update contract.
     """
 
-    input: StageInput
-    output: StageOutput
+    input: InputContract
+    output: OutputContract
 
 
-class EdgeDecl(msgspec.Struct, frozen=True):
+class EdgeContract(msgspec.Struct, frozen=True):
     """Describe both sides of a boundary and the residual's row movement.
 
     Fields:
@@ -135,23 +136,23 @@ class EdgeDecl(msgspec.Struct, frozen=True):
         residual_to: Residual layout after the boundary.
         residual_joins_sum: Whether one rank may add the residual into a partial
             before reduction; valid only for an eligible plain-add update.
-        update_capabilities: Allowed values of StageUpdate.adds_plainly for
+        arriving_plain_add: Allowed values of ResidualUpdate.is_plain_add for
             arriving contributions. Empty means use produced.update's capability.
             The actual update object travels with the residual stream.
     """
 
-    produced: StageOutput
-    need: StageInput
+    produced: OutputContract
+    need: InputContract
     residual: Layout
     residual_to: Layout
     # Whether the residual is added into one rank's share of the produced sum
     # before that sum completes, instead of after it.
     residual_joins_sum: bool = False
     # Capabilities allowed to arrive from another layer, not its update object.
-    update_capabilities: Tuple[bool, ...] = ()
+    arriving_plain_add: Tuple[bool, ...] = ()
 
 
-class FusedMlpInput(msgspec.Struct, frozen=True):
+class FfnInputFusion(msgspec.Struct, frozen=True):
     """A kernel that completes the sum the attention output owes together with
     the residual add and the post-attention norm, in that order.
 
@@ -181,7 +182,7 @@ class CpMoves(msgspec.Struct, frozen=True):
     reduce_scatter_group: Optional[Callable[[], GroupCoordinator]] = None
 
 
-class StageEntry(msgspec.Struct, frozen=True):
+class EntryPath(msgspec.Struct, frozen=True):
     """Bound consumer operations for one batch variant.
 
     Fields:
@@ -189,15 +190,15 @@ class StageEntry(msgspec.Struct, frozen=True):
             returning compute input and updated residual; finishes owed work,
             applies the producer update and performs the consumer read.
         input_rows: Layout handed to compute after preparation and input_move.
-        input_move: Optional movement after prepare, before the compute handoff.
-        handoff: Optional callable(input, forward_batch, qkv_latent_func) that
+        input_move: Optional movement after prepare, before compute takes the input.
+        attn_input_adapter: Optional callable(input, forward_batch, qkv_latent_func) that
             adapts already-placed input for attention.
         capture_move: Optional movement of the updated residual back onto the
             producer's rows for auxiliary capture.
         capture_move_allocates: Whether capture_move returns fresh storage (a
             gather) rather than a view (a cut); capture then retains it
             without copying.
-        input_sum: Statically owed sum group for an otherwise raw input tensor.
+        declared_sum: Statically owed sum group for an otherwise raw input tensor.
         preserves_residual: Optional (residual, batch) predicate certifying this
             input path leaves residual untouched, including backend fallback.
         capture_preserves_residual: Same guarantee for the local following stage,
@@ -215,35 +216,38 @@ class StageEntry(msgspec.Struct, frozen=True):
     input_move: Optional[Callable] = None
     # Hands the stage its input once it is on its rows:
     # (hidden_states, forward_batch, qkv_latent_func) -> hidden_states.
-    handoff: Optional[Callable] = None
+    attn_input_adapter: Optional[Callable] = None
     # Return the updated residual to the producer's rows for aux capture.
     capture_move: Optional[Callable] = None
     capture_move_allocates: bool = False
-    input_sum: Optional[SumGroup] = None
+    declared_sum: Optional[SumGroup] = None
     preserves_residual: Optional[Callable] = None
     # Bound from a local successor at construction; no runtime plan lookup.
     capture_preserves_residual: Optional[Callable] = None
 
 
-class StageSteps(msgspec.Struct, frozen=True):
+class StagePath(msgspec.Struct, frozen=True):
     """Precomputed entry and exit work for one stage and batch variant.
 
     Fields:
-        entry: Bound consumer preparation and handoff.
+        entry: Bound consumer half: preparation, input move and input adapter.
         output: Producer contract used by the exit decision.
         output_move: Fixed output transport, or None when absent or chosen per
             batch by the attention-DP exit path.
         output_move_completes_sum: Whether that move also reduces the output.
         returns_over_dp: Whether output uses batch-dependent attention-DP transport.
+        complete_output_move: The move for an output compute already reduced,
+            run instead of an output_move that also reduces it.
     """
 
-    entry: StageEntry
-    output: StageOutput
+    entry: EntryPath
+    output: OutputContract
     # None means no fixed move. returns_over_dp selects batch-dependent DP transport.
     output_move: Optional[Callable]
     output_move_completes_sum: bool = False
 
     returns_over_dp: bool = False
+    complete_output_move: Optional[Callable] = None
 
 
 class StageKind(Enum):
