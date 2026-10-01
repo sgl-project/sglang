@@ -67,7 +67,7 @@ __global__ void concat_mla_k_kernel(
     const int64_t k_nope_stride_0,
     const int k_nope_stride_1,
     const int64_t k_rope_stride_0) {
-  const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int flat_warp_id = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
   const int token_id = flat_warp_id / NUM_HEAD_CHUNKS;
   const int head_chunk_id = flat_warp_id % NUM_HEAD_CHUNKS;
   const int lane_id = get_lane_id();
@@ -215,7 +215,7 @@ __global__ void concat_mla_absorb_q_kernel(
 
   PDLWaitPrimary<kUsePDL>();
 
-  const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / kWarpThreads;
+  const int flat_warp_id = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / kWarpThreads;
   if (flat_warp_id >= num_items) return;
 
   const int idx_0 = flat_warp_id / dim_1;
