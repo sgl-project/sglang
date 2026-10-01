@@ -140,6 +140,7 @@ _HICACHE_PP_PREFETCH_SLOTS = 32
 _HICACHE_PP_IDENTITY = torch.iinfo(torch.int64).max
 _HICACHE_PP_STORAGE_START = 4
 _HICACHE_PP_STORAGE_SLOTS = 4 + len(_HICACHE_PP_EXTRA_POOLS)
+_HICACHE_PP_QUEUE_SLOTS = 2 + _HICACHE_PP_STORAGE_SLOTS
 _HICACHE_PP_TERMINATE = _HICACHE_PP_STORAGE_START + _HICACHE_PP_STORAGE_SLOTS
 _HICACHE_PP_WRITE_READY = _HICACHE_PP_TERMINATE + 1
 _HICACHE_PP_LOAD_READY = _HICACHE_PP_TERMINATE + 2
@@ -286,7 +287,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._hicache_pp_prefetch_inflight: set[int] = set()
         self._hicache_pp_write_acks_consumed = 0
         self._hicache_pp_write_ack_snapshots: dict[int, int] = {}
-        self._hicache_pp_last_applied_round = 0
+        self._hicache_pp_round_reservations: dict[int, tuple[int, ...]] = {}
+        self._hicache_pp_reserved_counts = [0] * _HICACHE_PP_QUEUE_SLOTS
         self._hicache_pp_sync_state_logged = False
 
         # HiCache D↔H defaults (overridden by init_hicache)
@@ -448,7 +450,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._hicache_pp_prefetch_inflight.clear()
         self._hicache_pp_write_acks_consumed = 0
         self._hicache_pp_write_ack_snapshots.clear()
-        self._hicache_pp_last_applied_round = 0
+        self._hicache_pp_round_reservations.clear()
+        self._hicache_pp_reserved_counts = [0] * _HICACHE_PP_QUEUE_SLOTS
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
 
@@ -3394,11 +3397,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self, payload: _HiCachePPRingPayload | None
     ) -> bool:
         """Apply a finalized ring envelope once at the consensus consume point."""
-        if payload is None or payload.round_id <= self._hicache_pp_last_applied_round:
+        if (
+            payload is None
+            or payload.round_id not in self._hicache_pp_round_reservations
+        ):
             return False
         ready_counts = self._finish_hicache_ready_count_reduction(payload)
         self._apply_hicache_ready_counts(ready_counts)
-        self._hicache_pp_last_applied_round = payload.round_id
         return True
 
     def _build_hicache_pp_envelope(self, round_id: int) -> torch.Tensor:
@@ -3448,6 +3453,26 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             else:
                 storage_queue_sizes = (0,) * _HICACHE_PP_STORAGE_SLOTS
+
+        # Scheduler rounds can overlap, so reserve each offered prefix until its
+        # result returns; otherwise a later round can claim the same queue items.
+        local_counts = (write_acks, load_acks, *storage_queue_sizes)
+        claims = tuple(
+            0
+            if count == unavailable
+            else max(0, count - self._hicache_pp_reserved_counts[index])
+            for index, count in enumerate(local_counts)
+        )
+        offered_counts = tuple(
+            unavailable if count == unavailable else claims[index]
+            for index, count in enumerate(local_counts)
+        )
+        assert round_id not in self._hicache_pp_round_reservations
+        self._hicache_pp_round_reservations[round_id] = claims
+        for index, count in enumerate(claims):
+            self._hicache_pp_reserved_counts[index] += count
+        write_acks, load_acks = offered_counts[:2]
+        storage_queue_sizes = offered_counts[2:]
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
@@ -3537,6 +3562,10 @@ class UnifiedRadixCache(BasePrefixCache):
         assert values[2] == -values[3], (
             "write_back duplicate-reclaim victims diverged across PP/TP ranks"
         )
+        reservation = self._hicache_pp_round_reservations.pop(payload.round_id)
+        for index, count in enumerate(reservation):
+            self._hicache_pp_reserved_counts[index] -= count
+            assert self._hicache_pp_reserved_counts[index] >= 0
         for slot in range(_HICACHE_PP_PREFETCH_SLOTS):
             offset = _HICACHE_PP_PREFETCH_START + 2 * slot
             tag = values[offset]

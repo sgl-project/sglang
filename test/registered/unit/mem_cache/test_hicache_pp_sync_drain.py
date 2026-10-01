@@ -11,6 +11,11 @@ import torch
 from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.mem_cache.unified_radix_cache import (
     _HICACHE_PP_ENVELOPE_SIZE,
+    _HICACHE_PP_IDENTITY,
+    _HICACHE_PP_PREFETCH_START,
+    _HICACHE_PP_QUEUE_SLOTS,
+    _HICACHE_PP_STORAGE_START,
+    _HICACHE_PP_TERMINATE,
     UnifiedRadixCache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -70,7 +75,8 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         cache._hicache_pp_prefetch_inflight = set()
         cache._hicache_pp_write_acks_consumed = 0
         cache._hicache_pp_write_ack_snapshots = {}
-        cache._hicache_pp_last_applied_round = 0
+        cache._hicache_pp_round_reservations = {}
+        cache._hicache_pp_reserved_counts = [0] * _HICACHE_PP_QUEUE_SLOTS
         cache._hicache_pp_sync_state_logged = False
         cache.work_list = []
         cache.enable_storage_metrics = False
@@ -180,7 +186,8 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         cache._hicache_pp_prefetch_inflight = set()
         cache._hicache_pp_write_acks_consumed = 0
         cache._hicache_pp_write_ack_snapshots = {}
-        cache._hicache_pp_last_applied_round = 0
+        cache._hicache_pp_round_reservations = {}
+        cache._hicache_pp_reserved_counts = [0] * _HICACHE_PP_QUEUE_SLOTS
         cache._hicache_pp_sync_state_logged = False
         cache.work_list = []
         cache.enable_storage = True
@@ -458,6 +465,62 @@ class TestHiCachePPConsensusRing(CustomTestCase):
             final
         )
         self.assertIs(forwarded.hicache, final)
+
+    def test_overlapping_rounds_offer_each_queue_item_once(self):
+        leader = self.helper._make_cache(0, [], [True])
+        follower = self.helper._make_cache(1, [], [True])
+        first = follower._build_hicache_pp_ring_payload(
+            leader._build_hicache_pp_ring_payload()
+        )
+        second = follower._build_hicache_pp_ring_payload(
+            leader._build_hicache_pp_ring_payload()
+        )
+
+        self.assertEqual(int(second.envelope[1]), 0)
+        for cache in (leader, follower):
+            cache._apply_hicache_pp_ring_payload(second)
+            cache._apply_hicache_pp_ring_payload(first)
+            self.assertFalse(cache._apply_hicache_pp_ring_payload(first))
+            self.assertEqual(
+                [
+                    item.kwargs["finish_count"]
+                    for item in cache.loading_check.call_args_list
+                ],
+                [0, 1],
+            )
+
+    def test_unaccepted_local_claim_is_reoffered_after_result(self):
+        leader = self.helper._make_storage_cache(0, backup_count=5)
+        follower = self.helper._make_storage_cache(1, backup_count=2)
+        first = follower._build_hicache_pp_ring_payload(
+            leader._build_hicache_pp_ring_payload()
+        )
+        leader._apply_hicache_pp_ring_payload(first)
+        follower._apply_hicache_pp_ring_payload(first)
+
+        next_proposal = leader._build_hicache_pp_ring_payload()
+
+        self.assertEqual(int(first.envelope[_HICACHE_PP_STORAGE_START + 2]), 2)
+        self.assertEqual(int(next_proposal.envelope[_HICACHE_PP_STORAGE_START + 2]), 3)
+
+    def test_follower_pp0_only_slots_do_not_reserve_counts(self):
+        follower = self.helper._make_cache(1, [], [])
+        follower._register_hicache_pp_prefetch_verdict(
+            "terminate", "follower-only", True
+        )
+        before = list(follower._hicache_pp_reserved_counts)
+
+        payload = follower._build_hicache_pp_ring_payload()
+
+        self.assertEqual(
+            int(payload.envelope[_HICACHE_PP_TERMINATE]), _HICACHE_PP_IDENTITY
+        )
+        self.assertTrue(
+            torch.all(
+                payload.envelope[_HICACHE_PP_PREFETCH_START:] == _HICACHE_PP_IDENTITY
+            )
+        )
+        self.assertEqual(follower._hicache_pp_reserved_counts, before)
 
 
 if __name__ == "__main__":
