@@ -90,7 +90,7 @@ class TestAttentionCpBoundary(CustomTestCase):
             attn_cp_size=CP_SIZE,
             attn_cp_rank=cp,
             enable_prefill_cp=True,
-            moe_dense_tp_size=1,
+            moe_dense_tp_size=1 if getattr(self, "sparse", True) else None,
             moe_dp_size=1,
             moe_ep_size=1,
             moe_tp_size=CP_SIZE,
@@ -144,9 +144,10 @@ class TestAttentionCpBoundary(CustomTestCase):
                 ((comm, "use_symmetric_memory"), lambda *a, **k: nullcontext()),
                 ((comm, "is_allocation_symmetric"), lambda: False),
                 (
-                    (dsa_cp, "get_local_dp_buffer"),
-                    lambda g: torch.empty(ROWS * CP_SIZE, HIDDEN).double(),
+                    (dsa_cp, "use_symmetric_memory"),
+                    lambda *a, **k: nullcontext(),
                 ),
+                ((dsa_cp, "is_allocation_symmetric"), lambda: False),
                 ((dsa_cp, "attn_cp_all_gather_into_tensor"), collectives["gather"]),
                 (
                     (comm, "attn_cp_reduce_scatter_tensor"),
@@ -175,7 +176,7 @@ class TestAttentionCpBoundary(CustomTestCase):
             return make_test_stages(
                 first=False,
                 last=False,
-                sparse=True,
+                sparse=getattr(self, "sparse", True),
                 previous_sparse=False,
                 next_layer_sparse=False,
                 attention_norm=layernorm,
@@ -287,6 +288,47 @@ class TestAttentionCpBoundary(CustomTestCase):
             torch.testing.assert_close(
                 back[cp], self.values[cp] + self.residuals[cp], rtol=0, atol=0
             )
+
+    def test_dense_tp_returns_the_same_context_shard(self):
+        self.sparse = False
+        for reduce_scatter in (False, True):
+            with self.subTest(reduce_scatter=reduce_scatter):
+                _, back, _ = self.run_ranks(use_reduce_scatter=reduce_scatter)
+                for cp in range(CP_SIZE):
+                    torch.testing.assert_close(
+                        back[cp], self.values[cp] + self.residuals[cp], rtol=0, atol=0
+                    )
+
+    def test_gather_uses_actual_rows_with_attention_dp(self):
+        # CP partners belong to one DP replica. Neither DP buffer padding nor
+        # expanded residual width determines the collective's output shape.
+        parallel = SimpleNamespace(
+            attn_dp_size=2,
+            attn_tp_size=1,
+            attn_cp_size=CP_SIZE,
+            attn_cp_group=group("attn_cp", [2, 3]),
+        )
+        for shape in ((0, HIDDEN), (5, HIDDEN), (7, 4, HIDDEN)):
+            with self.subTest(shape=shape):
+                local = torch.arange(torch.tensor(shape).prod()).reshape(shape).double()
+                expected = torch.cat((local, local + 1))
+
+                def gather(output, input_):
+                    self.assertEqual(output.shape, expected.shape)
+                    torch.testing.assert_close(input_, local)
+                    output.copy_(expected)
+
+                with (
+                    patch.object(dsa_cp, "get_parallel", lambda: parallel),
+                    patch.object(
+                        dsa_cp, "use_symmetric_memory", lambda *a, **k: nullcontext()
+                    ),
+                    patch.object(dsa_cp, "is_allocation_symmetric", lambda: False),
+                    patch.object(dsa_cp, "attn_cp_all_gather_into_tensor", gather),
+                ):
+                    torch.testing.assert_close(
+                        dsa_cp.attn_cp_interleave_gather(local), expected
+                    )
 
     def test_a_sum_over_other_ranks_is_not_left_to_it(self):
         # A MoE group narrower than attention CP, as when MoE DP splits CP.

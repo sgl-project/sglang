@@ -130,9 +130,6 @@ def attn_tp_reduce_scatter(
 
 def attn_cp_interleave_reduce_scatter(hidden_states: torch.Tensor):
     """Sum rank-major output onto each rank's equal, padded interleave shard."""
-    attn_dp_size = get_parallel().attn_dp_size
-    attn_tp_size = get_parallel().attn_tp_size
-    assert attn_dp_size == 1 and attn_tp_size == 1
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank
     input_hidden_states = hidden_states

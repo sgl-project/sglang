@@ -94,30 +94,25 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 attn_dp_size = cfg.attn_dp_size * cfg.dp_size
                 overrides["attn_dp_size"] = attn_dp_size
                 overrides["dp_size"] = 1
-                overrides["moe_dense_tp_size"] = 1
                 if cfg.cp_strategy == "zigzag":
+                    overrides["moe_dense_tp_size"] = 1
                     overrides["moe_a2a_backend"] = "deepep"
                     overrides["ep_size"] = cfg.tp_size
                     logger.warning(
                         "zigzag DSA CP requires moe_dense_tp_size=1, "
                         "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
                     )
-                else:
-                    assert attn_dp_size == 1, (
-                        "interleave DSA CP does not support DP attention."
-                    )
                 assert cfg.tp_size <= 8, (
                     "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                 )
                 # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
-                # The DSA / MLA CP gather and reduce-scatter
-                # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
+                # DSA attention runs all heads on each context shard.
                 attn_cp_size = cfg.tp_size // attn_dp_size
                 overrides["attn_cp_size"] = attn_cp_size
                 logger.warning(
                     "Enabled DSA context parallel: "
                     f"strategy={cfg.cp_strategy}, attn_dp_size={attn_dp_size}, "
-                    f"moe_dense_tp_size={overrides['moe_dense_tp_size']}, "
+                    f"moe_dense_tp_size={overrides.get('moe_dense_tp_size', cfg.moe_dense_tp_size)}, "
                     f"ep_size={overrides.get('ep_size', cfg.ep_size)}, tp_size={cfg.tp_size}, "
                     f"attn_cp_size={attn_cp_size}, "
                     f"kv_cache_dtype={cfg.kv_cache_dtype}, "
