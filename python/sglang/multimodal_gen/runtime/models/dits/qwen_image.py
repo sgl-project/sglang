@@ -878,6 +878,11 @@ def _sync_into_buffer(*, value: torch.Tensor, buf_view: torch.Tensor) -> None:
 
 
 class QwenImageCrossAttention(nn.Module):
+    # Per-instance values are set in __init__; the class defaults keep forward()
+    # valid on modules built around it (object.__new__ in the epilogue tests).
+    separate_unquantized_qkv_proj = False
+    separate_convrot_qkv_proj = False
+
     def __init__(
         self,
         dim: int,  # query_dim
