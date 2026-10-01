@@ -289,11 +289,10 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
+    abort_prefix_cache_request,
     discard_kv_cache_backup,
     maybe_cache_unfinished_req,
-    release_kv_cache,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -3329,9 +3328,17 @@ class Scheduler(
             return False
         return True
 
-    def _release_aborted_request(self, req: Req) -> None:
-        """Drop the cache-side state an aborted request left behind."""
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+    def _release_aborted_request(
+        self,
+        req: Req,
+        *,
+        release_kv: bool = False,
+        is_insert: bool = True,
+    ) -> None:
+        """Cancel lookup/prefetch, optionally STORE, then close the session."""
+        abort_prefix_cache_request(
+            req, self.tree_cache, release_kv=release_kv, is_insert=is_insert
+        )
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -3576,8 +3583,11 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._release_aborted_request(
+            req,
+            release_kv=req.kv.holds_kv or req.kv.holds_mamba,
+            is_insert=False,
+        )
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -5308,41 +5318,40 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            self._release_aborted_request(req)
+            # Decode waiting-queue entries already hold KV (STORE then session
+            # close). Other modes have no STORE; close the session immediately.
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+                    discard_kv_cache_backup(req, self.tree_cache, "host_pool")
+                if self.enable_hisparse:
+                    self.hisparse_coordinator.request_finished(req)
+                self._release_aborted_request(req, release_kv=True)
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.release_aborted_prefill_waiting_req(req)
+            elif req.kv.holds_mamba:
+                self._release_aborted_request(req, release_kv=True, is_insert=False)
+            else:
+                self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.ipc_channels.send_to_tokenizer.send_output(
                 _make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if get_disagg().disaggregation_decode_host_receive_threshold > 0:
-                    discard_kv_cache_backup(req, self.tree_cache, "host_pool")
-                if self.enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache)
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.release_aborted_prefill_waiting_req(req)
-
-            # For mamba radix cache
-            if req.kv.holds_mamba and self.disaggregation_mode not in (
-                DisaggregationMode.PREFILL,
-                DisaggregationMode.DECODE,
-            ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
-                self._release_aborted_request(req)
+                self._release_aborted_request(
+                    req,
+                    release_kv=req.kv.holds_kv or req.kv.holds_mamba,
+                    is_insert=False,
+                )
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
-                if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue

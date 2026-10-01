@@ -80,6 +80,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._pending_stores: list[LMCachePendingStore] = []
         self._pending_store_counts: dict[str, int] = {}
         self._session_finish_requested: set[str] = set()
+        # Tracks rids with an open LMCache MP session so finish_request is
+        # once-per-session. Prefill bootstrap abort can finalize twice.
+        self._open_sessions: set[str] = set()
+        self._sessions_finished: set[str] = set()
         self._lmcache_closed = False
         atexit.register(self.shutdown)
 
@@ -199,6 +203,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             local_hit_tokens=min(len(local_tokens), len(key)),
             cache_salt=self.lmcache_connector.build_cache_salt(cache_salt, extra_key),
         )
+        self._open_sessions.add(req_id)
+        self._sessions_finished.discard(req_id)
         self._external_flows[req_id] = LMCacheExternalFlow(
             key=key,
             lookup=lookup,
@@ -316,12 +322,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         return bool(self._external_flows or self._pending_stores)
 
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+        """Drop lookup/load state without closing the LMCache session.
+
+        ``finish_request`` belongs in :meth:`finish_request_session` so abort
+        paths that still STORE keep the session open across insert/STORE.
+        """
         rid = handle.rid
         self.prefetch_loaded_tokens_by_reqid.pop(handle, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(handle, None)
         flow = self._external_flows.get(rid)
         if flow is None:
-            self._request_session_finish(rid)
             return
         flow.cancelled = True
         # Keep the checkpoint alive until H2D completes.
@@ -337,14 +347,43 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 # No retrieve will release locks from this completed lookup.
                 self._retire_loaded_flow(rid)
             else:
-                # END_SESSION follows the in-flight lookup and releases its locks.
+                # Session close (finish_request_session) follows and releases locks.
                 self._external_flows.pop(rid, None)
         elif flow.load_completed:
             self._finish_failed_load(flow)
         else:
             # Complete the cross-rank load only in check_hicache_events().
             flow.retire_requested = True
+
+    def finish_request_session(self, handle: CacheRequestHandle) -> None:
+        """End the LMCache session after optional STORE, or immediately if none.
+
+        Idempotent: duplicate abort paths (e.g. bootstrap queue abort then
+        ``handle_bootstrap_failure``) must not emit a second finish_request.
+        No LOOKUP / never-opened session must not emit finish_request.
+        """
+        rid = handle.rid
+        if rid not in self._open_sessions and rid not in self._session_finish_requested:
+            return
         self._request_session_finish(rid)
+
+    def _request_session_finish(self, rid: str) -> None:
+        """End the LMCache session after this request's stores have completed."""
+        self._session_finish_requested.add(rid)
+        self._finish_session_if_store_idle(rid)
+
+    def _finish_session_if_store_idle(self, rid: str) -> None:
+        if (
+            rid not in self._session_finish_requested
+            or self._pending_store_counts.get(rid, 0) > 0
+        ):
+            return
+        self._session_finish_requested.remove(rid)
+        if rid in self._sessions_finished:
+            return
+        self._sessions_finished.add(rid)
+        self._open_sessions.discard(rid)
+        self.lmcache_connector.finish_request(rid)
 
     def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, NodeId]:
         req = params.req
@@ -422,6 +461,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self._pending_stores.clear()
             self._pending_store_counts.clear()
             self._session_finish_requested.clear()
+            self._open_sessions.clear()
+            self._sessions_finished.clear()
             self.prefetch_loaded_tokens_by_reqid.clear()
             connector.end_all_sessions()
         super().reset()
@@ -969,17 +1010,3 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._pending_store_counts[req.rid] = (
             self._pending_store_counts.get(req.rid, 0) + 1
         )
-
-    def _request_session_finish(self, rid: str) -> None:
-        """End the LMCache session after this request's stores have completed."""
-        self._session_finish_requested.add(rid)
-        self._finish_session_if_store_idle(rid)
-
-    def _finish_session_if_store_idle(self, rid: str) -> None:
-        if (
-            rid not in self._session_finish_requested
-            or self._pending_store_counts.get(rid, 0) > 0
-        ):
-            return
-        self._session_finish_requested.remove(rid)
-        self.lmcache_connector.finish_request(rid)

@@ -11,7 +11,11 @@ from sglang.kernels.ops.memory.common import (
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    CacheRequestOutcome,
+    EvictParams,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -289,6 +293,31 @@ def discard_kv_cache_backup(
     req.kv.retraction_backup = None
 
 
+def abort_prefix_cache_request(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    *,
+    release_kv: bool = False,
+    is_insert: bool = True,
+) -> None:
+    """Cancel abort-phase cache work, optionally STORE, then close the session.
+
+    FlexKV must cancel in-flight lookup/prefetch *before* KV finalization
+    (otherwise abort cleanup can drop the lock of an async STORE). LMCache must
+    end the session *after* that optional STORE, or immediately when no STORE
+    runs. See issue #40360.
+    """
+    handle = req.cache_request_handle
+    tree_cache.finish(handle, CacheRequestOutcome.ABORT)
+    if release_kv and (req.kv.holds_kv or req.kv.holds_mamba):
+        had_device_kv = req.kv.holds_kv
+        release_kv_cache(req, tree_cache, is_insert=is_insert)
+        if had_device_kv:
+            # ``release_kv_cache`` already closed the session after STORE.
+            return
+    tree_cache.finish_request_session(handle)
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     """Give the request's kv row back; with ``is_insert`` the tree first keeps
     what it can key."""
@@ -334,6 +363,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
     req.kv.mark_kv_released()
+    # Close backend session after optional STORE (LMCache), or when no STORE
+    # ran. Idempotent if insert_req already requested session finish.
+    tree_cache.finish_request_session(req.cache_request_handle)
 
 
 def _release_overallocated_kv_indices(
