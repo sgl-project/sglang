@@ -46,6 +46,10 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_gfx1100 = (
+    _is_hip
+    and torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0] == "gfx1100"
+)
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
@@ -300,6 +304,7 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         and getattr(forward_batch, "dcp_kv_mask", None) is None
     ) or (
         _is_hip
+        and not _is_gfx1100
         and not is_prefill_context_parallel_enabled()
         and getattr(forward_batch, "dcp_kv_mask", None) is None
     )
