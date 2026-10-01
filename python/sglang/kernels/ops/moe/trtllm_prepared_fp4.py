@@ -94,6 +94,7 @@ def _run_prepared(
     num_experts = kwargs["num_experts"]
     runtime = c.get_trtllm_moe_sm100_module()
     runner = runtime.MoERunner(
+        runtime.moe_op,
         top_k=top_k,
         num_local_experts=num_experts,
         dtype_act=dtype_act,
