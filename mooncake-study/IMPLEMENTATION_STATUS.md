@@ -329,11 +329,69 @@ The separate CUDA event ownership test remains the copy-lifetime evidence.
 Synthetic draft weights, Catalog test doubles, TCP transport and the Qwen3-0.6B
 single-H100 scope are unchanged.
 
+## Fixed-Input Training/Serving Gate
+
+The SGLang-side P8 gate now loads actual SpecForge backbone/Markov modules from
+commit `e10ea2fa3c248a4f60d636791dd71efb67338c9c1`, with a test-only shared KV
+encoder adapter. It compares every decoder layer, final hidden state, shared-head
+logits and Markov-corrected logits against actual SGLang context writes and Triton
+paged attention. The teacher/fixture digests are checked, target decoder execution
+is forbidden, and only saved KV/teacher tensors plus frozen shared weights are
+used. The windows cover the first response label and partial final blocks.
+
+This found and fixed a real checkpoint-loading defect: `markov_head.gate_proj`
+was interpreted as an MLP shard. Strict loading now resolves an exact parameter
+name first. Missing/duplicate/foreign-weight checks remain active.
+
+The gate records every failing stage, nonfinite values, artifact/source hashes,
+backends and runtime versions in `validation/parity.json`. A failed rerun cannot
+leave an older successful report. It is an explicit command, independent of the
+capture runtime test; installing SpecForge does not silently change that test.
+Small-model cases cover vanilla/gated/RNN heads, cached CE+TV128 backward, frozen
+shared modules, an optimizer step and export/reload, future-input isolation,
+and stale-report invalidation. These adapters are not a production SpecForge
+exporter, objective implementation or Catalog consumer.
+
+Completed H100 evidence:
+
+- `01790813285864674139-350dc423edd1`: 122 tests and 81 subtests passed in
+  24.89s, including the new numerical/gradient cases and existing capture,
+  DSpark, graph and IPC regressions.
+- `01790813123946597057-bc93902f0b3e`: the complete online runtime test passed
+  in 297.940s. All 64 snapshots pass exact readback, including 22 speculative
+  overlap samples, padded graphs and four fenced aborts with no quarantined
+  Host slots. Catalog is still a test double and transport is TCP.
+- `01790813375946155985-82bf010d8a6a`: the real Qwen3 BF16 fixed-input gate
+  **failed** at the unchanged `rtol=0.03, atol=0.03`. Layer 1 has 28/9216
+  mismatches with maximum absolute error 0.078125; hidden-state maximum error
+  is 0.25, and base/corrected logits reach 0.28125. The retained report is
+  [target-kv-parity-bf16-failure.json](experiments/target-kv-parity-bf16-failure.json).
+  Its checkpoint and snapshot remain at
+  `/gpfs/users/fuxuanwei-1/dspark-maas-lab/fixtures/qwen3-target-kv-parity-20261001`.
+- Earlier SDPA (`01790812483883726876-4e3d2b551f95`) and flex-attention
+  (`01790812484035034606-2117203d933e`) references also failed on the same
+  artifact with the original response-only anchor selection. Switching the
+  training attention backend alone did not resolve the difference.
+- `01790813286002064725-3024f10ef03f`: the committed FP32/native-auxiliary
+  diagnostic passed on anchors `[159,160,162]`, with seven valid labels and
+  nonzero encoder/backbone/Markov gradients. Maximum errors were 0.004612 in
+  layer 1, 0.021037 in final hidden states and 0.018180 in logits. It retains
+  paged attention but substitutes native norm/activation/RoPE because the
+  production norm kernel does not support FP32. It is not BF16 serving evidence
+  and does not write a serving parity certificate.
+
+Source review and controlled norm/residual/RoPE/activation substitutions identify
+BF16 rounding differences that explain part of the discrepancy, but do not yet
+establish a complete fix. The real BF16 gate remains open. No tolerances were
+relaxed and no speculative numerical-kernel change was applied. The synthetic
+draft's forced proposals and shallow copied target layers are not trained-model
+quality evidence. Commands and scope are in [the experiment guide](experiments/README.md).
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, real retraction, cache eviction,
    target weight replacement and saturated backpressure.
-2. Complete P8's fixed-input backbone/logit parity against the training side,
+2. Resolve P8's real BF16 backbone/logit parity failure, complete production
    exporter compatibility and artifact/quality validation. Broaden the runtime
    lifecycle tests to cache eviction and real request retraction.
 3. Complete P9's topology work: TP/PP, non-static speculative layouts,

@@ -1,8 +1,10 @@
 # Target-KV DSpark Serving Contract
 
 This implements the SGLang serving side of design package P8. It consumes an
-explicit KV-input checkpoint. A SpecForge exporter and complete training versus
-serving backbone/logit parity remain separate integration work. Synthetic test
+explicit KV-input checkpoint. A fixed-input numerical gate now exercises the
+existing SpecForge backbone through a test-only KV adapter. The real Qwen3 BF16
+fixture does not yet pass this gate; a production SpecForge exporter and complete
+training versus serving parity remain integration work. Synthetic test
 checkpoints are wiring fixtures, not trained drafts or acceptance benchmarks.
 
 ## Checkpoint Identity
@@ -51,6 +53,8 @@ legacy `fc`/`hidden_norm`, or confidence weights. Unknown, missing, duplicate,
 partial Q/K/V or gate/up shards, and mixed full/sharded parameters are rejected.
 Native fused weights and complete HF-style Q/K/V or gate/up shards are accepted.
 An optional leading `model.` is normalized before validation.
+Exact parameter names take precedence over shard aliases: a gated Markov head's
+`gate_proj` is a complete parameter, not an MLP `gate_up_proj` shard.
 
 For each context row, concatenate selected layers in the declared order; within
 each layer, flatten K then V in head/dimension order. The feature width is
@@ -190,6 +194,38 @@ uses only device lengths. All projection and capture copies remain on the
 ordered forward stream; the latest capture event fences writer ownership.
 
 ## Verification
+
+`python -m sglang.test.dspark_target_kv_parity --checkpoint /models/kv-draft
+--target-path /models/target` is an explicit fixed-input gate. Put the pinned
+SpecForge source checkout on `PYTHONPATH`. The checkpoint must include the
+contract-bound `validation/inputs.safetensors` snapshot tensors. The gate checks
+their digest and the target artifact identity before reading the shared embedding
+and output-head weights; tied target heads use the embedding. A guard rejects any
+target decoder forward. No target prefill or teacher-logit regeneration occurs.
+
+The training reference uses SpecForge's existing backbone and Markov head with
+the shared KV encoder as a test adapter. Actual SGLang layers, context projection,
+non-contiguous KV pool slots and Triton paged attention produce the serving output.
+Different prefix lengths run together. Every decoder layer, normalized hidden
+state, transformed shared-head logits and teacher-forced Markov logits is compared
+using the checkpoint's declared tolerance. The windows include the first response
+label and a partial final block. On success, a test-only cached CE+TV128 loss checks
+finite, nonzero encoder/backbone/Markov gradients and frozen shared weights.
+
+The gate writes `validation/parity.json` with pass/fail status, all stage errors,
+artifact/source digests, dtype, backends and runtime versions. Nonfinite values
+fail. A failed rerun invalidates an older passing report; early artifact-loading
+failures leave no report. The command exits unsuccessfully on a failed comparison.
+This gate is separate from online capture's exact tensor readback test and is not
+implicitly selected by installing SpecForge. Neither a successful tiny fixture
+nor the separate FP32 diagnostic certifies the real BF16 serving path.
+
+`test/registered/spec/dspark/test_dspark_target_kv_parity.py` covers vanilla,
+gated and RNN heads, a real optimizer step followed by export/reload, prefix-only
+input ownership, and report failure handling. It requires the pinned SpecForge
+checkout and is explicitly disabled in generic CI until that dependency is wired.
+The adapter and loss are test references, not a production SpecForge trainer,
+collator, Catalog consumer or exporter.
 
 `test/registered/unit/spec/test_dspark_target_kv.py` covers contracts, codec math,
 gradient ownership, prefix isolation, range validation, request-slot reuse,

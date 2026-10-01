@@ -101,3 +101,57 @@ python -m pytest -q \
   test/registered/unit/model_executor/runner/test_decode_cuda_graph_runner.py \
   test/registered/spec/dspark/test_dspark_draft_path_default.py
 ```
+
+## Fixed-Input Draft Parity
+
+The additional reference uses SpecForge commit
+`e10ea2fa3c248a4f60d636791dd71efb67338c9c1`. Stage its `specforge` package under
+`$LAB/specforge-reference/` and include both `$LAB/sglang/python` and
+`$LAB/specforge-reference` in each queued experiment's `PYTHONPATH`.
+The SpecForge repository itself does not need modifications.
+
+Run the small-model checks through the same resident queue:
+
+```bash
+python -m pytest -q test/registered/spec/dspark/test_dspark_target_kv_parity.py
+```
+
+These compare actual training/serving layers for three Markov head variants,
+backpropagate cached CE+TV128, take an optimizer step, export the weights and
+compare again after a fresh serving load. They also check future-token/KV
+isolation and failed validation reports. They are test-only adapters, not the
+production SpecForge training pipeline.
+
+The real captured fixture is retained outside Git at
+`$LAB/fixtures/qwen3-target-kv-parity-20261001`. It contains snapshot tensors read
+back from Mooncake and the synthetic two-layer draft used by the runtime test.
+It includes the target's shared-weight references, not the target decoder.
+Run the explicit gate under the queue with:
+
+```bash
+python -m sglang.test.dspark_target_kv_parity \
+  --checkpoint "$LAB/fixtures/qwen3-target-kv-parity-20261001" \
+  --target-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B
+```
+
+`--reference-attention` accepts `eager`, `sdpa` and `flex_attention`; serving uses
+Triton. `validation/parity.json` records all numerical stages and runtime/artifact
+identities, and a failed comparison exits nonzero. Failed reruns cannot leave an
+older successful report. Run one validation at a time per checkpoint directory.
+The real BF16 gate currently fails; see `../IMPLEMENTATION_STATUS.md`. The normal
+capture runtime test remains an independent, exact Store readback check.
+
+For diagnosis only, FP32 weights/activations and native auxiliary operators can
+be compared while preserving the actual paged-attention path:
+
+```bash
+python mooncake-study/experiments/diagnose_target_kv_parity_fp32.py \
+  --checkpoint "$LAB/fixtures/qwen3-target-kv-parity-20261001" \
+  --target-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B
+```
+
+The production RMSNorm kernel cannot execute FP32 activations; this diagnostic
+substitutes native norm/activation/RoPE and disables fused in-place QK norm.
+It reads only saved KV/teacher tensors and shared weights, forbids target decoder
+execution, and prints its result without writing a serving parity certificate.
+Passing it does not satisfy the BF16 gate or establish training quality.

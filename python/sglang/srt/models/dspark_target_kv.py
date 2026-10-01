@@ -84,10 +84,12 @@ class DSparkTargetKVDraftModel(DSparkDraftModel):
         for original_name, weight in weights:
             name = original_name.removeprefix("model.")
             parameter_name, shard = name, "full"
-            for source, target, part in shard_mapping:
-                if source in name:
-                    parameter_name, shard = name.replace(source, target), part
-                    break
+            # A Markov gate_proj is a full parameter, not a backbone MLP shard.
+            if name not in parameters:
+                for source, target, part in shard_mapping:
+                    if source in name:
+                        parameter_name, shard = name.replace(source, target), part
+                        break
             if parameter_name not in parameters:
                 raise ContractError(f"unexpected KV draft weight: {original_name}")
             if shard in coverage[parameter_name] or (

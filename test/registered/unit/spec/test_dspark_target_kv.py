@@ -333,6 +333,19 @@ class TestTargetKVInjector(CustomTestCase):
 
 
 class TestTargetKVWeightLoader(CustomTestCase):
+    def test_gated_markov_parameters_are_not_interpreted_as_mlp_shards(self):
+        from sglang.srt.models.dspark import GatedMarkovHead
+
+        model = make_minimal_kv_weight_loader()
+        model.markov_head = GatedMarkovHead(vocab_size=4, markov_rank=2, hidden_size=2)
+        expected = {
+            name: torch.full_like(parameter, index + 1)
+            for index, (name, parameter) in enumerate(model.named_parameters())
+        }
+        model.load_weights(expected.items())
+        for name, parameter in model.named_parameters():
+            torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
+
     def test_complete_checkpoint_loads_and_resets_projection_caches(self):
         model = make_minimal_kv_weight_loader()
         expected = {
