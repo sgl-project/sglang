@@ -274,19 +274,20 @@ impl Intake {
                         continue;
                     }
                     let rid = req.rid.clone();
-                    match self.senders.tokenizer_tx.send(req) {
+                    // Workers return through our bounded inbox. Waiting for a
+                    // queue slot here can prevent us from receiving those replies.
+                    match self.senders.tokenizer_tx.try_send(req) {
                         Ok(()) => {
                             self.request_states.insert(rid, state);
                         }
-                        Err(err) => {
-                            // Pool gone (workers exited); flume hands the request back.
-                            let mut req = err.into_inner();
-                            // Past `Received`, so registration happened.
-                            self.fail(
-                                &mut req,
-                                Error::Internal("tokenizer pool gone".into()),
-                                true,
-                            );
+                        Err(e) => {
+                            let (err, mut req) = match e {
+                                flume::TrySendError::Full(req) => (Error::QueueFull, req),
+                                flume::TrySendError::Disconnected(req) => {
+                                    (Error::Internal("tokenizer pool gone".into()), req)
+                                }
+                            };
+                            self.fail(&mut req, err, registered);
                         }
                     }
                     return;
