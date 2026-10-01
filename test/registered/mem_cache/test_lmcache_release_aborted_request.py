@@ -62,9 +62,9 @@ def _install_lmcache_stubs():
             self.prefix_published = False
             self.free_mamba_after_load = False
 
-    mods["lmcache.integration.sglang.lmcache_mp_metadata"].LMCacheExternalFlow = (
-        _LMCacheExternalFlow
-    )
+    mods[
+        "lmcache.integration.sglang.lmcache_mp_metadata"
+    ].LMCacheExternalFlow = _LMCacheExternalFlow
     mods["lmcache.integration.sglang.lmcache_mp_metadata"].LMCachePendingStore = object
     mods[
         "lmcache.integration.sglang.unified_lmcache_mp_connector"
