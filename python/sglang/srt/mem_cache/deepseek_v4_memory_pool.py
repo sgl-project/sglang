@@ -1997,6 +1997,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         positions: torch.Tensor,
     ) -> None:
         if self.uniform_fp8:
+            if envs.SGLANG_OPT_FUSED_TRTLLM_KV_STORE.get():
+                from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
+                    fused_k_norm_rope_uniform_fp8,
+                )
+
+                fused_k_norm_rope_uniform_fp8(
+                    kv,
+                    kv_weight,
+                    eps,
+                    freqs_cis,
+                    positions,
+                    swa_loc,
+                    self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id)),
+                )
+                return
             # Uniform-FP8 (trtllm-gen): in-place norm + RoPE (kv is not read again),
             # then an e4m3 cast + scatter with per-tensor scale 1.0.
             from sglang.kernels.ops.attention.deepseek_v4_rope import (

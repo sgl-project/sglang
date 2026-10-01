@@ -1564,6 +1564,8 @@ class Envs:
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # TRT uniform-FP8 KV: combine weighted norm, RoPE, FP8 cast and cache store.
+    SGLANG_OPT_FUSED_TRTLLM_KV_STORE = EnvBool(True)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
