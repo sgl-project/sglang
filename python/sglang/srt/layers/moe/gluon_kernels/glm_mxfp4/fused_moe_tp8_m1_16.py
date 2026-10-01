@@ -793,7 +793,7 @@ def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, routed_s
     m, h = x.shape
     intermediate = w13.shape[1] // 2
     routes = m * 9
-    direct = m in (1, 2, 4, 8, 16)
+    direct = m in (1, 2, 4, 8, 12, 16)
     grouped = not direct
     stagger = m <= 8
     splits = 4 if direct else 12
@@ -814,14 +814,14 @@ def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, routed_s
     weights = empty((routes,), torch.float32)
     xq = empty((2 * m, h // 2), torch.uint8)
     xs = empty((2 * m, h // 32), torch.uint8)
-    gu = None if 3 <= m <= 8 or m == 16 else empty((routes, splits, 2 * intermediate), torch.float32)
+    gu = None if 3 <= m <= 8 or m in (12, 16) else empty((routes, splits, 2 * intermediate), torch.float32)
     aq = empty((routes, intermediate // 2), torch.uint8)
     aqs = empty((routes, intermediate // 32), torch.uint8)
     down_output = None if direct else empty((m if m <= 8 else routes, h), torch.float32)
     out = empty((m, h))
     _router_linear[16 * router_splits + m * (h // (32 * quant_groups)) + int(grouped),](x, router, logits, xq, xs, groups, h, x.stride(0), m, router_splits, router_block, 16, grouped, quant_vector, quant_groups, NATIVE=m == 2, num_warps=1)
-    if m in (1, 16):
-        _select_fused_up[m + routes * (intermediate // 32),](logits, correction_bias, ids, weights, xq, xs, w13, w13_scale, aq, aqs, m, h, intermediate, 32, 1, router_splits, m == 1, m == 16, routed_scaling_factor, num_warps=1, enable_fp_fusion=False)
+    if m in (1, 12, 16):
+        _select_fused_up[m + routes * (intermediate // 32),](logits, correction_bias, ids, weights, xq, xs, w13, w13_scale, aq, aqs, m, h, intermediate, 32, 1, router_splits, m == 1, m in (12, 16), routed_scaling_factor, num_warps=1, enable_fp_fusion=False)
         if m == 1:
             _static_single_down[m, h // 16](aq, aqs, w2, w2_scale, ids, weights, out, h, intermediate, 16, 1, num_warps=1, enable_fp_fusion=False)
         else:
