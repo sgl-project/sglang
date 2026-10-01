@@ -456,6 +456,29 @@ def create_app(server_args: ServerArgs):
     if server_args.pipeline_config.supports_openpi_endpoint():
         app.include_router(openpi.router)
     app.include_router(mesh_api.router)
+
+    # NOTE (yiakwy) : experimental YuE2 direct-curl route lives outside the core API
+    if server_args.pipeline_config.__class__.__name__ == "Yue2PipelineConfig":
+        import importlib.util
+        from pathlib import Path as _Path
+
+        _route_path = (
+            _Path(__file__).resolve().parents[5]
+            / "experimental"
+            / "yue2"
+            / "http_api.py"
+        )
+        if _route_path.is_file():
+            _spec = importlib.util.spec_from_file_location(
+                "sglang_yue2_http_api", _route_path
+            )
+            if _spec is not None and _spec.loader is not None:
+                _module = importlib.util.module_from_spec(_spec)
+                import sys as _sys
+                _sys.modules[_spec.name] = _module
+                _spec.loader.exec_module(_module)
+                app.include_router(_module.router)
+                
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
 
