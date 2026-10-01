@@ -31,6 +31,9 @@ if TYPE_CHECKING:
 
 
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
+    # Materialized routing weights must carry the scale for the routed kernels.
+    fuse_routed_scaling_factor_in_topk = True
+
     def __init__(self):
         if not get_platform().is_blackwell:
             raise ValueError(
@@ -39,6 +42,16 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 " above."
             )
         self.group_size = 16
+        backend = get_moe_runner_backend()
+        if not (
+            backend.is_auto()
+            or backend.is_flashinfer_trtllm()
+            or backend.is_flashinfer_cutlass()
+        ):
+            raise ValueError(
+                "Compressed-tensors NVFP4 MoE requires the flashinfer_trtllm or "
+                "flashinfer_cutlass runner"
+            )
         self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
 
     @property

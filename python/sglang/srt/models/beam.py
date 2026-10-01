@@ -43,7 +43,6 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
@@ -158,16 +157,13 @@ class BeamMoE(nn.Module):
         self.tp_size = get_parallel().moe_tp_size
         self.ep_size = get_parallel().moe_ep_size
         backend = get_moe_runner_backend()
-        is_nvfp4 = quant_config is not None and is_serialized_w4a4_nvfp4(quant_config)
         supported_runner = (
-            backend.is_flashinfer_trtllm()
-            if is_nvfp4
-            else backend.is_auto() or backend.is_triton()
+            backend.is_auto() or backend.is_triton() or backend.is_flashinfer_trtllm()
         )
         if not supported_runner or not get_moe_a2a_backend().is_none():
             raise ValueError(
-                "Beam supports the auto or triton MoE runner for BF16/FP8 and "
-                "flashinfer_trtllm for NVFP4, with no MoE all-to-all"
+                "Beam supports the auto, triton, or flashinfer_trtllm MoE runner, "
+                "with no MoE all-to-all"
             )
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -188,14 +184,11 @@ class BeamMoE(nn.Module):
             renormalize=True,
             scoring_func="sigmoid",
             correction_bias=self.gate.e_score_correction_bias,
-            # The TRTLLM NVFP4 runner routes inside the kernel (DeepSeek-V3
-            # grouping) and applies the routed scale once there.
-            routed_scaling_factor=(config.routed_scaling_factor if is_nvfp4 else None),
-            # Routing materialized for one-token compile reaches the routed
-            # kernel, which applies no routed scale; carry it in the weights.
-            apply_routed_scaling_factor_on_output=is_nvfp4,
+            routed_scaling_factor=(
+                config.routed_scaling_factor if backend.is_flashinfer_trtllm() else None
+            ),
             output_format=(
-                TopKOutputFormat.BYPASSED if is_nvfp4 else TopKOutputFormat.STANDARD
+                None if backend.is_flashinfer_trtllm() else TopKOutputFormat.STANDARD
             ),
         )
         # Keep normalized routing coefficients in FP32. The runner applies the
@@ -211,10 +204,18 @@ class BeamMoE(nn.Module):
             routing_method_type=RoutingMethodType.DeepSeekV3,
             quant_config=quant_config,
             quant_method=(
-                BeamUnquantizedFusedMoEMethod() if quant_config is None else None
+                BeamUnquantizedFusedMoEMethod(
+                    use_flashinfer_trtllm_moe=backend.is_flashinfer_trtllm()
+                )
+                if quant_config is None
+                else None
             ),
             prefix=add_prefix("experts", prefix),
         )
+        # Some expert methods consume routing weights with scale already applied.
+        if self.experts.should_fuse_routed_scaling_factor_in_topk:
+            self.topk.topk_config.routed_scaling_factor = config.routed_scaling_factor
+            self.topk.topk_config.apply_routed_scaling_factor_on_output = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
@@ -483,22 +484,6 @@ class BeamModel(nn.Module):
         return self.norm(hidden_states)
 
 
-def is_serialized_w4a4_nvfp4(quant_config: QuantizationConfig) -> bool:
-    """Whether the checkpoint stores NVFP4 weights with NVFP4 activations.
-
-    Both exporters feed the same TRTLLM FP4 MoE kernel. Load-time
-    quantization, AWQ pre-scales and weight-only NVFP4 use other kernels.
-    """
-    if quant_config.get_name() == "compressed_tensors":
-        return getattr(quant_config, "quant_format", None) == "nvfp4-pack-quantized"
-    return (
-        isinstance(quant_config, ModelOptFp4Config)
-        and quant_config.is_checkpoint_nvfp4_serialized
-        and not quant_config.is_awq
-        and not quant_config.is_w4a16
-    )
-
-
 class BeamForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -512,19 +497,6 @@ class BeamForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        if (
-            quant_config is not None
-            and not is_serialized_w4a4_nvfp4(quant_config)
-            and quant_config.get_name() not in ("fp8", "w8a8_fp8", "modelopt_fp8")
-            and not (
-                quant_config.get_name() == "compressed_tensors"
-                and getattr(quant_config, "quant_format", None) == "float-quantized"
-            )
-        ):
-            raise NotImplementedError(
-                "Beam supports BF16, FP8, or serialized W4A4 NVFP4 weights from "
-                "compressed-tensors or ModelOpt"
-            )
         if get_parallel().enable_dp_attention or get_parallel().enable_dp_lm_head:
             raise NotImplementedError(
                 "Beam does not yet support attention data parallelism or a "
@@ -615,8 +587,11 @@ class BeamForCausalLM(nn.Module):
             ):
                 continue
             if (
-                name == "model.norm.weight" or name.startswith("lm_head.")
-            ) and not self.model.pp_group.is_last_rank:
+                name in ("model.norm.weight", "lm_head.weight")
+                and not self.model.pp_group.is_last_rank
+            ):
+                continue
+            if name.startswith("lm_head.") and not self.model.pp_group.is_last_rank:
                 continue
             for source, target, shard_id in packed_projections:
                 if source in name:

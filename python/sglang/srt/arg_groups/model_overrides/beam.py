@@ -30,21 +30,23 @@ def _beam_overrides(server_args: Any, hf_config: Any) -> dict:
     ):
         logger.info("Use trtllm_mha as default attention backend for Beam")
         overrides["attention_backend"] = "trtllm_mha"
-    # BeamMoE runs NVFP4 experts only on flashinfer_trtllm; BF16/FP8 keep auto.
+    # Select defaults by checkpoint format; explicit runner choices are preserved.
     quantization = cfg.quantization or get_quantization_config(hf_config)
     quant_config = getattr(hf_config, "quantization_config", None) or {}
     if quantization == "modelopt":
         quantization = canonicalize_modelopt_quant_algo(quant_config.get("quant_algo"))
-    is_nvfp4 = quantization == "modelopt_fp4" or (
-        quantization in ("compressed-tensors", "compressed_tensors")
-        and quant_config.get("format") == "nvfp4-pack-quantized"
-    )
+    if quantization in ("compressed-tensors", "compressed_tensors"):
+        quantization = quant_config.get("format")
+    default_moe_runner = {
+        "modelopt_fp4": "flashinfer_trtllm",
+        "nvfp4-pack-quantized": "flashinfer_trtllm",
+    }.get(quantization)
     if (
-        is_nvfp4
+        default_moe_runner is not None
         and get_platform().is_sm100
         and cfg.moe_runner_backend == "auto"
         and cfg.moe_a2a_backend == "none"
     ):
-        logger.info("Use flashinfer_trtllm as MoE runner backend for NVFP4 Beam")
-        overrides["moe_runner_backend"] = "flashinfer_trtllm"
+        logger.info("Use %s as default MoE runner backend for Beam", default_moe_runner)
+        overrides["moe_runner_backend"] = default_moe_runner
     return overrides

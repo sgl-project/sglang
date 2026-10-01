@@ -410,6 +410,7 @@ class TestBeamNumerics(CustomTestCase):
                 topk.forward = Mock(return_value=topk_output)
                 topk.empty_topk_output = Mock(return_value=topk_output)
                 experts = torch.nn.Module()
+                experts.should_fuse_routed_scaling_factor_in_topk = False
                 experts.forward = Mock(return_value=combined)
                 factory = Mock(return_value=experts)
                 with (
@@ -447,6 +448,12 @@ class TestBeamNumerics(CustomTestCase):
         with (
             get_context().override_server_args(),
             get_parallel().override(tp_size=1, tp_rank=0, moe_tp_size=1, moe_ep_size=1),
+            patch.object(
+                torch.nn.Identity,
+                "should_fuse_routed_scaling_factor_in_topk",
+                False,
+                create=True,
+            ),
             patch(
                 "sglang.srt.models.beam.get_moe_impl_class",
                 return_value=Mock(return_value=torch.nn.Identity()),
@@ -565,6 +572,11 @@ class TestBeamLoading(CustomTestCase):
         self.addCleanup(override.restore)
 
     def test_fp8_model_uses_shared_methods_and_loads_scales(self):
+        class CustomFp8Config(Fp8Config):
+            @classmethod
+            def get_name(cls):
+                return "custom_fp8"
+
         config = tiny_config(
             vocab_size=64,
             num_hidden_layers=2,
@@ -578,6 +590,7 @@ class TestBeamLoading(CustomTestCase):
             Fp8Config(),
             W8A8Fp8Config(),
             Fp8Config(is_checkpoint_fp8_serialized=True),
+            CustomFp8Config(is_checkpoint_fp8_serialized=True),
             Fp8Config(is_checkpoint_fp8_serialized=True, activation_scheme="static"),
             W8A8Fp8Config(is_checkpoint_fp8_serialized=True),
             ModelOptFp8Config(
@@ -640,12 +653,24 @@ class TestBeamLoading(CustomTestCase):
                     experts.moe_runner_config.routed_scaling_factor,
                     config.routed_scaling_factor,
                 )
-                self.assertEqual(
-                    sparse.mlp.topk.topk_config.output_format, TopKOutputFormat.STANDARD
-                )
-                self.assertIsNone(sparse.mlp.topk.topk_config.routed_scaling_factor)
                 self.assertFalse(
                     sparse.mlp.topk.topk_config.apply_routed_scaling_factor_on_output
+                )
+                with (
+                    torch.no_grad(),
+                    patch(
+                        "sglang.srt.layers.moe.topk.biased_grouped_topk",
+                        wraps=biased_grouped_topk_impl._torchdynamo_orig_callable,
+                    ),
+                ):
+                    sparse.mlp.gate.e_score_correction_bias.zero_()
+                    routing = sparse.mlp.topk.forward_native(
+                        torch.ones(1, config.hidden_size),
+                        torch.linspace(1, -1, config.num_experts)[None],
+                    )
+                # FP8/BF16 runners scale after expert combination, not in routing.
+                torch.testing.assert_close(
+                    routing.topk_weights.sum(-1), torch.ones(1, dtype=torch.float32)
                 )
                 if quant is None:
                     self.assertIsInstance(
@@ -959,6 +984,12 @@ class TestBeamLoading(CustomTestCase):
                     moe_ep_size=1,
                 ),
                 patch("sglang.srt.models.beam.TopK", return_value=torch.nn.Identity()),
+                patch.object(
+                    torch.nn.Identity,
+                    "should_fuse_routed_scaling_factor_in_topk",
+                    False,
+                    create=True,
+                ),
                 patch(
                     "sglang.srt.models.beam.get_moe_impl_class",
                     return_value=lambda **kwargs: torch.nn.Identity(),
