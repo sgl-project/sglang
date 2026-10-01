@@ -106,13 +106,15 @@ def _upright_rgb_png(data: bytes, content_type: Optional[str], loc: Tuple) -> by
 def _pillow_errors(loc: Tuple):
     try:
         yield
-    # Pillow's parsers also surface malformed data as struct.error, EOFError, or SyntaxError.
+    # Pillow's parsers also surface malformed data as struct.error, EOFError,
+    # SyntaxError, or IndexError from reading past a truncated block.
     except (
         OSError,
         ValueError,
         struct.error,
         EOFError,
         SyntaxError,
+        IndexError,
         Image.DecompressionBombError,
     ) as e:
         raise DecisionInputError("invalid, incomplete, or oversized image", loc) from e
