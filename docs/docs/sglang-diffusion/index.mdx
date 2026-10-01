@@ -2,7 +2,9 @@
 title: SGLang Diffusion
 description: Accelerated image and video generation with diffusion models.
 ---
-SGLang Diffusion is a high-performance inference framework for image and video generation. It provides native SGLang pipelines, diffusers backend support, an OpenAI-compatible server, and an optimized kernel stack built on both precompiled `sgl-kernel` operators and JIT kernels for key inference paths.
+SGLang Diffusion is SGLang's built-in inference engine for image and video generation. It ships in the same [repository](https://github.com/sgl-project/sglang) and `sglang` Python package, using the shared `sglang generate` and `sglang serve` commands.
+
+It provides native SGLang pipelines, diffusers backend support, an OpenAI-compatible server, and an optimized kernel stack built on both precompiled `sgl-kernel` operators and JIT kernels for key inference paths.
 
 ## Key Features
 
@@ -11,13 +13,9 @@ SGLang Diffusion is a high-performance inference framework for image and video g
 - Multiple interfaces: `sglang generate`, `sglang serve`, and an OpenAI-compatible API
 - Multi-platform support for NVIDIA, AMD, Intel XPU, Ascend, Apple Silicon, and Moore Threads
 
-SGLang Diffusion is part of the [SGLang repository](https://github.com/sgl-project/sglang) and is included in the `sglang` Python package. Install the `diffusion` extra to add its image and video generation dependencies.
-
 ## Quick Start
 
-```bash
-uv pip install "sglang[diffusion]" --prerelease=allow
-```
+Follow the [installation guide](/docs/sglang-diffusion/installation), then run these commands inside the container or your activated Python environment. Docker is recommended for Linux GPU deployments; the official NVIDIA images already include the diffusion dependencies. For Python installation, use `sglang[diffusion]`.
 
 ```bash
 sglang generate --model-path Qwen/Qwen-Image \
@@ -26,7 +24,7 @@ sglang generate --model-path Qwen/Qwen-Image \
 ```
 
 ```bash
-sglang serve --model-path Qwen/Qwen-Image --port 30010
+sglang serve --model-path Qwen/Qwen-Image --host 0.0.0.0 --port 30000
 ```
 
 ## Start Here

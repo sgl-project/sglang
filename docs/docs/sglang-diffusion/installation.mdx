@@ -1,19 +1,26 @@
 ---
 title: Install SGLang Diffusion
-description: Install the sglang package with diffusion dependencies for image and video generation.
+description: Run SGLang's built-in diffusion engine with Docker, or install the diffusion extra with pip, uv, or from source.
 ---
-SGLang Diffusion is part of the [SGLang repository](https://github.com/sgl-project/sglang) and ships in the **`sglang` Python package**. Install `sglang[diffusion]` to include the dependencies for image and video generation, then use `sglang generate` or `sglang serve`.
+SGLang Diffusion is SGLang's built-in image and video generation engine. It ships in the same [repository](https://github.com/sgl-project/sglang) and **`sglang` Python package**, using `sglang generate` and `sglang serve`.
 
-<Note>
-Already have SGLang installed? Run the `sglang[diffusion]` installation command below in the same environment to add the diffusion dependencies. The `[diffusion]` extra belongs to the same `sglang` package.
-</Note>
+Docker is recommended for Linux GPU deployments. The official NVIDIA images include the standard diffusion dependencies; no additional `pip install` is needed. For Python installation, use `sglang[diffusion]`: `[diffusion]` adds optional dependencies to the same package, not a separate engine. See the [cookbook](/cookbook/diffusion/intro) for model-specific dependencies and optional backends.
 
 ## Install on NVIDIA GPUs
 
-These instructions target Linux with NVIDIA GPUs and Python 3.10 or higher. For the shared CUDA requirements, see [SGLang installation](/docs/get-started/install). Choose one installation method below; other platforms have dedicated instructions further down this page.
+These instructions target Linux with NVIDIA GPUs. For the driver, CUDA, and Python requirements, see [SGLang installation](/docs/get-started/install). Docker includes Python; no host Python installation is required. Choose one installation method below; other platforms have dedicated instructions further down this page.
 
 <Tabs>
+<Tab title="Docker (recommended)" id="method-3-using-docker">
+
+Follow the shared [Docker setup](/docs/get-started/install#method-3-using-docker) to install the NVIDIA Container Toolkit and start an SGLang container. Use the latest stable image for released models, or a nightly image containing the required changes for unreleased models. Pin a release tag or image digest for reproducible deployments.
+
+Inside the container, run [generation or serving commands](/docs/sglang-diffusion#quick-start) directly. Use `--host 0.0.0.0 --port 30000` when serving through the published container port. Mount an output directory to retain generated files after removing the container, and mount any local input media or checkpoints before using their container paths in requests.
+
+</Tab>
 <Tab title="pip / uv" id="method-1-with-pip-or-uv">
+
+If SGLang is already installed, run the same installation command in that environment to add the diffusion dependencies.
 
 Use uv for faster installation:
 
@@ -47,31 +54,6 @@ pip install -e "python[diffusion]"
 Or replace the pip installation command with `uv pip install -e "python[diffusion]" --prerelease=allow`.
 
 The diffusion implementation lives in [`python/sglang/multimodal_gen`](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen).
-
-</Tab>
-<Tab title="Docker" id="method-3-using-docker">
-
-The Docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang), built from the [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/Dockerfile).
-Replace `<secret>` below with your HuggingFace Hub [token](https://huggingface.co/docs/hub/en/security-tokens).
-
-```bash Command
-docker run --gpus all \
-    --shm-size 32g \
-    -p 30000:30000 \
-    -v ~/.cache/huggingface:/root/.cache/huggingface \
-    --env "HF_TOKEN=<secret>" \
-    --ipc=host \
-    lmsysorg/sglang:dev \
-    zsh -c '\
-        echo "Installing diffusion dependencies..." && \
-        pip install -e "python[diffusion]" && \
-        echo "Starting SGLang-Diffusion..." && \
-        sglang generate \
-            --model-path black-forest-labs/FLUX.1-dev \
-            --prompt "A logo With Bold Large text: SGL Diffusion" \
-            --save-output \
-    '
-```
 
 </Tab>
 </Tabs>
