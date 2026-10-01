@@ -533,16 +533,6 @@ class LiLiCorrDraftModel(DFlashDraftModel):
             for name, weight in weights:
                 stripped = name[len("model.") :] if name.startswith("model.") else name
                 if stripped.startswith("lilicorr."):
-                    # Older exports index the head MLPs as nn.Sequential.
-                    for old, new in (
-                        ("feature_mlp.0.", "feature_norm."),
-                        ("feature_mlp.1.", "feature_mlp.up_proj."),
-                        ("feature_mlp.3.", "feature_mlp.down_proj."),
-                        (".mlp.0.", ".mlp.up_proj."),
-                        (".mlp.2.", ".mlp.down_proj."),
-                    ):
-                        stripped = stripped.replace(old, new)
-                    name = stripped
                     seen.add(stripped)
                 elif ".attention_conv." in stripped or ".mlp_conv." in stripped:
                     seen_conv.add(stripped)
