@@ -143,7 +143,7 @@ def attn_input_fusions(plan, read=NORM_QUANT_READOUT) -> Tuple[Callable, ...]:
             fused_attn_input,
             plan,
             fuses_quant=fuses_quant,
-            keep_bf16=declares_quant and read.fp8_input is Fp8Input.TUPLE_AND_BF16,
+            keep_bf16=fuses_quant and read.fp8_input is Fp8Input.TUPLE_AND_BF16,
             quant_format=read.quant_format if declares_quant else "",
         ),
     )
