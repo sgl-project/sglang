@@ -434,7 +434,7 @@ def _fuse_bmm_rope_cache(
         and q_nope.shape[1:] == (8, 192)
         and attn.kv_lora_rank == 512
         and attn.kv_cache_dtype == "fp8_e4m3"
-        and q_nope.shape[0] in (64, 128)
+        and q_nope.shape[0] == 64
     )
 
 

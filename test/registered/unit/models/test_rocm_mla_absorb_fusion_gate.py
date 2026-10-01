@@ -93,7 +93,7 @@ class TestFusedAbsorbGate(CustomTestCase):
                         ForwardMode.TARGET_VERIFY,
                         False,
                     ),
-                    m not in (64, 128),
+                    m != 64,
                 )
 
     def test_eager_and_other_graph_backends_keep_fusion(self):
