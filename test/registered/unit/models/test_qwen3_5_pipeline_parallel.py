@@ -43,11 +43,11 @@ class TestQwen3_5PackedGDNInProj(CustomTestCase):
         lora.start()
         self.addCleanup(lora.stop)
 
-    def _make_model(self, wrapper_cls, model_type):
+    def _make_model(self, wrapper_cls, model_type, qkvz_rows=QKVZ, ba_rows=BA):
         gdn = Qwen3_5GatedDeltaNet.__new__(Qwen3_5GatedDeltaNet)
         torch.nn.Module.__init__(gdn)
-        gdn.in_proj_qkvz = _Linear(self.QKVZ, self.HIDDEN)
-        gdn.in_proj_ba = _Linear(self.BA, self.HIDDEN)
+        gdn.in_proj_qkvz = _Linear(qkvz_rows, self.HIDDEN)
+        gdn.in_proj_ba = _Linear(ba_rows, self.HIDDEN)
         gdn._fused_in_proj_weight = None
         gdn._fused_in_proj_qkvz_width = 0
         backbone = Qwen3_5ForCausalLM.__new__(Qwen3_5ForCausalLM)
@@ -103,6 +103,17 @@ class TestQwen3_5PackedGDNInProj(CustomTestCase):
                     model.prepare_before_cuda_graph_capture(model_runner=None)
 
                 self.assertIsNone(gdn._fused_in_proj_weight)
+
+    def test_cuda_keeps_separate_gemms_for_unaligned_packed_rows(self):
+        """Per-rank shapes of Qwen3.5-0.8B at TP 8: 1,024 + 4 packed rows are not
+        16-byte aligned, which sends cuBLAS to slower kernels."""
+        model, gdn = self._make_model(
+            Qwen3_5ForConditionalGeneration, "qwen3_5_text", qkvz_rows=1024, ba_rows=4
+        )
+        with patch.object(qwen3_5, "_is_cuda", True):
+            model.prepare_before_cuda_graph_capture(model_runner=None)
+
+        self.assertIsNone(gdn._fused_in_proj_weight)
 
 
 class TestQwen3_5PipelineParallel(CustomTestCase):

@@ -660,6 +660,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and ba.bias is None
         ):
             return
+        if not _use_aiter and (qkvz.weight.shape[0] + ba.weight.shape[0]) % 8:
+            # cuBLAS picks slower kernels for BF16 output rows that are not 16-byte
+            # aligned; such a packed GEMM (e.g. Qwen3.5-0.8B, 2B, 27B at TP 8) is
+            # slower than the two separate ones.
+            return
         fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
         self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]
         qkvz.weight.data = fused[: self._fused_in_proj_qkvz_width]
