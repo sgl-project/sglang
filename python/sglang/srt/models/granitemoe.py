@@ -117,7 +117,6 @@ class GraniteMoeMoE(nn.Module):
         layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -135,6 +134,7 @@ class GraniteMoeMoE(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=True,
         )
 

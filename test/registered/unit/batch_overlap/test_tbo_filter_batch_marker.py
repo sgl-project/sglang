@@ -61,9 +61,11 @@ class TestTboFilterBatchMarker(CustomTestCase):
         parent = _make_target_verify_batch(8)
         parent._original_batch_size = 8
         parent._original_num_tokens = 8
+        parent.global_num_tokens_padded_cpu = [8, 0, 0, 0]
         child = _filter(parent, lo=0, hi=4)
         self.assertIsNone(child._original_batch_size)
         self.assertIsNone(child._original_num_tokens)
+        self.assertIsNone(child.global_num_tokens_padded_cpu)
 
     def test_filter_batch_resets_plan_marker_on_children(self):
         child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
@@ -90,6 +92,14 @@ class TestTboFilterBatchMarker(CustomTestCase):
                 parent.defer_logits_to_eager = deferred
                 child = _filter(parent, lo=0, hi=4)
                 self.assertEqual(child.defer_logits_to_eager, deferred)
+
+    def test_filter_batch_drops_aux_hidden_states_buffer(self):
+        """Decode graph capture sets the shared aux output on the parent before
+        the TBO split; children must not inherit it."""
+        parent = _make_target_verify_batch(8)
+        parent.aux_hidden_states_buffer = torch.empty(8, 12)
+        child = _filter(parent, lo=0, hi=4)
+        self.assertIsNone(child.aux_hidden_states_buffer)
 
 
 def _make_valued_batch(bs: int) -> ForwardBatch:

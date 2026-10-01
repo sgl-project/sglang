@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use sglang_radix_tree::{
     BackupKV, CacheAction, CacheInitParams, ComponentSet, DecLockRefParams, FULL, IncLockRefResult,
     InsertParams, InsertResult, KeyNamespaceRef, MAMBA, MatchPrefixParams, PageValue, RadixValue,
-    TreeCoreRuntimeError, UnifiedTreeCore,
+    SWA, TreeCoreRuntimeError, UnifiedTreeCore,
 };
 
 type TestCore = UnifiedTreeCore<Vec<i64>, PageValue<u32>>;
@@ -20,6 +20,7 @@ fn core(eviction_policy: &str) -> TestCore {
 
 fn insert(core: &mut TestCore, key: &[i64], values: &[u32]) -> InsertResult<PageValue<u32>> {
     core.insert(&InsertParams {
+        rotation_base: None,
         key: &key.to_vec(),
         namespace: KeyNamespaceRef::default(),
         session_id: None,
@@ -36,12 +37,7 @@ fn insert(core: &mut TestCore, key: &[i64], values: &[u32]) -> InsertResult<Page
 
 /// Replay an acquire's receipt on release, as the cache controller does.
 fn release_params(receipt: &IncLockRefResult) -> DecLockRefParams {
-    DecLockRefParams {
-        node_id: receipt.node_id,
-        swa_uuid_for_lock: receipt.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
-        skipped_lock_components: receipt.skipped_lock_components,
-    }
+    receipt.to_dec_params()
 }
 
 #[test]
@@ -76,6 +72,7 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
         prefix.last_device_node_id,
         2,
         &InsertParams {
+            rotation_base: None,
             key: &partial_key,
             namespace: KeyNamespaceRef::default(),
             session_id: None,
@@ -162,6 +159,7 @@ fn continuation_insert_rejects_a_host_only_anchor() {
             anchor,
             2,
             &InsertParams {
+                rotation_base: None,
                 key: &key,
                 namespace: KeyNamespaceRef::default(),
                 session_id: None,
@@ -196,6 +194,7 @@ fn full_kv_prefix_len_is_the_full_hit_not_the_admitted_prefix_on_mamba_trees() {
     );
     let key = vec![10, 20, 30, 40];
     tree.insert(&InsertParams {
+        rotation_base: None,
         key: &key,
         namespace: KeyNamespaceRef::default(),
         session_id: None,
@@ -233,6 +232,7 @@ fn continuation(
         anchor,
         2,
         &InsertParams {
+            rotation_base: None,
             key: &key.to_vec(),
             namespace: KeyNamespaceRef::default(),
             session_id: None,
@@ -303,6 +303,7 @@ fn empty_insert_leaves_the_donated_mamba_slot_with_the_caller() {
     // so the caller must free its donated slot (mamba_exist == true).
     let key = vec![10];
     let result = tree.insert(&InsertParams {
+        rotation_base: None,
         key: &key,
         namespace: KeyNamespaceRef::default(),
         session_id: None,
@@ -321,7 +322,9 @@ fn empty_insert_leaves_the_donated_mamba_slot_with_the_caller() {
 
 #[test]
 fn every_eviction_policy_operates_without_torch() {
-    for policy in ["lru", "lfu", "fifo", "mru", "filo", "priority", "slru"] {
+    for policy in [
+        "lru", "lfu", "fifo", "mru", "filo", "priority", "slru", "tlru",
+    ] {
         let mut tree = core(policy);
         insert(&mut tree, &[10, 20], &[1, 2]);
         assert_eq!(tree.evictable_size(), 2, "{policy}");
@@ -360,6 +363,7 @@ fn inserted_values_do_not_retain_the_caller_buffer() {
         prefix.last_device_node_id,
         2,
         &InsertParams {
+            rotation_base: None,
             key: &extended_key,
             namespace: KeyNamespaceRef::default(),
             session_id: None,
@@ -385,4 +389,126 @@ fn inserted_values_do_not_retain_the_caller_buffer() {
     assert_eq!(stored.as_slice(), &[3, 4]);
     assert_ne!(stored.as_slice().as_ptr(), extended_ptr);
     assert_eq!(stored.to_i64_vec(), vec![3, 4]);
+}
+
+#[test]
+fn continuation_insert_preserves_rotation_checks_before_prefix_side_effects() {
+    let mut tree = TestCore::new(
+        CacheInitParams {
+            enable_hicache: true,
+            write_through_threshold: 2,
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    let prefix = vec![10, 20];
+    let mut params = InsertParams {
+        rotation_base: Some(7),
+        key: &prefix,
+        namespace: KeyNamespaceRef::default(),
+        session_id: None,
+        value: PageValue::from_vec(vec![1, 2]),
+        prev_prefix_len: 0,
+        swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
+        mamba_value: None,
+        chunked: false,
+        priority: 0,
+        track_adopted_ranges: true,
+    };
+    let anchor = tree.insert(&params).last_device_node_id.unwrap();
+    let key = vec![10, 20, 30, 40];
+    params.key = &key;
+    params.value = PageValue::from_vec(vec![3, 4]);
+    params.prev_prefix_len = 2;
+    params.rotation_base = Some(8);
+    for chunked in [true, false] {
+        params.chunked = chunked;
+        let rejected = tree.insert_suffix_from_node(anchor, 2, &params);
+        assert!(rejected.rotation_tail_declined);
+        assert_eq!(rejected.prefix_len, 2);
+        assert!(rejected.cache_actions.is_empty());
+        assert!(rejected.adopted_ranges.unwrap().is_empty());
+        assert_eq!(tree.evictable_size(), 2);
+    }
+    params.rotation_base = Some(7);
+    let accepted = tree.insert_suffix_from_node(anchor, 2, &params);
+    assert!(!accepted.rotation_tail_declined);
+    assert_eq!(accepted.total_len, 4);
+    assert_eq!(backups(&accepted)[0].node_ids, vec![anchor]);
+    assert_eq!(tree.evictable_size(), 4);
+
+    // The new suffix keeps the same rotation for subsequent root inserts.
+    params.value = PageValue::from_vec(vec![1, 2, 3, 4]);
+    params.prev_prefix_len = 4;
+    assert!(!tree.insert(&params).rotation_tail_declined);
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn page_value_swa_window_validates_and_attaches_loaded_indices() {
+    let mut tree = TestCore::new(
+        CacheInitParams {
+            swa_sliding_window_size: Some(4),
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    // The request has already freed its SWA slots, but still has Full KV.
+    let key = vec![10, 20, 30, 40];
+    let anchor = tree
+        .insert(&InsertParams {
+            rotation_base: None,
+            key: &key,
+            namespace: KeyNamespaceRef::default(),
+            session_id: None,
+            value: PageValue::from_vec(vec![1, 2, 3, 4]),
+            prev_prefix_len: 0,
+            swa_evicted_seqlen: 4,
+            swa_branching_seqlen: None,
+            mamba_value: None,
+            chunked: false,
+            priority: 0,
+            track_adopted_ranges: false,
+        })
+        .last_device_node_id
+        .unwrap();
+    assert_eq!(
+        tree.swa_tombstone_ranges(&key, Default::default(), 0, 4)
+            .unwrap(),
+        vec![(0, 4)]
+    );
+    assert!(
+        tree.attach_swa_window(
+            &key,
+            Default::default(),
+            1,
+            3,
+            &PageValue::from_vec(vec![5])
+        )
+        .is_err()
+    );
+    assert_eq!(tree.swa_evictable_size(), 0);
+    tree.attach_swa_window(
+        &key,
+        Default::default(),
+        1,
+        3,
+        &PageValue::from_vec(vec![5, 6]),
+    )
+    .unwrap();
+    assert_eq!(
+        tree.swa_tombstone_ranges(&key, Default::default(), 0, 4)
+            .unwrap(),
+        vec![(0, 1), (3, 4)]
+    );
+    assert_eq!(tree.swa_evictable_size(), 2);
+    assert_eq!(tree.evictable_size(), 4);
+    assert_eq!(
+        tree.collect_full_device_indices(anchor, tree.root_node_handle(None))
+            .unwrap()
+            .as_slice(),
+        &[1, 2, 3, 4]
+    );
+    tree.try_sanity_check(&[], &[]).unwrap();
 }

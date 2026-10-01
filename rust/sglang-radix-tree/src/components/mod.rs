@@ -353,7 +353,7 @@ pub trait TreeComponent<K: ChildKeyType, V: RadixValue> {
         &self,
         _tree_core: &mut UnifiedTreeCore<K, V>,
         _node_id: NodeIdx_,
-        _swa_uuid_for_lock: Option<i64>,
+        _params: &DecLockRefParams,
         _device_frees: &mut HashMap<ComponentType, Vec<V>>,
         _host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) {

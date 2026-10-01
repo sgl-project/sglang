@@ -52,8 +52,9 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -64,6 +65,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
@@ -79,7 +81,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             url: worker_url.to_string(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         })
         .expect("test worker accepted");
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());

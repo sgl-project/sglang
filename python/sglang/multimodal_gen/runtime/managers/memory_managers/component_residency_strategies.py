@@ -278,14 +278,19 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
     ) -> None:
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
             return
+        # Not release_all: this is a use ending, not a reset. Whether the
+        # resident set outlives the use is declared on the use, by whoever has
+        # the pipeline's per-phase headroom in view; the default is off, so
+        # this stays the long-standing behaviour until something sets it.
+        keep_resident = use.retain_resident_layers
         for manager in module.layerwise_offload_managers:
-            # Not release_all: this is a use ending, not a reset. The default
-            # still drops the resident set, so behaviour is unchanged here.
-            manager.release_after_use()
+            manager.release_after_use(keep_resident=keep_resident)
         # The layers are gone; the rest of this component is dead weight on the
         # device until it is used again, and the stage that follows may be the
-        # one that needs the room.
-        module.park_non_layer_weights()
+        # one that needs the room. That reasoning does not hold when the room
+        # was just judged available: parking would undo the transfer we kept.
+        if not keep_resident:
+            module.park_non_layer_weights()
         if current_platform.is_mps():
             torch.mps.synchronize()
             module.restore_mps_cpu_non_layer_weights()

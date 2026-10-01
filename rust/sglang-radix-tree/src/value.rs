@@ -18,6 +18,18 @@ pub trait RadixValue: Debug + Sized + 'static {
         self.len() == 0
     }
 
+    /// Validate a flat device-index value before publishing it into the tree.
+    /// Backends with a dtype or device must also match the supplied empty value.
+    fn validate_device_indices(&self, len: usize, _device_empty: &Self) -> Result<(), String> {
+        if self.len() != len {
+            return Err(format!(
+                "size mismatch: got {} for {len} indices",
+                self.len()
+            ));
+        }
+        Ok(())
+    }
+
     /// Cheap handle clone used while collecting a matched path.
     fn shallow_clone(&self) -> Self;
 
@@ -174,6 +186,22 @@ where
 impl RadixValue for tch::Tensor {
     fn len(&self) -> usize {
         self.size()[0] as usize
+    }
+
+    fn validate_device_indices(&self, len: usize, device_empty: &Self) -> Result<(), String> {
+        if self.kind() != tch::Kind::Int64 || self.device() != device_empty.device() {
+            return Err(format!(
+                "requires int64 values on {:?}",
+                device_empty.device()
+            ));
+        }
+        if self.size() != [len as i64] {
+            return Err(format!(
+                "size mismatch: got {:?} for {len} indices",
+                self.size()
+            ));
+        }
+        Ok(())
     }
 
     fn shallow_clone(&self) -> Self {

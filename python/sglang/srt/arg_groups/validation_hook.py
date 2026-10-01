@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
-    model_config_of,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -19,25 +18,11 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
-
-_PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
-    {
-        "DeepseekV2ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "DeepseekV32ForCausalLM",
-        "GlmMoeDsaForCausalLM",
-        # Qwen3.5 (dense / MoE, text and multimodal); folded in from #39602.
-        "Qwen3_5ForCausalLM",
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
-    }
-)
 
 
 def validate_response_store(server_args: Any) -> None:
@@ -50,9 +35,7 @@ def validate_response_store(server_args: Any) -> None:
         )
 
 
-def check_pipeline_parallel_compat(
-    cfg: Any, *, model_architecture: Optional[str] = None
-) -> None:
+def check_pipeline_parallel_compat(cfg: Any) -> None:
     """Validate features used with pipeline parallelism."""
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
@@ -89,18 +72,14 @@ def check_pipeline_parallel_compat(
             # Every stage rebuilds the same verify input from the relayed
             # per-request state, so all stages must see the same batch.
             # DP attention partitions it per DP rank.
-            assert not cfg.enable_dp_attention, (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
+            assert not attn_dp_enabled_of(cfg), (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with attention DP "
+                "(--attn-dp-size)"
             )
         else:
             assert cfg.disaggregation_mode == "prefill", (
                 "PP + speculative decoding (MTP) is only supported on prefill nodes "
                 "(disaggregation-mode=prefill)"
-            )
-            assert model_architecture in _PP_EAGLE_SUPPORTED_ARCHITECTURES, (
-                "PP + speculative decoding is only supported for DeepSeek/GLM/Qwen3.5 "
-                "models whose last pipeline stage supplies the EAGLE draft "
-                f"embedding; got architecture={model_architecture}"
             )
     assert cfg.min_free_slots_delay is None, (
         "--min-free-slots-delay is not supported with pipeline "
@@ -134,13 +113,11 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        model_architecture = None
-        if cfg.speculative_algorithm is not None:
-            model_architecture = model_config_of(server_args).hf_config.architectures[0]
-        check_pipeline_parallel_compat(cfg, model_architecture=model_architecture)
+        check_pipeline_parallel_compat(cfg)
 
-    assert not (cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention), (
-        "multi-node data parallel is not supported unless dp attention!"
+    assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
+        "multi-node data-parallel replicas are not supported; use attention DP "
+        "(--attn-dp-size) across nodes"
     )
 
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
@@ -287,6 +264,8 @@ def check_server_args(server_args: Any):
     if cfg.enable_quant_communications and cfg.device != "npu":
         raise ValueError("Communications quantization is only supported for NPU device")
 
+    validate_device_sampling_backend(cfg.sampling_backend, cfg.device)
+
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
     if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
@@ -398,11 +377,23 @@ def check_load_publish_args(server_args: Any):
     _, reason = resolve_load_pub_range(
         kv_endpoint=cfg.endpoint,
         replay_endpoint=cfg.replay_endpoint,
-        dp_size=server_cfg.dp_size,
+        dp_size=num_dp_ranks_of(server_cfg),
         load_publish_endpoint=mode,
     )
     if reason:
         raise ValueError(reason)
+
+
+def validate_device_sampling_backend(
+    sampling_backend: Optional[str], device: str
+) -> None:
+    # sampler.py binds the intel_xpu kernels only under is_xpu(), so on another
+    # device the backend either aliases to flashinfer's names or NameErrors on
+    # the first non-greedy decode.
+    if sampling_backend == "intel_xpu" and device != "xpu":
+        raise ValueError(
+            f"--sampling-backend intel_xpu requires --device xpu, got --device {device}"
+        )
 
 
 def validate_ib_devices(device_str: Optional[str]) -> Optional[str]:
@@ -539,10 +530,10 @@ def check_two_batch_overlap(server_args: Any):
     if (
         cfg.enable_two_batch_overlap
         and cfg.moe_a2a_backend == "none"
-        and not cfg.enable_dp_attention
+        and not attn_dp_enabled_of(cfg)
     ):
         raise ValueError(
             "When enabling two batch overlap without an EP a2a backend "
-            "(moe_a2a_backend='none'), --enable-dp-attention is required "
+            "(moe_a2a_backend='none'), attention DP (--attn-dp-size) is required "
             "(DeepSeek-V4 non-EP DP TBO path)."
         )

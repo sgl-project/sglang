@@ -4,19 +4,56 @@ Rust tree core for the Unified Radix Cache, covering Full attention, sliding win
 
 ## Usage
 
-Select the backend with:
+Rust is the default tree core. The centralized tree-core registry falls back to
+Python in these cases:
+
+- Session-aware caching.
+- C128 or other unsupported components.
+- Custom component overrides.
+- Non-Linux platforms.
+- PyTorch versions outside 2.11 through 2.13.
+- Devices other than CPU or CUDA.
+- Installations containing neither the Rust extension nor its sources.
+- Source builds with a missing or unusable Rust toolchain.
+
+This policy also applies when Rust is explicitly selected.
+Build, import, and runtime failures in supported configurations remain errors.
+The Rust bindings report unexpected native panics as `RuntimeError` so Python's
+crash handlers can report them and coordinate shutdown. A panic during a core
+operation poisons its mutex, and subsequent calls refuse to reuse that state.
+
+T-LRU accepts integer and floating-point `threshold` and `next_prompt_estimate`
+parameters. In mixed integer/float configurations, the integer estimate must fit
+in i128; larger values raise `OverflowError` at initialization. Native integer
+addition is checked, and overflow is reported as `RuntimeError`.
+
+Select a backend explicitly with:
 
 ```bash
 SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust
+# Use the Python implementation instead:
+SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
 ```
 
-SGLang wheels bundle the production extension. A source checkout falls back to
+Standard SGLang wheels bundle the production extension; some platform
+distributions omit it. A source checkout falls back to
 the shared fingerprinted Rust-extension cache; it never writes a shared object
 into the Python package. LibTorch and the Python headers come from the running
 interpreter's PyTorch install. PyTorch 2.11 through 2.13 are accepted explicitly,
 and `torch_2_13_compat.h` covers two alignment APIs removed in PyTorch 2.13.
+Source checkouts need working `cargo` and `rustc` to use Rust, including for
+fingerprinted cache lookup. If either tool is unavailable, the registry selects
+Python. Trusted bundled extensions do not require a Rust compiler.
 
 ## Development
+
+Alternative backends implement `UnifiedTreeCoreInterface` and register through
+`register_tree_core_backend`. For built-in Mamba and SWA internal-state write-back,
+the core returns a backup request and the controller performs transfers and waits
+for acknowledgment.
+The controller then calls `finish_mamba_state_eviction` or
+`finish_swa_state_eviction` to resume eviction. This keeps I/O outside the Rust
+tree's mutex; both tree cores implement the same contract.
 
 ```bash
 # Torch-free native core and simulation tests:
