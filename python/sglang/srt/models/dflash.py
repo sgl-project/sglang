@@ -622,7 +622,6 @@ class DFlashDraftModel(nn.Module):
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
-    uses_own_vocab_modules = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()

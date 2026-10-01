@@ -48,7 +48,6 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
     resolve_runtime_config,
-    resolve_single_owner_pp_rank,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
@@ -183,7 +182,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
         self._draft_worker = None
-        self._next_pp_proxy_tensors = None
         self.enable_dp_spec_prefill_coordination = (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         )
@@ -214,28 +212,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
 
-        self._use_full_projection_prefill = False
-        if self._is_pd_prefill and self._draft_is_moe and parallel.pp_size > 1:
-            target_layer_ids = [
-                int(layer_id)
-                for layer_id in (
-                    self.model_runner.spec_aux_config.dflash_target_layer_ids or []
-                )
-            ]
-            owner_pp_rank = resolve_single_owner_pp_rank(
-                target_layer_ids=target_layer_ids,
-                num_hidden_layers=self.model_runner.model_config.num_hidden_layers,
-                pp_size=parallel.pp_size,
-            )
-            if owner_pp_rank != parallel.pp_size - 1:
-                raise ValueError(
-                    "PP DSpark requires all target context layers on "
-                    f"the final PP stage, got target_layer_ids={target_layer_ids} "
-                    f"and owner_pp_rank={owner_pp_rank}."
-                )
-            self._use_full_projection_prefill = (
-                not self._replicated_pp_draft and parallel.pp_rank == owner_pp_rank
-            )
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self._is_pd_prefill
@@ -270,7 +246,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
-        self._linear_accept_index_cache = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -338,13 +313,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         else:
             target_model = self.target_worker.model_runner.model
-            try:
-                lm_head = unwrap_lora_layer(target_model.lm_head)
-                lm_head.weight
-            except AttributeError as exc:
+            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+            if lm_head is None or not hasattr(lm_head, "weight"):
                 raise RuntimeError(
                     "DSpark requires the target model to expose `lm_head` with `weight`."
-                ) from exc
+                )
             self.draft_model.attach_shared_modules(
                 embed_tokens=unwrap_lora_layer(
                     self._resolve_target_embed_tokens(target_model)
@@ -478,9 +451,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
         )
 
-        if self._is_pd_prefill:
-            if not self._draft_is_moe:
-                self.draft_model.prune_to_ctx_kv_injection()
+        if self._is_pd_prefill and not self._draft_is_moe:
+            self.draft_model.prune_to_ctx_kv_injection()
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -492,11 +464,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return False
         return self._verify_planner.carries_confidence
-
-    def _draft_model_runners(self) -> tuple:
-        if not self._hosts_draft:
-            return ()
-        return super()._draft_model_runners()
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -640,9 +607,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
-    def set_pp_proxy_tensors_for_next_forward(self, pp_proxy_tensors) -> None:
-        self._next_pp_proxy_tensors = pp_proxy_tensors
-
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -651,10 +615,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         *,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
-        if pp_proxy_tensors is None:
-            pp_proxy_tensors = self._next_pp_proxy_tensors
-        self._next_pp_proxy_tensors = None
-
         if not self._hosts_draft:
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
@@ -844,12 +804,45 @@ class DSparkWorkerV2(BaseSpecWorker):
             else None
         )
         pp_projected_context = None
-        if self._use_full_projection_prefill:
-            if not has_local_target_hidden or output_pp_proxy_tensors is not None:
-                raise RuntimeError(
-                    "Single-owner DSpark prefill requires target hidden states "
-                    "on the final PP rank."
+        incoming_ctx = (
+            pp_proxy_tensors.tensors.get("dspark_ctx_acc")
+            if pp_proxy_tensors is not None
+            else None
+        )
+        local_ctx = None
+        if self._draft_is_moe and has_local_target_hidden:
+            local_ctx = self.draft_model.project_target_hidden_for_transfer(
+                target_hidden
+            )
+        if output_pp_proxy_tensors is not None:
+            output_pp_proxy_tensors.tensors.pop("dspark_aux_hidden_states", None)
+        ctx_acc = None
+        if incoming_ctx is not None and local_ctx is not None:
+            ctx_acc = (
+                incoming_ctx.to(device=local_ctx.device, dtype=local_ctx.dtype)
+                + local_ctx
+            )
+        elif incoming_ctx is not None:
+            ctx_acc = incoming_ctx.to(device=self.device, non_blocking=True)
+        elif local_ctx is not None:
+            ctx_acc = local_ctx
+        if output_pp_proxy_tensors is not None:
+            if ctx_acc is not None:
+                output_pp_proxy_tensors.tensors["dspark_ctx_acc"] = ctx_acc
+        elif ctx_acc is not None:
+            if self._replicated_pp_draft:
+                pp_projected_context = ctx_acc
+            else:
+                self._kv_injector.inject_projected_context(
+                    projected_context=ctx_acc,
+                    cache_loc=cache_loc,
+                    positions=positions,
+                    state_slot=state_slot,
+                    final_pos=final_pos,
                 )
+        elif has_local_target_hidden and not (
+            self.ps.pp_size > 1 and not self._draft_is_moe
+        ):
             self._kv_injector.inject_target_hidden(
                 target_hidden=target_hidden,
                 cache_loc=cache_loc,
@@ -858,54 +851,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 final_pos=final_pos,
                 target_hidden_is_projected=target_hidden_is_projected,
             )
-        else:
-            incoming_ctx = (
-                pp_proxy_tensors.tensors.get("dspark_ctx_acc")
-                if pp_proxy_tensors is not None
-                else None
-            )
-            local_ctx = None
-            if self._draft_is_moe and has_local_target_hidden:
-                local_ctx = self.draft_model.project_target_hidden_for_transfer(
-                    target_hidden
-                )
-            if output_pp_proxy_tensors is not None:
-                output_pp_proxy_tensors.tensors.pop("dspark_aux_hidden_states", None)
-            ctx_acc = None
-            if incoming_ctx is not None and local_ctx is not None:
-                ctx_acc = (
-                    incoming_ctx.to(device=local_ctx.device, dtype=local_ctx.dtype)
-                    + local_ctx
-                )
-            elif incoming_ctx is not None:
-                ctx_acc = incoming_ctx.to(device=self.device, non_blocking=True)
-            elif local_ctx is not None:
-                ctx_acc = local_ctx
-            if output_pp_proxy_tensors is not None:
-                if ctx_acc is not None:
-                    output_pp_proxy_tensors.tensors["dspark_ctx_acc"] = ctx_acc
-            elif ctx_acc is not None:
-                if self._replicated_pp_draft:
-                    pp_projected_context = ctx_acc
-                else:
-                    self._kv_injector.inject_projected_context(
-                        projected_context=ctx_acc,
-                        cache_loc=cache_loc,
-                        positions=positions,
-                        state_slot=state_slot,
-                        final_pos=final_pos,
-                    )
-            elif has_local_target_hidden and not (
-                self.ps.pp_size > 1 and not self._draft_is_moe
-            ):
-                self._kv_injector.inject_target_hidden(
-                    target_hidden=target_hidden,
-                    cache_loc=cache_loc,
-                    positions=positions,
-                    state_slot=state_slot,
-                    final_pos=final_pos,
-                    target_hidden_is_projected=target_hidden_is_projected,
-                )
         if (
             self._replicated_pp_draft
             and output_pp_proxy_tensors is None

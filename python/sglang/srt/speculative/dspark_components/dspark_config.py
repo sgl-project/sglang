@@ -48,24 +48,6 @@ def draft_is_deepseek_v4() -> bool:
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
 
 
-def resolve_single_owner_pp_rank(
-    *, target_layer_ids: List[int], num_hidden_layers: int, pp_size: int
-) -> Optional[int]:
-    from sglang.srt.distributed.utils import get_pp_indices
-
-    if not target_layer_ids:
-        return None
-    for pp_rank in range(pp_size):
-        start_layer, end_layer = get_pp_indices(
-            num_hidden_layers=num_hidden_layers,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
-        )
-        if all(start_layer <= layer_id < end_layer for layer_id in target_layer_ids):
-            return pp_rank
-    return None
-
-
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
     gamma = int(num_draft_tokens) - 1
     if gamma < 1:

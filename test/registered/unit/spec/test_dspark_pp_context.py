@@ -1,4 +1,3 @@
-import os
 import unittest
 from collections import deque
 from contextlib import nullcontext
@@ -37,9 +36,6 @@ from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
     DeepseekV4ForCausalLMDSpark,
 )
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2  # noqa: E402
-from sglang.srt.speculative.dspark_components.dspark_config import (  # noqa: E402
-    resolve_single_owner_pp_rank,
-)
 from sglang.srt.speculative.dspark_components.dspark_pp import (  # noqa: E402
     draft_owner,
 )
@@ -650,27 +646,6 @@ class TestDSparkPPContext(CustomTestCase):
             scheduler.forward_stream
         )
 
-    def test_full_projection_fast_path_requires_final_pp_owner(self):
-        with patch.dict(
-            os.environ,
-            {"SGLANG_PP_LAYER_PARTITION": "6,5,6,5,6,5,5,5"},
-        ):
-            self.assertEqual(
-                resolve_single_owner_pp_rank(
-                    target_layer_ids=[40, 41, 42],
-                    num_hidden_layers=43,
-                    pp_size=8,
-                ),
-                7,
-            )
-            self.assertIsNone(
-                resolve_single_owner_pp_rank(
-                    target_layer_ids=[35, 40],
-                    num_hidden_layers=43,
-                    pp_size=8,
-                )
-            )
-
     def test_pp_spec_verify_buffers_use_token_axis(self):
         max_bs = 64
         num_tokens_per_req = 6
@@ -760,10 +735,30 @@ class TestDSparkPPContext(CustomTestCase):
         )
         model.capture_aux_hidden_states = False
 
-        model.set_dspark_layers_to_capture([5, 12, 18, 25])
+        with patch(
+            "sglang.srt.models.deepseek_v4.get_spec",
+            return_value=SimpleNamespace(speculative_dspark_pp_replicated_draft=True),
+        ):
+            model.set_dspark_layers_to_capture([5, 12, 18, 25])
 
         self.assertTrue(model.capture_aux_hidden_states)
         self.assertEqual(model.model.dspark_layers_to_capture, [12, 18])
+
+    def test_deepseek_v4_non_replicated_capture_stays_on_last_pp_rank(self):
+        model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.pp_group = SimpleNamespace(is_last_rank=False)
+        model.model = SimpleNamespace(dspark_layers_to_capture=None)
+        model.capture_aux_hidden_states = False
+
+        with patch(
+            "sglang.srt.models.deepseek_v4.get_spec",
+            return_value=SimpleNamespace(speculative_dspark_pp_replicated_draft=False),
+        ):
+            model.set_dspark_layers_to_capture([5, 12, 18, 25])
+
+        self.assertFalse(model.capture_aux_hidden_states)
+        self.assertIsNone(model.model.dspark_layers_to_capture)
 
 
 if __name__ == "__main__":
