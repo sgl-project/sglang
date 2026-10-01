@@ -49,9 +49,9 @@ scenarios; use a separate `--out` file when collecting pool-specific candidates.
 
 `b200-cirrascale1-0123` has separate E2E references of 1574.32 ms for
 `flux1_modelopt_nvfp4_t2i` and 17742.04 ms for
-`qwen_image_2512_modelopt_nvfp4_t2i`. The measured Cirrascale 3 and Cirrascale 4
-runners below also have separate references. Other Cirrascale runners retain the
-defaults until calibrated.
+`qwen_image_2512_modelopt_nvfp4_t2i`; `b200-cirrascale1-4567` reuses them. The
+measured Cirrascale 3 and Cirrascale 4 runners below also have separate
+references. Other Cirrascale runners retain the defaults until calibrated.
 
 Historical jobs on this runner, all using driver 580.126.20, already recorded
 the slower timings before this PR's changes, with unchanged B200 case definitions:
