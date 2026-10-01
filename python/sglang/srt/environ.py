@@ -1304,6 +1304,9 @@ class Envs:
     # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
+    # DeepSeek-V4 on aiter: one moe_fused_gate launch emits routed + shared slots,
+    # replacing aiter topk_gating plus the shared-expert append kernel.
+    SGLANG_OPT_AITER_FUSED_GATE_SHARED = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
     # ===================================================================

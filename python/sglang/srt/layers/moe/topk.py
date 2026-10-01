@@ -2380,11 +2380,13 @@ def _post_process_topk_ids(
     if recorder_topk_ids is None and not recorder_was_fused:
         recorder_topk_ids = topk_ids
 
-    _aiter_append = num_fused_shared_experts > 0 and _use_aiter
-    if _aiter_append and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get():
-        # That router emits the shared slots itself; appending again would write
-        # the shared id twice and evict a real routed expert.
-        _aiter_append = topk_ids.shape[-1] < topk_config.top_k
+    # A gate that already emitted the shared slots must not be appended to again;
+    # the shared id would be written twice and evict a real routed expert.
+    _aiter_append = (
+        num_fused_shared_experts > 0
+        and _use_aiter
+        and topk_ids.shape[-1] < topk_config.top_k
+    )
 
     if _aiter_append and use_per_rank_shared_slots:
         # Fused path: append shared experts AND apply the per-rank shared-slot
@@ -2664,6 +2666,18 @@ def select_experts(
                     device=hidden_states.device,
                 )
                 _packed_kwargs = dict(packed_out=packed_topk)
+            # The gate emits the shared slot (weight 1.0, routed weights pre-scaled,
+            # as the aiter runner expects), so _post_process_topk_ids skips the append.
+            gate_emits_shared = (
+                _use_aiter
+                and scoring_func == "sqrtsoftplus"
+                and num_fused_shared_experts > 0
+                and not has_per_rank_fused_shared_slots(num_fused_shared_experts)
+                and topk_config.fused_shared_experts_scaling_factor is None
+                and not _eplb_remap_enabled()
+                and not _packed_kwargs
+                and envs.SGLANG_OPT_AITER_FUSED_GATE_SHARED.get()
+            )
             if topk_config.sqrtsoftplus_log1p:
                 _packed_kwargs["sqrtsoftplus_log1p"] = True
             if router_logits_partials is not None:
@@ -2672,14 +2686,24 @@ def select_experts(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=(
+                    top_k
+                    if gate_emits_shared or not _use_aiter
+                    else num_routed_topk
+                ),
                 renormalize=renormalize,
                 scoring_func=scoring_func,
-                num_fused_shared_experts=num_fused_shared_experts_for_gate,
+                num_fused_shared_experts=(
+                    num_fused_shared_experts
+                    if gate_emits_shared
+                    else num_fused_shared_experts_for_gate
+                ),
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                apply_routed_scaling_factor_on_output=(
+                    gate_emits_shared or apply_routed_scaling_factor_on_output
+                ),
                 **_packed_kwargs,
             )
             padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
