@@ -85,6 +85,7 @@ jobs:
             sgl_kernel:
               - ".github/workflows/pr-test-musa.yml"
               - "python/sglang/kernels/aot/csrc/musa/**"
+              - "python/sglang/kernels/aot/tests/test_musa_ops.py"
               - "scripts/ci/musa/**"
 
       - name: Test MUSA dependency constraints
@@ -225,6 +226,7 @@ jobs:
           pytest test/registered/kernels/ops/speculative/test_eagle_utils.py
           pytest test/registered/kernels/ops/speculative/test_ngram_utils.py
           pytest test/registered/kernels/ops/speculative/test_speculative_sampling.py
+          pytest python/sglang/kernels/aot/tests/test_musa_ops.py
           pytest python/sglang/kernels/aot/tests/test_torch_defaults_reset.py
 
 
