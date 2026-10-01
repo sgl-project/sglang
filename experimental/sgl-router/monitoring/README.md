@@ -44,6 +44,13 @@ Families the router emits. The dashboard graphs all of them except the
 | `sgl_router_kv_tree_maintained` | Gauge | 1 when this router maintains its own KV tree, 0 under an external Indexer |
 | `sgl_router_kv_bootstrap_peers` | Gauge | Ready sibling router replicas peer bootstrap could pull a tree snapshot from. Emitted only with `--kv-peer-selector` |
 | `sgl_router_kv_bootstrap_peers_synced` | Gauge | 1 once peer discovery has reported at least once; a 0 that never becomes 1 means the peer watch is not delivering (check EndpointSlice RBAC). Emitted only with `--kv-peer-selector` |
+| `sgl_router_kv_tree_nodes` | Gauge | Nodes in this replica's cache-aware tree. 0 after bootstrap settles means the replica is routing cache-blind. Emitted only with `--kv-peer-selector` |
+| `sgl_router_kv_bootstrap_settled` | Gauge | 1 once initial peer bootstrap settled (every rank terminal, or the `--kv-bootstrap-timeout-ms` deadline). Settling says nothing about success — join with `sgl_router_kv_peer_snapshot_total` |
+| `sgl_router_kv_bootstrap_seed_failed` | Gauge | 1 when the last sweep over a non-empty candidate set timed out: siblings were there and their tree could not be pulled. Emitted whether or not `--kv-bootstrap-seed-required` gates on it |
+| `sgl_router_kv_bootstrap_state` | Gauge | Per-rank bootstrap state by `worker_url` / `dp_rank`: 0 pending (events held back, heading for overflow), 1 recovered, 2 failed (routing on live deltas alone) |
+| `sgl_router_kv_peer_snapshot_total` | Counter | Peer snapshot fetches by `outcome` (`accepted` / `unreachable` / `cold_peer` / `rejected`). A fleet pinned at `unreachable` with warm siblings means the per-fetch bound is too small for the body |
+| `sgl_router_kv_bootstrap_rank_total` | Counter | Final per-rank bootstrap verdicts by `outcome` (`warm`, `warm_unwitnessed`, `from_origin`, `gap`, `uncovered`, `abandoned`, `overflow`, `publisher_reset`, `tree_rejected`); one count per rank per incarnation |
+| `sgl_router_kv_bootstrap_sweep_total` | Counter | Peer sweeps by `result` (`found` / `no_peers` / `fleet_cold` / `timed_out` / `ranks_resolved`) — what separates a healthy early settle on a cold fleet from burning the whole deadline |
 
 The legacy `sgl_router_overlap_blocks` metric was removed with the
 `cache_aware_zmq` policy and has no direct replacement. Remove queries, alerts,

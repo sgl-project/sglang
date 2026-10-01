@@ -85,7 +85,6 @@ class Qwen3Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.start_layer = start_layer
-        self.tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -108,7 +107,6 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_parallel().tp_rank
 
         norm_kwargs = (
             dict(
