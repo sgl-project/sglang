@@ -106,7 +106,11 @@ from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
     process_content_for_template_format,
 )
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import (
+    IQuestQ1ReasoningDetector,
+    ReasoningParser,
+)
+from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
@@ -325,6 +329,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
+        self.supports_inline_system = self._resolve_inline_system_support()
         self._dsv4_reasoning_effort_profile = (
             chat_encoding.resolve_dsv4_reasoning_effort_profile(
                 model_path=self.tokenizer_manager.model_path,
@@ -459,6 +464,16 @@ class OpenAIServingChat(OpenAIServingBase):
         if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
             encoded = encoded[1:]
         return prompt_ids + encoded
+
+    def _resolve_inline_system_support(self) -> bool:
+        if self.chat_encoding_spec is not None:
+            return chat_encoding.spec_supports_inline_system(self.chat_encoding_spec)
+        if self.template_manager.chat_template_name is not None:
+            return False
+        tokenizer = self.tokenizer_manager.tokenizer
+        return tokenizer is not None and detect_inline_system_support(
+            tokenizer.chat_template
+        )
 
     def _resolve_chat_encoding_spec(self) -> str | None:
         """Determine which chat encoding spec to use.
@@ -1748,6 +1763,7 @@ class OpenAIServingChat(OpenAIServingBase):
         cache_key = None
         if use_cache:
             try:
+                # Key order is part of the key: templates render dicts in their given order.
                 cache_key = orjson.dumps(
                     (
                         getattr(
@@ -1760,7 +1776,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         template_kwargs,
                         encode_kwargs,
                     ),
-                    option=orjson.OPT_SORT_KEYS,
                 )
             except TypeError:
                 pass
@@ -2564,12 +2579,12 @@ class OpenAIServingChat(OpenAIServingBase):
         # as constraint (mirrors the streaming path). For auto: always try.
         if self.tool_call_parser:
             parser = FunctionCallParser(
-                tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
+                tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+                tool_choice=tool_choice,
             )
-            detector_owns_format = (
-                parser.detector.supports_structural_tag()
-                or parser.detector.parses_required_natively()
-            )
+            detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
             if should_try_parser and parser.has_tool_call(text):
                 try:
@@ -2844,6 +2859,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.reasoning_effort = "medium" if enabled else "no_think"
             return
 
+        if self.reasoning_parser == "iquest_q1":
+            request.chat_template_kwargs = {
+                **(request.chat_template_kwargs or {}),
+                "thinking": enabled,
+                "enable_thinking": enabled,
+            }
+            return
+
         if self.reasoning_parser == "inkling":
             # Effort-conditioned, not toggled: "none" (0.0) is the off switch.
             if not enabled:
@@ -2901,6 +2924,11 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.reasoning_parser:
             return False
+
+        if self.reasoning_parser == "iquest_q1":
+            return IQuestQ1ReasoningDetector.thinking_enabled(
+                request.chat_template_kwargs or {}
+            )
 
         if self.reasoning_parser == "minimax-m3":
             # M3 template prefills <mm:think> for thinking_mode=enabled, so it never
@@ -3008,11 +3036,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=effective_tools,
                         tool_call_parser=self.tool_call_parser,
                         tokenizer=self.tokenizer_manager.tokenizer,
+                        tool_choice=request.tool_choice,
                     )
-                    use_native_parser = (
-                        probe.detector.supports_structural_tag()
-                        or probe.detector.parses_required_natively()
-                    )
+                    use_native_parser = probe.owns_tool_format()
                 if use_native_parser:
                     parser_dict[index] = probe
                 else:

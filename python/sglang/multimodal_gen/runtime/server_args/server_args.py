@@ -190,7 +190,9 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
+        "anima-base-v1.0-diffusers",
         "black-forest-labs/flux.1-dev",
+        "circlestone-labs/anima-base-v1.0-diffusers",
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
         "efficient-large-model/sana-video_2b_480p_diffusers",
@@ -237,6 +239,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
+        "AnimaPipelineConfig",
         "FluxPipelineConfig",
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
@@ -606,6 +609,8 @@ class ServerArgs(DisaggServerArgsMixin):
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
     enable_cache_report: bool = False
+    disable_conditioning_cache: bool = False
+    conditioning_cache_max_size_mb: float = 512.0
 
     # Tracing
     enable_trace: bool = False
@@ -793,7 +798,7 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only FLUX.1-dev, Ideogram-4, "
+            "[Diffusion BCG] disabled for %s: only Anima Base v1.0, FLUX.1-dev, Ideogram-4, "
             "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
             "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
             "Qwen/Qwen-Image-2.1, SANA1.5, "
@@ -1929,6 +1934,10 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(f"Could not parse attention backend config: {config_str}")
 
     def __post_init__(self):
+        if not 0 <= self.conditioning_cache_max_size_mb < float("inf"):
+            raise ValueError(
+                "conditioning_cache_max_size_mb must be finite and nonnegative"
+            )
         if not self._explicit_arg_names:
             self._explicit_arg_names = _infer_direct_constructor_explicit_arg_names(
                 self
@@ -3022,6 +3031,18 @@ class ServerArgs(DisaggServerArgsMixin):
             action="store_true",
             default=ServerArgs.enable_cache_report,
             help="Return number of cached tokens in usage.prompt_tokens_details for each OpenAI-compatible request.",
+        )
+        parser.add_argument(
+            "--disable-conditioning-cache",
+            action="store_true",
+            default=ServerArgs.disable_conditioning_cache,
+            help="Disable cross-request text/image and VAE posterior caching; reuse within a grouped stage remains enabled.",
+        )
+        parser.add_argument(
+            "--conditioning-cache-max-size-mb",
+            type=float,
+            default=ServerArgs.conditioning_cache_max_size_mb,
+            help="Per-worker conditioning cache capacity across CPU and device entries in MiB (default: 512; 0 disables cross-request caching).",
         )
         parser.add_argument(
             "--backend",

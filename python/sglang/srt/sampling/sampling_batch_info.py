@@ -100,6 +100,8 @@ class SamplingBatchInfo:
     return_sampling_support_logprobs: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
+    # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
+    sampling_mask_top_ks: Optional[List[int]] = None
 
     watermark_keys: Optional[torch.Tensor] = None
     watermark_context_windows: Optional[torch.Tensor] = None
@@ -233,6 +235,9 @@ class SamplingBatchInfo:
                 device,
             )
         )
+        sampling_mask_top_ks = [
+            r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs
+        ]
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -309,6 +314,7 @@ class SamplingBatchInfo:
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
+            sampling_mask_top_ks=sampling_mask_top_ks,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -482,6 +488,10 @@ class SamplingBatchInfo:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
             ]
+            if self.sampling_mask_top_ks is not None:
+                self.sampling_mask_top_ks = [
+                    self.sampling_mask_top_ks[i] for i in keep_indices
+                ]
             if self.return_sampling_support_logprobs is not None:
                 self.return_sampling_support_logprobs = [
                     self.return_sampling_support_logprobs[i] for i in keep_indices
@@ -584,6 +594,9 @@ class SamplingBatchInfo:
                     self.device,
                 )
             )
+            self.sampling_mask_top_ks = (
+                self.sampling_mask_top_ks or [1] * self_len
+            ) + (other.sampling_mask_top_ks or [1] * other_len)
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before

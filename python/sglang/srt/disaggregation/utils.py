@@ -518,51 +518,17 @@ class MetadataBuffers:
                     device="cpu",
                 )
         if req.return_sampling_mask:
-            # Sentinel -1: the decode side records None for this handoff token.
-            self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = -1
-            sampling_masks = req.output_token_sampling_mask
-            sampling_logprobs = req.output_token_sampling_logprobs
-            if sampling_masks:
-                sampling_mask = sampling_masks[0]
-                sampling_logprobs_row = (
-                    sampling_logprobs[0] if sampling_logprobs else None
-                )
-                if sampling_mask is not None and sampling_logprobs_row is not None:
-                    mask_len = len(sampling_mask)
-                    max_mask_len = self.output_token_sampling_mask_idx.shape[1]
-                    if mask_len > max_mask_len:
-                        raise RuntimeError(
-                            f"Sampling mask length {mask_len} exceeds disaggregation "
-                            f"metadata capacity {max_mask_len}. Increase "
-                            "--sampling-mask-max-tokens."
-                        )
-                    self.output_token_sampling_mask_len[req.metadata_buffer_index][
-                        0
-                    ] = mask_len
-                    if mask_len:
-                        self.output_token_sampling_mask_idx[
-                            req.metadata_buffer_index, :mask_len
-                        ].copy_(
-                            torch.tensor(
-                                sampling_mask,
-                                dtype=torch.int32,
-                                device=self.output_token_sampling_mask_idx.device,
-                            )
-                        )
-                    if req.sampling_logprobs_mode == "support" and mask_len:
-                        self.output_token_sampling_logprobs[
-                            req.metadata_buffer_index, :mask_len
-                        ].copy_(
-                            torch.tensor(
-                                sampling_logprobs_row,
-                                dtype=torch.float32,
-                                device=self.output_token_sampling_logprobs.device,
-                            )
-                        )
-                    elif req.sampling_logprobs_mode == "selected":
-                        self.output_token_sampling_logprobs[
-                            req.metadata_buffer_index, 0
-                        ] = float(sampling_logprobs_row)
+            # Prefill streams a request only once its KV transfer ends or it aborts,
+            # so the first token's row is the only one queued here.
+            chunk = req.sampling_mask_rows.view()
+            mask_len = len(chunk.token_ids)
+            self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = mask_len
+            self.output_token_sampling_mask_idx[
+                req.metadata_buffer_index, :mask_len
+            ].copy_(torch.from_numpy(chunk.token_ids))
+            self.output_token_sampling_logprobs[
+                req.metadata_buffer_index, : len(chunk.logprobs)
+            ].copy_(torch.from_numpy(chunk.logprobs))
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently
@@ -1592,7 +1558,7 @@ def setup_state_kv_args(
                 tail_item_lens = tail_item_lens + draft_tail_item_lens
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
-                    len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
+                    3 if token_to_kv_pool.index_head_dim is not None else 2
                 )
                 kv_args.hidden_kv_layers = total_kv_layers
                 kv_args.draft_kv_layers = (

@@ -65,9 +65,7 @@ class SchedulerRequestReceiver:
     mm_receiver: Any
     tp_group: Any
     tp_cpu_group: Any
-    attn_tp_group: Any
     attn_tp_cpu_group: Any
-    attn_cp_group: Any
     attn_cp_cpu_group: Any
     world_group: Any
     server_args: ServerArgs
@@ -175,7 +173,7 @@ class SchedulerRequestReceiver:
         rank 0 and would overwrite every DP group's aborts but the first.
         """
         local_reqs = local_reqs or []
-        if get_parallel().enable_dp_attention:
+        if get_parallel().attn_dp_enabled:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
                 work_reqs.extend(local_reqs)
@@ -268,7 +266,7 @@ class SchedulerRequestReceiver:
 
         # 1. wait until every rank has opened the shared feature segments
         parallel = get_parallel()
-        if parallel.enable_dp_attention:
+        if parallel.attn_dp_enabled:
             if parallel.attn_tp_size > 1:
                 barrier(group=self.attn_tp_cpu_group)
             if parallel.attn_cp_size > 1:
@@ -292,7 +290,7 @@ class SchedulerRequestReceiver:
                 failed[index] = 1
 
         # 3. all ranks reject the same requests before entering model collectives
-        if parallel.enable_dp_attention:
+        if parallel.attn_dp_enabled:
             if parallel.attn_tp_size > 1:
                 all_reduce(failed, op=ReduceOp.MAX, group=self.attn_tp_cpu_group)
             if parallel.attn_cp_size > 1:

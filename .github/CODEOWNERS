@@ -75,6 +75,7 @@
 /python/sglang/kernels/aot @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /python/sglang/kernels/aot/csrc/musa @yeahdongcn
 /rust/sglang-radix-tree @Jialin @hzh0425 @xiezhq-hermann @ispobock @alphabetc1
+/rust/sglang-processor @sagearc @rainj-me @ishandhanani @sherlockwu
 /rust/sglang-renderer @sagearc
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
