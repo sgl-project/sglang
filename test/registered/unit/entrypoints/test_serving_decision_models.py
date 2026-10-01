@@ -408,6 +408,8 @@ class TestDecisionModels(unittest.TestCase):
             ([_png("red")] * 9, ["body", "images"]),
             (["data:text/plain;base64," + _png("red")], ["body", "images", 0]),
             ([_b64(b"not an image")], ["body", "images", 0]),
+            # Lax base64 would drop the "!" and decode a valid PNG.
+            ([_png("red")[:8] + "!" + _png("red")[8:]], ["body", "images", 0]),
             (["/etc/passwd"], ["body", "images", 0]),
             (
                 [{"type": "image/png", "data": "https://example.com/a.png"}],
