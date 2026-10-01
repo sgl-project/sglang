@@ -504,9 +504,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states = self.first_ffn_boundary.branch_input(
             self.moe_boundary, hidden_states, forward_batch
         )
-        with self.first_ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlps[0](hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlps[0](hidden_states)
+        hidden_states = self.first_ffn_boundary.finish(hidden_states, forward_batch)
 
         # second_attn_boundary
         hidden_states = self.second_attn_boundary.prepare(hidden_states, forward_batch)
@@ -526,9 +525,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         # second_mlp
         hidden_states = self.second_attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.second_ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.second_ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlps[1](hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlps[1](hidden_states)
+        hidden_states = self.second_ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states, prev_topk_indices
 

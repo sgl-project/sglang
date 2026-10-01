@@ -479,15 +479,14 @@ def _apply_qwen3_next_mlp(
 ) -> torch.Tensor:
     hidden_states = layer.attn_boundary.finish(hidden_states, forward_batch)
     hidden_states = layer.ffn_boundary.prepare(hidden_states, forward_batch)
-    with layer.ffn_boundary.exit(forward_batch) as ffn_exit:
-        if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = layer.mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-            )
-        else:
-            hidden_states = layer.mlp(hidden_states)
-    hidden_states = ffn_exit.finish(hidden_states)
+    if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+        hidden_states = layer.mlp(
+            hidden_states,
+            forward_batch=forward_batch,
+        )
+    else:
+        hidden_states = layer.mlp(hidden_states)
+    hidden_states = layer.ffn_boundary.finish(hidden_states, forward_batch)
 
     return hidden_states
 

@@ -982,7 +982,6 @@ class DeepseekV2MoE(nn.Module):
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
                     self.layer_id,
-                    fwd.fuse_mlp_allreduce,
                     fwd.mlp_reduce_scatter,
                 )
             elif (
@@ -3535,7 +3534,6 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
 def dsv2_flashinfer_moe_dual_stream_graph(
     hidden_states: torch.Tensor,
     layer_id: int,
-    fuse_mlp_allreduce: bool,
     mlp_reduce_scatter: bool,
 ) -> torch.Tensor:
     forward_context = get_tc_piecewise_forward_context()
@@ -3548,7 +3546,6 @@ def dsv2_flashinfer_moe_dual_stream_graph(
     # torch.compile. Carry graph-varying control state as scalar operands and
     # republish it for the nested MoE/linear consumers.
     with get_forward().scoped(
-        fuse_mlp_allreduce=fuse_mlp_allreduce,
         mlp_reduce_scatter=mlp_reduce_scatter,
         flashinfer_trtllm_bypass=True,
         lora_batch_layout=LoRABatchLayout.TP_GLOBAL,

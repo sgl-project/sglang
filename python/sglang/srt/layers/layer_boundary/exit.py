@@ -129,11 +129,11 @@ class ExitPolicy:
         return stream.record(hidden_states, update, declared_sum=declared_sum)
 
     @staticmethod
-    def _sum_owed_after_skip(steps, skipped_reduction):
-        # The input-scattered path leaves the sum for the next input's TP
-        # reduce-scatter. Other skip paths complete it in the output move.
+    def _sum_left_to_next_input(steps, sum_in_reduce_scatter):
+        # On an input-scattered batch the next input's TP reduce-scatter
+        # completes the sum; the other reduce-scatters are this exit's move.
         if (
-            skipped_reduction
+            sum_in_reduce_scatter
             and not steps.returns_over_dp
             and not steps.output_move_completes_sum
         ):
@@ -160,10 +160,9 @@ class ExitPolicy:
             may_reduce_scatterv=steps.output.may_reduce_scatterv,
         )
 
-    def _skips_sum_for_reduce_scatter(self, steps, dp_step: Optional[Callable]) -> bool:
-        """Whether the FFN leaves its sum out because a reduce-scatter completes
-        it: the attention-DP one ``dp_step`` names, or the CP / input-scattered
-        one."""
+    def _sum_in_reduce_scatter(self, steps, dp_step: Optional[Callable]) -> bool:
+        """Whether a reduce-scatter completes the FFN output's sum: the
+        attention-DP one ``dp_step`` names, or the CP / input-scattered one."""
         if dp_step is not None:
             return True
         if not steps.output.may_reduce_scatter:
@@ -178,10 +177,10 @@ class ExitPolicy:
         return _sum_group(steps.output.group)
 
     def _decide(self, forward_batch: ForwardBatch, steps) -> ExitDecision:
-        """Decide once, before the FFN runs, what it skips and what completes its
-        output: the next layer's input, or this layer's postprocess step."""
+        """Decide once, before the FFN runs, what completes its output's sum:
+        the next layer's input, or this layer's postprocess step."""
         dp_step = self._dp_reduce_scatter_step(forward_batch, steps)
-        mlp_reduce_scatter = self._skips_sum_for_reduce_scatter(steps, dp_step)
+        sum_in_reduce_scatter = self._sum_in_reduce_scatter(steps, dp_step)
         complete_now = partial(
             self._complete_now,
             forward_batch=forward_batch,
@@ -189,7 +188,7 @@ class ExitPolicy:
             steps=steps,
             output_move=steps.output_move,
             # A reduce-scatter completes the sum on its way back.
-            owes_sum=steps.output.group is not None and not mlp_reduce_scatter,
+            owes_sum=steps.output.group is not None and not sum_in_reduce_scatter,
         )
         defer_moe_finalize = (
             self.plan.fusions is not None
@@ -200,16 +199,18 @@ class ExitPolicy:
         ):
             return ExitDecision(
                 defer_moe_finalize=False,
-                fuse_mlp_allreduce=False,
-                mlp_reduce_scatter=mlp_reduce_scatter,
+                sum_in_reduce_scatter=sum_in_reduce_scatter,
                 complete=complete_now,
             )
         # Producers declare remaining work independently of the kernel chosen
         # by the consumer. Every handoff also carries an unfused completion.
-        fuse_mlp_allreduce = defer_moe_finalize or self._defers_sum(
-            forward_batch, steps, mlp_reduce_scatter=mlp_reduce_scatter, dp_step=dp_step
+        defers = defer_moe_finalize or self._defers_sum(
+            forward_batch,
+            steps,
+            sum_in_reduce_scatter=sum_in_reduce_scatter,
+            dp_step=dp_step,
         )
-        if fuse_mlp_allreduce:
+        if defers:
             group = self.ffn_reduction_group(steps)
             if steps.returns_over_dp:
                 # Under attention DP the next layer also brings the sum back to
@@ -239,8 +240,7 @@ class ExitPolicy:
             complete = complete_now
         return ExitDecision(
             defer_moe_finalize=defer_moe_finalize,
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
+            sum_in_reduce_scatter=sum_in_reduce_scatter,
             complete=complete,
         )
 
@@ -288,15 +288,16 @@ class ExitPolicy:
         self, forward_batch: ForwardBatch, *, stream: ResidualStream
     ) -> MixerExit:
         """Decide once whether this stage's mixer (an attention-like stage)
-        skips its output all-reduce. Use the result as a context manager around
-        the mixer, then call ``finish``."""
+        output's sum is completed here or carried on. Call ``finish`` on the
+        result with the mixer's output."""
         return MixerExit(self, forward_batch, stream=stream)
 
     def ffn_exit(
         self, forward_batch: ForwardBatch, *, stream: ResidualStream
     ) -> FfnExit:
         """Decide once how this layer's FFN output reduction completes. Use the
-        result as a context manager around the FFN call, then call ``finish``."""
+        result as a context manager around the FFN call when the FFN may hand
+        off its MoE finalize, then call ``finish``."""
         return FfnExit(self, forward_batch, stream=stream)
 
     def _sum_deferral_allowed(self, steps) -> bool:
@@ -331,7 +332,7 @@ class ExitPolicy:
         forward_batch: ForwardBatch,
         steps,
         *,
-        mlp_reduce_scatter: bool,
+        sum_in_reduce_scatter: bool,
         dp_step: Optional[Callable],
     ) -> bool:
         """Whether the FFN leaves its output's all-reduce to the next layer's
@@ -342,7 +343,7 @@ class ExitPolicy:
             and not self.plan.terminal
             and self._sum_deferral_allowed(steps)
             and _batch_allows_deferred_sum(forward_batch, self.plan)
-            and not mlp_reduce_scatter
+            and not sum_in_reduce_scatter
             # Under attention DP the next layer must also run postprocess's
             # scatter back to this rank's tokens, and nothing more.
             and (
@@ -392,9 +393,7 @@ class ExitDecision(msgspec.Struct, frozen=True):
 
     Fields:
         defer_moe_finalize: Compute may return a producer-specific finalize handoff.
-        fuse_mlp_allreduce: The sum is carried to the next consumer, which
-            completes it, fused or unfused.
-        mlp_reduce_scatter: A reduce-scatter on the way back completes the sum.
+        sum_in_reduce_scatter: A reduce-scatter on the way back completes the sum.
         complete: Callable(output, residual) returning the completed or wrapped
             output and its corresponding residual rows.
 
@@ -402,8 +401,7 @@ class ExitDecision(msgspec.Struct, frozen=True):
     """
 
     defer_moe_finalize: bool
-    fuse_mlp_allreduce: bool
-    mlp_reduce_scatter: bool
+    sum_in_reduce_scatter: bool
     complete: Callable[[torch.Tensor, torch.Tensor], Tuple]
 
 
@@ -519,8 +517,8 @@ class FfnExit:
         self.defer_moe_finalize = completion.defer_moe_finalize
         self._complete = completion.complete
         self._update = steps.output.update
-        self._declared_sum = boundary._sum_owed_after_skip(
-            steps, completion.mlp_reduce_scatter
+        self._declared_sum = boundary._sum_left_to_next_input(
+            steps, completion.sum_in_reduce_scatter
         )
         self._scope = get_forward().scoped(defer_moe_finalize=self.defer_moe_finalize)
 

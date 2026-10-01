@@ -417,12 +417,11 @@ class Step3TextDecoderLayer(nn.Module):
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if self.use_moe:
-                hidden_states = self.moe_mlp_forward(hidden_states)
-            else:
-                hidden_states = self.mlp(hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        if self.use_moe:
+            hidden_states = self.moe_mlp_forward(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 

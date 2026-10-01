@@ -481,7 +481,7 @@ def test_dual_stream_op_pins_the_deferral_off_under_a_deferring_caller():
             return_value=SimpleNamespace(moe_fusions={0: fusion}),
         ),
     ):
-        out = op.redispatch(cuda_key, torch.zeros(4, 8), 0, True, False)
+        out = op.redispatch(cuda_key, torch.zeros(4, 8), 0, False)
         assert get_forward().defer_moe_finalize is True
 
     assert fusion.seen_defer is False

@@ -472,9 +472,8 @@ class Llama4DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         # Fully Connected
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.feed_forward(hidden_states, forward_batch)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.feed_forward(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 

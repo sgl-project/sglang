@@ -719,11 +719,10 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         residual = residual_batch.written_residual(forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self._next_stream(
-                hidden_states, residual, per_layer_input, forward_batch
-            )
-        return ffn_exit.finish(hidden_states)
+        hidden_states = self._next_stream(
+            hidden_states, residual, per_layer_input, forward_batch
+        )
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
     def _next_stream(
         self,

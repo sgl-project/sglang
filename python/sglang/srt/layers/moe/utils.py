@@ -730,12 +730,10 @@ def should_use_dp_reduce_scatterv():
 def should_skip_mlp_all_reduce() -> bool:
     """Whether dense MLP / row-parallel projections should skip their all-reduce.
 
-    True when the decoder published ``fuse_mlp_allreduce`` (next residual+LN
-    absorbs the AR) or ``mlp_reduce_scatter`` (postprocess will reduce-scatter)
-    on ``get_forward()``.
+    True when the decoder published ``mlp_reduce_scatter`` (postprocess will
+    reduce-scatter) on ``get_forward()``.
     """
-    f = get_forward()
-    return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
+    return get_forward().mlp_reduce_scatter
 
 
 def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:

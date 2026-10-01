@@ -170,20 +170,26 @@ class StageBoundary:
         return hidden_states
 
     def finish(self, hidden_states, forward_batch):
-        """Hand this attention's actual contribution to the following stage."""
-        if self.kind is not StageKind.ATTENTION or not self.plan.finishes_directly:
-            raise RuntimeError(
-                "use the stage exit scope for an FFN or single-stage mixer"
+        """Hand this stage's output to the following stage: an attention's
+        actual contribution, or an FFN's or a mixer's output with its sum
+        completed or carried on. An FFN whose boundary has fusions (which may
+        take a MoE finalize handoff) finishes through exit() instead."""
+        if self.kind is StageKind.ATTENTION and self.plan.finishes_directly:
+            produced = self.plan.produced(forward_batch)
+            return stream_of(forward_batch).record(
+                hidden_states,
+                produced.update,
+                declared_sum=produced.group if produced.always_partial else None,
             )
-        produced = self.plan.produced(forward_batch)
-        return stream_of(forward_batch).record(
-            hidden_states,
-            produced.update,
-            declared_sum=produced.group if produced.always_partial else None,
-        )
+        if self.kind is StageKind.FFN and self.plan.fusions is not None:
+            raise RuntimeError(
+                "an FFN whose boundary has fusions finishes through exit()"
+            )
+        return self.exit(forward_batch).finish(hidden_states)
 
     def exit(self, forward_batch):
-        """Select and scope one FFN or single-stage mixer's output decision.
+        """Select and scope one FFN or single-stage mixer's output decision,
+        for an FFN whose MoE may hand off its finalize (see finish()).
 
         Args:
             forward_batch: Active batch whose stream receives the compute result.
