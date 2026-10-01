@@ -25,13 +25,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PixtralVisionConfig, PretrainedConfig
 from transformers.models.pixtral.modeling_pixtral import (
-    PixtralRotaryEmbedding,
+    PixtralVisionRotaryEmbedding,
 )
 from transformers.models.pixtral.modeling_pixtral import (
     generate_block_attention_mask as _get_pixtral_attention_mask,
-)
-from transformers.models.pixtral.modeling_pixtral import (
-    position_ids_in_meshgrid,
 )
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -904,7 +901,7 @@ class PixtralHFVisionModel(nn.Module):
             )
 
         # Initialize patch position embedding
-        self.patch_positional_embedding = PixtralRotaryEmbedding(config)
+        self.patch_positional_embedding = PixtralVisionRotaryEmbedding(config)
         self.input_padder = MultiModalityDataPaddingPatternMultimodalTokens()
 
     @property
@@ -950,14 +947,10 @@ class PixtralHFVisionModel(nn.Module):
         embeds_1d = torch.cat([p.flatten(1).T for p in embeds_2d], dim=0)
         embeds_featurized = self.ln_pre(embeds_1d).unsqueeze(0)
 
-        # positional embeddings
-        position_ids = position_ids_in_meshgrid(
-            embeds_2d,
-            max_width=self.image_size // self.patch_size,
-        ).to(self.device)
+        # Axial rope indexes the (h, w) grid coordinates directly, so the ids are
+        # per-patch pairs rather than the flattened `h * max_width + w` offsets.
+        position_ids = position_meshgrid(embeds_2d).to(self.device)
 
-        # The original PixtralRotaryEmbedding expects 2D input but returns a tuple of tensors (cos, sin)
-        # These tensors are used by apply_rotary_pos_emb in the transformer blocks
         position_embedding = self.patch_positional_embedding(
             embeds_featurized, position_ids
         )
