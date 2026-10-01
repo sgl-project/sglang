@@ -372,9 +372,7 @@ def test_vae_tiling_defaults_off_but_forced_on_for_gfx1151(monkeypatch):
     monkeypatch.setattr(f"{module}.current_platform.is_gfx1151", lambda: True)
     assert QwenImage21PipelineConfig().should_enable_vae_tiling(latents)
     # gfx1151 forces tiling on even when the user explicitly asked for it off.
-    assert QwenImage21PipelineConfig(vae_tiling=False).should_enable_vae_tiling(
-        latents
-    )
+    assert QwenImage21PipelineConfig(vae_tiling=False).should_enable_vae_tiling(latents)
 
 
 def test_default_image_output_format_preserves_rgba():
