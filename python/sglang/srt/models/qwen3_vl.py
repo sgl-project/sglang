@@ -1267,14 +1267,13 @@ class Qwen3LLMModel(Qwen3Model):
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(
-                hidden_states,
-                forward_batch,
-                self.norm,
-                post_residual_addition=last_deepstack,
-            )
+        hidden_states = residual_batch.final_norm(
+            hidden_states,
+            forward_batch,
+            self.norm,
+            post_residual_addition=last_deepstack,
+            skip_empty=True,
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1764,17 +1763,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
         self.capture_aux_hidden_states = True
         self.model.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [
+            layers_to_capture = [
                 2,
                 num_layers // 2,
                 num_layers - 3,
             ]  # Specific layers for EAGLE3 support
         else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            layers_to_capture = [val + 1 for val in layer_ids]
+
+        if hasattr(self.model, "set_eagle3_layers_to_capture"):
+            self.model.set_eagle3_layers_to_capture(layers_to_capture)
+        else:
+            self.model.layers_to_capture = layers_to_capture
 
 
 def _require_vision(model) -> None:
