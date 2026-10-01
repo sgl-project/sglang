@@ -18,12 +18,14 @@ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     fused_append_remap_shared_experts_deepep,
     fused_append_shared_experts,
 )
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
     _use_aiter,
     biased_grouped_topk_gpu,
     remap_topk_for_per_rank_shared_slots,
+    select_experts,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device
@@ -420,20 +422,120 @@ class TestAiterGroupedTopkSharedFuse(CustomTestCase):
             _, topk_ids = self._topk(inputs, groups, topk_group, topk_routed, s, rsf, 1)
         self.assertEqual(tuple(topk_ids.shape), (num_tokens, topk_routed))
 
-    def test_uninitialized_expert_parallel_group_falls_back(self):
-        """Reaching this path before the MoE EP group exists must drop to the
-        plain append rather than raise out of the parallel-state accessor."""
-        num_tokens, num_experts, groups, topk_group, topk_routed, s, rsf = self.CASES[0]
-        inputs = self._make_inputs(num_tokens, num_experts)
-        with patch.object(
-            topk_module,
-            "get_parallel",
-            side_effect=AssertionError(
-                "expert model parallel group is not initialized"
+    def _config(self, bias, groups, topk_group, topk_routed, n_shared, factor):
+        return TopKConfig(
+            top_k=topk_routed + n_shared,
+            use_grouped_topk=True,
+            topk_group=topk_group,
+            num_expert_group=groups,
+            renormalize=True,
+            num_fused_shared_experts=n_shared,
+            correction_bias=bias,
+            routed_scaling_factor=1.0,
+            fused_shared_experts_scaling_factor=factor,
+            allow_routed_experts_capture=False,
+        )
+
+    def test_padded_replay_does_not_poison_shared_columns(self):
+        """A short num_token_non_padded must not zero the persistent shared columns.
+
+        Full prefill CUDA graph replays one bucket with a changing count. The
+        pad fill used to write the buffer view in place, and the next forward's
+        aiter launch does not rewrite those columns.
+        """
+        num_tokens, n_valid = 8, 3
+        num_experts, groups, topk_group, topk_routed, s = 256, 8, 4, 8, 1
+        factor = 1.0
+        hidden, gating, bias = self._make_inputs(num_tokens, num_experts)
+        cfg = self._config(bias, groups, topk_group, topk_routed, s, factor)
+        device = hidden.device
+        stamp_ids = torch.arange(
+            num_experts, num_experts + s, device=device, dtype=torch.int32
+        )
+        short = torch.tensor([n_valid], device=device, dtype=torch.int32)
+        full = torch.tensor([num_tokens], device=device, dtype=torch.int32)
+
+        with get_parallel().override(moe_ep_size=1):
+            first = select_experts(
+                hidden, gating, cfg, layer_id=0, num_token_non_padded=short
+            )
+            _buf_w, buf_ids = next(
+                iter(topk_module._aiter_topk_fuse_shared_bufs.values())
+            )
+            buf_shared = buf_ids[:num_tokens, topk_routed:].clone()
+            second = select_experts(
+                hidden, gating, cfg, layer_id=0, num_token_non_padded=full
+            )
+
+        self.assertTrue(torch.equal(buf_shared, stamp_ids.expand_as(buf_shared)))
+        self.assertTrue(torch.all(first.topk_weights[n_valid:] == 0))
+        self.assertTrue(
+            torch.equal(
+                first.topk_ids[:n_valid, topk_routed:], stamp_ids.expand(n_valid, s)
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                second.topk_ids[:, topk_routed:], stamp_ids.expand(num_tokens, s)
+            )
+        )
+        self.assertTrue(torch.all(second.topk_weights[:, topk_routed:] == factor))
+
+    def test_eplb_remap_leaves_shared_columns(self):
+        """A dispatch map must remap only the routed slice of an already-fused row.
+
+        Shared ids are ``num_experts + i``, outside the routed logical-to-physical
+        table. Remapping them is an out-of-range index, and the width check would
+        then skip the append that used to repair it.
+        """
+        num_tokens, num_experts, groups, topk_group, topk_routed, s, _rsf = self.CASES[
+            0
+        ]
+        factor = 1.0
+        hidden, gating, bias = self._make_inputs(num_tokens, num_experts)
+        cfg = self._config(bias, groups, topk_group, topk_routed, s, factor)
+        device = hidden.device
+        info = ExpertLocationDispatchInfo(
+            ep_dispatch_algorithm="static",
+            partial_logical_to_rank_dispatch_physical_map=(
+                torch.arange(num_experts, device=device, dtype=torch.int32) + 3
             ),
-        ):
-            _, topk_ids = self._topk(inputs, groups, topk_group, topk_routed, s, rsf, 1)
-        self.assertEqual(tuple(topk_ids.shape), (num_tokens, topk_routed))
+            partial_logical_to_all_physical_map=torch.zeros(
+                (num_experts, 1), device=device, dtype=torch.int32
+            ),
+            partial_logical_to_all_physical_map_num_valid=torch.ones(
+                num_experts, device=device, dtype=torch.int32
+            ),
+            num_physical_experts=num_experts,
+        )
+
+        with get_parallel().override(moe_ep_size=1):
+            with patch.object(topk_module, "_eplb_remap_enabled", return_value=False):
+                plain = select_experts(hidden, gating, cfg, layer_id=0)
+            plain_ids = plain.topk_ids.clone()
+            with patch.object(topk_module, "_eplb_remap_enabled", return_value=True):
+                remapped = select_experts(
+                    hidden,
+                    gating,
+                    cfg,
+                    layer_id=0,
+                    expert_location_dispatch_info=info,
+                )
+            _buf_w, buf_ids = next(
+                iter(topk_module._aiter_topk_fuse_shared_bufs.values())
+            )
+
+        self.assertTrue(
+            torch.equal(
+                remapped.topk_ids[:, :topk_routed], plain_ids[:, :topk_routed] + 3
+            )
+        )
+        self.assertTrue(
+            torch.equal(remapped.topk_ids[:, topk_routed:], plain_ids[:, topk_routed:])
+        )
+        self.assertTrue(
+            torch.equal(buf_ids[:num_tokens, topk_routed:], plain_ids[:, topk_routed:])
+        )
 
 
 if __name__ == "__main__":

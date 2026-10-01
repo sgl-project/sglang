@@ -193,13 +193,12 @@ def _get_aiter_topk_fuse_shared_max_tokens() -> int:
 
 def _aiter_topk_fuse_shared_ep_is_single() -> bool:
     """Whether the shared experts live on every rank, which is what lets the fused
-    path pre-populate their columns. Reports False rather than raising when the
-    MoE EP group is not initialized, so this check and its mirror in
-    select_experts fall back to the plain append together."""
-    try:
-        return get_parallel().moe_ep_size == 1
-    except (AssertionError, ValueError):
-        return False
+    path pre-populate their columns.
+
+    ``moe_ep_size`` is the published parallel width, computed from ``ep_size``.
+    It does not read the MoE EP process group, so a group that has not been
+    created does not raise here."""
+    return get_parallel().moe_ep_size == 1
 
 
 def _get_aiter_topk_fuse_shared_buf(
@@ -1976,8 +1975,10 @@ def biased_grouped_topk_gpu(
             scaling,
         )
         if _shared_fuse:
-            # Return the full [token, topk + n_shared] view (routed just written,
-            # shared pre-populated). _post_process_topk_ids skips its append.
+            # View of the persistent buffer (routed just written, shared
+            # pre-populated). _post_process_topk_ids skips its append, and copies
+            # these rows out before any in-place pad fill or EPLB remap: aiter
+            # will not rewrite the shared columns on the next launch.
             return full_w[:token], full_ids[:token]
         return topk_weights, topk_ids
     elif _is_musa and (
@@ -2197,10 +2198,9 @@ def biased_grouped_topk_cpu(
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
     fused_shared_experts_scaling_factor: Optional[float] = None,
 ):
-    if fused_shared_experts_scaling_factor is not None:
-        raise ValueError(
-            "fused_shared_experts_scaling_factor is not supported for CPU biased grouped topk"
-        )
+    # select_experts forwards this on every grouped-bias call. The CPU kernel
+    # does not read it; _post_process_topk_ids scales the shared columns.
+    # Glm4Moe stores 1 even with fusion off, and DeepSeek/Bailing store 1/ep_size.
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
         gating_output,
@@ -2398,21 +2398,52 @@ def _post_process_topk_ids(
         # shared-slot path, EPLB off) it folds this padded fill itself
         # (pad_fill_id=0 -> remap(0)=0, bit-identical), so skip the separate
         # _fill_padded_rows launch here.
+        _remap = _eplb_remap_enabled()
         _fold_pad_into_append = (
             num_fused_shared_experts > 0
             and _use_aiter
             and use_per_rank_shared_slots
-            and not _eplb_remap_enabled()
+            and not _remap
         )
-        if not _fold_pad_into_append:
+        # The aiter fuse returns a view of a process-lifetime buffer. Pad-fill
+        # writes every column of a padded row, and the logical-to-physical map
+        # is indexed by the whole tensor. Either one on that view zeros or
+        # remaps the shared slot, which aiter does not rewrite next launch.
+        # Copy out first, and remap only the routed slice, the way CUDA does.
+        _shared_fused_in_topk = (
+            num_fused_shared_experts > 0
+            and _use_aiter
+            and not use_per_rank_shared_slots
+            and _aiter_topk_fuse_shared_ep_is_single()
+            and topk_ids.shape[1] == topk_config.top_k
+        )
+        if _shared_fused_in_topk:
+            if num_token_non_padded is not None or _remap:
+                topk_ids = topk_ids.clone()
+                if num_token_non_padded is not None and not _skip_hip_pad_mask:
+                    topk_weights = topk_weights.clone()
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
-        # The logical->physical remap is only meaningful when a real
-        # expert-location mapping exists. With a trivial placement and EPLB off
-        # the map is identity so the remap can be skipped safely.
-        if _eplb_remap_enabled():
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info
-            )
+            if _remap:
+                routed_cols = topk_ids_logical_to_physical(
+                    topk_ids[:, :-num_fused_shared_experts],
+                    expert_location_dispatch_info,
+                )
+                topk_ids = torch.cat(
+                    [routed_cols, topk_ids[:, -num_fused_shared_experts:]],
+                    dim=-1,
+                )
+        else:
+            if not _fold_pad_into_append:
+                _mask_topk_ids_padded_region(
+                    topk_ids, num_token_non_padded, fill_value=0
+                )
+            # The logical->physical remap is only meaningful when a real
+            # expert-location mapping exists. With a trivial placement and EPLB off
+            # the map is identity so the remap can be skipped safely.
+            if _remap:
+                topk_ids = topk_ids_logical_to_physical(
+                    topk_ids, expert_location_dispatch_info
+                )
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
