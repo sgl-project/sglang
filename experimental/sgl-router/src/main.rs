@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
@@ -106,6 +106,13 @@ async fn main() -> Result<()> {
             )
         }
     };
+
+    // Ask the built policies, so any term or filter that reads the prompt is covered.
+    ensure!(
+        config.model.tokenizer_path.is_some()
+            || !chat_routing.needs_request_tokens(&routing_policies),
+        "--no-tokenizer is incompatible with cache-aware routing and prefix-cache terms or filters"
+    );
 
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
@@ -254,9 +261,10 @@ fn start_engine_state_monitor(config: &Config, use_external_indexer: bool) -> Ar
     // pre-settled and `/readyz` never waits on it.
     let bootstrap = Arc::new(
         match (&config.model.cache_aware, config.discovery.peer_selector()) {
-            (Some(cache), Some(_)) => BootstrapTracker::new_with_fetch_cap(
+            (Some(cache), Some(_)) => BootstrapTracker::new_with_opts(
                 Duration::from_millis(cache.bootstrap_timeout_ms),
                 Duration::from_millis(cache.bootstrap_fetch_timeout_cap_ms),
+                cache.bootstrap_seed_required,
             ),
             _ => BootstrapTracker::disabled(),
         },
