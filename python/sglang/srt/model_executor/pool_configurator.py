@@ -243,6 +243,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_kv_size = int(
                         target_kv_size * draft_num_layers / target_kv_num_layers
                     )
+                    if get_memory().enable_hisparse:
+                        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                        # Budget resident draft KV over all logical target slots.
+                        draft_kv_size *= parse_hisparse_config().host_to_device_ratio
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,

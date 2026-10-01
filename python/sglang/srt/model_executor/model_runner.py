@@ -943,6 +943,12 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        if self.is_draft_worker and isinstance(self.token_to_kv_pool, DSATokenToKVPool):
+            # Resident draft KV uses logical slots. The shared allocator's
+            # coordinator owns the target's sparse KV, not this draft pool.
+            return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
             resolve_shared_index_layers,
