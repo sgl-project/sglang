@@ -1638,6 +1638,70 @@ still need coordinator/scheduler integration. Inference never calls this new
 protocol yet, and TP/PP gates remain closed. The tests use one host, Gloo, a
 Catalog test double and TCP Store; they do not prove multi-GPU inference or RDMA.
 
+## Background Cohort Lifecycle
+
+`CaptureCohortService` now provides the bounded ready registry and background
+control loop above the allocator. Rank zero claims a request-fingerprinted
+ticket; every request actor binds its local cohort without HTTP or collectives.
+Unbound cancellation uses the ticket, while bound actors retain their handles
+through local CUDA/Store completion. A second registry exchange proves every
+rank installed a cohort before it becomes claimable. The allocator's version-2
+control sequence adds lease renewal, confirmed retirement and registry exchange
+with policy/ledger/shape agreement and final acknowledgement.
+
+Failure and buffer ownership are separate. Peer cancellation, expiry, request
+timeout and renewal failure invalidate captures, but a bound actor must still
+finish. Retirement waits for prior invalid votes from every rank, preventing a
+late bind after a state snapshot from losing its slot. Successful publication
+requires all active owners and all bound actors to finish; inactive ranks with
+handles participate in this lifetime too. Only aux can report publication, and
+an ambiguous publish must be resolved through the journal before that report.
+Control failure retains live handles, and uncertain transfers quarantine their
+slots and retain resources. Bounded shutdown cannot authorize teardown while
+those owners or transfers remain outstanding.
+
+First job `01790853924671212898-cc8ab04f43fc` passes one test and 15 subtests in
+23.32s. Combined job `01790854048491678654-246bd83bd37b` passes 13 tests and
+71 subtests in 162.30s, covering service/allocator, startup/resources and real
+Store transport/publication. The real Store resource test now starts background
+services, propagates a ticket, binds all four actors, writes from three registered
+slots, and requests shutdown while actors still own their slots. All actors
+explicitly finish before resource teardown; the independent provider reads the
+exact bytes after the producer processes exit.
+
+Expanded job `01790854390471440607-37089fe1e056` passes all three Store tests but
+fails a new lifecycle assertion: its multiple-request setup requested stop on
+every rank while expecting another propagation round. Drained captures can
+correctly retire in that round. The fixture now issues stop on one rank to test
+the intended propagation boundary. This was a test expectation error, not a
+production-code fix. Final job `01790854537590748661-5316cf63f0fd` passes one
+test and all 19 lifecycle subtests in 24.06s.
+
+The final cases additionally cover unbound cancellation, inactive actor drain,
+multiple concurrent cohorts with slot replenishment, and a local shutdown after
+an empty control snapshot under backpressure. A blocked aux heartbeat runs
+concurrently with foreground handle operations and a separate inference-group
+all-reduce. Control-frame construction, shape, ledger and flag faults stop all
+ranks without releasing live buffers. Changed renewal fences, stale tickets,
+request identity mismatch, expiry and ambiguous Catalog failure are covered.
+The service-only publication outcome cases use synthetic actor acknowledgements;
+they do not claim a published training sample. The separate real Store writer
+suite continues to verify manifest-last publication.
+
+All four modified/added Python files format and compile on host Python 3.10.
+Allocator, service and lifecycle tests pass Ruff; the Store test retains only
+its pre-existing SIM115/PLW1510 diagnostics. Local/GPU source hashes match.
+Commands, terminal results, log hashes and scope limits are recorded in
+`experiments/capture-cohort-lifecycle.json`.
+
+This completes the reusable cohort lifecycle, not its serving integration.
+The runtime still needs stable request digest construction and ticket transport,
+coordinator ownership of these handles, accepted-token delivery, descriptor and
+receipt exchange, global teacher scores and PP scheduling hooks. Distributed
+serving gates remain closed. Validation uses one host, four Gloo processes, a
+Catalog test double and TCP Mooncake; it does not prove multi-GPU inference,
+cross-node RDMA, production Catalog retention or trained draft quality.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1646,7 +1710,7 @@ Catalog test double and TCP Store; they do not prove multi-GPU inference or RDMA
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
 3. Connect P9's implemented identity/resource startup agreement, cohort
-   reservations, layout, partitioned request contexts, rank-local buffers and
+   reservations and background lifecycle, layout, partitioned request contexts, rank-local buffers and
    owner-local Store interface
    to distributed request admission/failure agreement, descriptor exchange,
    global teacher scores

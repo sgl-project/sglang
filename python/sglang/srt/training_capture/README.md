@@ -463,12 +463,67 @@ transfer has begun at this point. Cleanup failure is reported to every peer.
 Transport or control-sequence failure poisons the allocator; stop capture and
 tear down its control group instead of retrying it.
 
-This interface does not start a background queue, renew leases, bind serving
-requests, broadcast accepted tokens or coordinate snapshot publication. The
-runtime coordinator must provide those operations, retain each handed-out slot
-through CUDA and Store completion, and enforce Catalog fencing. In particular,
-an all-PP reservation collective inside `before_forward` would deadlock against
-PP proxy receive/send ordering. The distributed serving gates remain closed.
+`renew(cohort)` renews the agreed identity/fence through the aux Catalog client,
+then repeats lease validation and readiness on all ranks. A failed renewal never
+releases the slot. `fail(cohort)` reports a drained capture's terminal failure
+and requires a confirmed FAILED response. `synchronize(build_local)` exchanges
+bounded CPU registry frames after all ranks agree on the registry ledger and
+frame shape. Frame construction and validation errors are voted; a final
+acknowledgement precedes any state-dependent control operation. These operations
+use the same serialized, versioned control sequence as reservation.
+
+### Background Cohort Lifecycle
+
+`CaptureCohortService` owns the allocator after startup. Construct it alongside
+passive resources, validate construction on all ranks, then call `start()` on
+each rank. Its background thread fills a bounded registry, maintains leases,
+propagates failure and retires drained cohorts. A newly reserved cohort is not
+claimable until another registry exchange confirms every rank installed it.
+No HTTP request or collective executes from the request-facing methods:
+
+| Method | Ownership Contract |
+| --- | --- |
+| `claim(request_sha256)` | Rank zero returns a fresh `CaptureTicket`, or `None` immediately when no prepared cohort is available. |
+| `bind(ticket, request_sha256)` | Each participating actor binds once to its local cohort; stale fences, mismatched request identity and expired/failed cohorts cannot bind. |
+| `status(handle)` | Read the current renewed lease and local invalidation reason under the service lock. |
+| `cancel(ticket, reason)` | Cancel before binding, or invalidate an existing request without relinquishing its buffers. |
+| `fail(handle, reason)` | Report local failure; a bound handle still requires `finish`. |
+| `finish(handle, outcome, transfer_complete)` | Relinquish local actor ownership after CUDA/Store work resolves. KV owners report `stored` or `failed`; aux reports `published` or `failed`. |
+| `close(timeout)` | Request collective shutdown and wait boundedly. A false result prohibits resource/group teardown while workers or uncertain transfers remain. |
+
+Tickets carry the capture ID, fence and SHA-256 of the request contract. The
+runtime must compute that digest from stable request identity and the prompt /
+sampling contract, then carry the ticket through existing request propagation.
+The service checks agreement but does not construct that request digest or
+authenticate arbitrary producer processes. Handles are process-local; use the
+service methods to inspect/update them and never serialize their tensors or
+mutate their fields from request code.
+
+Cancellation and lease expiry close admission immediately when observed. Slot
+recycling additionally requires every rank to have already voted invalid and
+every bound actor to acknowledge completion. This extra round prevents a bind
+that occurred after a control snapshot from losing its slot during peer
+cancellation. Published cohorts require all active owners to have bound and
+all bound actors, including inactive metadata-only ranks, to finish. Inactive
+ranks without a handle still participate in control but have nothing to drain.
+Completed publication wins over a concurrent cancellation; it is never failed.
+
+The aux actor must resolve any ambiguous publish through its durable journal
+before reporting a final outcome. A renewal failure cannot prove publication
+failed. While an invalid capture is still draining, renewal may continue to
+protect its lease; an unsuccessful renewal disables further renewal of that
+cohort. A control failure stops admission and retains bound buffers until local
+completion. `transfer_complete=False` permanently quarantines the slot, and the
+service retains the resources even if its caller drops its reference. Normal
+close does not destroy the dedicated group, close Store, synchronize CUDA, or
+unregister memory. The supervisor owns those actions after a successful close;
+uncertain transfers require explicit transport/device teardown or process exit.
+
+The service does not yet connect to the serving coordinator/scheduler, accepted
+tokens, owner descriptors, receipts or global teacher logits. Those interfaces
+must be wired before opening the distributed serving gates. In particular, an
+all-PP collective inside `before_forward` would deadlock against PP proxy
+receive/send ordering. All service collectives remain on its dedicated group.
 
 ### HTTP Contract
 

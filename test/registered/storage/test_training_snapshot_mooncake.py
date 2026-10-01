@@ -24,6 +24,7 @@ import torch.distributed as dist
 from safetensors.torch import save_file
 from sglang.srt.training_capture.catalog import CaptureLease, HTTPCaptureCatalog
 from sglang.srt.training_capture.cohort import CaptureCohortAllocator
+from sglang.srt.training_capture.cohort_service import CaptureCohortService
 from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
 from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
@@ -181,6 +182,7 @@ def prepare_store_rank(rank, root, master, catalog):
                 )
             else:
                 control = dist.new_group(backend="gloo", timeout=timedelta(seconds=15))
+                service = None
                 try:
                     row = {"phase": "ready", "active": partition.active}
                     allocator = CaptureCohortAllocator(
@@ -192,8 +194,23 @@ def prepare_store_rank(rank, root, master, catalog):
                         resources=resource,
                         timeout_seconds=10,
                     )
-                    cohort = allocator.reserve()
-                    assert cohort is not None
+                    service = CaptureCohortService(allocator)
+                    service.start()
+                    request_digest = digest_bytes(b"resource-startup-request")
+                    ticket = None
+                    if rank == 0:
+                        deadline = time.monotonic() + 15
+                        while ticket is None and time.monotonic() < deadline:
+                            ticket = service.claim(request_digest)
+                            if ticket is None:
+                                time.sleep(0.01)
+                    tickets = [ticket]
+                    dist.broadcast_object_list(tickets, src=0)
+                    assert tickets[0] is not None
+                    handle = service.bind(tickets[0], request_digest)
+                    assert handle is not None
+                    cohort, reason = service.status(handle)
+                    assert reason is None
                     row.update(
                         capture_id=cohort.lease.capture_id,
                         reserved_bytes=cohort.reserved_bytes,
@@ -201,26 +218,35 @@ def prepare_store_rank(rank, root, master, catalog):
                         if partition.active
                         else 0,
                     )
-                    if partition.active:
-                        slot = cohort.slot
-                        complete = False
-                        try:
-                            payload = slot.storage[:64]
+                    dist.barrier()
+                    complete = not partition.active
+                    try:
+                        if partition.active:
+                            payload = cohort.slot.storage[:64]
                             payload.fill_(rank + 1)
                             key = f"resource-startup/{Path(root).name}/{rank}"
                             digest = digest_bytes(tensor_bytes(payload))
                             resource.store.put_registered(key, payload, digest)
                             complete = True
                             row.update(key=key, digest=digest)
-                        finally:
-                            resource.pool.release(slot, transfer_complete=complete)
-                    dist.barrier()
-                    if partition.include_aux:
-                        resource.catalog.fail(
-                            cohort.lease, "transport_fixture_finished"
+                    finally:
+                        # Shutdown may invalidate peers still writing, but only
+                        # their own completion can relinquish registered storage.
+                        service.close(timeout=0)
+                        service.finish(
+                            handle, outcome="failed", transfer_complete=complete
                         )
+                    assert service.close(timeout=20)
+                    assert service.error is None
+                    row["slots_free"] = (
+                        resource.pool.stats()["free"] if partition.active else 0
+                    )
                     results.append(row)
                 finally:
+                    if service is not None and not service.close(timeout=20):
+                        raise RuntimeError(
+                            "capture workers still own transport storage"
+                        )
                     dist.destroy_process_group(control)
                     resource.close()
             assert all(resource.closed for resource in prepared)
@@ -310,6 +336,7 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                     )
                     self.assertEqual(ready["phase"], "ready")
                     self.assertEqual(ready["active"], rank != 3)
+                    self.assertEqual(ready["slots_free"], int(rank != 3))
                     captures.add(ready["capture_id"])
                     budgets.add(ready["reserved_bytes"])
                     local_bytes += ready["local_bytes"]
@@ -328,12 +355,12 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                     {"dp0-pp0-tp0", "dp0-pp0-tp1", "dp0-pp0-tp2"},
                 )
                 self.assertEqual(record["state"], "FAILED")
-                self.assertEqual(record["reason"], "transport_fixture_finished")
+                self.assertEqual(record["reason"], "cohort_failed")
                 self.assertFalse(catalog.errors)
                 self.assertFalse(catalog.publications)
                 PublicationJournal(str(Path(root) / "journal")).close()
                 print(
-                    "Resource startup: 4 ranks, rollback, one capture cohort, "
+                    "Resource startup: 4 ranks, rollback, background cohort lifecycle, "
                     "3 registered writes readable after exit",
                     flush=True,
                 )

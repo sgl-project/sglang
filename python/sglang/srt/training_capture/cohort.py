@@ -6,6 +6,7 @@ import math
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import timedelta
 
 import msgspec
@@ -19,9 +20,32 @@ from sglang.srt.training_capture.protocol import (
     digest_bytes,
 )
 
-_VERSION = 1
+_VERSION = 2
 _LEASE_BYTES = 4096
-_PHASES = ("policy", "slots", "lease", "validation", "ready", "rollback")
+_PHASES = (
+    "policy",
+    "slots",
+    "lease",
+    "validation",
+    "ready",
+    "rollback",
+    "renew",
+    "retire",
+    "retired",
+    "state",
+    "state_validation",
+    "state_ready",
+)
+
+
+def _lease_identity(lease):
+    return (
+        lease.capture_id,
+        lease.fencing_token,
+        lease.dataset_id,
+        lease.sample_id,
+        lease.generation_id,
+    )
 
 
 def _digest_words(payload):
@@ -152,9 +176,20 @@ class CaptureCohortAllocator:
         return cohort
 
     def reserve(self) -> CaptureCohort | None:
+        with self._operation():
+            return self._reserve()
+
+    @contextmanager
+    def _operation(self):
         if self.poisoned or not self.lock.acquire(blocking=False):
             raise ContractError("cohort allocator is poisoned or already in use")
         self.round += 1
+        try:
+            yield
+        finally:
+            self.lock.release()
+
+    def _reserve(self):
         slot, lease, ready = None, None, False
         try:
             error, fingerprint = None, ()
@@ -225,49 +260,166 @@ class CaptureCohortAllocator:
                     )
             except Exception as cause:  # noqa: BLE001 - Catalog failure is collective
                 error = cause
-            votes = self._vote("lease", error, length=len(payload))
-            self._gather(self.bodies, self.body)
-
-            error, cohort, fingerprint = None, None, ()
-            try:
-                aux = next(
-                    index
-                    for index, part in enumerate(self.layout.partitions)
-                    if part.include_aux
-                )
-                if not 0 < votes[aux][5] <= _LEASE_BYTES or any(
-                    row[5] != 0 for index, row in enumerate(votes) if index != aux
-                ):
-                    raise ContractError(
-                        "lease payload was not supplied by the aux owner"
-                    )
-                cohort = self._decode_lease(
-                    memoryview(self.bodies[aux].numpy())[: votes[aux][5]],
-                    slot=slot,
-                    anchor=anchor,
-                    reserved_bytes=reserved_bytes,
-                )
-                fingerprint = _digest_words(canonical_bytes(cohort.lease))
-            except Exception as cause:  # noqa: BLE001 - no rank may return alone
-                error = cause
-            votes = self._vote("validation", error, fingerprint=fingerprint)
-            if len({tuple(item[6:]) for item in votes}) != 1:
-                raise CaptureCohortError("lease_agreement", range(self.size))
-            # A late participant must observe peers returning from validation.
-            error = (
-                ContractError("lease requires renewal before readiness")
-                if time.monotonic() >= cohort.renew_at
-                else None
+            cohort = self._exchange_lease(
+                payload, error, slot=slot, anchor=anchor, reserved_bytes=reserved_bytes
             )
-            self._vote("ready", error)
             ready = True
             return cohort
         finally:
+            if not ready:
+                self._rollback(slot, lease)
+
+    def _exchange_lease(
+        self, payload, error, *, slot, anchor, reserved_bytes, expected=None
+    ):
+        votes = self._vote("lease", error, length=len(payload))
+        self._gather(self.bodies, self.body)
+        error, cohort, fingerprint = None, None, ()
+        try:
+            aux = next(
+                index
+                for index, part in enumerate(self.layout.partitions)
+                if part.include_aux
+            )
+            if not 0 < votes[aux][5] <= _LEASE_BYTES or any(
+                row[5] != 0 for index, row in enumerate(votes) if index != aux
+            ):
+                raise ContractError("lease payload was not supplied by the aux owner")
+            cohort = self._decode_lease(
+                memoryview(self.bodies[aux].numpy())[: votes[aux][5]],
+                slot=slot,
+                anchor=anchor,
+                reserved_bytes=reserved_bytes,
+            )
+            if expected is not None and _lease_identity(
+                cohort.lease
+            ) != _lease_identity(expected):
+                raise ContractError("heartbeat changed the capture identity or fence")
+            fingerprint = _digest_words(canonical_bytes(cohort.lease))
+        except Exception as cause:  # noqa: BLE001 - no rank may return alone
+            error = cause
+        votes = self._vote("validation", error, fingerprint=fingerprint)
+        if len({tuple(item[6:]) for item in votes}) != 1:
+            raise CaptureCohortError("lease_agreement", range(self.size))
+        error = (
+            ContractError("lease requires renewal before readiness")
+            if time.monotonic() >= cohort.renew_at
+            else None
+        )
+        self._vote("ready", error)
+        return cohort
+
+    def _agree_cohort(self, phase, cohort):
+        error, fingerprint = None, ()
+        try:
+            lease = msgspec.convert(
+                msgspec.to_builtins(cohort.lease), type=CaptureLease
+            )
+            fingerprint = _digest_words(canonical_bytes((lease, cohort.reserved_bytes)))
+        except Exception as cause:  # noqa: BLE001 - peers must agree before Catalog I/O
+            error = cause
+        votes = self._vote(phase, error, fingerprint=fingerprint)
+        if len({tuple(item[6:]) for item in votes}) != 1:
+            raise CaptureCohortError(phase + "_agreement", range(self.size))
+
+    def renew(self, cohort: CaptureCohort) -> CaptureCohort:
+        """Renew one common lease; failure never releases an in-use Host slot."""
+        with self._operation():
+            anchor = time.monotonic()
+            self._agree_cohort("renew", cohort)
+            error, payload = None, b""
             try:
-                if not ready:
-                    self._rollback(slot, lease)
-            finally:
-                self.lock.release()
+                if anchor >= cohort.deadline:
+                    raise ContractError("cannot revive an expired local lease")
+                self.body.zero_()
+                if self.layout.partitions[self.rank].include_aux:
+                    renewed = self.resources.catalog.heartbeat(cohort.lease)
+                    renewed = msgspec.convert(
+                        msgspec.to_builtins(renewed), type=CaptureLease
+                    )
+                    if _lease_identity(renewed) != _lease_identity(cohort.lease):
+                        raise ContractError(
+                            "heartbeat changed the capture identity or fence"
+                        )
+                    payload = canonical_bytes(renewed)
+                    if len(payload) > _LEASE_BYTES:
+                        raise ContractError("capture lease exceeds control capacity")
+                    self.body[: len(payload)].copy_(
+                        torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+                    )
+            except Exception as cause:  # noqa: BLE001 - renewal failure is collective
+                error = cause
+            return self._exchange_lease(
+                payload,
+                error,
+                slot=cohort.slot,
+                anchor=anchor,
+                reserved_bytes=cohort.reserved_bytes,
+                expected=cohort.lease,
+            )
+
+    def fail(self, cohort: CaptureCohort):
+        """Fail a drained capture; the caller remains responsible for slot release."""
+        with self._operation():
+            self._agree_cohort("retire", cohort)
+            error = None
+            try:
+                if self.layout.partitions[self.rank].include_aux:
+                    result = self.resources.catalog.fail(cohort.lease, "cohort_failed")
+                    if result.get("state") != "FAILED":
+                        raise ContractError("Catalog did not confirm capture failure")
+            except Exception as cause:  # noqa: BLE001 - every peer needs the outcome
+                error = cause
+            self._vote("retired", error)
+
+    def synchronize(self, build_local):
+        """Exchange a bounded registry frame built without holding inference locks."""
+        with self._operation():
+            error, fingerprint = None, ()
+            send, outputs = None, None
+            try:
+                ledger, send, outputs = build_local()
+                shape = (self.config.max_inflight_samples + 1, 10)
+                if (
+                    tuple(send.shape) != shape
+                    or send.dtype != torch.int64
+                    or send.device.type != "cpu"
+                    or not send.is_contiguous()
+                    or len(outputs) != self.size
+                    or any(
+                        tuple(output.shape) != shape
+                        or output.dtype != send.dtype
+                        or output.device.type != "cpu"
+                        or not output.is_contiguous()
+                        for output in outputs
+                    )
+                    or send.numel() * send.element_size() * (self.size + 1) > 64 << 20
+                ):
+                    raise ContractError("invalid or oversized cohort state frame")
+                fingerprint = _digest_words(
+                    canonical_bytes((self._policy(), ledger, shape))
+                )
+            except Exception as cause:  # noqa: BLE001 - local frame failure must be voted
+                error = cause
+            votes = self._vote("state", error, fingerprint=fingerprint)
+            if len({tuple(item[6:]) for item in votes}) != 1:
+                raise CaptureCohortError("state_agreement", range(self.size))
+            self._gather(outputs, send)
+            error, values = None, None
+            try:
+                values = [output.tolist() for output in outputs]
+                if any(
+                    value not in (0, 1)
+                    for rows in values
+                    for row in rows
+                    for value in row[:6]
+                ):
+                    raise ContractError("invalid cohort state flags")
+            except Exception as cause:  # noqa: BLE001 - validate before choosing an action
+                error = cause
+            self._vote("state_validation", error)
+            self._vote("state_ready")
+            return values
 
     def _rollback(self, slot, lease):
         error = None
