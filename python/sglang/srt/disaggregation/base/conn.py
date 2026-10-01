@@ -107,6 +107,7 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    draft_total_kv_head_num: int = 0
 
 
 class KVPoll:

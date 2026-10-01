@@ -1059,6 +1059,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        dst_kv_item_lens: Optional[List[int]] = None,
+        dst_tp_rank: Optional[int] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1074,19 +1076,57 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 compression_ratios = compression_ratios[start:end]
             c4_layer_num = sum(ratio == 4 for ratio in compression_ratios)
             dst_device_kv_ptrs = set(dst_kv_ptrs[c4_layer_num:])
-        return self._send_kvcache_generic(
+        num_src = len(self.kv_args.kv_data_ptrs)
+        num_target = num_src
+        slice_draft = (
+            self.is_hybrid_mla_backend
+            and getattr(self.kv_args, "num_draft_entries", 0) > 0
+            and dst_attn_tp_size is not None
+            and dst_attn_tp_size != self.attn_tp_size
+        )
+        if slice_draft:
+            if (
+                dst_tp_rank is None
+                or dst_kv_item_len is None
+                or dst_kv_item_lens is None
+            ):
+                raise ValueError("Hybrid draft TP slicing requires destination layout")
+            draft_total_kv_heads = getattr(self.kv_args, "draft_total_kv_head_num", 0)
+            if draft_total_kv_heads <= 0:
+                raise ValueError("Hybrid draft TP slicing requires draft KV head count")
+            num_target -= self.kv_args.num_draft_entries
+            if num_target < 0:
+                raise ValueError("Invalid draft KV entry count")
+
+        ret = self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
-            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            src_data_ptrs=self.kv_args.kv_data_ptrs[:num_target],
             dst_data_ptrs=dst_kv_ptrs,
-            item_lens=self.kv_args.kv_item_lens,
+            item_lens=self.kv_args.kv_item_lens[:num_target],
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
             force_flat=get_memory().enable_unified_memory,
-            src_layer_ids=self.kv_args.kv_layer_ids,
+            src_layer_ids=self.kv_args.kv_layer_ids[:num_target],
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+        )
+        if ret != 0 or not slice_draft:
+            return ret
+        return self.send_kvcache_slice(
+            mooncake_session_id,
+            prefill_kv_indices,
+            dst_kv_ptrs,
+            dst_kv_indices,
+            dst_tp_rank,
+            dst_attn_tp_size,
+            dst_kv_item_len,
+            executor,
+            dst_layer_ids,
+            src_entry_start=num_target,
+            dst_kv_item_lens=dst_kv_item_lens,
+            total_kv_heads=draft_total_kv_heads,
         )
 
     def send_kvcache_dcp(
@@ -1350,6 +1390,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
+        *,
+        src_entry_start: int = 0,
+        dst_kv_item_lens: Optional[list[int]] = None,
+        total_kv_heads: Optional[int] = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -1363,21 +1407,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             compute_head_slice_params,
         )
 
-        # Extract configuration
-        src_kv_item_len = self.kv_args.kv_item_lens[0]
+        src_data_ptrs = self.kv_args.kv_data_ptrs[src_entry_start:]
+        src_item_lens = self.kv_args.kv_item_lens[src_entry_start:]
+        src_layer_ids = self.kv_args.kv_layer_ids[src_entry_start:]
+        if dst_kv_item_lens is None:
+            dst_kv_item_lens = [dst_kv_item_len] * len(dst_kv_ptrs)
+        if len(dst_kv_ptrs) != len(dst_kv_item_lens):
+            raise ValueError("Destination KV pointers and item lengths must match")
+
         page_size = self.kv_args.page_size
 
         # Use total KV head count (not per-rank) for correct head distribution.
         # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
-        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+        total_kv_heads = total_kv_heads or getattr(self.kv_args, "total_kv_head_num", 0)
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
 
+        src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
-        bytes_per_head_slice_to_send = (
-            dst_kv_item_len // page_size // dst_heads_per_rank
-        )
-
         (
             src_head_start_offset,
             num_heads_to_send,
@@ -1391,21 +1438,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             total_kv_heads,
         )
 
-        src_data_ptrs = self.kv_args.kv_data_ptrs
-        src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
-            # Draft buffers break the flat [K block, V block] layout, so pair by
-            # layer ID instead of the half-split used by get_mha_kv_ptrs_with_pp.
-            if any(
-                item_len != src_kv_item_len for item_len in self.kv_args.kv_item_lens
-            ):
-                logger.error(
-                    f"[{mooncake_session_id}] head-sliced transfer assumes one item "
-                    f"length for every KV entry, got {set(self.kv_args.kv_item_lens)}"
+            layer_params = [
+                (
+                    src_data_ptrs[i],
+                    dst_kv_ptrs[j],
+                    src_item_lens[i],
+                    dst_kv_item_lens[j],
                 )
-                return -1
-            layer_ptr_pairs = [
-                (src_data_ptrs[i], dst_kv_ptrs[j])
                 for i, j in build_transfer_entry_pairs(
                     src_layer_ids,
                     dst_layer_ids or [],
@@ -1414,6 +1454,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     allow_positional_fallback=self.pp_size == 1,
                 )
             ]
+        elif src_entry_start:
+            raise ValueError("Explicit KV entry ranges require layer IDs")
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_kv_ptrs)
@@ -1421,36 +1463,48 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             layer_ptr_pairs = [
                 (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(layers_current_pp_stage)
             ] + [(src_v_ptrs[i], dst_v_ptrs[i]) for i in range(layers_current_pp_stage)]
-
-        # Calculate precise byte offset and length for the sub-slice within the token
-        src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
-        dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
-        heads_bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice_to_send
-
-        # Sanity check: The data sub-slice to be sent should fit into the dst buffer.
-        # This means heads_bytes_per_token_to_send <= (dst_kv_item_len // page_size)
-        if heads_bytes_per_token_to_send > (dst_kv_item_len // page_size):
-            logger.error(
-                f"[{mooncake_session_id}] slice size ({heads_bytes_per_token_to_send}) exceeds "
-                f"target token slot size ({dst_kv_item_len // page_size})"
-            )
-            return -1
+            layer_params = [
+                (*pair, src_item_lens[0], dst_kv_item_len) for pair in layer_ptr_pairs
+            ]
 
         prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
         decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
         tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
-        bytes_per_token_on_prefill = src_kv_item_len // page_size
-        bytes_per_token_on_decode = dst_kv_item_len // page_size
-        src_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
-        )
-        dst_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
-        )
 
-        def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
-            src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
-            dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
+        def process_layer_tp_aware(
+            src_layer_ptr, dst_layer_ptr, src_item_len, dst_item_len
+        ):
+            src_token_len, src_page_rem = divmod(src_item_len, page_size)
+            dst_token_len, dst_page_rem = divmod(dst_item_len, page_size)
+            src_head_len, src_head_rem = divmod(src_token_len, src_heads_per_rank)
+            dst_head_len, dst_head_rem = divmod(dst_token_len, dst_heads_per_rank)
+            if (
+                src_page_rem
+                or dst_page_rem
+                or src_head_rem
+                or dst_head_rem
+                or src_head_len <= 0
+                or src_head_len != dst_head_len
+            ):
+                raise ValueError("Source and destination KV head widths must match")
+
+            src_head_slice_offset = src_head_start_offset * src_head_len
+            dst_head_slice_offset = dst_head_start_offset * src_head_len
+            transfer_len = num_heads_to_send * src_head_len
+            if transfer_len > src_token_len or transfer_len > dst_token_len:
+                raise ValueError(
+                    f"[{mooncake_session_id}] slice size {transfer_len} exceeds "
+                    f"token slots src={src_token_len}, dst={dst_token_len}"
+                )
+
+            src_token_slot_offsets = (
+                tokens_per_page * src_token_len + src_head_slice_offset
+            )
+            dst_token_slot_offsets = (
+                tokens_per_page * dst_token_len + dst_head_slice_offset
+            )
+            src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_item_len
+            dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_item_len
             src_slice_addrs = src_page_base_addrs + src_token_slot_offsets
             dst_slice_addrs = dst_page_base_addrs + dst_token_slot_offsets
 
@@ -1460,14 +1514,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 return 0
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
-            length_list = [heads_bytes_per_token_to_send] * total_slices
+            length_list = [transfer_len] * total_slices
             return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
         futures = [
-            executor.submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
-            for src_layer_ptr, dst_layer_ptr in layer_ptr_pairs
+            executor.submit(process_layer_tp_aware, *entry_params)
+            for entry_params in layer_params
         ]
 
         return self._await_transfer_futures(futures)
@@ -2268,6 +2322,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                dst_kv_item_lens=(
+                                    target_rank_registration_info.dst_kv_item_lens
+                                ),
+                                dst_tp_rank=target_rank_registration_info.dst_tp_rank,
                             )
                         elif (
                             self.enable_staging
