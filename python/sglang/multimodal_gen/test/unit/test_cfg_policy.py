@@ -44,5 +44,64 @@ class TestCFGNormalizationDtype(unittest.TestCase):
                     self.assertEqual(out.dtype, dtype)
 
 
+class TestCFGNormalizationPerSample(unittest.TestCase):
+    """CFG normalization clamps each sample by its own norm, not the batch's.
+
+    A batch-flattened norm makes one request's output depend on whichever
+    requests happen to be co-scheduled with it in the same DiT forward pass.
+    """
+
+    CFG_NORMALIZATION = 0.7
+
+    @staticmethod
+    def _batch(seed):
+        generator = torch.Generator().manual_seed(seed)
+        pred = torch.randn(4, 3, 8, 8, generator=generator)
+        cond = torch.randn(4, 3, 8, 8, generator=generator) * 0.3
+        return pred, cond
+
+    @staticmethod
+    def _per_sample_norm(tensor):
+        dims = list(range(1, tensor.ndim))
+        return torch.linalg.vector_norm(tensor.float(), dim=dims)
+
+    def test_sample_result_is_independent_of_batch_composition(self):
+        pred, cond = self._batch(seed=0)
+        pred[1] *= 50.0
+
+        co_batched = _apply_cfg_normalization(pred, cond, self.CFG_NORMALIZATION)
+        solo = _apply_cfg_normalization(
+            pred[:1], cond[:1], self.CFG_NORMALIZATION
+        )
+
+        self.assertTrue(torch.equal(solo, co_batched[:1]))
+
+    def test_every_sample_respects_its_own_threshold(self):
+        pred, cond = self._batch(seed=1)
+        pred[0] *= 100.0
+
+        out = _apply_cfg_normalization(pred, cond, self.CFG_NORMALIZATION)
+
+        ratio = self._per_sample_norm(out) / self._per_sample_norm(cond)
+        self.assertTrue(
+            torch.all(ratio <= self.CFG_NORMALIZATION + 1e-5),
+            f"per-sample norm ratios exceed threshold: {ratio.tolist()}",
+        )
+
+    def test_batch_size_one_matches_global_norm_reference(self):
+        """At batch size 1 the per-sample norm must stay bit-identical to upstream."""
+        pred, cond = self._batch(seed=2)
+        pred, cond = pred[:1], cond[:1]
+
+        out = _apply_cfg_normalization(pred, cond, self.CFG_NORMALIZATION)
+
+        ori_norm = torch.linalg.vector_norm(cond.float())
+        new_norm = torch.linalg.vector_norm(pred.float())
+        max_norm = ori_norm * self.CFG_NORMALIZATION
+        expected = pred * (max_norm / new_norm) if new_norm > max_norm else pred
+
+        self.assertTrue(torch.equal(out, expected))
+
+
 if __name__ == "__main__":
     unittest.main()
