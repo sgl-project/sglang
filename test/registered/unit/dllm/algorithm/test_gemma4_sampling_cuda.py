@@ -17,6 +17,55 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestGemma4SamplingCUDA(CustomTestCase):
+    def test_exponential_race_exact_ids_and_generator_state(self):
+        for scale in (1.0, 10.0, 30.0):
+            with self.subTest(scale=scale):
+                probabilities = (
+                    torch.randn(256, 262144, device="cuda") * scale
+                ).softmax(-1)
+                a = torch.Generator(device="cuda").manual_seed(42)
+                b = torch.Generator(device="cuda").manual_seed(42)
+                expected = (
+                    probabilities
+                    / torch.empty_like(probabilities).exponential_(generator=b)
+                ).argmax(-1)
+                torch.testing.assert_close(
+                    _sample_denoiser(probabilities, a), expected, rtol=0, atol=0
+                )
+                torch.testing.assert_close(a.get_state(), b.get_state())
+
+    def test_exponential_race_graph_boundaries(self):
+        from sglang.kernels.ops.sampling.exponential_race import exponential_race_argmax
+
+        probabilities = torch.ones(33, 65537, device="cuda")
+        noise = torch.ones_like(probabilities)
+        exponential_race_argmax(probabilities, noise)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = exponential_race_argmax(probabilities, noise)
+        for kind in ("ties", "all_zero", "nan", "inf", "zero_noise", "near_tie"):
+            with self.subTest(kind=kind):
+                probabilities.fill_(1)
+                noise.fill_(1)
+                if kind == "ties":
+                    probabilities[:, 4096] = probabilities[:, -1] = 4
+                elif kind == "all_zero":
+                    probabilities.zero_()
+                elif kind == "nan":
+                    probabilities[:, 123] = probabilities[:, 45000] = float("nan")
+                elif kind == "inf":
+                    probabilities[:, 2048] = probabilities[:, 45000] = float("inf")
+                elif kind == "zero_noise":
+                    noise[:, 5000] = 0
+                    probabilities[:, 3000] = noise[:, 3000] = 0
+                elif kind == "near_tie":
+                    probabilities[:, 4095] = 1 + 2**-23
+                    probabilities[:, 4096] = 1 + 2**-22
+                graph.replay()
+                torch.testing.assert_close(
+                    actual, (probabilities / noise).argmax(-1), rtol=0, atol=0
+                )
+
     def test_full_vocabulary_statistics_and_sampling(self):
         generator = torch.Generator(device="cuda").manual_seed(123)
         for batch_size in (1, 3):

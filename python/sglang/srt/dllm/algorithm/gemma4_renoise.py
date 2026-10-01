@@ -51,6 +51,18 @@ def _sample_denoiser(probabilities: torch.Tensor, generator: torch.Generator):
     # as multinomial. Probabilities come from softmax, so multinomial's repeated
     # validation and device-to-host synchronization are unnecessary here.
     noise = torch.empty_like(probabilities).exponential_(1.0, generator=generator)
+    if (
+        probabilities.is_cuda
+        and probabilities.dtype == torch.float32
+        and probabilities.ndim == 2
+        and probabilities.is_contiguous()
+        and probabilities.shape[0] >= 32
+        and probabilities.shape[1] >= 65536
+        and torch.cuda.get_device_capability(probabilities.device)[0] == 10
+    ):
+        from sglang.kernels.ops.sampling.exponential_race import exponential_race_argmax
+
+        return exponential_race_argmax(probabilities, noise)
     return (probabilities / noise).argmax(dim=-1)
 
 
