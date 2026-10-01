@@ -113,6 +113,7 @@ class SchedulerDllmMixin:
         if fdfo_mode or result.next_token_ids:
             block_size = self.dllm_config.block_size
             algo_states = result.dllm_algo_state
+            output_reqs = []
 
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx in range(batch.batch_size()):
@@ -133,6 +134,7 @@ class SchedulerDllmMixin:
                     req.update_finish_state(new_accepted_len=new_tokens)
                     self._append_dllm_logprobs(batch, result, idx, next_token_ids)
                     self._finish_dllm_request_if_needed(req)
+                    output_reqs.append(req)
                     continue
 
                 next_token_ids = result.next_token_ids[idx]
@@ -172,8 +174,12 @@ class SchedulerDllmMixin:
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
                 self._append_dllm_logprobs(batch, result, idx, next_token_ids)
                 self._finish_dllm_request_if_needed(req)
+                output_reqs.append(req)
 
-            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+            # Unresolved FDFO rows have no tokens or logprobs to send. Sending
+            # them can advance the streamer's logprob offset before the first
+            # canvas resolves, dropping its first row from the response.
+            self.output_streamer.stream_output(output_reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.report_prefill_stats(

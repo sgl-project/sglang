@@ -269,6 +269,25 @@ class TestGemma4LogprobResponses(unittest.TestCase):
         req.return_logprob = False
         self.assertIn("without return_logprob", Gemma4Renoise.validate_request(req))
 
+    def test_pending_fdfo_preserves_first_logprob_row(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                scheduler = _Scheduler(fdfo=True)
+                req = self.request(scheduler, max_new_tokens=4)
+                req.stream = streaming
+                emitted = []
+                scheduler.output_streamer.stream_output.side_effect = lambda reqs, _: (
+                    emitted.extend(self.emit(req) for req in reqs)
+                )
+                for _ in range(3):
+                    self.process(scheduler, [req], pending=True)
+                self.assertEqual(emitted, [])
+                self.assertEqual(req.send_output_token_logprobs_offset, 0)
+                self.process(scheduler, [req])
+                self.assertEqual(len(emitted), 1)
+                self.assertEqual(emitted[0].output_token_logprobs_idx, [[3, 2, 1, 0]])
+                self.assertEqual(len(emitted[0].output_token_ids_logprobs_val[0]), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

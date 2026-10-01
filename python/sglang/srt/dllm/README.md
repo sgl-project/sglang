@@ -38,4 +38,15 @@ rows continue denoising, and normal output truncation and streaming offsets appl
 This support is output-only: omit `logprob_start_len`, set it to `-1`, or set it
 to the prompt length. Prompt logprobs, `top_logprobs_num`, flat raw top logprobs,
 sampling masks, and logprobs with `max_new_tokens=0` remain unsupported. The
-candidate field requires `return_logprob=true`. No decision endpoint is added.
+candidate field requires `return_logprob=true`.
+
+`/v1/decisions` and `/v1/systemone` use these scores through `/v1/score`.
+Candidate scoring denoises one full canvas, validates the four-token empty
+thought prefix `<|channel>thought\n<channel|>`, and reads the next position
+(canvas index 4). It uses an internal request with `max_new_tokens=5` and
+`ignore_eos=true`; unexpected or nonempty thought prefixes return HTTP 400.
+The prefix belongs to the decoder canvas, not to the encoder prompt. Decision
+responses return no generated text and report zero completion tokens. Prompts
+must reserve the full configured canvas, and input-position / packed multi-item
+scoring remain unsupported. Use a fixed sampler `seed` for reproducible replay;
+otherwise each request id seeds its own denoising trajectory.
