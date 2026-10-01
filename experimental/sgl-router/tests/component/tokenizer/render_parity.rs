@@ -111,8 +111,9 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: model_id.into(),
-            tokenizer_path: tokenizer_path.to_str().unwrap().into(),
+            tokenizer_path: Some(tokenizer_path.to_str().unwrap().into()),
             disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
