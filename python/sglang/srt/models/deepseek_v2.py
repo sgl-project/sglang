@@ -942,6 +942,7 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.moe_runner.aiter_tiny_glm import (
             enabled,
+            record_routing_count,
             target_supported,
         )
 
@@ -967,10 +968,7 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] in (4, 8)
         )
         if active:
-            runner = getattr(self.experts.quant_method, "runner", None)
-            tiny = getattr(getattr(runner, "runner_core", None), "_tiny_glm", None)
-            if tiny is not None:
-                tiny.record_routing_count(forward_batch, hidden_states.shape[0])
+            record_routing_count(self.experts, forward_batch, hidden_states.shape[0])
         with get_forward().scoped(
             aiter_tiny_glm_input=hidden_states if active else None
         ):

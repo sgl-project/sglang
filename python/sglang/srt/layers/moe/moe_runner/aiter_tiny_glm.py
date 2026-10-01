@@ -21,6 +21,15 @@ def enabled():
     )
 
 
+def record_routing_count(layer, batch, rows):
+    # Quark delegates execution to the layer's quantization scheme. Its method
+    # object inherits runner=None and does not own the prepared AITER caller.
+    runner = getattr(getattr(layer, "scheme", None), "runner", None)
+    tiny = getattr(getattr(runner, "runner_core", None), "_tiny_glm", None)
+    if tiny is not None:
+        tiny.record_routing_count(batch, rows)
+
+
 def warmup_stream(stream):
     # FullCudaGraphBackend otherwise warms on the caller stream and captures on
     # a different stream. Use the capture stream for opt-in eager warmups so its

@@ -223,6 +223,20 @@ class TestTinyGlm(TestCase):
             ],
         )
 
+    def test_routing_count_census_uses_quark_scheme_owner(self):
+        calls = []
+        caller = NS(record_routing_count=lambda *args: calls.append(args))
+        layer = NS(
+            scheme=NS(runner=NS(runner_core=NS(_tiny_glm=caller))),
+            quant_method=NS(runner=None),
+        )
+        batch = object()
+        tiny.record_routing_count(layer, batch, 8)
+        self.assertEqual(calls, [(batch, 8)])
+        layer.scheme = None
+        tiny.record_routing_count(layer, batch, 8)
+        self.assertEqual(calls, [(batch, 8)])
+
     def test_no_factory_or_jit_inside_capture(self):
         # Exercise real host method with a mocked capture probe. The preparation
         # must exit before querying a stream or accessing a factory.
