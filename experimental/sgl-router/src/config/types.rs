@@ -436,6 +436,12 @@ pub struct CacheAwareConfig {
     /// Upper bound on the per-fetch timeout derived from `bootstrap_timeout_ms`;
     /// see `snapshot_fetch_timeout`. Validated by `Config::validate`.
     pub bootstrap_fetch_timeout_cap_ms: u64,
+    /// Hold `/readyz` at 503 when a sweep over a non-empty candidate set timed
+    /// out. Bounded at max(3x `bootstrap_timeout_ms`, 60s), after which the
+    /// replica serves cache-blind; nothing re-sweeps during the hold, so this
+    /// delays a failed seed's replica and a fleet-wide restart is a delay, not
+    /// an outage.
+    pub bootstrap_seed_required: bool,
 }
 
 impl Default for CacheAwareConfig {
@@ -445,6 +451,7 @@ impl Default for CacheAwareConfig {
             kv_indexer_endpoint: None,
             bootstrap_timeout_ms: DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
             bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
+            bootstrap_seed_required: false,
         }
     }
 }

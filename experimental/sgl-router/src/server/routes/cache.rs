@@ -118,7 +118,18 @@ pub async fn kv_snapshot(
     if params.cursors_only {
         // Read live, so there is nothing for `max_age_ms` to bound; it is
         // ignored when both are sent.
-        return json_ok(index.peer_cursors_body());
+        let body = index.peer_cursors_body();
+        if body.is_empty() {
+            // Same shape as the full export's failure answer below: a 200
+            // carrying an empty body would hand the caller JSON it cannot
+            // decode. Unreachable in practice (the body is a plain struct),
+            // kept so the two paths cannot drift apart.
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cursor table could not be encoded",
+            );
+        }
+        return json_ok(body);
     }
     let max_age = params
         .max_age_ms

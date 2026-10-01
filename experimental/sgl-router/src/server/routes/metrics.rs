@@ -12,7 +12,9 @@
 use crate::discovery::WorkerMode;
 use crate::server::app_context::AppContext;
 use crate::server::metrics::{escape_label, WorkerSnapshot};
-use crate::state::kv_events::bootstrap::PeerRegistry;
+use crate::state::kv_events::bootstrap::{
+    BootstrapTracker, PeerRegistry, RankOutcome, SnapshotOutcome, SweepOutcome,
+};
 use crate::state::kv_events::{KvIndexMetrics, Tiers, ACCOUNTING_REASONS};
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -76,12 +78,119 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
     // A local tree alone does not mean peer bootstrap is on; the selector does.
     if let (Some(index), Some(_)) = (ctx.kv_index.as_ref(), ctx.config.discovery.peer_selector()) {
         body.push_str(&render_kv_peers(&index.peers()));
+        body.push_str(&render_kv_bootstrap(
+            &index.bootstrap(),
+            index.tree().node_count(),
+        ));
     }
     (
         StatusCode::OK,
         [(CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
         body,
     )
+}
+
+/// Render the bootstrap series, which make "this replica is serving
+/// cache-blind" alertable instead of only inferable from a late hit-rate dip.
+fn render_kv_bootstrap(tracker: &BootstrapTracker, tree_nodes: usize) -> String {
+    let mut out = String::new();
+
+    // A whole-tree count; the per-(worker, tier) block gauges count a node once
+    // per carrier and tier, so they cannot be summed into one.
+    push_gauge(
+        &mut out,
+        "sgl_router_kv_tree_nodes",
+        "Nodes in this replica's cache-aware KV tree. Compare across replicas of one Deployment: an order-of-magnitude outlier is a replica that failed to inherit the fleet's prefixes and is routing cache-blind.",
+        tree_nodes,
+    );
+    push_gauge(
+        &mut out,
+        "sgl_router_kv_bootstrap_settled",
+        "1 once initial peer bootstrap has settled, which is also readiness condition 3. Latches: a later scale-up cannot drag an already-serving replica back to 503.",
+        u8::from(tracker.settled()),
+    );
+    push_gauge(
+        &mut out,
+        "sgl_router_kv_bootstrap_seed_failed",
+        "1 when a sweep ended timed_out over a non-empty candidate set: siblings were there and their tree could not be pulled. With --kv-bootstrap-seed-required this holds /readyz at 503 for up to max(3x --kv-bootstrap-timeout-ms, 60s); without it the replica serves cache-blind and this is the only signal that it did.",
+        u8::from(tracker.seed_failed()),
+    );
+
+    let states = tracker.states();
+    if !states.is_empty() {
+        out.push_str(
+            "# HELP sgl_router_kv_bootstrap_state Per-rank bootstrap state (0=pending, 1=recovered, 2=failed). A rank stuck at 0 is holding its events back and will overflow; a fleet of 2s means every rank is routing on live deltas alone.\n",
+        );
+        out.push_str("# TYPE sgl_router_kv_bootstrap_state gauge\n");
+        for (id, state) in states {
+            out.push_str(&format!(
+                "sgl_router_kv_bootstrap_state{{worker_url=\"{}\",dp_rank=\"{}\"}} {}\n",
+                escape_label(&id.url),
+                id.dp_rank,
+                state.as_metric(),
+            ));
+        }
+    }
+
+    // Fetches and ranks are counted separately: one accepted fetch can settle
+    // several ranks, and one rank can outlive many rejected fetches.
+    push_closed_counter(
+        &mut out,
+        "sgl_router_kv_peer_snapshot_total",
+        "Peer snapshot fetches by outcome. A fleet pinned at unreachable with a warm tree is the per-fetch timeout being too small for the body, not a network fault.",
+        "outcome",
+        SnapshotOutcome::ALL.map(SnapshotOutcome::as_label),
+        &tracker.peer_outcome_counts(),
+    );
+
+    // Once per rank at its final verdict, so the labels sum to the ranks that
+    // finished bootstrapping.
+    push_closed_counter(
+        &mut out,
+        "sgl_router_kv_bootstrap_rank_total",
+        "Ranks by final bootstrap outcome, counted once each when the verdict becomes final. warm_unwitnessed means the graft was kept without proof that the live stream joins it; a persistent gap share means peers are exporting staler than the ranks can splice.",
+        "outcome",
+        RankOutcome::ALL.map(RankOutcome::as_label),
+        &tracker.rank_outcome_counts(),
+    );
+
+    // Once per sweep: separates fleet_cold from timed_out, which the rank
+    // outcomes both fold into `abandoned`.
+    push_closed_counter(
+        &mut out,
+        "sgl_router_kv_bootstrap_sweep_total",
+        "Peer sweeps by terminal verdict. fleet_cold is a healthy early settle on a fleet with nothing to hand over; timed_out over real candidates is a failed seed.",
+        "result",
+        SweepOutcome::ALL.map(SweepOutcome::as_label),
+        &tracker.sweep_result_counts(),
+    );
+    out
+}
+
+fn push_gauge(out: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
+    out.push_str(&format!(
+        "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+    ));
+}
+
+/// Emit one counter family over a closed label set, with a zero row per label
+/// so `increase()` has a baseline for a series that moves once per boot.
+fn push_closed_counter(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    label: &str,
+    labels: impl IntoIterator<Item = &'static str>,
+    counts: &[(&'static str, u64)],
+) {
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+    for value in labels {
+        let n = counts
+            .iter()
+            .find(|(k, _)| *k == value)
+            .map_or(0, |(_, n)| *n);
+        out.push_str(&format!("{name}{{{label}=\"{value}\"}} {n}\n"));
+    }
 }
 
 /// Render the peer-discovery series, emitted only with a peer selector and a
@@ -208,6 +317,50 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// The bootstrap series are what make "this replica is serving
+    /// cache-blind" alertable, so their names and label keys are contract.
+    /// With the gate off, `seed_failed` is the only signal that a seed did not
+    /// land.
+    #[tokio::test]
+    async fn kv_bootstrap_series_report_state_and_verdicts() {
+        use crate::state::kv_events::{BootstrapState, KvWorkerId};
+
+        let tracker = BootstrapTracker::new(std::time::Duration::from_secs(300));
+        let warm = KvWorkerId::new("http://w0:30000".into(), 0);
+        let cold = KvWorkerId::new("http://w0:30000".into(), 1);
+        tracker.register(&[warm.clone(), cold.clone()]);
+        tracker.set(&warm, BootstrapState::Recovered);
+        tracker.record_rank_outcome(RankOutcome::Warm);
+        tracker.record_peer_outcome(SnapshotOutcome::Accepted, "http://peer:30000", None);
+        tracker.record_sweep_result(SweepOutcome::TimedOut, 9);
+
+        let out = render_kv_bootstrap(&tracker, 4_242);
+        for want in [
+            "sgl_router_kv_tree_nodes 4242\n",
+            "sgl_router_kv_bootstrap_settled 0\n",
+            "sgl_router_kv_bootstrap_seed_failed 1\n",
+            r#"sgl_router_kv_bootstrap_state{worker_url="http://w0:30000",dp_rank="0"} 1"#,
+            r#"sgl_router_kv_bootstrap_state{worker_url="http://w0:30000",dp_rank="1"} 0"#,
+            r#"sgl_router_kv_peer_snapshot_total{outcome="accepted"} 1"#,
+            r#"sgl_router_kv_bootstrap_rank_total{outcome="warm"} 1"#,
+            r#"sgl_router_kv_bootstrap_sweep_total{result="timed_out"} 1"#,
+            // Zero rows too, so `increase()` sees the first increment.
+            r#"sgl_router_kv_peer_snapshot_total{outcome="unreachable"} 0"#,
+            r#"sgl_router_kv_bootstrap_rank_total{outcome="overflow"} 0"#,
+            r#"sgl_router_kv_bootstrap_sweep_total{result="found"} 0"#,
+        ] {
+            assert!(out.contains(want), "missing {want:?}; got:\n{out}");
+        }
+
+        // A rank reaching a terminal state settles the tracker, and the gauge
+        // must move with it rather than latch at boot.
+        tracker.set(&cold, BootstrapState::Failed);
+        assert!(tracker.settled());
+        assert!(
+            render_kv_bootstrap(&tracker, 4_242).contains("sgl_router_kv_bootstrap_settled 1\n")
+        );
+    }
 
     /// The two readings of a zero peer count an operator has to tell apart:
     /// "discovery has not reported yet" and "this replica is genuinely alone".

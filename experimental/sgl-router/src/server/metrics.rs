@@ -179,8 +179,9 @@ pub enum RequestOutcome {
     /// The worker failed to serve the request: a 5xx fault, a transport failure,
     /// a timeout, or a body that never completed.
     Error,
-    /// The router cancelled the request itself — today only the stale-request
-    /// deadline. Never derived from a status; see [`outcome_from_status`].
+    /// The router cancelled the request itself: the stale-request deadline, or
+    /// a PD decode dispatch abandoned because prefill failed first. Never
+    /// derived from a status; see [`outcome_from_status`].
     Cancelled,
 }
 

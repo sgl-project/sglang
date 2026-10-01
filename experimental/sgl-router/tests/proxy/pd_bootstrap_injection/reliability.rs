@@ -152,7 +152,12 @@ async fn pd_failure_returns_without_waiting_for_the_other_side() {
                     false => ((&decode.url, "decode"), (&prefill.url, "prefill")),
                 };
                 assert_eq!(outcomes(&ctx, blamed.0, blamed.1).len(), 1);
-                assert!(outcomes(&ctx, other.0, other.1).is_empty());
+                // A blamed prefill means decode was dispatched and then dropped,
+                // which is counted rather than dropped from the per-worker series.
+                // A blamed decode leaves prefill still running, with nothing to
+                // record yet.
+                let abandoned: &[&str] = if prefill_blamed { &["cancelled"] } else { &[] };
+                assert_eq!(outcomes(&ctx, other.0, other.1), abandoned);
                 let decode_worker = ctx.registry.get(&WorkerId("d".into())).unwrap();
                 assert_eq!(decode_worker.router_inflight_load(), 0);
             }
@@ -201,6 +206,16 @@ async fn prefill_failure_aborts_decode_before_its_first_token() {
                 decode.abort_log.lock().unwrap()[0],
                 json!({"rid": sent["rid"], "abort_all": false})
             );
+            // Decode's dispatch is proven by the `wait_until` above, so it owes
+            // the per-worker series an outcome either way: `success` once it
+            // committed 200 headers (the broken stream is `stream_outcome`'s to
+            // report), `cancelled` when prefill's failure dropped it first.
+            let expected = if early_headers {
+                "success"
+            } else {
+                "cancelled"
+            };
+            assert_eq!(outcomes(&ctx, &decode.url, "decode"), [expected]);
         }
     }
 }
