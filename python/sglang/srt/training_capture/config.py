@@ -177,8 +177,7 @@ def validate_capture_server_args(args) -> None:
         and envs.SGLANG_SIMULATE_ACC_LEN.get() > 0,
         "PD capture topology or backend": args.disaggregation_mode != "null"
         and (
-            args.speculative_algorithm is not None
-            or args.disaggregation_transfer_backend != "mooncake"
+            args.disaggregation_transfer_backend != "mooncake"
             or args.optimistic_prefill_attempts > 0
         ),
         "mixed-chunk scheduling": args.enable_mixed_chunk,

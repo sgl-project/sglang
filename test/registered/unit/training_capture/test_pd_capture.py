@@ -168,6 +168,77 @@ class TestPDCapture(CustomTestCase):
         for name, value in expected.items():
             torch.testing.assert_close(tensors[name], value, rtol=0, atol=0)
 
+    def test_pd_verify_trims_accepted_tail_after_length_or_eos(self):
+        from sglang.srt.managers.schedule_batch import (
+            FINISH_LENGTH,
+            FINISH_MATCHED_TOKEN,
+        )
+
+        for output_length, reason in (
+            (3, FINISH_LENGTH(3)),
+            (2, FINISH_MATCHED_TOKEN(20)),
+        ):
+            with self.subTest(output_length=output_length):
+                self.decode.capture_mode = "pd_speculative_accepted_target_path"
+                req, wire = self.begin()
+                payload, prefill_raw = self.handoff(wire)
+                req.output_ids, req.eos_token_ids = [10], {20}
+                self.decode.accept_pd_handoff(req, payload)
+                logits = torch.randn(
+                    4, 256, generator=torch.Generator().manual_seed(818)
+                )
+                raw = logits.clone()
+                ticket = self.decode.after_verify_forward(
+                    SimpleNamespace(reqs=[req], seq_lens_cpu=[2]),
+                    SimpleNamespace(
+                        input_ids=torch.tensor([10, 20, 30, 40]),
+                        positions=torch.arange(2, 6),
+                        out_cache_loc=torch.tensor([6, 1, 9, 5]),
+                    ),
+                    SimpleNamespace(next_token_logits=logits),
+                    width=4,
+                    can_run_cuda_graph=False,
+                )
+                logits.zero_()
+                self.decode.after_verify_accept(
+                    ticket,
+                    commit_lens=torch.tensor([3]),
+                    out_tokens=torch.tensor([[20, 30, 55, 0]]),
+                )
+                req.output_ids = [10, 20, 30, 55]
+                req.finished_len, req.finished_reason = output_length, reason
+                previous = len(self.catalog.publications)
+                self.decode.on_release(req)
+                manifest, tensors = read_snapshot(
+                    self.store, self.catalog.wait_publications(previous + 1)[-1]
+                )
+                self.assertEqual(
+                    manifest.provenance.capture_mode, self.decode.capture_mode
+                )
+                self.assertEqual(
+                    tensors["token_ids"].tolist(),
+                    [3, 4, 10, 20, 30][: 2 + output_length],
+                )
+                self.assertEqual(
+                    tensors["kv_valid"].tolist(), [1] * (2 + output_length)
+                )
+                expected = torch.cat(
+                    (
+                        prefill_raw.topk(128).values,
+                        raw[: output_length - 1].topk(128).values,
+                    )
+                )
+                torch.testing.assert_close(
+                    tensors["teacher_topk_logits"], expected, rtol=0, atol=0
+                )
+                for name, buffer in self.buffers.items():
+                    torch.testing.assert_close(
+                        tensors[name],
+                        buffer[[7, 3, 6, 1, 9][: 2 + output_length]],
+                        rtol=0,
+                        atol=0,
+                    )
+
     def test_missing_corrupt_or_replayed_teacher_fails_only_capture(self):
         for failure in (
             "missing",

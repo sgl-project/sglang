@@ -90,7 +90,7 @@ def observe(
         else:
             start = end
             slots = forward_batch.out_cache_loc[region]
-            history = _token_prefixes[req.rid]
+            history = _token_prefixes.setdefault(req.rid, tokens)
             assert len(history) >= start
             verify_tokens = forward_batch.input_ids[region].tolist()
             tokens = history[:start] + verify_tokens

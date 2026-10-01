@@ -43,7 +43,10 @@ def prepare_cohort_capture(
     resources = None
     try:
         coordinator_type = CohortCaptureCoordinator
-        if capture_mode == "pd_autoregressive":
+        if capture_mode in (
+            "pd_autoregressive",
+            "pd_speculative_accepted_target_path",
+        ):
             from sglang.srt.training_capture.pd_capture import (
                 CohortDecodeCaptureCoordinator,
             )

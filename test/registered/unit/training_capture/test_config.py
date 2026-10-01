@@ -89,16 +89,23 @@ class TestCaptureConfiguration(CustomTestCase):
                 finally:
                     setattr(self.args, name, previous)
 
-    def test_pd_requires_mooncake_ar_and_waits_for_capture_context(self):
+    def test_pd_requires_mooncake_and_waits_for_capture_context(self):
         for role in ("prefill", "decode"):
             self.args.disaggregation_mode = role
             self.args.disaggregation_transfer_backend = "mooncake"
             self.args.optimistic_prefill_attempts = 0
             for tp, pp in ((1, 1), (2, 1), (4, 1), (1, 2), (2, 2)):
                 self.args.tp_size, self.args.pp_size = tp, pp
+                self.args.speculative_algorithm = None
                 validate_capture_server_args(self.args)
+                self.args.speculative_algorithm = "DSPARK"
+                if pp == 1:
+                    validate_capture_server_args(self.args)
+                else:
+                    with self.assertRaisesRegex(ValueError, "pipeline speculative"):
+                        validate_capture_server_args(self.args)
+            self.args.pp_size = 1
             for name, value in (
-                ("speculative_algorithm", "DSPARK"),
                 ("disaggregation_transfer_backend", "nixl"),
                 ("optimistic_prefill_attempts", 1),
             ):

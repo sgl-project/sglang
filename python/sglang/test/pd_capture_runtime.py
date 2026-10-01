@@ -50,6 +50,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
         cls.temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
+        cls.drafts = {}
         cls.model = os.environ.get("TRAINING_CAPTURE_TEST_MODEL", "Qwen/Qwen3-0.6B")
         if not Path(cls.model).is_dir():
             from huggingface_hub import snapshot_download
@@ -99,10 +100,14 @@ class PDCaptureRuntimeBase(CustomTestCase):
 
     @staticmethod
     def stop_process(process):
+        if process.poll() is not None:
+            return
         kill_process_tree(process.pid)
         process.wait(timeout=20)
 
-    def launch(self, role, root, *, replay, tp_size, pp_size):
+    def launch(
+        self, role, root, *, replay, tp_size, pp_size, draft=None, ragged_mode="static"
+    ):
         folder = root / role
         folder.mkdir()
         config = {
@@ -138,8 +143,29 @@ class PDCaptureRuntimeBase(CustomTestCase):
                 self.model,
                 url,
                 timeout=240,
-                env={**os.environ, "MOONCAKE_PROTOCOL": "tcp"},
+                env={
+                    **os.environ,
+                    "MOONCAKE_PROTOCOL": "tcp",
+                    "SGLANG_RAGGED_VERIFY_MODE": ragged_mode if draft else "static",
+                },
                 other_args=[
+                    *(
+                        [
+                            "--speculative-algorithm",
+                            "DSPARK",
+                            "--speculative-draft-model-path",
+                            str(draft),
+                            "--speculative-draft-attention-backend",
+                            "triton",
+                        ]
+                        if draft
+                        else []
+                    ),
+                    *(
+                        ["--speculative-dspark-sps-table-path", str(draft / "sps.json")]
+                        if draft and (draft / "sps.json").exists()
+                        else []
+                    ),
                     "--disaggregation-mode",
                     role,
                     "--tp-size",
@@ -150,13 +176,17 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     "mooncake",
                     "--disaggregation-bootstrap-port",
                     str(self.bootstrap_port),
-                    "--disaggregation-decode-enable-radix-cache",
+                    *(
+                        []
+                        if draft and role == "decode"
+                        else ["--disaggregation-decode-enable-radix-cache"]
+                    ),
                     "--training-capture-config",
                     str(path),
                     "--skip-server-warmup",
                     "--skip-tokenizer-init",
                     "--attention-backend",
-                    "triton",
+                    "fa3" if draft and ragged_mode == "compact" else "triton",
                     "--mem-fraction-static",
                     "0.20",
                     "--max-total-tokens",
@@ -182,6 +212,42 @@ class PDCaptureRuntimeBase(CustomTestCase):
             )
         self.addCleanup(self.stop_process, process)
         return process, url
+
+    def get_draft(self, kind):
+        if kind in self.drafts:
+            return self.drafts[kind]
+        destination = self.root / f"pd-{kind}-draft"
+        if kind == "target_hidden":
+            from sglang.test.dspark_ragged_capture_runtime import (
+                export_confidence_draft,
+            )
+
+            export_confidence_draft(self.model, destination)
+        else:
+            self.assertEqual(kind, "target_kv")
+            from sglang.test.dspark_target_kv_runtime import export_synthetic_kv_draft
+
+            root = self.root / "draft-seed"
+            root.mkdir()
+            self.bootstrap_port, self.bootstrap_room = free_port(), 4000
+            prefill, self.prefill_url = self.launch(
+                "prefill", root, replay=False, tp_size=1, pp_size=1
+            )
+            decode, self.decode_url = self.launch(
+                "decode", root, replay=False, tp_size=1, pp_size=1
+            )
+            first = len(self.catalog.publications)
+            try:
+                self.generate("draft-seed", [1, 2, 3], 3)
+                sample = read_snapshot(
+                    self.reader, self.catalog.wait_publications(first + 1)[-1]
+                )
+            finally:
+                self.stop_process(decode)
+                self.stop_process(prefill)
+            export_synthetic_kv_draft(self.model, destination, *sample)
+        self.drafts[kind] = destination
+        return destination
 
     def generate(self, rid, prompt, count, *, biased=False):
         batched = isinstance(rid, list)
@@ -307,31 +373,95 @@ class PDCaptureRuntimeBase(CustomTestCase):
             )
         return state
 
-    def exercise(self, *, replay, prefill_tp=1, decode_tp=1, prefill_pp=1, decode_pp=1):
+    def exercise(
+        self,
+        *,
+        replay,
+        prefill_tp=1,
+        decode_tp=1,
+        prefill_pp=1,
+        decode_pp=1,
+        draft_kind=None,
+        prefill_draft=False,
+        ragged_mode="static",
+    ):
+        draft = self.get_draft(draft_kind) if draft_kind else None
+        suffix = (
+            f"{replay}-{draft_kind}-{prefill_draft}-{ragged_mode}"
+            if draft
+            else str(replay)
+        )
         root = self.root / (
-            f"p{prefill_tp}x{prefill_pp}-d{decode_tp}x{decode_pp}-replay-{replay}"
+            f"p{prefill_tp}x{prefill_pp}-d{decode_tp}x{decode_pp}-replay-{suffix}"
         )
         root.mkdir()
         self.bootstrap_port, self.bootstrap_room = free_port(), 5000
         prefill, self.prefill_url = self.launch(
-            "prefill", root, replay=replay, tp_size=prefill_tp, pp_size=prefill_pp
+            "prefill",
+            root,
+            replay=replay,
+            tp_size=prefill_tp,
+            pp_size=prefill_pp,
+            draft=draft if prefill_draft else None,
+            ragged_mode=ragged_mode,
         )
         decode, self.decode_url = self.launch(
-            "decode", root, replay=replay, tp_size=decode_tp, pp_size=decode_pp
+            "decode",
+            root,
+            replay=replay,
+            tp_size=decode_tp,
+            pp_size=decode_pp,
+            draft=draft,
+            ragged_mode=ragged_mode,
+        )
+        if draft and ragged_mode != "static":
+            setting = requests.post(
+                self.decode_url + "/set_internal_state",
+                json={"server_args": {"dspark_force_budget_frac": 0.625}},
+                timeout=20,
+            )
+            self.assertEqual(setting.status_code, 200, setting.text)
+            updates = setting.json()
+            updates = updates if isinstance(updates, list) else [updates]
+            self.assertTrue(
+                all(
+                    item.get("updated") if isinstance(item, dict) else item is True
+                    for item in updates
+                ),
+                updates,
+            )
+        acceptance_offsets = (
+            {
+                path: len(path.read_text().splitlines())
+                for path in draft.glob("acceptance-tp*.jsonl")
+            }
+            if draft
+            else {}
         )
         first = len(self.catalog.publications)
         responses = {}
+        observation_offsets = (
+            {
+                path: len(path.read_text().splitlines())
+                for path in draft.glob("observations*.jsonl")
+            }
+            if draft_kind == "target_kv"
+            else {}
+        )
         prompt = [1] + [16, 17, 18, 19] * 38
-        for rid, tokens, count, biased in (
+        cases = [
             ("single", [1, 2, 3], 1, False),
             ("chunked", prompt, 7, True),
             ("cached", prompt, 5, True),
-        ):
-            name = f"{rid}-{replay}"
+        ]
+        if draft:
+            cases.append(("rejected", [1, 9, 8, 3], 6, False))
+        for rid, tokens, count, biased in cases:
+            name = f"{rid}-{suffix}"
             result = self.generate(name, tokens, count, biased=biased)
             responses[hashlib.sha256(name.encode()).hexdigest()] = (tokens, result)
             self.catalog.wait_publications(first + len(responses), timeout=45)
-        names = [f"batch-{i}-{replay}" for i in range(2)]
+        names = [f"batch-{i}-{suffix}" for i in range(2)]
         prompts = [[1, 3, 9, 2], [1, 7, 8, 3, 2, 4, 5]]
         for name, tokens, result in zip(
             names, prompts, self.generate(names, prompts, 3, biased=True), strict=True
@@ -339,9 +469,91 @@ class PDCaptureRuntimeBase(CustomTestCase):
             responses[hashlib.sha256(name.encode()).hexdigest()] = (tokens, result)
         expected = len(responses)
         publications = self.catalog.wait_publications(first + expected, timeout=45)
+        paths = sorted(root.rglob("*.pt"))
+        if draft:
+            paths.extend(sorted(draft.rglob("*.pt")))
         references = [
-            torch.load(path, weights_only=True) for path in sorted(root.rglob("*.pt"))
+            frame
+            for path in paths
+            if (frame := torch.load(path, weights_only=True))["trace_id"] in responses
         ]
+        capture_mode = (
+            "pd_speculative_accepted_target_path" if draft else "pd_autoregressive"
+        )
+        if draft:
+            decode_references = [
+                frame
+                for path in draft.rglob("*.pt")
+                if (frame := torch.load(path, weights_only=True))["trace_id"]
+                in responses
+            ]
+            self.assertTrue(decode_references)
+            self.assertTrue(
+                all(frame["verify_width"] is not None for frame in decode_references)
+            )
+            self.assertTrue(any(frame["num_commit"] > 1 for frame in decode_references))
+            self.assertTrue(
+                any(
+                    frame["num_commit"] < frame["verify_width"]
+                    for frame in decode_references
+                )
+            )
+        if draft_kind == "target_kv":
+            observations = [
+                json.loads(line)
+                for path in draft.glob("observations*.jsonl")
+                for line in path.read_text().splitlines()[
+                    observation_offsets.get(path, 0) :
+                ]
+            ]
+            contexts = [item for item in observations if item["kind"] == "context"]
+            self.assertTrue(
+                any(
+                    item["previous_end"] is None
+                    and item["projected_end"] == len(prompt)
+                    for item in contexts
+                )
+            )
+            self.assertTrue(any(item["kind"] == "projection" for item in observations))
+            if replay:
+                self.assertTrue(
+                    any(
+                        item["kind"] == "target_verify" and item["cuda_graph"]
+                        for item in observations
+                    )
+                )
+        if draft and ragged_mode != "static":
+            acceptance = [
+                json.loads(line)
+                for path in draft.glob("acceptance-tp*.jsonl")
+                for line in path.read_text().splitlines()[
+                    acceptance_offsets.get(path, 0) :
+                ]
+            ]
+            self.assertTrue(
+                any(
+                    item["verify_lens"] and len(set(item["verify_lens"])) > 1
+                    for item in acceptance
+                ),
+                acceptance,
+            )
+            self.assertTrue(
+                any(any(item["cap_trim_lens"]) for item in acceptance), acceptance
+            )
+            if ragged_mode == "compact":
+                self.assertTrue(
+                    any(
+                        frame["verify_count"] < frame["verify_width"]
+                        for frame in decode_references
+                    )
+                )
+                if replay:
+                    self.assertTrue(
+                        any(frame["verify_padding"] > 0 for frame in decode_references)
+                    )
+                    self.assertTrue(
+                        any(item["folded"] for item in acceptance), acceptance
+                    )
         if replay:
             self.assertTrue(any(frame["cuda_graph"] for frame in references))
         self.assertTrue(any(frame["batch_size"] > 1 for frame in references))
@@ -354,7 +566,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
                 tensors["token_ids"].tolist(), tokens + result["output_ids"]
             )
             check_capture_snapshot(
-                self, manifest, tensors, references, capture_mode="pd_autoregressive"
+                self, manifest, tensors, references, capture_mode=capture_mode
             )
         self.assertFalse(responses)
         for fault in ("missing", "stale"):
@@ -362,7 +574,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
                 failures_before = sum(
                     v["state"] == "FAILED" for v in self.catalog.captures.values()
                 )
-            self.generate(f"{fault}-{replay}", [1, 3, 8, 2], 3, biased=True)
+            self.generate(f"{fault}-{suffix}", [1, 3, 8, 2], 3, biased=True)
             with self.catalog.condition:
                 self.assertTrue(
                     self.catalog.condition.wait_for(
@@ -376,11 +588,14 @@ class PDCaptureRuntimeBase(CustomTestCase):
                 )
             self.assertEqual(len(self.catalog.publications), first + expected)
         state = self.abort_capture(
-            f"abort-{replay}", distributed=decode_tp > 1 or decode_pp > 1
+            f"abort-{suffix}", distributed=decode_tp > 1 or decode_pp > 1
         )
         self.assertEqual(len(self.catalog.publications), first + expected)
         self.assertGreaterEqual(state["counters"]["pd_handoff_committed"], expected + 1)
         self.assertGreaterEqual(state["counters"]["failed_pd_handoff_failed"], 1)
+        if draft:
+            self.assertGreater(state["counters"]["speculative_verify_forwards"], 0)
+            self.assertGreater(state["counters"]["speculative_commits_copied"], 0)
         self.assertIsNone(prefill.poll())
         self.assertIsNone(decode.poll())
         print(
@@ -391,6 +606,9 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     "prefill_pp": prefill_pp,
                     "decode_pp": decode_pp,
                     "replay": replay,
+                    "draft_kind": draft_kind,
+                    "prefill_draft": prefill_draft,
+                    "ragged_mode": ragged_mode,
                     "capture": state,
                 },
                 sort_keys=True,

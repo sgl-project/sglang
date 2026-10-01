@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import msgspec
 import torch
+
 from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
     SharedHeadTransform,
     TargetKVDraftContract,
@@ -42,6 +43,26 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestTargetKVDraftContract(CustomTestCase):
+    def test_pd_kv_draft_uses_local_projection_without_transferring_draft_pool(self):
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            DSparkWorkerV2,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        pool = object()
+        worker = object.__new__(DSparkWorkerV2)
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.DSPARK)
+        )
+        worker._draft_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(token_to_kv_pool=pool)
+        )
+        worker._target_kv_contract = make_target_kv_contract()
+        self.assertIs(worker.primary_draft_kv_pool, pool)
+        self.assertIsNone(worker.disaggregation_draft_kv_pool)
+        worker._target_kv_contract = None
+        self.assertIs(worker.disaggregation_draft_kv_pool, pool)
+
     def test_shared_head_transform_applies_once_in_fp32_before_markov(self):
         transform = SharedHeadTransform.decode(
             '{"logit_scale":0.5,"final_logit_softcapping":2.0}'

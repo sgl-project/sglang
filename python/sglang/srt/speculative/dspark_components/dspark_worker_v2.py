@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import Optional
 
 import torch
+
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -146,12 +147,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             if (
                 parallel.pp_size != 1
                 or parallel.dp_size != 1
-                or get_disagg().disaggregation_mode != "null"
+                or (
+                    get_disagg().disaggregation_mode != "null"
+                    and get_disagg().disaggregation_transfer_backend != "mooncake"
+                )
                 or get_lora().enable_lora
             ):
                 raise ValueError(
                     "target-KV DSpark currently requires PP=DP=1, "
-                    "no disaggregation and no LoRA"
+                    "Mooncake for disaggregation and no LoRA"
                 )
             self._capture_hidden_mode = CaptureHiddenMode.NULL
         self._draft_sampler = None
@@ -322,8 +326,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
         )
 
-        if self._is_pd_prefill and not self._draft_is_moe:
+        if (
+            self._is_pd_prefill
+            and not self._draft_is_moe
+            and self._target_kv_contract is None
+        ):
             self.draft_model.prune_to_ctx_kv_injection()
+
+    @property
+    def disaggregation_draft_kv_pool(self):
+        # KV-input drafts project the received target prefix on D. Transferring
+        # a P-side projection would couple the two draft versions and caches.
+        if self._target_kv_contract is not None:
+            return None
+        return self.primary_draft_kv_pool
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -488,7 +504,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._target_kv_contract is not None:
             # Include cached target prefixes whose draft projection may have
             # been evicted or may belong to a previous request.
-            self._kv_injector.ensure_context(batch)
+            if not self._is_pd_prefill:
+                self._kv_injector.ensure_context(batch)
             batch_output.next_draft_input = make_next_draft_input(
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,

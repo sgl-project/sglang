@@ -43,8 +43,8 @@ it does not redefine the goal as the modules already implemented.
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit retract/resume | Real 256-token KV pool eviction, physical slot reuse, failed-capture exclusion and subsequent admission pass in synchronous and overlap/graph modes; automatic AR OOM remains open |
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes in all four synchronous/overlap and eager/graph combinations; failed captures are excluded and fresh capture admission recovers |
-| PD collection | D-owned complete snapshot with fenced first-teacher handoff and TP cohort publication | Real P1/D1, P1/D2, P2/D1 and P2/D2 pass eager and graph/overlap, exact source parity, batches, prefix reuse and failed/aborted sample exclusion; PD PP/speculation and RDMA remain open |
-| Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark and matching/asymmetric TP AR PD have runtime evidence below; combined topologies, PD speculation, RDMA and workload SLO gates remain open |
+| PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2 passes eager and graph/overlap, exact source parity, batches, prefix reuse and failed/aborted sample exclusion; pipeline speculation and RDMA remain open |
+| Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark, TP/PP AR PD and TP1/TP2 target-KV DSpark PD have runtime evidence below; combined topologies, pipeline speculation, RDMA and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
 `/gpfs/users/fuxuanwei-1/dspark-maas-lab/state`):
@@ -2418,6 +2418,83 @@ P PP1 to D PP2 is still unsupported by that transport. The runtime evidence
 does not certify combined TP2/PP2, PD speculation, DP/CP, cross-node RDMA,
 production Catalog retention, trained draft quality or performance acceptance.
 
+## PD DSpark Capture And KV-Input Draft Context
+
+Mooncake PD now captures the real DSpark accepted target path. D selects
+`pd_speculative_accepted_target_path`, including its PD-aware cohort coordinator
+for TP. P supplies the first raw teacher row; subsequent rows come from target
+verify on D. Finalization trims the accepted window to the actual length/EOS
+boundary even without overlap. A computed terminal token may have valid KV;
+an unforwarded bonus remains invalid. Neither case needs an extra target forward.
+
+`BaseSpecWorker.disaggregation_draft_kv_pool` defaults to the existing primary
+draft pool. Target-KV DSpark returns no draft transfer pool: P may run only the
+target, and D projects its received canonical target prefix before proposals.
+P with a target-KV draft skips both prefix projection and legacy hidden-input
+pruning. The ordinary incremental injector handles later accepted verify rows.
+Existing hidden-input drafts retain their P-side projection and draft-KV
+transfer. Mooncake's KV/aux wire format is unchanged.
+
+The core serving restriction against decode radix cache with speculation still
+applies. Speculative D uses chunk cache, while P retains radix prefix reuse.
+The independent source observer reads canonical P slots at actual KV sends,
+including cached-prefix sends before P capture admission. Forward-time raw
+logits remain a separate reference. This avoids comparing against a newly
+computed KV row that radix insertion subsequently replaces before transmission.
+The initial configuration failure and both observer failures are retained in
+`experiments/capture-pd-dspark.json`, with their original log hashes.
+
+The following complete files pass separately on real Qwen3-0.6B workers:
+
+| Test File | Coverage | Tests | Seconds |
+| --- | --- | --- | --- |
+| `test_training_capture_pd_dspark.py` | TP1, P target-only or P/D draft, eager/graph | 4 | 326.078 |
+| `test_training_capture_pd_dspark_tp.py` | TP2 P/D target-KV draft serving/capture | 2 | 292.035 |
+| `test_training_capture_pd_dspark_hidden.py` | Hidden-input static/cap-accept/compact, eager/graph | 6 | 387.899 |
+| `test_training_capture_pd.py` | AR TP1 PD regression | 2 | 133.186 |
+| `test_training_capture_pd_pp.py` | AR PP2 P/D regression | 2 | 139.700 |
+| `test_training_capture_distributed.py` | Ordinary TP/PP AR and TP static/ragged DSpark | 4 | 414.498 |
+
+The twelve new speculative cases publish 72 complete samples and exclude
+36 selected missing-handoff, stale-handoff and cancelled requests. Separate
+Store readers compare every selected KV value and raw top-128 score/ID exactly;
+full-vocabulary LSE uses `rtol=atol=1e-6`. Tokens, positions, prompt/response
+masks, validity and accepted/terminal boundaries are also checked. Each case
+includes a one-token response, a 153-token chunked prompt, prefix reuse,
+rejection/full acceptance and a real two-request decode batch. D's selected
+source frames are all verify frames, with no target prefill added for capture.
+
+Target-KV observations validate rebuilding the received prefix and incremental
+projection; graph cases execute actual target verify graphs with overlap.
+Ragged cases require unequal verification budgets and cap trimming. Compact
+graph cases additionally require padded verify input and folded acceptance.
+All cases require drained capture work and zero quarantined Host slots after
+cancellation. The AR PD regressions independently publish 20 more snapshots
+and exclude 12 fault/cancellation samples. Two seed snapshots used solely to
+construct synthetic KV-input checkpoints are outside those counts.
+
+Six unit files pass 93 tests: 12 PD capture, 23 target-KV draft, eight config,
+46 coordinator, three cohort coordinator and one four-process startup rollback
+test. New assertions cover PD EOS/length truncation after accepted verify and
+draft-pool transfer selection. The total is 113 passing tests. All 15 changed
+Python files pass Black, isort, repository Ruff and compilation; new runtime
+helpers/tests pass broader Ruff, and registered-test validation passes.
+The GPU checkout matches the final source hashes.
+
+The temporary two-H100 job `job-d620696841be-20261002034031` on node189 was
+deleted after all serving/Store processes and GPU allocations were released.
+The resident H100 has no queued or active experiment and has resumed idle load.
+The original checkout's staged-index digest is unchanged. A failed temporary
+job caused by a malformed launcher command was also deleted after confirming
+its terminal exit. Commands, source/log hashes, counters and cleanup evidence
+are recorded in `experiments/capture-pd-dspark.json`.
+
+These are synthetic untrained drafts and TCP correctness tests. They do not
+certify useful acceptance/throughput, trained exports, production Catalog
+retention, cross-node RDMA, pipeline speculation, combined TP/PP, DP/CP or
+other model identities. Target-KV v1 remains static verify; confidence-scheduled
+ragged verification here uses the existing hidden-input draft path.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -2427,12 +2504,14 @@ production Catalog retention, trained draft quality or performance acceptance.
    checkpoints, complete exporter compatibility and artifact/quality validation.
 3. Extend P9's real TP2/PP1 and TP1/PP2 Qwen3 capture validation to combined
    TP2/PP2, replicated heads, distributed cancellation/backpressure and additional
-   model identities. Complete pipeline speculative collection,
-   speculative PD and cross-node RDMA. AR PD now transfers the
+   model identities. Complete pipeline speculative collection, extend real
+   speculative PD topology coverage and validate cross-node RDMA. AR PD transfers the
    first teacher row and publishes from D across matching/asymmetric TP groups
    and matching/reduced PP groups supported by the Mooncake transport.
    Ordinary AR uses the distributed serving
    path, and static and confidence-scheduled DSpark capture support TP. The
+   target-KV PD path reconstructs draft context from D's received target prefix,
+   with TP1/TP2 real-request validation. The
    target-KV v1 draft remains static by checkpoint contract; the remaining
    capability gates do not constitute implementation of those paths.
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to

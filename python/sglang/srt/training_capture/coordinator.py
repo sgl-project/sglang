@@ -167,7 +167,7 @@ class CaptureCoordinator:
             else "autoregressive"
         )
         if disaggregation_mode == "decode":
-            capture_mode = "pd_autoregressive"
+            capture_mode = "pd_" + capture_mode
 
         def prepare_local():
             if distributed:
@@ -929,9 +929,9 @@ class CaptureCoordinator:
             return
         try:
             self._commit(req, record)
-            if (
-                self.enable_overlap
-                or record.provenance.capture_mode == "speculative_accepted_target_path"
+            if self.enable_overlap or record.provenance.capture_mode in (
+                "speculative_accepted_target_path",
+                "pd_speculative_accepted_target_path",
             ):
                 record.context.trim_terminal_prefix()
             if isinstance(req.finished_reason, FINISH_LENGTH):

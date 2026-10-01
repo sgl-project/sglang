@@ -796,9 +796,10 @@ PD 的 TransferEngine KV 交接不是 Store 样本提交，两个完成事件分
 
 #### 13.3.1 当前实现: D 统一导出与发布
 
-`pd_capture.py` 实现 D 统一导出路径。当前接入 Mooncake backend、普通 AR、
-DP=1，支持 TP 分片与 PP；PD speculative 和跨节点 RDMA
-仍需后续实现与验证。P/D 的 TP 数可以不同，模型必须满足全局 teacher/KV 契约。
+`pd_capture.py` 实现 D 统一导出路径。当前接入 Mooncake backend、DP=1，
+普通 AR 支持 TP 分片与 PP；DSpark 推测采集支持 TP、要求 PP=1。
+PP speculative 和跨节点 RDMA 仍需后续实现与验证。
+AR 的 P/D TP 数可以不同，模型必须满足全局 teacher/KV 契约。
 PP 遵守现有 Mooncake 传输约束：P/D 的 PP 数相同，或 D 的 PP 数为 1；
 P=PP1、D=PP2 等展开拓扑仍不受底层传输支持。
 不允许 optimistic prefill，因为 P 必须在 forward 前收到 D 的采集上下文。
@@ -819,7 +820,7 @@ P=PP1、D=PP2 等展开拓扑仍不受底层传输支持。
 4. D 只有在原有 KV/metadata 完成检查通过后才消费 handoff，校验完整上下文、首 token
    与 teacher 行。`accept_pd_handoff(req, payload)` 从 D 的 canonical slots 导出完整
    prompt KV，包括已有的有效缓存前缀；首条 teacher 对齐绝对位置 `prompt_length`。
-   后续 decode 复用普通 AR 采集与 manifest-last 发布。只有一个回复 token 时也必须
+   后续 decode 复用 AR 或 DSpark accepted-path 采集与 manifest-last 发布。只有一个回复 token 时也必须
    完成这一交接；未计算的最后 token KV 仍以 `kv_valid=0` 表示。
 5. 缺失、损坏、过期代次或不匹配的 handoff 使该采集失败，正常生成继续。相同重复
    控制消息幂等；冲突重复消息使 handoff 无效；房间清理后的迟到消息不重新建立状态。
@@ -851,6 +852,28 @@ bootstrap-room 元数据已经落地，再求 PP 交集，之后才允许各级�
 否则先完成的级会移除请求，元数据晚到的级无法再次形成交集，造成采集与生成停滞。
 D 各级只导出所属全局层，最后一级的 aux owner 保存 teacher；完整分片收齐后发布。
 PP 的 CUDA Graph 路径仍遵守 serving 要求，关闭 overlap schedule。
+
+DSpark 的 D 使用 `pd_speculative_accepted_target_path` 标记 provenance；
+cohort factory 为这一模式创建 `CohortDecodeCaptureCoordinator`。首条 teacher 来自 P，
+后续 teacher 来自 D 的真实 target verify；只提交 accepted path，最终按实际 EOS/长度
+边界裁剪 token、teacher 和 KV。不为采集额外运行 D prefill 或补算最后 token。
+未 forward 的 bonus token 标记 `kv_valid=0`；若终止 token 已在接受窗口中 forward，
+其 KV 可以有效。两种情况都不能把窗口中被截掉的 token 写入最终样本。
+
+`BaseSpecWorker.disaggregation_draft_kv_pool` 声明需要随 target KV 传输的 draft pool，
+默认沿用 `primary_draft_kv_pool`。target-KV DSpark 返回 `None`，因此 P 无需加载同一个
+draft，也不发送已投影 draft KV。D 在 proposal 前从收到的 canonical target prefix
+调用现有 `ensure_context()`，按 checkpoint encoder 投影为本地 draft KV；后续只追加
+已接受 verify token 的投影。这个过程读取目标层 KV，不重新执行目标模型 prefill。
+P 若加载 target-KV draft，也跳过 prefix 投影和 legacy hidden-input 的 pruning。
+已有 hidden-input DSpark 保留 P 投影并传输 draft KV 的路径，需要兼容的 P/D draft。
+
+PD decode radix cache 与推测解码的现有 serving 校验仍生效：DSpark 的 D 使用 chunk
+cache，P 保留 radix 前缀复用。独立验证在 P 实际发送 KV 前观察 canonical 槽位，包括
+采集上下文绑定前发生的 cached-prefix early send；原始 teacher 仍在 forward 后、采样
+处理前观察。不能用 radix 插入之前的重算 KV 作为实际传输值的参考。
+target-KV v1 checkpoint 仍限定 static verify；legacy hidden-input draft 的
+cap-accept/compact 按原有 ragged verify 布局采集。
 
 两端均传入 `--training-capture-config`，teacher identity、选层和 KV 契约必须一致；
 `journal_directory` 可按 P/D 使用不同本地目录。只有 D 实际连接配置中的 Catalog

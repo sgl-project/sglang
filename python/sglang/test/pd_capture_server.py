@@ -1,6 +1,7 @@
 """Test-only P source observations and handoff faults in spawned workers."""
 
 import hashlib
+import importlib
 import itertools
 import json
 import os
@@ -12,6 +13,7 @@ import msgspec
 import torch
 
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.distributed import (
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
@@ -19,22 +21,21 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.training_capture.coordinator import CaptureCoordinator
 from sglang.srt.training_capture.pd_capture import PrefillCaptureCoordinator
 from sglang.srt.training_capture.pd_protocol import (
     PrefillTeacherHandoff,
     decode_handoff,
     encode_handoff,
 )
-from sglang.test.dspark_capture_observer import observe
+from sglang.test.dspark_capture_observer import install_capture_observer
 
 _pools = {}
 _sequence = itertools.count()
 _init = TpModelWorker.init_training_capture
 _prefill_forward = PrefillCaptureCoordinator.after_forward
-_decode_forward = CaptureCoordinator.after_forward
 _handoff = PrefillCaptureCoordinator.finish_handoff
 _prebuilt = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch
+_send_kv_chunk = SchedulerDisaggregationPrefillMixin.send_kv_chunk
 
 
 def observe_stage_state(capture, stage):
@@ -79,7 +80,6 @@ def observed_init(self, **kwargs):
 
 
 def observed_prefill(self, batch, forward_batch, logits_output, **kwargs):
-    pool, req_pool = _pools[id(self)]
     root = Path(self.config.journal_directory).parent / "capture-reference"
     rank = get_tensor_model_parallel_rank()
     root = root / f"pp{get_pipeline_model_parallel_rank()}" / f"tp{rank}"
@@ -88,7 +88,6 @@ def observed_prefill(self, batch, forward_batch, logits_output, **kwargs):
         if req.training_capture_pd is None:
             continue
         end = int(batch.seq_lens_cpu[row])
-        slots = req_pool.req_to_token[req.req_pool_idx, :end].long()
         last = end == len(req.origin_input_ids) and logits_output is not None
         torch.save(
             {
@@ -98,15 +97,7 @@ def observed_prefill(self, batch, forward_batch, logits_output, **kwargs):
                 "pp_rank": get_pipeline_model_parallel_rank(),
                 "tokens": list(req.origin_input_ids[:end]),
                 "kv_start": 0,
-                "kv": {
-                    f"target_{component}.{layer}": buffer[slots].cpu()
-                    for layer in self.kv.selected_layer_ids
-                    if pool.start_layer <= layer < pool.start_layer + pool.layer_num
-                    for component, buffer in (
-                        ("k", pool.get_key_buffer(layer)),
-                        ("v", pool.get_value_buffer(layer)),
-                    )
-                },
+                "kv": {},
                 "predictions": [end] if last else [],
                 "logits": (
                     logits_output.next_token_logits[
@@ -125,9 +116,54 @@ def observed_prefill(self, batch, forward_batch, logits_output, **kwargs):
     return _prefill_forward(self, batch, forward_batch, logits_output, **kwargs)
 
 
-def observed_decode(self, batch, forward_batch, logits_output, **kwargs):
-    observe(self, batch, forward_batch, logits_output, **kwargs)
-    return _decode_forward(self, batch, forward_batch, logits_output, **kwargs)
+def observed_send(self, req, last_chunk=False, end_idx=None):
+    capture = self.tp_worker.training_capture
+    # Cached-prefix sends can precede capture admission on P. Observe every
+    # send; the reader selects the references by the published trace ID.
+    if capture is not None:
+        pool, req_pool = _pools[id(capture)]
+        start = req.start_send_idx
+        end = (
+            end_idx
+            if end_idx is not None
+            else min(req.extend_range.end, len(req.origin_input_ids))
+        )
+        if not last_chunk:
+            end -= end % self.token_to_kv_pool_allocator.page_size
+        if start < end:
+            # Radix insertion can replace newly computed rows before transfer.
+            # Observe the canonical source slots that the sender will read.
+            slots = req_pool.req_to_token[req.req_pool_idx, start:end].long()
+            root = Path(capture.config.journal_directory).parent / "capture-reference"
+            rank = get_tensor_model_parallel_rank()
+            stage = get_pipeline_model_parallel_rank()
+            root = root / f"pp{stage}" / f"tp{rank}"
+            root.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "trace_id": hashlib.sha256(req.rid.encode()).hexdigest(),
+                    "tp_rank": rank,
+                    "tp_size": get_tensor_model_parallel_world_size(),
+                    "pp_rank": stage,
+                    "tokens": list(req.origin_input_ids[:end]),
+                    "kv_start": start,
+                    "kv": {
+                        f"target_{component}.{layer}": buffer[slots].cpu()
+                        for layer in capture.kv.selected_layer_ids
+                        if pool.start_layer <= layer < pool.start_layer + pool.layer_num
+                        for component, buffer in (
+                            ("k", pool.get_key_buffer(layer)),
+                            ("v", pool.get_value_buffer(layer)),
+                        )
+                    },
+                    "predictions": [],
+                    "logits": torch.empty(0, capture.teacher.vocab_size),
+                    "batch_size": 1,
+                    "cuda_graph": False,
+                },
+                root / f"transfer-{next(_sequence):06d}.pt",
+            )
+    return _send_kv_chunk(self, req, last_chunk=last_chunk, end_idx=end_idx)
 
 
 def handoff_faults(self, req):
@@ -162,8 +198,18 @@ def grouped_prebuilt(self, running_batch):
 TpModelWorker.init_training_capture = observed_init
 PrefillCaptureCoordinator.after_forward = observed_prefill
 PrefillCaptureCoordinator.finish_handoff = handoff_faults
-CaptureCoordinator.after_forward = observed_decode
+install_capture_observer()
+if "--speculative-draft-model-path" in sys.argv:
+    draft_path = Path(sys.argv[sys.argv.index("--speculative-draft-model-path") + 1])
+    if (
+        json.loads((draft_path / "config.json").read_text()).get("input_mode")
+        == "target_kv"
+    ):
+        importlib.import_module("sglang.test.dspark_target_kv_server")
+    else:
+        importlib.import_module("sglang.test.dspark_capture_server")
 SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch = grouped_prebuilt
+SchedulerDisaggregationPrefillMixin.send_kv_chunk = observed_send
 
 
 if __name__ == "__main__":

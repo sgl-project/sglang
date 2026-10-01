@@ -174,6 +174,10 @@ class BaseSpecWorker(ABC):
         return draft_runners[0].token_to_kv_pool if draft_runners else None
 
     @property
+    def disaggregation_draft_kv_pool(self) -> Optional[object]:
+        return self.primary_draft_kv_pool
+
+    @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
 
