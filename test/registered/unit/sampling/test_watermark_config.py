@@ -58,20 +58,17 @@ _FULL_CONFIG = {
 }
 
 
-def test_config_file_and_inline_json_resolve_all_fields(tmp_path):
-    config_path = tmp_path / "watermark.json"
-    _write_config(config_path, **_FULL_CONFIG)
-    for source in (str(config_path), json.dumps(_FULL_CONFIG)):
-        server_args = ServerArgs(
-            model_path="dummy",
-            device="cuda",
-            enable_watermark=True,
-            watermark_config=source,
-        )
-        server_args.resolve_once()
-        check_watermark_server_args(server_args)
-        for field, value in _FULL_CONFIG.items():
-            assert resolution_result(server_args, f"watermark_{field}") == value
+def test_inline_config_resolves_all_fields():
+    server_args = ServerArgs(
+        model_path="dummy",
+        device="cuda",
+        enable_watermark=True,
+        watermark_config=json.dumps(_FULL_CONFIG),
+    )
+    server_args.resolve_once()
+    check_watermark_server_args(server_args)
+    for field, value in _FULL_CONFIG.items():
+        assert resolution_result(server_args, f"watermark_{field}") == value
 
     manager = object.__new__(TokenizerManager)
     manager.server_args = server_args

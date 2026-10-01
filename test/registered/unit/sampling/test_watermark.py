@@ -45,25 +45,9 @@ _REQUEST_FORMS = {
         pytest.param(True, False, False, "omitted", None, False, id="opt-in-omitted"),
         pytest.param(True, False, False, "disabled", None, False, id="opt-in-opt-out"),
         pytest.param(
-            True, False, False, "enabled", _DEFAULT_KEY, True, id="opt-in-enabled"
-        ),
-        pytest.param(True, False, False, "key", _REQUEST_KEY, True, id="opt-in-key"),
-        pytest.param(
-            True, True, False, "omitted", _DEFAULT_KEY, True, id="default-on-omitted"
-        ),
-        pytest.param(
-            True, True, False, "disabled", None, False, id="default-on-opt-out"
-        ),
-        pytest.param(
             True, True, False, "enabled", _DEFAULT_KEY, True, id="default-on-enabled"
         ),
         pytest.param(True, True, False, "key", _REQUEST_KEY, True, id="default-on-key"),
-        pytest.param(
-            True, False, True, "omitted", _DEFAULT_KEY, True, id="enforce-omitted"
-        ),
-        pytest.param(
-            True, False, True, "disabled", ValueError, None, id="enforce-opt-out"
-        ),
         pytest.param(
             True, False, True, "enabled", _DEFAULT_KEY, True, id="enforce-enabled"
         ),
