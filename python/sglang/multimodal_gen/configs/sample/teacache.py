@@ -63,8 +63,10 @@ class TeaCacheParams(CacheParams):
         return self.coefficients
 
     def get_skip_boundaries(
-        self, num_inference_steps: int, do_cfg: bool
+        self, num_inference_steps: int, do_cfg: bool, *, cfg_parallel: bool = False
     ) -> tuple[int, int]:
+        """Return skip boundaries measured in local transformer forward calls."""
+
         def _resolve_boundary(value: int | float) -> int:
             if isinstance(value, float):
                 return int(num_inference_steps * value)
@@ -75,7 +77,8 @@ class TeaCacheParams(CacheParams):
         start_skipping = _resolve_boundary(self.start_skipping)
         end_skipping = _resolve_boundary(self.end_skipping)
 
-        if do_cfg:
+        # Only serial CFG executes both branches on the same model instance.
+        if do_cfg and not cfg_parallel:
             start_skipping *= 2
             end_skipping *= 2
 
