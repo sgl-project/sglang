@@ -51,10 +51,10 @@ DEEPSEEK_V41_FLASH_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V41_FLASH_MODEL_PATH", "deepseek-ai/DeepSeek-V4.1-Flash"
 )
 SERVER_LAUNCH_TIMEOUT = 5400
-# sgl-project/sglang#41308 measured 0.870-0.890 with the High-Throughput cell
-# on 200 questions at TP4 on MI350X. Provisional until a full 1319-question
-# nightly run replaces it.
-ACCURACY_THRESHOLD = 0.86
+# Measured 0.911 on all 1319 questions with the High-Throughput cell at TP4 on
+# MI35x (rocm10, sgl-project/sglang Actions run 36797490320). The threshold
+# sits 0.02 under that.
+ACCURACY_THRESHOLD = 0.89
 TP_SIZE = 4
 
 
