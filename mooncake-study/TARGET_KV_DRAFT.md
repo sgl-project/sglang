@@ -244,6 +244,44 @@ the prefix length current even with a backend such as Triton that otherwise
 uses only device lengths. All projection and capture copies remain on the
 ordered forward stream; the latest capture event fences writer ownership.
 
+### Batched KV D2H
+
+Optional capture-configuration fields batch short KV ranges in a request-owned
+device arena before copying them to the existing registered Host tensors:
+
+```json
+{
+  "kv_d2h_batch_tokens": 16,
+  "max_device_bytes": 16777216
+}
+```
+
+The default batch size is one and allocates no device staging. A larger batch
+requires an explicit positive device budget. The arena capacity is the smaller
+of the batch size and `max_sample_tokens`; its allocation covers all selected
+K/V components and all `max_inflight_samples` slots, including alignment gaps.
+The budget is checked before any Host registration. It bounds staging tensor
+bytes, not CUDA allocator reservations, model KV, teacher scores or transient
+gathers used by large prefill ranges.
+
+Large contiguous token ranges still go directly to Host. Short ranges gather
+into the private arena immediately, so serving KV slots can be reused normally.
+A full staging batch queues D2H on the producer stream before reusing the arena.
+Sealing flushes the tail on that stream, even when finalization is called from
+another stream context. The final completion event also covers earlier capture
+streams. The writer waits for this event before constructing Store objects.
+
+Abort/retraction discards the pending, unpublished tail and still waits for
+already queued GPU operations. Host and device storage share a slot lease and
+are both retained when transfer completion is uncertain. Stored tensor shapes,
+checksums, keys and the training contract are unchanged; this optimization does
+not add a target forward or retain rejected speculative tokens in a snapshot.
+
+`/server_info` exposes `host_pool.device_allocated_bytes` and
+`host_pool.device_limit_bytes`. With metrics enabled, the corresponding series
+are `sglang:training_capture_kv_staging_allocated_bytes` and
+`sglang:training_capture_kv_staging_limit_bytes`.
+
 ## Verification
 
 `python -m sglang.test.dspark_target_kv_parity --checkpoint /models/kv-draft

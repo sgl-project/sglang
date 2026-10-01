@@ -97,6 +97,8 @@ class CaptureConfig(StrictStruct):
     max_sample_tokens: Annotated[int, msgspec.Meta(ge=2, le=2147483647)] = 8192
     max_inflight_samples: Positive = 4
     max_host_bytes: Positive = 512 << 20
+    kv_d2h_batch_tokens: Positive = 1
+    max_device_bytes: Nonnegative = 0
     manifest_buffer_bytes: Positive = 1 << 20
     storage_chunk_tokens: Positive = 256
     replica_num: Positive = 1
@@ -129,6 +131,8 @@ class CaptureConfig(StrictStruct):
             raise ContractError("capture requires a Catalog HTTP endpoint")
         if not Path(config.journal_directory).is_absolute():
             raise ContractError("capture journal directory must be absolute")
+        if config.kv_d2h_batch_tokens > 1 and not config.max_device_bytes:
+            raise ContractError("batched KV D2H requires a device staging budget")
         if config.adaptive is not None:
             config.adaptive.validate()
         return config

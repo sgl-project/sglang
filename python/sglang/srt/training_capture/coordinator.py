@@ -180,6 +180,9 @@ class CaptureCoordinator:
             registrar=store,
             manifest_bytes=config.manifest_buffer_bytes,
             pin_memory=pin_memory,
+            device=exporter.device,
+            kv_d2h_batch_tokens=config.kv_d2h_batch_tokens,
+            max_device_bytes=config.max_device_bytes,
         )
         try:
             self.journal = PublicationJournal(config.journal_directory)

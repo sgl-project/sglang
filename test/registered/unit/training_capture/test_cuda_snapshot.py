@@ -1,11 +1,13 @@
 """CUDA source-reuse checks for independent teacher/KV snapshots."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 from sglang.srt.training_capture.context import RequestCaptureContext
 from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
+from sglang.srt.training_capture.protocol import CaptureError, ContractError
 from sglang.srt.training_capture.teacher import capture_teacher
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -19,7 +21,14 @@ class TestCudaSnapshot(CustomTestCase):
     def test_finalization_waits_for_last_lookahead_copy_on_forward_stream(self):
         kv = make_kv_spec()
         pool = HostBufferPool(
-            kv=kv, max_tokens=8, slots=1, max_bytes=2 << 20, registrar=Registrar()
+            kv=kv,
+            max_tokens=8,
+            slots=1,
+            max_bytes=2 << 20,
+            registrar=Registrar(),
+            device=torch.device("cuda"),
+            kv_d2h_batch_tokens=2,
+            max_device_bytes=1 << 20,
         )
         slot = pool.acquire()
         context = RequestCaptureContext(
@@ -124,6 +133,129 @@ class TestCudaSnapshot(CustomTestCase):
         )
         pool.release(slot, transfer_complete=True)
         pool.close()
+
+    def test_tail_fence_failure_quarantines_host_and_device_storage(self):
+        kv = make_kv_spec()
+        pool = HostBufferPool(
+            kv=kv,
+            max_tokens=8,
+            slots=1,
+            max_bytes=2 << 20,
+            registrar=Registrar(),
+            device=torch.device("cuda"),
+            kv_d2h_batch_tokens=3,
+            max_device_bytes=1 << 20,
+        )
+        slot = pool.acquire()
+        device_storage = slot.device_storage
+        context = RequestCaptureContext(
+            slot=slot, prompt_ids=(3,), max_tokens=8, vocab_size=256
+        )
+        source = {
+            name: torch.ones(16, 2, 4, dtype=torch.bfloat16, device="cuda")
+            for name in slot.device_tensors
+        }
+        context.export_kv(
+            SelectedLayerKVExporter(kv, source), torch.tensor([7], device="cuda"), end=1
+        )
+        context.record_teacher(
+            capture_teacher(torch.arange(256, device="cuda").float()[None], 256),
+            row=0,
+            position=1,
+        )
+        context.commit_token(position=1, token_id=255)
+        try:
+            with (
+                patch("torch.cuda.Event", side_effect=RuntimeError("event failure")),
+                self.assertRaisesRegex(RuntimeError, "event failure"),
+            ):
+                context.seal("length")
+            self.assertTrue(context.transfer_uncertain)
+            context.abort("copy_completion_uncertain")
+            with self.assertRaisesRegex(ContractError, "uncertain"):
+                context.wait_for_copies()
+            pool.release(slot, transfer_complete=False)
+            self.assertIsNone(pool.acquire())
+            with self.assertRaises(CaptureError):
+                pool.close()
+            self.assertIs(pool.slots[0].device_storage, device_storage)
+        finally:
+            torch.cuda.synchronize()
+
+    def test_full_staging_reuse_and_cross_stream_tail_preserve_exact_kv(self):
+        kv = make_kv_spec()
+        pool = HostBufferPool(
+            kv=kv,
+            max_tokens=8,
+            slots=1,
+            max_bytes=2 << 20,
+            registrar=Registrar(),
+            device=torch.device("cuda"),
+            kv_d2h_batch_tokens=3,
+            max_device_bytes=1 << 20,
+        )
+        slot = pool.acquire()
+        context = RequestCaptureContext(
+            slot=slot, prompt_ids=(3, 4), max_tokens=8, vocab_size=256
+        )
+        indices = torch.tensor([7, 1, 12, 3, 9], device="cuda", dtype=torch.int32)
+        sources = {
+            name: torch.arange(16 * 8, device="cuda").reshape(16, 2, 4).bfloat16()
+            for name in slot.device_tensors
+        }
+        expected = {name: value[indices].cpu() for name, value in sources.items()}
+        for name in sources:
+            slot.tensors[name].fill_(-5)
+        exporter = SelectedLayerKVExporter(kv, sources)
+        first, second = torch.cuda.Stream(), torch.cuda.Stream()
+        first.wait_stream(torch.cuda.current_stream())
+        try:
+            with torch.cuda.stream(first):
+                torch.cuda._sleep(2000000)
+                context.export_kv(exporter, indices[:2], end=2)
+                context.record_teacher(
+                    capture_teacher(
+                        torch.arange(256, device="cuda").float()[None], 256
+                    ),
+                    row=0,
+                    position=2,
+                )
+                context.commit_token(position=2, token_id=255)
+            with torch.cuda.stream(second):
+                context.export_kv(exporter, indices[2:3], end=3)
+                context.record_teacher(
+                    capture_teacher(
+                        torch.arange(256, device="cuda").float()[None], 256
+                    ),
+                    row=0,
+                    position=3,
+                )
+                context.commit_token(position=3, token_id=255)
+                context.export_kv(exporter, indices[3:], end=5)
+                context.record_teacher_range(
+                    capture_teacher(
+                        torch.arange(256, device="cuda").float().repeat(2, 1), 256
+                    ),
+                    row=0,
+                    position=4,
+                    count=2,
+                )
+                context.commit_token(position=4, token_id=255)
+                context.commit_token(position=5, token_id=255)
+                for value in sources.values():
+                    value.zero_()
+            context.seal("length")
+            context.wait_for_copies()
+            for name, reference in expected.items():
+                torch.testing.assert_close(
+                    slot.tensors[name][:5], reference, rtol=0, atol=0
+                )
+                self.assertTrue((slot.tensors[name][5:] == -5).all())
+        finally:
+            first.synchronize()
+            second.synchronize()
+            pool.release(slot, transfer_complete=True)
+            pool.close()
 
 
 if __name__ == "__main__":

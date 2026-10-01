@@ -232,6 +232,21 @@ scope, raw paths/hashes and two bracketed rounds of 0.1%, 1% and 10% sampling.
 [`capture-profile-analysis.md`](capture-profile-analysis.md) records the source
 attribution and the limits of the profiler's optimization suggestions.
 
+Both benchmark and profiler drivers accept `--kv-d2h-batch-tokens 16
+--device-mib 16` to exercise bounded KV staging. Without these arguments they
+retain direct per-forward D2H. Keep sampling rates, lengths, concurrency and
+bracketed capture-off phases identical when comparing runs. The batch option
+does not alter the Store layout or change the amount of committed training data.
+The profiler adds a separate `training_capture.kv_d2h` scope for staging flushes;
+sum its D2H activity with that in `training_capture.kv`, which still covers
+large prefill transfers. The normal runtime correctness test enables 16-token
+staging across its AR, DSpark, graph, overlap and failure scenarios; CUDA unit
+tests also retain direct-transfer coverage.
+[`capture-batched-kv-d2h.json`](capture-batched-kv-d2h.json) retains the 16-token
+H100 results: decode KV DMA calls fall from 7,920 to 720 with unchanged bytes;
+the two normal 10%-capture phases still lose 15.5% and 16.3% throughput against
+their bracketed off baselines. Reduced DMA work alone is not a service SLO.
+
 ### BF16 Rounding Isolation
 
 The actual fixed-input parity command remains the serving gate. The following

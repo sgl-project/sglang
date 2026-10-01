@@ -28,6 +28,8 @@ class HostSlot(msgspec.Struct, eq=False):
     tensors: dict[str, torch.Tensor]
     manifest_buffer: torch.Tensor
     state: str = "free"
+    device_storage: torch.Tensor | None = None
+    device_tensors: dict[str, torch.Tensor] | None = None
 
 
 class HostBufferPool:
@@ -47,16 +49,24 @@ class HostBufferPool:
         registrar: BufferRegistrar,
         manifest_bytes: int = 1 << 20,
         pin_memory: bool = True,
+        device: torch.device | None = None,
+        kv_d2h_batch_tokens: int = 1,
+        max_device_bytes: int = 0,
     ):
         if min(max_tokens, slots, max_bytes, manifest_bytes) <= 0:
             raise ValueError("Host pool sizes must be positive")
+        if kv_d2h_batch_tokens < 1 or max_device_bytes < 0:
+            raise ValueError("invalid KV staging limits")
         specs = aux_specs(max_tokens, max_tokens)
+        kv_names = []
         for layer in kv.layers:
             for component, dim in (
                 ("k", layer.key_head_dim),
                 ("v", layer.value_head_dim),
             ):
-                specs[f"target_{component}.{layer.layer_id}"] = (
+                name = f"target_{component}.{layer.layer_id}"
+                kv_names.append(name)
+                specs[name] = (
                     kv.dtype,
                     [max_tokens, layer.num_kv_heads, dim],
                 )
@@ -73,10 +83,30 @@ class HostBufferPool:
             raise ValueError(
                 f"Host pool requires {slot_bytes * slots} bytes, budget is {max_bytes}"
             )
+        device_layout = {}
+        device_bytes = 0
+        if kv_d2h_batch_tokens > 1:
+            if device is None or not max_device_bytes:
+                raise ValueError("KV staging requires a device and a byte budget")
+            capacity = min(kv_d2h_batch_tokens, max_tokens)
+            for name in kv_names:
+                dtype, shape = specs[name]
+                shape = [capacity, *shape[1:]]
+                device_bytes = (device_bytes + 63) // 64 * 64
+                length = math.prod(shape) * ELEMENT_BYTES[dtype]
+                device_layout[name] = (device_bytes, length, dtype, shape)
+                device_bytes += length
+            if device_bytes * slots > max_device_bytes:
+                raise ValueError(
+                    f"KV staging requires {device_bytes * slots} bytes, "
+                    f"budget is {max_device_bytes}"
+                )
         self.registrar = registrar
         self.lock = threading.Lock()
         self.slots: list[HostSlot] = []
         self.allocated_bytes = 0
+        self.device_allocated_bytes = 0
+        self.device_limit_bytes = max_device_bytes
         self.closed = False
         try:
             for _ in range(slots):
@@ -90,9 +120,20 @@ class HostBufferPool:
                     for name, (start, length, dtype, shape) in layout.items()
                 }
                 slot = HostSlot(storage, views, storage[manifest_offset:])
+                if device_layout:
+                    slot.device_storage = torch.empty(
+                        device_bytes, dtype=torch.uint8, device=device
+                    )
+                    slot.device_tensors = {
+                        name: slot.device_storage[start : start + length]
+                        .view(DTYPES[dtype])
+                        .reshape(shape)
+                        for name, (start, length, dtype, shape) in device_layout.items()
+                    }
                 self.registrar.register(storage)
                 self.slots.append(slot)
                 self.allocated_bytes += slot_bytes
+                self.device_allocated_bytes += device_bytes
         except Exception:
             self.close()
             raise
@@ -117,6 +158,8 @@ class HostBufferPool:
         with self.lock:
             return {
                 "allocated_bytes": self.allocated_bytes,
+                "device_allocated_bytes": self.device_allocated_bytes,
+                "device_limit_bytes": self.device_limit_bytes,
                 **{
                     s: sum(slot.state == s for slot in self.slots)
                     for s in ("free", "filling", "quarantined")
@@ -135,4 +178,5 @@ class HostBufferPool:
                 self.registrar.unregister(slot.storage)
                 self.slots.pop()
             self.allocated_bytes = 0
+            self.device_allocated_bytes = 0
             self.closed = True

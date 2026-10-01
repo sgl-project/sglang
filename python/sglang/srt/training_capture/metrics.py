@@ -89,6 +89,12 @@ class CaptureMetrics:
         self.host_bytes = gauge(
             "host_allocated_bytes", "Allocated registered Host arena bytes."
         )
+        self.device_bytes = gauge(
+            "kv_staging_allocated_bytes", "Allocated KV staging tensor bytes."
+        )
+        self.device_limit = gauge(
+            "kv_staging_limit_bytes", "Configured KV staging tensor byte budget."
+        )
         self.occupancy = gauge(
             "occupied_fraction", "Busy or quarantined fraction of capture capacity."
         )
@@ -209,6 +215,8 @@ class CaptureMetrics:
             (self.adaptive, int(admission["adaptive"])),
             (self.queued, stats["queued"]),
             (self.host_bytes, stats["host_pool"]["allocated_bytes"]),
+            (self.device_bytes, stats["host_pool"]["device_allocated_bytes"]),
+            (self.device_limit, stats["host_pool"]["device_limit_bytes"]),
             (self.occupancy, stats["occupied_fraction"]),
             (self.writer_age, stats["writer_age_seconds"]),
             (self.cooldown, admission["cooldown_remaining_seconds"]),

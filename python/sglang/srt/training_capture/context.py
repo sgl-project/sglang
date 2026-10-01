@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 from sglang.srt.training_capture.host_pool import HostSlot
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
+from sglang.srt.training_capture.kv_staging import KVStaging
 from sglang.srt.training_capture.protocol import ContractError, SequenceInfo
 from sglang.srt.training_capture.snapshot import SnapshotMetadata, build_snapshot
 from sglang.srt.training_capture.teacher import TeacherRows
@@ -41,6 +44,12 @@ class RequestCaptureContext:
         self.kv_end = 0
         self.teacher_rows = 0
         self.last_event = None
+        self.last_stream = None
+        self.kv_staging = (
+            KVStaging(slot.device_tensors, slot.tensors)
+            if slot.device_tensors is not None
+            else None
+        )
         self.transfer_uncertain = False
         self.state = "COLLECTING"
         self.failure_reason = None
@@ -56,9 +65,13 @@ class RequestCaptureContext:
     def _record_completion(self, device):
         if device.type == "cuda":
             try:
+                stream = torch.cuda.current_stream(device)
+                if self.last_event is not None and stream != self.last_stream:
+                    stream.wait_event(self.last_event)
                 event = torch.cuda.Event()
-                event.record(torch.cuda.current_stream(device))
+                event.record(stream)
                 self.last_event = event
+                self.last_stream = stream
             except Exception:
                 self.transfer_uncertain = True
                 raise
@@ -73,8 +86,13 @@ class RequestCaptureContext:
             return
         start = self.kv_end
         try:
-            exporter.export(slots, self.slot.tensors, start, end)
+            if self.kv_staging is None:
+                exporter.export(slots, self.slot.tensors, start, end)
+            else:
+                self.kv_staging.export(exporter, slots, start=start, end=end)
         finally:
+            if self.kv_staging is not None and self.kv_staging.transfer_uncertain:
+                self.transfer_uncertain = True
             # Also fence copies queued before a later layer raises.
             self._record_completion(exporter.device)
         self.kv_end = end
@@ -191,6 +209,7 @@ class RequestCaptureContext:
         r = n - self.prompt_length
         if not r or r != self.teacher_rows or self.kv_end not in (n - 1, n):
             raise ContractError("cannot seal an incomplete response or KV prefix")
+        self._flush_kv()
         self.slot.tensors["token_ids"][:n].copy_(
             torch.tensor(self.token_ids, dtype=torch.int32)
         )
@@ -203,6 +222,21 @@ class RequestCaptureContext:
             stop_reason=stop_reason,
         )
         self.state = "SEALED"
+
+    def _flush_kv(self):
+        staging = self.kv_staging
+        if staging is None or staging.start == staging.end:
+            return
+        # Finalization may run outside the model's forward-stream context.
+        with (
+            torch.cuda.stream(staging.stream)
+            if staging.stream is not None
+            else nullcontext()
+        ):
+            try:
+                staging.flush()
+            finally:
+                self._record_completion(staging.device)
 
     def abort(self, reason: str):
         if self.state == "COLLECTING":

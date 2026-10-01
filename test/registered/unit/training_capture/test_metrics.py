@@ -27,6 +27,8 @@ class TestCaptureMetrics(CustomTestCase):
             "states": {"available": 1, "writing": 1},
             "host_pool": {
                 "allocated_bytes": 1024,
+                "device_allocated_bytes": 256,
+                "device_limit_bytes": 512,
                 "free": 0,
                 "filling": 2,
                 "quarantined": 0,
@@ -48,6 +50,8 @@ class TestCaptureMetrics(CustomTestCase):
         self.metrics.update(self.stats)
         self.assertEqual(self.value("events_total", event="admitted"), 2)
         self.assertEqual(self.value("reservations", state="writing"), 1)
+        self.assertEqual(self.value("kv_staging_allocated_bytes"), 256)
+        self.assertEqual(self.value("kv_staging_limit_bytes"), 512)
         self.stats["counters"]["ready"] = 2
         self.stats["states"] = {"available": 2}
         self.stats["writer_age_seconds"] = 0

@@ -196,7 +196,15 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 14, 27])
+    parser.add_argument("--kv-d2h-batch-tokens", type=int, default=1)
+    parser.add_argument("--device-mib", type=int, default=0)
     args = parser.parse_args()
+    if (
+        args.kv_d2h_batch_tokens < 1
+        or args.device_mib < 0
+        or (args.kv_d2h_batch_tokens > 1 and not args.device_mib)
+    ):
+        parser.error("Batched KV D2H requires positive batching and device budget")
     if (
         min(args.input_len, args.output_len, args.concurrency, args.steps) < 1
         or args.warmup_steps < 0

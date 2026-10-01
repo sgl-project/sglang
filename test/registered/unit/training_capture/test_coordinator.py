@@ -42,6 +42,8 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestCaptureCoordinator(CustomTestCase):
+    kv_d2h_batch_tokens = 1
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.catalog = TestCaptureCatalog()
@@ -63,6 +65,8 @@ class TestCaptureCoordinator(CustomTestCase):
             max_sample_tokens=8,
             max_inflight_samples=1,
             max_host_bytes=2 << 20,
+            kv_d2h_batch_tokens=self.kv_d2h_batch_tokens,
+            max_device_bytes=1 << 20 if self.kv_d2h_batch_tokens > 1 else 0,
             sample_ratio=1.0,
         )
         buffers = {
@@ -622,6 +626,10 @@ class TestCaptureCoordinator(CustomTestCase):
         self.assertEqual(actual.fingerprint, self.coordinator.config.fingerprint)
         with self.assertRaises(msgspec.ValidationError):
             msgspec.json.decode(b'{"unexpected": 1}', type=CaptureConfig)
+
+
+class TestStagedCaptureCoordinator(TestCaptureCoordinator):
+    kv_d2h_batch_tokens = 3
 
 
 if __name__ == "__main__":

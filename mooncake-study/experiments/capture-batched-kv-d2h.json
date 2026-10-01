@@ -1,0 +1,1887 @@
+{
+  "purpose": "Batch short selected-layer KV transfers into bounded request-owned GPU arenas",
+  "source_baseline": "3f9e45d725b47c1c203c133fed805c5bf57610fc",
+  "baseline_evidence": "capture-native-indices.json",
+  "environment_lock": "h100-runtime-lock.json",
+  "source_sha256": {
+    "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+    "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+    "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+    "python/sglang/srt/training_capture/config.py": "59220f129b22db6457b7d7632a6b19b6430f424744e68b4b8590f8eadb399c81",
+    "python/sglang/srt/training_capture/context.py": "3a4e04b2bb72489c80c2094cb19d8946c940a55a862b6c0235499bdf4b83a098",
+    "python/sglang/srt/training_capture/coordinator.py": "0ca06973dd0e8842806423971aa394abfa23d176f0dcb18fb745c2580220d60d",
+    "python/sglang/srt/training_capture/host_pool.py": "b8b6041715ce061fb12e964a1bf89e9422620322e8d246ecefcbd97e79788e9e",
+    "python/sglang/srt/training_capture/identity.py": "f2629937313ce4edeb92f3d1c1e8b01420521d8ebf3f08ce6ea614197f0bfb93",
+    "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+    "python/sglang/srt/training_capture/kv_exporter.py": "d640dabd897dc7e4cdf8e67a7e6f868ddd92df89ea7fb31c226b40c683fd758f",
+    "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+    "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+    "python/sglang/srt/training_capture/metrics.py": "17703ff9d2c19b63c7d7d8e83ea3642264ddda6a6f258fc2634117cecf67241f",
+    "python/sglang/srt/training_capture/mooncake_store.py": "1c256830525cb30acfdd19a31826f2a006761c068d441bad2a0031a289a71202",
+    "python/sglang/srt/training_capture/protocol.py": "34dda38a141ec2b73abfc9e367e04cbfd043e4f3c725fdaea5028b5ba8362bac",
+    "python/sglang/srt/training_capture/snapshot.py": "cc72e0b308d416315e62c5832530d7fab1b2510c2f609ce8d6a53f2814479e92",
+    "python/sglang/srt/training_capture/snapshot_writer.py": "70aac420dfd7f81683ac57255bc57590dae5e6902172bee72ad72aa9c1684621",
+    "python/sglang/srt/training_capture/teacher.py": "ca48d11bf2eff16bf206aaa9928f820e6ed8d134e1b55622c68c116473a7a708",
+    "test/registered/unit/training_capture/test_cuda_snapshot.py": "c99b54d3e914c8a89fbd6c5cf14b3510cd9b66e822ecfc6e72a54a23db77780c",
+    "test/registered/unit/training_capture/test_kv_staging.py": "9ccdb7f0a1f1863d0f81e83de922522fd9c27e8732db4be6c734d84af463c541",
+    "test/registered/storage/test_training_capture_runtime.py": "0dab1a2d9c68e64f476407be5b653d6ce4774b06c80b92ba22347df9337d8a67",
+    "python/sglang/test/training_capture_profile_server.py": "932dee42ec31d93351350d68c23dccc5f5330945b316c9f3081d1faa25bd0b2e",
+    "mooncake-study/experiments/benchmark_training_capture.py": "4e09b53de3c330fd308a0e27a99f88f596a4e7c7d7e19d9daadaab982920398f",
+    "mooncake-study/experiments/profile_training_capture.py": "8d11b20af4ab6bd4158adb000ac2a4d22ed9afcdb84c39e958aa799f104d844b",
+    "mooncake-study/experiments/summarize_capture_trace.py": "064da800ce355994e8485a0fb361cd5b5a8eb728e77cfc321d6a584045c29e32"
+  },
+  "change": [
+    "Opt-in kv_d2h_batch_tokens > 1 requires a positive max_device_bytes budget covering every slot and selected K/V component, including alignment.",
+    "Short KV ranges gather immediately into a private device arena; full batches and sealed tails copy to registered Host tensors. Large ranges bypass staging.",
+    "Cross-stream arena reuse is ordered; final completion fences earlier capture streams. Abort discards unpublished tails, and uncertain completion quarantines both Host and device storage.",
+    "Host tensor layout, raw teacher values, selected layers, immutable Store protocol and training alignment remain unchanged.",
+    "Server statistics and Prometheus expose allocated staging tensor bytes and the configured budget."
+  ],
+  "unit": {
+    "job_id": "01790832852903241755-4e5417e86316",
+    "returncode": 0,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790832852903241755-4e5417e86316.log",
+    "log_sha256": "4b40ff6a45dd779aefefa40c4034cb59896130062eb7884a8da88e18b855234a",
+    "tests": 96,
+    "subtests": 72,
+    "seconds": 43.47,
+    "scope": "All test/registered/unit/training_capture tests, including direct and staged coordinator lifecycles. The expanded fourth CUDA case and stronger storage-retention assertion are covered by separate runs below."
+  },
+  "expanded_cuda": {
+    "job_id": "01790833042686896052-82e2e5393985",
+    "returncode": 0,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790833042686896052-82e2e5393985.log",
+    "log_sha256": "ef04f55455735c89c8430bdd83b518eaa2e92edec9a46f89ae96122843c36e0b",
+    "tests": 4,
+    "seconds": 10.43
+  },
+  "runtime": {
+    "job_id": "01790833043043329372-f95092d4a096",
+    "returncode": 0,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790833043043329372-f95092d4a096.log",
+    "log_sha256": "02784398cd4f798ee635e0d10f6cfa226246aa3ea9af0b5eee16a28c543e75fe",
+    "seconds": 377.872,
+    "test_source_sha256": "0dab1a2d9c68e64f476407be5b653d6ce4774b06c80b92ba22347df9337d8a67",
+    "snapshots": {
+      "synchronous_ar": 6,
+      "overlap_ar": 18,
+      "synchronous_dspark": 18,
+      "overlap_dspark": 22,
+      "writer_pressure_feedback": 2,
+      "latency_feedback": 2,
+      "total": 68
+    },
+    "observations": [
+      {
+        "graph_capture": {
+          "counters": {
+            "considered": 4,
+            "excluded_health_check": 1,
+            "admitted": 3,
+            "eager_forwards": 4,
+            "sealed": 3,
+            "writer_started": 3,
+            "copies_completed": 3,
+            "snapshot_built": 3,
+            "ready": 3,
+            "cuda_graph_forwards": 5
+          },
+          "disabled_reason": null,
+          "enable_overlap": false,
+          "reservations": 3,
+          "states": {
+            "available": 3
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "free": 1,
+            "filling": 3,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        }
+      },
+      {
+        "overlap_capture": {
+          "counters": {
+            "considered": 11,
+            "excluded_health_check": 1,
+            "admitted": 10,
+            "overlap_forwards": 43,
+            "eager_forwards": 43,
+            "sealed": 9,
+            "writer_started": 10,
+            "copies_completed": 10,
+            "snapshot_built": 9,
+            "ready": 9,
+            "failed_request_aborted_or_retracted": 1
+          },
+          "disabled_reason": null,
+          "enable_overlap": true,
+          "reservations": 3,
+          "states": {
+            "available": 3
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 13581568,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "free": 1,
+            "filling": 3,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        },
+        "samples": 9,
+        "cuda_graph_enabled": false,
+        "padded_graph": false,
+        "aborted": true,
+        "canonical_remaps": 6
+      },
+      {
+        "overlap_capture": {
+          "counters": {
+            "considered": 11,
+            "excluded_health_check": 1,
+            "admitted": 10,
+            "overlap_forwards": 43,
+            "eager_forwards": 9,
+            "cuda_graph_forwards": 34,
+            "sealed": 9,
+            "writer_started": 10,
+            "copies_completed": 10,
+            "snapshot_built": 9,
+            "ready": 9,
+            "failed_request_aborted_or_retracted": 1
+          },
+          "disabled_reason": null,
+          "enable_overlap": true,
+          "reservations": 3,
+          "states": {
+            "available": 3
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 13581568,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "free": 1,
+            "filling": 3,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        },
+        "samples": 9,
+        "cuda_graph_enabled": true,
+        "padded_graph": true,
+        "aborted": true,
+        "canonical_remaps": 6
+      },
+      {
+        "speculative_capture": {
+          "counters": {
+            "considered": 10,
+            "excluded_health_check": 1,
+            "admitted": 9,
+            "eager_forwards": 33,
+            "sealed": 9,
+            "writer_started": 9,
+            "copies_completed": 9,
+            "snapshot_built": 9,
+            "ready": 9,
+            "speculative_verify_forwards": 24,
+            "speculative_commits_copied": 25
+          },
+          "disabled_reason": null,
+          "enable_overlap": false,
+          "reservations": 3,
+          "states": {
+            "available": 3
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        },
+        "samples": 9,
+        "cuda_graph_enabled": false,
+        "overlap_enabled": false,
+        "aborted": false,
+        "padded_graph": false
+      },
+      {
+        "speculative_capture": {
+          "counters": {
+            "considered": 10,
+            "excluded_health_check": 1,
+            "admitted": 9,
+            "eager_forwards": 9,
+            "sealed": 9,
+            "writer_started": 9,
+            "copies_completed": 9,
+            "snapshot_built": 9,
+            "ready": 9,
+            "speculative_verify_forwards": 24,
+            "cuda_graph_forwards": 24,
+            "speculative_commits_copied": 25
+          },
+          "disabled_reason": null,
+          "enable_overlap": false,
+          "reservations": 3,
+          "states": {
+            "available": 3
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        },
+        "samples": 9,
+        "cuda_graph_enabled": true,
+        "overlap_enabled": false,
+        "aborted": false,
+        "padded_graph": false
+      },
+      {
+        "speculative_capture": {
+          "counters": {
+            "considered": 13,
+            "excluded_health_check": 1,
+            "admitted": 12,
+            "overlap_forwards": 47,
+            "eager_forwards": 47,
+            "speculative_verify_forwards": 36,
+            "speculative_commits_copied": 42,
+            "sealed": 11,
+            "writer_started": 12,
+            "copies_completed": 12,
+            "snapshot_built": 11,
+            "ready": 11,
+            "failed_request_aborted_or_retracted": 1
+          },
+          "disabled_reason": null,
+          "enable_overlap": true,
+          "reservations": 3,
+          "states": {
+            "available": 3
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "free": 1,
+            "filling": 3,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        },
+        "samples": 11,
+        "cuda_graph_enabled": false,
+        "overlap_enabled": true,
+        "aborted": true,
+        "padded_graph": false
+      },
+      {
+        "speculative_capture": {
+          "counters": {
+            "considered": 13,
+            "excluded_health_check": 1,
+            "admitted": 12,
+            "overlap_forwards": 47,
+            "eager_forwards": 11,
+            "speculative_verify_forwards": 36,
+            "cuda_graph_forwards": 36,
+            "speculative_commits_copied": 42,
+            "sealed": 11,
+            "writer_started": 12,
+            "copies_completed": 12,
+            "snapshot_built": 11,
+            "ready": 11,
+            "failed_request_aborted_or_retracted": 1
+          },
+          "disabled_reason": null,
+          "enable_overlap": true,
+          "reservations": 3,
+          "states": {
+            "available": 3
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "free": 1,
+            "filling": 3,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        },
+        "samples": 11,
+        "cuda_graph_enabled": true,
+        "overlap_enabled": true,
+        "aborted": true,
+        "padded_graph": true
+      },
+      {
+        "adaptive_capture": {
+          "counters": {
+            "considered": 4,
+            "excluded_health_check": 1,
+            "admitted": 2,
+            "overlap_forwards": 10,
+            "eager_forwards": 10,
+            "sealed": 2,
+            "writer_started": 2,
+            "copies_completed": 2,
+            "snapshot_built": 2,
+            "sampled_out": 1,
+            "adaptive_sampled_out": 1,
+            "ready": 2
+          },
+          "disabled_reason": null,
+          "enable_overlap": true,
+          "reservations": 2,
+          "states": {
+            "available": 2
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 8924160,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "free": 0,
+            "filling": 2,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": true,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 7,
+            "recoveries": 10,
+            "failures": 0,
+            "pauses": 1,
+            "latency": null
+          }
+        },
+        "samples": 2
+      },
+      {
+        "latency_capture": {
+          "counters": {
+            "considered": 5,
+            "excluded_health_check": 1,
+            "admitted": 2,
+            "overlap_forwards": 10,
+            "eager_forwards": 10,
+            "sealed": 2,
+            "writer_started": 2,
+            "copies_completed": 2,
+            "snapshot_built": 2,
+            "ready": 2,
+            "sampled_out": 2,
+            "adaptive_sampled_out": 2
+          },
+          "disabled_reason": null,
+          "enable_overlap": true,
+          "reservations": 1,
+          "states": {
+            "available": 1
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 8924160,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "free": 1,
+            "filling": 1,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": true,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0.5,
+            "writer_age_seconds": 0.0008147396147251129,
+            "decreases": 7,
+            "recoveries": 10,
+            "failures": 0,
+            "pauses": 2,
+            "latency": {
+              "state": "healthy",
+              "blocked": false,
+              "recovery_ready": true,
+              "percentile": 0.95,
+              "window_seconds": 1.5,
+              "invalid_observations": 0,
+              "metrics": {
+                "ttft": {
+                  "budget_seconds": 0.5,
+                  "percentile_seconds": 0.03539158031344414,
+                  "window_observations": 2,
+                  "observations": 4,
+                  "last_observation_age_seconds": 0.10573909804224968
+                },
+                "tpot": {
+                  "budget_seconds": 0.5,
+                  "percentile_seconds": 0.017136510461568832,
+                  "window_observations": 6,
+                  "observations": 12,
+                  "last_observation_age_seconds": 0.055745724588632584
+                }
+              }
+            }
+          }
+        },
+        "samples": 2,
+        "observed_requests": 4
+      }
+    ]
+  },
+  "profile": {
+    "job_id": "01790833043362056483-6e40fef82107",
+    "returncode": 0,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790833043362056483-6e40fef82107.log",
+    "log_sha256": "c461ec25bfd6980cfcf170e35a3679d7cb93b755d449b5c689cbde323841ab75",
+    "raw_report_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-batch16-20261001/report.json",
+    "raw_report_sha256": "88430441d1d006e3a6530742ad0bf5ed77a29c95fef13bbcaa81082e9d3c8eb0",
+    "report": {
+      "status": "completed",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "3f9e45d72+kv-batch16",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-batch16-20261001",
+        "input_len": 128,
+        "output_len": 32,
+        "concurrency": 8,
+        "warmup_steps": 10,
+        "steps": 5,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "kv_d2h_batch_tokens": 16,
+        "device_mib": 16,
+        "capture_slots": 16,
+        "host_mib": 256,
+        "segment_mib": 2048,
+        "seed": 42
+      },
+      "scope": "Profiler-only scopes; probes wait for capture slots. GPU work attribution, not serving latency or throughput.",
+      "modes": [
+        {
+          "enabled": false,
+          "prefill": {
+            "input_len": 128,
+            "output_len": 1,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {},
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-batch16-20261001/off/prefill/prefill-1790833487.6075106-TP-0.trace.json.gz"
+            ],
+            "capture_after": null
+          },
+          "decode": {
+            "input_len": 1,
+            "output_len": 32,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {},
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-batch16-20261001/off/decode/decode-1790833511.861766-TP-0.trace.json.gz"
+            ],
+            "capture_after": null
+          }
+        },
+        {
+          "enabled": true,
+          "prefill": {
+            "input_len": 128,
+            "output_len": 1,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {
+              "considered": 40,
+              "excluded_health_check": 0,
+              "admitted": 40,
+              "overlap_forwards": 45,
+              "eager_forwards": 40,
+              "sealed": 40,
+              "writer_started": 40,
+              "copies_completed": 40,
+              "snapshot_built": 40,
+              "ready": 40,
+              "cuda_graph_forwards": 5
+            },
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-batch16-20261001/on/prefill/prefill-1790833582.3207924-TP-0.trace.json.gz"
+            ],
+            "capture_after": {
+              "counters": {
+                "considered": 121,
+                "excluded_health_check": 1,
+                "admitted": 120,
+                "overlap_forwards": 135,
+                "eager_forwards": 120,
+                "sealed": 120,
+                "writer_started": 120,
+                "copies_completed": 120,
+                "snapshot_built": 120,
+                "ready": 120,
+                "cuda_graph_forwards": 15
+              },
+              "disabled_reason": null,
+              "enable_overlap": true,
+              "reservations": 6,
+              "states": {
+                "available": 6
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "host_pool": {
+                "allocated_bytes": 50913280,
+                "device_allocated_bytes": 3145728,
+                "device_limit_bytes": 16777216,
+                "free": 10,
+                "filling": 6,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "decode": {
+            "input_len": 1,
+            "output_len": 32,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {
+              "considered": 40,
+              "excluded_health_check": 0,
+              "admitted": 40,
+              "overlap_forwards": 165,
+              "eager_forwards": 5,
+              "sealed": 40,
+              "writer_started": 40,
+              "copies_completed": 40,
+              "snapshot_built": 40,
+              "ready": 40,
+              "cuda_graph_forwards": 160
+            },
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-batch16-20261001/on/decode/decode-1790833688.1528013-TP-0.trace.json.gz"
+            ],
+            "capture_after": {
+              "counters": {
+                "considered": 241,
+                "excluded_health_check": 1,
+                "admitted": 240,
+                "overlap_forwards": 630,
+                "eager_forwards": 135,
+                "sealed": 240,
+                "writer_started": 240,
+                "copies_completed": 240,
+                "snapshot_built": 240,
+                "ready": 240,
+                "cuda_graph_forwards": 495
+              },
+              "disabled_reason": null,
+              "enable_overlap": true,
+              "reservations": 8,
+              "states": {
+                "available": 8
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "host_pool": {
+                "allocated_bytes": 50913280,
+                "device_allocated_bytes": 3145728,
+                "device_limit_bytes": 16777216,
+                "free": 8,
+                "filling": 8,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          }
+        }
+      ]
+    },
+    "analysis": [
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-batch16-20261001/off/prefill/prefill-1790833487.6075106-TP-0.trace.json.gz",
+        "sha256": "8e3c1e09077ba7ffb5db66032c72d5735357cda32bcf07ba9ca2fcb71bc5e653",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {},
+        "all_kernel_us": 72834.99100000226,
+        "all_d2h_us": 100.89500000000001
+      },
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-batch16-20261001/off/decode/decode-1790833511.861766-TP-0.trace.json.gz",
+        "sha256": "a71555cfaf57605c2e07041dacef6785b857f8405d67f9501df7c59f2abf7b78",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {},
+        "all_kernel_us": 206380.59699999285,
+        "all_d2h_us": 375.9389999999997
+      },
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-batch16-20261001/on/prefill/prefill-1790833582.3207924-TP-0.trace.json.gz",
+        "sha256": "ce32d5b5fdffaa3760b3d51b9d6170a16c9ef6fe6639b56a7890db0bd03e9214",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {
+          "training_capture.kv": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 23900.682,
+            "gpu_kernel_calls": 270,
+            "gpu_kernel_us": 498.7789999999999,
+            "d2h_calls": 240,
+            "d2h_us": 1972.4840000000002,
+            "d2h_bytes": 62914560,
+            "d2h_events_missing_bytes": 0,
+            "kernels": {
+              "void at::native::vectorized_gather_kernel<16, int>(char*, char*, int*, int, long, long, long, long, bool)": {
+                "calls": 240,
+                "us": 439.45299999999986
+              },
+              "void at::native::(anonymous namespace)::indexSelectSmallIndex<c10::BFloat16, int, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<c10::BFloat16, unsigned int>, at::cuda::detail::TensorInfo<c10::BFloat16 const, unsigned int>, at::cuda::detail::TensorInfo<int const, unsigned int>, int, int, unsigned int, long)": {
+                "calls": 30,
+                "us": 59.32599999999999
+              }
+            }
+          },
+          "training_capture.positions_d2h": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 4677.41,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 45,
+            "d2h_us": 124.224,
+            "d2h_bytes": 41000,
+            "d2h_events_missing_bytes": 0,
+            "kernels": {}
+          },
+          "training_capture.teacher": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 23910.518999999997,
+            "gpu_kernel_calls": 1395,
+            "gpu_kernel_us": 3777.175999999998,
+            "d2h_calls": 0,
+            "d2h_us": 0,
+            "d2h_bytes": 0,
+            "d2h_events_missing_bytes": 0,
+            "kernels": {
+              "void at::native::(anonymous namespace)::indexSelectSmallIndex<float, long, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<float, unsigned int>, at::cuda::detail::TensorInfo<float const, unsigned int>, at::cuda::detail::TensorInfo<long const, unsigned int>, int, int, unsigned int, long)": {
+                "calls": 45,
+                "us": 129.02299999999997
+              },
+              "void at::native::mbtopk::fill<unsigned int, unsigned int>(unsigned int*, unsigned int, unsigned int)": {
+                "calls": 45,
+                "us": 43.45600000000001
+              },
+              "void at::native::mbtopk::computeBlockDigitCounts<float, unsigned int, unsigned int, 1>(at::cuda::detail::TensorInfo<float const, unsigned int>, unsigned int, unsigned int*, unsigned int, unsigned int, int, int, unsigned int, unsigned int, unsigned int*, short*)": {
+                "calls": 180,
+                "us": 424.60499999999996
+              },
+              "at::native::mbtopk::computeDigitCumSum(short*, unsigned int*, unsigned int)": {
+                "calls": 180,
+                "us": 837.2749999999994
+              },
+              "void at::native::mbtopk::computeBlockwiseWithinKCounts<unsigned int, float>(unsigned int*, short*, unsigned int*, unsigned int*, unsigned int, int, bool, unsigned int*, float*, unsigned int*, unsigned int*, unsigned int)": {
+                "calls": 180,
+                "us": 432.9000000000001
+              },
+              "void at::native::mbtopk::computeBlockwiseKthCounts<unsigned int>(unsigned int*, short*, unsigned int, unsigned int, unsigned int*)": {
+                "calls": 45,
+                "us": 63.19999999999998
+              },
+              "void at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyInitKernel<at_cuda_detail::cub::ReduceByKeyScanTileState<unsigned int, int, true>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, unsigned long long>(at_cuda_detail::cub::ReduceByKeyScanTileState<unsigned int, int, true>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, cuda::std::__4::iterator_traits<thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default> >::value_type*, unsigned long long, int)": {
+                "calls": 90,
+                "us": 87.20099999999994
+              },
+              "void at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyKernel<at_cuda_detail::cub::detail::scan_by_key::policy_hub<thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, unsigned int, unsigned int, cuda::std::__4::plus<void> >::Policy1000, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, unsigned int*, unsigned int*, at_cuda_detail::cub::ReduceByKeyScanTileState<unsigned int, int, true>, cuda::std::__4::equal_to<void>, cuda::std::__4::plus<void>, at_cuda_detail::cub::NullType, unsigned long long, unsigned int, unsigned int>(thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, unsigned int*, unsigned int*, unsigned int*, at_cuda_detail::cub::ReduceByKeyScanTileState<unsigned int, int, true>, int, cuda::std::__4::equal_to<void>, cuda::std::__4::plus<void>, at_cuda_detail::cub::NullType, unsigned long long)": {
+                "calls": 90,
+                "us": 288.41700000000003
+              },
+              "void at::native::mbtopk::gatherTopK<float, unsigned int, 1>(at::cuda::detail::TensorInfo<float const, unsigned int>, unsigned int, unsigned int, bool, unsigned int, unsigned int, at::cuda::detail::TensorInfo<float, unsigned int>, unsigned int, at::cuda::detail::TensorInfo<long, unsigned int>, unsigned int, unsigned int, unsigned int, float*, unsigned int*, unsigned int*, unsigned int)": {
+                "calls": 45,
+                "us": 192.12600000000003
+              },
+              "void at::native::warpMergeSortKVInPlace<-2, -1, 128, 16, float, long, at::native::GTOp<float, true>, unsigned int, 32>(at::cuda::detail::TensorInfo<float, unsigned int>, unsigned int, unsigned int, unsigned int, at::cuda::detail::TensorInfo<long, unsigned int>, unsigned int, at::native::GTOp<float, true>, float)": {
+                "calls": 45,
+                "us": 281.81600000000003
+              },
+              "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#3}::operator()() const::{lambda(int)#1}, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#3}::operator()() const::{lambda(int)#1}, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)": {
+                "calls": 45,
+                "us": 63.35700000000001
+              },
+              "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::native::MaxNanFunctor<float> >, unsigned int, float, 4, 4> >(at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::native::MaxNanFunctor<float> >, unsigned int, float, 4, 4>)": {
+                "calls": 45,
+                "us": 250.49799999999996
+              },
+              "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int, at::native::AbsFunctor<float>, std::array<char*, 2ul>)": {
+                "calls": 45,
+                "us": 51.651
+              },
+              "void at::native::vectorized_elementwise_kernel<8, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, std::array<char*, 2ul> >(int, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, std::array<char*, 2ul>)": {
+                "calls": 45,
+                "us": 55.230000000000004
+              },
+              "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#7}::operator()() const::{lambda(float, bool)#1}, std::array<char*, 3ul> >(int, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#7}::operator()() const::{lambda(float, bool)#1}, std::array<char*, 3ul>)": {
+                "calls": 45,
+                "us": 58.115000000000016
+              },
+              "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<float> >(at::TensorIteratorBase&, at::native::CUDAFunctor_add<float> const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<float> >(at::TensorIteratorBase&, at::native::CUDAFunctor_add<float> const&)::{lambda(int)#1})": {
+                "calls": 45,
+                "us": 93.185
+              },
+              "void at::native::vectorized_elementwise_kernel<4, at::native::exp_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::exp_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>)": {
+                "calls": 45,
+                "us": 71.77499999999999
+              },
+              "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::native::sum_functor<float, float, float>::operator()(at::TensorIterator&)::{lambda(float, float)#1}>, unsigned int, float, 4, 4> >(at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::native::sum_functor<float, float, float>::operator()(at::TensorIterator&)::{lambda(float, float)#1}>, unsigned int, float, 4, 4>)": {
+                "calls": 45,
+                "us": 240.962
+              },
+              "void at::native::vectorized_elementwise_kernel<4, at::native::log_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::log_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>)": {
+                "calls": 45,
+                "us": 60.322
+              },
+              "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul>)": {
+                "calls": 45,
+                "us": 52.062000000000005
+              }
+            }
+          },
+          "training_capture.teacher_d2h": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 11600.322000000002,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 135,
+            "d2h_us": 320.0849999999999,
+            "d2h_bytes": 46260,
+            "d2h_events_missing_bytes": 0,
+            "kernels": {}
+          },
+          "training_capture.kv_d2h": {
+            "cpu_calls": 5,
+            "cpu_scope_us": 2243.3360000000002,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 30,
+            "d2h_us": 77.05700000000002,
+            "d2h_bytes": 61440,
+            "d2h_events_missing_bytes": 0,
+            "kernels": {}
+          }
+        },
+        "all_kernel_us": 77385.88600000142,
+        "all_d2h_us": 2610.7099999999973
+      },
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-batch16-20261001/on/decode/decode-1790833688.1528013-TP-0.trace.json.gz",
+        "sha256": "d0708d2570c43ea12babf2df0ecde44c923253a50a096a2ce028654eed37c623",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {
+          "training_capture.kv": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 295350.57300000003,
+            "gpu_kernel_calls": 7920,
+            "gpu_kernel_us": 15323.231000000356,
+            "d2h_calls": 0,
+            "d2h_us": 0,
+            "d2h_bytes": 0,
+            "d2h_events_missing_bytes": 0,
+            "kernels": {
+              "void at::native::(anonymous namespace)::indexSelectSmallIndex<c10::BFloat16, int, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<c10::BFloat16, unsigned int>, at::cuda::detail::TensorInfo<c10::BFloat16 const, unsigned int>, at::cuda::detail::TensorInfo<int const, unsigned int>, int, int, unsigned int, long)": {
+                "calls": 7920,
+                "us": 15323.231000000356
+              }
+            }
+          },
+          "training_capture.positions_d2h": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 119498.46300000015,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 1320,
+            "d2h_us": 3287.930000000001,
+            "d2h_bytes": 10560,
+            "d2h_events_missing_bytes": 0,
+            "kernels": {}
+          },
+          "training_capture.teacher": {
+            "cpu_calls": 165,
+            "cpu_scope_us": 87539.956,
+            "gpu_kernel_calls": 5115,
+            "gpu_kernel_us": 17123.590999999902,
+            "d2h_calls": 0,
+            "d2h_us": 0,
+            "d2h_bytes": 0,
+            "d2h_events_missing_bytes": 0,
+            "kernels": {
+              "void at::native::(anonymous namespace)::indexSelectSmallIndex<float, long, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<float, unsigned int>, at::cuda::detail::TensorInfo<float const, unsigned int>, at::cuda::detail::TensorInfo<long const, unsigned int>, int, int, unsigned int, long)": {
+                "calls": 165,
+                "us": 1239.4470000000003
+              },
+              "void at::native::mbtopk::fill<unsigned int, unsigned int>(unsigned int*, unsigned int, unsigned int)": {
+                "calls": 165,
+                "us": 158.8819999999998
+              },
+              "void at::native::mbtopk::computeBlockDigitCounts<float, unsigned int, unsigned int, 2>(at::cuda::detail::TensorInfo<float const, unsigned int>, unsigned int, unsigned int*, unsigned int, unsigned int, int, int, unsigned int, unsigned int, unsigned int*, short*)": {
+                "calls": 660,
+                "us": 2481.080999999997
+              },
+              "at::native::mbtopk::computeDigitCumSum(short*, unsigned int*, unsigned int)": {
+                "calls": 660,
+                "us": 2668.692000000001
+              },
+              "void at::native::mbtopk::computeBlockwiseWithinKCounts<unsigned int, float>(unsigned int*, short*, unsigned int*, unsigned int*, unsigned int, int, bool, unsigned int*, float*, unsigned int*, unsigned int*, unsigned int)": {
+                "calls": 660,
+                "us": 1741.1220000000028
+              },
+              "void at::native::mbtopk::computeBlockwiseKthCounts<unsigned int>(unsigned int*, short*, unsigned int, unsigned int, unsigned int*)": {
+                "calls": 165,
+                "us": 359.2319999999998
+              },
+              "void at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyInitKernel<at_cuda_detail::cub::ReduceByKeyScanTileState<unsigned int, int, true>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, unsigned long long>(at_cuda_detail::cub::ReduceByKeyScanTileState<unsigned int, int, true>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, cuda::std::__4::iterator_traits<thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default> >::value_type*, unsigned long long, int)": {
+                "calls": 330,
+                "us": 320.06299999999965
+              },
+              "void at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyKernel<at_cuda_detail::cub::detail::scan_by_key::policy_hub<thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, unsigned int, unsigned int, cuda::std::__4::plus<void> >::Policy1000, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, unsigned int*, unsigned int*, at_cuda_detail::cub::ReduceByKeyScanTileState<unsigned int, int, true>, cuda::std::__4::equal_to<void>, cuda::std::__4::plus<void>, at_cuda_detail::cub::NullType, unsigned long long, unsigned int, unsigned int>(thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::native::mbtopk::BlockIdxToKey, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::counting_iterator<unsigned int, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, unsigned int*, unsigned int*, unsigned int*, at_cuda_detail::cub::ReduceByKeyScanTileState<unsigned int, int, true>, int, cuda::std::__4::equal_to<void>, cuda::std::__4::plus<void>, at_cuda_detail::cub::NullType, unsigned long long)": {
+                "calls": 330,
+                "us": 1122.7880000000025
+              },
+              "void at::native::mbtopk::gatherTopK<float, unsigned int, 2>(at::cuda::detail::TensorInfo<float const, unsigned int>, unsigned int, unsigned int, bool, unsigned int, unsigned int, at::cuda::detail::TensorInfo<float, unsigned int>, unsigned int, at::cuda::detail::TensorInfo<long, unsigned int>, unsigned int, unsigned int, unsigned int, float*, unsigned int*, unsigned int*, unsigned int)": {
+                "calls": 165,
+                "us": 1260.7369999999996
+              },
+              "void at::native::warpMergeSortKVInPlace<2, -1, 128, 16, float, long, at::native::GTOp<float, true>, unsigned int, 32>(at::cuda::detail::TensorInfo<float, unsigned int>, unsigned int, unsigned int, unsigned int, at::cuda::detail::TensorInfo<long, unsigned int>, unsigned int, at::native::GTOp<float, true>, float)": {
+                "calls": 165,
+                "us": 1095.8780000000002
+              },
+              "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#3}::operator()() const::{lambda(int)#1}, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#3}::operator()() const::{lambda(int)#1}, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)": {
+                "calls": 165,
+                "us": 312.15599999999966
+              },
+              "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::native::MaxNanFunctor<float> >, unsigned int, float, 4, 4> >(at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::native::MaxNanFunctor<float> >, unsigned int, float, 4, 4>)": {
+                "calls": 165,
+                "us": 1072.859
+              },
+              "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int, at::native::AbsFunctor<float>, std::array<char*, 2ul>)": {
+                "calls": 165,
+                "us": 185.37800000000027
+              },
+              "void at::native::vectorized_elementwise_kernel<8, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, std::array<char*, 2ul> >(int, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, std::array<char*, 2ul>)": {
+                "calls": 165,
+                "us": 200.83400000000006
+              },
+              "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#7}::operator()() const::{lambda(float, bool)#1}, std::array<char*, 3ul> >(int, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#7}::operator()() const::{lambda(float, bool)#1}, std::array<char*, 3ul>)": {
+                "calls": 165,
+                "us": 202.58700000000013
+              },
+              "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<float> >(at::TensorIteratorBase&, at::native::CUDAFunctor_add<float> const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<float> >(at::TensorIteratorBase&, at::native::CUDAFunctor_add<float> const&)::{lambda(int)#1})": {
+                "calls": 165,
+                "us": 770.8460000000013
+              },
+              "void at::native::vectorized_elementwise_kernel<4, at::native::exp_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::exp_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>)": {
+                "calls": 165,
+                "us": 466.52899999999977
+              },
+              "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::native::sum_functor<float, float, float>::operator()(at::TensorIterator&)::{lambda(float, float)#1}>, unsigned int, float, 4, 4> >(at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::native::sum_functor<float, float, float>::operator()(at::TensorIterator&)::{lambda(float, float)#1}>, unsigned int, float, 4, 4>)": {
+                "calls": 165,
+                "us": 1053.5080000000003
+              },
+              "void at::native::vectorized_elementwise_kernel<4, at::native::log_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::log_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>)": {
+                "calls": 165,
+                "us": 221.44599999999977
+              },
+              "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul>)": {
+                "calls": 165,
+                "us": 189.52599999999993
+              }
+            }
+          },
+          "training_capture.teacher_d2h": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 267804.347,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 3960,
+            "d2h_us": 9834.310999999972,
+            "d2h_bytes": 1356960,
+            "d2h_events_missing_bytes": 0,
+            "kernels": {}
+          },
+          "training_capture.kv_d2h": {
+            "cpu_calls": 120,
+            "cpu_scope_us": 24380.15299999999,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 720,
+            "d2h_us": 2213.2789999999936,
+            "d2h_bytes": 16220160,
+            "d2h_events_missing_bytes": 0,
+            "kernels": {}
+          }
+        },
+        "all_kernel_us": 239413.24799999493,
+        "all_d2h_us": 15762.841999999935
+      }
+    ],
+    "native_index_baseline_comparison": [
+      {
+        "workload": "prefill",
+        "before_trace_sha256": "87a8d6759de44615cdc9c0ffa29e1aef29f7b7b65afc22a21b9b0e5923f3d5c0",
+        "after_trace_sha256": "ce32d5b5fdffaa3760b3d51b9d6170a16c9ef6fe6639b56a7890db0bd03e9214",
+        "kv_before": {
+          "cpu_calls": 45,
+          "cpu_scope_us": 25391.162999999997,
+          "gpu_kernel_calls": 270,
+          "gpu_kernel_us": 498.24199999999985,
+          "d2h_calls": 270,
+          "d2h_us": 2028.2620000000009,
+          "d2h_bytes": 62976000,
+          "d2h_events_missing_bytes": 0
+        },
+        "kv_after": {
+          "cpu_calls": 50,
+          "cpu_scope_us": 26144.018,
+          "gpu_kernel_calls": 270,
+          "gpu_kernel_us": 498.7789999999999,
+          "d2h_calls": 270,
+          "d2h_us": 2049.541,
+          "d2h_bytes": 62976000,
+          "d2h_events_missing_bytes": 0
+        },
+        "all_capture_before": {
+          "cpu_calls": 180,
+          "cpu_scope_us": 65902.476,
+          "gpu_kernel_calls": 1665,
+          "gpu_kernel_us": 4245.597000000003,
+          "d2h_calls": 450,
+          "d2h_us": 2473.092000000001,
+          "d2h_bytes": 63063260,
+          "d2h_events_missing_bytes": 0
+        },
+        "all_capture_after": {
+          "cpu_calls": 185,
+          "cpu_scope_us": 66332.269,
+          "gpu_kernel_calls": 1665,
+          "gpu_kernel_us": 4275.954999999998,
+          "d2h_calls": 450,
+          "d2h_us": 2493.8500000000004,
+          "d2h_bytes": 63063260,
+          "d2h_events_missing_bytes": 0
+        },
+        "kv_dma_bytes_equal": true,
+        "teacher_and_position_copy_counts_and_bytes_equal": true
+      },
+      {
+        "workload": "decode",
+        "before_trace_sha256": "24b64b5cba799f61c40c7c083edb2b0a07cb7de081739b3bdd68104019b571a9",
+        "after_trace_sha256": "d0708d2570c43ea12babf2df0ecde44c923253a50a096a2ce028654eed37c623",
+        "kv_before": {
+          "cpu_calls": 1320,
+          "cpu_scope_us": 527024.5079999999,
+          "gpu_kernel_calls": 7920,
+          "gpu_kernel_us": 15294.019000000364,
+          "d2h_calls": 7920,
+          "d2h_us": 20694.196000000404,
+          "d2h_bytes": 16220160,
+          "d2h_events_missing_bytes": 0
+        },
+        "kv_after": {
+          "cpu_calls": 1440,
+          "cpu_scope_us": 319730.726,
+          "gpu_kernel_calls": 7920,
+          "gpu_kernel_us": 15323.231000000356,
+          "d2h_calls": 720,
+          "d2h_us": 2213.2789999999936,
+          "d2h_bytes": 16220160,
+          "d2h_events_missing_bytes": 0
+        },
+        "all_capture_before": {
+          "cpu_calls": 4125,
+          "cpu_scope_us": 1013412.8609999998,
+          "gpu_kernel_calls": 13035,
+          "gpu_kernel_us": 32466.77900000031,
+          "d2h_calls": 13200,
+          "d2h_us": 34178.98100000033,
+          "d2h_bytes": 17587680,
+          "d2h_events_missing_bytes": 0
+        },
+        "all_capture_after": {
+          "cpu_calls": 4245,
+          "cpu_scope_us": 794573.4920000001,
+          "gpu_kernel_calls": 13035,
+          "gpu_kernel_us": 32446.82200000026,
+          "d2h_calls": 6000,
+          "d2h_us": 15335.519999999966,
+          "d2h_bytes": 17587680,
+          "d2h_events_missing_bytes": 0
+        },
+        "kv_dma_bytes_equal": true,
+        "teacher_and_position_copy_counts_and_bytes_equal": true
+      }
+    ]
+  },
+  "checks": {
+    "local_and_gpu_sources_identical": true,
+    "runtime_benchmark_producer_hashes_match_checkout": true,
+    "ruff_new_code": "passed",
+    "ruff_modified_legacy": "diagnostic code/message multisets match HEAD",
+    "formatting": "16 files pass ruff format --check",
+    "whitespace": "git diff --check passed",
+    "benchmark_invariants": "All selected requests admitted and READY; same KV/aux payload bytes as native-index baseline; no quarantine, Catalog errors or cached prompt tokens."
+  },
+  "limits": [
+    "One H100, Qwen3-0.6B BF16, TP=1, local TCP Store and HTTP test Catalog; no cross-node RDMA evidence.",
+    "The byte budget covers staging tensor storage, not total CUDA allocator reservations, model KV, raw teacher computation or transient large-prefill gathers.",
+    "Profiler probes wait for capture reservations and run at 100% selection; their summed CPU/GPU work is not normal-serving wall time.",
+    "KV gather kernels and teacher/position D2H still execute per forward; reducing KV DMA calls does not eliminate capture overhead.",
+    "Two synthetic serving rounds with the same seed do not establish statistical significance, representative production performance or a service SLO.",
+    "New metric values have unit coverage and device allocation is observed in real server statistics; Grafana runtime acceptance is still pending.",
+    "Production SpecForge Catalog/consumer, trained draft quality, TP/PP/PD and non-static speculative deployment remain open."
+  ],
+  "final_cuda": {
+    "job_id": "01790833555947065229-813302e83634",
+    "returncode": 0,
+    "tests": 4,
+    "seconds": 10.42,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790833555947065229-813302e83634.log",
+    "log_sha256": "d2511c5d103779ca94a83503bd139178d02e53cf6a8beb761c1834c4a60d7471",
+    "test_source_sha256": "c99b54d3e914c8a89fbd6c5cf14b3510cd9b66e822ecfc6e72a54a23db77780c"
+  },
+  "benchmark": {
+    "job_id": "01790833043677920824-4b7d751c335a",
+    "returncode": 0,
+    "raw_report_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-batch16-20261001/report.json",
+    "raw_report_sha256": "442df12c48f8732d84fadd06b800f84912c09bd902f76509a2d1d251c14cfd0a",
+    "log_sha256": "327d473267c9181cdf222eb440c47c8c454cbdd3828418f7caa2fb791150be79",
+    "status": "completed",
+    "declared_source_revision": "3f9e45d72+kv-batch16",
+    "producer_source_sha256": {
+      "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+      "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+      "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+      "python/sglang/srt/training_capture/config.py": "59220f129b22db6457b7d7632a6b19b6430f424744e68b4b8590f8eadb399c81",
+      "python/sglang/srt/training_capture/context.py": "3a4e04b2bb72489c80c2094cb19d8946c940a55a862b6c0235499bdf4b83a098",
+      "python/sglang/srt/training_capture/coordinator.py": "0ca06973dd0e8842806423971aa394abfa23d176f0dcb18fb745c2580220d60d",
+      "python/sglang/srt/training_capture/host_pool.py": "b8b6041715ce061fb12e964a1bf89e9422620322e8d246ecefcbd97e79788e9e",
+      "python/sglang/srt/training_capture/identity.py": "f2629937313ce4edeb92f3d1c1e8b01420521d8ebf3f08ce6ea614197f0bfb93",
+      "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+      "python/sglang/srt/training_capture/kv_exporter.py": "d640dabd897dc7e4cdf8e67a7e6f868ddd92df89ea7fb31c226b40c683fd758f",
+      "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+      "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+      "python/sglang/srt/training_capture/metrics.py": "17703ff9d2c19b63c7d7d8e83ea3642264ddda6a6f258fc2634117cecf67241f",
+      "python/sglang/srt/training_capture/mooncake_store.py": "1c256830525cb30acfdd19a31826f2a006761c068d441bad2a0031a289a71202",
+      "python/sglang/srt/training_capture/protocol.py": "34dda38a141ec2b73abfc9e367e04cbfd043e4f3c725fdaea5028b5ba8362bac",
+      "python/sglang/srt/training_capture/snapshot.py": "cc72e0b308d416315e62c5832530d7fab1b2510c2f609ce8d6a53f2814479e92",
+      "python/sglang/srt/training_capture/snapshot_writer.py": "70aac420dfd7f81683ac57255bc57590dae5e6902172bee72ad72aa9c1684621",
+      "python/sglang/srt/training_capture/teacher.py": "ca48d11bf2eff16bf206aaa9928f820e6ed8d134e1b55622c68c116473a7a708"
+    },
+    "driver_sha256": "4e09b53de3c330fd308a0e27a99f88f596a4e7c7d7e19d9daadaab982920398f",
+    "config": {
+      "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+      "source_revision": "3f9e45d72+kv-batch16",
+      "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-batch16-20261001",
+      "num_prompts": 2048,
+      "input_len": 128,
+      "output_len": 32,
+      "concurrency": 8,
+      "ratios": [
+        0.1
+      ],
+      "repeats": 2,
+      "seed": 42,
+      "layers": [
+        0,
+        14,
+        27
+      ],
+      "capture_slots": 16,
+      "host_mib": 256,
+      "kv_d2h_batch_tokens": 16,
+      "device_mib": 16,
+      "segment_mib": 2048,
+      "phase_timeout": 600
+    },
+    "versions": {
+      "torch": "2.13.0",
+      "transformers": "5.12.1",
+      "sglang-kernel": "0.4.6.post1",
+      "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+    },
+    "scope": {
+      "transport": "local TCP",
+      "catalog": "HTTP test double",
+      "adaptive": false,
+      "overlap": true,
+      "decode_cuda_graphs": true,
+      "prefill_cuda_graphs": false,
+      "client": "existing sglang.benchmark.serving, streaming native /generate",
+      "workload": "seeded fixed-length random-ids, closed-loop concurrency, not production traffic",
+      "timing": "Client timing excludes warmup, server launch, readback and post-response writer drain",
+      "payload_bytes": "Validated manifest tensor sizes; not D2H or wire byte counters",
+      "gpu_capture_kernel_time": null,
+      "d2h_bytes": null,
+      "rdma_bytes": null,
+      "production_slo_pass": null
+    },
+    "rounds": [
+      {
+        "repetition": 0,
+        "comparison": {
+          "baseline_bracket_mean": {
+            "median_ttft_ms": 93.57717167586088,
+            "p95_ttft_ms": 145.3965445049107,
+            "p99_ttft_ms": 159.57165654748675,
+            "median_tpot_ms": 3.330746755724953,
+            "p95_tpot_ms": 6.195093114529886,
+            "p99_tpot_ms": 6.262245752037533,
+            "output_throughput": 1303.4925677078481
+          },
+          "baseline_after_over_before": {
+            "median_ttft_ms": 0.9300757917677636,
+            "p95_ttft_ms": 0.9666454231781296,
+            "p99_ttft_ms": 0.9572648628533033,
+            "median_tpot_ms": 0.9802286713210021,
+            "p95_tpot_ms": 0.9735980659364029,
+            "p99_tpot_ms": 0.9775181754565803,
+            "output_throughput": 1.0276572431294242
+          },
+          "capture_over_baseline": [
+            {
+              "sample_ratio": 0.1,
+              "ratios": {
+                "median_ttft_ms": 1.1238890236395982,
+                "p95_ttft_ms": 1.090296200406508,
+                "p99_ttft_ms": 1.1071761048860473,
+                "median_tpot_ms": 1.1815753483502454,
+                "p95_tpot_ms": 1.117465395736095,
+                "p99_tpot_ms": 1.3186806000247207,
+                "output_throughput": 0.8451108453309824
+              }
+            }
+          ]
+        },
+        "phases": [
+          {
+            "sample_ratio": null,
+            "capture_counter_delta": {},
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.007773827761411667,
+            "serving": {
+              "tag": null,
+              "backend": "sglang",
+              "dataset_name": "random-ids",
+              "request_rate": "inf",
+              "max_concurrency": 8,
+              "sharegpt_output_len": null,
+              "random_input_len": 128,
+              "random_output_len": 32,
+              "random_range_ratio": 1,
+              "duration": 50.972498185932636,
+              "completed": 2048,
+              "total_input_tokens": 262144,
+              "total_input_text_tokens": 262144,
+              "total_input_vision_tokens": 0,
+              "total_output_tokens": 65536,
+              "total_output_tokens_retokenized": 55766,
+              "request_throughput": 40.1785290673708,
+              "input_throughput": 5142.851720623463,
+              "output_throughput": 1285.7129301558657,
+              "total_throughput": 6428.564650779329,
+              "mean_e2e_latency_ms": 197.76853790608584,
+              "median_e2e_latency_ms": 195.16448862850666,
+              "std_e2e_latency_ms": 33.13812932077297,
+              "p90_e2e_latency_ms": 196.5551197528839,
+              "p95_e2e_latency_ms": 198.16726259887218,
+              "p99_e2e_latency_ms": 203.2360401749611,
+              "mean_ttft_ms": 96.16382158310444,
+              "median_ttft_ms": 96.96735441684723,
+              "std_ttft_ms": 54.59070666391267,
+              "p90_ttft_ms": 144.80312950909138,
+              "p95_ttft_ms": 147.86248989403248,
+              "p99_ttft_ms": 163.05576171725986,
+              "mean_tpot_ms": 3.277571494289723,
+              "median_tpot_ms": 3.3640021518353493,
+              "std_tpot_ms": 1.536732106629941,
+              "p90_tpot_ms": 5.095172625395559,
+              "p95_tpot_ms": 6.277968367982295,
+              "p99_tpot_ms": 6.333439388582784,
+              "mean_itl_ms": 3.0798892721280064,
+              "median_itl_ms": 1.5415865927934647,
+              "std_itl_ms": 10.638314579156356,
+              "p90_itl_ms": 1.5979021787643435,
+              "p95_itl_ms": 3.4016128629446003,
+              "p99_itl_ms": 74.73311904817821,
+              "concurrency": 7.946048948871095,
+              "accept_length": null,
+              "max_output_tokens_per_s": 1305,
+              "max_concurrent_requests": 56,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          },
+          {
+            "sample_ratio": 0.1,
+            "capture_counter_delta": {
+              "considered": 2048,
+              "sampled_out": 1858,
+              "admitted": 190,
+              "overlap_forwards": 4830,
+              "eager_forwards": 190,
+              "cuda_graph_forwards": 4640,
+              "sealed": 190,
+              "writer_started": 190,
+              "copies_completed": 190,
+              "snapshot_built": 190,
+              "ready": 190
+            },
+            "selected_requests": 190,
+            "actual_admission_fraction": 0.0927734375,
+            "ready_fraction_of_admitted": 1,
+            "ready_fraction_of_selected": 1,
+            "readback": {
+              "validated_samples": 190,
+              "manifest_bytes": 2688310,
+              "payload_bytes": 380255360,
+              "aux_payload_bytes": 6700160,
+              "payload_objects": 4940,
+              "kv_payload_bytes": 373555200
+            },
+            "post_client_capture_drain_seconds": 0.008062638342380524,
+            "serving": {
+              "tag": null,
+              "backend": "sglang",
+              "dataset_name": "random-ids",
+              "request_rate": "inf",
+              "max_concurrency": 8,
+              "sharegpt_output_len": null,
+              "random_input_len": 128,
+              "random_output_len": 32,
+              "random_range_ratio": 1,
+              "duration": 59.49188042059541,
+              "completed": 2048,
+              "total_input_tokens": 262144,
+              "total_input_text_tokens": 262144,
+              "total_input_vision_tokens": 0,
+              "total_output_tokens": 65536,
+              "total_output_tokens_retokenized": 55766,
+              "request_throughput": 34.42486580556976,
+              "input_throughput": 4406.382823112929,
+              "output_throughput": 1101.5957057782323,
+              "total_throughput": 5507.978528891162,
+              "mean_e2e_latency_ms": 231.12757710987353,
+              "median_e2e_latency_ms": 244.87504363059998,
+              "std_e2e_latency_ms": 41.15540759498565,
+              "p90_e2e_latency_ms": 260.3495854884386,
+              "p95_e2e_latency_ms": 262.11571227759123,
+              "p99_e2e_latency_ms": 285.7360805943608,
+              "mean_ttft_ms": 100.15532283432549,
+              "median_ttft_ms": 105.17035610973835,
+              "std_ttft_ms": 55.63546918584533,
+              "p90_ttft_ms": 151.58595070242882,
+              "p95_ttft_ms": 158.52530002593988,
+              "p99_ttft_ms": 176.6739251464605,
+              "mean_tpot_ms": 4.224911428243486,
+              "median_tpot_ms": 3.9355282581621607,
+              "std_tpot_ms": 1.7205688350189248,
+              "p90_tpot_ms": 6.682209057673331,
+              "p95_tpot_ms": 6.922802178850096,
+              "p99_tpot_ms": 8.257901985799112,
+              "mean_itl_ms": 4.032805439586629,
+              "median_itl_ms": 3.138868138194084,
+              "std_itl_ms": 10.758413345485645,
+              "p90_itl_ms": 3.3768698573112492,
+              "p95_itl_ms": 3.664456121623516,
+              "p99_itl_ms": 73.85509453713894,
+              "concurrency": 7.956535825973873,
+              "accept_length": null,
+              "max_output_tokens_per_s": 1286,
+              "max_concurrent_requests": 48,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 50913280,
+              "device_allocated_bytes": 3145728,
+              "device_limit_bytes": 16777216,
+              "free": 0,
+              "filling": 16,
+              "quarantined": 0
+            }
+          },
+          {
+            "sample_ratio": null,
+            "capture_counter_delta": {},
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.0077086687088012695,
+            "serving": {
+              "tag": null,
+              "backend": "sglang",
+              "dataset_name": "random-ids",
+              "request_rate": "inf",
+              "max_concurrency": 8,
+              "sharegpt_output_len": null,
+              "random_input_len": 128,
+              "random_output_len": 32,
+              "random_range_ratio": 1,
+              "duration": 49.600680116564035,
+              "completed": 2048,
+              "total_input_tokens": 262144,
+              "total_input_text_tokens": 262144,
+              "total_input_vision_tokens": 0,
+              "total_output_tokens": 65536,
+              "total_output_tokens_retokenized": 55766,
+              "request_throughput": 41.28975641436971,
+              "input_throughput": 5285.088821039323,
+              "output_throughput": 1321.2722052598308,
+              "total_throughput": 6606.361026299153,
+              "mean_e2e_latency_ms": 192.38679635054723,
+              "median_e2e_latency_ms": 190.02886302769184,
+              "std_e2e_latency_ms": 32.608515190503525,
+              "p90_e2e_latency_ms": 192.08189398050308,
+              "p95_e2e_latency_ms": 193.46594605594873,
+              "p99_e2e_latency_ms": 206.25312697142363,
+              "mean_ttft_ms": 92.49575953435851,
+              "median_ttft_ms": 90.18698893487453,
+              "std_ttft_ms": 53.03506488284945,
+              "p90_ttft_ms": 139.8183662444353,
+              "p95_ttft_ms": 142.93059911578894,
+              "p99_ttft_ms": 156.08755137771365,
+              "mean_tpot_ms": 3.222291510199636,
+              "median_tpot_ms": 3.2974913596145563,
+              "std_tpot_ms": 1.4762906068239883,
+              "p90_tpot_ms": 4.972030282501251,
+              "p95_tpot_ms": 6.112217861077478,
+              "p99_tpot_ms": 6.191052115492282,
+              "mean_itl_ms": 3.0352326710544815,
+              "median_itl_ms": 1.5390291810035706,
+              "std_itl_ms": 10.308453481557532,
+              "p90_itl_ms": 1.6015227884054184,
+              "p95_itl_ms": 3.3829374238848677,
+              "p99_itl_ms": 72.06075120717287,
+              "concurrency": 7.943603958655046,
+              "accept_length": null,
+              "max_output_tokens_per_s": 1455,
+              "max_concurrent_requests": 56,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          }
+        ]
+      },
+      {
+        "repetition": 1,
+        "comparison": {
+          "baseline_bracket_mean": {
+            "median_ttft_ms": 101.10861249268055,
+            "p95_ttft_ms": 144.071258418262,
+            "p99_ttft_ms": 158.9566471800208,
+            "median_tpot_ms": 3.3008093615212744,
+            "p95_tpot_ms": 6.148992947513058,
+            "p99_tpot_ms": 6.206370945419035,
+            "output_throughput": 1313.4541355591023
+          },
+          "baseline_after_over_before": {
+            "median_ttft_ms": 0.9388046301987715,
+            "p95_ttft_ms": 0.9975257025197874,
+            "p99_ttft_ms": 0.9864958113107195,
+            "median_tpot_ms": 0.9895260577292998,
+            "p95_tpot_ms": 0.9979638190143353,
+            "p99_tpot_ms": 0.9938745011817988,
+            "output_throughput": 1.0066210763732972
+          },
+          "capture_over_baseline": [
+            {
+              "sample_ratio": 0.1,
+              "ratios": {
+                "median_ttft_ms": 1.040558250020223,
+                "p95_ttft_ms": 1.096832243341625,
+                "p99_ttft_ms": 1.1062462997675806,
+                "median_tpot_ms": 1.1994996228704373,
+                "p95_tpot_ms": 1.1269346708556873,
+                "p99_tpot_ms": 1.339959679086822,
+                "output_throughput": 0.8370791014378058
+              }
+            }
+          ]
+        },
+        "phases": [
+          {
+            "sample_ratio": null,
+            "capture_counter_delta": {},
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.007714390754699707,
+            "serving": {
+              "tag": null,
+              "backend": "sglang",
+              "dataset_name": "random-ids",
+              "request_rate": "inf",
+              "max_concurrency": 8,
+              "sharegpt_output_len": null,
+              "random_input_len": 128,
+              "random_output_len": 32,
+              "random_range_ratio": 1,
+              "duration": 50.06110046058893,
+              "completed": 2048,
+              "total_input_tokens": 262144,
+              "total_input_text_tokens": 262144,
+              "total_input_vision_tokens": 0,
+              "total_output_tokens": 65536,
+              "total_output_tokens_retokenized": 55766,
+              "request_throughput": 40.91000759386636,
+              "input_throughput": 5236.480972014894,
+              "output_throughput": 1309.1202430037235,
+              "total_throughput": 6545.601215018618,
+              "mean_e2e_latency_ms": 194.3301225092,
+              "median_e2e_latency_ms": 191.24864228069782,
+              "std_e2e_latency_ms": 33.70301399269161,
+              "p90_e2e_latency_ms": 193.14572401344776,
+              "p95_e2e_latency_ms": 194.54999323934317,
+              "p99_e2e_latency_ms": 277.2407035529613,
+              "mean_ttft_ms": 94.1251590847969,
+              "median_ttft_ms": 104.29994948208332,
+              "std_ttft_ms": 54.74607023970828,
+              "p90_ttft_ms": 141.0446908324957,
+              "p95_ttft_ms": 144.2497167736292,
+              "p99_ttft_ms": 160.03723368048668,
+              "mean_tpot_ms": 3.232418174980745,
+              "median_tpot_ms": 3.318186609014388,
+              "std_tpot_ms": 1.4341669177843976,
+              "p90_tpot_ms": 5.006384645258227,
+              "p95_tpot_ms": 6.155259558750737,
+              "p99_tpot_ms": 6.225437901673779,
+              "mean_itl_ms": 3.0521750678195225,
+              "median_itl_ms": 1.540806144475937,
+              "std_itl_ms": 10.487138690434591,
+              "p90_itl_ms": 1.5971660614013672,
+              "p95_itl_ms": 3.376194834709167,
+              "p99_itl_ms": 72.75015085935593,
+              "concurrency": 7.950046787568352,
+              "accept_length": null,
+              "max_output_tokens_per_s": 1371,
+              "max_concurrent_requests": 56,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          },
+          {
+            "sample_ratio": 0.1,
+            "capture_counter_delta": {
+              "considered": 2048,
+              "sampled_out": 1858,
+              "admitted": 190,
+              "overlap_forwards": 4830,
+              "eager_forwards": 190,
+              "cuda_graph_forwards": 4640,
+              "sealed": 190,
+              "writer_started": 190,
+              "copies_completed": 190,
+              "snapshot_built": 190,
+              "ready": 190
+            },
+            "selected_requests": 190,
+            "actual_admission_fraction": 0.0927734375,
+            "ready_fraction_of_admitted": 1,
+            "ready_fraction_of_selected": 1,
+            "readback": {
+              "validated_samples": 190,
+              "manifest_bytes": 2688310,
+              "payload_bytes": 380255360,
+              "aux_payload_bytes": 6700160,
+              "payload_objects": 4940,
+              "kv_payload_bytes": 373555200
+            },
+            "post_client_capture_drain_seconds": 0.008070357143878937,
+            "serving": {
+              "tag": null,
+              "backend": "sglang",
+              "dataset_name": "random-ids",
+              "request_rate": "inf",
+              "max_concurrency": 8,
+              "sharegpt_output_len": null,
+              "random_input_len": 128,
+              "random_output_len": 32,
+              "random_range_ratio": 1,
+              "duration": 59.607172168791294,
+              "completed": 2048,
+              "total_input_tokens": 262144,
+              "total_input_text_tokens": 262144,
+              "total_input_vision_tokens": 0,
+              "total_output_tokens": 65536,
+              "total_output_tokens_retokenized": 55766,
+              "request_throughput": 34.35828148667448,
+              "input_throughput": 4397.860030294333,
+              "output_throughput": 1099.4650075735833,
+              "total_throughput": 5497.325037867916,
+              "mean_e2e_latency_ms": 231.5420628328866,
+              "median_e2e_latency_ms": 245.90986780822277,
+              "std_e2e_latency_ms": 41.558473487924005,
+              "p90_e2e_latency_ms": 260.3196285665035,
+              "p95_e2e_latency_ms": 264.50134534388775,
+              "p99_e2e_latency_ms": 274.1187485679984,
+              "mean_ttft_ms": 100.15291492345568,
+              "median_ttft_ms": 105.20940087735653,
+              "std_ttft_ms": 55.16443181359449,
+              "p90_ttft_ms": 151.7699345946312,
+              "p95_ttft_ms": 158.0220015719533,
+              "p99_ttft_ms": 175.84520276635885,
+              "mean_tpot_ms": 4.238359609981642,
+              "median_tpot_ms": 3.9593195843119773,
+              "std_tpot_ms": 1.7442978958012112,
+              "p90_tpot_ms": 6.688655336056986,
+              "p95_tpot_ms": 6.92951334339957,
+              "p99_tpot_ms": 8.316286820317467,
+              "mean_itl_ms": 4.040427866255759,
+              "median_itl_ms": 3.1562745571136475,
+              "std_itl_ms": 10.74101503097692,
+              "p90_itl_ms": 3.393213450908661,
+              "p95_itl_ms": 3.6972124129533763,
+              "p99_itl_ms": 74.03112292289737,
+              "concurrency": 7.9553873708175855,
+              "accept_length": null,
+              "max_output_tokens_per_s": 1251,
+              "max_concurrent_requests": 48,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 50913280,
+              "device_allocated_bytes": 3145728,
+              "device_limit_bytes": 16777216,
+              "free": 0,
+              "filling": 16,
+              "quarantined": 0
+            }
+          },
+          {
+            "sample_ratio": null,
+            "capture_counter_delta": {},
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.00774923712015152,
+            "serving": {
+              "tag": null,
+              "backend": "sglang",
+              "dataset_name": "random-ids",
+              "request_rate": "inf",
+              "max_concurrency": 8,
+              "sharegpt_output_len": null,
+              "random_input_len": 128,
+              "random_output_len": 32,
+              "random_range_ratio": 1,
+              "duration": 49.73182226717472,
+              "completed": 2048,
+              "total_input_tokens": 262144,
+              "total_input_text_tokens": 262144,
+              "total_input_vision_tokens": 0,
+              "total_output_tokens": 65536,
+              "total_output_tokens_retokenized": 55766,
+              "request_throughput": 41.180875878577524,
+              "input_throughput": 5271.152112457923,
+              "output_throughput": 1317.7880281144808,
+              "total_throughput": 6588.940140572404,
+              "mean_e2e_latency_ms": 192.93076098438178,
+              "median_e2e_latency_ms": 190.837774425745,
+              "std_e2e_latency_ms": 28.390679050353143,
+              "p90_e2e_latency_ms": 192.38475561141968,
+              "p95_e2e_latency_ms": 194.3851612508297,
+              "p99_e2e_latency_ms": 205.0670751184225,
+              "mean_ttft_ms": 92.94897652398504,
+              "median_ttft_ms": 97.91727550327778,
+              "std_ttft_ms": 51.010735040148084,
+              "p90_ttft_ms": 140.51727578043938,
+              "p95_ttft_ms": 143.89280006289482,
+              "p99_ttft_ms": 157.8760606795549,
+              "mean_tpot_ms": 3.2252188535611857,
+              "median_tpot_ms": 3.283432114028161,
+              "std_tpot_ms": 1.4688241406884779,
+              "p90_tpot_ms": 4.990719511143623,
+              "p95_tpot_ms": 6.142726336275378,
+              "p99_tpot_ms": 6.187303989164291,
+              "mean_itl_ms": 3.0377936004791795,
+              "median_itl_ms": 1.5412457287311554,
+              "std_itl_ms": 10.331447640773867,
+              "p90_itl_ms": 1.599438861012459,
+              "p95_itl_ms": 3.3842556178569776,
+              "p99_itl_ms": 72.54642058163883,
+              "concurrency": 7.945057721257333,
+              "accept_length": null,
+              "max_output_tokens_per_s": 1444,
+              "max_concurrent_requests": 56,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          }
+        ]
+      }
+    ],
+    "native_index_baseline_comparison": [
+      {
+        "repetition": 0,
+        "before_output_tokens_per_second": 1092.6433175679167,
+        "after_output_tokens_per_second": 1101.5957057782323,
+        "before_capture_over_bracket_throughput": 0.8314139661268934,
+        "after_capture_over_bracket_throughput": 0.8451108453309824,
+        "before_tpot_p95_over_bracket": 1.1456761594037217,
+        "after_tpot_p95_over_bracket": 1.117465395736095,
+        "committed_payload_bytes_equal": true
+      },
+      {
+        "repetition": 1,
+        "before_output_tokens_per_second": 1081.3054512230271,
+        "after_output_tokens_per_second": 1099.4650075735833,
+        "before_capture_over_bracket_throughput": 0.824419329285258,
+        "after_capture_over_bracket_throughput": 0.8370791014378058,
+        "before_tpot_p95_over_bracket": 1.1528963199984144,
+        "after_tpot_p95_over_bracket": 1.1269346708556873,
+        "committed_payload_bytes_equal": true
+      }
+    ],
+    "interpretation": "KV batching removes most small KV DMA calls. Normal-serving output throughput is 0.8%/1.7% higher than the prior native-index capture phases, with 15.5%/16.3% loss against each new round's off baseline. Two rounds do not establish significance or meet a production SLO."
+  },
+  "validation_summary": {
+    "timed_requests": 12288,
+    "generated_output_tokens": 393216,
+    "benchmark_snapshots_after_producer_exit": 380,
+    "runtime_snapshots": 68,
+    "profile_ready_requests_excluding_warmup": 80
+  }
+}

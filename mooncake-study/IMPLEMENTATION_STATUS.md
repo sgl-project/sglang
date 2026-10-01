@@ -27,7 +27,7 @@ it does not redefine the goal as the modules already implemented.
 | --- | --- | --- |
 | Wire contract | Typed manifest, raw tensor descriptors, shape/byte/digest/coverage/content validation | Generated fixtures pass the design's JSON Schema; malformed metadata and contents are rejected |
 | Raw teacher capture | Unpadded top-128 IDs/values and full-vocabulary LSE before serving processors | Independent online logits observer validates every captured row; serving bias does not leak into teacher scores |
-| KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, independent D2H copies | H100 source-reuse test and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode |
+| KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode |
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Coordinator admission, renewal, expiry, retract, shutdown and publication tests pass; traffic-scale stress remains open |
 | Mooncake adapter | Required hard pin, registered raw buffers, immutable retry verification, exact read length | Real cross-process TCP roundtrip passes; cross-node RDMA is pending |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
@@ -961,6 +961,77 @@ benchmark metrics are retained in
 [`capture-native-indices.json`](experiments/capture-native-indices.json).
 Formatting and whitespace checks pass. Ruff diagnostics in the modified legacy
 files match HEAD. All jobs have terminated and the H100 resumes its idle workload.
+
+## Bounded Batched KV D2H
+
+Capture now accepts opt-in `kv_d2h_batch_tokens` and `max_device_bytes` fields.
+Each Host slot owns a bounded device arena for the selected K/V components.
+Short ranges gather into that arena immediately; full batches and the sealed
+tail copy to the existing registered Host tensors. Large prefill ranges retain
+direct D2H. The default batch size is one and allocates no device staging.
+The all-slot budget is validated before registration, and Host/device storage
+share completion fencing, reuse and quarantine. Store objects and the training
+tensor contract are unchanged. See [configuration and ownership](TARGET_KV_DRAFT.md#batched-kv-d2h).
+
+Job `01790832852903241755-4e5417e86316` passes 96 tests and 72 subtests in
+43.47s, including both direct and staged coordinator lifecycles. CUDA coverage
+checks source mutation, full-batch arena reuse, cross-stream ordering and tail
+finalization outside the producer stream. A failed completion event quarantines
+both Host and device storage. Budget rejection happens before registration.
+The final CUDA file, including the stronger retained-storage assertion, passes
+all four tests in 10.42s in job `01790833555947065229-813302e83634`.
+
+H100 runtime job `01790833043043329372-f95092d4a096` passes in 377.872s with
+68 validated snapshots using 16-token staging. AR/DSpark, ordinary/graph/overlap
+execution, abort, prefix remapping, writer pressure and latency recovery pass.
+Independent forward observations still match captured KV and teacher values;
+Store snapshots remain readable after producer exit. The four-slot fixture
+allocates 786,432 device bytes within its 8MiB budget.
+
+Profiler job `01790833043362056483-6e40fef82107` completes the same off/on
+workloads as the native-index baseline, with all 40 measured requests READY in
+each enabled workload. KV attribution sums `training_capture.kv` and the new
+`training_capture.kv_d2h` flush scope.
+
+| Profile Workload | KV D2H Copies, Before / After | KV D2H Work, Before / After | KV Bytes, Both Runs |
+| --- | ---: | ---: | ---: |
+| 128-to-1 | 270 / 270 | 2.028 / 2.050ms | 62,976,000 |
+| 1-to-32 | 7,920 / 720 | 20.694 / 2.213ms | 16,220,160 |
+
+Decode KV D2H calls decrease 90.9%; total capture D2H calls decrease from
+13,200 to 6,000, with the same 17,587,680 bytes transferred. KV gather kernels
+remain 7,920. The combined instrumented KV CPU scope time decreases from
+527.025 to 319.731ms. Teacher and position copy counts and bytes are unchanged.
+These are profiler work measurements, not client latency. DMA may include
+lookahead teacher rows beyond the committed response; publication still follows
+the accepted token and valid-KV boundaries, so DMA and stored sizes can differ.
+
+Normal-serving benchmark job `01790833043677920824-4b7d751c335a` completes two
+off/10%-capture/off rounds with 12,288 timed requests and 393,216 output tokens.
+All 380 selected requests are admitted, published and read back after producer
+exit. Both capture phases have 373,555,200 KV bytes and 6,700,160 auxiliary bytes,
+matching the native-index baseline. There are no quarantined slots, Catalog
+errors or cached prompt tokens. The sixteen-slot pool allocates 3MiB of staging
+tensors within its explicit 16MiB budget.
+
+| Round | Baseline Mean Output Tokens/s | 10% Capture Output Tokens/s | Throughput Loss | TPOT p95 Increase |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 1,303.49 | 1,101.60 | 15.5% | 11.7% |
+| 1 | 1,313.45 | 1,099.47 | 16.3% | 12.7% |
+
+Capture throughput is 0.8% and 1.7% higher than the previous native-index runs.
+Their losses against their own baselines were 16.9% and 17.6%, and TPOT p95
+increases were 14.6% and 15.3%. These two synthetic rounds do not establish
+statistical significance or satisfy P10's production SLO. Teacher and position
+transfers, per-forward gathers and other capture work remain optimization
+targets. The default remains direct D2H; batching requires explicit opt-in.
+
+The retained tests, runtime observations, source/log/trace hashes, profiler
+attribution and normal-serving results are in
+[`capture-batched-kv-d2h.json`](experiments/capture-batched-kv-d2h.json).
+Local and GPU source hashes match. New code passes Ruff, modified legacy
+diagnostics match HEAD, and formatting/whitespace checks pass. All submitted
+jobs have terminated and the resident H100 has resumed its idle workload.
 
 ## Next Implementation
 

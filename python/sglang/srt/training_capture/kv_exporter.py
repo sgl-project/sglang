@@ -1,4 +1,4 @@
-"""Gather selected target KV into request-owned, pinned Host storage."""
+"""Gather selected target KV into request-owned Host or device storage."""
 
 from __future__ import annotations
 
@@ -89,8 +89,19 @@ class SelectedLayerKVExporter:
             indices.record_stream(stream)
         for name, source in self.buffers.items():
             destination = destinations[name][start:end]
-            if destination.shape[0] != end - start or destination.device.type != "cpu":
-                raise ContractError("Host destination does not cover the KV range")
+            if (
+                destination.shape != (end - start, *source.shape[1:])
+                or destination.dtype != source.dtype
+            ):
+                raise ContractError("destination does not cover the KV range")
+            if destination.is_cuda:
+                if destination.device != source.device:
+                    raise ContractError("KV staging must share the source device")
+                torch.index_select(source, 0, indices, out=destination)
+                destination.record_stream(stream)
+                continue
+            if destination.device.type != "cpu":
+                raise ContractError("KV export requires Host or CUDA storage")
             if source.is_cuda and not destination.is_pinned():
                 raise ContractError(
                     "asynchronous KV export requires pinned Host storage"

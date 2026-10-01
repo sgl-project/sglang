@@ -124,6 +124,9 @@ class TestCaptureConfiguration(CustomTestCase):
             {"selected_layer_ids": []},
             {"selected_layer_ids": [0, 0]},
             {"max_host_bytes": 0},
+            {"kv_d2h_batch_tokens": 0},
+            {"kv_d2h_batch_tokens": 16},
+            {"max_device_bytes": -1},
             {"sample_ratio": 2},
             {"catalog_endpoint": "file:///tmp/catalog"},
             {"journal_directory": "relative/journal"},
@@ -147,6 +150,18 @@ class TestCaptureConfiguration(CustomTestCase):
         adaptive = CaptureConfig.load(str(self.path))
         self.assertEqual(adaptive.adaptive.writer_stall_seconds, 10.0)
         self.assertNotEqual(baseline.fingerprint, adaptive.fingerprint)
+
+    def test_staging_budget_is_explicit_and_changes_capture_identity(self):
+        baseline = CaptureConfig.load(str(self.path))
+        self.assertEqual(baseline.kv_d2h_batch_tokens, 1)
+        self.assertEqual(baseline.max_device_bytes, 0)
+        self.path.write_text(
+            json.dumps(
+                self.config | {"kv_d2h_batch_tokens": 16, "max_device_bytes": 1 << 20}
+            )
+        )
+        staged = CaptureConfig.load(str(self.path))
+        self.assertNotEqual(baseline.fingerprint, staged.fingerprint)
 
 
 if __name__ == "__main__":

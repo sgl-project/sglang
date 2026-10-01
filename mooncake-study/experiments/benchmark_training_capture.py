@@ -154,6 +154,8 @@ def capture_config(args, directory, address, catalog, ratio):
         "max_sample_tokens": args.input_len + args.output_len,
         "max_inflight_samples": args.capture_slots,
         "max_host_bytes": args.host_mib << 20,
+        "kv_d2h_batch_tokens": args.kv_d2h_batch_tokens,
+        "max_device_bytes": args.device_mib << 20,
         "storage_chunk_tokens": 64,
     }
 
@@ -413,6 +415,8 @@ def main():
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 14, 27])
     parser.add_argument("--capture-slots", type=int, default=16)
     parser.add_argument("--host-mib", type=int, default=256)
+    parser.add_argument("--kv-d2h-batch-tokens", type=int, default=1)
+    parser.add_argument("--device-mib", type=int, default=0)
     parser.add_argument("--segment-mib", type=int, default=2048)
     parser.add_argument("--phase-timeout", type=int, default=600)
     args = parser.parse_args()
@@ -426,6 +430,7 @@ def main():
             args.repeats,
             args.capture_slots,
             args.host_mib,
+            args.kv_d2h_batch_tokens,
             args.segment_mib,
             args.phase_timeout,
         )
@@ -437,6 +442,8 @@ def main():
         )
     if any(not math.isfinite(ratio) or not 0 <= ratio <= 1 for ratio in args.ratios):
         parser.error("Capture ratios must be finite values in [0, 1]")
+    if args.device_mib < 0 or (args.kv_d2h_batch_tokens > 1 and not args.device_mib):
+        parser.error("Batched KV D2H requires a positive --device-mib budget")
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(1)
