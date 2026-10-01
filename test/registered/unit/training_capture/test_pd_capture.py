@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import msgspec
 import numpy as np
 import torch
-
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
 from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
 from sglang.srt.training_capture.context import RequestCaptureContext
@@ -525,7 +525,10 @@ class TestPDCapture(CustomTestCase):
         source, receiver = self.prefill_request(wire), self.prefill_request(wire)
         other = CaptureTestRequest("unselected")
         batch = SimpleNamespace(
-            reqs=[other, source], seq_lens_cpu=[1, 2], return_logprob=False
+            reqs=[other, source],
+            seq_lens_cpu=[1, 2],
+            return_logprob=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
         )
         received_batch = SimpleNamespace(
             reqs=[other, receiver],
@@ -533,6 +536,7 @@ class TestPDCapture(CustomTestCase):
             return_logprob=False,
             req_pool_indices=torch.tensor([0, 1]),
             input_ids=torch.tensor([3, 4]),
+            spec_algorithm=SpeculativeAlgorithm.NONE,
         )
         forward = SimpleNamespace(
             extend_seq_lens_cpu=[1, 2], positions=torch.tensor([0, 0, 1])

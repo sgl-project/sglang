@@ -2753,6 +2753,50 @@ All existing PP speculative capability gates remain. See
 [retained evidence](experiments/pipeline-target-kv.json), and the
 [serving contract](TARGET_KV_DRAFT.md#pipeline-source-assembly-prerequisite).
 
+## Pipeline DSpark Result Channel
+
+The scheduler's PP output channel now carries a versioned DSpark result with
+ordered request/committed-prefix identity, padded accepted tokens, acceptance
+and optional cap lengths, bonus tokens and new sequence lengths. Receivers keep
+the per-request bonus in local FutureMap slots and pass accepted blocks through
+the existing spec-v2 token resolver. Installation checks prefix arithmetic and
+bonus alignment before advancing batch state. Sender D2H completion is awaited
+before CPU/Gloo payload consumption; receiver D2H uses pinned buffers and keeps
+next-draft state on the device. DSpark chunked-prefill output is not elided, and
+P/D teacher handoffs retain their existing channel.
+
+The complete registered result unit file passed **seven tests** in **13.483
+seconds**, job `01790894608311260657-793d33af9b8d`. Its four-process Gloo ring
+covers prefill, accepted blocks, omitted cap metadata/int32 tokens, and sender
+results already copied to CPU. Local request-pool slots differ on every rank;
+poisoned padding is excluded and stale, reordered or malformed frames fail.
+Separate cases cover invalid commit arithmetic, withdrawn requests, P/D handoff,
+chunked-prefill communication and the CPU payload readiness boundary.
+
+The CUDA result file passed **two tests** in **0.263 seconds**, job
+`01790894608624330213-26a8375c0242`, on the resident H100. A temporary two-H100
+node ran the complete NCCL result file: **one test** in **15.373 seconds**, using
+the same four ring scenarios with real device-to-device transport and mixed
+CPU/GPU payloads. The modified P/D unit file passed all **12 tests** in **8.727
+seconds**, job `01790894140906972498-47d9abd8d05b`.
+
+The complete existing `test_training_capture_pd_pp.py` passed its **two real
+PP2 P/D tests** in **175.689 seconds** on the temporary node, covering eager and
+decode CUDA graphs. Each case checked five published snapshots against online
+source tensors using actual Mooncake TCP P/D and Store plus the Catalog test
+double. Missing/stale handoffs and cancellation stayed excluded. All **24 final
+tests** passed. No server or test process remained before deleting the temporary
+job; its pod disappearance was verified. The resident H100 returned to its idle
+workload with no active or queued experiment.
+
+These tests exercise deterministic result tensors and the real transport,
+scheduler result methods and token resolver. They do not execute a pipeline
+DSpark target/draft model. The PP worker must still separate target forward from
+cross-stage KV projection/commit, relay proposals and activations, and make
+shared embedding/output-head modules available. Existing PP speculative gates
+remain. See [the runbook](experiments/PIPELINE_RESULT.md) and
+[retained evidence](experiments/pipeline-dspark-result.json).
+
 ## Next Implementation
 
 1. Extend passing single-GPU AR prefill graph coverage to distributed/speculative

@@ -52,6 +52,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     return (
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
         and batch is not None
+        and not batch.spec_algorithm.is_dspark()
         and batch.forward_mode == ForwardMode.EXTEND
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
@@ -1019,6 +1020,12 @@ class SchedulerPPMixin:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
+        if batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_pp_result import (
+                pack_dspark_pp_result,
+            )
+
+            tensor_dict = pack_dspark_pp_result(result, batch)
         if (
             get_disagg().disaggregation_mode == "prefill"
             and self.tp_worker.training_capture is not None
@@ -1149,6 +1156,36 @@ class SchedulerPPMixin:
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
+        if batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_pp_result import (
+                unpack_dspark_pp_result,
+            )
+
+            result = unpack_dspark_pp_result(
+                pp_outputs.tensors,
+                batch,
+                can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            )
+            if (
+                get_disagg().disaggregation_mode == "prefill"
+                and self.tp_worker.training_capture is not None
+            ):
+                self.tp_worker.training_capture.accept_pp_handoffs(
+                    batch, pp_outputs.tensors.get("training_capture_pd_handoffs")
+                )
+            # Only the bonus enters the next forward; the padded accepted block
+            # remains available to the normal spec-v2 output processor.
+            self.future_map.stash(
+                batch.req_pool_indices,
+                RelayPayload(bonus_tokens=result.next_draft_input.bonus_tokens),
+            )
+            batch.input_ids = None
+            result.copy_done = self.device_module.Event()
+            result.copy_to_cpu(return_logprob=False, return_hidden_states=False)
+            return result
+        if any(name.startswith("dspark_") for name in pp_outputs.tensors):
+            raise ValueError("PP DSpark output received for a non-DSpark batch")
+
         logits_output = None
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
@@ -1187,6 +1224,12 @@ class SchedulerPPMixin:
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
+        if batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_pp_result import (
+                install_dspark_pp_result,
+            )
+
+            install_dspark_pp_result(output_result, batch)
         self.process_batch_result(batch, output_result)
 
     def _pp_send_output_to_next_stage(

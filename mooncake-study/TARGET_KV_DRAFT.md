@@ -199,6 +199,41 @@ activation transport, accepted-token propagation, shared embedding/output-head
 availability and request-state alignment remain required before enabling PP.
 See [the reproduction commands](experiments/PIPELINE_KV.md).
 
+### Pipeline Result Relay Prerequisite
+
+The existing PP output channel now has a DSpark result codec. Its versioned
+`dspark_result` header binds phase, token stride and ordered request keys
+`(rid, kv_committed_len, output_token_count)`. A stale step, reordered request
+batch, unsupported version, malformed tensor shape/dtype or inconsistent field
+set is rejected. The payload contains the padded accepted-token block, accepted
+and block-accepted lengths, optional cap lengths, bonus tokens and new sequence
+lengths. Raw target logits and physical KV slot indices are not part of it.
+
+The receiver stashes only the per-request bonus token in its own FutureMap slots.
+It retains the full accepted block for the existing spec-v2 output processor,
+copies output/acceptance tensors to CPU with a completion event, and keeps the
+next-draft state on the device. After D2H, installation checks acceptance bounds,
+bonus alignment and committed-length arithmetic before advancing batch state.
+The normal result processor performs request KV accounting, including its
+existing retraction and grammar handling. If the sender has already issued an
+asynchronous D2H copy, packing waits for its completion before a CPU/Gloo sender
+can read the pinned destination; a CUDA stream wait alone cannot protect it.
+
+Pure chunked-prefill output elision is disabled for DSpark because the next-draft
+state must reach every stage. P/D prefill teacher handoffs remain on the same
+output channel. Forwarded frames retain their original header instead of being
+repacked after local request state advances.
+
+The codec is covered by four-process Gloo and two-H100 NCCL result round trips,
+single-GPU CUDA copy-stream checks, and malformed/stale-result tests. Fixtures
+exercise actual PP dictionary transport and the spec-v2 token resolver with
+deterministic result tensors. They do not execute a PP DSpark target/draft model.
+The worker still needs separate forward/commit phases: running a cross-stage KV
+collective inside a stage's forward before it sends activation would strand
+later stages. Proposal/activation scheduling and shared modules remain required,
+and the PP speculative serving gates stay in place. See
+[the result-channel runbook](experiments/PIPELINE_RESULT.md).
+
 ### Disaggregated Context
 
 In PD serving, P transfers the target KV prefix. The target-KV worker's

@@ -1,0 +1,226 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "5f20ee06c9bd9e59c3288d019b77073cab62abda",
+  "feature": "DSpark accepted-result transport and scheduler state restoration on the existing PP output channel",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "resident_node": "node064",
+    "resident_gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "temporary_job": "job-252463de3574-20261002063829",
+    "temporary_node": "node189",
+    "temporary_gpus": [
+      "GPU-1a83f685-6ffb-cfc6-f9fd-fcd7a2dbcd8f",
+      "GPU-2911563e-b9dd-26d1-2145-32c3bb4ab97a"
+    ],
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "versions": {
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "sglang-kernel": "0.4.6.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "dependency_adjustment": "Removed only temporary container preinstalled flashinfer-cubin 0.6.12 and flashinfer-jit-cache 0.6.12+cu130; no shared virtual environment or resident changes."
+  },
+  "implementation": [
+    "Versioned phase/stride header binds ordered request IDs, committed KV lengths and output-token counts.",
+    "Carry padded accepted tokens, accept/block/cap lengths, bonus tokens and new sequence lengths; reject stale, reordered or malformed frames.",
+    "Stash only bonus tokens in rank-local FutureMap slots; copy accepted outputs to pinned CPU memory while retaining GPU next-draft state.",
+    "Validate acceptance bounds, bonus alignment and committed-length arithmetic before advancing batch state; reuse the existing spec-v2 token resolver.",
+    "Wait for sender D2H completion before CPU/Gloo payload consumption; preserve P/D teacher handoff and DSpark chunked-prefill result communication.",
+    "Keep PP speculative serving gates; forward/commit scheduling and shared target modules are not implemented by this result channel."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/managers/scheduler_pp_mixin.py": "495baa3518a1cf20c68b9e8ee99b44208d8f7117af4513ab8485fad40d601860",
+    "python/sglang/srt/speculative/dspark_components/dspark_pp_result.py": "207775ee92fb9ace3310141fe183f66040903d3516c762f2b2ef0f9d3dd762f3",
+    "python/sglang/test/dspark_pp_result_utils.py": "72fea6f4d5f79b0809de8459b8f4850d36e01b97ce0974b9d1c4ecb40b350ae2",
+    "test/registered/unit/spec/test_dspark_pp_result.py": "d00eb05bed97881fc8b3cc5b1d01643108e8dcb48537638610aae599c4fad1ff",
+    "test/registered/unit/training_capture/test_pd_capture.py": "194488410d0208180ae69710b188d5eb82cd74bfa07c39fb037a022a04f79bf5",
+    "test/registered/storage/test_dspark_pp_result_cuda.py": "4907d588e3fdef4f2023d538e69f10beb3395457cb6562a5aacabc79e9306664",
+    "test/registered/storage/test_dspark_pp_result_nccl.py": "98c28d217ec484fe29b675d866179d3d95e10cd6fa05b94ff76118f575ba2c26",
+    "test/registered/storage/test_training_capture_pd_pp.py": "011e33796a42a5dbe62c4e60b1731c7c76dedd541d43bd9b54c456a332f59933"
+  },
+  "gpu_source_hashes_match": true,
+  "result_transport_cases": [
+    "prefill",
+    "decode",
+    "uncapped_int32_tokens",
+    "sender_already_copied_to_cpu"
+  ],
+  "result_fixture": {
+    "request_prefixes": [
+      5,
+      9,
+      13
+    ],
+    "accept_lengths": [
+      1,
+      3,
+      4
+    ],
+    "new_sequence_lengths": [
+      6,
+      12,
+      17
+    ],
+    "bonus_tokens": [
+      31,
+      43,
+      54
+    ],
+    "correct_drafts_per_request": [
+      0,
+      2,
+      3
+    ],
+    "block_accept_total": 9,
+    "cap_total_when_present": 9,
+    "poisoned_padding": -999,
+    "per_rank_request_slots_differ": true
+  },
+  "tests": [
+    {
+      "file": "test/registered/unit/spec/test_dspark_pp_result.py",
+      "tests": 7,
+      "seconds": 13.483,
+      "job_id": "01790894608311260657-793d33af9b8d",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790894635.0558805,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790894608311260657-793d33af9b8d.log",
+      "log_sha256": "e21355fe0890d604a2f88d5f70efcf1c9437c6e67f3d75d83971f107ec63cdc9"
+    },
+    {
+      "file": "test/registered/storage/test_dspark_pp_result_cuda.py",
+      "tests": 2,
+      "seconds": 0.263,
+      "job_id": "01790894608624330213-26a8375c0242",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790894648.0930767,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790894608624330213-26a8375c0242.log",
+      "log_sha256": "91f4bb310cde08d2e0c641baacb01f6a76ca2c786bda0148151499ce5ab04c2a"
+    },
+    {
+      "file": "test/registered/unit/training_capture/test_pd_capture.py",
+      "tests": 12,
+      "seconds": 8.727,
+      "job_id": "01790894140906972498-47d9abd8d05b",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790894199.924813,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790894140906972498-47d9abd8d05b.log",
+      "log_sha256": "937ae710359743110802232fb83cd9639dea770ccfea2590222b7531ac256c02"
+    },
+    {
+      "file": "test/registered/storage/test_dspark_pp_result_nccl.py",
+      "tests": 1,
+      "seconds": 15.373,
+      "outcome": "completed",
+      "returncode": 0,
+      "exec_session_id": 43835,
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-252463de3574-20261002063829-master-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' 'timeout' '--signal=TERM' '--kill-after=30s' '240' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/test/registered/storage/test_dspark_pp_result_nccl.py' '-v' '-f' > '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-result-nccl-final-20261001.log' 2>&1",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-result-nccl-final-20261001.log",
+      "log_sha256": "42ed01f5e69b05cfbb842b219a5faf3bba2103570f15c6a430c5b8f087964e6c"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_pp.py",
+      "tests": 2,
+      "seconds": 175.689,
+      "outcome": "completed",
+      "returncode": 0,
+      "exec_session_id": 8413,
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-252463de3574-20261002063829-master-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' 'timeout' '--signal=TERM' '--kill-after=30s' '900' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/test/registered/storage/test_training_capture_pd_pp.py' '-v' '-f' > '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-result-pd-regression-20261001.log' 2>&1",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-result-pd-regression-20261001.log",
+      "log_sha256": "7ce5e960e64f41175ef4e39ebb2ce92ada1e3b90b9c5fce0a74042a23de6a397"
+    }
+  ],
+  "real_pp_serving_cases": [
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 2,
+      "decode_pp": 2,
+      "replay": false,
+      "draft_kind": null,
+      "counters": {
+        "admitted": 8,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 6,
+        "ready": 0,
+        "sealed": 5
+      },
+      "writer_counters": {
+        "failed": 3,
+        "stored": 5,
+        "submitted": 8
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 2,
+      "decode_pp": 2,
+      "replay": true,
+      "draft_kind": null,
+      "counters": {
+        "admitted": 8,
+        "cuda_graph_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 6,
+        "ready": 0,
+        "sealed": 5
+      },
+      "writer_counters": {
+        "failed": 3,
+        "stored": 5,
+        "submitted": 8
+      },
+      "quarantined_host_slots": 0
+    }
+  ],
+  "checks": {
+    "black": "Seven changed/new Python files pass.",
+    "ruff": "New Python files and modified P/D unit pass; shared PP mixin diagnostics match its preexisting baseline.",
+    "ruff_pp_mixin": {
+      "current": 81,
+      "baseline": 81,
+      "unchanged": true
+    }
+  },
+  "cleanup": {
+    "temporary_processes_before_deletion": "  PID  PPID STAT COMMAND\n    1     0 Ss   sleep 3600\n 5140     0 Rs   ps -eo pid,ppid,stat,args\n",
+    "temporary_job_deleted": true,
+    "temporary_pod_absence_verified": true,
+    "resident": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790894907.7407568,
+      "idle_pid": 39837,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.3746917247772217
+    }
+  },
+  "limitations": [
+    "Result fixtures use deterministic tensors and request/scheduler scaffolding. They exercise real Gloo/NCCL dictionary transport and the spec-v2 token resolver, not a PP DSpark model.",
+    "The real-model regression is ordinary AR PP2 on both P and D with Mooncake TCP and a Catalog test double; it checks ten published snapshots and handoff/cancellation exclusion.",
+    "PP speculative target forward/activation relay, proposal scheduling, synchronized KV projection/commit and shared embedding/output-head availability remain incomplete.",
+    "This does not validate the prior source-KV aggregation change over NCCL, combined TP/PP speculation, production Catalog retention, trained quality or performance SLOs."
+  ]
+}
