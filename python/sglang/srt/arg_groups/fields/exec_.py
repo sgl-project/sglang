@@ -417,6 +417,15 @@ class ExecMamba(msgspec.Struct):
         int,
         "The interval to track the mamba state during decode.",
     ] = 256
+    mamba_prefill_checkpoint_margin: A[
+        int,
+        "Keep the mamba checkpoint that a prefill donates at least this many "
+        "tokens before the end of the prompt (0 keeps it on the last grid "
+        "point). A client that rewrites the tail of its previous prompt, for "
+        "example an agent harness with a moving budget reminder, otherwise "
+        "invalidates that checkpoint on every call and the engine reads the "
+        "whole previous extension again.",
+    ] = 0
     enable_int8_mamba_checkpoint: A[
         bool,
         "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",

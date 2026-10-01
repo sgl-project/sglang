@@ -119,6 +119,9 @@ def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_
         # eagle/ngram/dspark/dflash all verify through
         # prepare_mamba_track_for_verify (lazy plan wired); dflash gained
         # the hook in DFlashVerifyInput.prepare_for_verify.
+    assert view.mamba_prefill_checkpoint_margin >= 0, (
+        "--mamba-prefill-checkpoint-margin must be >= 0"
+    )
     if view.speculative_num_draft_tokens is not None:
         assert view.mamba_track_interval >= view.speculative_num_draft_tokens
     if view.page_size is not None:

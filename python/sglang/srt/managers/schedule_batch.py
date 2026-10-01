@@ -3039,6 +3039,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         prefix_len = len(req.prefix_indices)
         seq_end = prefix_len + req.extend_range.length
+        keep_tail_margin = False
         if get_parallel().dcp_enabled:
             # DCP widens radix pages beyond scheduler chunk boundaries. Pick an
             # absolute page depth only when the kernel produced an h snapshot.
@@ -3056,6 +3057,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 prefix_len
                 + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
             )
+            # The last grid point of a prompt is only a few tokens from its
+            # end. A client that rewrites the tail of the prompt on its next
+            # call (an agent harness that moves a budget reminder, say) then
+            # diverges before that checkpoint and falls back to the start of
+            # this extension. Donate a checkpoint that sits a margin earlier
+            # in the forward that holds the end of the prompt.
+            tail_margin = get_exec().mamba.mamba_prefill_checkpoint_margin
+            keep_tail_margin = (
+                tail_margin > 0
+                and req.extend_range.end >= len(req.origin_input_ids)
+                and req.extend_range.length - tail_margin >= checkpoint_grid
+            )
+            if keep_tail_margin:
+                mamba_track_seqlen_aligned = (
+                    prefix_len
+                    + ((req.extend_range.length - tail_margin) // checkpoint_grid)
+                    * checkpoint_grid
+                )
         track_index = req.kv.mamba_ping_pong_track_buffer[
             req.kv.mamba_next_track_idx
         ].item()
@@ -3091,7 +3110,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.kv.mamba_next_track_idx
                     )
                 )
-            if req.mamba_branching_seqlen is not None:
+            if req.mamba_branching_seqlen is not None and not keep_tail_margin:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (

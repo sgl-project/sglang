@@ -36,10 +36,17 @@ def _track_seqlen(
     prefix_len: int,
     extend_len: int,
     dcp_enabled: bool = False,
+    tail_margin: int = 0,
+    prompt_len: int | None = None,
+    branching_seqlen: int | None = None,
 ) -> int | None:
     """Run one extend through the tracker and report the donated depth, or
     None when the extend donates no checkpoint."""
-    server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
+    server_args = ServerArgs(
+        model_path="dummy",
+        page_size=CHUNK,
+        mamba_prefill_checkpoint_margin=tail_margin,
+    )
     # The property would otherwise load the HF config for the dummy model.
     server_args._mamba_cache_chunk_size = CHUNK
     set_global_server_args_for_scheduler(server_args)
@@ -49,7 +56,7 @@ def _track_seqlen(
     req = Req(
         rid="req",
         origin_input_text="",
-        origin_input_ids=array("q", [1] * (prefix_len + extend_len)),
+        origin_input_ids=array("q", [1] * (prompt_len or prefix_len + extend_len)),
         sampling_params=sampling_params,
         vocab_size=128,
     )
@@ -57,7 +64,7 @@ def _track_seqlen(
     req.set_extend_range(prefix_len, prefix_len + extend_len)
     req.kv.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
     req.kv.mamba_next_track_idx = 0
-    req.mamba_branching_seqlen = None
+    req.mamba_branching_seqlen = branching_seqlen
 
     batch = ScheduleBatch(reqs=[req])
     batch.model_config = SimpleNamespace(
@@ -121,6 +128,68 @@ class TestMambaCheckpointDepth(unittest.TestCase):
         self.assertEqual(
             _track_seqlen(tree_page=16, prefix_len=4253, extend_len=16384),
             20637,
+        )
+
+
+class TestMambaPrefillCheckpointMargin(unittest.TestCase):
+    """A prompt whose tail the client rewrites needs a checkpoint before that tail."""
+
+    def test_margin_moves_the_checkpoint_before_the_prompt_tail(self):
+        # Without a margin the checkpoint sits 34 tokens before the end, past
+        # the point where a 91-token rewritten tail makes the next call diverge.
+        self.assertEqual(
+            _track_seqlen(tree_page=CHUNK, prefix_len=16384, extend_len=4066), 20416
+        )
+        depth = _track_seqlen(
+            tree_page=CHUNK, prefix_len=16384, extend_len=4066, tail_margin=192
+        )
+        self.assertEqual(depth, 20224)
+        self.assertLessEqual(depth, 16384 + 4066 - 192)
+        self.assertEqual((depth - 16384) % CHUNK, 0)
+
+    def test_extend_shorter_than_margin_keeps_the_grid_end(self):
+        self.assertEqual(
+            _track_seqlen(
+                tree_page=CHUNK, prefix_len=16384, extend_len=200, tail_margin=192
+            ),
+            16384 + 192,
+        )
+
+    def test_chunk_before_the_prompt_end_keeps_the_grid_end(self):
+        # A chunked prefill continues from this forward, so its end stays the
+        # most useful checkpoint.
+        self.assertEqual(
+            _track_seqlen(
+                tree_page=CHUNK,
+                prefix_len=0,
+                extend_len=16384,
+                tail_margin=192,
+                prompt_len=20450,
+            ),
+            16384,
+        )
+
+    def test_margin_checkpoint_wins_over_the_branching_point(self):
+        # One forward donates one checkpoint. The branching point serves the
+        # call that just diverged; the margin checkpoint serves the next one.
+        self.assertEqual(
+            _track_seqlen(
+                tree_page=CHUNK,
+                prefix_len=16384,
+                extend_len=4066,
+                branching_seqlen=16384 + 1024,
+            ),
+            16384 + 1024,
+        )
+        self.assertEqual(
+            _track_seqlen(
+                tree_page=CHUNK,
+                prefix_len=16384,
+                extend_len=4066,
+                tail_margin=192,
+                branching_seqlen=16384 + 1024,
+            ),
+            20224,
         )
 
 

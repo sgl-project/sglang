@@ -346,6 +346,7 @@ POSITIONAL_FIELD_ORDER = (
     "mamba_radix_cache_strategy",
     "uses_mamba_radix_cache",
     "mamba_track_interval",
+    "mamba_prefill_checkpoint_margin",
     "enable_int8_mamba_checkpoint",
     "int8_mamba_ckpt_size",
     "linear_attn_backend",
