@@ -100,5 +100,38 @@ class TestQwen3_5PipelineParallel(CustomTestCase):
         torch.testing.assert_close(model.model.embed_tokens.weight, expected)
 
 
+class TestQwen3_5MTPTiedDraftHead(CustomTestCase):
+    @staticmethod
+    def _make_tied_mtp():
+        model = Qwen3_5ForCausalLMMTP.__new__(Qwen3_5ForCausalLMMTP)
+        torch.nn.Module.__init__(model)
+        model.model = torch.nn.Module()
+        model.model.embed_tokens = torch.nn.Embedding(8, 3)
+        model.lm_head = model.model.embed_tokens
+        model.config = SimpleNamespace(tie_word_embeddings=True)
+        return model
+
+    def test_reduced_head_replaces_tied_embedding(self):
+        """With --speculative-token-map, draft index i must score hot_token_id[i];
+        a tied draft used to keep scoring every row of its embedding."""
+        model = self._make_tied_mtp()
+        embed = torch.randn(8, 3)
+        hot_token_id = torch.tensor([5, 0, 7])
+
+        model.set_embed_and_head(embed, embed[hot_token_id])
+
+        self.assertIs(model.model.embed_tokens.weight, embed)
+        torch.testing.assert_close(model.lm_head.weight, embed[hot_token_id])
+
+    def test_full_head_keeps_tied_embedding(self):
+        model = self._make_tied_mtp()
+        embed = torch.randn(8, 3)
+
+        model.set_embed_and_head(embed, embed)
+
+        self.assertIs(model.lm_head, model.model.embed_tokens)
+        self.assertIs(model.lm_head.weight, embed)
+
+
 if __name__ == "__main__":
     unittest.main()
