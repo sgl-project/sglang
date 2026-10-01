@@ -34,6 +34,7 @@ it does not redefine the goal as the modules already implemented.
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production exporter and trained-model validation still open |
+| Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit retract/resume | Real 256-token KV pool eviction, physical slot reuse, failed-capture exclusion and subsequent admission pass in synchronous and overlap/graph modes; automatic AR OOM remains open |
@@ -1125,6 +1126,49 @@ actual OOM log messages and source/log hashes are in
 This is a TP1/TCP correctness test with a synthetic draft and forced outputs;
 it does not establish trained-model quality, serving SLOs, non-static verify
 correctness or cross-node behavior.
+
+## Draft Checkpoint Tensor Validation
+
+The KV-input loader now validates every exported tensor before invoking the
+mutating parent loader. Packed parameters must match their full shape, while
+split Q/K/V and gate/up tensors must match the configured projection sizes.
+Only dense FP32/FP16/BF16 tensors are accepted. A min/max reduction detects
+NaN/Inf and checks representability after conversion to the destination dtype;
+only the two extrema are converted, avoiding a full converted weight or
+per-element boolean allocation.
+
+This closes observed defects in checkpoint admission. With the old production
+code, job `01790838342711980754-a0a5d065e9ff` fails ten new regression
+subcases: the generic parallel loaders silently truncate extra rows from
+packed/split exports, accept integer/complex/nonfinite values, and allow FP32
+values to overflow the FP16 destination. A malformed late tensor reaches the
+mutating loader before failing. The repaired path rejects these inputs before
+any parameter or projection-cache change.
+
+The tests use actual QKV and merged-MLP loaders with GQA geometry, checking
+split-to-packed layout against independently specified row order. Existing
+missing/duplicate/foreign-weight checks and Markov gate handling remain covered.
+Job `01790838420199480428-2bb5c92e8be4` passes 25 tests and 42 subtests in
+14.11s, including all three Markov heads, cached CE+TV128 gradients, an optimizer
+step and fresh serving export/reload. After adding successful cross-dtype
+coverage, the final unit run `01790838598515310920-4aa144bbb44b` passes
+20 tests and 42 subtests in 11.13s.
+
+Job `01790838509115541407-3e7fbe13b6b3` also loads the retained Qwen3
+snapshot/draft artifact through the new validation. BF16 fixed-input comparison
+against pinned SpecForge FlexAttention passes with zero differences at both
+backbone layers, hidden output, base logits and Markov-corrected logits.
+No teacher decoder is run. Source and log hashes, the negative baseline and
+the complete retained-fixture report are recorded in
+[`target-kv-checkpoint-validation.json`](experiments/target-kv-checkpoint-validation.json).
+
+Only `DSparkTargetKVDraftModel` production behavior changes. The existing
+TP1/unquantized topology gates remain in force. This validates tensor admission,
+not transactional rollback after a hardware copy failure, trained draft quality
+or release readiness. SpecForge's production KV-input exporter is still missing;
+its current specialized SGLang exporter supports EAGLE3. The full HTTP capture
+runtime was not repeated for this loader-only change. Ruff/format/whitespace
+checks pass, GPU source hashes match, and all jobs have terminated.
 
 ## Next Implementation
 

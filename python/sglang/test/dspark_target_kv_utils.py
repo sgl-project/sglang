@@ -87,13 +87,27 @@ def make_target_kv_injector():
 
 def make_minimal_kv_weight_loader():
     """Exercise the real loader on a small parameter tree without distributed init."""
+    from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
     from sglang.srt.models.dspark_target_kv import DSparkTargetKVDraftModel
 
     model = DSparkTargetKVDraftModel.__new__(DSparkTargetKVDraftModel)
     torch.nn.Module.__init__(model)
     layer = torch.nn.Module()
     layer.self_attn = torch.nn.Module()
-    layer.self_attn.qkv_proj = torch.nn.Linear(2, 6, bias=False)
+    layer.self_attn.qkv_proj = QKVParallelLinear(
+        2,
+        head_size=2,
+        total_num_heads=2,
+        total_num_kv_heads=1,
+        bias=False,
+        params_dtype=torch.float32,
+        tp_size=1,
+        tp_rank=0,
+    )
+    layer.mlp = torch.nn.Module()
+    layer.mlp.gate_up_proj = MergedColumnParallelLinear(
+        2, [4, 4], bias=False, params_dtype=torch.float32, tp_size=1, tp_rank=0
+    )
     model.layers = torch.nn.ModuleList([layer])
     model.kv_encoder = torch.nn.Linear(2, 2, bias=False)
     model.norm = torch.nn.Linear(2, 2, bias=False)
@@ -101,6 +115,8 @@ def make_minimal_kv_weight_loader():
     model.confidence_head = None
     model._fused_kv_write_cache = object()
     model._stacked_ctx_kv_cache = object()
+    for parameter in model.parameters():
+        torch.nn.init.zeros_(parameter)
     return model
 
 

@@ -394,8 +394,20 @@ python -m sglang.test.dspark_target_kv_parity \
 Triton. `validation/parity.json` records all numerical stages and runtime/artifact
 identities, and a failed comparison exits nonzero. Failed reruns cannot leave an
 older successful report. Run one validation at a time per checkpoint directory.
-The real BF16 gate currently fails; see `../IMPLEMENTATION_STATUS.md`. The normal
-capture runtime test remains an independent, exact Store readback check.
+The retained BF16 fixture passes with `--reference-attention flex_attention`;
+see `../IMPLEMENTATION_STATUS.md` for the numerical scope and other reference
+backends. The normal capture runtime test remains an independent, exact Store
+readback check.
+
+KV-input checkpoint loading validates complete packed/split tensor shapes and
+dense FP32/FP16/BF16 contents before writing parameters. Nonfinite values,
+destination-dtype overflow and malformed exports fail without changing the
+model or its projection caches. This validation is covered by the unit file
+`test/registered/unit/spec/test_dspark_target_kv.py` and the export/reload parity
+checks above. Baseline failures, repaired runs and the retained BF16 report are
+in [`target-kv-checkpoint-validation.json`](target-kv-checkpoint-validation.json).
+These checks do not replace the production exporter or trained-model acceptance
+evaluation.
 
 For diagnosis only, FP32 weights/activations and native auxiliary operators can
 be compared while preserving the actual paged-attention path:

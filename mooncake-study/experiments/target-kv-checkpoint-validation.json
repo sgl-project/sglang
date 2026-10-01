@@ -1,0 +1,238 @@
+{
+  "purpose": "Validate KV-input DSpark checkpoint tensors before parameter writes, preventing silent truncation, nonfinite loads and partial mutation from invalid exports",
+  "source_baseline": "e46c9015b27d55c2da5391d45c0cf70e3ef3e8ad",
+  "baseline_model_sha256": "97c59e1119eb80a7756076145c480e40de602d243327e33844d97cdbeea926c4",
+  "environment_lock": "h100-runtime-lock.json",
+  "source_sha256": {
+    "python/sglang/srt/models/dspark_target_kv.py": "6dab25a15ad61da84e10345d65cb6e2475e159412336a6207580c4d3483c3fcb",
+    "python/sglang/test/dspark_target_kv_utils.py": "dd476f54104c58277b29e3d596a5349013c29f5d6438a30a4501e0f5c6d59a50",
+    "test/registered/unit/spec/test_dspark_target_kv.py": "8098f4f0dfc30aa667169e4338b88d8cf15da2514c78218f224448acef9d6999",
+    "python/sglang/test/dspark_target_kv_parity.py": "1276dc7fb1a791c0cdedf31c90dcb4916871193a64aef51cf82f0f823d4c5658",
+    "test/registered/spec/dspark/test_dspark_target_kv_parity.py": "1685abb68ebeca5bdcca52e5701f5dbf40e2446eab3cfc969dfe85f51398d3da"
+  },
+  "implementation": {
+    "scope": "DSparkTargetKVDraftModel only; existing target_hidden DSpark loaders are unchanged",
+    "accepted_weight_dtypes": [
+      "float32",
+      "float16",
+      "bfloat16"
+    ],
+    "shape_validation": "Exact destination shapes for packed/full parameters; configured Q/K/V and gate/up output sizes for split parameters",
+    "numeric_validation": "Per-tensor aminmax, cast only the two extrema to the destination dtype, reject nonfinite extrema",
+    "validation_order": "All tensor, name, duplicate and coverage checks complete before the parent loader writes any parameter",
+    "projection_caches": "Reset only after successful load",
+    "supported_runtime_topology": "Existing TP=PP=DP=1 gate remains in force"
+  },
+  "baseline_regression": {
+    "job_id": "01790838342711980754-a0a5d065e9ff",
+    "outcome": "failed",
+    "returncode": 1,
+    "finished_unix": 1790838356.6484027,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790838342711980754-a0a5d065e9ff.log",
+    "log_sha256": "38085d4b5327b6bc056056ffa911d7c821ba2b624425b91617a7e088a51140ff",
+    "command": [
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+      "-m",
+      "pytest",
+      "-q",
+      "test/registered/unit/spec/test_dspark_target_kv.py::TestTargetKVWeightLoader"
+    ],
+    "expected_failure": true,
+    "failed_subtests": 10,
+    "passed_tests": 6,
+    "passed_subtests": 5,
+    "seconds": 10.94,
+    "failures": [
+      "Oversized packed QKV accepted and truncated",
+      "Oversized packed gate/up accepted and truncated",
+      "Oversized split Q/K/V accepted and truncated",
+      "Oversized split gate/up accepted and truncated",
+      "Late shape error escaped preflight and reached the mutating generic loader",
+      "Integer tensors accepted",
+      "Complex tensors accepted with imaginary components discarded",
+      "NaN accepted",
+      "Infinity accepted",
+      "Finite FP32 value overflowed on FP16 destination conversion"
+    ],
+    "note": "The final unit source additionally exercises successful cross-dtype loads; negative regression inputs are unchanged."
+  },
+  "fixed_unit_and_parity": {
+    "job_id": "01790838420199480428-2bb5c92e8be4",
+    "outcome": "completed",
+    "returncode": 0,
+    "finished_unix": 1790838437.7496657,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790838420199480428-2bb5c92e8be4.log",
+    "log_sha256": "1ad5aa212c29df096bfd3d56ec79d97837ec67f12e126bc595d01e8426b279fa",
+    "command": [
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+      "-m",
+      "pytest",
+      "-q",
+      "test/registered/unit/spec/test_dspark_target_kv.py",
+      "test/registered/spec/dspark/test_dspark_target_kv_parity.py"
+    ],
+    "passed_tests": 25,
+    "passed_subtests": 42,
+    "seconds": 14.11,
+    "covers": [
+      "Contract and encoder invariants",
+      "Committed-prefix projection/invalidation",
+      "Malformed export rejection without parameter/cache mutation",
+      "Independent expected packed GQA and MLP layout",
+      "Three Markov heads, cached CE+TV128 gradients, optimizer update and serving export/reload"
+    ]
+  },
+  "final_unit": {
+    "job_id": "01790838598515310920-4aa144bbb44b",
+    "outcome": "completed",
+    "returncode": 0,
+    "finished_unix": 1790838612.7949262,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790838598515310920-4aa144bbb44b.log",
+    "log_sha256": "0fdfe58475ba038d63843e897a1228ed0a99e2781df1e3777c2755e0277bf78e",
+    "command": [
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+      "-m",
+      "pytest",
+      "-q",
+      "test/registered/unit/spec/test_dspark_target_kv.py"
+    ],
+    "passed_tests": 20,
+    "passed_subtests": 42,
+    "seconds": 11.13,
+    "additional_successful_source_destination_dtypes": [
+      [
+        "float32",
+        "float16"
+      ],
+      [
+        "float16",
+        "bfloat16"
+      ],
+      [
+        "bfloat16",
+        "float32"
+      ]
+    ]
+  },
+  "retained_fixture": {
+    "job_id": "01790838509115541407-3e7fbe13b6b3",
+    "outcome": "completed",
+    "returncode": 0,
+    "finished_unix": 1790838532.9905612,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790838509115541407-3e7fbe13b6b3.log",
+    "log_sha256": "b470a780b2f9342ee71fadc16dc027d5a87e921ca57ce324fb95cc45f8a8f310",
+    "command": [
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+      "-m",
+      "sglang.test.dspark_target_kv_parity",
+      "--checkpoint",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/fixtures/qwen3-target-kv-parity-20261001",
+      "--target-path",
+      "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+      "--reference-attention",
+      "flex_attention"
+    ],
+    "report": {
+      "status": "passed",
+      "reference_adapter": "specforge_backbone_with_shared_kv_encoder",
+      "reference_attention": "flex_attention",
+      "serving_attention": "triton",
+      "dtype": "bfloat16",
+      "device": "NVIDIA H100 80GB HBM3",
+      "torch_version": "2.13.0+cu130",
+      "cuda_version": "13.0",
+      "cudnn_version": 92000,
+      "transformers_version": "5.12.1",
+      "specforge_sources": {
+        "specforge.modeling.draft.dflash": "d0cbb0dafb77fe6cc64c9a2850515aaca6f11b811af767b141a5aa473e4213ba",
+        "specforge.modeling.draft.dflash_kernels": "ce6496a07282b8d3ab4b69942191d27a8ba2d0a107613b2ae74e60604b0faf46",
+        "specforge.modeling.draft.dspark": "4ec764996b8a48c24e1ba15513503255ae9165a2c3abb9ad2d3e988c6a526be7"
+      },
+      "artifact_sha256": {
+        "config.json": "4b74ae312ce217dae27d1346a617245f370ebd0fbb80feeeccbc2b0e12bf6dbd",
+        "model.safetensors": "1bad9b3c7fdf78e75a180d3cc08fc536a643e6a70a82fd9c856f9249dbd69982",
+        "validation/inputs.safetensors": "75f2a38ab933a0112a2de1365511782c101578d00d0503c991cd1e752fdcc472"
+      },
+      "rtol": 0.03,
+      "atol": 0.03,
+      "stages": {
+        "layer.0": {
+          "passed": true,
+          "elements": 9216,
+          "mismatched": 0,
+          "nonfinite": 0,
+          "max_abs": 0,
+          "rms": 0
+        },
+        "layer.1": {
+          "passed": true,
+          "elements": 9216,
+          "mismatched": 0,
+          "nonfinite": 0,
+          "max_abs": 0,
+          "rms": 0
+        },
+        "hidden": {
+          "passed": true,
+          "elements": 9216,
+          "mismatched": 0,
+          "nonfinite": 0,
+          "max_abs": 0,
+          "rms": 0
+        },
+        "base": {
+          "passed": true,
+          "elements": 1367424,
+          "mismatched": 0,
+          "nonfinite": 0,
+          "max_abs": 0,
+          "rms": 0
+        },
+        "corrected": {
+          "passed": true,
+          "elements": 1367424,
+          "mismatched": 0,
+          "nonfinite": 0,
+          "max_abs": 0,
+          "rms": 0
+        }
+      },
+      "max_abs": {
+        "layer.0": 0,
+        "layer.1": 0,
+        "hidden": 0,
+        "base": 0,
+        "corrected": 0
+      },
+      "anchors": [
+        159,
+        160,
+        162
+      ],
+      "valid_labels": 7,
+      "loss": 8556.904296875,
+      "gradient_l1": {
+        "layers": 644639.2390060425,
+        "norm": 18.816329956054688,
+        "markov_head": 8545.822575569153,
+        "kv_encoder": 151947.00708007812
+      },
+      "fixture_sha256": "75f2a38ab933a0112a2de1365511782c101578d00d0503c991cd1e752fdcc472",
+      "weights_sha256": "1bad9b3c7fdf78e75a180d3cc08fc536a643e6a70a82fd9c856f9249dbd69982",
+      "observed_sdpa_operators": []
+    }
+  },
+  "limits": [
+    "Checkpoint tensor validation does not certify acceptance rates, draft training quality or production release readiness.",
+    "The retained draft still has synthetic encoder/Markov weights and copied target backbone layers; its KV/teacher fixture is actual Mooncake readback.",
+    "SpecForge's production KV-input exporter and trained-checkpoint validation remain open.",
+    "Hardware or copy failures after successful validation are not transactional rollback; runtime weight mutation remains gated for this architecture.",
+    "No TP/PP, quantized checkpoint or new serving throughput claim; the full HTTP capture runtime was not repeated for this loader-only change."
+  ],
+  "checks": {
+    "local_gpu_source_hashes_equal": true,
+    "ruff_passed": true,
+    "original_worktree_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "resident_gpu_idle_resumed": true
+  }
+}

@@ -142,7 +142,7 @@ class DSparkTargetKVDraftModel(DSparkDraftModel):
         )
 
     def load_weights(self, weights):
-        """Reject missing/duplicate/foreign tensors before touching parameters."""
+        """Validate the complete unquantized export before touching parameters."""
         parameters = dict(self.named_parameters())
         coverage = defaultdict(set)
         normalized = []
@@ -164,6 +164,9 @@ class DSparkTargetKVDraftModel(DSparkDraftModel):
                         break
             if parameter_name not in parameters:
                 raise ContractError(f"unexpected KV draft weight: {original_name}")
+            self._validate_checkpoint_tensor(
+                original_name, parameter_name, parameters[parameter_name], shard, weight
+            )
             if shard in coverage[parameter_name] or (
                 coverage[parameter_name]
                 and (shard == "full" or "full" in coverage[parameter_name])
@@ -184,6 +187,37 @@ class DSparkTargetKVDraftModel(DSparkDraftModel):
         super().load_weights(normalized)
         self._fused_kv_write_cache = None
         self._stacked_ctx_kv_cache = False
+
+    @torch.no_grad()
+    def _validate_checkpoint_tensor(
+        self, original_name, name, parameter, shard, weight
+    ):
+        if (
+            not isinstance(weight, torch.Tensor)
+            or weight.layout != torch.strided
+            or weight.is_meta
+            or weight.dtype not in (torch.float32, torch.float16, torch.bfloat16)
+        ):
+            raise ContractError(
+                f"KV draft weight must be a dense FP32/FP16/BF16 tensor: {original_name}"
+            )
+        expected = list(parameter.shape)
+        if shard != "full":
+            module = self.get_submodule(name.rsplit(".", 1)[0])
+            index = {"q": 0, "k": 1, "v": 2, "gate": 0, "up": 1}[shard]
+            expected[0] = module.output_sizes[index]
+        if tuple(weight.shape) != tuple(expected):
+            raise ContractError(
+                f"KV draft weight shape mismatch for {original_name}: "
+                f"expected {tuple(expected)}, got {tuple(weight.shape)}"
+            )
+        # Extrema detect NaN/Inf and overflow in the destination dtype without
+        # allocating a converted copy or a boolean mask of the whole weight.
+        extrema = torch.stack(torch.aminmax(weight)).to(dtype=parameter.dtype)
+        if not torch.isfinite(extrema).all().item():
+            raise ContractError(
+                f"KV draft weight is nonfinite in {parameter.dtype}: {original_name}"
+            )
 
 
 EntryClass = DSparkTargetKVDraftModel

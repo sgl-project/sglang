@@ -333,6 +333,107 @@ class TestTargetKVInjector(CustomTestCase):
 
 
 class TestTargetKVWeightLoader(CustomTestCase):
+    def test_split_gqa_and_mlp_exports_preserve_packed_parameter_layout(self):
+        model = make_minimal_kv_weight_loader()
+        expected = {
+            name: torch.arange(parameter.numel()).reshape_as(parameter).float() + i
+            for i, (name, parameter) in enumerate(model.named_parameters())
+        }
+        split = []
+        for name, value in expected.items():
+            if ".qkv_proj." in name:
+                parts = zip(("q", "k", "v"), value.split((4, 2, 2)), strict=True)
+                split.extend(
+                    ("model." + name.replace("qkv_proj", part + "_proj"), shard)
+                    for part, shard in parts
+                )
+            elif ".gate_up_proj." in name:
+                parts = zip(("gate", "up"), value.chunk(2), strict=True)
+                split.extend(
+                    ("model." + name.replace("gate_up_proj", part + "_proj"), shard)
+                    for part, shard in parts
+                )
+            else:
+                split.append(("model." + name, value))
+        model.load_weights(reversed(split))
+        for name, parameter in model.named_parameters():
+            torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
+
+    def test_oversized_packed_and_split_weights_cannot_be_silently_truncated(self):
+        """Parallel loaders otherwise narrow oversized exports and discard rows."""
+        for packed in (True, False):
+            for projection in ("qkv_proj", "gate_up_proj"):
+                with self.subTest(packed=packed, projection=projection):
+                    model = make_minimal_kv_weight_loader()
+                    original = {
+                        name: parameter.detach().clone()
+                        for name, parameter in model.named_parameters()
+                    }
+                    weights = []
+                    for name, value in original.items():
+                        value = torch.full_like(value, 9)
+                        if f".{projection}." not in name:
+                            weights.append((name, value))
+                        elif packed:
+                            weights.append((name, torch.cat((value, value[:1]))))
+                        else:
+                            parts = (
+                                zip(
+                                    ("q", "k", "v"), value.split((4, 2, 2)), strict=True
+                                )
+                                if projection == "qkv_proj"
+                                else zip(("gate", "up"), value.chunk(2), strict=True)
+                            )
+                            for part, shard in parts:
+                                weights.append(
+                                    (
+                                        name.replace(projection, part + "_proj"),
+                                        torch.cat((shard, shard[:1])),
+                                    )
+                                )
+                    with self.assertRaisesRegex(ContractError, "shape"):
+                        model.load_weights(weights)
+                    for name, parameter in model.named_parameters():
+                        torch.testing.assert_close(
+                            parameter, original[name], rtol=0, atol=0
+                        )
+
+    def test_late_invalid_tensor_rejects_before_any_parameter_or_cache_changes(self):
+        """Bad late weights previously partially overwrote or poisoned the draft."""
+        malformed = {
+            "shape": torch.ones(1, 2),
+            "integer": torch.ones(2, 2, dtype=torch.int64),
+            "complex": torch.ones(2, 2, dtype=torch.complex64),
+            "nan": torch.tensor([[1.0, float("nan")], [2.0, 3.0]]),
+            "infinity": torch.tensor([[1.0, 2.0], [float("inf"), 3.0]]),
+            "cast_overflow": torch.tensor([[1.0, 2.0], [-70000.0, 3.0]]),
+        }
+        for kind, invalid in malformed.items():
+            with self.subTest(kind=kind):
+                model = make_minimal_kv_weight_loader().half()
+                original = {
+                    name: parameter.detach().clone()
+                    for name, parameter in model.named_parameters()
+                }
+                fused, stacked = (
+                    model._fused_kv_write_cache,
+                    model._stacked_ctx_kv_cache,
+                )
+                weights = [
+                    (name, torch.full_like(value, 9, dtype=torch.float32))
+                    for name, value in original.items()
+                    if name != "markov_head.weight"
+                ]
+                weights.append(("markov_head.weight", invalid))
+                with self.assertRaises(ContractError):
+                    model.load_weights(weights)
+                for name, parameter in model.named_parameters():
+                    torch.testing.assert_close(
+                        parameter, original[name], rtol=0, atol=0
+                    )
+                self.assertIs(model._fused_kv_write_cache, fused)
+                self.assertIs(model._stacked_ctx_kv_cache, stacked)
+
     def test_gated_markov_parameters_are_not_interpreted_as_mlp_shards(self):
         from sglang.srt.models.dspark import GatedMarkovHead
 
@@ -347,18 +448,26 @@ class TestTargetKVWeightLoader(CustomTestCase):
             torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
 
     def test_complete_checkpoint_loads_and_resets_projection_caches(self):
-        model = make_minimal_kv_weight_loader()
-        expected = {
-            name: torch.full_like(parameter, i + 1)
-            for i, (name, parameter) in enumerate(model.named_parameters())
-        }
-        model.load_weights(
-            [("model." + name, value) for name, value in expected.items()]
-        )
-        for name, parameter in model.named_parameters():
-            torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
-        self.assertIsNone(model._fused_kv_write_cache)
-        self.assertIs(model._stacked_ctx_kv_cache, False)
+        for source, destination in (
+            (torch.float32, torch.float16),
+            (torch.float16, torch.bfloat16),
+            (torch.bfloat16, torch.float32),
+        ):
+            with self.subTest(source=source, destination=destination):
+                model = make_minimal_kv_weight_loader().to(dtype=destination)
+                expected = {
+                    name: torch.full_like(parameter, i + 1, dtype=source)
+                    for i, (name, parameter) in enumerate(model.named_parameters())
+                }
+                model.load_weights(
+                    [("model." + name, value) for name, value in expected.items()]
+                )
+                for name, parameter in model.named_parameters():
+                    torch.testing.assert_close(
+                        parameter, expected[name].to(destination), rtol=0, atol=0
+                    )
+                self.assertIsNone(model._fused_kv_write_cache)
+                self.assertIs(model._stacked_ctx_kv_cache, False)
 
     def test_missing_duplicate_foreign_and_partial_shards_reject_before_mutation(self):
         model = make_minimal_kv_weight_loader()
