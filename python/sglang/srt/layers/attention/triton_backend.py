@@ -182,8 +182,16 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
-        # Work-Centric (Lean) Attention activation. None => auto-gate from host-side
-        # seqlen metadata in forward_decode; True/False => explicit override.
+        # Lean's auto-gate is calibrated for gfx942/gfx950. Explicit True still
+        # allows bring-up on other architectures.
+        gcn_arch = (
+            torch.cuda.get_device_properties(model_runner.device).gcnArchName
+            if torch.version.hip
+            else ""
+        )
+        self.lean_attention_auto_supported = not any(
+            arch in gcn_arch for arch in ("gfx1100", "gfx1201")
+        )
         self.enable_lean_attention = model_runner.server_args.enable_lean_attention
         self._lean_decode_seqlen_gate = lean_decode_seqlen_gate
         self._lean_capture_policy = lean_capture_policy
@@ -1925,6 +1933,8 @@ class TritonAttnBackend(AttentionBackend):
             enable_lean = False
         else:
             enable_lean = self.enable_lean_attention
+            if enable_lean is None and not self.lean_attention_auto_supported:
+                enable_lean = False
             if enable_lean is None:
                 kv_group_num = layer.tp_q_head_num // layer.tp_k_head_num
                 is_mla = layer.qk_head_dim != layer.v_head_dim
