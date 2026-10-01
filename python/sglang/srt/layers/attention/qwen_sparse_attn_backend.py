@@ -512,19 +512,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         member_rows = None
         prefix_members = None
         if row_token_starts is not None:
-            # member_rows index this forward's packed token rows.  A private
-            # chunk-cache tail can leave the first group crossing the extend
-            # boundary; prefix_members records how many leading members must
-            # come from the per-request pending ring.
-            group_starts = blocks * compress_ratio
+            # member_rows index this forward's packed token rows.
             member_rows = torch.where(
                 valid,
-                row_token_starts[rows] + group_starts - prefix_lens[rows],
+                row_token_starts[rows] + blocks * compress_ratio - prefix_lens[rows],
                 torch.zeros_like(blocks),
             )
+            # A private chunk-cache tail can leave a group crossing the extend
+            # boundary, so member_rows points before row_token_starts;
+            # prefix_members counts the leading members that must instead come
+            # from the per-request pending ring.
             prefix_members = torch.where(
                 valid,
-                (prefix_lens[rows] - group_starts).clamp(min=0, max=compress_ratio - 1),
+                (prefix_lens[rows] - blocks * compress_ratio).clamp(
+                    min=0, max=compress_ratio - 1
+                ),
                 torch.zeros_like(blocks),
             )
         return write_locs, group_end_positions, rows, member_rows, prefix_members

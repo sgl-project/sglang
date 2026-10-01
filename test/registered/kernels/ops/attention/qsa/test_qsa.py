@@ -79,6 +79,95 @@ def test_qsa_write_plan_tracks_group_crossing_extend_prefix():
     assert prefix_members[:3].tolist() == [2, 0, 0]
 
 
+class _CrossPrefixPool:
+    """Minimal QSA pool exposing just the buffers the compress path touches."""
+
+    def __init__(self, ring_slots: int, compressed_slots: int, head_dim: int):
+        self.key_state = torch.zeros(ring_slots, 1, head_dim)
+        self.qsa_rope_position_buffer = torch.zeros(ring_slots, 3, dtype=torch.long)
+        self.compressed = torch.zeros(compressed_slots, 1, head_dim)
+
+    def get_qsa_key_state_buffer(self, layer_id):
+        return self.key_state
+
+    def set_qsa_compressed_k_buffer(self, layer_id, locs, values):
+        self.compressed[locs.long()] = values
+
+
+def test_qsa_cross_prefix_recompress_reads_the_pre_store_ring(monkeypatch):
+    """A straddling group must pool the prefix keys, not this chunk's tail.
+
+    The pending ring holds only `compress_ratio` entries per request, keyed by
+    `position % ratio`. With prefix 10 / extend 4 the group is [8, 12): tokens
+    8 and 9 sit in ring slots 0 and 1, and this forward's own tokens 12 and 13
+    land on those same two slots. Reading the ring after the store would pool
+    mean(K12, K13, K10, K11) and take the RoPE position from token 12.
+    """
+    monkeypatch.setattr(qsa_indexer_module, "is_gfx95_supported", lambda: True)
+    head_dim = 2
+    pool = _CrossPrefixPool(ring_slots=8, compressed_slots=8, head_dim=head_dim)
+    # Request 1 owns ring slots [4, 8); its previous chunk left tokens 8 and 9
+    # in the first two, which is what makes prefix_len=10 unaligned.
+    prefix_keys = torch.tensor([[[8.0, 8.0]], [[9.0, 9.0]]])
+    pool.key_state[4:6] = prefix_keys
+    pool.qsa_rope_position_buffer[4] = 8
+    pool.qsa_rope_position_buffer[5] = 9
+
+    metadata = SimpleNamespace(
+        has_cross_prefix_group=True,
+        # Group [8, 12) for request 1, oldest member first; the trailing
+        # entry is a group wholly inside this extend.
+        compress_group_ring_locs=torch.tensor([[4, 5, 6, 7], [4, 5, 6, 7]]),
+        compress_prefix_members=torch.tensor([2, 0]),
+        token_to_kv_pool=pool,
+    )
+
+    captured = {}
+
+    def _normalize(pooled, rope_positions):
+        captured["rope"] = rope_positions
+        return pooled
+
+    indexer = SimpleNamespace(
+        layer_id=0,
+        compress_ratio=COMPRESS_RATIO,
+        rotary_emb=SimpleNamespace(),
+        normalize_compressed_keys=_normalize,
+        _use_fused_compress=lambda pool: False,
+    )
+    for name in (
+        "_snapshot_cross_prefix_members",
+        "_overwrite_cross_prefix_groups",
+        "_rope_from_matrix",
+    ):
+        setattr(indexer, name, MethodType(getattr(QSAIndexer, name), indexer))
+
+    snapshot = indexer._snapshot_cross_prefix_members(metadata)
+    assert snapshot is not None
+
+    # The forward's own store now reuses ring slots 4 and 5 for tokens 12, 13.
+    pool.key_state[4:6] = torch.tensor([[[12.0, 12.0]], [[13.0, 13.0]]])
+    pool.qsa_rope_position_buffer[4] = 12
+    pool.qsa_rope_position_buffer[5] = 13
+
+    # Packed extend rows are tokens 10..13; member_rows=-2 clamps to row 0.
+    token_k = torch.tensor(
+        [[[10.0, 10.0]], [[11.0, 11.0]], [[12.0, 12.0]], [[13.0, 13.0]]]
+    )
+    current_group_locs = torch.tensor([[0, 0, 0, 1], [0, 1, 2, 3]])
+    compressed_locs = torch.tensor([3, 7], dtype=torch.int32)
+    indexer._overwrite_cross_prefix_groups(
+        token_k, metadata, current_group_locs, compressed_locs, snapshot
+    )
+
+    expected = torch.full((1, head_dim), (8 + 9 + 10 + 11) / 4)
+    torch.testing.assert_close(pool.compressed[3], expected)
+    assert captured["rope"][0].item() == 8
+    # The group wholly inside this extend keeps the main pass's result and is
+    # routed to the inert reserved slot 0 instead of its own slot.
+    assert torch.count_nonzero(pool.compressed[7]) == 0
+
+
 def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
         pytest.skip("FP8-capable CUDA GPU required")
@@ -590,7 +679,8 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
             _pending_ring_slots=lambda metadata, logical_positions, is_extend: (
                 torch.zeros(logical_positions.numel(), dtype=torch.long)
             ),
-            update_key_state_and_compress=lambda token_k, logical, rope, meta, state_slots=None, state_stored=False: (
+            _snapshot_cross_prefix_members=lambda metadata: None,
+            update_key_state_and_compress=lambda token_k, logical, rope, meta, state_slots=None, state_stored=False, cross_prefix_state=None: (
                 calls.update(
                     token_rows=token_k.shape[0],
                     logical_rows=logical.numel(),
@@ -997,6 +1087,7 @@ class _DispatchIndexer:
     index_n_heads = 4
     compress_ratio = 4
     _pending_ring_slots = QSAIndexer._pending_ring_slots
+    _snapshot_cross_prefix_members = QSAIndexer._snapshot_cross_prefix_members
     # forward_cuda (the code under test) delegates to _forward_impl; bind the
     # real implementation so this mock indexer can be dispatched through it.
     _forward_impl = QSAIndexer._forward_impl
@@ -1030,6 +1121,7 @@ class _DispatchMetadata:
     compress_member_rows = None
     decode_logical_positions = None
     pending_ring_slots = None
+    has_cross_prefix_group = False
     # Consumed by the real _pending_ring_slots helper the dispatch indexer
     # borrows: one token row owned by request slot 1.
     token_to_batch_idx = torch.zeros(2, dtype=torch.int32)

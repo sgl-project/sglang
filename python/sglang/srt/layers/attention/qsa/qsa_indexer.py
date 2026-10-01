@@ -22,6 +22,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils import is_gfx95_supported
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -268,6 +269,33 @@ class QSAIndexer(MultiPlatformOp):
             is_extend=is_extend,
         )
 
+    def _snapshot_cross_prefix_members(
+        self, metadata
+    ) -> Tuple[torch.Tensor, torch.Tensor] | None:
+        """Copy the ring keys and RoPE coordinates a straddling group needs.
+
+        gfx95 exact-chunk-fill can leave a private chunk-cache tail mid-group,
+        so a planned group's leading members live in the pending ring rather
+        than this forward's packed rows. The ring holds only ``compress_ratio``
+        entries per request and this forward's own tail reuses those very
+        slots (``position % ratio``), so the members must be read before any
+        store -- ``project_qk``'s fused path already writes the ring. Returns
+        ``None`` off gfx95 and on batches with no straddling group.
+        """
+        if not (is_gfx95_supported() and metadata.has_cross_prefix_group):
+            return None
+        ring_group_locs = metadata.compress_group_ring_locs
+        if ring_group_locs is None:
+            raise RuntimeError("QSA cross-prefix groups require pending-ring locations")
+        ring_group_locs = ring_group_locs.long()
+        pool = metadata.token_to_kv_pool
+        # Advanced indexing copies, so a later in-place ring store cannot
+        # reach these; the group start is in column 0 and is always a
+        # prefix-side member, so its RoPE coordinate rotates the group.
+        ring_keys = pool.get_qsa_key_state_buffer(self.layer_id)[ring_group_locs]
+        ring_rope = pool.qsa_rope_position_buffer[ring_group_locs[:, 0]]
+        return ring_keys, ring_rope
+
     def _group_ring_slots(
         self, metadata, group_end_positions: torch.Tensor, sequence_ids: torch.Tensor
     ) -> torch.Tensor:
@@ -286,8 +314,13 @@ class QSAIndexer(MultiPlatformOp):
         metadata,
         state_slots: torch.Tensor | None = None,
         state_stored: bool = False,
+        cross_prefix_state: Tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
-        """Store the pending-group ring and compress each completed group."""
+        """Store the pending-group ring and compress each completed group.
+
+        ``cross_prefix_state`` is ``_snapshot_cross_prefix_members``' pre-store
+        copy of the ring; it must be taken before this store overwrites it.
+        """
 
         pool = metadata.token_to_kv_pool
         is_extend = metadata.compress_member_rows is not None
@@ -321,11 +354,11 @@ class QSAIndexer(MultiPlatformOp):
             group_locs = member_rows[:, None] + torch.arange(
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
-            if metadata.has_cross_prefix_group:
-                # gfx95 exact-chunk-fill can leave a private chunk-cache tail
-                # mid-group. Clamp prefix-side rows for this main pass;
-                # _overwrite_cross_prefix_groups replaces that group's result
-                # from the pending ring below.
+            if cross_prefix_state is not None:
+                # A straddling group's member_rows start before this forward's
+                # packed rows. Clamp them for the main pass to keep the gather
+                # in range; _overwrite_cross_prefix_groups replaces that
+                # group's result from the ring snapshot below.
                 prefix_members = metadata.compress_prefix_members.long()
                 first_current_rows = member_rows + prefix_members
                 group_locs = torch.maximum(group_locs, first_current_rows[:, None])
@@ -367,9 +400,9 @@ class QSAIndexer(MultiPlatformOp):
             )
             pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
 
-        if is_extend and metadata.has_cross_prefix_group:
+        if is_extend and cross_prefix_state is not None:
             self._overwrite_cross_prefix_groups(
-                token_k, metadata, group_locs, compressed_locs
+                token_k, metadata, group_locs, compressed_locs, cross_prefix_state
             )
 
     def _overwrite_cross_prefix_groups(
@@ -378,21 +411,20 @@ class QSAIndexer(MultiPlatformOp):
         metadata,
         current_group_locs: torch.Tensor,
         compressed_locs: torch.Tensor,
+        cross_prefix_state: Tuple[torch.Tensor, torch.Tensor],
     ) -> None:
-        """Compress groups spanning a retained private prefix and this extend."""
+        """Recompress groups spanning a retained private prefix and this extend.
 
+        Runs over every planned group so the selection stays shape-derived:
+        a group wholly inside this extend has ``prefix_members == 0``, takes
+        no ring member, and is routed to the inert reserved slot 0 rather
+        than rewriting what the main pass already stored.
+        """
+
+        ring_keys, ring_rope = cross_prefix_state
         prefix_members = metadata.compress_prefix_members.long()
-        partial = (prefix_members > 0) & (compressed_locs != 0)
-        prefix_members = prefix_members[partial]
-        current_group_locs = current_group_locs[partial]
-        ring_group_locs = metadata.compress_group_ring_locs
-        if ring_group_locs is None:
-            raise RuntimeError("QSA cross-prefix groups require pending-ring locations")
-        ring_group_locs = ring_group_locs[partial].long()
-
         pool = metadata.token_to_kv_pool
         current_keys = token_k[current_group_locs]
-        ring_keys = pool.get_qsa_key_state_buffer(self.layer_id)[ring_group_locs]
         use_ring = (
             torch.arange(
                 self.compress_ratio,
@@ -404,14 +436,38 @@ class QSAIndexer(MultiPlatformOp):
         while use_ring.ndim < current_keys.ndim:
             use_ring = use_ring.unsqueeze(-1)
         key_groups = torch.where(use_ring, ring_keys, current_keys)
+        write_locs = torch.where(
+            prefix_members > 0, compressed_locs, torch.zeros_like(compressed_locs)
+        )
+        if self._use_fused_compress(pool):
+            # Feed the same kernel the main pass uses so a straddling group is
+            # not the one group on a different numeric path. Members are
+            # already gathered, so the scratch group is just consecutive rows
+            # with the group-start RoPE coordinate in column 0.
+            groups = key_groups.shape[0]
+            scratch_locs = torch.arange(
+                groups * self.compress_ratio,
+                device=key_groups.device,
+                dtype=torch.long,
+            ).view(groups, self.compress_ratio)
+            scratch_rope = (
+                ring_rope[:, None, :]
+                .expand(groups, self.compress_ratio, ring_rope.shape[-1])
+                .reshape(groups * self.compress_ratio, -1)
+                .contiguous()
+            )
+            self._fused_compress_store(
+                pool,
+                scratch_locs,
+                write_locs,
+                source_keys=key_groups.reshape(-1, *key_groups.shape[2:]),
+                source_rope=scratch_rope,
+            )
+            return
         pooled = average_pool_qsa_keys(key_groups)
-        compressed_rope_positions = self._rope_from_matrix(
-            pool.qsa_rope_position_buffer[ring_group_locs[:, 0]]
-        )
+        compressed_rope_positions = self._rope_from_matrix(ring_rope)
         normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
-        pool.set_qsa_compressed_k_buffer(
-            self.layer_id, compressed_locs[partial], normalized
-        )
+        pool.set_qsa_compressed_k_buffer(self.layer_id, write_locs, normalized)
 
     def _compress_decode_cuda_graph(self, metadata) -> None:
         """Fixed-shape graph-replay compression; non-boundary rows write slot 0."""
@@ -641,6 +697,9 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
+        # project_qk's fused path stores into the pending ring, so a straddling
+        # group's prefix-side members have to be copied out ahead of it.
+        cross_prefix_state = self._snapshot_cross_prefix_members(indexer_metadata)
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
@@ -660,6 +719,7 @@ class QSAIndexer(MultiPlatformOp):
             indexer_metadata,
             state_slots=state_slots,
             state_stored=state_stored,
+            cross_prefix_state=cross_prefix_state,
         )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
