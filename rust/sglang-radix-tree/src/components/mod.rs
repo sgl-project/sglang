@@ -354,7 +354,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         &self,
         _tree_core: &mut UnifiedTreeCore<K>,
         _node_id: NodeIdx_,
-        _swa_uuid_for_lock: Option<i64>,
+        _params: &DecLockRefParams,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {
@@ -372,6 +372,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         host_indices: Option<Tensor>,
         token_ids: Option<&[i64]>,
         prefetch_tokens: usize,
+        staging_tokens: usize,
         last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
         // Python reference — base.py::TreeComponent.build_hicache_transfers:
@@ -384,6 +385,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         //         host_indices: Optional[torch.Tensor] = None,
         //         token_ids: Optional[Sequence[int]] = None,
         //         prefetch_tokens: int = 0,
+        //         staging_tokens: int = 0,
         //         last_hash: Optional[str] = None,
         //     ) -> Optional[list[PoolTransfer]]:
         //         """Build transfer descriptors for this component in the given phase.

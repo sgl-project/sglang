@@ -23,6 +23,7 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
+    "ppu": HWBackend.PPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -73,6 +74,7 @@ PER_COMMIT_SUITES = {
         "base-b-test-1-gpu-large",
         "base-b-test-2-gpu-large",
         "base-b-test-4-gpu-b200",
+        "base-b-kernel-unit-test-1-gpu-small",
         "base-b-kernel-unit-test-1-gpu-large",
         "base-b-kernel-unit-test-4-gpu-b200",
         "base-b-kernel-unit-test-8-gpu-h200",
@@ -101,9 +103,10 @@ PER_COMMIT_SUITES = {
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
         "extra-b-test-8-gpu-h200",
+        "extra-b-test-8-gpu-b300",
     ],
     HWBackend.NPU: [
-        "base-a-test-1-npu-a2",
+        "base-a-test-npu",
         "base-b-test-1-npu-a3",
         "base-b-test-2-npu-a3",
         "base-b-test-4-npu-a3",
@@ -122,6 +125,14 @@ PER_COMMIT_SUITES = {
         "stage-a-unit-test-mlx",
         "stage-b-e2e-mlx",
     ],
+    # PPU has no suite in any of the three dicts yet: pr-test-ppu.yml only runs
+    # the runner preflight until the PPU SRT platform and AOT kernels land.
+    # Declaring a name here before a workflow dispatches it would let a test
+    # register, validate, and count as covered while never running, so each PPU
+    # suite name arrives with the job that runs it. Until then PPU is in
+    # _SUITE_CHECKED_BACKENDS with no valid suite, so validate_all_suites()
+    # rejects any register_ppu_ci() outright.
+    HWBackend.PPU: [],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -149,6 +160,9 @@ NIGHTLY_SUITES = {
         "nightly-amd-accuracy-8-gpu-mi35x-kimi-k3",
         "nightly-amd-8-gpu-mi35x-qwen38-mxfp4",
         "nightly-amd-8-gpu-mi35x-glm52-fp8",
+        "nightly-amd-8-gpu-mi35x-glm53-flash",
+        "nightly-amd-accuracy-8-gpu-glm53",
+        "nightly-amd-8-gpu-mi35x-glm53",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
@@ -170,9 +184,12 @@ NIGHTLY_SUITES = {
         "nightly-acc-2-npu-a3",
         "nightly-acc-8-npu-a3",
         "nightly-acc-16-npu-a3",
+        "nightly-acc-4-npu-a5",
         "nightly-perf-2-npu-a3",
         "nightly-perf-4-npu-a3",
         "nightly-perf-16-npu-a3",
+        "nightly-perf-16-npu-a3-cann910",
+        "nightly-acc-16-npu-a3-cann910",
         "full-4-npu-a2",
         "full-1-npu-a3",
         "full-2-npu-a3",
@@ -223,6 +240,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
+    HWBackend.PPU,
 }
 
 

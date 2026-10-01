@@ -5,6 +5,48 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_sm90_supported
+
+_is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
+_is_sm90 = is_sm90_supported()
+
+
+def _select_recurrent_launch_config(
+    n: int,
+    h: int,
+    hv: int,
+    k: int,
+    v: int,
+    is_kda: bool,
+    target_verify: bool = False,
+) -> tuple[int, int]:
+    """Select the value tile and warp count for recurrent GDN."""
+    if (
+        _is_hip
+        and _is_gfx95
+        and not is_kda
+        and 0 < n <= 32
+        and h == 4
+        and hv == 16
+        and k == 128
+        and v == 128
+    ):
+        return (8, 4) if n == 1 else (16, 2)
+    if (
+        target_verify
+        and not _is_hip
+        and not is_kda
+        and 0 < n <= 64
+        and k == 128
+        and v == 128
+        and _is_sm90
+    ):
+        # BV=4 and n <= 64 measured on H100/H200. SM90 only: Blackwell is faster
+        # with narrow tiles but not bit-identical to BV=32. Only the dense
+        # intermediate-state verify sets target_verify; cache_ring keeps BV=32.
+        return 4, 1
+    return min(triton.next_power_of_2(v), 32), 1
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -401,11 +443,13 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[1] if a.ndim == 4 else a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    BV, num_warps = _select_recurrent_launch_config(
+        N, H, HV, K, V, is_kda, target_verify=intermediate_states_buffer is not None
+    )
+    BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    num_warps = 1
 
     if scale is None:
         scale = k.shape[-1] ** -0.5

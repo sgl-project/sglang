@@ -48,7 +48,7 @@ class TestKdaDecodeMtpSlotStride(unittest.TestCase):
     small slot id and asserts bitwise parity against a contiguous pool."""
 
     def test_wrap_regime_matches_contiguous(self):
-        from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
+        from sglang.kernels.ops.attention.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
         )
 

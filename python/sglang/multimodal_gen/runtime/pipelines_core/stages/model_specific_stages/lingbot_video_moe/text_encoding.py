@@ -2,7 +2,13 @@
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_group,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.i2v import (
     TEXT_ONLY_EMBEDS_KEY,
@@ -12,6 +18,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 TOKEN_LENGTH = 37698
 HIDDEN_STATE_SKIP_LAYER = 0
@@ -30,10 +39,13 @@ PROMPT_TEMPLATE = (
     "<|im_start|>assistant\n"
 )
 IMG_PROMPT_TEMPLATE = "<|vision_start|><|image_pad|><|vision_end|>"
+VIDEO_PROMPT_TEMPLATE = "<|vision_start|><|video_pad|><|vision_end|>"
 
 
 class LingBotVideoTextEncodingStage(TextEncodingStage):
     """Qwen3-VL prompt/negative encoding; I2V adds the condition frame as visual context."""
+
+    deduplicated_output_fields = ()
 
     def __init__(self, text_encoders, tokenizers, transformer, encode_text_only=False):
         super().__init__(text_encoders, tokenizers)
@@ -58,8 +70,8 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
         return template.format(text)
 
     def _compute_crop_start(self) -> int:
+        processor = self.tokenizers[0]
         if self._crop_start is None:
-            processor = self.tokenizers[0]
             marker = "<|USER_INPUT_MARKER|>"
             marked = self.prompt_template.format(marker)
             marker_pos = marked.find(marker)
@@ -114,7 +126,34 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
                 "`text_encoder` and `processor` are required for encode_prompt()."
             )
 
+        # The visual tokens and pixels live in `inputs`, so they key the cache too.
         inputs = self._build_prompt_inputs(prompt, images)
+        cache_group = (
+            text_encoder._encoder_tp_group
+            if isinstance(text_encoder, TextEncoder)
+            else None
+        )
+        if cache_group is None and model_parallel_is_initialized():
+            cache_group = get_tp_group()
+        return cached_encoder_call(
+            text_encoder,
+            (dict(inputs),),
+            {
+                "device": str(device),
+                "dtype": dtype,
+                "skip_layer": self.hidden_state_skip_layer,
+                "crop_start": self._compute_crop_start(),
+            },
+            lambda: self._encode_inputs(inputs, device, dtype),
+            cache_group,
+            namespace=self,
+            nested=False,
+            share_in_group=True,
+        )
+
+    def _encode_inputs(self, inputs, device, dtype):
+        self._begin_text_encoder_use(0)
+        text_encoder = self.text_encoders[0]
         inputs = inputs.to(device)
         outputs = self._forward_text_encoder(
             text_encoder,
@@ -134,7 +173,7 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
             prompt_embeds = prompt_embeds[:, crop_start:]
             prompt_mask = prompt_mask[:, crop_start:]
 
-        # Trimming padding here lets the DiT skip the mask at B=1.
+        # B=1: drop right padding before DiT inference.
         if prompt_embeds.shape[0] == 1:
             true_len = int(prompt_mask[0].sum().item())
             prompt_embeds = prompt_embeds[:, :true_len]
@@ -145,7 +184,7 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
-        dtype = next(self.transformer.parameters()).dtype
+        dtype = next(self.transformer.parameters(), torch.tensor([])).dtype
         if dtype not in (torch.bfloat16, torch.float16, torch.float32):
             dtype = torch.bfloat16
 

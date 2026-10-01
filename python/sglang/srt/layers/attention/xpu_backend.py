@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -67,7 +68,7 @@ class XPUAttentionBackend(AttentionBackend):
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
         )
-        self.tp_size = model_runner.ps.tp_size
+        self.tp_size = get_parallel().tp_size
         assert self.num_attention_heads % self.tp_size == 0
         self.num_local_heads = self.num_attention_heads // self.tp_size
         self.device = model_runner.device
@@ -949,14 +950,13 @@ class XPUAttentionBackend(AttentionBackend):
                         layer.v_scale,
                     )
                 else:
-                    k_rope_val = (
-                        k_rope if k_rope is not None else k[:, :, layer.v_head_dim :]
-                    )
+                    # Pass k_rope as-is like forward_extend: when rope is folded into
+                    # k (k_rope is None), set_mla_kv_buffer stores the whole kv row.
                     self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
-                        k_rope_val,
+                        k_rope,
                     )
 
         # Use precomputed metadata across all layers

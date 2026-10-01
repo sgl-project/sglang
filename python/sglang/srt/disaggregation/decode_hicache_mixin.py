@@ -12,6 +12,7 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestOutcome,
     InitLoadBackParams,
 )
 
@@ -129,7 +130,7 @@ class DecodeHiCachePreallocMixin:
                 else None
             )
             self.tree_cache.prefetch_from_storage(
-                req.rid,
+                req.cache_request_handle,
                 prefix_match.last_host_node,
                 suffix,
                 last_hash,
@@ -137,8 +138,8 @@ class DecodeHiCachePreallocMixin:
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
             )
-            prefix_match.prefetch_registered = (
-                req.rid in self.tree_cache.ongoing_prefetch
+            prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
+                req.cache_request_handle
             )
         except Exception as e:
             logger.warning(
@@ -186,7 +187,9 @@ class DecodeHiCacheTransferMixin:
             decode_req.prefix_match is not None
             and decode_req.prefix_match.prefetch_registered
         ):
-            self.tree_cache.release_aborted_request(decode_req.req.rid)
+            self.tree_cache.finish(
+                decode_req.req.cache_request_handle, CacheRequestOutcome.ABORT
+            )
         if decode_req.hicache_restored_node is not None:
             self.tree_cache.dec_lock_ref(
                 decode_req.hicache_restored_node,
@@ -207,9 +210,9 @@ class DecodeHiCacheTransferMixin:
 
         # Wait for L3 -> L2 prefetch to drain (skip when no L3 hit).
         if pm.l3_storage_hit_length > 0:
-            if not self.tree_cache.check_prefetch_progress(dr.req.rid):
+            if not self.tree_cache.check_prefetch_progress(dr.req.cache_request_handle):
                 return False
-            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
+            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
         rematch = match_prefix_for_req(
@@ -250,7 +253,7 @@ class DecodeHiCacheTransferMixin:
 
         dr.hicache_restored_kv_indices = torch.cat(
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
-        )
+        )[: pm.restore_token_count]
         dr.hicache_restored_node = restored_node
         dr.hicache_restore_lock_receipt = self.tree_cache.inc_lock_ref(
             restored_node
@@ -263,9 +266,6 @@ class DecodeHiCacheTransferMixin:
         return True
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
-        if not hasattr(self.tree_cache, "is_load_back_event_done"):
-            return
-
         # Filter once: keep only PENDING reqs that still need restore work;
         # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
         active: List[DecodeRequest] = []
@@ -288,13 +288,8 @@ class DecodeHiCacheTransferMixin:
             ):
                 dr.hicache_restore_status = HiCacheRestoreResult.READY
 
-        # Phase B: queue new load_back ops if the next slot is free.
-        # The (producer_index + 1) check ensures we never overwrite a still-in-flight slot:
-        # if a previous req holds that slot and isn't done, its event won't be signaled.
-        counter = self.tree_cache.cache_controller.layer_done_counter
-        if not self.tree_cache.is_load_back_event_done(
-            (counter.producer_index + 1) % counter.num_counters
-        ):
+        # Phase B: queue new load_back ops if the next slot is free on every rank.
+        if not self.tree_cache.has_free_load_back_slot():
             return
         queued = [
             dr

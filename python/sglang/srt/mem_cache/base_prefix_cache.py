@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from enum import Enum, auto
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -24,18 +25,32 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
+    radix_cache_metric_labels,
     resolve_collector_class,
 )
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class CacheRequestHandle:
+    rid: str
+    attempt_id: int
+
+
+class CacheRequestOutcome(Enum):
+    SUCCESS = auto()
+    ABORT = auto()
 
 
 @runtime_checkable
@@ -72,18 +87,27 @@ class InsertParams:
 
     # SWA specific
     prev_prefix_len: int = 0
-    swa_evicted_seqlen: int = 0
     swa_branching_seqlen: Optional[int] = None
 
     # General
+    component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
+        default_factory=dict, kw_only=True
+    )
     chunked: bool = False
     priority: int = 0
+    session_id: Optional[str] = None
     track_adopted_ranges: bool = False
 
     # Logical-page KV sharding: rotation base of the chain the inserted
     # values belong to (stamped onto new tree nodes; None when sharding is
     # off). See UnifiedTreeNode.rotation_base.
     rotation_base: Optional[int] = None
+
+    def get_evicted_seqlen(self, component_type: ComponentType) -> int:
+        return self.component_evicted_seqlens.get(component_type, 0)
+
+    def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
+        self.component_evicted_seqlens[component_type] = length
 
 
 @dataclasses.dataclass
@@ -146,24 +170,41 @@ class IncLockRefResult:
     """Receipt returned by ``inc_lock_ref``.
 
     ``node_id`` is the anchor the lock was taken on; a release replays the
-    receipt on that node only. The SWA UUID marks the segment boundary;
-    ``None`` means root. ``skipped_lock_components`` records the components
-    the acquire left untaken, so the release leaves them untouched.
+    receipt on that node only. A recorded UUID marks a segment boundary;
+    ``None`` means root, while an absent entry means no receipt.
+    ``skipped_lock_components`` records the components the acquire left
+    untaken, so the release leaves them untouched.
     """
 
     delta: Optional[int] = None
     node_id: Optional[int] = None
-    swa_uuid_for_lock: Optional[int] = None
-    swa_uuid_for_host_lock: Optional[int] = None
     skipped_lock_components: tuple[ComponentType, ...] = ()
+    component_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    component_host_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def set_lock_uuid(
+        self,
+        component_type: ComponentType,
+        uuid: Optional[int],
+        *,
+        lock_host: bool = False,
+    ) -> None:
+        uuids = (
+            self.component_host_lock_uuids if lock_host else self.component_lock_uuids
+        )
+        uuids[component_type] = uuid
 
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
             node_id=self.node_id,
-            swa_uuid_for_lock=self.swa_uuid_for_lock,
-            swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
             skipped_lock_components=tuple(self.skipped_lock_components),
+            component_lock_uuids=dict(self.component_lock_uuids),
+            component_host_lock_uuids=dict(self.component_host_lock_uuids),
         )
 
 
@@ -171,16 +212,28 @@ class IncLockRefResult:
 class DecLockRefParams:
     """Receipt required by unified-tree ``dec_lock_ref``.
 
-    Fields default to nothing-acquired, so a lost receipt under-releases (a
-    leak the sanity checks report) instead of releasing another holder's
-    lock. ``node_id`` is ``None`` only for receipts that never came from a
-    unified-tree acquire (legacy caches, session sentinels).
+    A segment release requires its component's boundary entry; a missing
+    entry must not be treated as a lock reaching the root. ``node_id`` is
+    ``None`` only for receipts that never came from a unified-tree acquire
+    (legacy caches, session sentinels).
     """
 
     node_id: Optional[int] = None
-    swa_uuid_for_lock: Optional[int] = None
-    swa_uuid_for_host_lock: Optional[int] = None
     skipped_lock_components: tuple[ComponentType, ...] = ()
+    component_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    component_host_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def get_lock_uuid(
+        self, component_type: ComponentType, *, lock_host: bool = False
+    ) -> Optional[int]:
+        uuids = (
+            self.component_host_lock_uuids if lock_host else self.component_lock_uuids
+        )
+        return uuids[component_type]
 
 
 @dataclasses.dataclass
@@ -319,11 +372,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         None  # metrics collector for the cache
     )
     cache_controller: Optional[HiCacheController] = None
+    buffer_pipeline: Optional[BufferModePipeline] = None
+    storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
 
     def init_metrics_collector(self):
-        labels = {"cache_type": self.__class__.__name__}
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        labels = radix_cache_metric_labels(
+            self.__class__.__name__, get_parallel(), is_dp_attention_enabled()
+        )
         if get_observability().extra_metric_labels:
             labels.update(get_observability().extra_metric_labels)
         radix_cache_cls = resolve_collector_class(
@@ -345,6 +404,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Kernel-side unpinning during process reclaim can stall teardown for
         tens of seconds (see HostKVCache.destroy). Idempotent.
         """
+
+    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+        """Release attempt state; caches without prefetch state have nothing to drop."""
+
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        """Finish an attempt without cancelling successful asynchronous cache work."""
+        if outcome != CacheRequestOutcome.SUCCESS:
+            self.release_aborted_request(handle)
 
     @abstractmethod
     def reset(self):
@@ -376,22 +443,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         implementations that shard trees per cache namespace."""
         return self.root_node
 
-    def is_backuped(self, node: Any) -> bool:
-        """Whether the node's Full KV is present on host."""
-        return node.backuped
-
-    def is_root(self, node: Any) -> bool:
-        """Whether the node is a tree root."""
-        return node is self.root_node
-
-    def get_last_hash_value(self, node: Any) -> Optional[str]:
-        """The node's last page hash, or None when it was never hashed."""
-        return node.get_last_hash_value()
-
-    def get_prefix_hash_values(self, node: Any) -> list[str]:
-        """The hash chain of the node's ancestors, in root-to-parent order."""
-        return node.get_prefix_hash_values(node.parent)
-
     def rotation_base_of(self, node: Any) -> Optional[int]:
         """Logical-page KV sharding: the rotation base stamped on ``node``.
 
@@ -404,8 +455,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
-        pass
+    def insert_req(self, req: Req, *, up_to: int, **kwargs):
+        """Hand a finished request's KV up to row position ``up_to`` to the
+        tree: insert what can be keyed and advance ``cache_protected_len``
+        past it. The caller then frees ``[cache_protected_len, up_to)`` and
+        everything after, and unpins; nothing here releases a slot."""
 
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):
@@ -415,13 +469,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.
         """
-        from sglang.srt.mem_cache.common import free_kv_row_segments
+        from sglang.srt.mem_cache.common import coalesce_ranges, free_kv_row_segments
 
+        allocator = self.token_to_kv_pool_allocator
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
+        # Adjacent pieces whose seam falls inside one (DCP-widened) page would
+        # free that page twice; the allocator rejects that, so merge them first.
         free_kv_row_segments(
-            self.token_to_kv_pool_allocator,
-            [(row[start:end], start) for start, end in ranges],
-            swa_evicted_seqlen=kv.swa_evicted_seqlen,
+            allocator,
+            [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
+            swa_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
+            swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
         )
 
     @abstractmethod
@@ -448,6 +506,21 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> DecLockRefResult:
         pass
 
+    def unpin(self, req: Req) -> None:
+        """Drop the tree lock the request holds on ``req.last_node``; a cache
+        whose acquire returned a receipt releases with it here."""
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
+
+    def claim_kv_row(self, req: Req) -> bool:
+        """A streaming session keeps the request's kv row for the next turn.
+        Return True after taking the row; the caller then releases nothing."""
+        return False
+
+    def on_release(self, req: Req, *, inserted: bool) -> None:
+        """The row is freed and the lock dropped; ``inserted`` says whether the
+        KV went into the tree first. Drop per-request state kept outside the tree."""
+
     def evictable_size(self):
         return 0
 
@@ -466,6 +539,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_protected_size(self):
         return 0
 
+    def swa_transient_size(self):
+        """Allocated SWA tokens owned outside the request and tree views."""
+        return 0
+
     def total_size(self):
         raise NotImplementedError()
 
@@ -475,26 +552,32 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Any]:
+    ) -> Optional[Tuple[torch.Tensor, Any]]:
         """
-        Preparing KV cache loading from host to device.
+        Prepare host-to-device loading. None means retry admission; an empty
+        tensor can be a successful auxiliary-only load or a recompute fallback.
         """
         raise NotImplementedError()
 
     def finish_storage_prefetch_admission(
-        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+        self,
+        handle: CacheRequestHandle,
+        fulfilled_tokens: int,
+        reason: Optional[str],
     ) -> None:
         """Resolve storage-hit accounting once a request is admitted.
 
         Non-storage caches have no lifecycle state to resolve.
         """
 
-    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
+    def discard_storage_prefetch_accounting(self, handle: CacheRequestHandle) -> None:
         """Forget storage-hit lifecycle state without emitting a result."""
 
-    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
+    def pop_prefetch_loaded_span(
+        self, handle: CacheRequestHandle
+    ) -> tuple[int, Optional[int]]:
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
-        return self.pop_prefetch_loaded_tokens(req_id), None
+        return self.pop_prefetch_loaded_tokens(handle), None
 
     def ready_to_load_host_cache(self) -> Any:
         """
@@ -508,11 +591,39 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def flush_pending_backups(self) -> None:
+        """
+        Submit queued host backups.
+        Caches without deferred backups have nothing to flush.
+        """
+        pass
+
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()
 
     def supports_swa(self) -> bool:
         return False
+
+    def supports_auxiliary_swa(self) -> bool:
+        return False
+
+    def evict_sliding_windows(
+        self, req: Req, pre_len: int, *, eviction_interval: int = 1
+    ) -> None:
+        """Slide request-owned windows at the scheduler's safe eviction frontier."""
+        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+
+        free_swa_out_of_window_slots(
+            req,
+            pre_len,
+            sliding_window_size=self.sliding_window_size,
+            page_size=self.page_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            is_chunk_cache=self.is_chunk_cache(),
+            retain_floor=self.swa_retain_floor(req),
+            eviction_interval=eviction_interval,
+        )
 
     def swa_retain_floor(self, req) -> int | None:
         # A match lands on a state checkpoint rather than on the tail, so a cache
