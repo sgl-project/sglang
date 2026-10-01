@@ -64,6 +64,8 @@ def _mimo_local_attention(
     scores = tl.where(allowed, scores, -float("inf"))
     probabilities = tl.exp(scores - tl.max(scores, axis=2)[:, :, None])
     denominator = tl.sum(probabilities, axis=2)
+    # Match the tested cuDNN path: round the unnormalized exponential weights,
+    # then normalize the weighted sum. Rounding normalized weights differs.
     probabilities = probabilities.to(Q.dtype.element_ty).to(tl.float32)
     result = tl.sum(probabilities[:, :, :, None] * v[:, None, :, :], axis=2)
     result /= denominator[:, :, None]

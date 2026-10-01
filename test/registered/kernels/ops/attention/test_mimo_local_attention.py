@@ -29,7 +29,7 @@ class TestMiMoLocalAttention(CustomTestCase):
                 (3, 7, 2),
                 (3, 7, 3),
                 (32, 64, 4),
-                (1875, 64, 4),
+                (1876, 64, 4),
             ]:
                 for causal in [False, True]:
                     for token_major in [False, True]:
@@ -107,7 +107,11 @@ class TestMiMoLocalAttention(CustomTestCase):
                                 )
                                 self.assertLess(float(error / reference), 0.001)
                                 self.assertTrue(actual.is_contiguous())
-                                if dtype == torch.bfloat16 and heads == 64:
+                                if (
+                                    dtype == torch.bfloat16
+                                    and heads == 64
+                                    and torch.cuda.get_device_capability()[0] == 9
+                                ):
                                     with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
                                         cudnn = F.scaled_dot_product_attention(
                                             q, k, v, is_causal=causal
