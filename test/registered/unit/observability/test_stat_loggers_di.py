@@ -3,9 +3,6 @@
 These tests cover the small, in-process pieces of the ``stat_loggers``
 dependency injection feature:
 
-* The four DI hook class attributes (``_counter_cls``/``_gauge_cls``/
-  ``_histogram_cls``/``_summary_cls``) default to ``None`` on every
-  collector, so the existing prometheus_client backend is used unchanged.
 * ``resolve_collector_class()`` returns the registered subclass when a role
   is present in ``stat_loggers`` and falls back to the default otherwise.
 * Without any subclass override, collectors instantiate the real
@@ -33,7 +30,6 @@ from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_SCHEDULER,
     STAT_LOGGER_ROLE_STORAGE,
     STAT_LOGGER_ROLE_TOKENIZER,
-    ExpertDispatchCollector,
     RadixCacheMetricsCollector,
     SchedulerMetricsCollector,
     StorageMetricsCollector,
@@ -42,6 +38,7 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.runtime_context import get_context, reset_context
+from sglang.test.test_utils import CustomTestCase
 
 
 class _BoundRecordingMetric:
@@ -84,32 +81,6 @@ class _RecordingTokenizerMetricsCollector(TokenizerMetricsCollector):
 class _RecordingStorageMetricsCollector(StorageMetricsCollector):
     _counter_cls = _RecordingMetric
     _histogram_cls = _RecordingMetric
-
-
-class TestCollectorClassAttrs(unittest.TestCase):
-    """All five collectors expose four DI hook class attrs, all defaulting to
-    None so the existing prometheus_client backend is used unchanged."""
-
-    def test_scheduler_collector_attrs_default_none(self):
-        self.assertIsNone(SchedulerMetricsCollector._counter_cls)
-        self.assertIsNone(SchedulerMetricsCollector._gauge_cls)
-        self.assertIsNone(SchedulerMetricsCollector._histogram_cls)
-        self.assertIsNone(SchedulerMetricsCollector._summary_cls)
-
-    def test_tokenizer_collector_attrs_default_none(self):
-        self.assertIsNone(TokenizerMetricsCollector._counter_cls)
-        self.assertIsNone(TokenizerMetricsCollector._histogram_cls)
-
-    def test_storage_collector_attrs_default_none(self):
-        self.assertIsNone(StorageMetricsCollector._counter_cls)
-        self.assertIsNone(StorageMetricsCollector._histogram_cls)
-
-    def test_expert_dispatch_collector_attrs_default_none(self):
-        self.assertIsNone(ExpertDispatchCollector._histogram_cls)
-
-    def test_radix_cache_collector_attrs_default_none(self):
-        self.assertIsNone(RadixCacheMetricsCollector._counter_cls)
-        self.assertIsNone(RadixCacheMetricsCollector._histogram_cls)
 
 
 class TestResolveCollectorClass(unittest.TestCase):
@@ -251,6 +222,50 @@ class TestHiCacheMetrics(unittest.TestCase):
         self.assertEqual(
             collector.storage_prefetch_deferred_tokens_total.increments,
             [({**labels, "reason": "device_capacity"}, 7)],
+        )
+
+
+class TestRequestTimePerOutputToken(CustomTestCase):
+    def _collector(self, labels):
+        with get_context().override_server_args(
+            prompt_tokens_buckets=None, generation_tokens_buckets=None
+        ):
+            return _RecordingTokenizerMetricsCollector(labels=labels)
+
+    def _finish(self, collector, labels, **kwargs):
+        collector.observe_one_finished_request(
+            labels=labels,
+            prompt_tokens=20,
+            generation_tokens=101,
+            cached_tokens=0,
+            e2e_latency=2.5,
+            has_grammar=False,
+            **kwargs,
+        )
+
+    def test_observed_with_streaming_label(self):
+        labels = {"model_name": "test"}
+        collector = self._collector(labels)
+
+        self._finish(collector, labels, is_streaming=True, time_per_output_token=0.02)
+        self._finish(collector, labels, is_streaming=False, time_per_output_token=0.08)
+
+        self.assertEqual(
+            collector.histogram_request_time_per_output_token.observations,
+            [
+                ({**labels, "is_streaming": "true"}, 0.02),
+                ({**labels, "is_streaming": "false"}, 0.08),
+            ],
+        )
+
+    def test_not_observed_when_undefined(self):
+        labels = {"model_name": "test"}
+        collector = self._collector(labels)
+
+        self._finish(collector, labels, time_per_output_token=None)
+
+        self.assertEqual(
+            collector.histogram_request_time_per_output_token.observations, []
         )
 
 

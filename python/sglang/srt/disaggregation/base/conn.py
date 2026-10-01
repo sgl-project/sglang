@@ -46,6 +46,11 @@ class KVTransferMetric:
     transfer_total_bytes: Optional[int] = None
 
 
+class KVTransferDestination(str, enum.Enum):
+    DEVICE = "device"
+    HOST = "host"
+
+
 class KVArgs:
     engine_rank: int
     kv_data_ptrs: List[int]
@@ -53,6 +58,9 @@ class KVArgs:
     kv_item_lens: List[int]
     kv_layer_ids: List[int]
     kv_cache_dtype_str: str
+    host_kv_data_ptrs: Optional[List[int]] = None
+    host_kv_data_lens: Optional[List[int]] = None
+    host_kv_item_lens: Optional[List[int]] = None
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -113,6 +121,7 @@ class BaseKVManager(ABC):
     """Base class for managing transfer states"""
 
     enable_deferred_decode_kv_release: bool = False
+    supports_host_destination: bool = False
 
     @abstractmethod
     def __init__(
@@ -131,6 +140,10 @@ class BaseKVManager(ABC):
     # Opt-in per backend: set True and implement teardown() to support runtime PD
     # role switch (release transfer resources; the scheduler owns the KV pool).
     supports_role_switch: bool = False
+
+    # Opt-in per backend: set True once the prefill acks a drained abort
+    # (ABORT_ACK carrying the sender rank). Without it a hold only ends on timeout.
+    supports_deferred_decode_kv_release: bool = False
 
     def teardown(self) -> None:
         raise NotImplementedError(
@@ -212,6 +225,11 @@ class BaseKVSender(ABC):
 
 
 class BaseKVReceiver(ABC):
+    @property
+    def supports_host_destination(self) -> bool:
+        """Whether this receiver's peer and layout support host KV destinations."""
+        return False
+
     @abstractmethod
     def __init__(
         self,
@@ -237,6 +255,7 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

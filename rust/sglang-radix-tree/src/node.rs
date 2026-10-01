@@ -177,9 +177,12 @@ pub struct Node<K: ChildKeyType> {
     pub hash_value: Option<Vec<String>>,
     /// Whether this node is available through the direct external-cache linker.
     pub external_cache_stored: bool,
+    /// Chain-wide logical-page owner rotation, retained across node splits.
+    pub rotation_base: Option<i64>,
     /// The in-flight write-through backup's ack id.
     pub write_through_pending_id: Option<usize>,
-    /// Load-back anchor currently reading this node's host slots.
+    /// Load-back anchor currently reading this node's Full host slots.
+    /// Auxiliary transfers are protected by their component locks.
     pub load_back_pending_id: Option<NodeId>,
     /// Monotonic access tick for LRU ordering (exact; not wall-clock).
     pub last_access_counter: i64,
@@ -187,6 +190,10 @@ pub struct Node<K: ChildKeyType> {
     pub creation_counter: i64,
     /// Match hits accumulated for write-through and LFU decisions.
     pub hit_count: i64,
+    /// Logical root-path length; maintained only for T-LRU.
+    pub tlru_cached_prefix_len: usize,
+    /// Greatest subtree depth reached, retained when cached tails are evicted.
+    pub tlru_history_len: usize,
     /// Eviction priority; the root uses `i64::MIN` and is never a leaf.
     pub priority: i64,
     /// This node's external handle; minted once, never recycled.
@@ -380,7 +387,7 @@ impl<K: ChildKeyType> Node<K> {
             .any(|state| state.lock_ref > 0)
     }
 
-    /// Whether an in-flight load-back currently pins this node.
+    /// Whether an in-flight load-back currently pins this node's Full slots.
     pub fn is_load_back_pending(&self) -> bool {
         self.load_back_pending_id.is_some()
     }
@@ -399,11 +406,14 @@ impl<K: ChildKeyType> Node<K> {
             swa_host_uuid: None,
             hash_value: Some(Vec::new()),
             external_cache_stored: false,
+            rotation_base: None,
             write_through_pending_id: None,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,
             hit_count: 0,
+            tlru_cached_prefix_len: 0,
+            tlru_history_len: 0,
             priority: i64::MIN,
             id,
             idx: NodeIdx_(id),
@@ -422,11 +432,14 @@ impl<K: ChildKeyType> Node<K> {
             swa_host_uuid: None,
             hash_value: None,
             external_cache_stored: false,
+            rotation_base: None,
             write_through_pending_id: None,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,
             hit_count: 0,
+            tlru_cached_prefix_len: 0,
+            tlru_history_len: 0,
             priority,
             id,
             idx: NodeIdx_(id),
@@ -1557,68 +1570,135 @@ impl<K: ChildKeyType> NodeArena<K> {
     }
 }
 
-// Eviction-eligible node set.
+// Shared node membership for eviction leaves and Full host duplicates.
 
-/// Set of `NodeIdx_`s with O(1) membership ops and dense iteration.
-#[derive(Default)]
-pub struct EvictableNodeSet {
-    /// Dense member list; order is unspecified (swap-remove).
-    nodes: Vec<NodeIdx_>,
-    /// Each member's position in `nodes`, indexed by `NodeIdx_`.
-    slots: Vec<Option<usize>>,
+/// An insertion-ordered set of arena slots. Full host duplicate reclamation
+/// consumes this order directly; leaf eviction ranks members in a policy heap.
+/// Links are indexed by arena slot: membership/removal are O(1), insertion is
+/// amortized O(1), and iteration visits only current members.
+pub struct NodeSet {
+    /// Per arena slot: `Some((previous, next))` in insertion order, or `None` if absent.
+    /// `END` marks a missing neighbor at either end.
+    links: Vec<Option<(NodeIdx_, NodeIdx_)>>,
+    /// First member in insertion order, or `END` when empty.
+    head: NodeIdx_,
+    /// Last member in insertion order; new members append here. `END` when empty.
+    tail: NodeIdx_,
+    /// Number of current members, excluding absent slots in `links`.
+    len: usize,
 }
 
-impl EvictableNodeSet {
+impl Default for NodeSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NodeSet {
+    const END: NodeIdx_ = NodeIdx_(usize::MAX);
+
     pub fn new() -> Self {
-        Default::default()
-    }
-
-    /// Whether `node_id` is a member.
-    pub fn contains(&self, node_id: NodeIdx_) -> bool {
-        self.slots.get(node_id.0).copied().flatten().is_some()
-    }
-
-    /// Insert `node_id`; no-op when already a member.
-    pub fn add(&mut self, node_id: NodeIdx_) {
-        if node_id.0 >= self.slots.len() {
-            self.slots.resize(node_id.0 + 1, None);
+        Self {
+            links: Vec::new(),
+            head: Self::END,
+            tail: Self::END,
+            len: 0,
         }
-        if self.slots[node_id.0].is_some() {
+    }
+
+    pub fn contains(&self, node_id: NodeIdx_) -> bool {
+        self.links.get(node_id.0).is_some_and(Option::is_some)
+    }
+
+    /// Existing membership keeps its position; a removed/reinserted slot is
+    /// appended, matching assignment to Python's insertion-ordered dict.
+    pub fn add(&mut self, node_id: NodeIdx_) {
+        assert_ne!(
+            node_id,
+            Self::END,
+            "node slot is reserved for the set sentinel"
+        );
+        if node_id.0 >= self.links.len() {
+            self.links.resize(node_id.0 + 1, None);
+        }
+        if self.links[node_id.0].is_some() {
             return;
         }
-        self.slots[node_id.0] = Some(self.nodes.len());
-        self.nodes.push(node_id);
+        self.links[node_id.0] = Some((self.tail, Self::END));
+        if self.tail == Self::END {
+            self.head = node_id;
+        } else {
+            self.links[self.tail.0].as_mut().unwrap().1 = node_id;
+        }
+        self.tail = node_id;
+        self.len += 1;
     }
 
-    /// Remove `node_id`; no-op when not a member.
     pub fn discard(&mut self, node_id: NodeIdx_) {
-        let Some(slot) = self.slots.get(node_id.0).copied().flatten() else {
+        let Some((prev, next)) = self.links.get_mut(node_id.0).and_then(Option::take) else {
             return;
         };
-        self.slots[node_id.0] = None;
-        self.nodes.swap_remove(slot);
-        // The swapped-in tail member (if any) now lives at `slot`.
-        if let Some(&moved) = self.nodes.get(slot) {
-            self.slots[moved.0] = Some(slot);
+        if prev == Self::END {
+            self.head = next;
+        } else {
+            self.links[prev.0].as_mut().unwrap().1 = next;
         }
+        if next == Self::END {
+            self.tail = prev;
+        } else {
+            self.links[next.0].as_mut().unwrap().0 = prev;
+        }
+        self.len -= 1;
     }
 
-    /// The members, in unspecified order.
-    pub fn iter(&self) -> impl Iterator<Item = NodeIdx_> + '_ {
-        self.nodes.iter().copied()
+    /// Visit members from `head` to `tail` by following each entry's `next` link.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = NodeIdx_> + '_ {
+        // Keep an exact size hint so eviction heaps can reserve once.
+        NodeSetIter {
+            links: &self.links,
+            current: self.head,
+            remaining: self.len,
+        }
     }
 
     // Test-only conveniences: production callers use add/discard/contains/iter.
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.len
     }
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.head == Self::END
     }
 }
+
+struct NodeSetIter<'a> {
+    links: &'a [Option<(NodeIdx_, NodeIdx_)>],
+    current: NodeIdx_,
+    remaining: usize,
+}
+
+impl Iterator for NodeSetIter<'_> {
+    type Item = NodeIdx_;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let node_id = self.current;
+        self.current = self.links[node_id.0].unwrap().1;
+        self.remaining -= 1;
+        Some(node_id)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for NodeSetIter<'_> {}
+
 #[cfg(test)]
 #[path = "tests/node.rs"]
 mod tests;

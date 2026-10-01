@@ -13,6 +13,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -77,6 +78,7 @@ def _make_chunk_cache(req_to_token_pool) -> ChunkCache:
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
     s.scheduler_stage_metrics = None
+    s.disaggregation_mode = DisaggregationMode.NULL
     s.dllm_config = None
     s.dllm_manager = None
     s.enable_hisparse = False

@@ -1992,6 +1992,14 @@ class FlashInferIndicesUpdaterPrefill:
                     else:
                         paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
+            elif use_ragged:
+                # Extend K/V lands after the paged pass: plan over the prefix only.
+                paged_kernel_lens = prefix_lens
+                if extend_prefix_lens_cpu is not None:
+                    paged_kernel_lens_sum = sum(extend_prefix_lens_cpu)
+                else:
+                    paged_kernel_lens_sum = prefix_lens.sum().item()
+                kv_start_idx = None
             else:
                 # full attention
                 paged_kernel_lens = seq_lens

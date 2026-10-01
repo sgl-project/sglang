@@ -5,6 +5,7 @@ from unittest.mock import patch
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.models import glm5_next
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+from sglang.srt.models.glm5_next_nextn import Glm5NextForConditionalGenerationNextN
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -98,6 +99,23 @@ class TestGlm5NextModelOpt(CustomTestCase):
             )
 
         self.assertIsNone(reason)
+
+    def test_nextn_mapper_routes_checkpoint_names_to_runtime_modules(self):
+        """Draft quant lookups miss unless checkpoint names reach NextN module paths."""
+        mapper = Glm5NextForConditionalGenerationNextN.get_hf_to_sglang_mapper(
+            self._hf_config()
+        )
+        cases = {
+            "model.language_model.layers.45.mlp.experts.7.up_proj": "model.decoder.mlp.experts.7.up_proj",
+            "model.language_model.layers.45.eh_proj.weight": "model.eh_proj.weight",
+            "model.layers.45.eh_proj.weight": "model.eh_proj.weight",
+            "model.language_model.layers.45.enorm.weight": "model.enorm.weight",
+            "model.language_model.layers.44.mlp.experts.3.up_proj": "model.layers.44.mlp.experts.3.up_proj",
+            "model.visual.blocks.0.attn.proj": "visual.blocks.0.attn.proj",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(mapper._map_name(source), expected)
 
 
 if __name__ == "__main__":
