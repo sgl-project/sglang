@@ -25,8 +25,6 @@ from sglang.srt.entrypoints.decision.request_id import (
     TypesafeRequestIdMiddleware,
     install_typesafe_request_id,
 )
-from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
-from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.managers.tokenizer_manager import resolve_readout_anchor
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -141,8 +139,8 @@ class ReadoutManager(TokenizerManagerScoreMixin):
             yield {"meta_info": meta}
 
 
-def _serving(manager, serving_class):
-    """The decision route handler over the chat serving state of a Jinja-template server."""
+def _chat_serving(manager):
+    """The chat serving state of a Jinja-template server."""
     _, reasoning_config = detect_reasoning_pattern(manager.tokenizer.chat_template)
     template_manager = SimpleNamespace(
         chat_template_name=None,
@@ -157,7 +155,7 @@ def _serving(manager, serving_class):
         _prompt_text_round_trip_is_lossy=False,
         reasoning_parser=None,
     )
-    return serving_class(chat_serving)
+    return chat_serving
 
 
 def _logs(*ps):
@@ -221,8 +219,10 @@ class TestDecisionModels(unittest.TestCase):
             RequestValidationError, server.validation_exception_handler
         )
         manager = ReadoutManager(tokenizer or self.tokenizer, rows, **server_args)
-        app.state.openai_serving_decisions = _serving(manager, OpenAIServingDecisions)
-        app.state.systemone_serving = _serving(manager, SystemOneServing)
+        (
+            app.state.openai_serving_decisions,
+            app.state.systemone_serving,
+        ) = server.decision_route_servings(_chat_serving(manager))
         return TestClient(app), manager
 
     def test_prompt_matches_the_official_compiler(self):

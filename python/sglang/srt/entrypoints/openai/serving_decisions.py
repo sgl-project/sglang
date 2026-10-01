@@ -5,14 +5,24 @@ import json
 import logging
 import math
 import string
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 import msgspec
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from transformers import PreTrainedTokenizerBase
 
-from sglang.srt.entrypoints.decision.protocol import JevRequest
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentImageURL,
     DecisionAnswer,
@@ -70,13 +80,44 @@ class QuestionView(msgspec.Struct, frozen=True):
     details: List[Any]
 
 
+class DecisionPromptSource(Protocol):
+    """Where the prompts of one decision request shape come from, and who answers it."""
+
+    name: str
+    # Requests are dispatched to the first source whose request model they are.
+    request_model: type
+
+    @staticmethod
+    def detect(tokenizer: Any) -> bool:
+        """Whether the served checkpoint is native to this source.
+
+        The first native source picks the request model of a route whose body
+        shape alone cannot tell the sources apart.
+        """
+        ...
+
+    async def handle(self, request: Any, raw_request: Request): ...
+
+
+# Built once per decision route handler, with keyword arguments tokenizer_manager
+# and validate_server, the handler's server refusals for a model name.
+DecisionPromptSourceFactory = Callable[..., DecisionPromptSource]
+
+
 class OpenAIServingDecisions(OpenAIServingBase):
     """Handler for /v1/decisions requests, answered by candidate scoring without generation"""
 
     # Named in setup refusals, so each decision route reports itself.
     route = "/v1/decisions"
+    # The generic prompt source: this handler's own per-question rendering.
+    name = "decisions"
+    request_model = DecisionRequest
 
-    def __init__(self, chat_serving: OpenAIServingChat):
+    def __init__(
+        self,
+        chat_serving: OpenAIServingChat,
+        prompt_sources: Sequence[DecisionPromptSourceFactory] = (),
+    ):
         super().__init__(chat_serving.tokenizer_manager)
         # Render the way the chat route does, and refuse where it renders differently.
         self.template_manager = chat_serving.template_manager
@@ -125,18 +166,40 @@ class OpenAIServingDecisions(OpenAIServingBase):
                         detector.think_end_token,
                     )
                     self.answers_open_reasoning = detector.reasoning_default == "always"
-        # A checkpoint trained on its own decision prompt is a second prompt source,
-        # used for the Jev request shape. Imported here, as it builds on this module.
-        from sglang.srt.entrypoints.decision.serving import TrainedDecisions
-
-        self.trained_decisions = TrainedDecisions(
-            self.tokenizer_manager, validate_server=self._validate_server
+        # Last, since it detects every checkpoint: the fallback native source.
+        self.sources: Tuple[DecisionPromptSource, ...] = (
+            *(
+                factory(
+                    tokenizer_manager=self.tokenizer_manager,
+                    validate_server=self._validate_server,
+                )
+                for factory in prompt_sources
+            ),
+            self,
+        )
+        self.native_source = next(
+            source for source in self.sources if source.detect(tokenizer)
         )
 
+    @staticmethod
+    def detect(tokenizer: Any) -> bool:
+        # Any checkpoint; the refusals run per request.
+        return True
+
     async def handle_request(self, request, raw_request: Request):
-        if isinstance(request, JevRequest):
-            return await self.trained_decisions.handle_request(request, raw_request)
+        return await self._source_for(request).handle(request, raw_request)
+
+    async def handle(self, request, raw_request: Request):
         return await super().handle_request(request, raw_request)
+
+    def _source_for(self, request) -> DecisionPromptSource:
+        for source in self.sources:
+            if isinstance(request, source.request_model):
+                return source
+        names = [source.name for source in self.sources]
+        raise TypeError(
+            f"no decision prompt source of {names} answers {type(request).__name__}"
+        )
 
     def _request_id_prefix(self) -> str:
         return "decision-"

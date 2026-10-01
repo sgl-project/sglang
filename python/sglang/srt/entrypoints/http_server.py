@@ -37,6 +37,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Tuple,
     Union,
 )
 
@@ -81,6 +82,7 @@ from sglang.srt.entrypoints.decision.protocol import (
     SystemOneRouteRequest,
 )
 from sglang.srt.entrypoints.decision.request_id import install_typesafe_request_id
+from sglang.srt.entrypoints.decision.serving import PROMPT_SOURCES
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -107,6 +109,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeRequest,
     V1RerankReqInput,
 )
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
@@ -121,7 +124,6 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
-from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
@@ -336,9 +338,10 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
         _global_state.tokenizer_manager
     )
-    fast_api_app.state.openai_serving_decisions = OpenAIServingDecisions(
-        fast_api_app.state.openai_serving_chat
-    )
+    (
+        fast_api_app.state.openai_serving_decisions,
+        fast_api_app.state.systemone_serving,
+    ) = decision_route_servings(fast_api_app.state.openai_serving_chat)
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
@@ -357,11 +360,6 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Initialize Anthropic-compatible serving handler
     fast_api_app.state.anthropic_serving = AnthropicServing(
-        fast_api_app.state.openai_serving_chat
-    )
-
-    # Initialize System One compatible decision handler
-    fast_api_app.state.systemone_serving = SystemOneServing(
         fast_api_app.state.openai_serving_chat
     )
 
@@ -2124,10 +2122,8 @@ async def systemone_decisions(
     A decision model checkpoint answers with its own trained protocol instead.
     """
     serving = raw_request.app.state.systemone_serving
-    decision_model = serving.trained_decisions.family is not None
-    model = JevRequest if decision_model else SystemOneRequest
     try:
-        request = model.model_validate(body)
+        request = serving.native_source.request_model.model_validate(body)
     except ValidationError as e:
         raise RequestValidationError(
             [{**error, "loc": ("body", *error["loc"])} for error in e.errors()]
@@ -2140,6 +2136,16 @@ async def jev_decisions(request: JevRequest, raw_request: Request):
     """Decision model checkpoints: every field's answer read at its readout position in one prefill."""
     return await raw_request.app.state.openai_serving_decisions.handle_request(
         request, raw_request
+    )
+
+
+def decision_route_servings(
+    chat_serving: OpenAIServingChat,
+) -> Tuple[OpenAIServingDecisions, SystemOneServing]:
+    """The handlers of /v1/decisions and /v1/jev, and of /v1/systemone, with every prompt source."""
+    return (
+        OpenAIServingDecisions(chat_serving, prompt_sources=PROMPT_SOURCES),
+        SystemOneServing(chat_serving, prompt_sources=PROMPT_SOURCES),
     )
 
 
