@@ -418,6 +418,7 @@ class AiterAttnBackend(AttentionBackend):
             (max_bs + 1,), dtype=torch.int64, device=model_runner.device
         )
         self._kv_indices_scratch: Optional[torch.Tensor] = None
+        self._arange_buf: Optional[torch.Tensor] = None
 
         # Create prefill indices updater
         if not skip_prefill:
@@ -1141,6 +1142,20 @@ class AiterAttnBackend(AttentionBackend):
             )
         return self._kv_indices_scratch[:required_tokens]
 
+    def _get_arange(self, length: int) -> torch.Tensor:
+        """arange(length), grown to the next power of two when it is too short.
+
+        Slices stay valid after a regrow: each one keeps the buffer it was
+        taken from alive, so an earlier caller never reads freed rows.
+        """
+        if self._arange_buf is None or self._arange_buf.numel() < length:
+            self._arange_buf = torch.arange(
+                1 << max(length - 1, 0).bit_length(),
+                device=self.device,
+                dtype=torch.int32,
+            )
+        return self._arange_buf[:length]
+
     def _asm_context_prefill_indices(
         self, forward_batch: ForwardBatch, bs: int, num_kv_slots: int
     ):
@@ -1458,7 +1473,7 @@ class AiterAttnBackend(AttentionBackend):
         layer: RadixAttention,
         ps: MlaPrefillPsMetadata,
     ):
-        """Run the asm prefill over one work partition, returning (out, lse)."""
+        """Run the asm prefill over one PS metadata, returning (out, lse)."""
         total_q = q.shape[0]
         nhead = layer.tp_q_head_num
         v_head_dim = layer.v_head_dim
@@ -1533,8 +1548,11 @@ class AiterAttnBackend(AttentionBackend):
             final_lse,
         )
         if head_pad:
-            output = output[:, : layer.tp_q_head_num, :].contiguous()
+            output = output[:, : layer.tp_q_head_num, :]
             if final_lse is not None:
+                # Slicing the padded head axis leaves the kernel's stride
+                # behind, and merge_state reads its inputs as contiguous.
+                output = output.contiguous()
                 final_lse = final_lse[:, : layer.tp_q_head_num].contiguous()
         return output, final_lse
 
@@ -2857,19 +2875,22 @@ class AiterAttnBackend(AttentionBackend):
         qo_indptr = self.forward_metadata.qo_indptr
         max_q_len = self.forward_metadata.max_q_len
 
-        self.forward_metadata.chunked_skip_prefix_ps_metadata = (
-            self._build_prefill_ps_metadata(
-                qo_indptr=qo_indptr,
-                qo_indptr_cpu=qo_indptr_cpu,
-                kv_indptr=qo_indptr,
-                kv_indptr_cpu=qo_indptr_cpu,
-                kv_lens_cpu=extend_lens_cpu,
-                num_kv_tokens=int(qo_indptr_cpu[-1]),
-                max_q_len=max_q_len,
-                is_causal=True,
-                need_lse=True,
+        # disable_flashinfer_ragged asks for no ragged pass. The skip-prefix
+        # pass is this backend's ragged one, so leave it on the varlen path.
+        if not disable_flashinfer_ragged:
+            self.forward_metadata.chunked_skip_prefix_ps_metadata = (
+                self._build_prefill_ps_metadata(
+                    qo_indptr=qo_indptr,
+                    qo_indptr_cpu=qo_indptr_cpu,
+                    kv_indptr=qo_indptr,
+                    kv_indptr_cpu=qo_indptr_cpu,
+                    kv_lens_cpu=extend_lens_cpu,
+                    num_kv_tokens=int(qo_indptr_cpu[-1]),
+                    max_q_len=max_q_len,
+                    is_causal=True,
+                    need_lse=True,
+                )
             )
-        )
 
         metadatas: list[Optional[MlaPrefillPsMetadata]] = []
         for i in range(forward_batch.num_prefix_chunks):
@@ -2911,7 +2932,7 @@ class AiterAttnBackend(AttentionBackend):
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         exact_partial_count: bool = True,
     ) -> MlaPrefillPsMetadata:
-        """Plan one asm-prefill work partition over the key set the caller names"""
+        """Plan one asm-prefill PS metadata over the key set the caller names."""
         (
             work_metadata,
             work_indptr,
@@ -2961,9 +2982,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr=kv_indptr,
             # The k/v handed to the kernel are contiguous and in key order, so
             # the page table is the identity.
-            kv_indices=torch.arange(
-                num_kv_tokens, device=self.device, dtype=torch.int32
-            ),
+            kv_indices=self._get_arange(num_kv_tokens),
             work_metadata=work_metadata,
             work_indptr=work_indptr,
             work_info_set=work_info_set,
