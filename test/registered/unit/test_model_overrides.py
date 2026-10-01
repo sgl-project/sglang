@@ -1159,27 +1159,48 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             self.assertEqual(_mimo_v2_overrides(_args(), None), {})
 
-    def test_mimo_v2_sm100_fp8_pins_flashinfer_trtllm_moe(self):
-        """Blackwell FP8 must not be left on the triton fused-MoE runner."""
+    def test_mimo_v2_sm100_defaults(self):
         from sglang.srt.arg_groups.model_overrides.mimo_v2 import _mimo_v2_overrides
 
         def _args(**kw):
-            defaults = dict(speculative_algorithm=None, moe_runner_backend="auto")
+            defaults = dict(
+                speculative_algorithm=None,
+                moe_runner_backend="auto",
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+            )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
 
         with override_platform(is_sm100=True):
             self.assertEqual(
                 _mimo_v2_overrides(_args(), _hf("fp8")),
-                {"moe_runner_backend": "flashinfer_trtllm"},
+                {"attention_backend": "fa4", "moe_runner_backend": "flashinfer_trtllm"},
             )
             # An explicit user choice is never overwritten.
             self.assertEqual(
-                _mimo_v2_overrides(_args(moe_runner_backend="triton"), _hf("fp8")), {}
+                _mimo_v2_overrides(_args(moe_runner_backend="triton"), _hf("fp8")),
+                {"attention_backend": "fa4"},
             )
             # FP4 checkpoints run through flashinfer_mxfp4, so they must not be
             # pinned to flashinfer_trtllm.
-            self.assertEqual(_mimo_v2_overrides(_args(), _hf("mxfp4")), {})
+            self.assertEqual(
+                _mimo_v2_overrides(_args(), _hf("mxfp4")),
+                {"attention_backend": "fa4"},
+            )
+            for field in (
+                "attention_backend",
+                "prefill_attention_backend",
+                "decode_attention_backend",
+            ):
+                self.assertEqual(
+                    _mimo_v2_overrides(
+                        _args(moe_runner_backend="triton", **{field: "triton"}),
+                        _hf("fp8"),
+                    ),
+                    {},
+                )
 
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):

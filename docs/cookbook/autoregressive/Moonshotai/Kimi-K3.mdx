@@ -105,7 +105,7 @@ SGLang revision `e7f7447333`, which includes
 the [DCP KV-free fix (#38941)](https://github.com/sgl-project/sglang/pull/38941).
 No source overlay is required for DCP.
 
-Keep `SGLANG_K3_KDA_FUSED_BACKEND` unset with this image. The separate fused-KDA
+Keep `SGLANG_ROCM_K3_KDA_FUSED_BACKEND` unset with this image. The separate fused-KDA
 opt-in requires the [deferred-gate fix (#39066)](https://github.com/sgl-project/sglang/pull/39066),
 which is not included in this image. This updated recipe remains **Final
 Verification In Progress**; the recorded speed numbers use their original
@@ -221,7 +221,7 @@ Outside the two verified B300 1×8 `Unified` cells, no cell has a serving round 
 |---|---|---|
 | `AITER_SITUV2_A8W4=1` | unset | SiTU v2 MoE with A8W4 activation quantization, on AITER's GU-interleaved preshuffled weight layout. The performance default the cell ships. |
 | `AITER_SITUV2_A4W4=1` | unset | A4W4 instead, on the generic separated shuffle layout. Numerically correct but slower than A8W4 (530.8 vs 537.3 tok/s median output on 8×MI35x). Setting **both** gives A8W4 precedence — SGLang follows AITER and keeps the GU-interleaved layout. |
-| `SGLANG_K3_KDA_FUSED_BACKEND=aiter` | unset | Opt in to the fused ROCm KDA decode boundary: the `f_b` projection is deferred into the gfx950 FlyDSL kernel so decode fuses `f_b` + convolution + recurrent state update + gated RMSNorm. Any other value (or unset) keeps the unfused KDA path. |
+| `SGLANG_ROCM_K3_KDA_FUSED_BACKEND=aiter` | unset | Opt in to the fused ROCm KDA decode boundary: the `f_b` projection is deferred into the gfx950 FlyDSL kernel so decode fuses `f_b` + convolution + recurrent state update + gated RMSNorm. Any other value (or unset) keeps the unfused KDA path. |
 | `SGLANG_K3_FLYDSL_SOURCE` | `auto` | Which FlyDSL implementation backs the fused decode: `auto` prefers SGLang's vendored kernels and falls back to the AITER module, `sglang` / `aiter` pin one. Leave it alone unless you are bisecting the two. |
 
 The fused KDA backend is fail-closed at two levels: it arms during model init only when the flag is exactly `aiter` **and** the gfx950 FlyDSL kernels are importable, and each decode step re-validates shapes, dtypes, strides, state indices, and output buffers before dispatch — anything unexpected falls back to the stock KDA implementation rather than erroring. Batch size 2 automatically picks a separately validated kernel schedule; every other batch keeps the original build options. Measured on a 69-layer graph the fused boundary is 9.20 → 8.38 µs/layer (−8.9%), with GSM8K 1319 at 0.950.
