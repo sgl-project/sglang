@@ -9,7 +9,6 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
 )
-from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -58,6 +57,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -191,11 +191,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         # Only the last target PP stage loads the draft. Capture its TP group
         # before draft_pp_context hides the target's pipeline topology.
-        load_group = (
-            get_parallel().tp_group
-            if get_parallel().pp_size > 1
-            else _DEFAULT_LOAD_GROUP
-        )
+        load_group = get_pp_stage_load_group()
         with (
             draft_tp_context(self.draft_owns_attention),
             draft_pp_context(),
