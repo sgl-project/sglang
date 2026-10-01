@@ -380,11 +380,8 @@ def disable_full_prefill_cudagraph_if_incompatible(server_args: Any):
 
 
 def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
-    """Disable prefill CUDA graph for dsr1 by default when using the trtllm_mla
-    attention backend. Under any captured prefill CUDA graph (tc_piecewise or
-    breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
-    performance, so disable whichever prefill graph backend is in effect.
-    """
+    """Disable dsr1 prefill CUDA graphs on trtllm_mla by default; their gain with
+    varlen absorbed MLA is not yet measured on DeepSeek-V3."""
 
     cfg = resolving_view(server_args)
 
@@ -402,9 +399,8 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
         return
     logger.warning(
         "Disabling prefill CUDA graph (%s) by default for the DeepSeek-V3 arch on "
-        "the trtllm_mla attention backend (a captured prefill graph forces a "
-        "FlashAttention fallback that regresses prefill). Set the prefill cuda graph "
-        "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
+        "the trtllm_mla attention backend. Set the prefill cuda graph backend "
+        "explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
         cfg.cuda_graph_config.prefill.backend,
     )
     declare_resolution(

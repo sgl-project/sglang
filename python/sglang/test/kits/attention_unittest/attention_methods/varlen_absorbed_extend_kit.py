@@ -8,9 +8,11 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
+    build_mla_attention_fixture,
     run_mla_attention_case,
     run_mla_attention_case_captured,
 )
@@ -188,6 +190,16 @@ class VarlenAbsorbedExtendMixin:
             f"an opted-out backend still took the varlen absorbed path under "
             f"{self.MODE_NAME} capture",
         )
+
+    def test_workspace_is_skipped_without_a_captured_prefill_graph(self):
+        fixture = build_mla_attention_fixture(
+            self,
+            self.CASES[0],
+            fp8_kv_cache=True,
+            prefill_graph_backend=Backend.DISABLED,
+            **MLA_SHAPE_KWARGS,
+        )
+        self.assertIsNone(fixture.backend._varlen_absorbed_workspace_buffer)
 
     def test_unsupported_env_keeps_the_paged_fallback(self):
         case = self.CASES[0]

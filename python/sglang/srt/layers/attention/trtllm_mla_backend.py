@@ -59,6 +59,7 @@ from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -68,6 +69,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import (
     get_buffer,
+    get_exec,
     get_model,
     get_parallel,
     get_schedule,
@@ -185,14 +187,11 @@ def _get_varlen_absorbed_workspace_buffer(
 
 def varlen_absorbed_mla_supported(kv_cache_dtype: Union[str, torch.dtype]) -> bool:
     """Whether trtllm_mla can serve a captured-graph extend with absorbed MLA
-    over a ragged query, instead of the slower FlashInfer paged-MLA fallback.
+    over a ragged query. Accepts the ServerArgs string or the runtime dtype.
 
-    Accepts both the ServerArgs string and the runtime torch dtype.
-
-    - Arch: flashinfer's backend="auto" resolves to XQA off SM100, and XQA
-      raises on cum_seq_lens_q.
-    FlashInfer 0.6.18 supports this path with BF16 or FP8 E4M3 KV. FP4 uses
-    the paged fallback, and other FP8 formats are unsupported.
+    SM100 only: off SM100, FlashInfer's backend="auto" resolves to XQA, which
+    rejects cum_seq_lens_q. FlashInfer 0.7.0.post1 serves BF16 and FP8 E4M3 KV;
+    FP4 keeps the paged fallback.
     """
     if not is_sm100_supported():
         return False
@@ -211,6 +210,20 @@ def configured_varlen_absorbed_mla_supported(
     """Resolve ``auto`` conservatively before the KV cache is materialized."""
     return varlen_absorbed_mla_supported(
         model_dtype if kv_cache_dtype == "auto" else kv_cache_dtype
+    )
+
+
+def varlen_absorbed_extend_may_run(
+    cuda_graph_config: Optional[CudaGraphConfig], dcp_enabled: bool
+) -> bool:
+    """Process-level preconditions of the varlen absorbed extend: it only runs
+    inside a captured prefill graph, without DCP or skip-softmax decode."""
+    return (
+        cuda_graph_config is not None
+        and cuda_graph_config.prefill.backend
+        in (Backend.TC_PIECEWISE, Backend.BREAKABLE)
+        and not dcp_enabled
+        and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() is None
     )
 
 
@@ -334,6 +347,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             if self.backend == "trtllm-gen"
             and self.owns_varlen_absorbed_extend
             and self._varlen_absorbed_arch_dtype_ok
+            and varlen_absorbed_extend_may_run(
+                get_exec().graph.cuda_graph_config, get_parallel().dcp_enabled
+            )
             else None
         )
 
@@ -1239,9 +1255,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if self.backend != "trtllm-gen":
             extra_kwargs = {"backend": self.backend}
         elif cum_seq_lens_q is None:
-            # Pin dense decode to TRT before it can touch a CuTeDSL workspace.
+            # Dense decode keeps FlashInfer's auto dispatch, as on main.
             extra_kwargs = {
-                "backend": "trtllm-gen",
                 "multi_ctas_kv_counter_buffer": self._multi_ctas_kv_counter_buffer,
             }
         else:
@@ -1250,8 +1265,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert max_q_len is not None, "max_q_len must accompany cum_seq_lens_q"
             if self._varlen_absorbed_workspace_buffer is None:
                 raise RuntimeError(
-                    "Variable-Q MLA workspace requires the TRT backend and a "
-                    "supported architecture and KV dtype"
+                    "Variable-Q MLA workspace requires the TRT backend, a "
+                    "supported architecture and KV dtype, and a captured "
+                    "prefill graph without DCP or skip-softmax decode"
                 )
             extra_kwargs["cum_seq_lens_q"] = cum_seq_lens_q
             extra_kwargs["max_q_len"] = max_q_len
@@ -1764,7 +1780,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and layer.head_dim == self.kv_lora_rank + self.qk_rope_head_dim
         ):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+            kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
             raw_out = self._run_varlen_absorbed_kernel(
                 query=q.to(self.data_type),
                 kv_cache=kv_cache,

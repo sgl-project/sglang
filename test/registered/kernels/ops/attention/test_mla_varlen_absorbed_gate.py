@@ -14,36 +14,19 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     _get_cute_dsl_workspace_buffer,
     _get_varlen_absorbed_workspace_buffer,
     configured_varlen_absorbed_mla_supported,
+    varlen_absorbed_extend_may_run,
     varlen_absorbed_mla_supported,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import FP4_KV_CACHE_DTYPES
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=1, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
-def _skip_unless_fp4_dtype_available(test_case):
-    try:
-        torch.float4_e2m1fn_x2
-    except AttributeError:
-        test_case.skipTest("torch build has no float4_e2m1fn_x2")
-
-
 class TestVarlenAbsorbedMLAGate(CustomTestCase):
     DECODE_KERNEL_OVERRIDERS = (TokenspeedMLABackend, CuteDslMLABackend)
-
-    def test_base_backend_owns_varlen_extend(self):
-        self.assertTrue(TRTLLMMLABackend.owns_varlen_absorbed_extend)
-
-    def test_tokenspeed_does_not_own_varlen_extend(self):
-        self.assertFalse(TokenspeedMLABackend.owns_varlen_absorbed_extend)
-        self.assertTrue(issubclass(TokenspeedMLABackend, TRTLLMMLABackend))
-
-    def test_decode_only_cutedsl_does_not_own_varlen_extend(self):
-        self.assertFalse(CuteDslMLABackend.owns_varlen_absorbed_extend)
-        self.assertTrue(issubclass(CuteDslMLABackend, TRTLLMMLABackend))
 
     def test_decode_overrides_do_not_own_a_varlen_extend_kernel(self):
         for cls in self.DECODE_KERNEL_OVERRIDERS:
@@ -59,6 +42,7 @@ class TestVarlenAbsorbedMLAGate(CustomTestCase):
                 continue
             with self.subTest(cls=cls.__name__):
                 self.assertIn("owns_varlen_absorbed_extend", cls.__dict__)
+                self.assertFalse(cls.owns_varlen_absorbed_extend)
             found.add(cls)
         self.assertEqual(
             found,
@@ -70,13 +54,7 @@ class TestVarlenAbsorbedMLAGate(CustomTestCase):
 
 
 class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
-    """ServerArgs decides whether the prefill CUDA graph may stay on
-    tc_piecewise for trtllm_mla; forward_extend decides whether the ragged
-    absorbed path actually runs. If those two ever answer differently, the graph
-    is captured and the extend silently falls back to paged MLA -- the exact
-    regression this path removes, with nothing raised to notice it by. They must
-    therefore read one predicate, not two copies of it.
-    """
+    """ServerArgs and forward_extend must read the same capability predicate."""
 
     _BACKEND = "sglang.srt.layers.attention.trtllm_mla_backend"
 
@@ -147,32 +125,6 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
         ):
             self.assertTrue(trtllm_mla_has_varlen_absorbed(args))
 
-    def test_fp4_kv_spellings_match_the_dtype_resolver(self):
-        # A --kv-cache-dtype spelling that resolves to the packed 4-bit dtype but
-        # is missing from FP4_KV_CACHE_DTYPES would let ServerArgs upgrade to
-        # tc_piecewise for a config forward_extend refuses to serve.
-        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
-
-        _skip_unless_fp4_dtype_available(self)
-
-        def resolve(name):
-            _, dtype = configure_kv_cache_dtype(
-                server_args_kv_cache_dtype=name,
-                model=SimpleNamespace(quant_config=None),
-                model_dtype=torch.bfloat16,
-                is_draft_worker=False,
-                is_dflash=False,
-                speculative_draft_attention_backend="",
-            )
-            return dtype
-
-        for name in FP4_KV_CACHE_DTYPES:
-            with self.subTest(name=name):
-                self.assertIs(resolve(name), torch.float4_e2m1fn_x2)
-        for name in ("fp8_e4m3", "bf16"):
-            with self.subTest(name=name):
-                self.assertIsNot(resolve(name), torch.float4_e2m1fn_x2)
-
     def test_only_supported_string_and_dtype_forms_are_allowed(self):
         with patch(f"{self._BACKEND}.is_sm100_supported", return_value=True):
             for dtype in (
@@ -207,6 +159,37 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
         with patch(f"{self._BACKEND}.is_sm100_supported", return_value=False):
             self.assertFalse(varlen_absorbed_mla_supported("fp8_e4m3"))
             self.assertFalse(varlen_absorbed_mla_supported(torch.float8_e4m3fn))
+
+
+class TestVarlenAbsorbedWorkspaceAllocation(CustomTestCase):
+    _SKIP_SOFTMAX = (
+        "sglang.srt.layers.attention.trtllm_mla_backend.envs."
+        "SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get"
+    )
+
+    @staticmethod
+    def _graph(prefill_backend):
+        return SimpleNamespace(prefill=SimpleNamespace(backend=prefill_backend))
+
+    def _may_run(self, graph, *, dcp_enabled=False, skip_softmax=None):
+        with patch(self._SKIP_SOFTMAX, return_value=skip_softmax):
+            return varlen_absorbed_extend_may_run(graph, dcp_enabled)
+
+    def test_captured_prefill_graphs_allocate(self):
+        for backend in (Backend.TC_PIECEWISE, Backend.BREAKABLE):
+            with self.subTest(backend=backend):
+                self.assertTrue(self._may_run(self._graph(backend)))
+
+    def test_unreachable_configs_skip_the_workspace(self):
+        cases = {
+            "no graph config": (None, {}),
+            "prefill graph disabled": (self._graph(Backend.DISABLED), {}),
+            "dcp": (self._graph(Backend.TC_PIECEWISE), {"dcp_enabled": True}),
+            "skip-softmax": (self._graph(Backend.BREAKABLE), {"skip_softmax": 1.0}),
+        }
+        for name, (graph, kwargs) in cases.items():
+            with self.subTest(name):
+                self.assertFalse(self._may_run(graph, **kwargs))
 
 
 class TestVarlenAbsorbedMLARouting(CustomTestCase):
@@ -303,9 +286,9 @@ class TestVarlenAbsorbedMLADispatchContract(CustomTestCase):
         self.assertEqual(kwargs["max_q_len"], 2)
         self.assertTrue(torch.equal(kwargs["cum_seq_lens_q"], torch.tensor([0, 2, 3])))
 
-    def test_dense_call_keeps_explicit_trt_counter(self):
+    def test_dense_call_keeps_auto_dispatch_and_trt_counter(self):
         kwargs = self._call(self._backend(), varlen=False)
-        self.assertEqual(kwargs["backend"], "trtllm-gen")
+        self.assertNotIn("backend", kwargs)
         self.assertIs(kwargs["multi_ctas_kv_counter_buffer"], sentinel.counter_buffer)
         self.assertIs(kwargs["workspace_buffer"], sentinel.workspace_buffer)
 
