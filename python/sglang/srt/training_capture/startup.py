@@ -117,6 +117,24 @@ class _StartupCollectives:
         return values
 
 
+def _agree_policy(channel, build_policy):
+    error, fingerprint = None, ()
+    try:
+        fingerprint = _fingerprint(build_policy())
+    except Exception as cause:  # noqa: BLE001 - every peer must reach the policy vote
+        error = cause
+    votes = channel.vote("policy", error, fingerprint=fingerprint)
+    if len({tuple(item[3:7]) for item in votes}) != 1:
+        raise CaptureStartupError("policy_agreement", range(channel.world_size))
+
+
+def coordinate_policy_startup(*, group, build_policy, timeout_seconds=120.0):
+    """Agree on immutable subsystem metadata before subsequent collectives."""
+    channel = _StartupCollectives(group, timeout_seconds)
+    _agree_policy(channel, build_policy)
+    channel.vote("identity_ready", None)
+
+
 def coordinate_resource_startup(
     *, group, build_policy: Callable, prepare_local: Callable, timeout_seconds=120.0
 ):
@@ -129,14 +147,7 @@ def coordinate_resource_startup(
     callbacks and close barriers still require the worker supervisor's watchdog.
     """
     channel = _StartupCollectives(group, timeout_seconds)
-    error, fingerprint = None, ()
-    try:
-        fingerprint = _fingerprint(build_policy())
-    except Exception as cause:  # noqa: BLE001 - every peer must reach the policy vote
-        error = cause
-    votes = channel.vote("policy", error, fingerprint=fingerprint)
-    if len({tuple(item[3:7]) for item in votes}) != 1:
-        raise CaptureStartupError("policy_agreement", range(channel.world_size))
+    _agree_policy(channel, build_policy)
 
     error, resource = None, None
     try:

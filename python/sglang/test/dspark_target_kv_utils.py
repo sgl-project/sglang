@@ -85,9 +85,13 @@ def make_target_kv_injector():
     return injector, writer, batch
 
 
-def make_minimal_kv_weight_loader():
+def make_minimal_kv_weight_loader(*, tp_size=1, tp_rank=0):
     """Exercise the real loader on a small parameter tree without distributed init."""
-    from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
+    from sglang.srt.layers.linear import (
+        MergedColumnParallelLinear,
+        QKVParallelLinear,
+        RowParallelLinear,
+    )
     from sglang.srt.models.dspark_target_kv import DSparkTargetKVDraftModel
 
     model = DSparkTargetKVDraftModel.__new__(DSparkTargetKVDraftModel)
@@ -101,12 +105,20 @@ def make_minimal_kv_weight_loader():
         total_num_kv_heads=1,
         bias=False,
         params_dtype=torch.float32,
-        tp_size=1,
-        tp_rank=0,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
     )
     layer.mlp = torch.nn.Module()
     layer.mlp.gate_up_proj = MergedColumnParallelLinear(
-        2, [4, 4], bias=False, params_dtype=torch.float32, tp_size=1, tp_rank=0
+        2,
+        [4, 4],
+        bias=False,
+        params_dtype=torch.float32,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+    )
+    layer.self_attn.o_proj = RowParallelLinear(
+        4, 2, bias=False, params_dtype=torch.float32, tp_size=tp_size, tp_rank=tp_rank
     )
     model.layers = torch.nn.ModuleList([layer])
     model.kv_encoder = torch.nn.Linear(2, 2, bias=False)

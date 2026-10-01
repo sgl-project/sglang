@@ -144,14 +144,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._target_kv_contract is not None:
             parallel = get_parallel()
             if (
-                parallel.tp_size != 1
-                or parallel.pp_size != 1
+                parallel.pp_size != 1
                 or parallel.dp_size != 1
                 or get_disagg().disaggregation_mode != "null"
                 or get_lora().enable_lora
             ):
                 raise ValueError(
-                    "target-KV DSpark currently requires TP=PP=DP=1, "
+                    "target-KV DSpark currently requires PP=DP=1, "
                     "no disaggregation and no LoRA"
                 )
             self._capture_hidden_mode = CaptureHiddenMode.NULL

@@ -235,6 +235,40 @@ class TestTargetKVFeatureMath(CustomTestCase):
 
 
 class TestTargetKVInjector(CustomTestCase):
+    def test_encoder_receives_global_heads_once_in_canonical_order(self):
+        """Replicated TP heads occupy adjacent ranks, not a second head block."""
+        for heads in (2, 8):
+            with self.subTest(heads=heads):
+                injector, _, _ = make_target_kv_injector()
+                full = torch.arange(6 * heads * 2).reshape(6, heads, 2)
+                locations = torch.tensor([4, 1, 5])
+                replicas = max(1, 4 // heads)
+                physical = full.repeat_interleave(replicas, dim=1)
+                if replicas > 1:
+                    physical[:, 1::replicas] = -999
+                injector.sources = {"target_k.3": physical[:, : max(1, heads // 4)]}
+                injector.head_replicas = {"target_k.3": replicas}
+
+                def gather(
+                    value,
+                    *,
+                    dim,
+                    injector=injector,
+                    locations=locations,
+                    physical=physical,
+                ):
+                    self.assertEqual(dim, 1)
+                    torch.testing.assert_close(
+                        value, injector.sources["target_k.3"][locations]
+                    )
+                    return physical[locations]
+
+                injector.tp_group = SimpleNamespace(all_gather=gather)
+                selected = injector._select_target_kv(locations)
+                torch.testing.assert_close(
+                    selected["target_k.3"], full[locations], rtol=0, atol=0
+                )
+
     def test_large_cached_prefix_projects_in_bounded_chunks(self):
         injector, writer, batch = make_target_kv_injector()
         injector.sources = {"target_k.3": torch.arange(5000).reshape(2500, 1, 2)}
@@ -333,6 +367,66 @@ class TestTargetKVInjector(CustomTestCase):
 
 
 class TestTargetKVWeightLoader(CustomTestCase):
+    def test_global_exports_load_into_tp_shards_with_replicated_kv_heads(self):
+        """A global checkpoint must not be checked against local parameter shapes."""
+        full = make_minimal_kv_weight_loader()
+        weights = {
+            name: torch.arange(value.numel()).reshape_as(value).float() + 100 * i
+            for i, (name, value) in enumerate(full.named_parameters())
+        }
+        for rank in range(2):
+            for split in (False, True):
+                with self.subTest(rank=rank, split=split):
+                    model = make_minimal_kv_weight_loader(tp_size=2, tp_rank=rank)
+                    checkpoint = []
+                    expected = {}
+                    for name, value in weights.items():
+                        if ".qkv_proj." in name:
+                            q, k, v = value.split((4, 2, 2))
+                            expected[name] = torch.cat(
+                                (q[rank * 2 : rank * 2 + 2], k, v)
+                            )
+                            parts = zip(("q", "k", "v"), (q, k, v), strict=True)
+                            if split:
+                                checkpoint.extend(
+                                    (name.replace("qkv_proj", part + "_proj"), shard)
+                                    for part, shard in parts
+                                )
+                            else:
+                                checkpoint.append((name, value))
+                        elif ".gate_up_proj." in name:
+                            gate, up = value.chunk(2)
+                            expected[name] = torch.cat(
+                                (
+                                    gate[rank * 2 : rank * 2 + 2],
+                                    up[rank * 2 : rank * 2 + 2],
+                                )
+                            )
+                            if split:
+                                checkpoint.extend(
+                                    (
+                                        name.replace("gate_up_proj", part + "_proj"),
+                                        shard,
+                                    )
+                                    for part, shard in zip(
+                                        ("gate", "up"), (gate, up), strict=True
+                                    )
+                                )
+                            else:
+                                checkpoint.append((name, value))
+                        else:
+                            checkpoint.append((name, value))
+                            expected[name] = (
+                                value[:, rank * 2 : rank * 2 + 2]
+                                if ".o_proj." in name
+                                else value
+                            )
+                    model.load_weights(checkpoint)
+                    for name, value in model.named_parameters():
+                        torch.testing.assert_close(
+                            value, expected[name], rtol=0, atol=0
+                        )
+
     def test_split_gqa_and_mlp_exports_preserve_packed_parameter_layout(self):
         model = make_minimal_kv_weight_loader()
         expected = {

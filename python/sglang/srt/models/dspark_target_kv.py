@@ -8,6 +8,12 @@ import torch
 import torch.nn.functional as F
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.models.dflash import DFlashAttention, DFlashDecoderLayer
 from sglang.srt.models.dspark import DSparkDraftModel, gather_and_crop_vocab
 from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
@@ -202,8 +208,30 @@ class DSparkTargetKVDraftModel(DSparkDraftModel):
                 f"KV draft weight must be a dense FP32/FP16/BF16 tensor: {original_name}"
             )
         expected = list(parameter.shape)
-        if shard != "full":
-            module = self.get_submodule(name.rsplit(".", 1)[0])
+        module = self.get_submodule(name.rsplit(".", 1)[0])
+        if isinstance(module, QKVParallelLinear):
+            # Checkpoint heads are logical heads, before TP replication/sharding.
+            sizes = [
+                module.total_num_heads * module.head_size,
+                module.total_num_kv_heads * module.head_size,
+                module.total_num_kv_heads * module.v_head_size,
+            ]
+            expected[0] = (
+                sum(sizes)
+                if shard == "full"
+                else sizes[{"q": 0, "k": 1, "v": 2}[shard]]
+            )
+        elif isinstance(module, MergedColumnParallelLinear):
+            expected[0] = (
+                sum(module.output_sizes)
+                if shard == "full"
+                else module.output_sizes[{"gate": 0, "up": 1}[shard]]
+            )
+        elif isinstance(module, ColumnParallelLinear):
+            expected[0] = module.output_size
+        elif isinstance(module, RowParallelLinear) and parameter.ndim == 2:
+            expected[1] = module.input_size
+        elif shard != "full":
             index = {"q": 0, "k": 1, "v": 2, "gate": 0, "up": 1}[shard]
             expected[0] = module.output_sizes[index]
         if tuple(weight.shape) != tuple(expected):

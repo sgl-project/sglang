@@ -146,13 +146,24 @@ checkpoint variant; changing the target also requires a matching draft contract.
 
 ## Runtime Scope
 
-Current capability gates require one target/draft GPU, TP=PP=DP=1, dense
+Current capability gates allow TP and require PP=DP=1, dense
 unquantized NHD target/draft pools, no LoRA or PD, and standard RoPE. Synchronous
 scheduling and normal overlap are supported. Target identity binding currently
 supports Qwen3, Qwen2 and Llama text models; real-model evidence currently covers
-Qwen3-0.6B only. Static verify
+Qwen3-0.6B at TP1 and TP2 only. Static verify
 supports ordinary execution and decode/verify CUDA graphs. Target hidden-state
 capture is disabled for both ordinary execution and graph construction.
+
+At TP startup, ranks agree on the actual target identity and geometry, then the
+draft contract and checkpoint digest before projection collectives can begin.
+Checkpoint validation uses global logical Q/K/V and MLP dimensions; native
+parallel loaders shard or replicate them into rank-local parameters. The KV
+encoder is replicated. Before each bounded 1024-token projection chunk, the
+injector gathers selected target K/V across the target TP group in global-head
+order and keeps one canonical copy of replicated heads. The replicated encoder
+then writes each rank's local draft context projections. This inference gather
+is separate from training capture, whose owner-local snapshot payloads go
+directly to the Store without gathering through the capture control group.
 
 Example with an exported checkpoint and local target artifacts:
 
@@ -168,7 +179,7 @@ SGLANG_RAGGED_VERIFY_MODE=static python -m sglang.launch_server \
 The checkpoint's golden-fixture/acceptance metadata is recorded and validated
 structurally; startup does not execute or certify a SpecForge validation report.
 Production exporter compatibility, trained-model quality/throughput gates,
-parallel topology, non-static verification, PD, RDMA and production rollout
+broader parallel topologies, non-static verification, PD, RDMA and production rollout
 remain open. The retained Qwen3 BF16 fixture now passes the complete backbone
 and logits gate against the pinned FlexAttention training reference; this is
 not a certificate for other models, backends or runtime versions.

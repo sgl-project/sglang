@@ -3,10 +3,15 @@
 import json
 import os
 import sys
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.models.dspark_target_kv import DSparkTargetKVDraftModel
 from sglang.srt.speculative.dspark_components.dspark_target_kv_inject import (
     TargetKVInjector,
@@ -16,7 +21,11 @@ from sglang.test.dspark_capture_observer import install_capture_observer
 
 
 def record(model, event):
-    with open(model.config.test_observation_path, "a") as stream:
+    path = Path(model.config.test_observation_path)
+    event["tp_rank"] = get_tensor_model_parallel_rank()
+    if get_tensor_model_parallel_world_size() > 1:
+        path = path.with_name(f"{path.stem}-tp{event['tp_rank']}{path.suffix}")
+    with path.open("a") as stream:
         stream.write(json.dumps(event) + "\n")
 
 

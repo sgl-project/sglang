@@ -36,14 +36,20 @@ An example for an unquantized Qwen3-0.6B target with layers 0, 14 and 27:
 ```
 
 Synchronous and normal overlap scheduling are supported for ordinary AR and
-single-rank static DSpark verification. Ordinary AR can use TP/PP with DP=1;
+static DSpark verification. Ordinary AR can use TP/PP with DP=1;
 the complete worker group must participate in capture startup. Real-model
 numerical validation currently covers Qwen3-0.6B on two H100s with TP2/PP1 and
 TP1/PP2, including chunked prefill, prefix reuse, decode CUDA Graphs and TP
 overlap scheduling. Other topologies and model families still require deployment
 validation. PP uses SGLang's non-overlap pipeline scheduler.
+Static DSpark capture supports TP with PP=DP=1. Qwen3-0.6B with a synthetic
+target-KV draft is verified at TP2, including eager and graph/overlap execution,
+prefix reuse, full acceptance, rejection and mixed acceptance lengths in a batch.
+Each rank writes its own captured KV heads to the Store. An independent reader
+reconstructs the global tensors after producer exit; the snapshot path does not
+gather KV payloads through its control group.
 The configuration is checked before weights load; unsupported DP/context
-parallelism, distributed speculation, non-static or other speculative algorithms,
+parallelism, pipeline speculation, non-static or other speculative algorithms,
 PD, mixed-chunk, LoRA, quantized or embedding execution is rejected. Model/pool
 binding additionally requires a local safetensors target, local tokenizer
 artifacts, standard unscaled RoPE, full attention, and dense unquantized NHD

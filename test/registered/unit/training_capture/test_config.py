@@ -89,7 +89,7 @@ class TestCaptureConfiguration(CustomTestCase):
                 finally:
                     setattr(self.args, name, previous)
 
-    def test_distributed_ar_does_not_enable_distributed_speculation(self):
+    def test_tp_static_dspark_does_not_enable_pipeline_speculation(self):
         for tp, pp in ((2, 1), (1, 2), (2, 2)):
             with self.subTest(tp=tp, pp=pp):
                 self.args.tp_size, self.args.pp_size = tp, pp
@@ -100,11 +100,14 @@ class TestCaptureConfiguration(CustomTestCase):
                     patch.object(
                         envs.SGLANG_RAGGED_VERIFY_MODE, "get", return_value="static"
                     ),
-                    self.assertRaisesRegex(
-                        ValueError, "distributed speculative capture"
-                    ),
                 ):
-                    validate_capture_server_args(self.args)
+                    if pp == 1:
+                        validate_capture_server_args(self.args)
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "pipeline speculative capture"
+                        ):
+                            validate_capture_server_args(self.args)
 
     def test_static_dspark_capture_rejects_compact_or_simulated_paths(self):
         self.args.speculative_algorithm = "DSPARK"

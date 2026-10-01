@@ -22,15 +22,18 @@ from unittest.mock import patch
 
 import requests
 import torch
+from sglang.srt.environ import envs
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.utils import kill_process_tree
 from sglang.test import test_utils
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.dspark_capture_observer import check_capture_snapshot
+from sglang.test.dspark_target_kv_runtime import export_synthetic_kv_draft
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 from sglang.test.training_capture_catalog import TestCaptureCatalog
 from sglang.test.training_capture_utils import read_snapshot
 
-register_cuda_ci(est_time=180, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
 
 
 def free_port():
@@ -120,9 +123,10 @@ class TestDistributedCaptureRuntime(CustomTestCase):
             cls.master.wait(timeout=20)
         cls.temporary.cleanup()
 
-    def launch(self, tp, pp, *, replay=False):
-        root = self.root / f"tp{tp}-pp{pp}-replay{replay}"
-        root.mkdir()
+    def launch(self, tp, pp, *, replay=False, draft=None):
+        root = Path(
+            tempfile.mkdtemp(prefix=f"tp{tp}-pp{pp}-replay{replay}-", dir=self.root)
+        )
         config = {
             "dataset_id": f"runtime-tp{tp}-pp{pp}",
             "model_id": "Qwen/Qwen3-0.6B",
@@ -152,9 +156,13 @@ class TestDistributedCaptureRuntime(CustomTestCase):
                     sys.executable,
                     "-m",
                     (
-                        "sglang.test.training_capture_distributed_server"
-                        if replay
-                        else "sglang.test.training_capture_server"
+                        "sglang.test.dspark_target_kv_server"
+                        if draft
+                        else (
+                            "sglang.test.training_capture_distributed_server"
+                            if replay
+                            else "sglang.test.training_capture_server"
+                        )
                     ),
                 ]
                 + command[2:],
@@ -175,15 +183,24 @@ class TestDistributedCaptureRuntime(CustomTestCase):
             else [
                 "--cuda-graph-backend-decode",
                 "disabled",
-                "--debug-tensor-dump-output-folder",
-                str(self.dump_path),
-                "--debug-tensor-dump-layers",
-                "0",
-                "14",
-                "27",
+                *(
+                    []
+                    if draft
+                    else [
+                        "--debug-tensor-dump-output-folder",
+                        str(self.dump_path),
+                        "--debug-tensor-dump-layers",
+                        "0",
+                        "14",
+                        "27",
+                    ]
+                ),
             ]
         )
-        with patch.object(test_utils, "_launch_server_process", observed_server):
+        with (
+            patch.object(test_utils, "_launch_server_process", observed_server),
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+        ):
             type(self).server = popen_launch_server(
                 self.model_path,
                 self.url,
@@ -198,6 +215,18 @@ class TestDistributedCaptureRuntime(CustomTestCase):
                     "--pp-size",
                     str(pp),
                     *schedule_args,
+                    *(
+                        [
+                            "--speculative-algorithm",
+                            "DSPARK",
+                            "--speculative-draft-model-path",
+                            str(draft),
+                            "--speculative-draft-attention-backend",
+                            "triton",
+                        ]
+                        if draft
+                        else []
+                    ),
                     "--skip-server-warmup",
                     "--skip-tokenizer-init",
                     "--attention-backend",
@@ -431,6 +460,165 @@ class TestDistributedCaptureRuntime(CustomTestCase):
 
     def test_pipeline_parallel_capture(self):
         self.check_capture(tp=1, pp=2)
+
+    def test_tensor_parallel_target_kv_dspark_capture(self):
+        prompt = [100, 200, 300, 400] * 40
+        cases = [(1, False), (8, False), (9, True)]
+        baselines, seeds = [], []
+        self.launch(tp=2, pp=1)
+        try:
+            for length, biased in cases:
+                previous = len(self.catalog.publications)
+                response = requests.post(
+                    self.url + "/generate",
+                    json={
+                        "input_ids": prompt,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": length,
+                            "ignore_eos": True,
+                            **({"logit_bias": {"100": 100.0}} if biased else {}),
+                        },
+                    },
+                    timeout=120,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                baselines.append(response.json()["output_ids"])
+                seeds.append(
+                    self.catalog.wait_publications(previous + 1, timeout=45)[-1]
+                )
+        finally:
+            self.stop_server()
+        seed = read_snapshot(self.reader, seeds[1])
+        for replay in (False, True):
+            destination = self.root / f"tp2-kv-draft-{replay}"
+            export_synthetic_kv_draft(self.model_path, destination, *seed)
+            self.launch(tp=2, pp=1, replay=replay, draft=destination)
+            samples, responses = [], {}
+            try:
+                for (length, biased), baseline in zip(cases, baselines, strict=True):
+                    previous = len(self.catalog.publications)
+                    response = requests.post(
+                        self.url + "/generate",
+                        json={
+                            "input_ids": prompt,
+                            "sampling_params": {
+                                "temperature": 0,
+                                "max_new_tokens": length,
+                                "ignore_eos": True,
+                                **({"logit_bias": {"100": 100.0}} if biased else {}),
+                            },
+                        },
+                        timeout=120,
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    actual = response.json()
+                    self.assertEqual(actual["output_ids"], baseline)
+                    publication = self.catalog.wait_publications(
+                        previous + 1, timeout=45
+                    )[-1]
+                    responses[
+                        hashlib.sha256(actual["meta_info"]["id"].encode()).hexdigest()
+                    ] = actual
+                    samples.append(publication)
+                deadline = time.monotonic() + 20
+                while True:
+                    state = requests.get(self.url + "/server_info", timeout=10).json()[
+                        "internal_states"
+                    ]
+                    if all(
+                        item["training_capture"]["states"].get("available", 0) >= 2
+                        for item in state
+                    ):
+                        break
+                    self.assertLess(time.monotonic(), deadline, state)
+                    time.sleep(0.05)
+                previous = len(self.catalog.publications)
+                batch = requests.post(
+                    self.url + "/generate",
+                    json={
+                        "input_ids": [prompt, prompt],
+                        "sampling_params": [
+                            {
+                                "temperature": 0,
+                                "max_new_tokens": length,
+                                "ignore_eos": True,
+                                **({"logit_bias": {"100": 100.0}} if biased else {}),
+                            }
+                            for length, biased in cases[1:]
+                        ],
+                    },
+                    timeout=120,
+                )
+                self.assertEqual(batch.status_code, 200, batch.text)
+                for actual, baseline in zip(batch.json(), baselines[1:], strict=True):
+                    self.assertEqual(actual["output_ids"], baseline)
+                    responses[
+                        hashlib.sha256(actual["meta_info"]["id"].encode()).hexdigest()
+                    ] = actual
+                samples.extend(
+                    self.catalog.wait_publications(previous + 2, timeout=45)[previous:]
+                )
+                states = requests.get(self.url + "/server_info", timeout=10)
+                states.raise_for_status()
+                states = [
+                    item["training_capture"]
+                    for item in states.json()["internal_states"]
+                ]
+                # Management replies are emitted by the TP leader of each DP group.
+                self.assertEqual(len(states), 1)
+                self.assertTrue(
+                    all(state["enable_overlap"] == replay for state in states)
+                )
+            finally:
+                self.stop_server()
+            references = [
+                torch.load(path, weights_only=True)
+                for path in sorted((destination / "capture-reference").glob("tp*/*.pt"))
+            ]
+            self.assertEqual({item["tp_rank"] for item in references}, {0, 1})
+            for publication in samples:
+                manifest, tensors = read_snapshot(self.reader, publication)
+                actual = responses.pop(manifest.provenance.trace_id)
+                self.assertEqual(
+                    (manifest.topology.tp_size, manifest.topology.pp_size), (2, 1)
+                )
+                self.assertEqual(
+                    tensors["token_ids"].tolist(), prompt + actual["output_ids"]
+                )
+                check_capture_snapshot(self, manifest, tensors, references)
+            self.assertFalse(responses)
+            for rank in range(2):
+                records = [
+                    json.loads(line)
+                    for line in (destination / f"observations-tp{rank}.jsonl")
+                    .read_text()
+                    .splitlines()
+                ]
+                verify = [item for item in records if item["kind"] == "verify"]
+                self.assertTrue(any(item["num_reject"] > 0 for item in verify))
+                self.assertTrue(any(item["num_reject"] == 0 for item in verify))
+                self.assertTrue(
+                    any(len(set(item["num_commit"])) > 1 for item in verify)
+                )
+                self.assertTrue(any(item["kind"] == "projection" for item in records))
+                if replay:
+                    self.assertTrue(
+                        any(
+                            item["kind"] == "target_verify" and item["cuda_graph"]
+                            for item in records
+                        )
+                    )
+            print(
+                json.dumps(
+                    {
+                        "tp2_dspark_exact": len(samples),
+                        "replay": replay,
+                        "states": states,
+                    }
+                ),
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

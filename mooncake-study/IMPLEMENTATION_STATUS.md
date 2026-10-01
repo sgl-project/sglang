@@ -2109,6 +2109,67 @@ the configuration test retains its two baseline C408 diagnostics. Source hashes
 match the tested checkout. Commands, all failed/successful attempts, log hashes
 and scope limits are recorded in `experiments/capture-real-tp-pp.json`.
 
+## TP Target-KV Draft And Static Speculative Capture
+
+Static DSpark now supports TP with PP=DP=1. The target-KV draft binds its
+selected layers against real per-rank target geometry and agrees on target and
+draft artifact identities before any projection collective. Every 1024-token
+projection chunk gathers selected K/V in global-head order through the serving
+TP group, removes replicated logical heads and runs the replicated encoder.
+Each rank writes only its local draft context projections. Snapshot publication
+continues to use owner-local registered buffers and Store writes; it does not
+move KV payloads through the capture control group.
+
+Strict checkpoint validation previously compared global exports against local
+TP parameter shapes. It now uses global logical Q/K/V dimensions (before KV
+replication), global merged MLP dimensions and the row-parallel input dimension.
+The native parallel weight loader still owns slicing and replication. A concrete
+TP2 regression with one replicated KV head failed on both ranks with packed and
+split checkpoints before the fix. The full target-KV file passes 22 tests and
+48 subtests, including canonical global-head ordering and request-slot lifetime.
+The startup file passes four tests and 32 subtests, including coordinated draft
+policy failures and disagreements. Resource startup passes four tests and
+13 subtests; configuration passes seven tests and 32 subtests.
+
+The temporary Northjob `job-3a8707e23152-20261001233124` provides two H100 80GB
+devices on node082. The runtime test uses Qwen3-0.6B and a synthetic two-layer KV
+draft, real CUDA pools, real TP collectives and an independent TCP Mooncake
+segment. Its HTTP Catalog remains a test double. Each worker independently
+records its raw teacher rows and source KV before sampler changes or slot reuse;
+the test reconstructs heads without reading captured Host buffers.
+
+The complete DSpark case passes in 116.199s. After three AR baseline requests,
+eager and graph/overlap DSpark each publish five samples: one-token completion,
+unbiased rejection, forced full acceptance and a two-request mixed-acceptance
+batch. The 160-token prompt exercises chunked prefill and prefix reuse. Generated
+tokens match the AR baseline. After both serving ranks exit, independent Store
+readback matches all selected K/V and raw top-128 scores exactly; global vocab
+IDs, masks, positions, accepted-path alignment, KV validity and full-vocabulary
+logsumexp are checked. Both ranks' draft context projections also match the
+independent test reconstruction. Graph/overlap records 18 verify graph forwards
+and 23 overlap forwards. The first attempt failed a fixture assertion that
+expected two management replies; the API emits one reply per DP group's TP
+leader. This was corrected without changing the data-plane checks.
+
+These observers synchronize GPU work, so the result is numerical and lifecycle
+evidence, not latency/SLO acceptance. Real replicated-head inference, more than
+two TP ranks, combined TP/PP, pipeline speculation, non-static verify, PD/RDMA,
+production Catalog integration and trained draft quality remain open. The full
+validation record is `experiments/capture-tp-dspark.json`.
+
+The complete distributed file passes all three tests in 257.098s, retaining the
+AR TP2 and PP2 checks alongside the new TP2 DSpark case. Final target-KV and
+startup files pass independently in 12.09s and 56.49s. The complete single-H100
+runtime regression passes in 468.033s in job
+`01790869200834994945-4f27d5be0d90`, including cache lifecycle, graph/overlap,
+pressure, adaptive sampling and latency protection. No serving/Store process
+remained on the temporary node; the two-H100 allocation was deleted and its Pod
+is confirmed absent. All 12 changed Python files compile and match the tested
+GPU checkout. Ten files pass Ruff; the worker and configuration test retain
+their six and two baseline diagnostics. Eleven files format cleanly; the worker
+retains its pre-existing class blank line. The original checkout's staged-index
+digest is unchanged.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -2118,10 +2179,10 @@ and scope limits are recorded in `experiments/capture-real-tp-pp.json`.
    checkpoints, complete exporter compatibility and artifact/quality validation.
 3. Extend P9's real TP2/PP1 and TP1/PP2 Qwen3 capture validation to combined
    TP2/PP2, replicated heads, distributed cancellation/backpressure and additional
-   model identities. Complete distributed and non-static speculative collection,
+   model identities. Complete pipeline and non-static speculative collection,
    PD transfer and cross-node RDMA. Ordinary AR now uses the distributed serving
-   path; the remaining capability gates do not constitute implementation of
-   those paths.
+   path, and static DSpark also supports TP; the remaining capability gates do
+   not constitute implementation of those paths.
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to
    representative workloads and SLO thresholds, and complete dashboard runtime
    acceptance and rollout/rollback checks. Per-model numerical/runtime validation and

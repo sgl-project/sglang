@@ -173,8 +173,8 @@ def validate_capture_server_args(args) -> None:
         or args.attn_cp_size != 1
         or args.dcp_size != 1
         or args.enable_dp_attention,
-        "distributed speculative capture": args.speculative_algorithm is not None
-        and (args.tp_size != 1 or args.pp_size != 1),
+        "pipeline speculative capture": args.speculative_algorithm is not None
+        and args.pp_size != 1,
         "speculative algorithm": args.speculative_algorithm not in (None, "DSPARK"),
         "non-static speculative verify": args.speculative_algorithm == "DSPARK"
         and read_ragged_verify_mode() is not RaggedVerifyMode.STATIC,

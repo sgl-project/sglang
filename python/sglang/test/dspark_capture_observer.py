@@ -6,6 +6,10 @@ from pathlib import Path
 
 import torch
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.training_capture.coordinator import CaptureCoordinator
 
@@ -31,7 +35,11 @@ def observe(
         if draft_path
         else Path(coordinator.config.journal_directory).parent
     ) / "capture-reference"
-    root.mkdir(exist_ok=True)
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size > 1:
+        root = root / f"tp{tp_rank}"
+    root.mkdir(parents=True, exist_ok=True)
     if width is not None:
         _verify_frames[id(coordinator)] = []
     offset = 0
@@ -85,13 +93,17 @@ def observe(
                 "result_lag": end - len(req.origin_input_ids) - len(req.output_ids),
                 "batch_size": len(batch.reqs),
                 "cuda_graph": can_run_cuda_graph,
+                "tp_rank": tp_rank,
+                "tp_size": tp_size,
                 "tokens": tokens,
                 "kv_start": start,
                 "kv_slots": slots.long().cpu(),
                 "kv": {
                     name: buffer[slots.long()].cpu()
                     for name, buffer in coordinator.exporter.buffers.items()
-                },
+                }
+                if coordinator.exporter is not None
+                else {},
                 "predictions": predictions,
                 "logits": logits[:, : coordinator.teacher.vocab_size].float().cpu(),
             },
@@ -160,6 +172,8 @@ def check_capture_snapshot(
                 and item["tokens"][:prediction] == tokens[:prediction]
             ):
                 teacher[prediction] = item["logits"][row]
+        if not item["kv"]:
+            continue
         for row in range(next(iter(item["kv"].values())).shape[0]):
             position = item["kv_start"] + row
             if (
@@ -168,9 +182,18 @@ def check_capture_snapshot(
             ):
                 # Prefix dedup may remap a row after it has been copied. The
                 # sample retains its first observation, just like draft context.
-                kv.setdefault(
-                    position, {name: value[row] for name, value in item["kv"].items()}
-                )
+                by_name = kv.setdefault(position, {})
+                for name, value in item["kv"].items():
+                    layer = next(
+                        layer
+                        for layer in manifest.kv.layers
+                        if layer.layer_id == int(name.split(".")[1])
+                    )
+                    rank, size = item.get("tp_rank", 0), item.get("tp_size", 1)
+                    first = rank * layer.num_kv_heads // size
+                    by_head = by_name.setdefault(name, {})
+                    for head in range(value.shape[1]):
+                        by_head.setdefault(first + head, value[row, head])
     test.assertEqual(manifest.provenance.capture_mode, capture_mode)
     test.assertEqual(tensors["position_ids"].tolist(), list(range(len(tokens))))
     test.assertEqual(
@@ -195,5 +218,12 @@ def check_capture_snapshot(
         [int(position in kv) for position in range(len(tokens))],
     )
     for name in (name for name in tensors if name.startswith("target_")):
-        expected = torch.stack([kv[position][name] for position in sorted(kv)])
+        expected = torch.stack(
+            [
+                torch.stack(
+                    [kv[position][name][head] for head in range(tensors[name].shape[1])]
+                )
+                for position in sorted(kv)
+            ]
+        )
         torch.testing.assert_close(tensors[name], expected, rtol=0, atol=0)

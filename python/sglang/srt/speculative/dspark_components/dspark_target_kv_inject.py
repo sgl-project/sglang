@@ -10,11 +10,15 @@ from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
     validate_target_kv_draft_contract,
 )
 from sglang.srt.training_capture.identity import (
+    bind_rank_target_contract,
     bind_target_contract,
     local_safetensors_digest,
 )
-from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.protocol import ContractError
+from sglang.srt.training_capture.startup import (
+    coordinate_policy_startup,
+    coordinate_target_startup,
+)
 
 
 class TargetKVSourceRange(msgspec.Struct, frozen=True, kw_only=True):
@@ -38,6 +42,8 @@ class TargetKVInjector:
         self.epoch = 0
         self.projected_token_ct = 0
         self.invalidation_ct = 0
+        self.tp_group = None
+        self.head_replicas = {}
 
     @property
     def weight_version(self):
@@ -50,41 +56,89 @@ class TargetKVInjector:
     def bind(self, *, tokenizer_path, prediction_count, mask_token_id):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
-        pool = self.draft_model_runner.token_to_kv_pool
-        if (
-            not isinstance(pool, MHATokenToKVPool)
-            or pool.is_quantized_kv_cache
-            or pool.use_hnd
-        ):
-            raise ContractError(
-                "target-KV DSpark requires an unquantized NHD draft pool"
-            )
         contract = self.draft_model.target_kv_contract
-        teacher, kv = bind_target_contract(
-            model_id=contract.teacher.model_id,
-            selected_layer_ids=contract.kv.selected_layer_ids,
-            storage_chunk_tokens=contract.kv.storage_chunk_tokens,
-            model=self.model_runner.model,
-            model_config=self.model_runner.model_config,
-            tokenizer_path=tokenizer_path,
-            pool=self.model_runner.token_to_kv_pool,
-            expected_weights_revision=contract.teacher.weights_revision,
-            expected_tokenizer_revision=contract.teacher.tokenizer_revision,
-        )
-        validate_target_kv_draft_contract(
-            target=teacher,
-            draft=contract,
-            pool_codec=kv,
-            target_hidden_size=self.model_runner.model_config.hf_text_config.hidden_size,
-            prediction_count=prediction_count,
-            mask_token_id=mask_token_id,
-        )
-        self.sources = SelectedLayerKVExporter.from_pool(
-            kv, self.model_runner.token_to_kv_pool
-        ).buffers
-        self.weights_digest = local_safetensors_digest(
-            Path(self.draft_model_runner.model_config.model_path)
-        )
+        group = self.model_runner.tp_group
+        self.tp_group = group if group.world_size > 1 else None
+        target_args = {
+            "model_id": contract.teacher.model_id,
+            "selected_layer_ids": contract.kv.selected_layer_ids,
+            "storage_chunk_tokens": contract.kv.storage_chunk_tokens,
+            "model": self.model_runner.model,
+            "model_config": self.model_runner.model_config,
+            "tokenizer_path": tokenizer_path,
+            "pool": self.model_runner.token_to_kv_pool,
+            "expected_weights_revision": contract.teacher.weights_revision,
+            "expected_tokenizer_revision": contract.teacher.tokenizer_revision,
+        }
+        if self.tp_group is None:
+            teacher, kv = bind_target_contract(**target_args)
+        else:
+            teacher, kv, _ = coordinate_target_startup(
+                group=group.cpu_group,
+                build_local=lambda: bind_rank_target_contract(
+                    **target_args,
+                    tp_rank=group.rank_in_group,
+                    tp_size=group.world_size,
+                    pp_rank=0,
+                    pp_size=1,
+                ),
+                tp_size=group.world_size,
+                pp_size=1,
+            )
+
+        def validate_draft():
+            pool = self.draft_model_runner.token_to_kv_pool
+            if (
+                not isinstance(pool, MHATokenToKVPool)
+                or pool.is_quantized_kv_cache
+                or pool.use_hnd
+            ):
+                raise ContractError(
+                    "target-KV DSpark requires an unquantized NHD draft pool"
+                )
+            validate_target_kv_draft_contract(
+                target=teacher,
+                draft=contract,
+                pool_codec=kv,
+                target_hidden_size=self.model_runner.model_config.hf_text_config.hidden_size,
+                prediction_count=prediction_count,
+                mask_token_id=mask_token_id,
+            )
+            self.weights_digest = local_safetensors_digest(
+                Path(self.draft_model_runner.model_config.model_path)
+            )
+            return contract, self.weights_digest
+
+        if self.tp_group is None:
+            validate_draft()
+        else:
+            coordinate_policy_startup(
+                group=group.cpu_group, build_policy=validate_draft
+            )
+        pool = self.model_runner.token_to_kv_pool
+        self.sources = {}
+        for layer in kv.layers:
+            for component, buffer in (
+                ("k", pool.get_key_buffer(layer.layer_id)),
+                ("v", pool.get_value_buffer(layer.layer_id)),
+            ):
+                name = f"target_{component}.{layer.layer_id}"
+                self.sources[name] = buffer
+                self.head_replicas[name] = max(
+                    1, group.world_size // layer.num_kv_heads
+                )
+
+    def _select_target_kv(self, locations):
+        selected = {}
+        for name, buffer in self.sources.items():
+            values = buffer.index_select(0, locations)
+            if self.tp_group is not None:
+                values = self.tp_group.all_gather(values, dim=1)
+                # TP can replicate a logical KV head on adjacent ranks. Keep
+                # the canonical copy before the encoder flattens global heads.
+                values = values[:, :: self.head_replicas[name], :].contiguous()
+            selected[name] = values
+        return selected
 
     def invalidate_projected_context(self, req, *, reason, new_weight_version):
         if not reason or new_weight_version != self.weight_version:
@@ -135,10 +189,7 @@ class TargetKVInjector:
         # came from radix/HiCache and needs its first draft projection.
         for offset in range(0, locations.numel(), 1024):
             chunk_locs = locations[offset : offset + 1024]
-            selected = {
-                name: value.index_select(0, chunk_locs)
-                for name, value in self.sources.items()
-            }
+            selected = self._select_target_kv(chunk_locs)
             self.draft_model.write_target_kv(
                 target_kv=selected,
                 pool=self.draft_model_runner.token_to_kv_pool,

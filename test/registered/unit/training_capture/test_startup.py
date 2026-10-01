@@ -68,6 +68,8 @@ def rank_contract(rank, *, tp_size, pp_size):
 
 
 FAILURES = {
+    "policy_local_error": ("policy", [1]),
+    "policy_disagreement": ("policy_agreement", [0, 1, 2, 3]),
     "binding": ("binding", [1]),
     "record_limit": ("binding", [1]),
     "aggregate_limit": ("allocation", [1]),
@@ -96,7 +98,13 @@ def startup_worker(rank, root, timeout_case):
     scenarios = (
         ["validation_timeout" if timeout_case == "validation" else "timeout"]
         if timeout_case
-        else ["pp", "success"]
+        else [
+            "policy_local_error",
+            "policy_disagreement",
+            "policy_ready",
+            "pp",
+            "success",
+        ]
     )
     if not timeout_case:
         for case in FAILURES:
@@ -191,6 +199,22 @@ def startup_worker(rank, root, timeout_case):
                     os._exit(0)
                 started = time.monotonic()
                 try:
+                    if case.startswith("policy_"):
+
+                        def policy(case=case):
+                            if case == "policy_local_error" and rank == 1:
+                                raise ValueError("draft checkpoint is invalid")
+                            return {
+                                "weights": "other"
+                                if case == "policy_disagreement" and rank == 2
+                                else "common"
+                            }
+
+                        startup.coordinate_policy_startup(
+                            group=dist.group.WORLD,
+                            build_policy=policy,
+                            timeout_seconds=10,
+                        )
                     value = startup.coordinate_target_startup(
                         group=dist.group.WORLD,
                         build_local=build_local,
@@ -255,7 +279,7 @@ class TestCaptureStartup(CustomTestCase):
         for rows in zip(*results, strict=True):
             case = rows[0]["case"]
             with self.subTest(case=case):
-                if case in ("pp", "success"):
+                if case in ("pp", "success", "policy_ready"):
                     self.assertTrue(all(row["phase"] == "ready" for row in rows), rows)
                     self.assertEqual(len({row["digest"] for row in rows}), 1)
                     if case == "success":

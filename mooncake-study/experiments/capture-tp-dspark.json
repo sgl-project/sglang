@@ -1,0 +1,261 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "81f0ee0ceffe9cc79848725b9dacb697d28751db",
+  "feature": "TP target-KV DSpark inference and accepted-path distributed training capture",
+  "environment": {
+    "temporary_job": "job-3a8707e23152-20261001233124",
+    "temporary_node": "node082",
+    "temporary_gpus": [
+      "GPU-c5322113-fc49-be2f-1a56-a6c4300362b1",
+      "GPU-b0540b1d-bb11-fc96-8eda-6079be971e7b"
+    ],
+    "gpu_model": "H100 80GB HBM3",
+    "priority": "low-priority-job",
+    "reclaimable": true,
+    "temporary_job_deleted": true,
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "namespace": "qiji",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang:v0.5.15",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "versions": {
+      "torch": "2.13.0",
+      "sglang-kernel": "0.4.6.post1",
+      "flashinfer-python": "0.6.17",
+      "transformers": "5.12.1",
+      "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+    },
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "draft": "Synthetic BF16 two-layer target-KV draft; not trained.",
+    "store": "Independent TCP Mooncake segment survives serving workers",
+    "catalog": "HTTP TestCaptureCatalog double",
+    "environment_notes": [
+      "Removed stale container-local FlashInfer 0.6.12 cubin/JIT packages to match the shared 0.6.17 venv.",
+      "After tests, process inspection found only PID 1 sleep and the inspection command."
+    ],
+    "temporary_pod_not_found_confirmed": true,
+    "resident_idle_resumed": true
+  },
+  "distributed_command": "'kubectl' 'exec' '-n' 'qiji' 'job-3a8707e23152-20261001233124-master-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' 'timeout' '600' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/test/registered/storage/test_training_capture_distributed.py' '-v' > '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-tp2-dspark-full.log' 2>&1",
+  "source_sha256": {
+    "python/sglang/srt/models/dspark_target_kv.py": "87e00ac0b11c7dc583ef120dcfbadb06ef610b7aa6d3f119116305d1baec969c",
+    "python/sglang/srt/speculative/dspark_components/dspark_target_kv_inject.py": "a6a9dd1cb18e353cca88d206199a4394e2e1f6911628479d2c22d51541fd2b25",
+    "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": "e879d99dc94c9c07998cf227558e3081312debb2e76bd3f1333359485d838598",
+    "python/sglang/srt/training_capture/config.py": "d7cba451d73c5d8996f93a89a743db77b9cbec1ee01afe6292b57e87012bcfea",
+    "python/sglang/srt/training_capture/startup.py": "00d81ee4757ef83347248e419065a81dd8f812837f5589a91fd9b7511e895371",
+    "python/sglang/test/dspark_capture_observer.py": "686931373c86a47b1eccdcb365683be855dc2439a163044e0fddca5edda6db80",
+    "python/sglang/test/dspark_target_kv_server.py": "406c75565f78a87c10a7b6be170ee85173bbde41972c66bfd60f3999480ad859",
+    "python/sglang/test/dspark_target_kv_utils.py": "25dfc181831c048dd4e56f6cd391d2b043ab10b33a34142e3bc38aaad02d0833",
+    "test/registered/storage/test_training_capture_distributed.py": "ba7331100f07e8107a73fc75882f58cb3f8b648352da7808d45c1ccb1a03afda",
+    "test/registered/unit/spec/test_dspark_target_kv.py": "e816b1977d22df2d65e734d23c91ba2c4c7b433fc4cd503bd57d8258a7bdda10",
+    "test/registered/unit/training_capture/test_config.py": "8b431f64c23586dca72f2c691e51df0c8af6e9c8c37c97b12766e74afaf1f055",
+    "test/registered/unit/training_capture/test_startup.py": "408749cf33bbfca9481f5b7d481fe0a96149d9239b7ccf9cbaf6d6d941b7f204"
+  },
+  "gpu_source_hashes_match": true,
+  "jobs": [
+    {
+      "job_id": "01790867859895242717-9390d30bb2bf",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790867874.0452068,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790867859895242717-9390d30bb2bf.log",
+      "log_sha256": "2aec3267fa4953b1499f3fa3df9db3e4a1c3e36c9c004e3327c18c786b909886",
+      "scope": "Pre-fix TP2 global checkpoint loading: both ranks fail packed and split exports; four failing subtests.",
+      "elapsed_seconds": 10.95
+    },
+    {
+      "job_id": "01790868141271251076-735385f18f97",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790868155.609499,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790868141271251076-735385f18f97.log",
+      "log_sha256": "d31a655f09a0b0aa668cccde9dcab5e697f7b50a635a3251f81c44f629be06a1",
+      "tests_run": 21,
+      "subtests_passed": 46,
+      "elapsed_seconds": 11.06,
+      "scope": "Post-fix full target-KV unit file before canonical-gather derived property was added."
+    },
+    {
+      "job_id": "01790868141597711558-be946a28a576",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790868167.9009974,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790868141597711558-be946a28a576.log",
+      "log_sha256": "9faac9235de65baf6fef04c74ec7b09cf499d52be71e8e64548aa2f943b2b27f",
+      "tests_run": 7,
+      "subtests_passed": 32,
+      "elapsed_seconds": 9.81
+    },
+    {
+      "job_id": "01790868788975402820-88912d83450b",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790868803.162414,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790868788975402820-88912d83450b.log",
+      "log_sha256": "d18b8133683f98751abfb7fba00ae0beb38b2d6c79431fd6a74edba8f547df64",
+      "tests_run": 22,
+      "subtests_passed": 48,
+      "elapsed_seconds": 11.12
+    },
+    {
+      "job_id": "01790868789299703264-84981a4231c7",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790868860.2831335,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790868789299703264-84981a4231c7.log",
+      "log_sha256": "c252c3931811b545721325699d4dd2d9fe96eddfd53092b57cd75e36551f4076",
+      "tests_run": 4,
+      "subtests_passed": 32,
+      "elapsed_seconds": 54.84
+    },
+    {
+      "job_id": "01790868789695620722-b4014e08dafd",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790868888.360227,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790868789695620722-b4014e08dafd.log",
+      "log_sha256": "739c705695dfbe6af56bc3f542cf95ab6e580b0402d10d3b7a1b6f9e778ba572",
+      "tests_run": 4,
+      "subtests_passed": 13,
+      "elapsed_seconds": 25.82
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-tp2-dspark-initial.log",
+      "returncode": 1,
+      "tests_run": 1,
+      "elapsed_seconds": 159.012,
+      "scope": "Requests completed; fixture incorrectly expected one management state per TP rank instead of per DP group.",
+      "log_sha256": "a931756fd08b4edb3163684c8f46a9a97ede5c7313d7dba06b698af61928432b"
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-tp2-dspark-batch.log",
+      "returncode": 0,
+      "tests_run": 1,
+      "elapsed_seconds": 116.199,
+      "scope": "Eager and graph/overlap; ten DSpark samples including mixed acceptance batches, exact Store readback after producer exit.",
+      "log_sha256": "f5e5d327361245ff3c3cd02f229877f8a7e85d7bcca3ab4cb2ebfb13ed5b62ee"
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-tp2-dspark-full.log",
+      "returncode": 0,
+      "tests_run": 3,
+      "elapsed_seconds": 257.098,
+      "scope": "Complete distributed file: AR TP2, AR PP2, TP2 static target-KV DSpark. Eight AR validation samples, three AR draft seeds, ten DSpark validation samples.",
+      "log_sha256": "f3956aca614cdcc4852aad3395dcfab3566d222db28c24cb4496adb847699c5f"
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-tp2-unit-kv-final.log",
+      "returncode": 0,
+      "tests_run": 22,
+      "elapsed_seconds": 12.09,
+      "scope": "Final formatted target-KV tests: 48 subtests.",
+      "log_sha256": "45855e08fdd980ceef7de74d8302eda6dc4dedeec551bfe918a55db34fe350fb"
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-tp2-unit-startup-final.log",
+      "returncode": 0,
+      "tests_run": 4,
+      "elapsed_seconds": 56.49,
+      "scope": "Final startup tests: 32 subtests.",
+      "log_sha256": "5fb0f7163886257db2758edcbdf6335a113e72dce4924f3073f2d630a8d962ff"
+    },
+    {
+      "job_id": "01790869200834994945-4f27d5be0d90",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790869680.8117578,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790869200834994945-4f27d5be0d90.log",
+      "log_sha256": "6a1f7678f98d58e6e30e3095dbe38afbb6383f83c749cf57977898a87ddd8c42",
+      "tests_run": 1,
+      "elapsed_seconds": 468.033,
+      "command": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--timeout",
+        "700",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "-v"
+      ],
+      "scope": "Complete single-H100 runtime regression: AR/static DSpark, graph/overlap, pressure, cache lifecycle, adaptive admission and latency protection."
+    }
+  ],
+  "validation": {
+    "topology": {
+      "tp": 2,
+      "pp": 1,
+      "dp": 1
+    },
+    "selected_layers": [
+      0,
+      14,
+      27
+    ],
+    "prompt_tokens": 160,
+    "chunked_prefill_tokens": 128,
+    "single_response_lengths": [
+      1,
+      8,
+      9
+    ],
+    "batched_response_lengths": [
+      8,
+      9
+    ],
+    "eager_samples": 5,
+    "graph_overlap_samples": 5,
+    "eager_verify_forwards": 14,
+    "graph_verify_forwards": 18,
+    "overlap_forwards": 23,
+    "capture_checks": [
+      "Exact global KV from independent rank-local source observations after producer exit",
+      "Exact raw global top-128 scores and vocab IDs before sampling bias",
+      "Teacher positions and CE loss masks match final response tokens",
+      "Rejected candidates and unforwarded tokens excluded using accepted-path and KV-valid semantics",
+      "Both ranks' projected draft KV match independent encoder/projection reconstruction",
+      "Generated outputs equal ordinary TP2 AR baseline; mixed batch has unequal accepted lengths"
+    ],
+    "logsumexp_rtol": 0.000001,
+    "logsumexp_atol": 0.000001,
+    "unit_properties": [
+      "Global checkpoint geometry with TP2 KV replication, packed and split exports",
+      "Canonical global head order with poisoned noncanonical replicas",
+      "Rank-local policy exceptions and artifact disagreement fail collectively before later startup phases"
+    ]
+  },
+  "checks": {
+    "python_files_compile": 12,
+    "python_files_formatted": 11,
+    "ruff_clean_files": 10,
+    "baseline_diagnostics": "dspark_worker_v2.py retains its existing class blank line and six Ruff diagnostics; test_config.py retains two C408 diagnostics.",
+    "root_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "limits": [
+    "Real-model evidence covers Qwen3-0.6B, TP2 and dense BF16 NHD pools.",
+    "Replicated KV heads are covered by unit tests, not real inference in this run.",
+    "PP speculative, non-static verify, DP/context parallelism and PD remain gated.",
+    "TCP only: no multi-node/RDMA result.",
+    "Observers synchronize work; numerical validation is not latency or throughput acceptance.",
+    "Production-exported/trained draft quality, production Catalog/consumer and remaining performance/SLO gates are unfinished."
+  ]
+}
