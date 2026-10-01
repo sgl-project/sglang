@@ -443,5 +443,101 @@ def bad(self, pool, fb, layer):
         self.assertEqual(census.unmarked(), ["m.py:16", "m.py:18", "m.py:19"])
 
 
+def _only_raises(fn) -> bool:
+    body = [
+        s
+        for s in fn.body
+        if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+    ]
+    return bool(body) and all(isinstance(s, ast.Raise) for s in body)
+
+
+def _door_takes_a_write_loc(fn) -> bool:
+    """A pool's write door unwraps its loc argument, forwards it untouched to
+    another write door, takes only `*args`, or only raises."""
+    params = [a.arg for a in fn.args.posonlyargs + fn.args.args]
+    if _only_raises(fn):
+        return True
+    if len(params) < 3:  # (self, layer, loc_info, ...)
+        return fn.args.vararg is not None
+    loc = params[2]
+    reassigned = any(
+        _is_name(t, loc)
+        for node in ast.walk(fn)
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+    )
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _callee_name(node)
+        if name == "unwrap_write_loc" and node.args and _is_name(node.args[0], loc):
+            return True
+        if name in _WRITE_DOORS and not reassigned:
+            if _is_name(_loc_argument(node), loc):
+                return True
+    return False
+
+
+def _pool_doors_taking_a_bare_loc(sources):
+    doors, bad = 0, []
+    for where, src in sources.items():
+        for cls in ast.walk(ast.parse(src)):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for fn in cls.body:
+                if isinstance(fn, ast.FunctionDef) and fn.name in _WRITE_DOORS:
+                    doors += 1
+                    if not _door_takes_a_write_loc(fn):
+                        bad.append(f"{where}:{cls.name}.{fn.name}")
+    return doors, bad
+
+
+class TestEveryPoolDoorTakesAWriteLoc(unittest.TestCase):
+    """Producers now hand every pool a `KVWriteLoc`, static pools included, so
+    an override that still indexes with its loc argument breaks on the first
+    write."""
+
+    def test_every_pool_write_door_unwraps_or_forwards_its_loc(self):
+        doors, bad = _pool_doors_taking_a_bare_loc(
+            {
+                str(f.relative_to(_SRT)): f.read_text()
+                for f in sorted(_SRT.rglob("*.py"))
+            }
+        )
+        self.assertGreater(doors, 20)  # the census saw the doors
+        self.assertEqual(bad, [])
+
+    def test_the_census_tells_unwrapping_from_bare(self):
+        src = """
+class Good(KVCache):
+    def set_kv_buffer(self, layer, loc_info, k, v):
+        loc, _, _ = unwrap_write_loc(loc_info)
+        self.buf[loc] = k
+
+    def set_mla_kv_buffer(self, layer, loc_info, k, v):
+        self.inner.set_mla_kv_buffer(layer, loc_info, k, v)
+
+
+class PassThrough(KVCache):
+    def set_kv_buffer(self, *args, **kwargs):
+        self.inner.set_kv_buffer(*args, **kwargs)
+
+
+class Bare(KVCache):
+    def set_kv_buffer(self, layer, loc, k, v):
+        self.buf[loc] = k
+
+    def set_mla_kv_buffer(self, layer, loc, k, v):
+        loc = self.translate(loc)
+        super().set_mla_kv_buffer(layer, loc, k, v)
+"""
+        doors, bad = _pool_doors_taking_a_bare_loc({"m.py": src})
+        self.assertEqual(doors, 5)
+        self.assertEqual(
+            bad, ["m.py:Bare.set_kv_buffer", "m.py:Bare.set_mla_kv_buffer"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
