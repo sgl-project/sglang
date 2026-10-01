@@ -43,11 +43,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
 from sglang.srt.layers.moe.topk import (
-    BypassedTopKOutput,
-    StandardTopKOutput,
-    TopKConfig,
     TopKOutput,
-    TopKOutputChecker,
 )
 from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
@@ -67,10 +63,6 @@ from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import (
     get_exec,
@@ -87,7 +79,6 @@ from sglang.srt.utils import (
     is_npu,
     round_up,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1528,36 +1519,9 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
-        if is_in_tc_piecewise_cuda_graph():
-            if TopKOutputChecker.format_is_standard(topk_output):
-                return moe_forward_piecewise_cuda_graph_impl(
-                    hidden_states,
-                    topk_output.topk_weights,
-                    topk_output.topk_ids,
-                    topk_output.router_logits,
-                    self.layer_id,
-                )
-            elif TopKOutputChecker.format_is_bypassed(topk_output):
-                return fused_moe_bypassed_piecewise_cuda_graph_impl(
-                    hidden_states,
-                    topk_output.router_logits,
-                    topk_output.topk_config.top_k,
-                    topk_output.topk_config.topk_group,
-                    topk_output.topk_config.num_expert_group,
-                    topk_output.topk_config.correction_bias,
-                    topk_output.topk_config.renormalize,
-                    self.layer_id,
-                    topk_output.topk_config.allow_routed_experts_capture,
-                )
-            else:
-                # Make sure there is torch lib op registration for the whole moe layer
-                return self.forward_impl(
-                    hidden_states, topk_output, pre_quant_input=pre_quant_input
-                )
-        else:
-            return self.forward_impl(
-                hidden_states, topk_output, pre_quant_input=pre_quant_input
-            )
+        return self.forward_impl(
+            hidden_states, topk_output, pre_quant_input=pre_quant_input
+        )
 
     def forward_impl(
         self,
@@ -1809,49 +1773,3 @@ class FusedMoE(torch.nn.Module):
                             stacked = torch.stack(weight_list, dim=0)
                             param.materialize(stacked.shape, dtype=stacked.dtype)
                             param.data.copy_(stacked)
-
-
-@register_custom_op(out_shape="hidden_states")
-def moe_forward_piecewise_cuda_graph_impl(
-    hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    router_logits: torch.Tensor,
-    layer_id: int,
-) -> torch.Tensor:
-    # only standard topk output is supported for piecewise cuda graph
-    topk_output = StandardTopKOutput(
-        topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
-    )
-    forward_context = get_tc_piecewise_forward_context()
-    moe_layer = forward_context.moe_layers[layer_id]
-    return moe_layer.forward_impl(hidden_states, topk_output)
-
-
-@register_custom_op(out_shape="hidden_states")
-def fused_moe_bypassed_piecewise_cuda_graph_impl(
-    hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    top_k: int,
-    topk_group: Optional[int],
-    num_expert_group: Optional[int],
-    correction_bias: Optional[torch.Tensor],
-    renormalize: bool,
-    layer_id: int,
-    allow_routed_experts_capture: bool,
-) -> torch.Tensor:
-    topk_output = BypassedTopKOutput(
-        hidden_states=hidden_states,
-        router_logits=router_logits,
-        topk_config=TopKConfig(
-            top_k=top_k,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            correction_bias=correction_bias,
-            renormalize=renormalize,
-            allow_routed_experts_capture=allow_routed_experts_capture,
-        ),
-    )
-    forward_context = get_tc_piecewise_forward_context()
-    moe_layer = forward_context.moe_layers[layer_id]
-    return moe_layer.forward_impl(hidden_states, topk_output)

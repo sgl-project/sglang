@@ -22,7 +22,6 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.layers.activation import ReLU2
@@ -67,10 +66,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -86,7 +81,6 @@ from sglang.srt.utils import (
     is_cuda,
     make_layers,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
@@ -529,17 +523,39 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph():
             output = torch.empty_like(hidden_states)
-            breakable_nemotron_mamba2_with_output(
-                hidden_states, output, self.layer_id, skip_reduce
-            )
-            return output
-        if is_in_tc_piecewise_cuda_graph():
-            output = torch.empty_like(hidden_states)
-            nemotron_mamba2_with_output(
-                hidden_states, output, self.layer_id, skip_reduce
-            )
+            self._eager_mamba(hidden_states, output, forward_batch, skip_reduce)
             return output
         return self._forward_mamba(hidden_states, forward_batch)
+
+    @eager_on_graph
+    def _eager_mamba(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        forward_batch: ForwardBatch,
+        fuse_mlp_allreduce: bool = False,
+    ) -> None:
+        """Run Mamba2 on live tokens between graph segments."""
+        # In graph mode, hidden_states may be padded to the
+        # captured graph size. Slice to actual token count for Mamba forward.
+        attn_backend = get_attn_backend()
+        metadata = attn_backend.linear_attn_backend.forward_metadata
+        num_actual_tokens = metadata.num_prefill_tokens + (
+            metadata.num_decodes * metadata.draft_token_num
+            if metadata.is_target_verify
+            else metadata.num_decodes
+        )
+        if hidden_states.shape[0] != num_actual_tokens:
+            hidden_states = hidden_states[:num_actual_tokens]
+
+        # Replay runs outside the caller's scope; restore its collective policy.
+        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
+            ret = self._forward_mamba(hidden_states, forward_batch)
+
+        # Copy result back; output may be larger (padded) so only fill actual tokens
+        output[:num_actual_tokens].view(ret.shape).copy_(ret)
+        if output.shape[0] != num_actual_tokens:
+            output[num_actual_tokens:].zero_()
 
 
 class NemotronHAttention(nn.Module):
@@ -1144,47 +1160,3 @@ class NemotronHPuzzleForCausalLM(NemotronHForCausalLM):
 
 
 EntryClass = [NemotronHForCausalLM, NemotronHPuzzleForCausalLM]
-
-
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def nemotron_mamba2_with_output(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-    fuse_mlp_allreduce: bool = False,
-) -> None:
-    """Split op for Mamba2 forward in piecewise CUDA graph mode."""
-    context = get_tc_piecewise_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    mamba_layer = attention_layers[layer_id]
-
-    # In piecewise CUDA graph mode, hidden_states may be padded to the
-    # captured graph size. Slice to actual token count for Mamba forward.
-    attn_backend = get_attn_backend()
-    metadata = attn_backend.linear_attn_backend.forward_metadata
-    num_actual_tokens = metadata.num_prefill_tokens + (
-        metadata.num_decodes * metadata.draft_token_num
-        if metadata.is_target_verify
-        else metadata.num_decodes
-    )
-    if hidden_states.shape[0] != num_actual_tokens:
-        hidden_states = hidden_states[:num_actual_tokens]
-
-    # This function is an opaque custom op under torch.compile. The caller's
-    # ForwardFlags scope is Python control-plane state and is no longer active
-    # when the compiled graph invokes this implementation. Carry the scalar
-    # across the graph boundary and republish it for RowParallelLinear.
-    with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
-        ret = mamba_layer._forward_mamba(hidden_states, forward_batch)
-
-    # Copy result back; output may be larger (padded) so only fill actual tokens
-    output[:num_actual_tokens].view(ret.shape).copy_(ret)
-    if output.shape[0] != num_actual_tokens:
-        output[num_actual_tokens:].zero_()
-
-
-breakable_nemotron_mamba2_with_output = eager_on_graph(True)(
-    nemotron_mamba2_with_output
-)

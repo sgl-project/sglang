@@ -19,7 +19,6 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
-    moe_forward_piecewise_cuda_graph_impl,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
@@ -38,9 +37,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
@@ -179,7 +175,20 @@ class DeepEPMoE(FusedMoE):
                 f"DeepEP {self.deepep_mode} mode requires deep_gemm"
             )
 
-    def _a2a_forward_with_output_impl(
+    def _a2a_forward_capture_stub(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        # Capture pass only: record the buffer address, skip the
+        # rank-coupled a2a. Warmup and replay run the real body.
+        output.zero_()
+
+    @eager_on_graph(capture_stub=_a2a_forward_capture_stub)
+    def _eager_a2a_forward(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -200,22 +209,6 @@ class DeepEPMoE(FusedMoE):
         finally:
             set_is_extend_in_batch(saved_is_extend_in_batch)
 
-    def _a2a_forward_capture_stub(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        router_logits: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        # Capture pass only: record the buffer address, skip the
-        # rank-coupled a2a. Warmup and replay run the real body.
-        output.zero_()
-
-    a2a_forward_with_output = eager_on_graph(
-        True, capture_stub=_a2a_forward_capture_stub
-    )(_a2a_forward_with_output_impl)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -227,7 +220,7 @@ class DeepEPMoE(FusedMoE):
                 "Only standard topk output is supported for breakable cuda graph"
             )
             output = torch.empty_like(hidden_states)
-            self.a2a_forward_with_output(
+            self._eager_a2a_forward(
                 hidden_states,
                 topk_output.topk_weights,
                 topk_output.topk_ids,
@@ -235,19 +228,7 @@ class DeepEPMoE(FusedMoE):
                 output,
             )
             return output
-        if is_in_tc_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(topk_output), (
-                "Only standard topk output is supported for piecewise cuda graph"
-            )
-            return moe_forward_piecewise_cuda_graph_impl(
-                hidden_states,
-                topk_output.topk_weights,
-                topk_output.topk_ids,
-                topk_output.router_logits,
-                self.layer_id,
-            )
-        else:
-            return self.forward_impl(hidden_states, topk_output)
+        return self.forward_impl(hidden_states, topk_output)
 
     def forward_impl(
         self,
