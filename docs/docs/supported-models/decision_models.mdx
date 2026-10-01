@@ -270,20 +270,20 @@ curl -s http://127.0.0.1:30000/v1/decisions -H "Content-Type: application/json" 
 }'
 ```
 
-Images go in `images`, up to 8 per request, each a `data:image/...;base64,` URL or plain base64 bytes. They are placed, in order, before the state and schema, as the model was trained:
+Images go in `images`, up to 8 per request. Each is an upload object `{"type": "image/png", "data": "<base64>"}` as the official service takes it, a `data:image/...;base64,` URL, or plain base64 bytes. JPEG, PNG, WebP, and static GIF are accepted, at most 12 MiB and 16 million pixels each and 32 MiB combined. Each image is decoded upright, by its EXIF orientation, to RGB, and placed, in order, before the state and schema, as the model was trained:
 
 ```bash Command
 IMAGE=$(base64 -w0 boxes.png)
 curl -s http://127.0.0.1:30000/v1/jev -H "Content-Type: application/json" -d '{
   "state": {"task": "Inspect the picture."},
   "questions": {"red_side": {"type": "choice", "instructions": "Which side of the picture is red?", "criteria": {"left": "The left half", "right": "The right half"}}},
-  "images": ["data:image/png;base64,'"$IMAGE"'"]
+  "images": [{"type": "image/png", "data": "'"$IMAGE"'"}]
 }'
 ```
 
-Each answer has `probabilities`, `decision`, and `confidence`, plus `choice`, `noul` (the probability of yes), or `score` with its `legend`. Confidence uses TypeSafe's formulas for choice and score and is the top probability for noul. `temperature` applies the official calibration, `softmax(log p / T)`, without changing `decision`; the published values are 2.747761 (0.8B), 2.100509 (2B), and 1.992418 (4B). `model` may name the served model, `jev-latest`, or `jev-preview`, and every response carries `x-typesafe-request-id`.
+Each answer has `probabilities`, `decision`, and `confidence`, plus `choice`, `noul` (the probability of yes), or `score` with its `legend`. Confidence uses TypeSafe's formulas for choice and score and is the top probability for noul. `temperature` applies the official calibration, `softmax(log p / T)`, without changing `decision`; a temperature so extreme that rounding would change a decision is a 422; the published values are 2.747761 (0.8B), 2.100509 (2B), and 1.992418 (4B). `model` may name the served model, `jev-latest`, or `jev-preview`, and every response carries `x-typesafe-request-id`.
 
-Limits: 1 to 16 questions, and at most 62 options or levels per question for Intern-Decision, one per answer symbol. Invalid requests return 422 with the field location, including text that contains `<decision>`, images that are not base64 image data, and, when images are attached, text that contains an image placeholder such as `<image>`. The route refuses prompts longer than `--chunked-prefill-size` after the images are expanded, `--chat-template`, `--allow-auto-truncate`, speculative decoding, `--enable-mis`, and `--dllm-algorithm`.
+Limits: 1 to 16 questions, and at most 62 options or levels per question for Intern-Decision, one per answer symbol. Invalid requests return 422 with the field location, including text that contains `<decision>`, images that are not base64 image data or exceed the limits, and, when images are attached, text that contains an image placeholder such as `<image>`. The route refuses prompts longer than `--chunked-prefill-size` after the images are expanded, `--chat-template`, `--allow-auto-truncate`, speculative decoding, `--enable-mis`, and `--dllm-algorithm`.
 
 ## Build decisions without `/v1/decisions`
 

@@ -28,5 +28,14 @@ class TypesafeRequestIdMiddleware:
         await self.app(scope, receive, send_with_request_id)
 
 
+def install_typesafe_request_id(app) -> None:
+    """Tag responses outside every middleware, so auth rejections and unhandled 500s carry the id too."""
+    build_middleware_stack = app.build_middleware_stack
+    # Starlette builds the stack on the first call, after all middleware is added.
+    app.build_middleware_stack = lambda: TypesafeRequestIdMiddleware(
+        build_middleware_stack()
+    )
+
+
 def _is_decision_route(scope) -> bool:
     return scope["path"].removeprefix(scope.get("root_path", "")) in DECISION_ROUTES

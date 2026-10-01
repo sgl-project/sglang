@@ -1,23 +1,20 @@
 """Jev (TypeSafe System One) request and response models, served for decision model checkpoints."""
 
-import binascii
-import io
 import math
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
-import pybase64
-from PIL import Image, UnidentifiedImageError
 from pydantic import (
-    AfterValidator,
     BaseModel,
     ConfigDict,
     Discriminator,
     Field,
+    PlainValidator,
     Tag,
     field_validator,
 )
 
 from sglang.srt.entrypoints.openai.protocol import DecisionRequest
+from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 
 MAX_QUESTIONS = 16
 MAX_IMAGES = 8
@@ -69,30 +66,24 @@ JevQuestion = Annotated[
 ]
 
 
-def _image_data_url(value: str) -> str:
-    """A data URL of the decoded image; paths and remote URLs are never loaded."""
-    payload = value
-    if value.startswith("data:"):
-        header, _, payload = value.partition(",")
-        if not header.startswith("data:image/") or not header.endswith(";base64"):
-            raise ValueError("an image data URL must be data:image/<type>;base64,...")
-    try:
-        data = pybase64.b64decode(payload, validate=True)
-        Image.open(io.BytesIO(data)).verify()
-    except (binascii.Error, ValueError, UnidentifiedImageError, OSError) as e:
-        raise ValueError(f"not base64 image data: {e}") from e
-    return "data:image/*;base64," + payload
+class JevImageUpload(BaseModel):
+    """The upload object of the official service; a data URL in data overrides type."""
+
+    type: str = ""
+    data: str
 
 
-JevImage = Annotated[str, AfterValidator(_image_data_url)]
+# Base64 or a base64 data URL; paths and remote URLs are never loaded.
+JevImage = Union[JevImageUpload, str]
 
 
 class JevRequest(BaseModel):
     state: Any
     questions: Dict[str, JevQuestion] = Field(min_length=1, max_length=MAX_QUESTIONS)
-    # Base64 image bytes or data URLs, in prompt order.
+    # In prompt order; decoded and normalized only after the server refusals pass.
     images: Optional[List[JevImage]] = Field(default=None, max_length=MAX_IMAGES)
-    # Divides the candidate logits, softmax(log p / T); argmax is unchanged.
+    # Divides the candidate logits, softmax(log p / T); a value whose rounding would
+    # change an argmax is refused.
     temperature: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     thinking: Optional[Dict[str, Any]] = None
     model: Optional[str] = None
@@ -156,4 +147,18 @@ DecisionsRouteRequest = Annotated[
         Annotated[JevRequest, Tag("jev")],
     ],
     Discriminator(_decisions_body_kind),
+]
+
+
+def _validated_by_route(body: Any) -> Any:
+    return body
+
+
+# The served checkpoint picks the shape, so the route validates; the schema documents both.
+SystemOneRouteRequest = Annotated[
+    Any,
+    PlainValidator(
+        _validated_by_route,
+        json_schema_input_type=Union[SystemOneRequest, JevRequest],
+    ),
 ]

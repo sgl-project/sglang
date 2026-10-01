@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from http import HTTPStatus
 from typing import Callable, Dict, List, Optional, Tuple
@@ -14,6 +15,7 @@ from sglang.srt.entrypoints.decision.families.base import (
     DecisionInputError,
     DecisionPrompt,
 )
+from sglang.srt.entrypoints.decision.images import normalize_images
 from sglang.srt.entrypoints.decision.protocol import (
     JevAnswer,
     JevCalibration,
@@ -60,6 +62,10 @@ class TrainedDecisions(OpenAIServingBase):
                 status_code=HTTPStatus.NOT_FOUND.value,
             )
         try:
+            if request.images:
+                # Decoding up to 32 MiB of images would stall the event loop.
+                images = await asyncio.to_thread(normalize_images, request.images)
+                request = request.model_copy(update={"images": images})
             self.family.validate(request)
         except DecisionInputError as e:
             return _unprocessable(e)
@@ -116,6 +122,12 @@ class TrainedDecisions(OpenAIServingBase):
             temperature=temperature,
             request=raw_request,
         )
+        if temperature != 1.0:
+            error = _calibration_error(
+                prompt.fields, result.token_logprobs, result.scores
+            )
+            if error is not None:
+                return _unprocessable(error)
         answers = {
             field.name: build_answer(
                 kind=request.questions[field.name].type,
@@ -151,6 +163,33 @@ def _unprocessable(error: DecisionInputError) -> ORJSONResponse:
     )
 
 
+def _calibration_error(fields, token_logprobs, scaled) -> Optional[DecisionInputError]:
+    """Temperature scaling preserves the argmax in exact arithmetic; refuse when rounding breaks that."""
+    for field, logprobs, probabilities in zip(fields, token_logprobs, scaled):
+        labels = [label for label, _ in field.options]
+        if _decide(labels, _uncalibrated(logprobs)) != _decide(labels, probabilities):
+            return DecisionInputError(
+                f"the temperature changes the decision of {field.name!r} through "
+                "floating-point rounding",
+                ("body", "temperature"),
+            )
+    return None
+
+
+def _uncalibrated(logprobs: List[float]) -> List[float]:
+    # Term for term the temperature-1 softmax of score_readouts.
+    maximum = max(logprobs)
+    weights = [math.exp(logprob - maximum) for logprob in logprobs]
+    total = sum(weights)
+    return [weight / total for weight in weights]
+
+
+def _decide(labels: List[str], probabilities: List[float]) -> str:
+    by_label = dict(zip(labels, probabilities))
+    # Ties go to the smaller label, as in the official argmax.
+    return min(labels, key=lambda label: (-by_label[label], label))
+
+
 def build_answer(
     kind: str, options: List[Tuple[str, str]], probabilities: List[float]
 ) -> JevAnswer:
@@ -158,8 +197,7 @@ def build_answer(
         raise RuntimeError("the readout produced non-finite probabilities")
     labels = [label for label, _ in options]
     by_label: Dict[str, float] = dict(zip(labels, probabilities))
-    # Ties go to the smaller label, as in the official argmax.
-    decision = min(labels, key=lambda label: (-by_label[label], label))
+    decision = _decide(labels, probabilities)
     if kind == "choice":
         return JevAnswer(
             type=kind,

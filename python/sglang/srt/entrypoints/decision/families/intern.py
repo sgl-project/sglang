@@ -117,7 +117,8 @@ def compile_decision(
     )
     if DECISION_TOKEN in user_text:
         raise DecisionInputError(
-            f"the reserved decision marker {DECISION_TOKEN} appears in the request"
+            f"the reserved decision marker {DECISION_TOKEN} appears in the request",
+            _source_loc(state, questions, DECISION_TOKEN),
         )
     skeleton = json.dumps(
         dict.fromkeys(fields, DECISION_TOKEN), ensure_ascii=False, indent=4
@@ -148,7 +149,8 @@ class InternDecisionFamily:
         self.symbol_ids: List[int] = _symbol_ids(tokenizer)
 
     def validate(self, request: JevRequest) -> None:
-        compiled = _compile(request)
+        questions = _questions(request)
+        compiled = compile_decision(request.state, questions)
         if not request.images:
             return
         user_text = compiled.messages[1]["content"]
@@ -156,7 +158,8 @@ class InternDecisionFamily:
             if placeholder in user_text:
                 raise DecisionInputError(
                     f"the request text contains the image placeholder {placeholder}, "
-                    "which would take the place of an attached image"
+                    "which would take the place of an attached image",
+                    _source_loc(request.state, questions, placeholder),
                 )
 
     def encode(self, request: JevRequest) -> DecisionPrompt:
@@ -195,12 +198,33 @@ class InternDecisionFamily:
         )
 
 
-def _compile(request: JevRequest) -> CompiledDecision:
-    questions = {
+def _source_loc(
+    state: Any, questions: Mapping[str, Mapping[str, Any]], text: str
+) -> Tuple[Any, ...]:
+    """The request part whose rendering holds text; the fixed prompt text never does."""
+    if text in json.dumps(state, ensure_ascii=False, indent=2, sort_keys=False):
+        return ("body", "state")
+    for field, question in questions.items():
+        loc = ("body", "questions", field)
+        if text in field:
+            return loc
+        if text in str(question.get("instructions", "")):
+            return (*loc, "instructions")
+        options = question_options(question)
+        if any(text in value or text in note for value, note in options):
+            return (*loc, "criteria")
+    return ("body",)
+
+
+def _questions(request: JevRequest) -> Dict[str, Dict[str, Any]]:
+    return {
         name: question.model_dump(include={"type", "instructions", "criteria"})
         for name, question in request.questions.items()
     }
-    return compile_decision(request.state, questions)
+
+
+def _compile(request: JevRequest) -> CompiledDecision:
+    return compile_decision(request.state, _questions(request))
 
 
 def _symbol_ids(tokenizer: PreTrainedTokenizerBase) -> Optional[List[int]]:

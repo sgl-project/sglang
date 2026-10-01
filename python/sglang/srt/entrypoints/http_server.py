@@ -78,8 +78,9 @@ from sglang.srt.entrypoints.api_contract import generate_contract_error
 from sglang.srt.entrypoints.decision.protocol import (
     DecisionsRouteRequest,
     JevRequest,
+    SystemOneRouteRequest,
 )
-from sglang.srt.entrypoints.decision.request_id import TypesafeRequestIdMiddleware
+from sglang.srt.entrypoints.decision.request_id import install_typesafe_request_id
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -491,7 +492,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(TypesafeRequestIdMiddleware)
+install_typesafe_request_id(app)
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (
@@ -2106,7 +2107,18 @@ async def anthropic_v1_count_tokens(
 
 ## System One compatible decision API
 @app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
-async def systemone_decisions(raw_request: Request):
+async def systemone_decisions(
+    body: Annotated[
+        SystemOneRouteRequest,
+        Body(
+            description=(
+                "A SystemOneRequest, or a JevRequest when the served checkpoint is "
+                "a decision model, which answers with its own trained prompt."
+            )
+        ),
+    ],
+    raw_request: Request,
+):
     """System One compatible decisions, answered by candidate scoring without generation.
 
     A decision model checkpoint answers with its own trained protocol instead.
@@ -2114,12 +2126,6 @@ async def systemone_decisions(raw_request: Request):
     serving = raw_request.app.state.systemone_serving
     decision_model = serving.trained_decisions.family is not None
     model = JevRequest if decision_model else SystemOneRequest
-    try:
-        body = await raw_request.json()
-    except ValueError as e:
-        raise RequestValidationError(
-            [{"type": "json_invalid", "loc": ("body",), "msg": "JSON decode error"}]
-        ) from e
     try:
         request = model.model_validate(body)
     except ValidationError as e:
