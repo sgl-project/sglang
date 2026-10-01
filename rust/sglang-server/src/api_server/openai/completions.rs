@@ -19,7 +19,9 @@ use dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
+use serde::Deserialize;
 
+use super::routing::BootstrapParams;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     openai_error, submit_generation, unix_seconds_u32,
@@ -36,6 +38,14 @@ use crate::message::types::{OneOrMany, TokenIds};
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/completions", post(completions))
+}
+
+#[derive(Deserialize)]
+struct CompletionRequest {
+    #[serde(flatten)]
+    request: CreateCompletionRequest,
+    #[serde(flatten)]
+    bootstrap: BootstrapParams,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -60,9 +70,9 @@ pub(super) struct ChoiceExtensions {
 
 async fn completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateCompletionRequest>, JsonRejection>,
+    body: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let CompletionRequest { request, bootstrap } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
@@ -116,6 +126,9 @@ async fn completions(
             return openai_error(StatusCode::BAD_REQUEST, &message, false);
         }
     };
+    if let Err(message) = bootstrap.validate(prompts.len()) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
+    }
     let mut sampling = match completion_sampling_params(&request) {
         Ok(sampling) => sampling,
         Err(message) => {
@@ -130,7 +143,8 @@ async fn completions(
     }
 
     let n = request.n.unwrap_or(1) as usize;
-    let choice_count = match prompts.len().checked_mul(n) {
+    let prompt_count = prompts.len();
+    let choice_count = match prompt_count.checked_mul(n) {
         Some(count) if count <= MAX_OPENAI_CHOICES => count,
         _ => {
             return openai_error(
@@ -164,7 +178,7 @@ async fn completions(
                     Err(response) => return response,
                 };
             }
-            let native = FrontendRequest {
+            let mut native = FrontendRequest {
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
@@ -180,6 +194,11 @@ async fn completions(
                 return_text_in_logprobs: request.logprobs.map(|_| true),
                 ..Default::default()
             };
+            bootstrap.apply(
+                &mut native,
+                prompt_index,
+                sample_index * prompt_count + prompt_index,
+            );
             let call = match submit_generation(&state, native, stream).await {
                 Ok(call) => call,
                 Err(response) => return response,
