@@ -175,7 +175,7 @@ class StagePlan:
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
-        self._publish_lora_layout = get_parallel().enable_dp_attention and bool(
+        self._publish_lora_layout = get_parallel().attn_dp_enabled and bool(
             get_lora().enable_lora
         )
         self._next_input_rows = None

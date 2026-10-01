@@ -381,8 +381,8 @@ class Envs:
     # ===================================================================
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
-    # Set to true by the check-changes CI job when a PR touches nothing under
-    # rust/; default false so local and scheduled runs never skip the cargo tests.
+    # Set to true by the check-changes CI job when a PR touches no Rust workspace
+    # inputs; default false so local and scheduled runs never skip the cargo tests.
     SGLANG_SKIP_RUST_TESTS = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
@@ -922,7 +922,9 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
+    # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
+    # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
     SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
@@ -942,6 +944,10 @@ class Envs:
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
+    # Select the AITER MLA kernel for DCP decode. "gluon" preserves the native
+    # low-head Triton path; "asm" quantizes the DCP-gathered query to FP8 and
+    # runs mla_decode_fwd with persistent metadata and return_lse=True.
+    SGLANG_AITER_MLA_DCP_DECODE_BACKEND = EnvStr("gluon")
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)

@@ -11,7 +11,7 @@ from sglang.kernels.ops.speculative.reject_sampling import (
 )
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
-    build_dflash_verify_target_probs,
+    build_speculative_verify_target_probs,
 )
 from sglang.srt.speculative.spec_utils import fast_sample
 
@@ -277,7 +277,7 @@ def _build_dense_probs(
     uniform_top_k_value: int | None,
 ) -> torch.Tensor:
     """Build the dense sampling distribution used by SGLang verification."""
-    return build_dflash_verify_target_probs(
+    return build_speculative_verify_target_probs(
         next_token_logits=next_token_logits,
         sampling_info=sampling_info,
         draft_token_num=forward_width,
