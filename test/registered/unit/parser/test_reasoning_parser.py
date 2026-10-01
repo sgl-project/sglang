@@ -1287,6 +1287,20 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             (reasoning, f"\n{self.GLM_CALL}"),
         )
 
+    def test_qwen3_reasoning_quoting_tool_call_is_chunk_invariant(self):
+        """Qwen3-family templates (Qwen3, MiMo) share the <tool_call> start."""
+        quote = "The call opens with <tool_call> and closes with </tool_call>."
+        call = (
+            "<tool_call>\n<function=bash>\n<parameter=command>\nls\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+        self._assert_invariant(
+            Qwen3Detector, f"<think>{quote}</think>\n\n{call}", (quote, f"\n\n{call}")
+        )
+        self._assert_invariant(
+            Qwen3Detector, f"<think>Need a tool{call}", ("Need a tool", call)
+        )
+
     def test_glm45_tool_call_without_think_end_still_ends_reasoning(self):
         """With no </think> at all, the first <tool_call> still ends reasoning
         (the GLM-4.5 case the tool start token exists for); streaming now

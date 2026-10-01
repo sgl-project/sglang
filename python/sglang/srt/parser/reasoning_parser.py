@@ -503,6 +503,9 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             # Qwen3.5 sometimes opens ``<tool_call>`` without closing
             # ``</think>``; treat it as an implicit reasoning close.
             tool_start_token="<tool_call>",
+            # A <tool_call> quoted while reasoning is not that case; decide at
+            # </think> or the end of the stream, as detect_and_parse does.
+            defer_tool_start=True,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             thinks_internally=True,
