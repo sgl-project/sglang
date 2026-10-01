@@ -130,7 +130,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 # Single e2e test: boot + a short Q&A.
 register_xpu_ci(
     est_time=240,
-    suite="nightly-xpu-1-gpu",
+    suite="nightly-A-xpu-1-gpu",
     nightly=True,
 )
 register_xpu_ci(
