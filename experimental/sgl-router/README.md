@@ -172,6 +172,14 @@ In PD mode, decode is ranked by load only. The bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`, which is how a decode engine finds
 the prefill rank.
 
+### Engines with `--api-key`
+
+The router reads each worker's `/server_info` and `/model_info` to learn its
+model, KV-event publisher, HTTP/2 support and DP size. An engine launched with
+`--api-key` rejects those requests without the key, so pass the same key as
+`--worker-api-key`. Chat requests and `/flush_cache` forward the caller's
+`Authorization` header instead, so callers still need the engine key.
+
 ### Fleet-wide sampling contract
 
 `--override-sampling-params` fixes the sampling configuration for every client

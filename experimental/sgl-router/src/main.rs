@@ -28,7 +28,7 @@ use sgl_router::{
         },
     },
     tokenizer::TokenizerRegistry,
-    workers::{manager, WorkerRegistry},
+    workers::{introspect::worker_client, manager, WorkerRegistry},
 };
 use std::{
     sync::Arc,
@@ -249,10 +249,7 @@ fn prefix_index_config(indexer: &KvIndexerEndpointConfig) -> PrefixIndexConfig {
 }
 
 fn start_engine_state_monitor(config: &Config, use_external_indexer: bool) -> Arc<KvEventIndex> {
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("default http client builds");
+    let http = worker_client(Duration::from_secs(2), config.server.worker_auth.clone());
     if use_external_indexer {
         // External indexing still needs worker hash metadata and engine load, but no local KV tree.
         return KvEventIndex::new_metadata_only_with_http_and_oracle(http, BlockSizeOracle::new());

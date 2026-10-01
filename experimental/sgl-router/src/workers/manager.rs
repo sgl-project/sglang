@@ -6,7 +6,9 @@ use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::state::kv_events::KvEventIndex;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
-use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
+use crate::workers::introspect::{
+    worker_client, DisaggregationRole, WorkerIntrospector, SERVER_INFO_TIMEOUT,
+};
 use crate::workers::{EngineProfile, WireProtocol, Worker, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,8 +122,8 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// `cfg` is `None` the default CB config is used for every worker
 /// (threshold = 3).
 ///
-/// Uses the default HTTP client (2-second timeout) for worker
-/// introspection.  Tests that want a tighter timeout call
+/// Introspects workers with a 2-second timeout, sending `--worker-api-key`
+/// when set.  Tests that want a tighter timeout call
 /// [`run_with_introspector`] directly.
 pub async fn run_with_config(
     rx: mpsc::Receiver<DiscoveryEvent>,
@@ -130,13 +132,15 @@ pub async fn run_with_config(
     kv_index: Option<Arc<KvEventIndex>>,
     router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
 ) {
+    let auth = cfg.as_ref().and_then(|c| c.server.worker_auth.clone());
+    let introspector = WorkerIntrospector::with_client(worker_client(SERVER_INFO_TIMEOUT, auth));
     run_with_introspector(
         rx,
         registry,
         cfg,
         kv_index,
         router_inflight_load,
-        Arc::new(WorkerIntrospector::default()),
+        Arc::new(introspector),
     )
     .await
 }
