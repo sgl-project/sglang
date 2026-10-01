@@ -817,7 +817,14 @@ sgl-eval run aime25 \\
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [],
+      env: [
+        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1",
+        "SGLANG_ENABLE_THINKING=1",
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+        "SGLANG_HICACHE_DEBUG_LOG=1",
+        "SGLANG_HICACHE_DEBUG_SAMPLE_RATE=16384",
+        "SGLANG_MOE_NVFP4_DISPATCH=1",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -838,7 +845,14 @@ sgl-eval run aime25 \\
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [],
+      env: [
+        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1",
+        "SGLANG_ENABLE_THINKING=1",
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+        "SGLANG_HICACHE_DEBUG_LOG=1",
+        "SGLANG_HICACHE_DEBUG_SAMPLE_RATE=16384",
+        "SGLANG_MOE_NVFP4_DISPATCH=1",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -860,7 +874,14 @@ sgl-eval run aime25 \\
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: [],
+      env: [
+        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1",
+        "SGLANG_ENABLE_THINKING=1",
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+        "SGLANG_HICACHE_DEBUG_LOG=1",
+        "SGLANG_HICACHE_DEBUG_SAMPLE_RATE=16384",
+        "SGLANG_MOE_NVFP4_DISPATCH=1",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
