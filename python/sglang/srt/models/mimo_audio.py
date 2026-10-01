@@ -30,6 +30,79 @@ from sglang.srt.runtime_context import (
 logger = logging.getLogger(__name__)
 
 
+def _mimo_local_attention_forward(
+    module,
+    query,
+    key,
+    value,
+    attention_mask,
+    dropout=0.0,
+    scaling=None,
+    is_causal=None,
+    position_bias=None,
+    **kwargs,
+):
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    if (
+        query.is_cuda
+        and query.device == key.device == value.device
+        and query.dtype == key.dtype == value.dtype
+        and query.dtype in (torch.float16, torch.bfloat16)
+        and query.ndim == 4
+        and query.shape == key.shape == value.shape
+        and query.shape[0] > 0
+        and 0 < query.shape[2] <= 4
+        and query.shape[3] == 16
+        and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+        and attention_mask is None
+        and position_bias is None
+        and dropout == 0.0
+        and not kwargs.get("output_attentions", False)
+        and torch.cuda.get_device_capability(query.device)[0] == 9
+    ):
+        from sglang.kernels.ops.attention.mimo_local_attention import (
+            mimo_local_attention,
+        )
+
+        causal = (
+            is_causal if is_causal is not None else getattr(module, "is_causal", True)
+        )
+        return mimo_local_attention(
+            query,
+            key,
+            value,
+            scale=scaling if scaling is not None else 0.25,
+            is_causal=bool(causal),
+        ), None
+    return sdpa_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout=dropout,
+        scaling=scaling,
+        is_causal=is_causal,
+        position_bias=position_bias,
+        **kwargs,
+    )
+
+
+def _register_mimo_local_attention():
+    from transformers import AttentionInterface
+    from transformers.masking_utils import (
+        ALL_MASK_ATTENTION_FUNCTIONS,
+        AttentionMaskInterface,
+    )
+
+    name = "sglang_mimo_local"
+    AttentionInterface.register(name, _mimo_local_attention_forward)
+    # Keep the same mask preparation as the previous SDPA implementation.
+    AttentionMaskInterface.register(name, ALL_MASK_ATTENTION_FUNCTIONS["sdpa"])
+    return name
+
+
 def _compute_default_rope_parameters(
     config=None, device=None, seq_len=None, **rope_kwargs
 ):
@@ -1227,6 +1300,7 @@ class AudioEncoderMixin:
             partial_rotary_factor=config.partial_rotary_factor,
         )
         input_local_config.head_dim = config.input_local_head_dim
+        input_local_config._attn_implementation = _register_mimo_local_attention()
         self.input_local_transformer = Qwen2Model(input_local_config)
         if not config.add_post_norm:
             self.input_local_transformer.norm = nn.Identity()
