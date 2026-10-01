@@ -991,6 +991,16 @@ class Envs:
     # kernels/ops/quantization/configs/ (currently L40S), so it is a no-op on
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
+    # Off by default. Keep a bf16 (dequantized) copy of the listed block-FP8
+    # self_attn projections and run calls with <= MAX_TOKENS rows on it (the
+    # bf16 kernels a bf16 checkpoint would use); larger calls stay on block-FP8.
+    SGLANG_BF16_DECODE_PROJ = EnvBool(False)
+    SGLANG_BF16_DECODE_PROJ_MAX_TOKENS = EnvInt(16)
+    SGLANG_BF16_DECODE_PROJ_MODULES = EnvTuple(
+        ("fused_qkv_a_proj_with_mqa", "q_b_proj", "o_proj", "wq_b")
+    )
+    # "auto": same kernel choice as the bf16 model path; "torch": F.linear.
+    SGLANG_BF16_DECODE_PROJ_KERNEL = EnvStr("auto")
 
     # ===================================================================
     # Humming quantization
