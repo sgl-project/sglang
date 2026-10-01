@@ -127,6 +127,17 @@ class Qwen3_5ForCausalLM(nn.Module):
             [layer_id + 1 for layer_id in layer_ids]
         )
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = len(self.model.layers)
+            layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.set_eagle3_layers_to_capture(layers_to_capture)
+
     def get_embed_and_head(self):
         # PP splits embedding and lm_head across first/last stages; the draft keeps
         # its own copy of whichever half its stage cannot receive.
