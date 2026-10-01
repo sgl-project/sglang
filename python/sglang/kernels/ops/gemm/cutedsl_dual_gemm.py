@@ -36,7 +36,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import utils
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
@@ -341,7 +340,7 @@ class BlackwellDualGemmKernel:
         self.dynamic_smem_bytes = (
             _NARROW_CTA_SMEM_BYTES
             if cta_features == 64
-            else utils.get_smem_capacity_in_bytes("sm_100")
+            else cutlass.memory.get_smem_capacity_in_bytes("sm_100")
         )
 
     def __repr__(self) -> str:
@@ -370,8 +369,8 @@ class BlackwellDualGemmKernel:
         return sm100_utils.make_trivial_tiled_mma(
             self.element_type,
             self.element_type,
-            utils.LayoutEnum.from_tensor(operand_a).mma_major_mode(),
-            utils.LayoutEnum.from_tensor(operand_b).mma_major_mode(),
+            cutlass.tensor_utils.LayoutEnum.from_tensor(operand_a).mma_major_mode(),
+            cutlass.tensor_utils.LayoutEnum.from_tensor(operand_b).mma_major_mode(),
             self.accumulator_type,
             self.cta_group,
             self.mma_tiler_mn,
@@ -569,7 +568,7 @@ class BlackwellDualGemmKernel:
         tiled_mma: cute.TiledMma,
         epilogue_thread: cutlass.Int32,
     ):
-        destination_layout = utils.LayoutEnum.from_tensor(destination)
+        destination_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(destination)
         copy_atom = sm100_utils.get_tmem_load_op(
             (self.cta_m, self.cta_n, self.cta_k),
             destination_layout,
