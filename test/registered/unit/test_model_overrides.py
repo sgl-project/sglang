@@ -3705,6 +3705,9 @@ class TestBeamOverrides(CustomTestCase):
             attention_backend=None,
             prefill_attention_backend=None,
             decode_attention_backend=None,
+            quantization=None,
+            moe_runner_backend="auto",
+            moe_a2a_backend="none",
         )
         defaults.update(kw)
         return SimpleNamespace(**defaults)
@@ -3737,6 +3740,36 @@ class TestBeamOverrides(CustomTestCase):
                         _beam_overrides(self._args(**{field: "flashinfer"}), hf_config),
                         {},
                     )
+
+    def test_quantized_beam_defaults_to_trtllm_moe_on_blackwell(self):
+        """Quantized BeamMoE rejects auto, so auto must resolve to
+        flashinfer_trtllm; BF16 and explicit choices keep their backend."""
+        from sglang.srt.arg_groups.model_overrides.beam import _beam_overrides
+
+        bf16 = SimpleNamespace(architectures=["BeamForCausalLM"])
+        nvfp4 = SimpleNamespace(
+            architectures=["BeamForCausalLM"],
+            quantization_config={"quant_method": "compressed-tensors"},
+        )
+        trtllm = {"moe_runner_backend": "flashinfer_trtllm"}
+        cases = [
+            (nvfp4, {}, trtllm),
+            (bf16, {"quantization": "modelopt_fp4"}, trtllm),
+            (bf16, {}, {}),
+            (nvfp4, {"moe_runner_backend": "flashinfer_cutlass"}, {}),
+            (nvfp4, {"moe_a2a_backend": "deepep"}, {}),
+        ]
+        # Pin the attention backend so only the MoE decision is compared.
+        pinned = {"attention_backend": "flashinfer"}
+        with override_platform(is_sm100=True):
+            for hf_config, kw, expected in cases:
+                with self.subTest(hf_config=hf_config, kw=kw):
+                    self.assertEqual(
+                        _beam_overrides(self._args(**pinned, **kw), hf_config),
+                        expected,
+                    )
+        with override_platform(is_sm100=False):
+            self.assertEqual(_beam_overrides(self._args(**pinned), nvfp4), {})
 
     def test_beam_family_is_registered(self):
         with (

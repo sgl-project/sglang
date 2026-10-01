@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import get_quantization_config
 
 logger = logging.getLogger(__name__)
 
@@ -28,4 +29,16 @@ def _beam_overrides(server_args: Any, hf_config: Any) -> dict:
     ):
         logger.info("Use trtllm_mha as default attention backend for Beam")
         overrides["attention_backend"] = "trtllm_mha"
+    # BeamMoE runs NVFP4 experts only on flashinfer_trtllm; BF16 keeps auto.
+    is_quantized = (
+        cfg.quantization is not None or get_quantization_config(hf_config) is not None
+    )
+    if (
+        is_quantized
+        and get_platform().is_sm100
+        and cfg.moe_runner_backend == "auto"
+        and cfg.moe_a2a_backend == "none"
+    ):
+        logger.info("Use flashinfer_trtllm as MoE runner backend for quantized Beam")
+        overrides["moe_runner_backend"] = "flashinfer_trtllm"
     return overrides

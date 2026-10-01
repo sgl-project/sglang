@@ -685,6 +685,35 @@ class TestBeamLoading(CustomTestCase):
                     actual = (w2 if shard == "w2" else w13).shards[expert, shard]
                     torch.testing.assert_close(actual, tensor.to(actual.dtype))
 
+    def test_nvfp4_expert_weights_and_scales_use_same_shard_mapping(self):
+        suffixes = ("weight", "weight_scale", "weight_scale_2", "input_scale")
+        for suffix in suffixes:
+            with self.subTest(suffix=suffix):
+                w13, w2 = _LoadedExpert(), _LoadedExpert()
+                params = {
+                    f"model.layers.3.mlp.experts.w13_{suffix}": w13,
+                    f"model.layers.3.mlp.experts.w2_{suffix}": w2,
+                }
+                weights = [
+                    (
+                        f"model.layers.3.mlp.experts.7.{projection}.{suffix}",
+                        torch.tensor([value]),
+                    )
+                    for value, projection in enumerate(
+                        ("gate_proj", "up_proj", "down_proj"), start=1
+                    )
+                ]
+                loaded = loader_model(params).load_weights(weights)
+                self.assertEqual(loaded, set(params))
+                for param, shard, expected in (
+                    (w13, "w1", 1),
+                    (w13, "w3", 2),
+                    (w2, "w2", 3),
+                ):
+                    torch.testing.assert_close(
+                        param.shards[7, shard], torch.tensor([expected])
+                    )
+
     def test_router_parameters_preserve_fp32_checkpoint_values(self):
         config = tiny_config()
         previous_dtype = torch.get_default_dtype()
