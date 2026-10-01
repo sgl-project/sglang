@@ -12,6 +12,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <sgl_kernel/deepseek_v4/topk_impl.cuh>
@@ -765,12 +766,10 @@ struct TopKKernel {
             constexpr uint32_t kClusterSize = 16;
             // Widths above 8 are non-portable; the launch is rejected without this.
             const auto kernel = topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1>;
-            [[maybe_unused]]
-            static const bool _ = [&kernel] {
-              const auto kernel_ptr = reinterpret_cast<const void*>(kernel);
+            const auto kernel_ptr = reinterpret_cast<const void*>(kernel);
+            runtime::init_per_device(device, [kernel_ptr] {
               CHECK_CUDA(::cudaFuncSetAttribute(kernel_ptr, ::cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-              return true;
-            }();
+            });
             return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
                 .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
                 .launch(kernel, params);

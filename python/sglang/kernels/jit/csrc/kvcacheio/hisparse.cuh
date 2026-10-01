@@ -779,7 +779,10 @@ void load_cache_to_device_buffer(
     constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K_TOKENS, HOT_BUFFER_SIZE>::BYTES;
 #ifndef USE_ROCM
     if constexpr (smem_bytes > 48u * 1024u) {
-      cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+      /// NOTE: for each launch template, the `kernel_fn` must be unique
+      runtime::init_per_device(kernel_device, [=] {  //
+        runtime::set_max_dynamic_smem(kernel_fn, smem_bytes);
+      });
     }
 #endif
     LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
