@@ -1192,11 +1192,7 @@ class AiterAttnBackend(AttentionBackend):
         return self._kv_indices_scratch[:required_tokens]
 
     def _get_arange(self, length: int) -> torch.Tensor:
-        """arange(length), grown to the next power of two when it is too short.
-
-        Slices stay valid after a regrow: each one keeps the buffer it was
-        taken from alive, so an earlier caller never reads freed rows.
-        """
+        """arange(length) grown to the next power of two."""
         if self._arange_buf is None or self._arange_buf.numel() < length:
             self._arange_buf = torch.arange(
                 1 << max(length - 1, 0).bit_length(),
