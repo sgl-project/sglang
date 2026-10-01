@@ -1402,6 +1402,87 @@ diagnostics match HEAD, and formatting, whitespace and Python 3.10 syntax checks
 pass. The original worktree index is unchanged; all three jobs are terminal and
 the resident GPU has resumed its idle workload.
 
+## Collective Resource Readiness
+
+Capture startup now has a passive resource phase after target identity binding.
+`CaptureConfig.startup_policy` agrees on request, lease, Catalog and shared Store
+settings while allowing rank-local journal paths, byte budgets and transport
+configuration. `coordinate_resource_startup` votes policy construction failures,
+compares policy digests before allocation, then votes resource readiness and
+confirms receipt of that vote. Startup wire version 2 adds an explicit phase ID
+to the fixed control header; identity agreement also has a confirmation step.
+
+`CaptureResources.prepare` connects one Store client per active owner and builds
+the partition's registered Host pool and selected-layer exporter. Only the aux
+owner locks the publication journal. Aux-only ranks do not access source KV;
+inactive ranks allocate no Store client or Host pool but participate in every
+collective. No Catalog requests or Store writes occur during preparation.
+
+Serving prepares writer, lease and metrics threads behind an activation event.
+They begin recovery/admission only after resource confirmation. Failed thread
+startup stops any waiting threads. Failed rank preparation cleans its partial
+resources, while the protocol closes the other ranks' successfully prepared
+resources and votes cleanup failures when transport still works. Store close
+must complete before registered storage can lose its references. Failed close
+retains the adapter, registered buffers and owning resources until a successful
+explicit close or process teardown. SDK setup exceptions now close the partially
+initialized client as well as nonzero setup statuses.
+
+The first fault run exposed a late-participant bug: three ranks timed out waiting
+for resource readiness, but the fourth completed that old Gloo all-gather and
+returned ready. The added acknowledgement prevents this path. Corrected focused
+job `01790846332571489732-242c1c36d202` passes six tests and 37 subtests in
+54.32s. The initial failing log is retained as evidence of the reproduced fault.
+
+Broader job `01790846523111396436-6453ef509248` passes 146 tests and
+216 subtests in 150.98s. It covers capture, DSpark KV-input helpers and the real
+TCP Store tests. Four Gloo processes exercise TP4 replicated heads and a TP2/PP2
+layout whose last stage owns only aux. Faults include common policy disagreement,
+policy construction failure on an inactive rank, ambiguous second-buffer
+registration, insufficient local Host budget, an occupied journal, inactive-rank
+preparation failure, uncertain transport close and a delayed rank.
+
+The real Store case first rejects rank 2's insufficient budget and closes the
+other prepared clients. It then recreates each client using the same configured
+local address and journal, performs the readiness protocol, and writes from
+three independently registered arenas. After all four producer processes exit,
+an independent 64MiB provider/reader verifies all three 64-byte payloads. No
+Catalog capture or publication was created. This validates resource lifecycle
+and registered transport; the existing separate owner-publication tests still
+cover snapshot manifests and receipts.
+
+Full serving job `01790846523443531563-0d819d0e7ceb` passes in 460.686s
+and publishes 90 snapshots through the real TCP Store. This covers the new
+startup path in AR/static DSpark, graph/overlap, memory pressure, capture
+admission/latency and cache lifecycle scenarios. The SDK setup regression was
+also run against the pre-change adapter from `8fc2ed67b`: job
+`01790846569607181735-6e059025cf6b` fails exactly because the client remains
+open after an `OSError` from setup. The corrected adapter passes the same test
+in the broader run.
+
+Final focused job `01790846803151233405-013c9cb15ce9` passes eight tests and
+38 subtests in 71.36s, including phase mismatch and delayed identity validation.
+The latter requires all ranks, including the late validator, to fail instead of
+returning a partial contract. These two boundary cases were added after the
+broader run; production sources are unchanged. Commands, failures, terminal
+results and source/log hashes are retained in
+[`capture-resource-startup.json`](experiments/capture-resource-startup.json).
+
+Local/GPU source hashes match. New/changed production helpers and new tests pass
+Ruff; legacy diagnostics exactly match the baseline. Formatting, whitespace and
+host Python 3.10 syntax checks pass. The original worktree index is unchanged.
+All six jobs are terminal and the resident H100 has resumed its idle workload.
+
+This does not enable TP/PP model serving. The single-rank serving coordinator
+uses the new resource protocol on its existing world CPU group; distributed
+request admission, failure agreement, descriptor exchange, teacher scores and
+scheduler integration remain open. Startup confirmation is not a durable
+transaction or protection against a process dying after confirmation. Blocking
+callbacks/close calls and worker initialization still require the supervisor;
+a transport-failed process group must be torn down. Real Store verification uses
+TCP on one host, synthetic local KV and a Catalog test double, not RDMA or
+distributed target inference.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1409,9 +1490,9 @@ the resident GPU has resumed its idle workload.
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
-3. Connect P9's implemented startup identity exchange, layout, rank-local buffers
-   and owner-local Store interface to distributed resource initialization and
-   request admission/failure agreement, descriptor exchange, global teacher scores
+3. Connect P9's implemented identity/resource startup agreement, layout,
+   rank-local buffers and owner-local Store interface to distributed request
+   admission/failure agreement, descriptor exchange, global teacher scores
    and TP/PP scheduling.
    Complete TP/PP runtime validation, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do

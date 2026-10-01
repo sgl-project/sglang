@@ -6,6 +6,7 @@ Catalog calls use a test double. This does not exercise distributed inference.
 import argparse
 import importlib.util
 import json
+import multiprocessing as mp
 import shutil
 import socket
 import subprocess
@@ -13,13 +14,16 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import msgspec
 import torch
+import torch.distributed as dist
 from safetensors.torch import save_file
 from sglang.srt.training_capture.catalog import CaptureLease, HTTPCaptureCatalog
+from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
 from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.protocol import (
@@ -31,16 +35,26 @@ from sglang.srt.training_capture.protocol import (
     tensor_bytes,
     validate_tensors,
 )
+from sglang.srt.training_capture.resources import CaptureResources
 from sglang.srt.training_capture.snapshot_writer import (
     OwnerWriteReceipt,
     PublicationJournal,
     SnapshotWriter,
 )
+from sglang.srt.training_capture.startup import (
+    CaptureStartupError,
+    coordinate_resource_startup,
+)
+from sglang.srt.training_capture.topology import plan_capture_layout
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.training_capture_catalog import TestCaptureCatalog
 from sglang.test.training_capture_partition import make_partitioned_snapshot
-from sglang.test.training_capture_utils import make_snapshot, read_snapshot
+from sglang.test.training_capture_utils import (
+    make_kv_spec,
+    make_snapshot,
+    read_snapshot,
+)
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
@@ -89,6 +103,110 @@ def read_sample(master, key, size, digest):
         store.close()
 
 
+def prepare_store_rank(rank, root, master, catalog):
+    """Real Store clients; synthetic local KV, no model or CUDA collectives."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=(Path(root) / "rendezvous").as_uri(),
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=20),
+    )
+    kv = make_kv_spec()
+    layout = plan_capture_layout(kv, tp_size=4, pp_layer_ranges=[(0, 4)], aux_tp_rank=1)
+    partition = layout.partitions[rank]
+    config = CaptureConfig(
+        dataset_id="resource-startup",
+        model_id="fixture",
+        producer_revision="test",
+        selected_layer_ids=kv.selected_layer_ids,
+        catalog_endpoint=catalog,
+        journal_directory=str(Path(root) / "journal"),
+        store=StoreSetup(
+            local_hostname=f"127.0.0.1:{free_port()}", master_server_addr=master
+        ),
+        max_sample_tokens=8,
+        max_inflight_samples=1,
+        max_host_bytes=2 << 20,
+    )
+    source = MagicMock(spec=MHATokenToKVPool)
+    source.is_quantized_kv_cache = source.use_hnd = False
+    source.page_size, source.start_layer, source.layer_num = kv.source_page_size, 0, 4
+    keys, values = {}, {}
+    for layer in partition.local_layers(kv):
+        keys[layer.layer_id] = torch.zeros(
+            16, layer.num_kv_heads, layer.key_head_dim, dtype=torch.bfloat16
+        )
+        values[layer.layer_id] = torch.zeros(
+            16, layer.num_kv_heads, layer.value_head_dim, dtype=torch.bfloat16
+        )
+    source.get_key_buffer.side_effect = keys.__getitem__
+    source.get_value_buffer.side_effect = values.__getitem__
+    results = []
+    try:
+        for reject in (True, False):
+            local = (
+                msgspec.structs.replace(config, max_host_bytes=1)
+                if reject and rank == 2
+                else config
+            )
+            prepared = []
+
+            def prepare(local=local, prepared=prepared):
+                resources = CaptureResources.prepare(
+                    config=local,
+                    kv=kv,
+                    partition=partition,
+                    source_pool=source,
+                    pin_memory=False,
+                )
+                prepared.append(resources)
+                return resources
+
+            try:
+                resource = coordinate_resource_startup(
+                    group=dist.group.WORLD,
+                    build_policy=lambda: (config.startup_policy, layout),
+                    prepare_local=prepare,
+                    timeout_seconds=15,
+                )
+            except CaptureStartupError as error:
+                results.append(
+                    {"phase": error.phase, "failed_ranks": error.failed_ranks}
+                )
+            else:
+                try:
+                    row = {"phase": "ready", "active": partition.active}
+                    if partition.active:
+                        slot = resource.pool.acquire()
+                        complete = False
+                        try:
+                            payload = slot.storage[:64]
+                            payload.fill_(rank + 1)
+                            key = f"resource-startup/{Path(root).name}/{rank}"
+                            digest = digest_bytes(tensor_bytes(payload))
+                            resource.store.put_registered(key, payload, digest)
+                            complete = True
+                            row.update(key=key, digest=digest)
+                        finally:
+                            resource.pool.release(slot, transfer_complete=complete)
+                    results.append(row)
+                finally:
+                    resource.close()
+            assert all(resource.closed for resource in prepared)
+            assert all(
+                resource.store is None or not resource.store.registered
+                for resource in prepared
+            )
+            dist.barrier()
+        (Path(root) / f"rank-{rank}.json").write_bytes(canonical_bytes(results))
+    finally:
+        dist.destroy_process_group()
+
+
 @unittest.skipUnless(
     shutil.which("mooncake_master") and importlib.util.find_spec("mooncake"),
     "Mooncake master and SDK required",
@@ -133,6 +251,59 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                 cls.master.kill()
                 cls.master.wait()
         cls.master_log.close()
+
+    @unittest.skipUnless(dist.is_gloo_available(), "Gloo required")
+    def test_collective_resource_rollback_then_real_registered_store_write(self):
+        store = connect(self.master_address, segment_bytes=64 << 20)
+        catalog = TestCaptureCatalog()
+        workers = []
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                context = mp.get_context("spawn")
+                workers = [
+                    context.Process(
+                        target=prepare_store_rank,
+                        args=(rank, root, self.master_address, catalog.endpoint),
+                    )
+                    for rank in range(4)
+                ]
+                for worker in workers:
+                    worker.start()
+                deadline = time.monotonic() + 100
+                for worker in workers:
+                    worker.join(timeout=max(0, deadline - time.monotonic()))
+                self.assertEqual([worker.exitcode for worker in workers], [0] * 4)
+                for rank in range(4):
+                    failure, ready = json.loads(
+                        (Path(root) / f"rank-{rank}.json").read_bytes()
+                    )
+                    self.assertEqual(
+                        failure, {"phase": "resources", "failed_ranks": [2]}
+                    )
+                    self.assertEqual(ready["phase"], "ready")
+                    self.assertEqual(ready["active"], rank != 3)
+                    if ready["active"]:
+                        payload = store.get_tensor(
+                            ready["key"], [64], torch.uint8, ready["digest"]
+                        )
+                        self.assertEqual(payload.tolist(), [rank + 1] * 64)
+                self.assertFalse(catalog.captures)
+                self.assertFalse(catalog.publications)
+                PublicationJournal(str(Path(root) / "journal")).close()
+                print(
+                    "Resource startup: 4 ranks, rollback, 3 registered writes readable after exit",
+                    flush=True,
+                )
+        finally:
+            for worker in workers:
+                if worker.pid is not None and worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+                    if worker.is_alive():
+                        worker.kill()
+                        worker.join(timeout=5)
+            catalog.close()
+            store.close()
 
     def test_manifest_last_and_registered_arena_cross_process_read(self):
         manifest, tensors = make_snapshot(response_length=4)

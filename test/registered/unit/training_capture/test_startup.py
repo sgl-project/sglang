@@ -93,7 +93,11 @@ def startup_worker(rank, root, timeout_case):
         world_size=4,
         timeout=timedelta(seconds=20),
     )
-    scenarios = ["timeout"] if timeout_case else ["pp", "success"]
+    scenarios = (
+        ["validation_timeout" if timeout_case == "validation" else "timeout"]
+        if timeout_case
+        else ["pp", "success"]
+    )
     if not timeout_case:
         for case in FAILURES:
             scenarios.extend((case, "success"))
@@ -122,6 +126,18 @@ def startup_worker(rank, root, timeout_case):
                 return contract
 
             with ExitStack() as patches:
+                if case == "validation_timeout" and rank == 3:
+                    assemble = startup.assemble_target_contract
+
+                    def slow_validation(*args, assemble=assemble, **kwargs):
+                        time.sleep(5)
+                        return assemble(*args, **kwargs)
+
+                    patches.enter_context(
+                        patch.object(
+                            startup, "assemble_target_contract", slow_validation
+                        )
+                    )
                 if rank == 1:
                     if case == "record_limit":
                         patches.enter_context(
@@ -162,7 +178,7 @@ def startup_worker(rank, root, timeout_case):
                         )
                     elif case == "version":
                         patches.enter_context(
-                            patch.object(startup, "PROTOCOL_VERSION", 2)
+                            patch.object(startup, "PROTOCOL_VERSION", 3)
                         )
                 dist.barrier()
                 if case == "peer_exit" and rank == 3:
@@ -256,6 +272,12 @@ class TestCaptureStartup(CustomTestCase):
         self.assertTrue(all(row["seconds"] < 4 for row in rows[:3]), rows)
         self.assertLess(rows[3]["seconds"], 10)
 
+    def test_slow_validator_cannot_return_after_peers_time_out(self):
+        rows = [result[0] for result in self.run_workers(timeout_case="validation")]
+        self.assertEqual([row["phase"] for row in rows], ["transport"] * 4)
+        self.assertTrue(all(row["seconds"] < 4 for row in rows[:3]), rows)
+        self.assertLess(rows[3]["seconds"], 10)
+
     def test_configuration_failure_occurs_inside_the_startup_vote(self):
         from sglang.srt.training_capture.coordinator import CaptureCoordinator
 
@@ -271,7 +293,7 @@ class TestCaptureStartup(CustomTestCase):
                 side_effect=exchange,
             ) as vote,
             patch(
-                "sglang.srt.training_capture.coordinator.MooncakeSnapshotStore.connect"
+                "sglang.srt.training_capture.resources.MooncakeSnapshotStore.connect"
             ) as connect,
             self.assertRaises(startup.CaptureStartupError),
         ):

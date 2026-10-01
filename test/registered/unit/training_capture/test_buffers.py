@@ -1,6 +1,8 @@
 """Ownership and exact transfer-result contracts for capture buffers."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 from sglang.srt.training_capture.host_pool import HostBufferPool
@@ -125,6 +127,26 @@ class TestMooncakeTransferContract(CustomTestCase):
 
     def tearDown(self):
         self.store.close()
+
+    def test_setup_exception_closes_the_partially_initialized_sdk_client(self):
+        """A setup exception must not leak the client created before setup."""
+        for outcome in (-1, OSError("setup transport failed")):
+            with self.subTest(outcome=type(outcome).__name__):
+                client = BufferStore()
+                client.setup = Mock(
+                    side_effect=outcome if isinstance(outcome, Exception) else None,
+                    return_value=outcome,
+                )
+                sdk = SimpleNamespace(
+                    MooncakeDistributedStore=Mock(return_value=client),
+                    ReplicateConfig=FakeReplicateConfig,
+                )
+                with (
+                    patch.dict("sys.modules", {"mooncake.store": sdk}),
+                    self.assertRaises((TransportError, OSError)),
+                ):
+                    MooncakeSnapshotStore.connect({"protocol": "tcp"})
+                self.assertTrue(client.closed)
 
     def test_immutable_idempotence_and_conflict(self):
         self.store.put_registered("test", self.tensor, self.digest)

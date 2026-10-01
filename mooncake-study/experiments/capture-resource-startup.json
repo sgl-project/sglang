@@ -1,0 +1,229 @@
+{
+  "purpose": "Prepare passive owner-local resources and require common policy/resource agreement before activating capture workers",
+  "source_baseline": "8fc2ed67bf366582d71a0fd13b1b64fba5c2e8fe",
+  "environment_lock": "h100-runtime-lock.json",
+  "jobs": [
+    {
+      "job_id": "01790846144463792650-5594c5e1bdbe",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790846234.8620224,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790846144463792650-5594c5e1bdbe.log",
+      "log_sha256": "ab78b66a6e697ec286161c3f7699e8a5cc295a81cbbe06f56595256a50acaa7b",
+      "stage": "initial_fault_reproduction",
+      "tests_passed": 57,
+      "failed_subtests": 1,
+      "subtests_passed": 48,
+      "seconds": 87.21,
+      "note": "Before the readiness acknowledgement, delayed inactive rank 3 returned ready while ranks 0-2 reported transport timeout.",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_resources.py",
+        "test/registered/unit/training_capture/test_startup.py",
+        "test/registered/unit/training_capture/test_buffers.py",
+        "test/registered/unit/training_capture/test_coordinator.py"
+      ]
+    },
+    {
+      "job_id": "01790846332571489732-242c1c36d202",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790846389.8014815,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790846332571489732-242c1c36d202.log",
+      "log_sha256": "40cd632282d35b487126451149a69d46cdf11d71a7914353477090fccd618d05",
+      "stage": "corrected_startup_protocol",
+      "tests": 6,
+      "subtests": 37,
+      "seconds": 54.32,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_resources.py",
+        "test/registered/unit/training_capture/test_startup.py"
+      ]
+    },
+    {
+      "job_id": "01790846523111396436-6453ef509248",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790846677.8078735,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790846523111396436-6453ef509248.log",
+      "log_sha256": "67dd9cf24a330551f212e6d845241ab5cdd5eefb638307ef4f699ec314c3347f",
+      "stage": "unit_and_real_store_regression",
+      "tests": 146,
+      "subtests": 216,
+      "seconds": 150.98,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture",
+        "test/registered/unit/spec/test_dspark_target_kv.py",
+        "test/registered/storage/test_training_snapshot_mooncake.py"
+      ],
+      "tested_source_sha256": {
+        "python/sglang/srt/training_capture/config.py": "842029d4fce0abae6fd1fefefbcd8d573567b70a1ff2c34c5270fefae8495b73",
+        "python/sglang/srt/training_capture/coordinator.py": "bb8125a54e51c709a3466071980c598afedc619d75859b2184dd7d8027ff5e29",
+        "python/sglang/srt/training_capture/mooncake_store.py": "9d2f448c5b8275e5c117f8f4f25567c49d178af6e14570252a425011768ef80d",
+        "python/sglang/srt/training_capture/resources.py": "648d52121b8531dd905e13a0bd0f7a9eca482e43a93798be87897af2f83747ea",
+        "python/sglang/srt/training_capture/startup.py": "a7fd0bfdee4c2cd18954a4bec3feb10034d0fdf05e2051db2105f491a746b7c3",
+        "test/registered/unit/training_capture/test_buffers.py": "29b7f30c6280f1ba7ff01c5ab56657a8ffe94c19091c33fdbb9cdd7baba8a11d",
+        "test/registered/unit/training_capture/test_resources.py": "20fa1492ea33424d5fc0fd7890b2aec0a7c3b22bbe53e96c3be770b05c2f5a11",
+        "test/registered/unit/training_capture/test_startup.py": "c6a3c1fb416d68c3efa267b5dfa2ce4757e69a76faf9807f783008dd70a85ee1",
+        "test/registered/storage/test_training_snapshot_mooncake.py": "f039e6fea69c782a150ad5a446f6d112a531daa97083622b92c7faa79c4ac5c9"
+      },
+      "note": "Follow-up phase-mismatch and late-validator tests were added after this run; production code remains identical."
+    },
+    {
+      "job_id": "01790846523443531563-0d819d0e7ceb",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790847150.5692277,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790846523443531563-0d819d0e7ceb.log",
+      "log_sha256": "71d7330b1e4d16580351e5473ac40b4cefe316cec78d8406bc61f0a6dd8421e1",
+      "stage": "full_serving_runtime",
+      "tests": 1,
+      "seconds": 460.686,
+      "published_snapshots": 90,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      ]
+    },
+    {
+      "job_id": "01790846569607181735-6e059025cf6b",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790847161.6121397,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790846569607181735-6e059025cf6b.log",
+      "log_sha256": "5faaa19bffc2653843442dccce12e0435b698ac2fa6b855104273fe78f940e59",
+      "stage": "pre_fix_regression_proof",
+      "expected_failure": true,
+      "tests": 1,
+      "failed_subtests": 1,
+      "seconds": 0.004,
+      "adapter_source": "git show 8fc2ed67bf366582d71a0fd13b1b64fba5c2e8fe:python/sglang/srt/training_capture/mooncake_store.py",
+      "test": "test_buffers.TestMooncakeTransferContract.test_setup_exception_closes_the_partially_initialized_sdk_client",
+      "method": "Load unmodified baseline adapter source in an isolated in-memory module and run the current regression test against its Store/TransportError classes.",
+      "failure": "OSError subcase: assertTrue(client.closed) fails; nonzero-status subcase passes."
+    },
+    {
+      "job_id": "01790846803151233405-013c9cb15ce9",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790847235.2675326,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790846803151233405-013c9cb15ce9.log",
+      "log_sha256": "2d92a2020baa93da5f84a6ce7a3b104d977e47b5e7b74f50da8462db6e1e01ce",
+      "stage": "final_startup_boundary_checks",
+      "tests": 8,
+      "subtests": 38,
+      "seconds": 71.36,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_resources.py",
+        "test/registered/unit/training_capture/test_startup.py"
+      ]
+    }
+  ],
+  "protocol": {
+    "version": 2,
+    "control_header": "Eight int64 CPU values: version, error flag, byte length, four signed SHA-256 words, phase ID.",
+    "policy_byte_limit": 1048576,
+    "identity_record_byte_limit": 1048576,
+    "padded_receive_byte_limit": 67108864,
+    "global_identity_digest_input_byte_limit": 67108864,
+    "collective_timeout_seconds": 120,
+    "confirmation": "Identity and resource status votes require a subsequent acknowledgement. A late participant cannot return from the old status all_gather after its peers timed out.",
+    "failure_handling": "Local preparation callbacks clean partial failures. Returned passive resources are closed on failed readiness. Cleanup errors are voted unless transport failed. Failed Store/resource close retains ownership until explicit successful close or process teardown."
+  },
+  "common_policy": {
+    "included": "Request/sample/admission, Catalog endpoint, lease policy and shared Store settings; serving includes teacher/KV/layout/mode/overlap.",
+    "rank_local_config": [
+      "journal_directory",
+      "max_host_bytes",
+      "max_device_bytes",
+      "store.local_hostname",
+      "store.local_buffer_size",
+      "store.global_segment_size",
+      "store.rdma_devices"
+    ],
+    "secrets": "Credential values are not read into policy. Policy contents are not exchanged, only SHA-256."
+  },
+  "gloo_tests": {
+    "processes": 4,
+    "layouts": [
+      "TP4/PP1 with canonical owners 0 and 2, aux-only rank 1 and inactive rank 3",
+      "TP2/PP2 with no selected KV on the last PP stage"
+    ],
+    "faults": [
+      "different sample policy",
+      "different Store namespace/master",
+      "policy callback fails on inactive rank",
+      "protocol phase mismatch",
+      "second registration has uncertain outcome",
+      "rank-local Host allocation budget",
+      "publication journal already locked",
+      "inactive rank preparation failure",
+      "uncertain client close during rollback",
+      "delayed preparation",
+      "delayed identity validation"
+    ],
+    "passive_threads": "Observed both background workers entering their activation-event wait before any Catalog capture; activating then admits normally.",
+    "ownership": "Weak-reference test drops all caller and exception references after failed Store close. Class retention preserves registered storage until successful close."
+  },
+  "real_store": {
+    "protocol": "tcp",
+    "processes": 4,
+    "provider_segment_bytes": 67108864,
+    "first_attempt": "Rank 2's insufficient Host budget rejects startup; successful ranks close their prepared clients.",
+    "second_attempt": "Reuses each configured local address and the aux journal; 3 active ranks write from their independently registered Host arenas; inactive rank allocates neither client nor Host pool.",
+    "payloads": 3,
+    "bytes_per_payload": 64,
+    "verification": "Independent provider/reader reads exact rank-specific bytes after all producers exit.",
+    "catalog_captures": 0,
+    "catalog_publications": 0,
+    "source_kv": "Synthetic CPU tensors behind a mocked source pool; actual SelectedLayerKVExporter.from_pool and actual Mooncake SDK/transport."
+  },
+  "limits": [
+    "TP/PP serving gates remain closed; distributed request admission/failure agreement, descriptor exchange, teacher scores and scheduler integration remain required.",
+    "Confirmation is not a durable transaction or protection against process death after confirmation.",
+    "Callbacks, close barriers, control allocation and earlier worker initialization require the supervisor watchdog; a transport-failed group must be torn down.",
+    "TCP single-host Store tests and one-H100 runtime tests do not prove multi-GPU target inference, RDMA, production Catalog retention or trained draft quality."
+  ],
+  "checks": {
+    "new_files_ruff": "pass",
+    "existing_diagnostics": "Exactly match baseline code/message lists: coordinator 9 BLE001; buffer tests 1 PLC0206; Store test SIM115 and PLW1510.",
+    "python310_compile": "pass",
+    "format": "pass",
+    "diff_check": "pass",
+    "original_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "local_gpu_sources_match": true,
+    "gpu_after_tests": "All six queued jobs are terminal; worker resumed idle_load, PID 63832."
+  },
+  "source_sha256": {
+    "python/sglang/srt/training_capture/config.py": "842029d4fce0abae6fd1fefefbcd8d573567b70a1ff2c34c5270fefae8495b73",
+    "python/sglang/srt/training_capture/coordinator.py": "bb8125a54e51c709a3466071980c598afedc619d75859b2184dd7d8027ff5e29",
+    "python/sglang/srt/training_capture/mooncake_store.py": "9d2f448c5b8275e5c117f8f4f25567c49d178af6e14570252a425011768ef80d",
+    "python/sglang/srt/training_capture/resources.py": "648d52121b8531dd905e13a0bd0f7a9eca482e43a93798be87897af2f83747ea",
+    "python/sglang/srt/training_capture/startup.py": "a7fd0bfdee4c2cd18954a4bec3feb10034d0fdf05e2051db2105f491a746b7c3",
+    "test/registered/unit/training_capture/test_buffers.py": "29b7f30c6280f1ba7ff01c5ab56657a8ffe94c19091c33fdbb9cdd7baba8a11d",
+    "test/registered/unit/training_capture/test_resources.py": "689098ee67299393184068996b02edeb419270d68299be5074a6fa8dd0e7dd9e",
+    "test/registered/unit/training_capture/test_startup.py": "e33b65c97a49867a2857566f4668c7a4cb1494ddbeaf6e2d9c949c56b1e751a5",
+    "test/registered/storage/test_training_snapshot_mooncake.py": "f039e6fea69c782a150ad5a446f6d112a531daa97083622b92c7faa79c4ac5c9"
+  }
+}

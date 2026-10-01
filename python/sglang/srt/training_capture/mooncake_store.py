@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import math
+from typing import ClassVar
 
 import torch
 from sglang.srt.training_capture.protocol import (
@@ -27,6 +28,8 @@ class TransportError(CaptureError):
 
 
 class MooncakeSnapshotStore:
+    _retained: ClassVar[set[MooncakeSnapshotStore]] = set()
+
     def __init__(self, client, replicate_config, *, max_receive_bytes: int = 2 << 30):
         try:
             # Capability checks are intentional at this external SDK boundary.
@@ -67,11 +70,18 @@ class MooncakeSnapshotStore:
         config = ReplicateConfig()
         config.replica_num = replica_num
         client = MooncakeDistributedStore()
-        adapter = cls(client, config, max_receive_bytes=max_receive_bytes)
-        rc = client.setup(**setup)
-        if rc != 0:
+        try:
+            adapter = cls(client, config, max_receive_bytes=max_receive_bytes)
+        except Exception:
             client.close()
-            raise TransportError(f"Mooncake setup failed: status={rc}")
+            raise
+        try:
+            rc = client.setup(**setup)
+            if rc != 0:
+                raise TransportError(f"Mooncake setup failed: status={rc}")
+        except Exception:
+            adapter.close()
+            raise
         versions = {}
         for distribution in (
             "mooncake-transfer-engine",
@@ -209,9 +219,14 @@ class MooncakeSnapshotStore:
         """Caller first stops all threads and synchronizes all outstanding CUDA copies."""
         if self.closed:
             return
-        rc = self.client.close()
-        if rc not in (None, 0):
-            raise TransportError(f"Mooncake close failed: status={rc}")
+        try:
+            rc = self.client.close()
+            if rc not in (None, 0):
+                raise TransportError(f"Mooncake close failed: status={rc}")
+        except Exception:
+            self._retained.add(self)
+            raise
         self.closed = True
         self.registered.clear()
         self.quarantined.clear()
+        self._retained.discard(self)

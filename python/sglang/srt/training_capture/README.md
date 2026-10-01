@@ -247,7 +247,10 @@ loading and target binding before any Store or Catalog resource is created.
 | Allocation | A second status vote | All ranks confirm bounded CPU send/receive allocation before transferring metadata |
 | Metadata | Padded CPU byte buffers containing strict JSON | Decode, group-origin, topology and global identity checks run independently on every rank |
 | Agreement | Status and SHA-256 of the resulting teacher/KV/layout | No rank returns a contract until all validators succeed and all resulting digests match |
+| Confirmation | Acknowledgement of the agreement vote | A late validator cannot accept a completed old collective after peers have already timed out |
 
+Startup wire version 2 uses eight int64 control words: version, error flag,
+payload length, four SHA-256 words and phase ID. Phase disagreement is rejected.
 The wire payload is metadata-only JSON, not a pickled Python object. Each record
 is limited to 1MiB; padded receive buffers across the group are limited to 64MiB
 per receiver. Small control buffers are reserved before local binding and reused
@@ -269,10 +272,52 @@ coordinates to `CaptureCoordinator.create`. Enabled capture loads configuration
 inside the binding callback; configuration errors therefore participate in the
 startup vote. Disabled capture returns before invoking the protocol. The current
 request coordinator still rejects distributed capture after identity agreement,
-and the server's TP/PP/DP gates remain closed. Store/Catalog resource-creation
-agreement, request-level configuration/admission/failure decisions, snapshot
-descriptor exchange, global teacher scores and distributed scheduling remain
-separate work. This protocol exchanges startup target identity only.
+and the server's TP/PP/DP gates remain closed. Distributed request admission,
+failure decisions, snapshot descriptor exchange, global teacher scores and
+distributed scheduling remain separate work.
+
+### Resource Readiness
+
+`coordinate_resource_startup(group=..., build_policy=..., prepare_local=...,
+timeout_seconds=120)` first agrees on a bounded policy digest, then prepares
+passive resources on every rank. Local policy construction failures are voted;
+differing policies fail before any resource callback. `CaptureConfig.startup_policy`
+includes request admission, sample limits, lease policy, Catalog endpoint and
+shared Store settings. Only journal paths, Host/device byte budgets and local
+Store address/buffer/segment/device settings may differ. The serving caller also
+includes teacher, KV, layout, capture mode and overlap mode in the agreement.
+Policy values and credentials are not exchanged, only SHA-256 words.
+
+`CaptureResources.prepare(config=..., kv=..., partition=..., source_pool=...)`
+creates the local exporter, Catalog client, Store client and registered Host pool.
+It allocates only the partition's canonical KV heads. The aux owner also allocates
+aux/manifest buffers and locks the publication journal. An aux-only owner needs
+no source KV exporter; an inactive rank allocates neither a Store client nor a
+Host pool, but still participates in every readiness vote. Preparation does not
+issue Catalog calls, start capture threads or write Store objects.
+
+After preparation, ranks exchange status and acknowledge the completed vote.
+The extra acknowledgement matters because a timed-out Gloo `all_gather` can
+still complete for a late participant. On failure, successfully prepared ranks
+close their resources. Cooperative cleanup errors are voted as `cleanup`; after
+transport failure there is no further collective. Callbacks must clean their
+own partial failures. Store shutdown is the barrier before registered storage
+can lose its references. A failed Store close retains the adapter and buffers
+until a successful explicit close or process teardown. Failed resource close
+also retains the owning resource bundle and journal lock.
+
+The serving coordinator prepares its writer, lease and metrics threads behind
+an activation event. Only after readiness confirmation does `activate()` release
+them to perform recovery and admission. A thread creation/start failure closes
+the prepared resources and wakes/stops any threads already waiting. Single-rank
+serving uses this path on its existing CPU group; the resource API is also tested
+with independent TP/PP-style rank partitions and real TCP Store clients.
+
+This is startup coordination, not a durable transaction or a guarantee against
+a process dying immediately after confirmation. Resource callbacks, transport
+close calls and earlier worker initialization still require the serving
+supervisor's watchdog. A transport-failed group must be torn down. Distributed
+serving activation remains gated until the request coordinator is connected.
 
 ## Catalog Producer API
 

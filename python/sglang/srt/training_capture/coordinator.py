@@ -5,7 +5,6 @@ from __future__ import annotations
 import atexit
 import hashlib
 import logging
-import os
 import queue
 import random
 import threading
@@ -18,29 +17,22 @@ import msgspec
 import torch
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.training_capture.admission import CaptureAdmission
-from sglang.srt.training_capture.catalog import (
-    CaptureLease,
-    CatalogConflict,
-    HTTPCaptureCatalog,
-)
+from sglang.srt.training_capture.catalog import CaptureLease, CatalogConflict
 from sglang.srt.training_capture.config import CaptureConfig
 from sglang.srt.training_capture.context import RequestCaptureContext
-from sglang.srt.training_capture.host_pool import HostBufferPool, HostSlot
+from sglang.srt.training_capture.host_pool import HostSlot
 from sglang.srt.training_capture.identity import (
     assemble_target_contract,
     bind_rank_target_contract,
 )
-from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
-from sglang.srt.training_capture.mooncake_store import (
-    MooncakeSnapshotStore,
-    TransportError,
-)
+from sglang.srt.training_capture.mooncake_store import TransportError
 from sglang.srt.training_capture.protocol import OWNER, ContractError, Provenance
-from sglang.srt.training_capture.snapshot_writer import (
-    PublicationJournal,
-    SnapshotWriter,
+from sglang.srt.training_capture.resources import CaptureResources
+from sglang.srt.training_capture.snapshot_writer import SnapshotWriter
+from sglang.srt.training_capture.startup import (
+    coordinate_resource_startup,
+    coordinate_target_startup,
 )
-from sglang.srt.training_capture.startup import coordinate_target_startup
 from sglang.srt.training_capture.teacher import TeacherRows, capture_teacher
 
 logger = logging.getLogger(__name__)
@@ -134,51 +126,65 @@ class CaptureCoordinator:
 
         topology = {"tp_size": tp_size, "pp_size": pp_size, "dp_rank": dp_rank}
         if startup_group is None:
-            teacher, kv, _ = assemble_target_contract([build_local()], **topology)
+            teacher, kv, layout = assemble_target_contract([build_local()], **topology)
         else:
-            teacher, kv, _ = coordinate_target_startup(
+            teacher, kv, layout = coordinate_target_startup(
                 group=startup_group, build_local=build_local, **topology
             )
         if (tp_size, pp_size, dp_rank) != (1, 1, 0):
             raise ContractError("distributed request capture is not yet connected")
-        exporter = SelectedLayerKVExporter.from_pool(kv, pool)
-        if exporter.device.type != "cuda":
-            raise ContractError("serving capture currently requires CUDA")
-        token = (
-            os.environ[config.catalog_token_env] if config.catalog_token_env else None
+        capture_mode = (
+            "speculative_accepted_target_path"
+            if get_spec().speculative_algorithm == "DSPARK"
+            else "autoregressive"
         )
-        catalog = HTTPCaptureCatalog(
-            config.catalog_endpoint,
-            bearer_token=token,
-            timeout=config.http_timeout_seconds,
-            attempts=config.http_attempts,
-        )
-        metrics = CaptureMetrics(metrics_labels) if metrics_labels is not None else None
-        store = MooncakeSnapshotStore.connect(
-            msgspec.to_builtins(config.store),
-            replica_num=config.replica_num,
-            max_receive_bytes=config.max_host_bytes,
-        )
-        try:
-            coordinator = cls(
+
+        def prepare_local():
+            resources = CaptureResources.prepare(
                 config=config,
-                teacher=teacher,
                 kv=kv,
-                exporter=exporter,
-                req_to_token=req_to_token,
-                store=store,
-                catalog=catalog,
-                enable_overlap=enable_overlap,
-                metrics=metrics,
-                capture_mode=(
-                    "speculative_accepted_target_path"
-                    if get_spec().speculative_algorithm == "DSPARK"
-                    else "autoregressive"
-                ),
+                partition=layout.partition(OWNER),
+                source_pool=pool,
             )
-        except Exception:
-            store.close()
-            raise
+            try:
+                if resources.exporter.device.type != "cuda":
+                    raise ContractError("serving capture currently requires CUDA")
+                metrics = (
+                    CaptureMetrics(metrics_labels)
+                    if metrics_labels is not None
+                    else None
+                )
+                return cls(
+                    config=config,
+                    teacher=teacher,
+                    kv=kv,
+                    req_to_token=req_to_token,
+                    resources=resources,
+                    enable_overlap=enable_overlap,
+                    metrics=metrics,
+                    capture_mode=capture_mode,
+                    autostart=False,
+                )
+            except Exception:
+                resources.close()
+                raise
+
+        if startup_group is None:
+            coordinator = prepare_local()
+        else:
+            coordinator = coordinate_resource_startup(
+                group=startup_group,
+                build_policy=lambda: (
+                    config.startup_policy,
+                    teacher,
+                    kv,
+                    layout,
+                    capture_mode,
+                    enable_overlap,
+                ),
+                prepare_local=prepare_local,
+            )
+        coordinator.activate()
         atexit.register(coordinator.close)
         return coordinator
 
@@ -188,41 +194,36 @@ class CaptureCoordinator:
         config,
         teacher,
         kv,
-        exporter,
+        exporter=None,
         req_to_token,
-        store,
-        catalog,
+        store=None,
+        catalog=None,
         pin_memory=True,
         capture_mode="autoregressive",
         enable_overlap=False,
         metrics=None,
+        resources=None,
+        autostart=True,
     ):
         self.config, self.teacher, self.kv = config, teacher, kv
         self.capture_mode = capture_mode
         self.enable_overlap = enable_overlap
-        self.exporter, self.req_to_token = exporter, req_to_token
-        self.store, self.catalog = store, catalog
-        self.pool = HostBufferPool(
+        self.resources = resources or CaptureResources.from_connected(
+            config=config,
             kv=kv,
-            max_tokens=config.max_sample_tokens,
-            slots=config.max_inflight_samples,
-            max_bytes=config.max_host_bytes,
-            registrar=store,
-            manifest_bytes=config.manifest_buffer_bytes,
+            exporter=exporter,
+            store=store,
+            catalog=catalog,
             pin_memory=pin_memory,
-            device=exporter.device,
-            kv_d2h_batch_tokens=config.kv_d2h_batch_tokens,
-            max_device_bytes=config.max_device_bytes,
         )
-        try:
-            self.journal = PublicationJournal(config.journal_directory)
-        except Exception:
-            self.pool.close()
-            raise
-        self.writer = SnapshotWriter(store, catalog, self.journal)
+        self.exporter, self.req_to_token = self.resources.exporter, req_to_token
+        self.store, self.catalog = self.resources.store, self.resources.catalog
+        self.pool, self.journal = self.resources.pool, self.resources.journal
+        self.writer = SnapshotWriter(self.store, self.catalog, self.journal)
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.writer_stop = threading.Event()
+        self.activation = threading.Event()
         self.available = deque()
         self.records: dict[str, CaptureReservation] = {}
         self.requests: dict[str, Any] = {}
@@ -235,21 +236,46 @@ class CaptureCoordinator:
         self.metrics = metrics
         self.metrics_thread = (
             threading.Thread(
-                target=self._metrics_loop, name="training-capture-metrics", daemon=True
+                target=self._after_activation,
+                args=(self._metrics_loop,),
+                name="training-capture-metrics",
+                daemon=True,
             )
             if metrics is not None
             else None
         )
         self.writer_thread = threading.Thread(
-            target=self._writer_loop, name="training-snapshot-writer", daemon=True
+            target=self._after_activation,
+            args=(self._writer_loop,),
+            name="training-snapshot-writer",
+            daemon=True,
         )
         self.lease_thread = threading.Thread(
-            target=self._lease_loop, name="training-capture-leases", daemon=True
+            target=self._after_activation,
+            args=(self._lease_loop,),
+            name="training-capture-leases",
+            daemon=True,
         )
-        self.writer_thread.start()
-        self.lease_thread.start()
-        if self.metrics_thread is not None:
-            self.metrics_thread.start()
+        try:
+            self.writer_thread.start()
+            self.lease_thread.start()
+            if self.metrics_thread is not None:
+                self.metrics_thread.start()
+        except Exception:
+            self.close()
+            raise
+        if autostart:
+            self.activate()
+
+    def _after_activation(self, callback):
+        self.activation.wait()
+        if not self.stop.is_set():
+            callback()
+
+    def activate(self):
+        if self.stop.is_set() or self.closed:
+            raise ContractError("cannot activate a stopped capture coordinator")
+        self.activation.set()
 
     def _count(self, name):
         with self.lock:
@@ -943,9 +969,11 @@ class CaptureCoordinator:
             return
         self.disable("producer_shutdown")
         self.stop.set()
-        if self.metrics_thread is not None:
+        self.activation.set()
+        if self.metrics_thread is not None and self.metrics_thread.ident is not None:
             self.metrics_thread.join(timeout=5)
-        self.lease_thread.join(timeout=20)
+        if self.lease_thread.ident is not None:
+            self.lease_thread.join(timeout=20)
         if self.lease_thread.is_alive():
             logger.error(
                 "Capture lease thread did not stop; retaining registered buffers"
@@ -957,11 +985,11 @@ class CaptureCoordinator:
             record.invalid_reason = "producer_shutdown"
             self._queue_record(record)
         self.writer_stop.set()
-        self.writer_thread.join(timeout=20)
+        if self.writer_thread.ident is not None:
+            self.writer_thread.join(timeout=20)
         if self.writer_thread.is_alive():
             logger.error("Capture writer did not stop; retaining registered buffers")
             return
         # Client close is the transport stop barrier, including quarantined slots.
-        self.store.close()
-        self.journal.close()
+        self.resources.close()
         self.closed = True

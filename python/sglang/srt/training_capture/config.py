@@ -141,6 +141,21 @@ class CaptureConfig(StrictStruct):
     def fingerprint(self):
         return digest_bytes(canonical_bytes(self))
 
+    @property
+    def startup_policy(self):
+        """Common request/storage policy, excluding rank-local capacity and paths."""
+        policy = msgspec.to_builtins(self)
+        for name in ("journal_directory", "max_host_bytes", "max_device_bytes"):
+            del policy[name]
+        for name in (
+            "local_hostname",
+            "local_buffer_size",
+            "global_segment_size",
+            "rdma_devices",
+        ):
+            del policy["store"][name]
+        return policy
+
 
 def validate_capture_server_args(args) -> None:
     """Called during ServerArgs validation, before loading target weights."""
