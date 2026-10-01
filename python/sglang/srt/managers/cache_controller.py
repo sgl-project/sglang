@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+    from sglang.srt.mem_cache.mla_host_dedup import MLAHostDedupContext
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -81,13 +82,19 @@ class LayerLoadingEvent:
 
 
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(
+        self,
+        num_layers: int,
+        on_layer_ready: Optional[Callable[[int, int], None]] = None,
+    ):
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        # Called on the forward stream after each wait, with (consumer, layer).
+        self.on_layer_ready = on_layer_ready
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -103,6 +110,8 @@ class LayerDoneCounter:
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
+        if self.on_layer_ready is not None:
+            self.on_layer_ready(self.consumer_index, threshold)
 
     def reset(self):
         self.producer_index = -1
@@ -311,6 +320,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        mla_dedup_context: Optional[MLAHostDedupContext] = None,
     ):
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
@@ -356,7 +366,17 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.transfer_layer_id_max = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+        # --enable-mla-hicache-host-dedup: each rank loads its own layers, and the
+        # forward broadcasts every loaded layer from its owner as it waits for it.
+        self.mla_dedup = mla_dedup_context
+        self.layer_done_counter = LayerDoneCounter(
+            self.transfer_layer_id_max,
+            on_layer_ready=(
+                None
+                if mla_dedup_context is None
+                else mla_dedup_context.broadcast_ready_layers
+            ),
+        )
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -543,6 +563,11 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        if self.mla_dedup is not None:
+            raise RuntimeError(
+                "Cannot attach a storage backend with MLA host dedup: each rank's "
+                "host pool holds only its own layers."
+            )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -989,6 +1014,10 @@ class HiCacheController:
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
+        if self.mla_dedup is not None:
+            self.mla_dedup.start_load(
+                producer_id, op.device_indices, completion.finish_event
+            )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "load"), completion.finish_event

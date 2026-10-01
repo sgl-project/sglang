@@ -558,6 +558,7 @@ class TestDeclaredStackStructure(CustomTestCase):
                     hicache_write_policy="write_through",
                     hicache_io_backend="kernel",
                     hicache_host_memory_mode="cache",
+                    enable_mla_hicache_host_dedup=False,
                 ),
             ),
         ):

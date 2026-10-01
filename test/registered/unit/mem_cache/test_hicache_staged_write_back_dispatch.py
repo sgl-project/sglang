@@ -236,6 +236,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller._transfer_num_bytes.return_value = 0
         controller.l2_transfer_engine = mock.Mock()
         controller.load_fence_stream = None
+        controller.mla_dedup = None
         completion = SimpleNamespace(
             start_event=object(), finish_event=object(), timing_enabled=False
         )

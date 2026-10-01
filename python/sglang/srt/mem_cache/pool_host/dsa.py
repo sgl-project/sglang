@@ -158,6 +158,19 @@ class DSAIndexerPoolHost(HostKVCache):
             for layer in range(owned_start, owned_end)
             if declared is None or layer in declared
         ]
+        owners = anchor_host.dedup_owners
+        if owners is not None:
+            # Rotating MLA host dedup: keep only the index-key layers this rank owns.
+            self._live_target_layers = [
+                layer
+                for i, layer in enumerate(self._live_target_layers)
+                if owners.indexer_owner(i) == owners.rank
+            ]
+            logger.info(
+                "MLA host dedup: rank %d stores indexer host layers %s",
+                owners.rank,
+                self._live_target_layers,
+            )
         self._device_to_host_layer = {
             layer: i for i, layer in enumerate(self._live_target_layers)
         }

@@ -520,5 +520,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_decoder_swa_bounded_replay",
     "enable_response_store",
     "disaggregation_decode_host_receive_threshold",
+    "enable_mla_hicache_host_dedup",
 )
 # fmt: on
