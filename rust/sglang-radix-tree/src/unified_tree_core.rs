@@ -156,9 +156,9 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub swa_branching_seqlen: Option<usize>,
     /// The donated mamba slot for the insert target leaf; None on non-mamba trees.
     pub mamba_value: Option<Tensor>,
-    /// Whether this insert records a request end: the walked path's hit
-    /// counts are bumped (and checked against the write-through threshold).
-    pub record_end: bool,
+    /// The inserting request already inserted [0, here); only the nodes past it
+    /// count a hit (and get threshold-checked), so a request counts each node once.
+    pub inserted_len: usize,
     /// Eviction priority floor applied along the walked path.
     pub priority: i64,
     /// Whether the result should report which incoming ranges the tree retained.
@@ -246,7 +246,7 @@ pub struct InsertWalkState<K: ChildKeyType> {
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
     mamba_value: Option<Tensor>,
-    record_end: bool,
+    inserted_len: usize,
     priority: i64,
     track_adopted_ranges: bool,
     total_prefix_length: usize,
@@ -1491,9 +1491,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Increment hit count; check whether a write backup should be fired.
-    pub fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_, record_end: bool) -> bool {
+    pub fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_, first_insert: bool) -> bool {
         let node = self.arena.node_mut(node_id);
-        if node.evicted() || !record_end {
+        if node.evicted() || !first_insert {
             return false;
         }
         if self.is_write_back {
@@ -1610,7 +1610,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
-            record_end: params.record_end,
+            inserted_len: params.inserted_len,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
             total_prefix_length: 0,
@@ -1772,7 +1772,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
-            record_end: state.record_end,
+            inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
         };
@@ -1860,7 +1860,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             }
         }
 
-        if self.inc_hit_count_and_check_(node_id, state.record_end) {
+        let node_end = state.total_prefix_length + prefix_len;
+        if self.inc_hit_count_and_check_(node_id, node_end > state.inserted_len) {
             let backup = self
                 .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ false);
             state.pending_actions.push(CacheAction::BackupKV(backup));
@@ -1929,7 +1930,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
-            record_end: state.record_end,
+            inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
         };
@@ -1966,7 +1967,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         target_node_id: NodeIdx_,
     ) -> bool {
         if state.is_new_leaf {
-            return self.inc_hit_count_and_check_(target_node_id, state.record_end);
+            // The new leaf runs to the end of the aligned key.
+            return self.inc_hit_count_and_check_(
+                target_node_id,
+                state.aligned_key_len > state.inserted_len,
+            );
         }
 
         let node = self.arena.node(target_node_id);

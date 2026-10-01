@@ -706,7 +706,6 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
         params = InsertParams(
             key=RadixKey(array("q", tokens)),
             value=value[: len(tokens)],
-            record_end=True,
         )
         if cache.supports_mamba():
             req = Req(
@@ -1120,7 +1119,6 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
                 key=key,
                 value=value[: len(key)],
                 session_id=session_id,
-                record_end=True,
             )
         )
 
@@ -1538,9 +1536,7 @@ class UnifiedRadixCacheSuite:
         """Insert tokens, attaching mamba data when the config has mamba."""
         key = RadixKey(array("q", tokens), extra_key=extra_key, cache_salt=cache_salt)
         value = self._alloc(allocator, len(tokens))
-        params = InsertParams(
-            key=key, value=value[: len(key)], priority=priority, record_end=True
-        )
+        params = InsertParams(key=key, value=value[: len(key)], priority=priority)
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
@@ -1868,7 +1864,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), 0)
         cache.sanity_check()
 
-    def test_checkpoint_req(self):
+    def test_insert_req_mid_flight(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         req = self._make_req(req_to_token_pool)
@@ -1890,7 +1886,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
-        cache.checkpoint_req(req, up_to=req.extend_range.end)
+        cache.insert_req(req, up_to=req.extend_range.end)
 
         self.assertGreater(len(req.prefix_indices), 0)
         self.assertEqual(req.kv.cache_protected_len, len(req.prefix_indices))
@@ -1928,7 +1924,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
 
-        cache.checkpoint_req(req, up_to=req.extend_range.end)
+        cache.insert_req(req, up_to=req.extend_range.end)
 
         (first,) = _node_children(cache, cache.root_node_handle())
         self.assertEqual(_node_key_length(cache, first), evicted_len)
@@ -2155,7 +2151,7 @@ class UnifiedRadixCacheSuite:
 
         full_available_before_insert = allocator.full_attn_allocator.available_size()
 
-        cache.checkpoint_req(req, up_to=req.extend_range.end)
+        cache.insert_req(req, up_to=req.extend_range.end)
 
         self.assertEqual(
             allocator.full_attn_allocator.available_size(),
@@ -2844,7 +2840,7 @@ class UnifiedRadixCacheSuite:
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.checkpoint_req(req, up_to=req.extend_range.end)
+            cache.insert_req(req, up_to=req.extend_range.end)
 
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
         expected_evicted = (pre_len - 1) - cushion
@@ -2931,7 +2927,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.checkpoint_req(req, up_to=req.extend_range.end)
+            cache.insert_req(req, up_to=req.extend_range.end)
 
         self.assertEqual(
             req.kv.get_evicted_seqlen(ComponentType.SWA),
@@ -6044,7 +6040,6 @@ class UnifiedRadixCacheSuite:
                 key=RadixKey(array("q", seq)),
                 value=value,
                 component_evicted_seqlens={ComponentType.SWA: ps},
-                record_end=True,
             )
         )
         self.assertEqual(result.prefix_len, 0)
@@ -9268,7 +9263,6 @@ class TestResumableInsertWalk(_InsertWalkSuite):
         params = InsertParams(
             key=RadixKey(array("q", [1, 2, 3, 4])),
             value=self._alloc(allocator, 4),
-            record_end=True,
         )
         step = cache.tree_core.begin_insert(params)
         self.assertIsNone(step.result)
@@ -10214,7 +10208,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
 
 
 class TestSWAWindowUnderBigramKey(CustomTestCase):
-    """`checkpoint_req` has to leave the leaf it inserts holding a full
+    """`insert_req` has to leave the leaf it inserts holding a full
     sliding window of live SWA. Otherwise the match that follows the insert
     refuses that leaf, `cache_protected_len` never advances, and the next insert
     frees KV the tree already owns as if it were the request's duplicate.
@@ -10270,7 +10264,7 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         req.extra_key = None
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.checkpoint_req(req, up_to=req.extend_range.end)
+            cache.insert_req(req, up_to=req.extend_range.end)
 
         boundary = (seq_len - 1) // page_size * page_size
         self.assertGreaterEqual(

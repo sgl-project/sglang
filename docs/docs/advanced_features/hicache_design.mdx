@@ -124,7 +124,7 @@ The write-back mechanism is responsible for moving frequently accessed KV caches
 **Configurable Write-back Policies**: HiCache supports three write-back strategies:
 
 * **write_through**: Every access is immediately written back to the next level. When bandwidth is sufficient, this strategy provides the strongest caching benefit.
-* **write_through_selective**: A prefix is written back once the first request using it finishes. On a prefill node in PD disaggregation it additionally keeps speculative (pending-bootstrap) KV unpublished until the bootstrap succeeds.
+* **write_through_selective**: Data is written back only after the access frequency exceeds a threshold. This strategy backs up only hot data, reducing I/O overhead.
 * **write_back**: Data is written back to the next level only when it is evicted from the upper level. This strategy alleviates storage pressure and is suitable for scenarios where storage capacity is limited but memory utilization must be maximized.
 
 **Cross-instance Sharing**: When data is written back from L2 to L3, only data not already present in L3 is transferred. KV caches stored in L3 can then be shared across all SGLang instances in the cluster (depending on the L3 backend implementation), significantly improving cache hit rates within the same memory budget.
@@ -193,7 +193,7 @@ Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM 
 
 - **`--hicache-write-policy {write_back,write_through,write_through_selective}`**: Controls how data is written from faster to slower memory tiers. See [Data Write-back](#data-write-back) for details.
   - `write_through`: Immediately writes data to all tiers (strongest caching benefits)
-  - `write_through_selective`: Writes a prefix back once the first request using it finishes; keeps speculative KV unpublished on PD prefill nodes
+  - `write_through_selective`: Uses hit-count tracking to back up only frequently accessed data
   - `write_back`: Writes data back to slower tiers only when eviction is needed (reduces I/O load)
 
 - **`--hicache-io-backend {direct,kernel}`**: Choose the I/O backend for KV cache transfer between CPU and GPU. See [Data Transfer Optimization](#data-transfer-optimization) for details.

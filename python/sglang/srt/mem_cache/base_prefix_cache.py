@@ -93,10 +93,9 @@ class InsertParams:
     component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
         default_factory=dict, kw_only=True
     )
-    # The insert that hands a finished request to the tree: hit counts on the
-    # walked path count request ends, so only that insert bumps them (and
-    # checks the write-through threshold).
-    record_end: bool = False
+    # The inserting request already inserted [0, here) (req.kv.cache_inserted_len);
+    # only the nodes past it count a hit, so a request counts each node once.
+    inserted_len: int = 0
     priority: int = 0
     session_id: Optional[str] = None
     track_adopted_ranges: bool = False
@@ -459,17 +458,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     @abstractmethod
     def insert_req(self, req: Req, *, up_to: int, **kwargs):
-        """Hand a finished request's KV up to row position ``up_to`` to the
-        tree: insert what can be keyed and advance ``cache_protected_len``
-        past it. The caller then frees ``[cache_protected_len, up_to)`` and
-        everything after, and unpins; nothing here releases a slot."""
-
-    @abstractmethod
-    def checkpoint_req(self, req: Req, *, up_to: int, **kwargs):
-        """Publish a running request's KV up to row position ``up_to`` so
-        other requests can match it, and repoint the request onto the tree's
-        copy; the request keeps running on the row. Nothing is counted as a
-        cache hit here."""
+        """Insert the request's KV up to row position ``up_to`` into the tree,
+        repoint the row onto the tree's copy, re-anchor ``req.last_node`` on
+        the node the insert ended on and advance ``cache_protected_len``.
+        Called at every checkpoint of a running request and once more when
+        it finishes (``req.finished()``), when the tree also takes over the
+        component state the request no longer needs. Nothing here frees a
+        slot: ``release_kv_cache`` frees ``[cache_protected_len, up_to)`` and
+        everything after, and unpins."""
 
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
         """Give back ascending, disjoint, half-open row-position ranges

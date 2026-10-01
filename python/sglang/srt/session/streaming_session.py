@@ -325,7 +325,7 @@ class StreamingSession(BasePrefixCache):
 
         return True
 
-    def try_checkpoint_req(self, req: Req, *, up_to: int, **kwargs) -> bool:
+    def try_insert_req(self, req: Req, *, up_to: int, **kwargs) -> bool:
         """A first turn checkpoints into the tree like any request (its
         prompt prefix is tree-owned and the slot inherits that lock); later
         turns run on the slot's KV, so only the chunk cursor is kept."""
@@ -350,12 +350,9 @@ class StreamingSession(BasePrefixCache):
         self.inner.on_release(req, inserted=inserted)
 
     def insert_req(self, req: Req, **kwargs):
-        self.inner.insert_req(req, **kwargs)
-
-    def checkpoint_req(self, req: Req, **kwargs):
-        if self.try_checkpoint_req(req, **kwargs):
+        if self.try_insert_req(req, **kwargs):
             return
-        self.inner.checkpoint_req(req, **kwargs)
+        self.inner.insert_req(req, **kwargs)
 
     def unpin(self, req: Req) -> None:
         self.inner.unpin(req)

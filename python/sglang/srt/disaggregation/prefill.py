@@ -1130,6 +1130,8 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        if req.finished_reason is None:
+            req.finished_reason = FINISH_LENGTH(length=0)
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):

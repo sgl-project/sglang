@@ -390,8 +390,10 @@ class FlexKVRadixCache(RadixCache):
             self._load_markers.pop(req.cache_request_handle, None)
 
     def insert_req(self, req: Req, *, up_to: int) -> None:  # type: ignore[override]
-        """Base insert_req then fire an async FlexKV store."""
+        """Base insert_req; a finished request also fires an async FlexKV store."""
         super().insert_req(req, up_to=up_to)
+        if not req.finished():
+            return
 
         # Compute the committed prefix.
         topk = get_spec().speculative_eagle_topk

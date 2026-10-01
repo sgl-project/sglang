@@ -81,7 +81,6 @@ def _insert(core: RustUnifiedTreeCore, token_ids: list[int], indices: list[int])
         InsertParams(
             key=_key(token_ids),
             value=torch.tensor(indices, dtype=torch.int64),
-            record_end=True,
         ),
     )
 
@@ -999,7 +998,6 @@ def test_insert_suspends_at_a_backup_barrier_through_the_binding():
         InsertParams(
             key=_key([1, 2, 3, 4, 5]),
             value=torch.tensor([20, 21, 22, 13, 14], dtype=torch.int64),
-            record_end=True,
         )
     )
     # The crossing node's backup is a barrier: the walk stays suspended in Rust.
