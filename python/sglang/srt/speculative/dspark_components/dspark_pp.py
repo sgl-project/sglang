@@ -65,9 +65,9 @@ def validate_pd_contract(
         )
     if not decode_capable:
         return
-    if decode_pp_size != 2 or prefill_pp_size not in (1, 2):
+    if decode_pp_size != 2 or prefill_pp_size != 2:
         raise ValueError(
-            "PP DSpark requires Decode PP2 and Prefill PP1 or PP2, got "
+            "PP DSpark requires Decode PP2 and Prefill PP2, got "
             f"decode PP{decode_pp_size} and prefill PP{prefill_pp_size}"
         )
 

@@ -38,6 +38,7 @@ from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2  # noqa: E402
 from sglang.srt.speculative.dspark_components.dspark_pp import (  # noqa: E402
     draft_owner,
+    validate_pd_contract,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (  # noqa: E402
     TargetVerifyExecutor,
@@ -51,6 +52,25 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestDSparkPPContext(CustomTestCase):
+    def test_pd_contract_requires_pp2_on_both_sides(self):
+        validate_pd_contract(True, True, 2, 2)
+        for decode_pp_size, prefill_pp_size in ((2, 1), (1, 2), (4, 2)):
+            with (
+                self.subTest(
+                    decode_pp_size=decode_pp_size,
+                    prefill_pp_size=prefill_pp_size,
+                ),
+                self.assertRaisesRegex(
+                    ValueError, "requires Decode PP2 and Prefill PP2"
+                ),
+            ):
+                validate_pd_contract(
+                    True,
+                    True,
+                    decode_pp_size,
+                    prefill_pp_size,
+                )
+
     def test_batched_result_relay_gate_is_cuda_pp2_replicated_dspark_only(self):
         cases = [
             (True, 2, True, True, True),

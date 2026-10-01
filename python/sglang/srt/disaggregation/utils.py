@@ -463,6 +463,7 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
+
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
@@ -917,7 +918,6 @@ def build_transfer_entry_pairs(
     n_src: int,
     n_dst: int,
     allow_positional_fallback: bool = False,
-    allow_src_superset: bool = False,
 ) -> List[Tuple[int, int]]:
     """Pair prefill-local transfer entries with decode entries by layer id."""
     if n_src == 0:
@@ -938,19 +938,6 @@ def build_transfer_entry_pairs(
             )
         # Layer ids can repeat across tensor groups (for example K/V or multiple
         # state tensors), so pair occurrences in order rather than by plain lookup.
-        if allow_src_superset:
-            src_pos = {}
-            for i, lid in enumerate(src_layer_ids):
-                src_pos.setdefault(lid, deque()).append(i)
-            pairs = []
-            for j, lid in enumerate(dst_layer_ids):
-                if not src_pos.get(lid):
-                    raise RuntimeError(
-                        f"Prefill peer is missing a transfer entry for model layer {lid}"
-                    )
-                pairs.append((src_pos[lid].popleft(), j))
-            return pairs
-
         dst_pos = {}
         for j, lid in enumerate(dst_layer_ids):
             dst_pos.setdefault(lid, deque()).append(j)
@@ -991,9 +978,11 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
-    if not hasattr(token_to_kv_pool, "get_kv_layer_ids"):
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
         return []
-    layer_ids = list(token_to_kv_pool.get_kv_layer_ids())
+    layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
         return layer_ids
 
@@ -1122,49 +1111,6 @@ def append_state_component(
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
     kv_args.state_layer_ids.append(layer_ids or [])
-
-
-def pack_state_types(state_types) -> bytes:
-    return ",".join(
-        state_type.value if hasattr(state_type, "value") else str(state_type)
-        for state_type in (state_types or [])
-    ).encode("ascii")
-
-
-def unpack_state_types(data: bytes):
-    from sglang.srt.disaggregation.base.conn import StateType
-
-    if not data:
-        return []
-    return [StateType(value) for value in data.decode("ascii").split(",") if value]
-
-
-def resolve_state_component_dst_index(
-    src_state_types,
-    dst_state_types,
-    src_index: int,
-    *,
-    allow_missing: bool = False,
-) -> Optional[int]:
-    """Map a source component to the same StateType occurrence at destination."""
-    if not dst_state_types:
-        return src_index
-    if not src_state_types or src_index >= len(src_state_types):
-        raise RuntimeError("State component metadata is inconsistent between PD peers")
-
-    state_type = src_state_types[src_index]
-    occurrence = sum(item == state_type for item in src_state_types[: src_index + 1])
-    seen = 0
-    for dst_index, dst_state_type in enumerate(dst_state_types):
-        if dst_state_type == state_type:
-            seen += 1
-            if seen == occurrence:
-                return dst_index
-    if allow_missing:
-        return None
-    raise RuntimeError(
-        f"Decode peer is missing state component {state_type!s} occurrence {occurrence}"
-    )
 
 
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
@@ -1436,18 +1382,8 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
-            state_layer_ids = (
-                token_to_kv_pool.get_state_layer_ids()
-                if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-                else None
-            )
             append_state_component(
-                kv_args,
-                StateType.SWA,
-                data_ptrs,
-                data_lens,
-                item_lens,
-                layer_ids=state_layer_ids,
+                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
@@ -1481,11 +1417,6 @@ def setup_state_kv_args(
                         ring_ptrs,
                         ring_lens,
                         ring_item_lens,
-                        layer_ids=(
-                            token_to_kv_pool.get_unified_swa_ring_layer_ids()
-                            if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-                            else None
-                        ),
                     )
             if hasattr(token_to_kv_pool, "get_request_state_buf_infos"):
                 c128_ptrs, c128_lens, c128_item_lens = (
@@ -1498,7 +1429,6 @@ def setup_state_kv_args(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
-                        layer_ids=token_to_kv_pool.get_request_state_layer_ids(),
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (

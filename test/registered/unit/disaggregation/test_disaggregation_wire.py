@@ -39,14 +39,11 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     get_qsa_pending_state_indices,
-    pack_state_types,
     poll_and_all_reduce,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_with_staging,
-    resolve_state_component_dst_index,
     setup_state_kv_args,
     should_send_replicated_state,
-    unpack_state_types,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
@@ -74,17 +71,6 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
-    def test_state_types_roundtrip_and_match_occurrences(self):
-        src = [StateType.SWA, StateType.DSV4_REQUEST_STATE, StateType.SWA]
-        dst = [StateType.SWA, StateType.SWA]
-
-        self.assertEqual(unpack_state_types(pack_state_types(src)), src)
-        self.assertEqual(resolve_state_component_dst_index(src, dst, 0), 0)
-        self.assertEqual(resolve_state_component_dst_index(src, dst, 2), 1)
-        self.assertIsNone(
-            resolve_state_component_dst_index(src, dst, 1, allow_missing=True)
-        )
-
     def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
         manager = object.__new__(MooncakeKVManager)
         sender = object.__new__(MooncakeKVSender)
@@ -135,18 +121,8 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
         self.assertEqual(info.dst_kv_item_lens, [])
-        self.assertEqual(info.dst_state_types, [])
-        info = KVArgsRegisterInfo.from_zmq(
-            msg
-            + [
-                struct.pack("Q", 7),
-                struct.pack("Q", 128),
-                pack_state_types([StateType.SWA]),
-            ]
-        )
-        self.assertEqual(info.staging.slot_layer_ids, [7])
+        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
         self.assertEqual(info.dst_kv_item_lens, [128])
-        self.assertEqual(info.dst_state_types, [StateType.SWA])
 
     def test_int_lists_roundtrip(self):
         cases = [
@@ -511,7 +487,6 @@ class TestQwen4StateWire(unittest.TestCase):
             dst_state_item_lens=[[16]],
             dst_state_dim_per_tensor=[[]],
             dst_state_layer_ids=[[24]],
-            dst_state_types=[StateType.QSA_COMPRESSED],
         )
         manager = self._qsa_compressed_manager(src_item_len=32)
         with self.assertRaisesRegex(RuntimeError, "QSA_COMPRESSED layout differs"):
@@ -1355,9 +1330,6 @@ def _make_dsv4_target(*, unified, mapping=None):
         _buf_infos(12) if unified else ([], [], [])
     )
     pool.get_request_state_buf_infos = lambda: ([], [], [])
-    pool.get_state_layer_ids = lambda: [0]
-    pool.get_unified_swa_ring_layer_ids = lambda: [0]
-    pool.get_request_state_layer_ids = lambda: []
     return pool
 
 

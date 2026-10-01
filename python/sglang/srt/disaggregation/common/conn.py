@@ -175,10 +175,7 @@ class CommonKVManager(BaseKVManager):
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.dspark_pp_owner_version = int(
             (get_spec().speculative_algorithm or "").upper() == "DSPARK"
-            and (
-                get_parallel().pp_size == 1
-                or get_spec().speculative_dspark_pp_replicated_draft
-            )
+            and get_spec().speculative_dspark_pp_replicated_draft
         )
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
@@ -217,11 +214,6 @@ class CommonKVManager(BaseKVManager):
         )
         self.pp_size = get_parallel().pp_size
         self.pp_rank = self.kv_args.pp_rank
-        self.allow_src_superset_transfer = (
-            self.disaggregation_mode == DisaggregationMode.PREFILL
-            and bool(self.dspark_pp_owner_version)
-            and self.pp_size == 1
-        )
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or get_parallel().enable_dsa_cache_layer_split
@@ -1093,22 +1085,15 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
-        # PP rank mapping. DSpark can fan one full-model prefill rank out to both
-        # replicated-draft decode stages; the entry metadata selects each stage's
-        # target-layer subset.
+        # PP rank mapping — decode pp size should be equal to prefill pp size or 1
+        assert self.pp_size == info.pp_size or self.pp_size == 1, (
+            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
+        )
         if info.pp_size == self.pp_size:
             target_pp_ranks = [self.pp_rank]
-        elif self.pp_size == 1:
+        else:
             target_pp_ranks = list(range(info.pp_size))
             required_prefill_response_num *= info.pp_size // self.pp_size
-        elif self.dspark_pp_owner_version and self.pp_size == 2 and info.pp_size == 1:
-            target_pp_ranks = [0]
-            required_dst_info_num *= self.pp_size
-        else:
-            raise ValueError(
-                "Unsupported PD pipeline topology: "
-                f"decode PP{self.pp_size}, prefill PP{info.pp_size}"
-            )
 
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks
