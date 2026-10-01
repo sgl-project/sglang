@@ -335,6 +335,9 @@ def gather_fp4_index_k(
     ue8m0 scales packed int32 ``[n]``), the layout ``quantize_fp4_indexer_tensor``
     returns."""
     assert cache.shape[1] == page_size * INDEX_K_SLOT_BYTES and cache.stride(1) == 1
+    # The kernel addresses slots as `slots + rows`, so a strided view would be read
+    # as if its elements were packed.
+    assert slots.is_contiguous()
     words = cache.view(torch.int32)
     n = slots.shape[0]
     payload = torch.empty((n, 16), device=cache.device, dtype=torch.int32)
