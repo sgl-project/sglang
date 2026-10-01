@@ -390,7 +390,6 @@ def _chunk_state_varlen_kernel(
     # - if start_idx < pid_c * chunk_size, then we need to take the past_states_ptrs
     # - if state_idx >= pid * chunk_size, then we need to insert initstates
     if (start_idx < pid_c * chunk_size) or (HAS_INITSTATES):  # first chunk
-
         dA_cs_boundary = 0.0  # default
 
         if not HAS_INITSTATES:
@@ -399,7 +398,6 @@ def _chunk_state_varlen_kernel(
                 + offs_n[None, :] * stride_chunk_states_dstate
             )
         else:
-
             # - this seems repetitive, buts its to help the compiler
             if start_idx < pid_c * chunk_size:
                 past_states_ptrs = chunk_states_ptr + (

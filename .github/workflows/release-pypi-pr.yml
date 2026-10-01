@@ -17,7 +17,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     outputs:
-      wheel_version: ${{ steps.gen_version.outputs.wheel_version }}
+      wheel_version: ${{ steps.wheel.outputs.wheel_version }}
+      wheel_filename: ${{ steps.wheel.outputs.wheel_filename }}
       commit_hash: ${{ steps.gen_version.outputs.commit_hash }}
       build_date: ${{ steps.gen_version.outputs.build_date }}
     steps:
@@ -34,7 +35,7 @@ jobs:
       - name: Generate PR wheel version
         id: gen_version
         run: |
-          LATEST_TAG=$(python3 scripts/release/get_version_tag.py)
+          LATEST_TAG=$(python3 scripts/release/get_version_tag.py --tag-only)
           BASE_VERSION=${LATEST_TAG#v}
           echo "Latest release tag: ${LATEST_TAG}"
 
@@ -57,10 +58,12 @@ jobs:
           echo "Commit: ${COMMIT_HASH}"
           echo "Build date: ${BUILD_DATE}"
 
-          echo "wheel_version=${WHEEL_VERSION}" >> $GITHUB_OUTPUT
-          echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
-          echo "base_version=${BASE_VERSION}" >> $GITHUB_OUTPUT
-          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+          {
+            echo "wheel_version=${WHEEL_VERSION}"
+            echo "commit_hash=${COMMIT_HASH}"
+            echo "base_version=${BASE_VERSION}"
+            echo "build_date=${BUILD_DATE}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Update pyproject.toml with PR wheel version
         run: |
@@ -79,18 +82,25 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          cd python
-          pip install build wheel setuptools
+          pip install \
+            auditwheel build patchelf wheel "setuptools>=61.0" \
+            "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.13.0"
 
       - name: Build wheel
         run: |
           cd python
           cp ../README.md ../LICENSE .
-          python3 -m build --wheel
+          python3 -m build --wheel --no-isolation
 
           # List built wheels
           echo "Built wheel:"
           ls -lh dist/
+
+      - name: Repair and smoke-test wheel
+        id: wheel
+        run: |
+          python3 scripts/release/prepare_sglang_wheel.py python/dist \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
@@ -127,7 +137,7 @@ jobs:
           prerelease: true
           body: |
             PR wheel build from PR #${{ inputs.pr_number }}
-            Commit: ${{ github.sha }}
+            Commit: ${{ needs.build-pr-wheel.outputs.commit_hash }}
             Build date: ${{ needs.build-pr-wheel.outputs.build_date }}
             Version: ${{ needs.build-pr-wheel.outputs.wheel_version }}
 
@@ -143,14 +153,14 @@ jobs:
 
             **Direct installation:**
             ```bash
-            pip install https://github.com/sgl-project/whl/releases/download/pr-${{ inputs.pr_number }}-${{ needs.build-pr-wheel.outputs.build_date }}-${{ needs.build-pr-wheel.outputs.commit_hash }}/sglang-${{ needs.build-pr-wheel.outputs.wheel_version }}-py3-none-any.whl
+            pip install https://github.com/sgl-project/whl/releases/download/pr-${{ inputs.pr_number }}-${{ needs.build-pr-wheel.outputs.build_date }}-${{ needs.build-pr-wheel.outputs.commit_hash }}/${{ needs.build-pr-wheel.outputs.wheel_filename }}
             ```
           files: |
             dist/*.whl
 
       - name: Clone wheel index repository
         run: |
-          git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+          git clone "https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git" sgl-whl
           cd sgl-whl
           git config --local user.name "sglang-bot"
           git config --local user.email "sglangbot@gmail.com"
@@ -165,10 +175,10 @@ jobs:
       - name: Update wheel index
         run: |
           python3 scripts/update_pr_whl_index.py \
-            --pr-number ${{ inputs.pr_number }} \
-            --commit-hash ${{ needs.build-pr-wheel.outputs.commit_hash }} \
-            --wheel-version ${{ needs.build-pr-wheel.outputs.wheel_version }} \
-            --build-date ${{ needs.build-pr-wheel.outputs.build_date }}
+            --pr-number "${{ inputs.pr_number }}" \
+            --commit-hash "${{ needs.build-pr-wheel.outputs.commit_hash }}" \
+            --wheel-version "${{ needs.build-pr-wheel.outputs.wheel_version }}" \
+            --build-date "${{ needs.build-pr-wheel.outputs.build_date }}"
 
       - name: Push wheel index
         run: |

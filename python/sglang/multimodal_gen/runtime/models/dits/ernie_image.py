@@ -228,9 +228,9 @@ class ErnieImageSelfAttention(nn.Module):
 
         tp_size = get_tp_world_size()
         self.num_local_heads = num_heads // tp_size
-        assert (
-            num_heads % tp_size == 0
-        ), f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
+        assert num_heads % tp_size == 0, (
+            f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
+        )
 
         self.to_q = ColumnParallelLinear(
             hidden_size,

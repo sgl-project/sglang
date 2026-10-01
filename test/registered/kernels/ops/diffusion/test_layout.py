@@ -21,6 +21,7 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.diffusion import (
     build_inv_indices,
+    can_use_nearest_upsample_nhwc,
     can_use_usp_merge_heads,
     cat_pad_channels_last_3d,
     dup_up3d_add,
@@ -31,7 +32,9 @@ from sglang.kernels.ops.diffusion import (
 from sglang.kernels.ops.diffusion import (
     fused_causal_conv3d_cat_pad_cuda,
     fused_pack_qkv,
+    fused_pack_segmented_qkv,
     fused_scatter_to_padded,
+    nearest_upsample_nhwc,
     pack_qkv_destination_major,
     usp_merge_heads,
 )
@@ -213,6 +216,28 @@ def test_varlen_pack_matches_index_select(dtype, shape):
 
 @pytest.mark.parametrize("dtype", VARLEN_DTYPES)
 @pytest.mark.parametrize("shape", VARLEN_SHAPES, ids=lambda s: s[0])
+def test_varlen_segmented_pack_matches_materialized_joint(dtype, shape):
+    _, bs, s_txt, s_img, num_heads, head_dim, valid_txt_lens = shape
+    torch.manual_seed(42)
+    indices, _ = _build_meta(_build_mask(bs, s_txt, s_img, valid_txt_lens))
+    txt_qkv = tuple(
+        torch.randn(bs, s_txt, num_heads, head_dim, dtype=dtype, device=DEVICE)
+        for _ in range(3)
+    )
+    img_qkv = tuple(
+        torch.randn(bs, s_img, num_heads, head_dim, dtype=dtype, device=DEVICE)
+        for _ in range(3)
+    )
+
+    got = fused_pack_segmented_qkv(*txt_qkv, *img_qkv, indices)
+    for actual, txt, img in zip(got, txt_qkv, img_qkv, strict=True):
+        joint = torch.cat([txt, img], dim=1)
+        expected = joint.flatten(0, 1).index_select(0, indices)
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", VARLEN_DTYPES)
+@pytest.mark.parametrize("shape", VARLEN_SHAPES, ids=lambda s: s[0])
 def test_varlen_scatter_matches_index_copy(dtype, shape):
     _, bs, s_txt, s_img, num_heads, head_dim, valid_txt_lens = shape
     torch.manual_seed(1)
@@ -342,6 +367,45 @@ def _varlen_path(q, k, v, key_mask, softmax_scale):
         # unit-wise above on every lane.
         pytest.skip(f"FlashAttention varlen v{_fa_backend.fa_ver} unavailable: {exc}")
     return fused_scatter_to_padded(out_unpad, meta["inv_indices"], bs, seq)
+
+
+@pytest.mark.parametrize("dtype", VARLEN_DTYPES)
+def test_fa_dense_scheduler_matches_single_sequence_varlen(dtype):
+    torch.manual_seed(7)
+    batch_size, seq, num_heads, head_dim = 1, 256, 4, 128
+    q, k, v = (
+        torch.randn(
+            batch_size,
+            seq,
+            num_heads,
+            head_dim,
+            dtype=dtype,
+            device=DEVICE,
+        )
+        for _ in range(3)
+    )
+    cu_seqlens = torch.tensor([0, seq], dtype=torch.int32, device=DEVICE)
+    kwargs = dict(
+        max_seqlen_q=seq,
+        max_seqlen_k=seq,
+        softmax_scale=head_dim**-0.5,
+        causal=False,
+        ver=_fa_backend.fa_ver,
+    )
+    try:
+        varlen = flash_attn_varlen_func(
+            q.flatten(0, 1),
+            k.flatten(0, 1),
+            v.flatten(0, 1),
+            cu_seqlens,
+            cu_seqlens,
+            **kwargs,
+        ).view_as(q)
+        dense = flash_attn_varlen_func(q, k, v, None, None, **kwargs)
+    except ImportError as exc:  # pragma: no cover - image-dependent
+        pytest.skip(f"FlashAttention unavailable: {exc}")
+
+    torch.testing.assert_close(dense, varlen, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("dtype", VARLEN_DTYPES)
@@ -595,3 +659,70 @@ def test_wan_cached_conv_chunk_loop_bitwise(pads_temporal_only):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# -------------------------------------------------------------------------
+# Wan-family VAE channels_last nearest upsample (pure gather, bit-exact)
+# -------------------------------------------------------------------------
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "shape,scale", [((1, 192, 30, 52), 2), ((4, 96, 15, 26), 2), ((2, 3, 5, 7), (3, 2))]
+)
+@pytest.mark.parametrize("mode", ["nearest", "nearest-exact"])
+def test_nearest_upsample_nhwc_is_bit_exact(dtype, shape, scale, mode):
+    x = torch.randn(shape, device="cuda", dtype=dtype).contiguous(
+        memory_format=torch.channels_last
+    )
+    sf = (
+        (float(scale), float(scale))
+        if isinstance(scale, int)
+        else tuple(float(v) for v in scale)
+    )
+    assert can_use_nearest_upsample_nhwc(x, sf, mode)
+    ref = F.interpolate(x, scale_factor=sf, mode=mode)
+    out = nearest_upsample_nhwc(x, sf)
+    assert out.shape == ref.shape
+    assert out.stride() == ref.stride()  # layout-identical, not just values
+    assert torch.equal(out, ref)
+
+
+@torch.no_grad()
+def test_nearest_upsample_nhwc_rejects_unsupported_inputs():
+    x = torch.randn(2, 8, 6, 6, device="cuda", dtype=torch.bfloat16)
+    assert not can_use_nearest_upsample_nhwc(x, 2.0, "nearest-exact")  # NCHW
+    x_cl = x.contiguous(memory_format=torch.channels_last)
+    assert can_use_nearest_upsample_nhwc(x_cl, 2.0, "nearest-exact")
+    assert not can_use_nearest_upsample_nhwc(x_cl, 1.5, "nearest-exact")
+    assert not can_use_nearest_upsample_nhwc(x_cl, 2.0, "bilinear")
+    assert not can_use_nearest_upsample_nhwc(x_cl[:, :, :0], 2.0, "nearest")
+    # Malformed scale factors must yield False, never raise.
+    for bad in (
+        (None, 2),
+        float("nan"),
+        float("inf"),
+        (2, float("-inf")),
+        "2",
+        True,
+        (2,),
+    ):
+        assert not can_use_nearest_upsample_nhwc(x_cl, bad, "nearest")
+    # C == 1 is also NCHW-contiguous: aten picks its NCHW kernel and returns a
+    # differently laid-out tensor, so the predicate must reject it.
+    x1 = torch.randn(1, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    assert x1.is_contiguous(memory_format=torch.channels_last)
+    assert not can_use_nearest_upsample_nhwc(x1, 2.0, "nearest-exact")
+    with pytest.raises(ValueError):
+        nearest_upsample_nhwc(x1, 2.0)
+    # Direct calls validate too: no silent autograd drop, no layout surprise.
+    with pytest.raises(ValueError):
+        nearest_upsample_nhwc(x_cl, 1.5)
+    with pytest.raises(ValueError):
+        nearest_upsample_nhwc(x, 2.0)  # NCHW
+    with torch.enable_grad():
+        xg = x_cl.clone().requires_grad_(True)
+        assert not can_use_nearest_upsample_nhwc(xg, 2.0, "nearest")
+        with pytest.raises(ValueError):
+            nearest_upsample_nhwc(xg, 2.0)

@@ -26,6 +26,8 @@ def get_qkv_projections(
     attn: Any,
     hidden_states: torch.Tensor,
     encoder_hidden_states: torch.Tensor | None = None,
+    *,
+    make_contiguous: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -41,10 +43,15 @@ def get_qkv_projections(
     set by those blocks' constructors, and ``use_fused_added_qkv`` whenever
     ``added_kv_proj_dim`` is not ``None`` — direct attribute access so a
     renamed flag fails loudly instead of silently unfusing.
+
+    ``make_contiguous=False`` preserves zero-copy views for a caller that can
+    consume packed projection output strides directly.
     """
     if attn.use_fused_qkv:
         qkv, _ = attn.to_qkv(hidden_states)
-        query, key, value = [t.contiguous() for t in qkv.chunk(3, dim=-1)]
+        query, key, value = qkv.chunk(3, dim=-1)
+        if make_contiguous:
+            query, key, value = [t.contiguous() for t in (query, key, value)]
     else:
         query, _ = attn.to_q(hidden_states)
         key, _ = attn.to_k(hidden_states)
@@ -54,9 +61,11 @@ def get_qkv_projections(
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
         if attn.use_fused_added_qkv:
             added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            encoder_query, encoder_key, encoder_value = [
-                t.contiguous() for t in added_qkv.chunk(3, dim=-1)
-            ]
+            encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
+            if make_contiguous:
+                encoder_query, encoder_key, encoder_value = [
+                    t.contiguous() for t in (encoder_query, encoder_key, encoder_value)
+                ]
         else:
             encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
             encoder_key, _ = attn.add_k_proj(encoder_hidden_states)

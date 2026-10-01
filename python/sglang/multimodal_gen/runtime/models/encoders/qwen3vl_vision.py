@@ -30,12 +30,29 @@ class Qwen3VLVisionOutput:
 
 
 class Qwen3VLVisionRotaryEmbedding(nn.Module):
+    recompute_on_device_change = False
+
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
+        self.dim = dim
+        self.theta = theta
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._inv_freq_device = inv_freq.device
 
     def forward(self, sequence_length: int) -> torch.Tensor:
+        if (
+            self.recompute_on_device_change
+            and self.inv_freq.device != self._inv_freq_device
+        ):
+            # match resident initialization: CPU and GPU pow round differently
+            indices = torch.arange(
+                0, self.dim, 2, dtype=torch.float32, device=self.inv_freq.device
+            )
+            self.inv_freq = (1.0 / (self.theta ** (indices / self.dim))).to(
+                self.inv_freq.dtype
+            )
+            self._inv_freq_device = self.inv_freq.device
         positions = torch.arange(
             sequence_length,
             device=self.inv_freq.device,
@@ -45,22 +62,30 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
 
 
 class Qwen3VLVisionBlock(nn.Module):
-    def __init__(self, config: Any, layer_idx: int) -> None:
+    def __init__(
+        self,
+        config: Any,
+        layer_idx: int,
+        quant_config: Any = None,
+        prefix: str = "visual",
+    ) -> None:
         super().__init__()
         parallel = get_parallel()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.attn = QwenVLVisionAttention(
             config,
-            prefix=f"visual.blocks.{layer_idx}.attn",
+            prefix=f"{prefix}.blocks.{layer_idx}.attn",
             model_name="Qwen3-VL",
+            quant_config=quant_config,
         )
         self.mlp = Qwen3_VisionMLP(
             config.hidden_size,
             config.intermediate_size,
             bias=True,
             hidden_act=config.hidden_act,
-            prefix=f"visual.blocks.{layer_idx}.mlp",
+            prefix=f"{prefix}.blocks.{layer_idx}.mlp",
+            quant_config=quant_config,
             tp_rank=parallel.tp_rank,
             tp_size=parallel.tp_size,
         )
@@ -176,7 +201,14 @@ def _vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
 
 
 class Qwen3VLVisionTransformer(nn.Module):
-    def __init__(self, config: Any) -> None:
+    fp32_position_interpolation = True
+
+    def __init__(
+        self,
+        config: Any,
+        quant_config: Any = None,
+        prefix: str = "visual",
+    ) -> None:
         super().__init__()
         parallel = get_parallel()
         self.config = config
@@ -191,7 +223,8 @@ class Qwen3VLVisionTransformer(nn.Module):
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
         self.blocks = nn.ModuleList(
-            Qwen3VLVisionBlock(config, layer_idx) for layer_idx in range(config.depth)
+            Qwen3VLVisionBlock(config, layer_idx, quant_config, prefix)
+            for layer_idx in range(config.depth)
         )
         self.merger = Qwen3VLMoeVisionPatchMerger(
             dim=config.out_hidden_size,
@@ -236,7 +269,14 @@ class Qwen3VLVisionTransformer(nn.Module):
             num_grid_per_side=self.num_grid_per_side,
             spatial_merge_size=self.spatial_merge_size,
         )
-        return (self.pos_embed(indices) * weights[:, :, None]).sum(0)
+        if self.fp32_position_interpolation:
+            return (self.pos_embed(indices) * weights[:, :, None]).sum(0)
+        # Transformers 4.57 rounds each corner and each addition in the weight dtype
+        corners = (
+            self.pos_embed(indices)
+            * weights.to(self.pos_embed.weight.dtype)[:, :, None]
+        )
+        return corners[0] + corners[1] + corners[2] + corners[3]
 
     def forward(
         self,

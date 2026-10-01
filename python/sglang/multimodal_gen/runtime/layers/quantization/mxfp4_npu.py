@@ -1,4 +1,4 @@
-"""Online MXFP4 quantization for Diffusion models on Ascend NPU.
+"""Online MXFP4 quantization for Diffusion models on NPU.
 
 Provides ``NPUMXFP4Config`` (registered as ``"mxfp4_npu"``) and
 ``NPUMXFP4DiffusionLinearMethod`` which quantises FP16/BF16 weights to MXFP4
@@ -10,9 +10,10 @@ The ``"mxfp4_npu"`` key is distinct from upstream's ROCm ``"mxfp4"``
 (``Mxfp4Config`` in ``mxfp4.py``) which targets AMD MI350+ via aiter kernels.
 
 NOTE: Online weight quantization via ``npu_dynamic_dual_level_mx_quant`` is
-experimental. MindIE-SD only uses an offline (pre-quantized) path for MXFP4
-weights. The online path quantizes FP16/BF16 weights at load time, which may
-produce different numerical results than the offline calibrated path.
+experimental; the established MXFP4 path for these models is offline
+(pre-quantized) only. The online path quantizes FP16/BF16 weights at load
+time, which may produce different numerical results than the offline
+calibrated path.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ logger = init_logger(__name__)
 
 
 class NPUMXFP4Config(QuantizationConfig):
-    """Config for online MXFP4 quantization on Ascend NPU (Diffusion)."""
+    """Config for online MXFP4 quantization on NPU (Diffusion)."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -78,13 +79,11 @@ class NPUMXFP4Config(QuantizationConfig):
 
 
 class NPUMXFP4DiffusionLinearMethod(LinearMethodBase):
-    """Ascend NPU MXFP4 linear method for Diffusion models (dual-level).
+    """NPU MXFP4 linear method for Diffusion models (dual-level).
 
     Online mode: loads FP16/BF16 weights → quantises to MXFP4 at load time
     via ``npu_dynamic_dual_level_mx_quant``.
     Inference: dynamic dual-level MXFP4 activation quant + dual-level matmul.
-
-    Reference: MindIE-SD ``W4A4MXFP4DualQuantLinear`` (offline path only).
     """
 
     def __init__(self, quant_config: NPUMXFP4Config):
@@ -133,9 +132,9 @@ class NPUMXFP4DiffusionLinearMethod(LinearMethodBase):
             weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
 
         # Online dual-level MXFP4 weight quantisation.
-        # NOTE: This is experimental — MindIE-SD only has an offline path for
-        # MXFP4 weights. We assume npu_dynamic_dual_level_mx_quant can also
-        # quantise weights (not just activations).
+        # NOTE: This is experimental — the established MXFP4 path for these
+        # models is offline only. We assume npu_dynamic_dual_level_mx_quant can
+        # also quantise weights (not just activations).
         # Returns: (qw, w_dual_scale, w_scale)
         #   qw          — quantized weight in float4_e2m1fn_x2 (2 FP4 packed/byte)
         #   w_dual_scale — L0-level scale (goes to pos 3 in npu_dual_level_quant_matmul)
@@ -145,14 +144,12 @@ class NPUMXFP4DiffusionLinearMethod(LinearMethodBase):
         )
 
         # npu_dual_level_quant_matmul requires x2 (weight) in FRACTAL_NZ format.
-        # Reference: MindIE-SD W4A4MXFP4DualQuantLinear._init_dynamic_quant_param
         qw = torch_npu.npu_format_cast(
             qw.view(torch.int8), 29, customize_dtype=torch.int8
         )
 
         # x2Level0Scale must be [in/level0_block_size, out] — transpose from
         # the [out, in/level0_block_size] shape returned by the quant op.
-        # Reference: MindIE-SD layer.py:409
         w_dual_scale = w_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
 
         layer.weight = Parameter(qw, requires_grad=False)
