@@ -5,9 +5,14 @@ import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    DENSE_ATOL,
+    DENSE_RTOL,
     DenseAttentionCase,
+    build_dense_attention_fixture,
+    expected_dense_fixture_output,
     make_dense_cases,
     run_dense_attention_case,
+    run_dense_fixture_eager,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
@@ -301,6 +306,40 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
                         hidden_size=self.HIDDEN_SIZE,
                         loc_layout=layout,
                     )
+
+    def test_bf16_kv_with_checkpoint_scales(self):
+        # ModelOpt FP8 checkpoints can carry KV scales even when the user
+        # explicitly selects an unquantized BF16 KV cache.
+        for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
+            with self.subTest(mode=mode):
+                case = DenseAttentionCase(
+                    name="fa4_bf16_kv_with_checkpoint_scales",
+                    backend="fa4",
+                    forward_mode=mode,
+                    num_heads=4,
+                    num_kv_heads=2,
+                    page_size=16,
+                    prefix_lens=(14, 16),
+                    extend_lens=(2, 3) if mode.is_extend() else (),
+                )
+                fixture = build_dense_attention_fixture(
+                    self,
+                    case,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                    dtype=torch.bfloat16,
+                )
+                fixture.backend.kv_cache_dtype_str = "bf16"
+                fixture.actual_module.attn.k_scale = torch.tensor(2.0, device="cuda")
+                fixture.actual_module.attn.v_scale = torch.tensor(4.0, device="cuda")
+                actual = run_dense_fixture_eager(fixture)
+                expected = expected_dense_fixture_output(fixture)
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    atol=DENSE_ATOL,
+                    rtol=DENSE_RTOL,
+                )
 
     def test_projected_dense_attention_cases(self):
         for case in self.CASES:
