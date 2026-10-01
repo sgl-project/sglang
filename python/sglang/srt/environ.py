@@ -1580,6 +1580,9 @@ class Envs:
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # DSpark draft block on the HIP radix backend: build the attention metadata inside the
+    # draft CUDA graph from the raw inputs instead of eagerly before every replay.
+    SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
