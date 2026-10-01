@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
@@ -23,7 +23,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     with_phase,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import (
     is_cpu,
     is_mps,
@@ -78,6 +78,8 @@ def parse_cuda_graph_config(server_args: Any):
         _set(Phase.DECODE, "max_bs", cfg.cuda_graph_max_bs_decode)
     if cfg.cuda_graph_max_bs_prefill is not None:
         _set(Phase.PREFILL, "max_bs", cfg.cuda_graph_max_bs_prefill)
+    if cfg.cuda_graph_max_seq_len_prefill is not None:
+        _set(Phase.PREFILL, "max_seq_len", cfg.cuda_graph_max_seq_len_prefill)
     if cfg.cuda_graph_bs_decode is not None:
         _set(Phase.DECODE, "bs", cfg.cuda_graph_bs_decode)
     if cfg.cuda_graph_bs_prefill is not None:
@@ -87,6 +89,12 @@ def parse_cuda_graph_config(server_args: Any):
         # decode is implemented; today decode ignores it.
         _set(Phase.DECODE, "tc_compiler", cfg.cuda_graph_tc_compiler)
         _set(Phase.PREFILL, "tc_compiler", cfg.cuda_graph_tc_compiler)
+    if cfg.cuda_graph_prefill_max_context is not None:
+        _set(
+            Phase.PREFILL,
+            "max_context_size",
+            cfg.cuda_graph_prefill_max_context,
+        )
 
     # ---- Explicit JSON config (highest precedence) ----
     for phase, phase_config in explicit_input.items():
@@ -178,7 +186,7 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             "model-arch blacklist",
             lambda: model_config_of(server_args).is_piecewise_cuda_graph_disabled_model,
         ),
-        ("DP attention", lambda: resolved_view(server_args).enable_dp_attention),
+        ("DP attention", lambda: attn_dp_enabled_of(resolved_view(server_args))),
         ("full torch.compile mode", lambda: cfg.enable_torch_compile),
         ("pipeline parallelism (pp_size > 1)", lambda: cfg.pp_size > 1),
         (
@@ -401,24 +409,6 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
     )
 
 
-def apply_glm5_chunked_prefill_default(server_args: Any):
-    """Set the opted-in GLM BCG chunk default before memory budgeting."""
-    cfg = resolving_view(server_args)
-    if (
-        get_platform().is_cuda
-        and (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked
-        and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
-        and cfg.chunked_prefill_size is None
-        and "Glm5NextForConditionalGeneration"
-        in model_config_of(server_args).hf_config.architectures
-    ):
-        declare_resolution(
-            server_args,
-            "_apply_glm5_chunked_prefill_default",
-            chunked_prefill_size=4096,
-        )
-
-
 def apply_glm5_prefill_cuda_graph_policy(server_args: Any):
     """Set capture sizes for explicitly enabled GLM breakable prefill graphs."""
     cfg = resolving_view(server_args)
@@ -552,6 +542,63 @@ def validate_cuda_graph_config(server_args: Any):
                 f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
                 f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
             )
+
+
+def _resolve_max_context_size(
+    *, requested_size: Any, page_size: int, model_context_len: Optional[int]
+) -> int:
+    if requested_size <= 0:
+        raise ValueError("--cuda-graph-prefill-max-context must be a positive integer")
+
+    aligned_size = int((requested_size + page_size - 1) // page_size * page_size)
+    if (
+        model_context_len is not None
+        and model_context_len > 0
+        and aligned_size > model_context_len
+    ):
+        raise ValueError(
+            "--cuda-graph-prefill-max-context exceeds the model context length: "
+            f"aligned size {aligned_size} > {model_context_len}"
+        )
+    if requested_size != aligned_size:
+        logger.info(
+            "Page-aligning prefill CUDA graph max context size %d -> %d "
+            "(page_size=%d).",
+            requested_size,
+            aligned_size,
+            page_size,
+        )
+    return aligned_size
+
+
+def finalize_cuda_graph_prefill_max_context(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    requested_size = cfg.cuda_graph_config.prefill.max_context_size
+    if requested_size is None:
+        return
+    page_size = cfg.page_size
+    assert page_size is not None and page_size > 0, (
+        "page_size must be resolved before prefill CUDA graph max context size"
+    )
+
+    max_context_size = _resolve_max_context_size(
+        requested_size=requested_size,
+        page_size=page_size,
+        model_context_len=model_config_of(server_args).context_len,
+    )
+    logger.info(
+        "Prefill CUDA graph max context size: %d; graph keys remain token-only.",
+        max_context_size,
+    )
+    declare_resolution(
+        server_args,
+        "_finalize_cuda_graph_prefill_max_context",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config,
+            Phase.PREFILL,
+            max_context_size=max_context_size,
+        ),
+    )
 
 
 def generate_prefill_cuda_graph_batch_sizes(max_bs: int):

@@ -18,9 +18,11 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.layout.page_major import (
+    build_mha_views,
     build_mla_views,
     build_page_major_mamba_views,
     mamba_entry_bytes,
+    mha_entry_bytes,
     mla_entry_bytes,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -72,6 +74,118 @@ class TestMLAEnvelopeTransferAddressing(CustomTestCase):
                     )
                     got = raw[start : start + row_bytes].view(store_dtype)
                     self.assertTrue(torch.equal(got, val), (page, layer, off))
+
+
+class TestMHAEnvelopeTransferAddressing(CustomTestCase):
+    """The MHA counterpart of the MLA case above.
+
+    An MHA page envelope holds ``2 * layer_num`` row-blocks (layer l's K at
+    block 2l, its V at 2l+1). PD ships that whole envelope as one item, so a
+    row written through ANY per-layer view must land inside its own page's
+    ``page_envelope_bytes`` block -- otherwise the transfer would carry a
+    page's K but another page's V and every kernel would still read fine
+    locally.
+    """
+
+    def test_page_envelope_matches_per_layer_views(self):
+        layer_num, page_size, head_num, head_dim, num_pages = 3, 4, 2, 8, 6
+        store_dtype = torch.bfloat16
+        entry_bytes = mha_entry_bytes(
+            layer_num=layer_num,
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=head_dim,
+            itemsize=store_dtype.itemsize,
+        )
+        page_bytes = page_size * entry_bytes
+        row_bytes = head_num * head_dim * store_dtype.itemsize
+        self.assertEqual(page_bytes, page_size * 2 * layer_num * row_bytes)
+
+        # One page envelope of tail pad, as UnifiedKVPool allocates for MHA.
+        raw = torch.zeros((num_pages + 1) * page_bytes, dtype=torch.uint8)
+        k_views, v_views = build_mha_views(
+            raw,
+            layer_num=layer_num,
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=head_dim,
+            store_dtype=store_dtype,
+            page_size=page_size,
+            num_pages=num_pages,
+            anchor_bytes=0,
+        )
+
+        blocks = 2 * layer_num
+        for page in range(num_pages):
+            for layer in range(layer_num):
+                for is_v, views in ((0, k_views), (1, v_views)):
+                    for pos in range(page_size):
+                        row = page * blocks * page_size + pos
+                        views[layer][row].fill_(1)
+                        (nz,) = torch.nonzero(raw, as_tuple=True)
+                        lo, hi = int(nz.min()), int(nz.max())
+                        self.assertGreaterEqual(
+                            lo,
+                            page * page_bytes,
+                            f"page={page} layer={layer} v={is_v} pos={pos} "
+                            "wrote below its page envelope",
+                        )
+                        self.assertLess(
+                            hi,
+                            (page + 1) * page_bytes,
+                            f"page={page} layer={layer} v={is_v} pos={pos} "
+                            "wrote past its page envelope",
+                        )
+                        views[layer][row].zero_()
+
+    def test_envelope_move_is_a_whole_page_copy(self):
+        """Relocating a page envelope must move every layer's K and V with it;
+        this is what `UnifiedMHATokenToKVPool.move_kv_cache` relies on and what
+        makes a physical page id a valid PD transfer index after compaction."""
+        layer_num, page_size, head_num, head_dim, num_pages = 2, 2, 1, 4, 4
+        store_dtype = torch.bfloat16
+        entry_bytes = mha_entry_bytes(
+            layer_num=layer_num,
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=head_dim,
+            itemsize=store_dtype.itemsize,
+        )
+        page_bytes = page_size * entry_bytes
+        raw = torch.zeros((num_pages + 1) * page_bytes, dtype=torch.uint8)
+        k_views, v_views = build_mha_views(
+            raw,
+            layer_num=layer_num,
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=head_dim,
+            store_dtype=store_dtype,
+            page_size=page_size,
+            num_pages=num_pages,
+            anchor_bytes=0,
+        )
+        blocks = 2 * layer_num
+        # Distinct content in source page 1, every layer, K and V.
+        for layer in range(layer_num):
+            for pos in range(page_size):
+                row = 1 * blocks * page_size + pos
+                k_views[layer][row].fill_(layer + 1)
+                v_views[layer][row].fill_(-(layer + 1))
+
+        env = raw[: num_pages * page_bytes].view(num_pages, page_bytes)
+        env[3] = env[1]
+
+        for layer in range(layer_num):
+            for pos in range(page_size):
+                row = 3 * blocks * page_size + pos
+                self.assertTrue(
+                    torch.all(k_views[layer][row] == layer + 1),
+                    f"K layer {layer} did not ride the envelope move",
+                )
+                self.assertTrue(
+                    torch.all(v_views[layer][row] == -(layer + 1)),
+                    f"V layer {layer} did not ride the envelope move",
+                )
 
 
 class TestMambaEnvelopeTransferAddressing(CustomTestCase):

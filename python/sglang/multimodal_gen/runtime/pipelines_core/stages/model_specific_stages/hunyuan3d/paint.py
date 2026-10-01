@@ -19,6 +19,7 @@ from PIL import Image
 from torch import nn
 from transformers import PreTrainedTokenizerBase
 
+from sglang.kernels.ops.diffusion import load_mesh_processor
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
@@ -790,6 +791,9 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         del server_args
+        if batch.is_warmup:
+            # compile without exporting warmup meshes or textures
+            load_mesh_processor()
         if batch.is_warmup or batch.extra.get("_mesh_failed"):
             return OutputBatch(output_file_paths=[], metrics=batch.metrics)
 

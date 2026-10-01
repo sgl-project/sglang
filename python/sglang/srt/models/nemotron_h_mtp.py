@@ -18,11 +18,8 @@ import torch
 from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
-from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.dp_attention import (
-    attn_tp_all_reduce,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -38,7 +35,6 @@ from sglang.srt.models.nemotron_h import (
     NemotronHForCausalLM,
     NemotronHMoEDecoderLayer,
 )
-from sglang.srt.models.nemotron_h_utils import is_attn_layer
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
@@ -93,9 +89,8 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
         *,
         inputs_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None = None,
         forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         if self.has_start_projections:
             inputs_embeds_normed = self.enorm(inputs_embeds)
             previous_hidden_states_normed = self.hnorm(hidden_states)
@@ -109,20 +104,22 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
                     hidden_states, dim=-1
                 )
 
-        hidden_states, residual = super().forward(
+        if self.has_start_projections:
+            hidden_states = residual_batch.set_written(hidden_states, forward_batch)
+
+        hidden_states = super().forward(
             hidden_states=hidden_states,
-            residual=residual,
             forward_batch=forward_batch,
         )
 
         if self.has_end_norm:
-            if residual is not None:
-                hidden_states = hidden_states + residual
-                residual = None
+            hidden_states = residual_batch.fold(hidden_states, forward_batch)
 
-            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = residual_batch.set_written(
+                self.final_layernorm(hidden_states), forward_batch
+            )
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
@@ -143,11 +140,6 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         )
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
-        _pat = config.mtp_hybrid_override_pattern
-        self.prev_layer_is_attn = layer_idx > 0 and is_attn_layer(
-            _pat[(layer_idx - 1) % len(_pat)]
-        )
-        self.layer_communicator.is_last_layer = True
 
         if has_start_projections:
             self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -179,9 +171,8 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         *,
         inputs_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None = None,
         forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         if self.has_start_projections:
             inputs_embeds_normed = self.enorm(inputs_embeds)
             previous_hidden_states_normed = self.hnorm(hidden_states)
@@ -195,27 +186,22 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
                     hidden_states, dim=-1
                 )
 
-        if (
-            is_dp_attention_enabled()
-            and self.prev_layer_is_attn
-            and residual is not None
-        ):
-            hidden_states = attn_tp_all_reduce(hidden_states)
+        if self.has_start_projections:
+            hidden_states = residual_batch.set_written(hidden_states, forward_batch)
 
-        hidden_states, residual = super().forward(
+        hidden_states = super().forward(
             hidden_states=hidden_states,
-            residual=residual,
             forward_batch=forward_batch,
         )
 
         if self.has_end_norm:
-            if residual is not None:
-                hidden_states = hidden_states + residual
-                residual = None
+            hidden_states = residual_batch.fold(hidden_states, forward_batch)
 
-            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = residual_batch.set_written(
+                self.final_layernorm(hidden_states), forward_batch
+            )
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class NemotronHMultiTokenPredictor(nn.Module):
@@ -312,16 +298,15 @@ class NemotronHMultiTokenPredictor(nn.Module):
                 inputs_embeds = self.get_input_embeddings(input_ids)
 
         hidden_states = forward_batch.spec_info.hidden_states
-        residual = None
+        residual_batch.start(forward_batch)
 
         for i in range(self.pattern_len):
-            hidden_states, residual = self.layers[str(i)](
+            hidden_states = self.layers[str(i)](
                 inputs_embeds=inputs_embeds,
                 hidden_states=hidden_states,
-                residual=residual,
                 forward_batch=forward_batch,
             )
-        return hidden_states
+        return residual_batch.take_output(hidden_states, forward_batch)
 
 
 class NemotronHForCausalLMMTP(NemotronHForCausalLM):
@@ -341,7 +326,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         self.quant_config = quant_config
         self._owns_lm_head = False
         # Required for parent's load_weights
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # Override config for MTP pattern (which has no Mamba layers)
         config.num_hidden_layers = len(config.mtp_hybrid_override_pattern)

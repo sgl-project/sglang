@@ -7,26 +7,26 @@ metatags:
 <Note>
 This page focuses on optimal configuration and benchmark results for GLM-5.1 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [GLM-5.1 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_1).
 
-On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65k+1.5k (90% prefix cache hit rate) | 25ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
+| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 65k+1.5k (90% prefix cache hit rate) | 25ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Atlas 800I A3 | 16 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 128k+1k | 56.4ms | 13.1s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-56-4ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 16k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64k+1k | 55.2ms | 7.58s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-55-2ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64k+1k (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
+| GLM-5.1 | Ascend A3 Series Products | 16 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
+| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 128k+1k | 56.4ms | 13.1s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-56-4ms) |
+| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 16k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
+| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 64k+1k | 55.2ms | 7.58s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-55-2ms) |
+| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 64k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
+| GLM-5.1 | Ascend A3 Series Products | 48 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
+| GLM-5.1 | Ascend A3 Series Products | 48 | PD Disaggregation | 64k+1k (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
 
 ## Optimal Configuration
 
@@ -36,7 +36,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Model**: GLM-5.1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 16
 
@@ -83,7 +83,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -106,8 +105,7 @@ do
         --attention-backend ascend \
         --device npu \
         --tp-size 32 \
-        --dp-size 16 \
-        --enable-dp-attention \
+        --attn-dp-size 16 \
         --chunked-prefill-size 65536 \
         --max-prefill-tokens 280000 \
         --trust-remote-code \
@@ -155,7 +153,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 32
 
@@ -281,7 +279,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
@@ -296,9 +293,8 @@ do
         --trust-remote-code \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --ep-size 32 \
-        --enable-dp-attention \
         --mem-fraction-static 0.85 \
         --max-running-requests 32 \
         --attention-backend ascend \
@@ -363,7 +359,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 32
 
@@ -456,8 +452,7 @@ do
         --disable-shared-experts-fusion \
         --disable-cuda-graph \
         --dtype bfloat16 \
-        --dp-size 4 \
-        --enable-dp-attention \
+        --attn-dp-size 4 \
         --load-balance-method round_robin \
         --enable-prefill-cp \
         --cp-strategy zigzag \
@@ -482,7 +477,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -495,9 +489,8 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --ep-size 32 \
-        --enable-dp-attention \
         --mem-fraction-static 0.87 \
         --max-running-requests 96 \
         --attention-backend ascend \
@@ -565,7 +558,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 32
 
@@ -692,7 +685,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
@@ -706,8 +698,7 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
-        --enable-dp-attention \
+        --attn-dp-size 32 \
         --ep-size 32 \
         --mem-fraction-static 0.85 \
         --max-running-requests 32 \
@@ -774,7 +765,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 32
 
@@ -907,8 +898,7 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
-        --enable-dp-attention \
+        --attn-dp-size 32 \
         --ep-size 32 \
         --mem-fraction-static 0.85 \
         --max-running-requests 32 \
@@ -973,7 +963,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 32
 
@@ -1066,8 +1056,7 @@ do
         --disable-shared-experts-fusion \
         --disable-cuda-graph \
         --dtype bfloat16 \
-        --dp-size 4 \
-        --enable-dp-attention \
+        --attn-dp-size 4 \
         --load-balance-method round_robin \
         --enable-prefill-cp \
         --cp-strategy zigzag \
@@ -1092,7 +1081,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -1105,9 +1093,8 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --ep-size 32 \
-        --enable-dp-attention \
         --mem-fraction-static 0.87 \
         --max-running-requests 96 \
         --attention-backend ascend \
@@ -1180,7 +1167,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 48
 
@@ -1301,7 +1288,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -1314,9 +1300,8 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --ep-size 32 \
-        --enable-dp-attention \
         --mem-fraction-static 0.865 \
         --max-running-requests 96 \
         --attention-backend ascend \
@@ -1390,7 +1375,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 48
 
@@ -1510,7 +1495,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=40
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -1523,9 +1507,8 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --ep-size 32 \
-        --enable-dp-attention \
         --mem-fraction-static 0.85 \
         --max-running-requests 320 \
         --attention-backend ascend \

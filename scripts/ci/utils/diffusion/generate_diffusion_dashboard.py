@@ -258,6 +258,23 @@ def _stage_group_seconds(result: dict, suffixes: str | tuple[str, ...]) -> float
     return sum(values) / 1000.0
 
 
+def _server_sample_coverage(result: dict) -> tuple[int, int] | None:
+    total = result.get("measurement_count")
+    if not isinstance(total, int) or total <= 0:
+        return None
+
+    samples = result.get("server_latency_samples_s")
+    if isinstance(samples, list):
+        available = len(samples)
+    elif "missing_perf_dumps" in result:
+        available = total - int(result["missing_perf_dumps"])
+    elif result.get("server_latency_s") is not None:
+        available = total
+    else:
+        available = 0
+    return max(0, min(available, total)), total
+
+
 def _sanitize_filename(name: str) -> str:
     """Sanitize a case ID to be a safe filename."""
     return name.replace("/", "_").replace(" ", "_").replace(":", "_")
@@ -284,10 +301,30 @@ def generate_dashboard(
     ts = current.get("timestamp", datetime.now(timezone.utc).isoformat())
     sha = current.get("commit_sha", "unknown")
     lines.append(f"*Generated: {_short_date(ts)} | Commit: `{_short_sha(sha)}`*\n")
+    methodology = current.get("methodology")
+    if methodology:
+        warmups = current.get("warmup_requests", 1)
+        lines.append(
+            f"*Methodology `{methodology}`: client-side latency through each "
+            "framework's public API, from submit until the output is downloaded; "
+            f"{warmups} identical client warmup request(s) per case, discarded. "
+            "First request = the first request after the server reports ready. "
+            "Server perf dumps are telemetry only.*\n"
+        )
 
     current_cases = _extract_case_results(current)
     current_records = _extract_case_records(current)
     case_ids = list(current_cases.keys())
+
+    incomplete_server_telemetry = []
+    for cid in case_ids:
+        record = current_records.get(cid, {}).get("sglang", {})
+        coverage = _server_sample_coverage(record)
+        if coverage is not None and coverage[0] < coverage[1]:
+            model = record.get("model", cid).split("/")[-1]
+            incomplete_server_telemetry.append(
+                f"**{model}**: {coverage[0]}/{coverage[1]}"
+            )
 
     # ---- Regression detection ----
     regressions: list[str] = []
@@ -309,6 +346,16 @@ def generate_dashboard(
         lines.append("> [!WARNING]\n> **Performance Regression Detected**\n>")
         for reg in regressions:
             lines.append(f"> - {reg}")
+        lines.append("\n")
+
+    if incomplete_server_telemetry:
+        lines.append(
+            "> [!WARNING]\n> **Incomplete Server Telemetry**\n>\n"
+            "> Client-side latency includes every measured request, but server-side "
+            "stage medians use only the readable perf dumps."
+        )
+        for coverage in incomplete_server_telemetry:
+            lines.append(f"> - {coverage} server samples available")
         lines.append("\n")
 
     # Discover all frameworks present in results
@@ -334,8 +381,8 @@ def generate_dashboard(
         risk_map[cid] = _assess_risk(cid, current_cases, history, other_frameworks)
 
     # Dynamic header
-    header = "| Model | Risk | Samples |"
-    sep = "|-------|------|---------|"
+    header = "| Model | Risk | Client samples | Server samples | First request (s) |"
+    sep = "|-------|------|----------------|----------------|-------------------|"
     for fw in all_frameworks:
         header += f" {fw} median (s) |"
         sep += "---------|"
@@ -359,10 +406,18 @@ def generate_dashboard(
         sample_count = sg_record.get("measurement_count")
         if not sample_count and sg_lat is not None:
             sample_count = 1
+        server_coverage = _server_sample_coverage(sg_record)
+        server_samples = (
+            f"{server_coverage[0]}/{server_coverage[1]}"
+            if server_coverage is not None
+            else "N/A"
+        )
 
         risk_emoji, _ = risk_map.get(cid, ("✅", ""))
         row = (
-            f"| {r['model'].split('/')[-1]} | {risk_emoji} | {sample_count or 'N/A'} |"
+            f"| {r['model'].split('/')[-1]} | {risk_emoji} | "
+            f"{sample_count or 'N/A'} | {server_samples} | "
+            f"{_fmt_latency(sg_record.get('first_request_latency_s'))} |"
         )
         # Latency columns -- bold the fastest
         lats = {fw: case_fws.get(fw) for fw in all_frameworks}

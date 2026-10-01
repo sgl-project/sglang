@@ -26,7 +26,6 @@ from torch import nn
 from transformers import LlamaConfig
 
 from sglang.srt.distributed import (
-    get_pp_group,
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -54,7 +53,13 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_npu,
+    is_xpu,
+    make_pp_layers,
+)
 from sglang.utils import get_exception_traceback
 
 _is_cuda = is_cuda()
@@ -379,7 +384,7 @@ class LlamaModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -395,7 +400,7 @@ class LlamaModel(nn.Module):
             self.pp_group.rank_in_group,
             self.pp_group.world_size,
         )
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LlamaDecoderLayer(
                 config=config,
@@ -404,8 +409,6 @@ class LlamaModel(nn.Module):
                 start_layer=pp_start_layer,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix="model.layers",
         )
 
@@ -521,7 +524,7 @@ class LlamaForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))

@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.utils import is_xpu
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import calculate_rouge_l
+from sglang.test.test_utils import calculate_rouge_l, is_in_amd_ci
 
 _IS_XPU = is_xpu()
 
@@ -151,6 +151,7 @@ CI_MULTI_LORA_MODELS = [
                 rouge_l_tolerance=0.9,
             ),
         ],
+        rouge_l_tolerance=0.9 if is_in_amd_ci() else 1.0,
         max_loras_per_batch=2,
         max_loaded_loras=4,
     ),

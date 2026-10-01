@@ -40,8 +40,7 @@ class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "16",
-            "--enable-dp-attention",
-            "--dp",
+            "--attn-dp-size",
             "2",
             "--enable-torch-compile",
             "--torch-compile-max-bs",
@@ -81,7 +80,7 @@ class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.url.hostname}",
+            host=self.url.hostname,
             port=int(self.url.port),
         )
 
