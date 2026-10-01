@@ -15,6 +15,11 @@ def _unescape_mount_path(value: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
 
 
+def _memory_stat(directory: Path) -> dict[str, int]:
+    lines = (directory / "memory.stat").read_text().splitlines()
+    return {key: int(value) for key, value in map(str.split, lines)}
+
+
 def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
     memberships = {}
     try:
@@ -65,6 +70,13 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
         usage_name = (
             "memory.current" if filesystem == "cgroup2" else "memory.usage_in_bytes"
         )
+        # File LRU pages, as MemAvailable counts; shmem sits on the anon LRU.
+        # v1's unprefixed counters omit descendants, unlike its usage.
+        page_cache_keys = (
+            ("active_file", "inactive_file")
+            if filesystem == "cgroup2"
+            else ("total_active_file", "total_inactive_file")
+        )
         while True:
             for name in limits:
                 try:
@@ -78,7 +90,10 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
                 # Do not silently ignore an unreadable usage file for a known
                 # limit: falling back to host RAM could overrun the container.
                 usage = int((directory / usage_name).read_text())
-                remaining = max(0, limit - usage)
+                stat = _memory_stat(directory)
+                page_cache = sum(stat[key] for key in page_cache_keys)
+                # Charged page cache is reclaimed under the limit, not used.
+                remaining = max(0, limit - max(0, usage - page_cache))
                 headroom = remaining if headroom is None else min(headroom, remaining)
             if directory == mount:
                 break
@@ -91,7 +106,7 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
 
 
 def available_host_memory_bytes() -> int:
-    """Conservative allocatable RAM; charged file cache is not assumed reclaimable."""
+    """Allocatable RAM, counting reclaimable page cache as free."""
     available = psutil.virtual_memory().available
     cgroup_headroom = _cgroup_memory_headroom()
     if cgroup_headroom is not None:
