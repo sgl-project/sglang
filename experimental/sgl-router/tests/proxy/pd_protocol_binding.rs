@@ -134,6 +134,7 @@ fn config() -> Config {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,

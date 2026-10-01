@@ -159,17 +159,20 @@ class TestScriptedCore(ScriptedTestCase):
         _assert_prefill_twice_decode_once(t, prompt_len=prompt_len)
 
 
-def _assert_prefill_twice_decode_once(t: ScriptedContext, *, prompt_len: int) -> None:
-    root = t.scheduler.tree_cache.root_node
+def _assert_prefill_twice_decode_once(t: ScriptedContext, prompt_len: int) -> None:
+    core = t.scheduler.tree_cache.tree_core
     prefill_hits: list[int] = []
     decode_hits: list[int] = []
-    stack = [(child, len(child.key)) for child in root.children.values()]
+    stack = [
+        (node_id, core.get_node_key_length(node_id))
+        for node_id in core.get_child_node_ids(core.root_node_handle())
+    ]
     while stack:
-        node, end_index = stack.pop()
+        node_id, end_index = stack.pop()
         bucket = prefill_hits if end_index <= prompt_len else decode_hits
-        bucket.append(node.hit_count)
-        for child in node.children.values():
-            stack.append((child, end_index + len(child.key)))
+        bucket.append(core.get_node_hit_count(node_id))
+        for child_id in core.get_child_node_ids(node_id):
+            stack.append((child_id, end_index + core.get_node_key_length(child_id)))
 
     assert prefill_hits and decode_hits, (
         f"expected both prefill and decode radix nodes; "
