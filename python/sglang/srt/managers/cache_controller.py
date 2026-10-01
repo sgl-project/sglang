@@ -77,6 +77,8 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        # SGLANG_ENABLE_HICACHE_RANK_SHARD: L2TransferEngine.gate_rank_shard_forward.
+        self.forward_gate: Optional[Callable[[], None]] = None
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -86,6 +88,9 @@ class LayerDoneCounter:
         return self.producer_index
 
     def set_consumer(self, index: int):
+        if self.forward_gate is not None:
+            # Before the forward's first kernel, on the forward stream (tp_worker).
+            self.forward_gate()
         self.consumer_index = index
 
     def wait_until(self, threshold: int):
@@ -365,6 +370,7 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
+        self._init_rank_shard()
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -379,6 +385,31 @@ class HiCacheController:
             except ValueError as e:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
+
+    def _init_rank_shard(self) -> None:
+        """SGLANG_ENABLE_HICACHE_RANK_SHARD: the host pools were built sharded, so
+        load-back needs the exchange (collective on every TP rank)."""
+        from sglang.srt.mem_cache.hicache_rank_shard import (
+            RankShardExchange,
+            rank_sharded_host_pools,
+        )
+
+        pools = rank_sharded_host_pools(self.mem_pool_host)
+        if not pools:
+            return
+        self.l2_transfer_engine.enable_rank_shard(
+            RankShardExchange.build(pools, self.tp_group, self.device)
+        )
+        self.enable_rank_shard_forward_gate()
+
+    def enable_rank_shard_forward_gate(self) -> Optional[Callable[..., None]]:
+        """Hook the forward gate into the (final) layer_done_counter; returns it for
+        the scheduler's own pre-forward call, or None when the tier is not sharded."""
+        if self.l2_transfer_engine.rank_shard is None:
+            return None
+        gate = self.l2_transfer_engine.gate_rank_shard_forward
+        self.layer_done_counter.forward_gate = gate
+        return gate
 
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
         """Derive CP rank/size from the attn_cp process group."""
@@ -944,6 +975,8 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
+        if self.l2_transfer_engine.rank_shard is not None:
+            self.l2_transfer_engine.rank_shard.maybe_verify(op.host_indices)
         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
@@ -962,6 +995,7 @@ class HiCacheController:
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             layer_num=self.layer_num,
+            fenced=self.load_fence_stream is not None,
         )
 
         self.ack_load_queue.append(

@@ -113,6 +113,8 @@ def synchronized(func):
 class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
+    # SGLANG_ENABLE_HICACHE_RANK_SHARD spec; set by MLA/DSA pools that shard.
+    rank_shard = None
 
     def __init__(
         self,

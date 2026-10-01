@@ -741,6 +741,20 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # TP MLA/DSA with direct I/O + page_first_direct, L2 only: each TP rank backs
+    # up and loads back only its round-robin share of the host layers; loaded
+    # layers are broadcast from their owner over a dedicated NCCL group. Host
+    # capacity in tokens grows ~tp_size x at the same --hicache-size. Off by default.
+    SGLANG_ENABLE_HICACHE_RANK_SHARD = EnvBool(False)
+    # Keep the unsharded host token capacity (host bytes shrink ~tp_size x instead).
+    SGLANG_HICACHE_RANK_SHARD_KEEP_CAPACITY = EnvBool(False)
+    # Device staging for the load-back broadcasts, in MB (one chunk per broadcast).
+    SGLANG_HICACHE_RANK_SHARD_STAGING_MB = EnvInt(64)
+    # Log the rank-shard exchange counters once per N load-backs per rank (0 = off).
+    SGLANG_HICACHE_RANK_SHARD_LOG_EVERY = EnvInt(64)
+    # Every N load-backs, check over gloo that all TP ranks load the same host
+    # pages (debug; 0 = off).
+    SGLANG_HICACHE_RANK_SHARD_VERIFY_EVERY = EnvInt(0)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)

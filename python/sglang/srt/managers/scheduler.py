@@ -434,6 +434,8 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    # SGLANG_ENABLE_HICACHE_RANK_SHARD: set with the tree cache (see run_batch).
+    hicache_forward_gate = None
 
     def __init__(
         self,
@@ -616,6 +618,11 @@ class Scheduler(
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                enable_gate = getattr(
+                    cache_controller, "enable_rank_shard_forward_gate", None
+                )
+                if enable_gate is not None:
+                    self.hicache_forward_gate = enable_gate()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -4234,6 +4241,14 @@ class Scheduler(
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
+
+        if self.hicache_forward_gate is not None:
+            # HiCache rank shard: before any of this batch's work (the draft runs
+            # ahead of the target's set_consumer in spec decode), the stream the
+            # forward runs on waits for every pending load-back exchange.
+            self.hicache_forward_gate(
+                self.forward_stream if self.enable_overlap else None
+            )
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
