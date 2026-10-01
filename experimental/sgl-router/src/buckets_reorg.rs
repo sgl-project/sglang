@@ -164,6 +164,21 @@ impl Bucket {
         Ok(())
     }
 
+    /// Whether choosing or serving this bucket reads request tokens: a length
+    /// bound, or a group policy that matches prefixes.
+    pub fn needs_request_tokens(&self) -> bool {
+        let groups: &[&EngineGroup] = match &self.groups {
+            BucketGroups::Plain(group) => &[group],
+            BucketGroups::Pd { prefill, decode } => &[prefill, decode],
+        };
+        self.limits.min.is_some()
+            || self.limits.max.is_some()
+            || self.max_context_tokens.is_some()
+            || groups
+                .iter()
+                .any(|group| group.policy.needs_request_tokens())
+    }
+
     /// Select this bucket's plain engine or complete P/D pair, without dispatching.
     /// A failed group reports its stage; the caller may then try another bucket.
     pub async fn pick_engines(
@@ -266,6 +281,11 @@ impl BucketResolver {
             buckets,
             ..Self::default()
         })
+    }
+
+    /// Whether any bucket reads request tokens; startup rejects this under `--no-tokenizer`.
+    pub fn needs_request_tokens(&self) -> bool {
+        self.buckets.iter().any(Bucket::needs_request_tokens)
     }
 
     /// Return all length-compatible buckets, ordered by unmet SLO preferences,

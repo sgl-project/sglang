@@ -327,8 +327,8 @@ impl Default for ObservabilityConfig {
 pub struct ModelConfig {
     pub id: String,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
-    /// Resolved by [`crate::tokenizer::adapter::load`]; `"none"` disables it.
-    pub tokenizer_path: String,
+    /// Resolved by [`crate::tokenizer::adapter::load`]; `None` (`--no-tokenizer`) disables it.
+    pub tokenizer_path: Option<String>,
     /// Disable router-generated input IDs for this model; keep routing tokenization.
     /// Use when workers have rendering defaults or template stops the router cannot see.
     pub disable_input_ids_forwarding: bool,
@@ -354,32 +354,6 @@ pub struct ModelConfig {
     pub sampling_overrides: SamplingOverrides,
     /// Worker `--default-chat-template-kwargs`, applied when rendering.
     pub default_chat_template_kwargs: crate::tokenizer::chat_formatter::ChatTemplateKwargs,
-}
-
-impl ModelConfig {
-    /// Whether `--tokenizer-path none` opted out of loading a tokenizer.
-    pub fn tokenizer_disabled(&self) -> bool {
-        self.tokenizer_path == "none"
-    }
-
-    /// Cache matching and length-based buckets require a real tokenizer.
-    /// Load-only routing can use the request-size estimate for accounting.
-    pub fn requires_tokenizer(&self) -> bool {
-        self.policy == PolicyKind::CacheAware
-            || (matches!(
-                self.policy,
-                PolicyKind::FusedScore | PolicyKind::ScorePolicy
-            ) && self.fused.as_ref().is_none_or(|terms| {
-                terms
-                    .iter()
-                    .any(|term| term.kind == ScoreTermKind::PrefixCache)
-            }))
-            || self
-                .eligibility
-                .as_ref()
-                .is_some_and(|eligibility| eligibility.filters.contains(&FilterKind::PrefixCache))
-            || self.bucket_config.is_some()
-    }
 }
 
 /// External KV Indexer client settings.

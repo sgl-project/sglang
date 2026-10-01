@@ -90,7 +90,7 @@ Omitting `--chat-routing` keeps the existing policies and defaults.
 
 ### Optional tokenizer for load-only routing
 
-`--tokenizer-path none` skips tokenizer loading for load-only policies such as
+`--no-tokenizer` skips tokenizer loading for load-only policies such as
 `power_of_two` and `session_aware`, on either routing path. Workers tokenize the
 original messages, and `/v1/tokenize` and `/v1/detokenize` are unavailable.
 Cache-aware routing, prefix-cache terms or filters, and `--bucket-config` still

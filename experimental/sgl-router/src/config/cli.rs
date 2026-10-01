@@ -64,9 +64,13 @@ pub struct ModelArgs {
     pub model_id: String,
 
     /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
-    /// "none" skips it for load-only policies; cache-aware and length-bucket routing require one.
     #[arg(long)]
     pub tokenizer_path: Option<String>,
+
+    /// Skip loading a tokenizer; workers tokenize requests. Load-only policies only:
+    /// cache-aware routing, prefix-cache terms or filters, and length buckets require one.
+    #[arg(long, conflicts_with = "tokenizer_path")]
+    pub no_tokenizer: bool,
 
     /// Disable generated input_ids; workers tokenize messages, while routing still renders locally.
     /// Use for worker parser/template overrides or template stop strings.
@@ -474,10 +478,11 @@ impl Cli {
                 log_format: self.server.log_format,
             },
             model: ModelConfig {
-                tokenizer_path: self
-                    .model
-                    .tokenizer_path
-                    .unwrap_or_else(|| self.model.model_id.clone()),
+                tokenizer_path: (!self.model.no_tokenizer).then(|| {
+                    self.model
+                        .tokenizer_path
+                        .unwrap_or_else(|| self.model.model_id.clone())
+                }),
                 id: self.model.model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 tokenizer: TokenizerConfig {
@@ -1196,7 +1201,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
-        assert_eq!(c.model.tokenizer_path, "Qwen/Qwen3-0.6B");
+        assert_eq!(c.model.tokenizer_path.as_deref(), Some("Qwen/Qwen3-0.6B"));
     }
 
     #[test]
@@ -1210,7 +1215,25 @@ mod tests {
             "http://x:30000",
         ])
         .unwrap();
-        assert_eq!(c.model.tokenizer_path, "/models/qwen3/tokenizer.json");
+        assert_eq!(
+            c.model.tokenizer_path.as_deref(),
+            Some("/models/qwen3/tokenizer.json")
+        );
+    }
+
+    #[test]
+    fn no_tokenizer_disables_loading_and_conflicts_with_a_path() {
+        let base = ["--model-id", "qwen3", "--worker-urls", "http://x:30000"];
+        let c = into_config(&[&base[..], &["--no-tokenizer"]].concat()).unwrap();
+        assert_eq!(c.model.tokenizer_path, None);
+        assert!(into_config(
+            &[
+                &base[..],
+                &["--no-tokenizer", "--tokenizer-path", "/t.json"]
+            ]
+            .concat()
+        )
+        .is_err());
     }
 
     #[test]
