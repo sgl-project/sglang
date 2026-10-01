@@ -36,7 +36,7 @@ class TestSWACpuCopyFilter(unittest.TestCase):
         side produced, and a short chunk resumes against the wrong exponents."""
         row_mask = torch.tensor([True, False, True, False])
 
-        filtered = _pool()._filter_swa_cpu_copy(_chunk(4), row_mask)
+        filtered = _pool()._filter_swa_cpu_copy(swa_kv_cpu=_chunk(4), row_mask=row_mask)
 
         self.assertEqual(len(filtered[0][0]), 4)
         for t, tensor in enumerate(filtered[0][0]):
@@ -46,7 +46,7 @@ class TestSWACpuCopyFilter(unittest.TestCase):
     def test_unquantized_chunk_is_unchanged(self):
         row_mask = torch.tensor([False, True, True, False])
 
-        filtered = _pool()._filter_swa_cpu_copy(_chunk(2), row_mask)
+        filtered = _pool()._filter_swa_cpu_copy(swa_kv_cpu=_chunk(2), row_mask=row_mask)
 
         self.assertEqual(len(filtered[0][0]), 2)
         self.assertEqual(filtered[0][0][0].shape[0], 2)
@@ -55,7 +55,9 @@ class TestSWACpuCopyFilter(unittest.TestCase):
         original = _chunk(4)
 
         self.assertIs(
-            _pool()._filter_swa_cpu_copy(original, torch.tensor([True] * ROWS)),
+            _pool()._filter_swa_cpu_copy(
+                swa_kv_cpu=original, row_mask=torch.tensor([True] * ROWS)
+            ),
             original,
         )
 

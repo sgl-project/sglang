@@ -2,25 +2,190 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
-use dynamo_tokenizers::{traits::DecodeResult, Tokenizer};
+use dynamo_tokenizers::{
+    create_tokenizer_from_file, traits, traits::DecodeResult, CacheTokenUsage, CachedTokenizer,
+    FastTokenizer, Tokenizer,
+};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// Load a local tokenizer file or Hugging Face repo, honoring HF cache/auth settings.
-/// Tiktoken `.model` files also require sibling config.json and tokenizer_config.json.
+use super::stats::{EncodeBackend, L1Counters, L1State, TokenizerStats};
+use crate::config::{TokenizerBackend, TokenizerConfig};
+
+/// Load a local tokenizer file or Hugging Face repo with the default HF, uncached encoder.
 pub fn load(source: &str) -> Result<Arc<Tokenizer>> {
+    load_with(source, TokenizerConfig::default()).map(|(t, _)| t)
+}
+
+/// Load a local tokenizer file or Hugging Face repo, honoring HF cache/auth settings, with the
+/// configured encode backend and L1 cache. Tiktoken `.model` files also require sibling
+/// config.json and tokenizer_config.json.
+pub fn load_with(
+    source: &str,
+    cfg: TokenizerConfig,
+) -> Result<(Arc<Tokenizer>, Arc<TokenizerStats>)> {
     if Path::new(source).is_file() || looks_like_path(source) {
-        return Tokenizer::from_file(source)
-            .map(Arc::new)
-            .with_context(|| format!("load tokenizer from {source}"));
+        return build(source, cfg).with_context(|| format!("load tokenizer from {source}"));
     }
     let downloaded = download_tokenizer(source)?;
     let path = downloaded
         .to_str()
         .context("downloaded tokenizer path is not valid UTF-8")?;
-    Tokenizer::from_file(path)
-        .map(Arc::new)
-        .with_context(|| format!("load downloaded tokenizer for {source}"))
+    build(path, cfg).with_context(|| format!("load downloaded tokenizer for {source}"))
+}
+
+fn build(path: &str, cfg: TokenizerConfig) -> Result<(Arc<Tokenizer>, Arc<TokenizerStats>)> {
+    let (inner, backend) = encoder(path, cfg.backend)?;
+    let l1 = Arc::new(L1Counters::default());
+    let (tokenizer, l1_state) = if cfg.l1_cache_mb == 0 {
+        (Tokenizer::from(inner), L1State::Off)
+    } else {
+        let specials = boundary_tokens(path)?;
+        if specials.is_empty() {
+            tracing::warn!(
+                path,
+                "--tokenizer-l1-cache-mb is set but the tokenizer declares no safely splittable \
+                 special tokens; the L1 cache is inert"
+            );
+            (Tokenizer::from(inner), L1State::DisabledNoSpecials)
+        } else {
+            let bytes = cfg.l1_cache_mb.saturating_mul(1 << 20);
+            let cached = with_l1(inner, specials, bytes, &l1)?;
+            (Tokenizer::from(Arc::new(cached)), L1State::Active)
+        }
+    };
+    let stats = TokenizerStats {
+        backend,
+        l1_state,
+        l1,
+    };
+    Ok((Arc::new(tokenizer), Arc::new(stats)))
+}
+
+/// Wrap `inner` in the L1 prefix cache, extending on partial hits so each turn of a growing
+/// conversation reuses all earlier turns, and feed `counters` from its observers.
+fn with_l1(
+    inner: Arc<dyn traits::Tokenizer>,
+    specials: Vec<String>,
+    max_memory_bytes: usize,
+    counters: &Arc<L1Counters>,
+) -> Result<CachedTokenizer> {
+    let usage = Arc::clone(counters);
+    Ok(CachedTokenizer::new(inner, specials, max_memory_bytes)?
+        .with_extend(true)
+        .with_token_observer(Arc::new(move |u: CacheTokenUsage| {
+            usage
+                .cached_tokens
+                .fetch_add(u.cached_tokens as u64, Ordering::Relaxed);
+            usage
+                .encoded_tokens
+                .fetch_add(u.uncached_tokens as u64, Ordering::Relaxed);
+        })))
+}
+
+/// Build the encoder for `backend`; `fast` falls back to HF when fastokens cannot load the file.
+fn encoder(
+    path: &str,
+    backend: TokenizerBackend,
+) -> Result<(Arc<dyn traits::Tokenizer>, EncodeBackend)> {
+    if !path.ends_with(".json") {
+        if backend == TokenizerBackend::Fast {
+            tracing::warn!(
+                path,
+                "fastokens needs a tokenizer.json; encoding on tiktoken"
+            );
+        }
+        return Ok((create_tokenizer_from_file(path)?, EncodeBackend::Tiktoken));
+    }
+    if backend == TokenizerBackend::Fast {
+        match FastTokenizer::from_file(path) {
+            Ok(t) => return Ok((Arc::new(t), EncodeBackend::Fast)),
+            Err(e) => tracing::warn!(path, error = %format!("{e:#}"),
+                "fastokens cannot load this tokenizer; encoding on hf"),
+        }
+        return Ok((
+            create_tokenizer_from_file(path)?,
+            EncodeBackend::FastFallbackHf,
+        ));
+    }
+    Ok((create_tokenizer_from_file(path)?, EncodeBackend::Hf))
+}
+
+/// L1 matches literal spellings, so only unconditional, non-overlapping added tokens
+/// are safe boundaries. Consider all added tokens as competitors, including ordinary
+/// tokens that can consume a candidate spelling as part of a longer match.
+fn boundary_tokens(path: &str) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct AddedToken {
+        content: String,
+        #[serde(default)]
+        special: bool,
+        #[serde(default)]
+        single_word: bool,
+        normalized: Option<bool>,
+        #[serde(default)]
+        lstrip: bool,
+        #[serde(default)]
+        rstrip: bool,
+    }
+    #[derive(serde::Deserialize)]
+    struct TokenizerJson {
+        #[serde(default)]
+        added_tokens: Vec<AddedToken>,
+    }
+    if !path.ends_with(".json") {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+    let parsed: TokenizerJson =
+        serde_json::from_str(&text).with_context(|| format!("parse added_tokens in {path}"))?;
+    let safe = |t: &AddedToken| {
+        t.special
+            && t.normalized == Some(false)
+            && !t.single_word
+            && !t.lstrip
+            && !t.rstrip
+            && !t.content.is_empty()
+    };
+    // HF also merges special-token declarations from the sibling config. A declaration
+    // there can change matching flags or introduce a token overlapping a JSON boundary.
+    // Match HF's treatment of this optional file: ignore missing/invalid config entries.
+    let config_tokens: Vec<AddedToken> = Path::new(path)
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("tokenizer_config.json")).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|config| config.get("added_tokens_decoder")?.as_object().cloned())
+        .into_iter()
+        .flat_map(|tokens| tokens.into_values())
+        .filter_map(|value| serde_json::from_value::<AddedToken>(value).ok())
+        .filter(|t| t.special)
+        .collect();
+    let tokens = &parsed.added_tokens;
+    Ok(tokens
+        .iter()
+        .filter(|t| safe(t) && !suffix_overlaps(&t.content, &t.content))
+        .filter(|t| {
+            tokens.iter().chain(&config_tokens).all(|other| {
+                if other.content == t.content {
+                    return safe(other);
+                }
+                other.content.is_empty()
+                    || !(t.content.contains(&other.content)
+                        || other.content.contains(&t.content)
+                        || suffix_overlaps(&t.content, &other.content)
+                        || suffix_overlaps(&other.content, &t.content))
+            })
+        })
+        .map(|t| t.content.clone())
+        .collect())
+}
+
+/// Whether a proper suffix of `left` can start `right` (including self-overlap).
+fn suffix_overlaps(left: &str, right: &str) -> bool {
+    left.char_indices()
+        .skip(1)
+        .any(|(start, _)| right.starts_with(&left[start..]))
 }
 
 /// Treat `source` as a filesystem path (rather than a HuggingFace repo id)
@@ -226,5 +391,137 @@ mod model_files_tests {
         let files = ModelFiles::open(tokenizer.to_str().unwrap());
         let error = files.json("config.json").unwrap_err();
         assert!(error.to_string().contains("config.json"));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn added(content: &str) -> Value {
+        json!({"content": content, "special": true, "single_word": false,
+            "normalized": false, "lstrip": false, "rstrip": false})
+    }
+
+    /// Keep an independent safe boundary so both the cold path and an actual cache hit
+    /// exercise the unsafe spelling. Compare each backend with its own uncached encoder.
+    fn check(mut tokens: Vec<Value>, config: Option<Value>, text: &str, keep_safe: bool) {
+        if keep_safe {
+            tokens.insert(0, added("[SAFE]"));
+        }
+        for (i, token) in tokens.iter_mut().enumerate() {
+            token["id"] = json!(257 + i);
+        }
+        let mut data: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/tiny_tokenizer.json")).unwrap();
+        data["model"]["type"] = json!("BPE");
+        data["added_tokens"] = tokens.into();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, data.to_string()).unwrap();
+        if let Some(config) = config {
+            std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
+        }
+        let path = path.to_str().unwrap();
+        let expected_boundaries = if keep_safe { vec!["[SAFE]"] } else { vec![] };
+        assert_eq!(boundary_tokens(path).unwrap(), expected_boundaries);
+        let text = if keep_safe {
+            format!("[SAFE]{text}")
+        } else {
+            text.to_owned()
+        };
+        for backend in [TokenizerBackend::Hf, TokenizerBackend::Fast] {
+            let (plain, _) = load_with(
+                path,
+                TokenizerConfig {
+                    backend,
+                    l1_cache_mb: 0,
+                },
+            )
+            .unwrap();
+            let expected = encode(&plain, &text).unwrap();
+            let (cached, stats) = load_with(
+                path,
+                TokenizerConfig {
+                    backend,
+                    l1_cache_mb: 1,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                stats.backend(),
+                match backend {
+                    TokenizerBackend::Hf => EncodeBackend::Hf,
+                    TokenizerBackend::Fast => EncodeBackend::Fast,
+                }
+            );
+            for pass in 0..3 {
+                assert_eq!(
+                    encode(&cached, &text).unwrap(),
+                    expected,
+                    "{backend:?}, pass {pass}: {text}"
+                );
+            }
+            if keep_safe {
+                assert!(stats.l1_tokens().0 > 0, "must exercise a cache hit");
+            } else {
+                assert_eq!(stats.l1_state(), L1State::DisabledNoSpecials);
+                assert_eq!(stats.l1_tokens(), (0, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn l1_excludes_whole_word_boundaries() {
+        let mut cat = added("cat");
+        cat["single_word"] = json!(true);
+        check(vec![cat], None, "catfish", true);
+    }
+
+    #[test]
+    fn l1_excludes_overlapping_added_tokens() {
+        check(
+            vec![added("<x>"), added("<x>long")],
+            None,
+            "<x>longtail",
+            true,
+        );
+        let mut ordinary = added("<x>long");
+        ordinary["special"] = json!(false);
+        check(vec![added("<x>"), ordinary], None, "<x>longtail", true);
+        check(
+            vec![added("<x>"), added(">tail")],
+            None,
+            "<x>tailmore",
+            true,
+        );
+        check(vec![added("aba")], None, "ababa!", true);
+        check(vec![added("猫猫")], None, "猫猫猫!", true);
+    }
+
+    #[test]
+    fn l1_checks_sibling_special_token_declarations() {
+        let mut cat = added("cat");
+        cat["single_word"] = json!(true);
+        check(
+            vec![added("cat")],
+            Some(json!({"added_tokens_decoder": {"258": cat}})),
+            "catfish",
+            true,
+        );
+        check(
+            vec![added("<x>")],
+            Some(json!({"added_tokens_decoder": {"259": added("<x>long")}})),
+            "<x>longtail",
+            true,
+        );
+    }
+
+    #[test]
+    fn l1_passes_through_without_safe_boundaries() {
+        let mut cat = added("cat");
+        cat["single_word"] = json!(true);
+        check(vec![cat], None, "catfish", false);
     }
 }

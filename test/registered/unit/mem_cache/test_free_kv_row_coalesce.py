@@ -39,7 +39,7 @@ class _RowCache(BasePrefixCache):
     def match_prefix(self, params):
         raise NotImplementedError
 
-    def cache_finished_req(self, req, **kwargs):
+    def insert_req(self, req, **kwargs):
         raise NotImplementedError
 
     def cache_unfinished_req(self, req, **kwargs):

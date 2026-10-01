@@ -87,10 +87,12 @@ class InsertParams:
 
     # SWA specific
     prev_prefix_len: int = 0
-    swa_evicted_seqlen: int = 0
     swa_branching_seqlen: Optional[int] = None
 
     # General
+    component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
+        default_factory=dict, kw_only=True
+    )
     chunked: bool = False
     priority: int = 0
     session_id: Optional[str] = None
@@ -100,6 +102,12 @@ class InsertParams:
     # values belong to (stamped onto new tree nodes; None when sharding is
     # off). See UnifiedTreeNode.rotation_base.
     rotation_base: Optional[int] = None
+
+    def get_evicted_seqlen(self, component_type: ComponentType) -> int:
+        return self.component_evicted_seqlens.get(component_type, 0)
+
+    def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
+        self.component_evicted_seqlens[component_type] = length
 
 
 @dataclasses.dataclass
@@ -162,24 +170,41 @@ class IncLockRefResult:
     """Receipt returned by ``inc_lock_ref``.
 
     ``node_id`` is the anchor the lock was taken on; a release replays the
-    receipt on that node only. The SWA UUID marks the segment boundary;
-    ``None`` means root. ``skipped_lock_components`` records the components
-    the acquire left untaken, so the release leaves them untouched.
+    receipt on that node only. A recorded UUID marks a segment boundary;
+    ``None`` means root, while an absent entry means no receipt.
+    ``skipped_lock_components`` records the components the acquire left
+    untaken, so the release leaves them untouched.
     """
 
     delta: Optional[int] = None
     node_id: Optional[int] = None
-    swa_uuid_for_lock: Optional[int] = None
-    swa_uuid_for_host_lock: Optional[int] = None
     skipped_lock_components: tuple[ComponentType, ...] = ()
+    component_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    component_host_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def set_lock_uuid(
+        self,
+        component_type: ComponentType,
+        uuid: Optional[int],
+        *,
+        lock_host: bool = False,
+    ) -> None:
+        uuids = (
+            self.component_host_lock_uuids if lock_host else self.component_lock_uuids
+        )
+        uuids[component_type] = uuid
 
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
             node_id=self.node_id,
-            swa_uuid_for_lock=self.swa_uuid_for_lock,
-            swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
             skipped_lock_components=tuple(self.skipped_lock_components),
+            component_lock_uuids=dict(self.component_lock_uuids),
+            component_host_lock_uuids=dict(self.component_host_lock_uuids),
         )
 
 
@@ -187,16 +212,28 @@ class IncLockRefResult:
 class DecLockRefParams:
     """Receipt required by unified-tree ``dec_lock_ref``.
 
-    Fields default to nothing-acquired, so a lost receipt under-releases (a
-    leak the sanity checks report) instead of releasing another holder's
-    lock. ``node_id`` is ``None`` only for receipts that never came from a
-    unified-tree acquire (legacy caches, session sentinels).
+    A segment release requires its component's boundary entry; a missing
+    entry must not be treated as a lock reaching the root. ``node_id`` is
+    ``None`` only for receipts that never came from a unified-tree acquire
+    (legacy caches, session sentinels).
     """
 
     node_id: Optional[int] = None
-    swa_uuid_for_lock: Optional[int] = None
-    swa_uuid_for_host_lock: Optional[int] = None
     skipped_lock_components: tuple[ComponentType, ...] = ()
+    component_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    component_host_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def get_lock_uuid(
+        self, component_type: ComponentType, *, lock_host: bool = False
+    ) -> Optional[int]:
+        uuids = (
+            self.component_host_lock_uuids if lock_host else self.component_lock_uuids
+        )
+        return uuids[component_type]
 
 
 @dataclasses.dataclass
@@ -418,12 +455,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs):
-        """Hand a finished request's KV to the tree: insert what can be keyed
-        (advancing ``cache_protected_len``), ``free_kv_row`` the rest of
-        ``[cache_protected_len, owned_kv_len)``, ``unpin``. Slicing the row by
-        token count instead strands the slots up to ``owned_kv_len``; the
-        caller frees everything past it."""
+    def insert_req(self, req: Req, *, up_to: int, **kwargs):
+        """Hand a finished request's KV up to row position ``up_to`` to the
+        tree: insert what can be keyed and advance ``cache_protected_len``
+        past it. The caller then frees ``[cache_protected_len, up_to)`` and
+        everything after, and unpins; nothing here releases a slot."""
 
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):
@@ -442,7 +478,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         free_kv_row_segments(
             allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
-            swa_evicted_seqlen=kv.swa_evicted_seqlen,
+            swa_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
             swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
         )
 
@@ -567,6 +603,27 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_swa(self) -> bool:
         return False
+
+    def supports_auxiliary_swa(self) -> bool:
+        return False
+
+    def evict_sliding_windows(
+        self, req: Req, pre_len: int, *, eviction_interval: int = 1
+    ) -> None:
+        """Slide request-owned windows at the scheduler's safe eviction frontier."""
+        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+
+        free_swa_out_of_window_slots(
+            req,
+            pre_len,
+            sliding_window_size=self.sliding_window_size,
+            page_size=self.page_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            is_chunk_cache=self.is_chunk_cache(),
+            retain_floor=self.swa_retain_floor(req),
+            eviction_interval=eviction_interval,
+        )
 
     def swa_retain_floor(self, req) -> int | None:
         # A match lands on a state checkpoint rather than on the tail, so a cache

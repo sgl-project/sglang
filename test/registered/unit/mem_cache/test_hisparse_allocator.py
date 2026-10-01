@@ -10,6 +10,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -89,6 +90,61 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_free_returns_c4_slots(self):
+        """Freeing a request's logical row must return the C4 HiSparse slots its
+        compressed tokens were mapped to."""
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        page_size, full_size = 256, 4 * 256
+        override = get_context().override_server_args(page_size=page_size)
+        override.install()
+        self.addCleanup(override.restore)
+        pool = DeepSeekV4TokenToKVPool(
+            max_num_reqs=4,
+            swa_size=full_size,
+            c4_size=full_size // 4,
+            c128_size=2 * full_size // 128,  # sizes the C4 logical index space
+            c4_state_pool_size=16,
+            c128_state_pool_size=0,
+            page_size=page_size,
+            swa_page_size=page_size,
+            dtype=torch.float8_e4m3fn,
+            c4_state_dtype=torch.float32,
+            c128_state_dtype=torch.float32,
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            indexer_head_dim=128,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            compression_ratios=[0, 4],
+            full_size=full_size,
+            enable_hisparse=True,
+        )
+        logical = PagedTokenToKVPoolAllocator(
+            full_size, page_size, pool.dtype, "cpu", pool, need_sort=False
+        )
+        allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(logical)
+        c4_free = allocator.hisparse_attn_allocator.available_size()
+
+        # What alloc_extend leaves behind for a one-page request.
+        locs = logical.alloc(page_size)
+        compressed = allocator.hisparse_kvcache.translate_loc_from_full_to_compressed(
+            locs
+        )
+        slots = allocator.hisparse_attn_allocator.alloc(len(compressed))
+        allocator.full_to_hisparse_device_index_mapping[compressed] = slots
+
+        allocator.free(locs)
+
+        self.assertEqual(allocator.hisparse_attn_allocator.available_size(), c4_free)
+        self.assertFalse(
+            allocator.full_to_hisparse_device_index_mapping[compressed].any()
+        )
 
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
@@ -242,7 +298,9 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         _, kwargs = allocator.alloc_extend_swa_tail.call_args
         self.assertEqual(kwargs["extend_num_tokens"], fill_len)
         self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
-        self.assertEqual(req.kv.swa_evicted_seqlen, fill_len - swa_tail_len)
+        self.assertEqual(
+            req.kv.get_evicted_seqlen(ComponentType.SWA), fill_len - swa_tail_len
+        )
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv.kv_committed_len, fill_len)
         self.assertEqual(req.extend_range.length, fill_len)

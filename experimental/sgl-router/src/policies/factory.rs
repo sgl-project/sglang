@@ -338,6 +338,7 @@ mod tests {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
                 disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
                 policy,
                 decode_policy: Default::default(),
                 bucket_config: None,
@@ -348,6 +349,7 @@ mod tests {
                 fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],
