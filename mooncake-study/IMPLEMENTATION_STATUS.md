@@ -43,8 +43,8 @@ it does not redefine the goal as the modules already implemented.
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit retract/resume | Real 256-token KV pool eviction, physical slot reuse, failed-capture exclusion and subsequent admission pass in synchronous and overlap/graph modes; automatic AR OOM remains open |
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes in all four synchronous/overlap and eager/graph combinations; failed captures are excluded and fresh capture admission recovers |
-| PD collection | D-owned complete snapshot with fenced first-teacher handoff over Mooncake control messages | Real TP1 P/D on one H100 passes eager and graph/overlap, source parity, batches, prefix reuse and failed/aborted sample exclusion; broader PD topology and RDMA remain open |
-| Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark and TP1 AR PD have runtime evidence below; combined topologies, PD speculation, RDMA and workload SLO gates remain open |
+| PD collection | D-owned complete snapshot with fenced first-teacher handoff and TP cohort publication | Real P1/D1, P1/D2, P2/D1 and P2/D2 pass eager and graph/overlap, exact source parity, batches, prefix reuse and failed/aborted sample exclusion; PD PP/speculation and RDMA remain open |
+| Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark and matching/asymmetric TP AR PD have runtime evidence below; combined topologies, PD speculation, RDMA and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
 `/gpfs/users/fuxuanwei-1/dspark-maas-lab/state`):
@@ -2259,10 +2259,11 @@ Abort/retract and lease invalidation reuse the existing D cleanup path. Fake
 warmup/health-check transfers are explicitly excluded; actual server startup
 found this required guard, and a unit regression now protects it.
 
-The current gate permits Mooncake AR with TP=PP=DP=1 and no optimistic prefill.
-PD speculation, multi-rank PD, cross-node RDMA, and PD cache/rebootstrap stress
-are still open. The design's section 13.3.1 records the wire and ownership
-decision, compatibility behavior and configuration requirements.
+This milestone initially permitted Mooncake AR with TP=PP=DP=1 and no optimistic
+prefill. The TP extension below supersedes that TP restriction. PD speculation,
+pipeline parallel, cross-node RDMA, and PD cache/rebootstrap stress remain open.
+The design's section 13.3.1 records the wire and ownership decision,
+compatibility behavior and configuration requirements.
 
 The complete `test_training_capture_pd.py` passes both tests in 134.189s on the
 resident H100 (job `01790876096551927410-528c095406d8`). Each mode starts separate
@@ -2293,6 +2294,65 @@ The Catalog remains an HTTP test double and transport is TCP. These results do
 not certify production retention, a production SpecForge consumer, distributed
 PD, RDMA, trained draft quality, or P10 performance acceptance.
 
+## TP PD Cohort Publication
+
+PD AR now reuses the distributed decode capture coordinator. All D ranks bind
+the existing ingress ticket to one cohort lease before sending destination
+metadata. The shared PD import validates the first teacher and committed token;
+each KV owner exports its canonical prompt head range and only the aux owner
+stores teacher/positions. Aux-only and inactive ranks advance the same ledger.
+The existing all-owner descriptor/receipt agreement gates manifest publication,
+so one rank's failed handoff excludes the complete sample.
+
+P/D TP sizes may differ because the wire binds global teacher/KV identity, not
+the local ownership layout. P requires matching contexts from all non-dummy
+destinations. P1/D2 imports one handoff into each D rank; P2/D1 deduplicates
+identical teacher payloads and rejects conflicting payloads. No Mooncake SDK or
+registered serving KV-buffer layout change is needed. PP=DP=1, AR, Mooncake and
+no optimistic prefill remain required.
+
+The final runtime files all pass on real Qwen3-0.6B P/D processes and TCP Store:
+
+| Test File | Topology | Tests | Seconds |
+| --- | --- | --- | --- |
+| `test_training_capture_pd.py` | P1/D1 | 2 | 133.291 |
+| `test_training_capture_pd_tp_expand.py` | P1/D2 | 2 | 136.482 |
+| `test_training_capture_pd_tp_reduce.py` | P2/D1 | 2 | 139.462 |
+| `test_training_capture_pd_tp.py` | P2/D2 | 2 | 136.128 |
+
+Every file covers eager and actual graph/overlap execution. The eight cases
+publish 40 snapshots whose KV, raw top-128 scores/IDs, LSE, token IDs, positions,
+loss masks and validity match independent online source observations. The
+24 selected missing-handoff, stale-P-rank-0 and stream-abort requests publish
+no snapshot, and handoff faults do not stop serving. Both ends use radix cache;
+the reused 153-token prompt verifies complete prefix reconstruction. A test-only
+ready-queue barrier makes the tagged pair form an actual decode batch.
+
+Eight PD unit tests include TP4 replicated heads with separate KV/aux owners
+and an inactive rank. Eight configuration tests, 46 coordinator tests, three
+cohort-coordinator tests and one four-process startup rollback test pass as
+separate files. The final total is 74 tests. Eleven changed Python files pass
+Black, isort, repository Ruff checks and compilation; new helpers/tests also
+pass broader Ruff rules with import ordering delegated to isort. Registered
+test validation passes, and the GPU checkout matches the final source hashes.
+
+Two initial fixture failures are retained in the evidence: distributed Catalog
+failures use `cohort_failed`, and a batched HTTP call does not guarantee the
+two transfers become runnable together. The corrected tests also require
+admission, cancellation, drained capture work and zero quarantined Host slots.
+All final runtime files were executed after those test changes.
+
+The temporary two-H100 job `job-ad7074c7546a-20261002020118` on node199 was
+deleted after verifying no live serving/Store process remained; its pod is
+NotFound. The resident single-H100 worker has no queued/active experiment and
+has resumed idle load. The original checkout's staged-index digest is unchanged.
+Full commands, results, runtime counters, failed attempts and source/log hashes
+are recorded in `experiments/capture-pd-tp.json` and its referenced logs.
+
+This extends TCP correctness coverage. It does not certify PD PP/speculation,
+DP, RDMA, deployed TP4 replicated heads, production Catalog retention, trained
+draft quality or workload performance acceptance.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -2303,8 +2363,9 @@ PD, RDMA, trained draft quality, or P10 performance acceptance.
 3. Extend P9's real TP2/PP1 and TP1/PP2 Qwen3 capture validation to combined
    TP2/PP2, replicated heads, distributed cancellation/backpressure and additional
    model identities. Complete pipeline speculative collection,
-   multi-rank/speculative PD and cross-node RDMA. TP1 AR PD now transfers the
-   first teacher row and publishes from D. Ordinary AR uses the distributed serving
+   pipeline/speculative PD and cross-node RDMA. AR PD now transfers the
+   first teacher row and publishes from D across matching/asymmetric TP groups.
+   Ordinary AR uses the distributed serving
    path, and static and confidence-scheduled DSpark capture support TP. The
    target-KV v1 draft remains static by checkpoint contract; the remaining
    capability gates do not constitute implementation of those paths.

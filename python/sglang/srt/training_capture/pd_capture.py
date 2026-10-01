@@ -8,6 +8,7 @@ import msgspec
 import torch
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.training_capture.cohort_coordinator import CohortCaptureCoordinator
 from sglang.srt.training_capture.coordinator import CaptureCoordinator
 from sglang.srt.training_capture.pd_protocol import (
     CaptureTransferContext,
@@ -157,7 +158,9 @@ class PrefillCaptureCoordinator:
         }
 
 
-class DecodeCaptureCoordinator(CaptureCoordinator):
+class DecodeCaptureMixin:
+    """Import the PD boundary using the coordinator's existing lease and owners."""
+
     def begin_pd_transfer(self, req):
         self.before_forward([req])
         record = req.training_capture_context
@@ -203,11 +206,15 @@ class DecodeCaptureCoordinator(CaptureCoordinator):
             slots = self.req_to_token.req_to_token[
                 req.req_pool_idx, : context.prompt_length
             ].clone()
-            context.export_kv(self.exporter, slots, end=context.prompt_length)
-            context.record_positions(
-                torch.arange(context.prompt_length, device=slots.device), start=0
-            )
-            context.record_teacher(rows, row=0, position=context.prompt_length)
+            if context.owns_kv:
+                context.export_kv(self.exporter, slots, end=context.prompt_length)
+            else:
+                context.record_kv_progress(end=context.prompt_length)
+            if context.owns_aux:
+                context.record_positions(
+                    torch.arange(context.prompt_length, device=slots.device), start=0
+                )
+                context.record_teacher(rows, row=0, position=context.prompt_length)
             context.commit_token(
                 position=context.prompt_length, token_id=handoff.output_token_id
             )
@@ -219,3 +226,11 @@ class DecodeCaptureCoordinator(CaptureCoordinator):
     def _detach(self, req, record):
         req.training_capture_pd = None
         return super()._detach(req, record)
+
+
+class DecodeCaptureCoordinator(DecodeCaptureMixin, CaptureCoordinator):
+    pass
+
+
+class CohortDecodeCaptureCoordinator(DecodeCaptureMixin, CohortCaptureCoordinator):
+    pass

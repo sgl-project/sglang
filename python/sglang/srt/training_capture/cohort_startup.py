@@ -3,6 +3,7 @@
 from datetime import timedelta
 
 import torch.distributed as dist
+
 from sglang.srt.training_capture.cohort import CaptureCohortAllocator
 from sglang.srt.training_capture.cohort_coordinator import CohortCaptureCoordinator
 from sglang.srt.training_capture.metrics import CaptureMetrics
@@ -41,6 +42,13 @@ def prepare_cohort_capture(
     )
     resources = None
     try:
+        coordinator_type = CohortCaptureCoordinator
+        if capture_mode == "pd_autoregressive":
+            from sglang.srt.training_capture.pd_capture import (
+                CohortDecodeCaptureCoordinator,
+            )
+
+            coordinator_type = CohortDecodeCaptureCoordinator
         partition = layout.partitions[dist.get_rank(control)]
         resources = CaptureResources.prepare(
             config=config, kv=kv, partition=partition, source_pool=pool
@@ -48,7 +56,7 @@ def prepare_cohort_capture(
         if resources.exporter is not None and resources.exporter.device.type != "cuda":
             raise ContractError("serving capture currently requires CUDA")
         metrics = CaptureMetrics(metrics_labels) if metrics_labels is not None else None
-        return CohortCaptureCoordinator(
+        return coordinator_type(
             allocator=CaptureCohortAllocator(
                 group=control,
                 layout=layout,

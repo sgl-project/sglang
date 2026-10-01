@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -13,10 +14,13 @@ import torch
 
 from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
 from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
+from sglang.srt.training_capture.context import RequestCaptureContext
+from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.pd_capture import (
     DecodeCaptureCoordinator,
+    DecodeCaptureMixin,
     PrefillCaptureCoordinator,
 )
 from sglang.srt.training_capture.pd_protocol import (
@@ -26,7 +30,9 @@ from sglang.srt.training_capture.pd_protocol import (
     decode_handoff,
     encode_handoff,
 )
-from sglang.srt.training_capture.protocol import ContractError
+from sglang.srt.training_capture.protocol import ContractError, validate_tensors
+from sglang.srt.training_capture.snapshot import SnapshotMetadata, assemble_snapshot
+from sglang.srt.training_capture.topology import plan_capture_layout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.training_capture_catalog import TestCaptureCatalog
@@ -34,6 +40,7 @@ from sglang.test.training_capture_utils import (
     BufferStore,
     CaptureTestRequest,
     FakeReplicateConfig,
+    Registrar,
     make_snapshot,
     read_snapshot,
 )
@@ -308,6 +315,116 @@ class TestPDCapture(CustomTestCase):
                 self.assertEqual(info.training_capture_context, context)
                 self.assertEqual(info.decode_prefix_len, 4)
                 np.testing.assert_array_equal(info.dst_kv_indices, indices)
+
+    def test_pd_import_partitions_prompt_heads_and_writes_aux_only_once(self):
+        req, wire = self.begin()
+        payload, raw = self.handoff(wire)
+        transfer = decode_handoff(wire, CaptureTransferContext)
+        # Two physical heads replicated over four ranks leaves an inactive rank;
+        # aux ownership is deliberately on a rank without canonical KV heads.
+        layout = plan_capture_layout(
+            self.decode.kv, tp_size=4, pp_layer_ranges=[(0, 4)], aux_tp_rank=1
+        )
+        parts, objects = [], {}
+        with ExitStack() as stack:
+            for partition in layout.partitions:
+                with self.subTest(owner=partition.owner_id):
+                    pool, slot = None, None
+                    if partition.active:
+                        pool = HostBufferPool(
+                            kv=self.decode.kv,
+                            max_tokens=8,
+                            slots=1,
+                            max_bytes=2 << 20,
+                            registrar=Registrar(),
+                            pin_memory=False,
+                            partition=partition,
+                        )
+                        stack.callback(pool.close)
+                        slot = pool.acquire()
+                        stack.callback(pool.release, slot, transfer_complete=True)
+                    context = RequestCaptureContext(
+                        slot=slot,
+                        prompt_ids=(3, 4),
+                        max_tokens=8,
+                        vocab_size=256,
+                        partition=partition,
+                    )
+                    buffers = {
+                        f"target_{c}.{heads.layer_id}": self.buffers[
+                            f"target_{c}.{heads.layer_id}"
+                        ][:, heads.start : heads.end]
+                        for heads in partition.heads
+                        for c in ("k", "v")
+                    }
+                    exporter = (
+                        SelectedLayerKVExporter(
+                            self.decode.kv, buffers, partition=partition
+                        )
+                        if buffers
+                        else None
+                    )
+                    record = SimpleNamespace(context=context, invalid_reason=None)
+                    local_req = SimpleNamespace(
+                        req_pool_idx=0,
+                        output_ids=[10],
+                        training_capture_context=record,
+                        training_capture_pd=transfer,
+                    )
+                    coordinator = SimpleNamespace(
+                        teacher=self.decode.teacher,
+                        req_to_token=self.decode.req_to_token,
+                        exporter=exporter,
+                        _count=Mock(),
+                        _fail_request=Mock(
+                            side_effect=AssertionError("PD import failed")
+                        ),
+                    )
+                    DecodeCaptureMixin.accept_pd_handoff(
+                        coordinator, local_req, payload
+                    )
+                    self.assertEqual(context.token_ids, [3, 4, 10])
+                    self.assertEqual(context.kv_end, 2)
+                    self.assertEqual(context.teacher_rows, int(partition.include_aux))
+                    self.assertIsNone(local_req.training_capture_pd)
+                    context.seal("length")
+                    if not partition.active:
+                        continue
+                    metadata = SnapshotMetadata(
+                        dataset_id=transfer.dataset_id,
+                        sample_id=transfer.sample_id,
+                        generation_id=transfer.generation_id,
+                        teacher=self.decode.teacher,
+                        sequence=context.sequence,
+                        kv=self.decode.kv,
+                        provenance=req.training_capture_context.provenance,
+                        topology=layout.topology,
+                    )
+                    part, tensors = context.prepare_partition(
+                        **{
+                            name: getattr(metadata, name)
+                            for name in SnapshotMetadata.__struct_fields__
+                            if name != "sequence"
+                        }
+                    )
+                    parts.append(part)
+                    objects.update(tensors)
+            manifest = assemble_snapshot(metadata, parts, layout=layout)
+            validate_tensors(manifest, objects)
+            aux = {
+                obj.name: objects[obj.key]
+                for obj in manifest.objects
+                if obj.kind == "aux"
+            }
+            self.assertEqual(aux["token_ids"].tolist(), [3, 4, 10])
+            torch.testing.assert_close(aux["teacher_topk_logits"], raw.topk(128).values)
+            for obj in manifest.objects:
+                if obj.kind == "kv":
+                    start, end = obj.head_range
+                    expected = self.buffers[obj.name][[7, 3], start:end]
+                    torch.testing.assert_close(
+                        objects[obj.key], expected, rtol=0, atol=0
+                    )
 
 
 if __name__ == "__main__":

@@ -797,7 +797,8 @@ PD 的 TransferEngine KV 交接不是 Store 样本提交，两个完成事件分
 #### 13.3.1 当前实现: D 统一导出与发布
 
 `pd_capture.py` 实现 D 统一导出路径。当前接入 Mooncake backend、普通 AR、
-TP=PP=DP=1；PD speculative、多 rank PD 和跨节点 RDMA 仍需后续实现与验证。
+PP=DP=1，支持 TP 分片；PD speculative、PD pipeline parallel 和跨节点 RDMA
+仍需后续实现与验证。P/D 的 TP 数可以不同，模型必须满足全局 teacher/KV 契约。
 不允许 optimistic prefill，因为 P 必须在 forward 前收到 D 的采集上下文。
 
 1. D 在发布 KV 接收地址前，通过原有 Host 配额与 Catalog reservation 申请采集。
@@ -822,13 +823,31 @@ TP=PP=DP=1；PD speculative、多 rank PD 和跨节点 RDMA 仍需后续实现�
    控制消息幂等；冲突重复消息使 handoff 无效；房间清理后的迟到消息不重新建立状态。
    abort/retract/lease invalidation 使用 D 现有失败与资源回收流程。
 
+TP 场景复用 D 的 `CaptureRequestRouter` 和 cohort：请求在 TP 广播前绑定共享
+reservation，所有 rank 使用同一个 capture ID、fencing token 和 generation ID。
+`CohortDecodeCaptureCoordinator` 与单 rank coordinator 共用首条 teacher 导入逻辑。
+各 KV owner 从自己的 canonical slots 导出所属 head 范围；只有 aux owner 保存
+positions、token IDs、loss mask 和 teacher。复制 KV heads 只由 canonical owner 写入，
+无 payload 的 rank 仍推进 token/KV ledger，参与全体一致性检查。
+对象写入和 manifest 发布复用现有分片 receipts 协议；任一 rank 失败时整份样本失败。
+Catalog 对分布式失败记录 `cohort_failed`，具体原因保留在各 rank 的采集计数器中。
+
+P 的 raw logits 必须已完成全词表 TP gather。P 对所有非 dummy 接收端的采集上下文
+检查一致性，随后沿正常 KV 传输对应关系发送同一 handoff。P1→D2 时两个 D rank
+各自导入首条边界；P2→D1 时 D 的 mailbox 对相同 handoff 去重，冲突 handoff 作废。
+teacher/KV 契约摘要使用全局模型身份与 KV 几何，不包含 P/D 本地 TP 分片布局。
+
 两端均传入 `--training-capture-config`，teacher identity、选层和 KV 契约必须一致；
 `journal_directory` 可按 P/D 使用不同本地目录。只有 D 实际连接配置中的 Catalog
 与 Mooncake Store。旧 P 不提供 handoff 时，新 D 不发布该样本；旧 D 不发送上下文时，
 新 P 不采集 teacher。健康检查的 Fake transfer 不参与采集。
 
-`test_training_capture_pd.py` 使用真实 P/D 进程和独立 Mooncake Store reader；测试用
-observer 在在线 forward 中保存完整原始分数与 source KV，不重跑 target 作为回读 oracle。
+`test_training_capture_pd.py`、`test_training_capture_pd_tp.py`、
+`test_training_capture_pd_tp_expand.py` 和 `test_training_capture_pd_tp_reduce.py`
+分别覆盖 P1→D1、P2→D2、P1→D2、P2→D1，均使用真实 P/D 进程和独立 Store reader。
+测试用 observer 在在线 forward 中按 rank 保存完整原始分数与 source KV，
+不重跑 target 作为回读 oracle。指定的双请求在测试服务器的 ready queue 会合后
+再调度，以保证实际 batch 覆盖；这个约束不进入生产调度器。
 Catalog 在该测试中仍是 test double，不能据此宣称生产保留策略或训练消费已验收。
 
 ### 13.4 speculative verify

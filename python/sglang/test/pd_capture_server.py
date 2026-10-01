@@ -9,6 +9,11 @@ from pathlib import Path
 import msgspec
 import torch
 
+from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.training_capture.coordinator import CaptureCoordinator
 from sglang.srt.training_capture.pd_capture import PrefillCaptureCoordinator
@@ -25,6 +30,7 @@ _init = TpModelWorker.init_training_capture
 _prefill_forward = PrefillCaptureCoordinator.after_forward
 _decode_forward = CaptureCoordinator.after_forward
 _handoff = PrefillCaptureCoordinator.finish_handoff
+_prebuilt = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch
 
 
 def observed_init(self, **kwargs):
@@ -39,6 +45,8 @@ def observed_init(self, **kwargs):
 def observed_prefill(self, batch, forward_batch, logits_output, **kwargs):
     pool, req_pool = _pools[id(self)]
     root = Path(self.config.journal_directory).parent / "capture-reference"
+    rank = get_tensor_model_parallel_rank()
+    root = root / f"tp{rank}"
     root.mkdir(parents=True, exist_ok=True)
     for row, req in enumerate(batch.reqs):
         if req.training_capture_pd is None:
@@ -49,6 +57,8 @@ def observed_prefill(self, batch, forward_batch, logits_output, **kwargs):
         torch.save(
             {
                 "trace_id": hashlib.sha256(req.rid.encode()).hexdigest(),
+                "tp_rank": rank,
+                "tp_size": get_tensor_model_parallel_world_size(),
                 "tokens": list(req.origin_input_ids[:end]),
                 "kv_start": 0,
                 "kv": {
@@ -82,7 +92,11 @@ def handoff_faults(self, req):
     payload = _handoff(self, req)
     if req.rid.startswith("missing-"):
         return None
-    if payload is not None and req.rid.startswith("stale-"):
+    if (
+        payload is not None
+        and req.rid.startswith("stale-")
+        and get_tensor_model_parallel_rank() == 0
+    ):
         value = decode_handoff(payload, PrefillTeacherHandoff)
         context = msgspec.structs.replace(
             value.context, fencing_token=value.context.fencing_token + 1
@@ -91,10 +105,22 @@ def handoff_faults(self, req):
     return payload
 
 
+def grouped_prebuilt(self, running_batch):
+    # PD transfers may complete separately even for one batched HTTP request.
+    # Hold the tagged pair in the ready queue to exercise an actual decode batch.
+    if (
+        running_batch.is_empty()
+        and sum(req.rid.startswith("batch-") for req in self.waiting_queue) == 1
+    ):
+        return None
+    return _prebuilt(self, running_batch)
+
+
 TpModelWorker.init_training_capture = observed_init
 PrefillCaptureCoordinator.after_forward = observed_prefill
 PrefillCaptureCoordinator.finish_handoff = handoff_faults
 CaptureCoordinator.after_forward = observed_decode
+SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch = grouped_prebuilt
 
 
 if __name__ == "__main__":

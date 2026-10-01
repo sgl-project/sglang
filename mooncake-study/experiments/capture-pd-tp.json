@@ -1,0 +1,731 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "2f6b92bb363823d644b6fc0db83ef42ad6bdc88b",
+  "feature": "TP-sharded decode-owned PD capture across matching and asymmetric Mooncake transfer groups",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "resident_node": "node064",
+    "resident_gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "temporary_job": "job-ad7074c7546a-20261002020118",
+    "temporary_node": "node199",
+    "temporary_gpus": [
+      "GPU-9a2310f8-4162-b824-638e-95729f284b28",
+      "GPU-d509370c-2949-982e-9f93-c0653fe393c0"
+    ],
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "layers": [
+      0,
+      14,
+      27
+    ],
+    "versions": {
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+      "sglang-kernel": "0.4.6.post1",
+      "flashinfer-python": "0.6.17",
+      "transformers": "5.12.1"
+    },
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang:v0.5.15",
+    "transport": "Actual Mooncake TransferEngine TCP and independent TCP Store segment/reader",
+    "catalog": "HTTP TestCaptureCatalog double",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "topology": "P1/D1 shares one H100; P1/D2, P2/D1 and P2/D2 share the temporary two H100s. PP=DP=1, AR, no optimistic prefill.",
+    "dependency_adjustment": "Removed only the temporary container's preinstalled flashinfer-cubin/flashinfer-jit-cache 0.6.12, so the shared 0.6.17 runtime is consistent."
+  },
+  "implementation": [
+    "D uses its existing all-rank request ticket and cohort lease, owner-local arenas/writers, and all-owner receipt agreement.",
+    "Single-rank and cohort decode coordinators share the fenced first-teacher import. Each KV owner exports its local canonical head range; the aux owner alone stores teacher/positions.",
+    "Aux-only and inactive ranks advance the same first-token ledger. A TP4 CPU fixture with two replicated physical heads validates canonical ownership and exact reconstruction.",
+    "P/D global teacher/KV contract digests do not depend on local TP layout. P validates all non-dummy destination contexts; D rejects missing, stale or conflicting handoffs.",
+    "The capability gate now permits TP for AR Mooncake PD and retains the PP/DP/speculation/optimistic-prefill exclusions."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/training_capture/cohort_startup.py": "8607c96860c3037819c4f4f9bb5bebf4eb8e7eb7e1ba79188e80609bd35e6a5e",
+    "python/sglang/srt/training_capture/config.py": "2e5de4f080d8c5f15c5f3089cf846f6b8a91d03971499c2d0c2ac4d00c6ed65c",
+    "python/sglang/srt/training_capture/pd_capture.py": "81f1ff80daa441b20688542c9668a02e03c8933b210198ea584e21f3fb71f22b",
+    "python/sglang/test/pd_capture_server.py": "b1a8d88b29dc6f7072cbe5ac61fa2d34d2359b4d3605c4268a83ee98f369519d",
+    "python/sglang/test/pd_capture_runtime.py": "3e91d42168145bf58c14e9c087bcba7714ac29044a86fcf2a460ac1f04cc3ce9",
+    "test/registered/storage/test_training_capture_pd.py": "02df9ba1b3421e96acbead9f5d8e4774fd2a2bfd0f0274b138c76d0d02a1371e",
+    "test/registered/storage/test_training_capture_pd_tp.py": "5f249e498d6e6c69d736c0b4c5ebc14f1d2d4ec8648cf5d3ea842161440c956c",
+    "test/registered/unit/training_capture/test_config.py": "1eb0cd589bf38c37f85312adff9751ad9b737c997108bbe0955b1a8cbf12fe4e",
+    "test/registered/unit/training_capture/test_pd_capture.py": "88f92132719e10de494d75eb57102b3fe7fbbecbdbe8e94f18b58997fab50515",
+    "test/registered/storage/test_training_capture_pd_tp_expand.py": "7b70acf597267f5846e88ac81c1c39e03a8dbb6f7bab7e63c1004b2c63727239",
+    "test/registered/storage/test_training_capture_pd_tp_reduce.py": "609ccb60df6328aa43e7d35aa53b2978c4601adeedd1d5418fc87cd4cbdfb577",
+    "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+    "python/sglang/srt/training_capture/cohort_coordinator.py": "c858b29968f2dda7e8ae5353324bae5bfa436f0ea216d10da58d040c33acfa45",
+    "python/sglang/srt/training_capture/coordinator.py": "a94a6e8d20eee5f882e6fe45c5ddb4b7297d20c39221a515181882def84db728",
+    "python/sglang/srt/disaggregation/mooncake/conn.py": "286615ad3ce75816892235551dc3cae63a9f99a4bc1c6a5d56ab96677b3c0220",
+    "python/sglang/test/dspark_capture_observer.py": "77110bec37b965fff75ab2498d3b0cb454dc803735716c33f3b6f928ef4426e0"
+  },
+  "gpu_source_hashes_match": true,
+  "tests": [
+    {
+      "job_id": "01790877654003003364-240a43b30eb8",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790877670.8799593,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790877654003003364-240a43b30eb8.log",
+      "test_file": "test/registered/unit/training_capture/test_pd_capture.py",
+      "tests_run": 8,
+      "elapsed_seconds": 5.039,
+      "log_sha256": "5bb3b7d95ee265c6ac5ced7311f21531e000b0e971c4b262bc6ed96b4ed66fba"
+    },
+    {
+      "job_id": "01790877654359596460-a02dd784abf2",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790877681.9134336,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790877654359596460-a02dd784abf2.log",
+      "test_file": "test/registered/unit/training_capture/test_config.py",
+      "tests_run": 8,
+      "elapsed_seconds": 0.009,
+      "log_sha256": "753b181f7926be62dd2193f24c62b5529eaf458669b5794707f4edcf006f21de"
+    },
+    {
+      "job_id": "01790877654758924179-8e34fdf102e5",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790877706.2259276,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790877654758924179-8e34fdf102e5.log",
+      "test_file": "test/registered/unit/training_capture/test_cohort_startup.py",
+      "tests_run": 1,
+      "elapsed_seconds": 13.509,
+      "log_sha256": "fb7f941314d02933b350b0a8e2e4e2962aa36f848b42a1839052992693fded93"
+    },
+    {
+      "job_id": "01790877869763738225-8a6cb59faa2b",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790877915.9888363,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790877869763738225-8a6cb59faa2b.log",
+      "test_file": "test/registered/unit/training_capture/test_coordinator.py",
+      "tests_run": 46,
+      "elapsed_seconds": 34.622,
+      "log_sha256": "ac5bcf0aba2c0970a47229dc0979c727487e345104b47eec37a2cf25996db4d3"
+    },
+    {
+      "job_id": "01790877870070254547-a350c18d0c49",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790877929.2766438,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790877870070254547-a350c18d0c49.log",
+      "test_file": "test/registered/unit/training_capture/test_cohort_coordinator.py",
+      "tests_run": 3,
+      "elapsed_seconds": 1.945,
+      "log_sha256": "36fca2744894921bb871ffac07e99f641f6e039f5f52de65b553d6a32d82a2d4"
+    },
+    {
+      "job_id": "01790878482950439625-7adf40373c69",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790878627.9001894,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790878482950439625-7adf40373c69.log",
+      "test_file": "test/registered/storage/test_training_capture_pd.py",
+      "tests_run": 2,
+      "elapsed_seconds": 133.291,
+      "log_sha256": "b08a4e51115362f97579239d911405d7cb4d97109be362e6a3301ae5136a4839"
+    },
+    {
+      "name": "expand-grouped",
+      "test_file": "test/registered/storage/test_training_capture_pd_tp_expand.py",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-tp-expand-grouped-20261001.log",
+      "tests_run": 2,
+      "elapsed_seconds": 136.482,
+      "returncode": 0,
+      "log_sha256": "af994b7e6dd98866714bdf1bccb268190b7364aa9973be4fa8da48af1b2f35bd"
+    },
+    {
+      "name": "reduce",
+      "test_file": "test/registered/storage/test_training_capture_pd_tp_reduce.py",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-tp-reduce-20261001.log",
+      "tests_run": 2,
+      "elapsed_seconds": 139.462,
+      "returncode": 0,
+      "log_sha256": "2a203ed50557908b689733f38fd7cdede5f596700a26e3613d657a40db03a115"
+    },
+    {
+      "name": "matching",
+      "test_file": "test/registered/storage/test_training_capture_pd_tp.py",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-tp-matching-20261001.log",
+      "tests_run": 2,
+      "elapsed_seconds": 136.128,
+      "returncode": 0,
+      "log_sha256": "58c6b596103c97aed6c075824e74ab180ae74d55deb972ccd94c642b7b92c88f"
+    }
+  ],
+  "summary": {
+    "unique_tests": 74,
+    "real_runtime_cases": 8,
+    "ready_samples": 40,
+    "selected_fault_or_abort_requests": 24
+  },
+  "runtime": [
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "counters": {
+          "admitted": 8,
+          "considered": 8,
+          "copies_completed": 8,
+          "eager_forwards": 14,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5,
+          "snapshot_built": 5,
+          "writer_started": 8
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "filling": 2,
+          "free": 2,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 1,
+        "states": {
+          "available": 1
+        },
+        "writer_age_seconds": 0
+      },
+      "decode_tp": 1,
+      "prefill_tp": 1,
+      "replay": false
+    },
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "counters": {
+          "admitted": 8,
+          "considered": 8,
+          "copies_completed": 8,
+          "cuda_graph_forwards": 17,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "overlap_forwards": 17,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5,
+          "snapshot_built": 5,
+          "writer_started": 8
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "filling": 1,
+          "free": 3,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 1,
+        "states": {
+          "available": 1
+        },
+        "writer_age_seconds": 0
+      },
+      "decode_tp": 1,
+      "prefill_tp": 1,
+      "replay": true
+    },
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "cohort_writer": {
+          "counters": {
+            "failed": 3,
+            "published": 5,
+            "submitted": 8
+          },
+          "error": null,
+          "oldest_seconds": 0,
+          "pending": 0,
+          "ready": true,
+          "recovery_error": null,
+          "states": {},
+          "stopping": false
+        },
+        "counters": {
+          "admitted": 8,
+          "eager_forwards": 13,
+          "failed_pd_handoff_failed": 2,
+          "failed_running_request_aborted": 1,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "host_pool": {
+          "allocated_bytes": 11556864,
+          "device_allocated_bytes": 393216,
+          "device_limit_bytes": 8388608,
+          "filling": 4,
+          "free": 0,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "request_router": {
+          "attached": 8,
+          "bound": 8,
+          "cancelled": 1,
+          "considered": 9,
+          "excluded": 1,
+          "selected": 8
+        },
+        "reservations": 3,
+        "states": {
+          "available": 3,
+          "pending_publication": 0,
+          "writing": 0
+        },
+        "writer_age_seconds": 0
+      },
+      "decode_tp": 2,
+      "prefill_tp": 1,
+      "replay": false
+    },
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "cohort_writer": {
+          "counters": {
+            "failed": 3,
+            "published": 5,
+            "submitted": 8
+          },
+          "error": null,
+          "oldest_seconds": 0,
+          "pending": 0,
+          "ready": true,
+          "recovery_error": null,
+          "states": {},
+          "stopping": false
+        },
+        "counters": {
+          "admitted": 8,
+          "cuda_graph_forwards": 16,
+          "failed_pd_handoff_failed": 2,
+          "failed_running_request_aborted": 1,
+          "overlap_forwards": 16,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "host_pool": {
+          "allocated_bytes": 11556864,
+          "device_allocated_bytes": 393216,
+          "device_limit_bytes": 8388608,
+          "filling": 4,
+          "free": 0,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "request_router": {
+          "attached": 8,
+          "bound": 8,
+          "cancelled": 1,
+          "considered": 9,
+          "excluded": 1,
+          "selected": 8
+        },
+        "reservations": 3,
+        "states": {
+          "available": 3,
+          "pending_publication": 0,
+          "writing": 0
+        },
+        "writer_age_seconds": 0
+      },
+      "decode_tp": 2,
+      "prefill_tp": 1,
+      "replay": true
+    },
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "counters": {
+          "admitted": 8,
+          "considered": 8,
+          "copies_completed": 8,
+          "eager_forwards": 14,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5,
+          "snapshot_built": 5,
+          "writer_started": 8
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "filling": 3,
+          "free": 1,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "writer_age_seconds": 0
+      },
+      "decode_tp": 1,
+      "prefill_tp": 2,
+      "replay": false
+    },
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "counters": {
+          "admitted": 8,
+          "considered": 8,
+          "copies_completed": 8,
+          "cuda_graph_forwards": 17,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "overlap_forwards": 17,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5,
+          "snapshot_built": 5,
+          "writer_started": 8
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "filling": 2,
+          "free": 2,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 2,
+        "states": {
+          "available": 2
+        },
+        "writer_age_seconds": 0
+      },
+      "decode_tp": 1,
+      "prefill_tp": 2,
+      "replay": true
+    },
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "cohort_writer": {
+          "counters": {
+            "failed": 3,
+            "published": 5,
+            "submitted": 8
+          },
+          "error": null,
+          "oldest_seconds": 0,
+          "pending": 0,
+          "ready": true,
+          "recovery_error": null,
+          "states": {},
+          "stopping": false
+        },
+        "counters": {
+          "admitted": 8,
+          "eager_forwards": 13,
+          "failed_pd_handoff_failed": 2,
+          "failed_running_request_aborted": 1,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "host_pool": {
+          "allocated_bytes": 11556864,
+          "device_allocated_bytes": 393216,
+          "device_limit_bytes": 8388608,
+          "filling": 4,
+          "free": 0,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "request_router": {
+          "attached": 8,
+          "bound": 8,
+          "cancelled": 1,
+          "considered": 9,
+          "excluded": 1,
+          "selected": 8
+        },
+        "reservations": 3,
+        "states": {
+          "available": 3,
+          "pending_publication": 0,
+          "writing": 0
+        },
+        "writer_age_seconds": 0
+      },
+      "decode_tp": 2,
+      "prefill_tp": 2,
+      "replay": false
+    },
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "cohort_writer": {
+          "counters": {
+            "failed": 3,
+            "published": 5,
+            "submitted": 8
+          },
+          "error": null,
+          "oldest_seconds": 0,
+          "pending": 0,
+          "ready": true,
+          "recovery_error": null,
+          "states": {},
+          "stopping": false
+        },
+        "counters": {
+          "admitted": 8,
+          "cuda_graph_forwards": 16,
+          "failed_pd_handoff_failed": 2,
+          "failed_running_request_aborted": 1,
+          "overlap_forwards": 16,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "host_pool": {
+          "allocated_bytes": 11556864,
+          "device_allocated_bytes": 393216,
+          "device_limit_bytes": 8388608,
+          "filling": 4,
+          "free": 0,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "request_router": {
+          "attached": 8,
+          "bound": 8,
+          "cancelled": 1,
+          "considered": 9,
+          "excluded": 1,
+          "selected": 8
+        },
+        "reservations": 3,
+        "states": {
+          "available": 3,
+          "pending_publication": 0,
+          "writing": 0
+        },
+        "writer_age_seconds": 0
+      },
+      "decode_tp": 2,
+      "prefill_tp": 2,
+      "replay": true
+    }
+  ],
+  "runtime_invariants": [
+    "Five samples per mode: one-token reply, 153-token chunked prompt, reused prompt, and two requests in one actual decode batch.",
+    "Test-only per-rank online observers retain full raw logits and source KV. No target reference forward is rerun.",
+    "Independent Store readback checks exact KV and top-128 values/IDs, full-vocabulary LSE within 1e-6, final tokens, positions, masks, and last-token KV validity.",
+    "Actual CUDA graph observations are required in every replay case.",
+    "Missing handoff and a stale fence on P rank 0 both exclude the sample while biased generation completes normally.",
+    "Stream cancellation must be admitted, retire through the proper fenced Catalog failure, drain local capture work, and leave zero quarantined Host slots.",
+    "Test-only tagged pair waits in D's ready queue before scheduling, making actual batching independent of transfer completion timing."
+  ],
+  "failed_attempts": [
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-tp-runtime-20261001.log",
+      "log_sha256": "c9214ce393469b9562ec4bb7a5479fb0bd2284e046575854d9540870bd9f9cb5",
+      "returncode": 1,
+      "tests_run": 1,
+      "elapsed_seconds": 160.084,
+      "cause": "TP1 cancellation assertion expected request_aborted_or_retracted, but the distributed allocator intentionally reports cohort_failed.",
+      "resolution": "The fixture now checks the appropriate Catalog reason, request admission, routing cancellation, drained state, and zero quarantine."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-tp-expand-20261001.log",
+      "log_sha256": "d710e5ab9b3e24943cfe59fc1e226c4b6f011a2338eecd0e51c5e39c7fc1cb23",
+      "returncode": 1,
+      "tests_run": 2,
+      "elapsed_seconds": 137.545,
+      "cause": "The batched HTTP pair completed as separate short decode batches, failing the required multi-row observation.",
+      "resolution": "The test-only server holds the tagged pair until both transfers reach the ready queue. All final runtime files were run after this change."
+    }
+  ],
+  "static_checks": [
+    "Black --check (11 changed Python files)",
+    "isort --check-only (11 changed Python files)",
+    "Ruff F401/F821/UP037 (11 changed Python files)",
+    "Broader Ruff excluding I001 for runtime helpers and new TP tests",
+    "Python compileall",
+    "Registered-test validation",
+    "git diff --check"
+  ],
+  "resource_cleanup": {
+    "temporary_pod_not_found": true,
+    "no_live_temporary_serving_or_store_processes": true,
+    "no_live_resident_serving_or_store_processes": true,
+    "resident": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790879091.9563196,
+      "idle_pid": 33380,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.43147897720336914
+    }
+  },
+  "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+  "limits": [
+    "This is TCP correctness coverage, not RDMA or a performance acceptance run.",
+    "PD pipeline parallel, PD speculation, DP and optimistic prefill remain excluded.",
+    "Actual TP4 replicated-head serving and larger model/topology combinations remain unverified.",
+    "Production SpecForge Catalog retention/consumer training, trained draft artifact quality and P10 workload SLO acceptance remain open."
+  ]
+}
