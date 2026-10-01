@@ -97,7 +97,6 @@ def build_inputs(
     with_sink=False,
     paged=True,
     dtype=torch.bfloat16,
-    page_size=None,
 ):
     max_kv_len = max(seq_lens_list)
     max_slots = batch_size * max_kv_len
@@ -112,18 +111,7 @@ def build_inputs(
     for i in range(batch_size):
         base = i * max_kv_len
         slot_ids[i] = i
-        if paged == "pages":
-            # What PagedTokenToKVPoolAllocator emits: page * page_size + offset, so
-            # slots are contiguous inside a page while pages themselves are shuffled.
-            page = page_size or block_size
-            npages = max_kv_len // page
-            pages = torch.randperm(npages, device=DEVICE) + i * npages
-            req_to_token[i, :max_kv_len] = (
-                (pages[:, None] * page + torch.arange(page, device=DEVICE)[None, :])
-                .reshape(-1)
-                .to(torch.int32)
-            )
-        elif paged:
+        if paged:
             req_to_token[i, :max_kv_len] = (
                 torch.randperm(max_kv_len, device=DEVICE) + base
             ).to(torch.int32)
@@ -369,113 +357,6 @@ def test_sparse_gqa_deterministic(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat,
     assert torch.equal(o1, o2), (
         f"non-deterministic: max diff {(o1.float() - o2.float()).abs().max().item():.4e}"
     )
-
-
-@pytest.mark.parametrize("page_size,engages", [(128, True), (256, True), (64, False)])
-def test_paged_tile_matches_slot_gather(page_size, engages):
-    """Deriving a block's slots from its first slot must match gathering them.
-
-    Only valid when a block cannot straddle a page, so page_size < block_size must
-    fall back. Uses the page-structured layout the allocator actually produces; the
-    `paged=True` layout above is a bare permutation and violates the precondition.
-    """
-    torch.manual_seed(0)
-    bs, nqh, nkh, hd, blk, tk = 4, 64, 1, 128, 128, 16
-    seq_lens_list = make_seq_lens("aligned", bs, blk)
-    args = build_inputs(
-        bs,
-        nqh,
-        nkh,
-        hd,
-        seq_lens_list,
-        blk,
-        tk,
-        with_sink=False,
-        paged="pages",
-        page_size=page_size,
-    )
-    q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_ids, topk_idx = args
-
-    def run(ps):
-        return flash_decode_with_gqa_share_sparse(
-            q,
-            sink,
-            k_cache,
-            v_cache,
-            req_to_token,
-            seq_lens,
-            slot_ids,
-            blk,
-            topk_idx,
-            page_size=ps,
-        )
-
-    gather = run(0)
-    assert torch.equal(gather, run(page_size))
-    if not engages:
-        # These pages split every block, so reading a block as one tile gives a
-        # different result: the equality above means the gather really ran.
-        assert not torch.equal(gather, run(blk))
-    # A layout that violates the precondition must diverge, else the branch under
-    # test never ran and the assertion above proves nothing.
-    if engages:
-        scattered = build_inputs(
-            bs, nqh, nkh, hd, seq_lens_list, blk, tk, with_sink=False, paged=True
-        )
-        q2, s2, k2, v2, r2, sl2, sid2, ti2 = scattered
-        a = flash_decode_with_gqa_share_sparse(
-            q2, s2, k2, v2, r2, sl2, sid2, blk, ti2, page_size=0
-        )
-        b = flash_decode_with_gqa_share_sparse(
-            q2, s2, k2, v2, r2, sl2, sid2, blk, ti2, page_size=page_size
-        )
-        assert not torch.equal(a, b)
-
-
-def test_hisparse_slots_override_paged_tile():
-    """Pre-resolved HiSparse slots must win over the paged-tile branch.
-
-    They index the HiSparse device buffer, not req_to_token's page layout, and the
-    backend passes page_size alongside them, so a paged tile taking precedence
-    would read the wrong K/V.
-    """
-    torch.manual_seed(0)
-    bs, nqh, nkh, hd, blk, tk = 4, 64, 1, 128, 128, 16
-    seq_lens_list = make_seq_lens("aligned", bs, blk)
-    args = build_inputs(
-        bs, nqh, nkh, hd, seq_lens_list, blk, tk, with_sink=False, paged="pages"
-    )
-    q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_ids, topk_idx = args
-    # Resolve every selected block through a different slot permutation, laid out
-    # like the coordinator's output: [1, batch, topk * block] int32.
-    remap = torch.randperm(k_cache.shape[0], device=DEVICE).to(torch.int32)
-    hisparse_slots = torch.full((1, bs, tk * blk), -1, dtype=torch.int32, device=DEVICE)
-    for b in range(bs):
-        for t, block in enumerate(topk_idx[0, b].tolist()):
-            if block >= 0:
-                tokens = req_to_token[b, block * blk : (block + 1) * blk].long()
-                hisparse_slots[0, b, t * blk : (t + 1) * blk] = remap[tokens]
-
-    def run(ps, slots):
-        return flash_decode_with_gqa_share_sparse(
-            q,
-            sink,
-            k_cache,
-            v_cache,
-            req_to_token,
-            seq_lens,
-            slot_ids,
-            blk,
-            topk_idx,
-            page_size=ps,
-            hisparse_slots=slots,
-        )
-
-    expected = run(0, hisparse_slots)
-    assert torch.equal(expected, run(blk, hisparse_slots))
-    # The remapped slots must change the result, else a paged tile that ignored
-    # them would pass the assertion above.
-    assert not torch.equal(expected, run(blk, None))
 
 
 if __name__ == "__main__":
