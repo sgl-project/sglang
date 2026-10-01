@@ -865,6 +865,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if isinstance(obj, EmbeddingReqInput) and obj.encoding_format == "tensor":
+            if request is not None:
+                raise ValueError(
+                    "encoding_format='tensor' is only supported by Engine.encode/"
+                    "async_encode, not HTTP endpoints"
+                )
+            if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
+                raise ValueError("encoding_format='tensor' requires dense embeddings")
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -1566,6 +1574,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 rid=obj.rid,
                 priority=obj.priority,
                 dimensions=obj.dimensions,
+                encoding_format=obj.encoding_format,
                 lora_id=obj.lora_id,
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
@@ -2601,8 +2610,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out_dict["prompt_token_ids"] = state.prompt_token_ids
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
+                embedding = recv_obj.embeddings[i]
+                if (
+                    recv_obj.tensor_embeddings is not None
+                    and recv_obj.tensor_embeddings[i] is not None
+                ):
+                    embedding = recv_obj.tensor_embeddings[i]
                 out_dict = {
-                    "embedding": recv_obj.embeddings[i],
+                    "embedding": embedding,
                     "meta_info": meta_info,
                 }
                 # Unpack pooled hidden states (PHS).

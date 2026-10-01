@@ -445,7 +445,7 @@ class SchedulerBatchResultProcessor:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
 
-            embeddings = self._convert_embeddings(result=result)
+            embeddings = self._convert_embeddings(result=result, batch=batch)
             phs = result.pooled_hidden_states
 
             if phs is not None:
@@ -494,7 +494,9 @@ class SchedulerBatchResultProcessor:
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
 
-    def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
+    def _convert_embeddings(
+        self, *, result: EmbeddingBatchResult, batch: ScheduleBatch
+    ) -> list:
         is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
         embeddings = result.embeddings
@@ -507,7 +509,20 @@ class SchedulerBatchResultProcessor:
             for i in range(batch_ids.shape[0]):
                 embeddings[batch_ids[i].item()][token_ids[i].item()] = values[i].item()
         else:
-            if isinstance(embeddings, torch.Tensor):
+            keep_tensors = any(
+                not req.is_retracted and req.encoding_format == "tensor"
+                for req in batch.reqs
+            )
+            if keep_tensors:
+                if isinstance(embeddings, torch.Tensor):
+                    embeddings = embeddings.detach().cpu()
+                embeddings = [
+                    tensor.detach().cpu()
+                    if req.encoding_format == "tensor"
+                    else tensor.tolist()
+                    for req, tensor in zip(batch.reqs, embeddings)
+                ]
+            elif isinstance(embeddings, torch.Tensor):
                 embeddings = embeddings.tolist()
             else:
                 embeddings = [tensor.tolist() for tensor in embeddings]
