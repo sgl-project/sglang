@@ -264,3 +264,31 @@ Known limitations:
 
 - Speculative decoding does not start under PD at the current cut (draft-graph capture width assert on the prefill role; decode-side memory pressure at TP2). Run PD without speculative flags.
 - Prefill and decode with different TP sizes transfer state through slice paths, but numeric correctness is unverified. Keep both roles at the same TP size.
+
+### 3.6 Prefill context parallelism
+
+Interleave CP distributes DSA prefill tokens across ranks while KDA remains head-parallel. Layer boundaries all-gather the KDA input and reduce-scatter its output back onto the context shards. The mHC residual streams and their coefficients stay on those shards; MoE layers can still use the full TP group.
+
+For four Blackwell GPUs, the following text-serving recipe uses DSA CP4, KDA TP4, and MoE TP4:
+
+```bash Command
+sglang serve \
+  --model-path zai-org/GLM-5.3-Flash \
+  --language-only \
+  --tp-size 4 \
+  --attn-cp-size 4 \
+  --enable-prefill-cp \
+  --cp-strategy interleave \
+  --moe-dense-tp-size 4 \
+  --ep-size 1 \
+  --dsa-prefill-backend trtllm \
+  --dsa-decode-backend trtllm \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-runner-backend flashinfer_trtllm \
+  --reasoning-parser auto \
+  --tool-call-parser auto
+```
+
+This path retains replicated DSA KV/index caches and KPool tail state. It does not use DSA cache LayerSplit. KDA keeps the same head partition for prefill and decode so its recurrent cache remains compatible across phases.
+
+Prefill CP currently requires `--language-only` for standalone text serving, including text-only server warmup. Do not combine it with PD disaggregation: the state-transfer path does not yet preserve KDA head ownership across CP ranks. Multimodal CP requests are also unsupported and are rejected instead of bypassing their image/video embeddings. These limitations do not affect ordinary non-CP serving.
