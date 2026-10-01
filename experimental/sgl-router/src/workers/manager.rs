@@ -7,7 +7,7 @@ use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::state::kv_events::KvEventIndex;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
-use crate::workers::{WireProtocol, Worker, WorkerRegistry};
+use crate::workers::{EngineProfile, WireProtocol, Worker, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -561,10 +561,13 @@ async fn register_one(
     // path quiet, matching why its own progress message stays at `debug!`.
     let previous_protocol = registry.get(&spec.id).map(|w| w.protocol());
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
-    // `protocol` rides beside the spec rather than on it: `WorkerSpec` is the
-    // serde wire type for `DiscoveryEvent`, and no discovery backend can know
-    // a worker's protocol.
-    if let Err(e) = registry.add_with_cb(spec, cb, protocol) {
+    // The profile rides beside the spec rather than on it: `WorkerSpec` is the
+    // serde wire type for `DiscoveryEvent`, and no discovery backend can know it.
+    let profile = EngineProfile {
+        protocol,
+        dp_ranks: info.dp_ranks,
+    };
+    if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration
         // time. Log loudly so the operator notices the conflicting
         // worker — the alternative (silently dropping into either pool)
@@ -619,6 +622,7 @@ mod tests {
                 tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
+                dp_aware: false,
                 bucket_config: None,
                 circuit_breaker: Some(RawCbConfig {
                     threshold: NonZeroU32::new(threshold).unwrap(),

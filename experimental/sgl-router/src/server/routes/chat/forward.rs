@@ -3,8 +3,12 @@
 
 //! Plain and PD chat forwarding, including load tracking and streaming metrics.
 
-use super::preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
+use super::nonempty_header;
+use super::preparation::{
+    generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedChatRequest,
+};
 use crate::discovery::WorkerMode;
+use crate::policies::dp_rank::select_dp_rank;
 use crate::proxy::sse::{self, StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -13,7 +17,7 @@ use crate::server::metrics::{
     StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
-use crate::workers::{LoadGuard, Worker};
+use crate::workers::{DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
@@ -26,7 +30,9 @@ use tokio_util::sync::CancellationToken;
 const CHAT_PATH: &str = "/v1/chat/completions";
 // Expose the selected decode worker to both PD workers and the client.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
-type LoadGuards = (LoadGuard, RouterInflightLoadGuard);
+// SGLang's DP controller dispatches to this rank; it outranks `routed_dp_rank` in the body.
+const X_DATA_PARALLEL_RANK: HeaderName = HeaderName::from_static("x-data-parallel-rank");
+type LoadGuards = (LoadGuard, RouterInflightLoadGuard, Option<DpRankGuard>);
 
 /// A plain worker, or a prefill worker paired with a decode worker for PD.
 pub(super) struct SelectedWorkers {
@@ -53,6 +59,16 @@ pub(super) async fn forward_chat_request(
     if let Some(hint) = &decode_url_header {
         headers.insert(X_SGL_DECODE_URL, hint.clone());
     }
+    // Only the router chooses DP ranks; a client-supplied rank is never forwarded.
+    headers.remove(X_DATA_PARALLEL_RANK);
+    let dp_aware = ctx.config.model.dp_aware;
+    let prefill_rank = dp_aware
+        .then(|| prompt_dp_rank(ctx, &request, &headers, &prefill))
+        .flatten();
+    let decode_rank = decode
+        .as_deref()
+        .filter(|_| dp_aware)
+        .and_then(|decode| select_dp_rank(decode, None, &[]));
 
     // Track worker occupancy and the prompt's contribution to active load.
     let worker_load_guard = if track_dispatch_timestamps {
@@ -78,7 +94,10 @@ pub(super) async fn forward_chat_request(
         let bootstrap = BootstrapFields {
             host: prefill.bootstrap_host().to_string(),
             port: prefill.bootstrap_port(),
-            room: generate_room_id(),
+            room: match prefill_rank {
+                Some(rank) => generate_room_id_for_rank(rank, prefill.dp_ranks()),
+                None => generate_room_id(),
+            },
         };
         (decode, bootstrap)
     });
@@ -88,17 +107,22 @@ pub(super) async fn forward_chat_request(
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
-    let prefill_load_guards = (worker_load_guard, active_request_guard);
+    let prefill_headers = with_dp_rank(headers.clone(), prefill_rank);
+    let prefill_load_guards = (
+        worker_load_guard,
+        active_request_guard,
+        prefill_rank.map(|rank| prefill.dp_rank_guard(rank)),
+    );
 
     // In PD mode, prefill runs independently and decode supplies the client response.
     let stream_abort = CancellationToken::new();
-    let (response_worker, response_load_guards, prefill_task) =
+    let (response_worker, response_headers, response_load_guards, prefill_task) =
         if let Some((decode, bootstrap)) = pd {
             let task = spawn_prefill_request(
                 ctx,
                 &metrics,
                 Arc::clone(&prefill),
-                headers.clone(),
+                prefill_headers,
                 body.clone(),
                 prefill_load_guards,
                 bootstrap.room,
@@ -108,10 +132,17 @@ pub(super) async fn forward_chat_request(
                 decode.load_guard(),
                 ctx.router_inflight_load
                     .register(decode.id.clone(), decode.url.clone(), 0, 1),
+                decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
-            (decode, decode_load_guards, Some((task, prefill)))
+            let decode_headers = with_dp_rank(headers, decode_rank);
+            (
+                decode,
+                decode_headers,
+                decode_load_guards,
+                Some((task, prefill)),
+            )
         } else {
-            (prefill, prefill_load_guards, None)
+            (prefill, prefill_headers, prefill_load_guards, None)
         };
 
     // In PD mode, prefill can finish before decode. Watch the registration
@@ -120,7 +151,7 @@ pub(super) async fn forward_chat_request(
     let response = forward_to_response_worker(
         ctx,
         &response_worker,
-        &headers,
+        &response_headers,
         body,
         engine_rid.as_deref(),
         response_load_guards,
@@ -156,6 +187,41 @@ pub(super) async fn forward_chat_request(
     };
     response.extensions_mut().insert(log_context);
     Ok(response)
+}
+
+/// Rank for the worker that computes the prompt; decode gets its KV from
+/// prefill, so it is placed by load alone.
+fn prompt_dp_rank(
+    ctx: &AppContext,
+    request: &PreparedChatRequest,
+    headers: &HeaderMap,
+    worker: &Worker,
+) -> Option<u32> {
+    if worker.dp_ranks() <= 1 {
+        return None;
+    }
+    let model = &ctx.config.model;
+    let sticky = model.sticky.as_ref().map(|c| c.header_name.as_str());
+    let session = model
+        .affinity
+        .as_ref()
+        .map(|c| c.session_id_header.as_str());
+    let key = [sticky, session]
+        .into_iter()
+        .flatten()
+        .find_map(|name| nonempty_header(headers, name));
+    let prefix_depths = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
+        (None, Some(provider), Some(tokens)) => provider.rank_depths(&tokens.ids, &worker.url),
+        _ => Vec::new(),
+    };
+    select_dp_rank(worker, key, &prefix_depths)
+}
+
+fn with_dp_rank(mut headers: HeaderMap, rank: Option<u32>) -> HeaderMap {
+    if let Some(rank) = rank {
+        headers.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(rank));
+    }
+    headers
 }
 
 fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {

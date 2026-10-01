@@ -65,6 +65,9 @@ pub struct ServerInfo {
     /// protocol costs throughput and never correctness. Consumed by
     /// `manager::register_one` to set [`crate::workers::WireProtocol`].
     pub enable_http2: Option<bool>,
+    /// DP ranks behind the endpoint, mirroring the engine's `num_dp_ranks_of`;
+    /// an absent field counts as 1.
+    pub dp_ranks: u32,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -167,6 +170,10 @@ impl WorkerIntrospector {
             event_config,
             disaggregation_role,
             enable_http2: parsed.enable_http2,
+            dp_ranks: parsed
+                .dp_size
+                .unwrap_or(1)
+                .saturating_mul(parsed.attn_dp_size.unwrap_or(1)),
         }
     }
 
@@ -377,6 +384,11 @@ struct ServerInfoBody {
     /// predate the flag.
     #[serde(default)]
     enable_http2: Option<bool>,
+    #[serde(default)]
+    dp_size: Option<u32>,
+    /// Absent on engines that express attention DP through `dp_size`.
+    #[serde(default)]
+    attn_dp_size: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -756,6 +768,17 @@ mod tests {
         let (url, _shutdown) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
         let got = fast_introspector().fetch(&url).await;
         assert_eq!(got.enable_http2, None);
+    }
+
+    #[tokio::test]
+    async fn fetch_counts_dp_ranks() {
+        for (body, want) in [
+            (json!({"dp_size": 1, "attn_dp_size": 8}), 8),
+            (json!({"dp_size": 4}), 4),
+        ] {
+            let (url, _shutdown) = spawn_fake_worker(body).await;
+            assert_eq!(fast_introspector().fetch(&url).await.dp_ranks, want);
+        }
     }
 
     /// Partial data (`prefill` mode with no bootstrap port) returns
