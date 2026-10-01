@@ -330,12 +330,11 @@ class UnifiedCacheLinkerWrapper:
             if req.kv is None:
                 from sglang.srt.managers.schedule_batch import ReqKvInfo
 
-                req.kv = ReqKvInfo(
-                    kv_allocated_len=prefix_len,
-                    swa_evicted_seqlen=prefix_len,
-                )
-            else:
-                req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, prefix_len)
+                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
+            req.kv.set_evicted_seqlen(
+                ComponentType.SWA,
+                max(req.kv.get_evicted_seqlen(ComponentType.SWA), prefix_len),
+            )
 
         # Insert the newly loaded tail into the tree.
         prefix_indices = torch.cat(
@@ -359,8 +358,10 @@ class UnifiedCacheLinkerWrapper:
                     else None
                 ),
                 prev_prefix_len=device_hit_len,
-                swa_evicted_seqlen=(
-                    req.kv.swa_evicted_seqlen if req.kv is not None else 0
+                component_evicted_seqlens=(
+                    req.kv.component_evicted_seqlens.copy()
+                    if req.kv is not None
+                    else {}
                 ),
                 chunked=True,
                 priority=req.priority or 0,

@@ -7,11 +7,16 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.gemm.fp8_kernel import (
+    get_w8a8_channelwise_fp8_config,
+    triton_scaled_mm,
+    w8a8_block_fp8_matmul_deepgemm,
+    w8a8_block_fp8_matmul_triton,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
     fp8_min,
-    get_w8a8_channelwise_fp8_config,
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -19,9 +24,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8_row_padded,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
-    triton_scaled_mm,
-    w8a8_block_fp8_matmul_deepgemm,
-    w8a8_block_fp8_matmul_triton,
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
@@ -381,6 +383,8 @@ class Mxfp8DenseGemmBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     DEEP_GEMM = "deep_gemm"
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
+    # gfx950 native MXFP8: lane-ordered fp8 weight + ue8m0 scale bytes; untiled shapes keep bf16
+    GFX95_MXFP8_NATIVE = "gfx95_mxfp8_native"
     UNSUPPORTED = "unsupported"
 
     def is_flashinfer_cutlass(self) -> bool:
@@ -400,6 +404,15 @@ class Mxfp8DenseGemmBackend(Enum):
 
     def is_gfx95_dot_scaled(self) -> bool:
         return self == Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
+
+    def is_gfx95_mxfp8_native(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
+
+    def is_gfx95(self) -> bool:
+        return self in (
+            Mxfp8DenseGemmBackend.GFX95_DOT_SCALED,
+            Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE,
+        )
 
     def is_unsupported(self) -> bool:
         return self == Mxfp8DenseGemmBackend.UNSUPPORTED
@@ -724,8 +737,14 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
 
 
 def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
-    """The FlashInfer MXFP8 backend a 32-wide-K ue8m0 block-fp8 weight can run on."""
+    """The MXFP8 backend (FlashInfer on CUDA, gfx950 on ROCm) a 32-wide-K ue8m0
+    block-fp8 weight can run on."""
     backend = get_fp8_gemm_runner_backend()
+    # the Triton block kernel's ue8m0 activation quant is CUDA-only, so gfx950 takes an MXFP8 route
+    if _is_hip and _is_gfx95_supported:
+        if backend.is_triton():
+            return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
+        return Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
     # Explicit CUTLASS / CuTe-DSL only: they leave the weight untouched and store
     # the swizzled scale separately, so the block layout stays readable by Triton.
     if not (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass()):
@@ -758,6 +777,18 @@ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl", pin_tactic=True
         )
+    if backend.is_gfx95_dot_scaled():
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            dot_scaled_mxfp8_blockscaled_linear,
+        )
+
+        return dot_scaled_mxfp8_blockscaled_linear
+    if backend.is_gfx95_mxfp8_native():
+        from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+            mxfp8_native_blockscaled_linear,
+        )
+
+        return mxfp8_native_blockscaled_linear
     return _unsupported_mxfp8_linear
 
 
@@ -817,9 +848,9 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
     bias: Optional[torch.Tensor] = None,
     weight_scale_swizzled: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    from sglang.kernels.ops.gemm.fp8_kernel import w8a8_mxfp8_matmul_deepgemm
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
-        w8a8_mxfp8_matmul_deepgemm,
     )
 
     assert input_scale is None
@@ -1992,6 +2023,9 @@ def channel_quant_to_tensor_quant(
     x_q_channel: torch.Tensor,
     x_s: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Reshape per-output-channel scale [N] -> [N, 1, ...] to broadcast over K dims.
+    while x_s.dim() < x_q_channel.dim():
+        x_s = x_s.unsqueeze(-1)
     x_dq_channel = x_q_channel.to(torch.float32) * x_s
     x_q_tensor, scale = (
         scaled_fp8_quant(x_dq_channel)
@@ -2357,9 +2391,10 @@ def apply_fp8_ptpc_linear(
     compressed_tensor_quant: bool = False,
 ) -> torch.Tensor:
     """FP8 per-token per-channel linear. Only used with the aiter (ROCm) backend."""
-    # Handle pre-quantized (fp8_tensor, scale) tuple from fused RMSNorm+Quant
+    # Handle pre-quantized (fp8_tensor, scale[, bf16]) tuple from fused RMSNorm+Quant.
+    # The optional 3rd element is the unquantized bf16 tensor kept for DSA; ignore it.
     if isinstance(input, tuple):
-        q_input, x_scale = input
+        q_input, x_scale = input[0], input[1]
         q_input = q_input.view(-1, q_input.shape[-1])
         output_shape = [*q_input.shape[:-1], weight.shape[0]]
         output = aiter.gemm_a8w8_bpreshuffle(

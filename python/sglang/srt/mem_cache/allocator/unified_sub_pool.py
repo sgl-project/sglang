@@ -2385,7 +2385,11 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         lo, hi = self._region_bounds_pages()
         gap_low, gap_high = self._gap_pages()
         gap_side_bytes = (gap_low if side == "low" else gap_high) * epp
-        if gap_side_bytes >= min_bytes or self._is_frontier_transparent():
+        if (
+            self.moves_blocked()
+            or gap_side_bytes >= min_bytes
+            or self._is_frontier_transparent()
+        ):
             return gap_side_bytes
 
         # Capacity: even packing every live page flush against the far side
@@ -2560,7 +2564,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         OPPOSITE ``retreat_side`` (order-preserving), shrinking the span on
         ``retreat_side`` by the hole count. Returns pages moved."""
         assert retreat_side in ("low", "high")
-        if self._hole_pages() == 0:
+        if self.moves_blocked() or self._hole_pages() == 0:
             return 0
         # Settle before the first copy -- see `make_room`.
         self._settle_inflight_forward()

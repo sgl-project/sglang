@@ -198,15 +198,26 @@ prefix queries match the blocks the engine caches. Models the engine encodes in
 code but dynamo-render cannot tokenize here (Inkling) route via raw prompt
 text, as does any model whose template fails to load or render.
 
-Plain text chat requests (string `content`, no tools, no template kwargs or
-reasoning controls or historical `reasoning_content`, no assistant continuation,
-no consecutive users or non-leading system turns) additionally forward the
-rendered tokens to the engine as `input_ids`, retaining the original messages,
-so the engine skips re-tokenizing. Every other request shape is rendered for
-routing only: the router renders with dynamo-render and does not replicate
-SGLang's request normalization, so forwarding is enabled shape by shape as
-parity is verified. Use matching model files on the router and workers; worker
-template overrides and default kwargs are not observable from the request.
+Some chats additionally forward the rendered tokens to the engine as
+`input_ids`, retaining the original messages, so the engine skips
+re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's native
+encoder is fixture-verified against SGLang's request normalization, so it
+forwards every chat except multimodal ones and those with caller-provided
+`input_ids`. Renderers without that verification (HF Jinja templates, Kimi-K3)
+forward only plain text chat requests (string `content`, no tools, no template
+kwargs or reasoning controls or historical `reasoning_content`, no assistant
+continuation, no consecutive users or non-leading system turns) and warn
+`UNVERIFIED` at startup; every other request shape is rendered for routing
+only. DeepSeek-V4.1 forwards nothing — its renderer is not verified against
+current SGLang — while routing tokenization keeps working.
+
+Use matching model files on the router and workers, and set
+the same `--default-chat-template-kwargs`, `SGLANG_DEFAULT_THINKING`,
+`SGLANG_DSV4_REASONING_EFFORT`, and `SGLANG_DSV41_REASONING_EFFORT` on both.
+The router reads these render defaults from its own configuration and environment;
+it does not discover the workers' settings. Point `--tokenizer-path` at the workers'
+model snapshot so the V4 effort profile is read from the same
+`encoding/encoding_dsv4.py`.
 
 Set `--disable-input-ids-forwarding` for this router's model when worker-side
 rendering has not been verified to match. This disables router-generated IDs
@@ -214,13 +225,13 @@ for every routing policy; cache-aware routing still renders and tokenizes
 locally, and the original messages reach the workers for engine processing.
 Caller-supplied `input_ids` remain caller-owned and pass through unchanged.
 
-Forwarding logs its assumptions at startup. In particular, disable it for
-`SGLANG_DEFAULT_THINKING=true`, a non-default `SGLANG_DSV4_REASONING_EFFORT`,
-worker parser overrides such as `--tool-call-parser deepseekv32` that select a
-native encoder over a shipped template, or conversation templates with stop
-strings (the engine's `input_ids` path skips those template stops). These worker
-settings are not inferred from the router's environment. Disabling forwarding preserves
-engine behavior but does not establish parity for local routing hashes.
+Forwarding logs its assumptions at startup. In particular, disable it when the
+router's render defaults differ from the workers', for worker template overrides
+not reflected in the router's model files, for worker parser overrides such as
+`--tool-call-parser deepseekv32` that select a native encoder over a shipped
+template, or conversation templates with stop strings (the engine's `input_ids`
+path skips those template stops). Disabling forwarding preserves engine behavior
+but does not establish parity for local routing hashes.
 
 Also set `--disable-input-ids-forwarding` for array-only templates: Dynamo may wrap
 string content into arrays differently from the worker. The pinned Dynamo renderer does not expose
@@ -229,6 +240,24 @@ Detailed content-format parity coverage follows in #39133.
 
 The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
 with `--locked`, so rendered bytes cannot change without a reviewed diff.
+
+Router tokenization sits on the TTFT path for every chat it renders. Two opt-in
+flags make it cheaper:
+
+- `--tokenizer-backend fast` encodes with fastokens (decoding stays on HF). It
+  needs a `tokenizer.json` and falls back to `hf` when fastokens cannot load it.
+- `--tokenizer-l1-cache-mb N` caches prefix tokenizations at special-token
+  boundaries, so a multi-turn chat encodes only the turns added since the
+  previous request. Boundaries are unconditional, non-normalized, non-stripping
+  special tokens with no overlapping added-token spellings. Unsafe candidates
+  are excluded; if none remain, encoding proceeds without the cache.
+
+On a ~69K-token DeepSeek-V4 chat, `hf` encodes in ~40 ms, `fast` in ~4 ms, and
+a new turn on a cached history in ~0.2 ms. The DeepSeek fixtures check every
+case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
+backend and cache state. `/metrics` exposes only
+`sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
+how much tokenization work the cache reuses.
 
 ## DeepSeek V4
 
@@ -241,9 +270,11 @@ official/preview effort profile is detected from the checkpoint's
 and are regenerated by `tests/scripts/generate_deepseek_parity.py`.
 
 V4.1 Flash uses Dynamo's separate V4.1 encoder with SGLang's numeric reasoning
-budgets, tool payloads, and `<｜System｜>` markers. Developer messages and media
-are left to the worker (the pinned encoder renders them differently), and a
-non-default `SGLANG_DSV41_REASONING_EFFORT` needs the forwarding precautions above.
+budgets, tool payloads, and `<｜System｜>` markers — for routing tokenization
+only, since V4.1 never forwards `input_ids`. Developer messages and media are
+left to the worker (the pinned encoder renders them differently), and a
+non-default `SGLANG_DSV41_REASONING_EFFORT` still matters for cache-aware
+routing-hash parity.
 
 ## Kimi-K3
 
