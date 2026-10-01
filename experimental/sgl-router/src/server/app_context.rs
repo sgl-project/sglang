@@ -38,6 +38,16 @@ pub enum ChatRouting {
     Reorg(HashMap<ModelId, BucketResolver>),
 }
 
+impl ChatRouting {
+    /// Whether the built routing reads request tokens; `legacy` holds the legacy policies.
+    pub fn needs_request_tokens(&self, legacy: &PolicyRegistry) -> bool {
+        match self {
+            Self::Legacy => legacy.needs_request_tokens(),
+            Self::Reorg(resolvers) => resolvers.values().any(BucketResolver::needs_request_tokens),
+        }
+    }
+}
+
 pub struct AppContext {
     pub config: Config,
     pub tokenizers: Arc<TokenizerRegistry>,
@@ -197,7 +207,7 @@ impl AppContext {
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
                     id: "stub-model".into(),
-                    tokenizer_path: "stub".into(),
+                    tokenizer_path: Some("stub".into()),
                     disable_input_ids_forwarding: false,
                     tokenizer: Default::default(),
                     policy: crate::config::PolicyKind::RoundRobin,

@@ -436,13 +436,23 @@ def commit_kv_proj_fused(
     stacked = _stacked_wkv_weight(wkv_linears=wkv_linears)
 
     if stacked.mxfp8_scale is not None:
-        kv_all = wkv_linears[0].quant_method.w8a8_mxfp8_linear(
-            input=main_x,
-            weight=stacked.weight,
-            weight_scale=stacked.mxfp8_scale,
-            input_scale=None,
-            bias=None,
-        )
+        quant_method = wkv_linears[0].quant_method
+        if quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_aiter():
+            kv_all = quant_method.w8a8_mxfp8_linear(
+                input=main_x,
+                weight=stacked.weight,
+                weight_scale_ue8m0=stacked.mxfp8_scale,
+                input_scale=None,
+                bias=None,
+            )
+        else:
+            kv_all = quant_method.w8a8_mxfp8_linear(
+                input=main_x,
+                weight=stacked.weight,
+                weight_scale=stacked.mxfp8_scale,
+                input_scale=None,
+                bias=None,
+            )
     elif stacked.fp8_scale is not None:
         quant_method = wkv_linears[0].quant_method
         kv_all = quant_method.w8a8_block_fp8_linear(
@@ -481,6 +491,18 @@ def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
     block_quant = hasattr(quant_method, "block_quant") and quant_method.block_quant
     if not (block_quant and hasattr(quant_method, "w8a8_block_fp8_linear")):
         return False
+    # on gfx950 only the aiter MXFP8 route stacks (the Triton block kernel's ue8m0 activation
+    # quant is CUDA-only); the others serve 32x32-block weights through apply()
+    backend = getattr(quant_method, "mxfp8_dense_backend", None)
+    if backend is not None and backend.is_gfx95():
+        if not (
+            backend.is_gfx95_mxfp8_aiter()
+            and all(
+                getattr(linear, "block_fp8_mxfp8_ready", False)
+                for linear in wkv_linears
+            )
+        ):
+            return False
     block_out = quant_method.quant_config.weight_block_size[0]
     # the gfx950 native MXFP8 route keeps the weight in a 3-D lane-order layout
     return all(
@@ -534,6 +556,12 @@ def _build_stacked_wkv_weight(
             # 128-row-aligned scale tiles concatenate without breaking the swizzle.
             scale = torch.cat(
                 [linear.weight_scale_inv_swizzled.reshape(-1) for linear in wkv_linears]
+            )
+            return _StackedWkvWeight(weight=weight, fp8_scale=None, mxfp8_scale=scale)
+        if backend is not None and backend.is_gfx95_mxfp8_aiter():
+            # compact ue8m0 block scales, one row per 32 output rows: whole blocks stack
+            scale = torch.cat(
+                [linear.weight_scale_mx_e8m0 for linear in wkv_linears], dim=0
             )
             return _StackedWkvWeight(weight=weight, fp8_scale=None, mxfp8_scale=scale)
         if wkv_linears[0].weight_scale_inv.dtype == torch.int32:

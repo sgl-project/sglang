@@ -327,8 +327,8 @@ impl Default for ObservabilityConfig {
 pub struct ModelConfig {
     pub id: String,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
-    /// Resolved by [`crate::tokenizer::adapter::load`].
-    pub tokenizer_path: String,
+    /// Resolved by [`crate::tokenizer::adapter::load`]; `None` (`--no-tokenizer`) disables it.
+    pub tokenizer_path: Option<String>,
     /// Disable router-generated input IDs for this model; keep routing tokenization.
     /// Use when workers have rendering defaults or template stops the router cannot see.
     pub disable_input_ids_forwarding: bool,
