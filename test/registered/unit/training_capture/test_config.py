@@ -109,7 +109,7 @@ class TestCaptureConfiguration(CustomTestCase):
                         ):
                             validate_capture_server_args(self.args)
 
-    def test_static_dspark_capture_rejects_compact_or_simulated_paths(self):
+    def test_dspark_verify_modes_still_reject_simulated_acceptance(self):
         self.args.speculative_algorithm = "DSPARK"
         with (
             patch.object(envs.SGLANG_RAGGED_VERIFY_MODE, "get", return_value="static"),
@@ -125,7 +125,6 @@ class TestCaptureConfiguration(CustomTestCase):
                     patch.object(
                         envs.SGLANG_RAGGED_VERIFY_MODE, "get", return_value=mode
                     ),
-                    self.assertRaisesRegex(ValueError, "non-static speculative verify"),
                 ):
                     validate_capture_server_args(self.args)
             with (

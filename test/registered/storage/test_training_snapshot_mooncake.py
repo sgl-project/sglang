@@ -49,6 +49,7 @@ from sglang.srt.training_capture.startup import (
     coordinate_resource_startup,
 )
 from sglang.srt.training_capture.topology import plan_capture_layout
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.training_capture_catalog import TestCaptureCatalog
@@ -503,12 +504,8 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if cls.master is not None:
-            cls.master.terminate()
-            try:
-                cls.master.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                cls.master.kill()
-                cls.master.wait()
+            kill_process_tree(cls.master.pid)
+            cls.master.wait(timeout=10)
         cls.master_log.close()
 
     @unittest.skipUnless(dist.is_gloo_available(), "Gloo required")

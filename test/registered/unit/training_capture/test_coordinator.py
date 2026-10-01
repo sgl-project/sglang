@@ -354,9 +354,9 @@ class TestCaptureCoordinator(CustomTestCase):
                 fixture = VerifyCaptureFixture(self.coordinator, self.request(failure))
                 ticket = fixture.forward()
                 if failure == "anchor":
-                    ticket.input_tokens[0, 0] = 99
+                    ticket.input_tokens[0] = 99
                 elif failure == "position":
-                    ticket.positions[0, 1] = 99
+                    ticket.positions[1] = 99
                 outputs = [[99 if failure == "correct_prefix" else 20, 55, 0, 0]]
                 fixture.accept(ticket, outputs, [2])
                 self.wait_until(lambda fixture=fixture: fixture.record.state == "done")
@@ -366,6 +366,55 @@ class TestCaptureCoordinator(CustomTestCase):
                     "verify_commit_failed",
                 )
                 self.assertFalse(self.catalog.publications)
+
+    def test_compact_offsets_skip_unsampled_requests_and_graph_padding(self):
+        """Accepted rows start at the sum of all preceding request lengths."""
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        fixture = VerifyCaptureFixture(self.coordinator, self.request("compact"))
+        ticket = fixture.forward(selected_row=2, verify_lens=[1, 2, 3], padding=2)
+        self.assertEqual(ticket.steps[0].batch_row, 2)
+        self.assertEqual(ticket.steps[0].num_rows, 3)
+        self.assertEqual(ticket.input_tokens.tolist(), [10, 20, 30])
+        raw = fixture.logits.clone()
+        fixture.logits.fill_(-1000)
+        fixture.forward_batch.input_ids.zero_()
+        fixture.forward_batch.positions.zero_()
+        fixture.forward_batch.out_cache_loc.zero_()
+        result = fixture.accept(
+            ticket, [[55, 0, 0, 0], [20, 55, 0, 0], [20, 55, 0, 0]], [1, 2, 2]
+        )
+        for source in self.coordinator.exporter.buffers.values():
+            source.zero_()
+        fixture.finish([10, 20, 55], 3)
+        self.coordinator.after_result(result)
+        _, tensors = read_snapshot(self.store, self.catalog.wait_publications(1)[0])
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10, 20, 55])
+        self.assertEqual(tensors["kv_valid"].tolist(), [1, 1, 1, 1, 0])
+        torch.testing.assert_close(
+            tensors["teacher_topk_logits"][1:],
+            raw[3:5].topk(128).values,
+            rtol=0,
+            atol=0,
+        )
+        for name, source in fixture.sources.items():
+            torch.testing.assert_close(
+                tensors[name], source[[7, 3, 6, 1]], rtol=0, atol=0
+            )
+
+    def test_compact_accept_cannot_consume_padding_or_the_following_request(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        fixture = VerifyCaptureFixture(self.coordinator, self.request("over-accept"))
+        ticket = fixture.forward(selected_row=1, verify_lens=[3, 1, 2], padding=4)
+        fixture.accept(
+            ticket, [[20, 30, 55, 0], [20, 55, 0, 0], [20, 55, 0, 0]], [3, 2, 2]
+        )
+        self.wait_until(lambda: fixture.record.state == "done")
+        self.assertIsNone(fixture.request.training_capture_context)
+        self.assertFalse(self.catalog.publications)
+        self.assertEqual(
+            self.catalog.captures[fixture.record.lease.capture_id]["reason"],
+            "verify_commit_failed",
+        )
 
     def test_admission_is_bounded_and_publication_runs_off_request_thread(self):
         self.wait_until(lambda: len(self.coordinator.available) == 1)

@@ -70,6 +70,8 @@ class VerifyCaptureStep(msgspec.Struct, frozen=True):
     reservation: CaptureReservation
     batch_row: int
     prefix_end: int
+    row_start: int
+    num_rows: int
 
 
 class VerifyCaptureBatch(msgspec.Struct, frozen=True):
@@ -78,7 +80,6 @@ class VerifyCaptureBatch(msgspec.Struct, frozen=True):
     input_tokens: torch.Tensor
     positions: torch.Tensor
     cache_locs: torch.Tensor
-    width: int
 
 
 class CaptureCoordinator:
@@ -668,12 +669,24 @@ class CaptureCoordinator:
         return CaptureBatch(tuple(steps))
 
     def after_verify_forward(
-        self, batch, forward_batch, logits_output, *, width, can_run_cuda_graph
+        self,
+        batch,
+        forward_batch,
+        logits_output,
+        *,
+        width,
+        can_run_cuda_graph,
+        verify_lens=None,
     ):
         """Own compact raw rows before grammar, penalties or rejection sampling."""
         steps = tuple(
             VerifyCaptureStep(
-                req, req.training_capture_context, row, int(batch.seq_lens_cpu[row])
+                req,
+                req.training_capture_context,
+                row,
+                int(batch.seq_lens_cpu[row]),
+                0,
+                width,
             )
             for row, req in enumerate(batch.reqs)
             if req.training_capture_context is not None
@@ -684,22 +697,52 @@ class CaptureCoordinator:
             return None
         try:
             owns_aux = steps[0].reservation.context.owns_aux
+            if verify_lens is None:
+                lengths = [width] * len(batch.reqs)
+            else:
+                if (
+                    verify_lens.ndim != 1
+                    or verify_lens.numel() != len(batch.reqs)
+                    or verify_lens.dtype not in (torch.int32, torch.int64)
+                ):
+                    raise ContractError("invalid compact verify lengths")
+                lengths = verify_lens.cpu().tolist()
+            offsets = [0]
+            for count in lengths:
+                if not 1 <= count <= width:
+                    raise ContractError("verify length exceeds its proposal window")
+                offsets.append(offsets[-1] + count)
+            rows = forward_batch.input_ids.numel()
             if (
                 width < 1
-                or forward_batch.input_ids.numel() != len(batch.reqs) * width
+                or offsets[-1] > rows
+                or (verify_lens is None and rows != offsets[-1])
+                or forward_batch.positions.numel() != rows
+                or forward_batch.out_cache_loc.numel() != rows
+                or (owns_aux and logits_output.next_token_logits.shape[0] < offsets[-1])
                 or (
                     owns_aux
-                    and logits_output.next_token_logits.shape[0]
-                    != len(batch.reqs) * width
+                    and verify_lens is None
+                    and logits_output.next_token_logits.shape[0] != rows
                 )
             ):
-                raise ContractError("capture requires a dense linear verify layout")
+                raise ContractError("verify rows do not cover the request layout")
+            # Compact row offsets include unselected requests. Captured offsets
+            # include only selected requests and exclude graph padding entirely.
+            mapped_steps, selected_indices = [], []
+            for step in steps:
+                count = lengths[step.batch_row]
+                mapped_steps.append(
+                    msgspec.structs.replace(
+                        step, row_start=len(selected_indices), num_rows=count
+                    )
+                )
+                selected_indices.extend(
+                    range(offsets[step.batch_row], offsets[step.batch_row + 1])
+                )
+            steps = tuple(mapped_steps)
             indices = torch.tensor(
-                [
-                    step.batch_row * width + column
-                    for step in steps
-                    for column in range(width)
-                ],
+                selected_indices,
                 dtype=torch.long,
                 device=forward_batch.input_ids.device,
             )
@@ -714,16 +757,9 @@ class CaptureCoordinator:
                     if owns_aux
                     else None
                 ),
-                input_tokens=forward_batch.input_ids.index_select(0, indices).view(
-                    -1, width
-                ),
-                positions=forward_batch.positions.index_select(0, indices).view(
-                    -1, width
-                ),
-                cache_locs=forward_batch.out_cache_loc.index_select(0, indices).view(
-                    -1, width
-                ),
-                width=width,
+                input_tokens=forward_batch.input_ids.index_select(0, indices),
+                positions=forward_batch.positions.index_select(0, indices),
+                cache_locs=forward_batch.out_cache_loc.index_select(0, indices),
             )
             self._count("speculative_verify_forwards")
             if self.enable_overlap:
@@ -754,13 +790,15 @@ class CaptureCoordinator:
                     step.request, step.reservation, "verify_commit_failed"
                 )
             return None
-        for selected_row, step in enumerate(ticket.steps):
+        for step in ticket.steps:
             req, record, start = step.request, step.reservation, step.prefix_end
             if req.training_capture_context is not record:
                 continue
             context = record.context
             try:
                 count = counts[step.batch_row]
+                row_start, row_end = step.row_start, step.row_start + step.num_rows
+                input_row = inputs[row_start:row_end]
                 observed_end = len(context.token_ids) + len(context.pending_tokens)
                 first_overlap_anchor = (
                     self.enable_overlap
@@ -769,13 +807,12 @@ class CaptureCoordinator:
                 )
                 if (
                     record.invalid_reason
-                    or not 1 <= count <= ticket.width
+                    or not 1 <= count <= step.num_rows
                     or start != context.kv_end
                     or (observed_end != start + 1 and not first_overlap_anchor)
-                    or positions[selected_row]
-                    != list(range(start, start + ticket.width))
-                    or outputs[step.batch_row][: count - 1]
-                    != inputs[selected_row][1:count]
+                    or positions[row_start:row_end]
+                    != list(range(start, start + step.num_rows))
+                    or outputs[step.batch_row][: count - 1] != input_row[1:count]
                 ):
                     raise ContractError(
                         "verify commit does not extend the recorded token path"
@@ -784,24 +821,24 @@ class CaptureCoordinator:
                 teacher_count = min(count, context.max_tokens - start - 1)
                 context.observe_tokens(
                     position=start,
-                    tokens=[inputs[selected_row][0]] + outputs[step.batch_row][:count],
+                    tokens=[input_row[0]] + outputs[step.batch_row][:count],
                 )
                 if context.owns_kv:
                     context.export_kv(
                         self.exporter,
-                        ticket.cache_locs[selected_row, :kv_count],
+                        ticket.cache_locs[row_start : row_start + kv_count],
                         end=start + kv_count,
                     )
                 else:
                     context.record_kv_progress(end=start + kv_count)
                 if context.owns_aux:
                     context.record_positions(
-                        ticket.positions[selected_row, :kv_count], start=start
+                        ticket.positions[row_start : row_start + kv_count], start=start
                     )
                 if teacher_count and context.owns_aux:
                     context.record_teacher_range(
                         ticket.teacher,
-                        row=selected_row * ticket.width,
+                        row=row_start,
                         position=start + 1,
                         count=teacher_count,
                     )

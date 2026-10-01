@@ -2170,6 +2170,74 @@ their six and two baseline diagnostics. Eleven files format cleanly; the worker
 retains its pre-existing class blank line. The original checkout's staged-index
 digest is unchanged.
 
+## Confidence-Scheduled DSpark Capture
+
+The capture hook now accepts the original per-request verify lengths. Owned
+tickets flatten selected real rows and retain each request's row offset and
+length. Cumulative source offsets include unselected requests; graph padding is
+excluded. Acceptance cannot exceed a request's forwarded range, and only the
+committed prefix supplies KV and raw teacher rows. No snapshot schema or
+Mooncake SDK change is required.
+
+This enables collection while serving the existing hidden-input DSpark draft
+with its confidence scheduler in `cap-accept` and `compact` modes. It does not
+change the target-KV v1 checkpoint's static-only, confidence-disabled contract.
+The synthetic confidence draft uses two Qwen3 layers, fixed confidence scores
+and a deterministic proposal head to exercise rejection, budget truncation and
+unequal batch lengths. Its hidden inputs use layers 0, 14 and 26; captured target
+KV still comes from layers 0, 14 and 27.
+
+The independent observer copies source KV and full raw logits before sampling,
+then records the actual acceptance commit length. Token equality alone cannot
+establish KV validity: a budget-trimmed candidate can match the eventual output
+without ever being committed. Store readback is restricted to the committed
+path and still requires exact KV/top-128 values, vocab IDs, masks and positions;
+full-vocabulary logsumexp keeps its existing floating-point tolerance.
+
+The single-H100 focused run passes all four mode/scheduling combinations in
+164.277s (job `01790872384795104248-79c1768047c9`), publishing twelve samples.
+Cap-accept uses Triton attention; compact uses FA3, because Triton does not
+support ragged target-verify CUDA Graphs. Compact graph/overlap records nine
+verify graph forwards and five graph-folded acceptances, including padded graph
+layouts. The teacher and KV comparisons happen after each producer exits.
+
+The final coordinator file passes 46 tests and six subtests in 44.62s; its
+derived properties cover unselected requests, source-buffer mutation, graph
+padding and refusal to consume another request's rows. Configuration passes
+seven tests and 32 subtests in 9.75s. Earlier runtime attempts exposed fixture
+assumptions about hidden-layer selection, management API responses, commit
+boundaries, eager padding and backend graph support. They are retained in the
+validation record; numerical comparisons were not relaxed.
+
+Temporary Northjob `job-0cbb9a69991d-20261002002521` allocates two H100 80GB
+devices on node199. The same four non-static combinations publish twelve TP2
+samples and pass exact independent readback after both ranks exit. Compact
+graph/overlap records nine verify graph forwards on the auxiliary owner and ten
+folded acceptances across the two ranks. Actual acceptance logs contain unequal
+per-request verify lengths `[3, 2]` and budget-trimmed suffixes. Both ranks'
+observations participate in global-head reconstruction. The complete distributed
+file passes all four tests in 503.439s, retaining AR TP2, AR PP2 and static
+target-KV DSpark TP2 coverage.
+
+The complete single-H100 file passes both tests in 628.904s (job
+`01790872599883226014-8dba045cfb82`), retaining cache lifecycle, memory pressure,
+retraction, static speculation, adaptive sampling and latency protection checks.
+The Store suite initially reached the 180-second task limit after five tests;
+with a 360-second limit, all six passed in 187.06s. Process inspection then found
+an orphaned master child from the SDK launcher. The fixture now kills the whole
+launcher process tree; the complete Store file passes again in 188.37s with no
+live Store/test process left on the temporary node.
+
+The temporary two-H100 job was deleted and its Pod is confirmed absent. The
+resident worker has resumed its idle task with no serving/Store process left.
+All twelve changed Python files compile, format and match the GPU checkout.
+Seven pass Ruff; the five remaining files retain 29 diagnostics also present in
+HEAD. The original checkout's staged-index digest is unchanged. Commands,
+outcomes, source/log hashes and scope limits are recorded in
+`experiments/capture-ragged-dspark.json`. Production Catalog/consumer integration,
+trained checkpoint quality, broader topology validation, PD/RDMA and P10 SLO
+acceptance remain open.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -2179,10 +2247,11 @@ digest is unchanged.
    checkpoints, complete exporter compatibility and artifact/quality validation.
 3. Extend P9's real TP2/PP1 and TP1/PP2 Qwen3 capture validation to combined
    TP2/PP2, replicated heads, distributed cancellation/backpressure and additional
-   model identities. Complete pipeline and non-static speculative collection,
+   model identities. Complete pipeline speculative collection,
    PD transfer and cross-node RDMA. Ordinary AR now uses the distributed serving
-   path, and static DSpark also supports TP; the remaining capability gates do
-   not constitute implementation of those paths.
+   path, and static and confidence-scheduled DSpark capture support TP. The
+   target-KV v1 draft remains static by checkpoint contract; the remaining
+   capability gates do not constitute implementation of those paths.
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to
    representative workloads and SLO thresholds, and complete dashboard runtime
    acceptance and rollout/rollback checks. Per-model numerical/runtime validation and

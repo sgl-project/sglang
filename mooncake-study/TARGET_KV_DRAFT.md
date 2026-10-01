@@ -212,17 +212,25 @@ strided tensors, tile boundaries and changing graph inputs.
 ## Online Capture
 
 Add `--training-capture-config /path/to/capture.json` to collect training samples
-while serving a static DSpark draft. The existing registered Host arena,
+while serving a DSpark draft. The existing registered Host arena,
 Mooncake writer and Catalog producer protocol are reused. The manifest records
 `capture_mode=speculative_accepted_target_path`; its tensor contract is unchanged.
-Compact/cap-accept verification, simulated acceptance and other speculative
-algorithms are rejected by the capture capability gate.
+The collector supports static, cap-accept and compact verification. The target-KV
+v1 checkpoint described above remains static-only; confidence-scheduled modes
+use the existing hidden-input draft and confidence head. Simulated acceptance,
+pipeline speculation and other speculative algorithms remain rejected by the
+capture capability gate.
 
 `TargetVerifyExecutor` calls `CaptureCoordinator.after_verify_forward` immediately
 after the target forward, before grammar, penalties, bias or rejection sampling.
 An owned ticket preserves compact raw top-128 IDs/scores, full-vocabulary LSE,
 the selected requests' original batch rows, input tokens, positions and KV slots.
 It does not retain mutable graph-output views.
+For compact verification, the hook receives the original per-request
+`verify_lens`. Cumulative offsets include unselected requests, while owned
+ticket offsets include only selected real rows. Graph padding never becomes
+sample data. Acceptance is bounded by each request's actual forwarded length,
+so it cannot consume the next request's rows or a padded suffix.
 
 `DSparkWorkerV2` passes the result to `after_verify_accept` before KV slot reuse.
 For a prefix ending at `s` and a commit length `L`, the forwarded inputs are the
@@ -231,6 +239,8 @@ rows predict positions `[s+1, s+L+1)`, including the bonus/correction token.
 The collector validates the anchor, consecutive positions and correct-draft
 tokens against the actual emitted prefix. Rejected suffixes do not enter the
 sample, and temporary copies are clipped to the reserved Host capacity.
+Budget-trimmed suffixes are excluded by the same commit boundary, even when
+their token IDs happen to equal a later committed output.
 
 Scheduler stop/length/grammar processing can shorten that result further.
 Finalization commits `Req.output_ids_through_stop` and truncates the owned teacher

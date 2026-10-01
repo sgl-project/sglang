@@ -33,7 +33,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 from sglang.test.training_capture_catalog import TestCaptureCatalog
 
-register_cuda_ci(est_time=480, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=720, stage="base-b", runner_config="1-gpu-small")
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
 ASSERT_HF_KV = False
@@ -237,6 +237,43 @@ class TestTrainingCaptureRuntime(CustomTestCase):
             for name in names
         }
         return manifest, packed
+
+    def test_ragged_dspark_capture(self):
+        from sglang.test.dspark_ragged_capture_runtime import exercise_ragged_capture
+
+        if type(self).server is None:
+            type(self).launch_server(self.capture_path)
+        prompt = [100, 200, 300, 400] * 40
+        previous = len(self.catalog.publications)
+        try:
+            response = requests.post(
+                self.url + "/generate",
+                json={
+                    "input_ids": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 4,
+                        "ignore_eos": True,
+                    },
+                },
+                timeout=120,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            baseline = response.json()["output_ids"]
+            self.catalog.wait_publications(previous + 1, timeout=45)
+        finally:
+            kill_process_tree(self.server.pid)
+            self.server.wait(timeout=20)
+            type(self).server = None
+        for mode in ("cap-accept", "compact"):
+            for cuda_graph in (False, True):
+                exercise_ragged_capture(
+                    self,
+                    prompt=prompt,
+                    baseline=baseline,
+                    mode=mode,
+                    cuda_graph=cuda_graph,
+                )
 
     def test_chunk_prefix_single_token_and_raw_teacher_reference(self):
         samples, responses = [], []

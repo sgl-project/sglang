@@ -1,0 +1,601 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "d97653ea1ee94fec67ee632eaf1894e7230ca7b4",
+  "feature": "Confidence-scheduled DSpark accepted-path training capture into Mooncake Store",
+  "environment": {
+    "temporary_job": "job-0cbb9a69991d-20261002002521",
+    "temporary_node": "node199",
+    "temporary_gpu_uuids": [
+      "GPU-9a2310f8-4162-b824-638e-95729f284b28",
+      "GPU-ba8dcfbf-4408-a5f3-86bb-310df1785097"
+    ],
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "namespace": "qiji",
+    "priority": "low-priority-job",
+    "reclaimable": true,
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang:v0.5.15",
+    "versions": {
+      "python": "3.12.3",
+      "packages": {
+        "torch": "2.13.0",
+        "sglang-kernel": "0.4.6.post1",
+        "flashinfer-python": "0.6.17",
+        "transformers": "5.12.1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      }
+    },
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "draft": "Synthetic two-layer hidden-input DSpark with constant confidence and deterministic proposals; not trained.",
+    "draft_hidden_layers": [
+      0,
+      14,
+      26
+    ],
+    "capture_kv_layers": [
+      0,
+      14,
+      27
+    ],
+    "store": "Independent TCP Mooncake segment surviving producer shutdown",
+    "catalog": "HTTP TestCaptureCatalog double",
+    "environment_notes": [
+      "Removed stale container-local FlashInfer 0.6.12 cubin/JIT cache packages; shared venv unchanged."
+    ],
+    "resident_idle_resumed": true,
+    "resident_idle_pid": 10805,
+    "resident_no_active_tests_or_store_processes": true,
+    "temporary_no_active_test_or_store_processes": true,
+    "temporary_job_deleted": true,
+    "temporary_pod_not_found_confirmed": true,
+    "test_cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "pythonpath": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference"
+  },
+  "source_sha256": {
+    "python/sglang/srt/training_capture/coordinator.py": "468735beef000bd04670d3939fadd3973fd743830bf0c7e61c440efedb8ac0e5",
+    "python/sglang/srt/training_capture/config.py": "4cd5099ba93efbf16fc1575a5d85e32b75060e11b3c30fc1cbb05a79858d3863",
+    "python/sglang/srt/speculative/dspark_components/dspark_verify.py": "a27d8de5a586f5d7d53de03447299a68842ce3178292505e2f3075e7ce8d26e5",
+    "python/sglang/test/training_capture_utils.py": "c7f36e491676cd21ce0555a25bd4c461cf21d39d56ebd646dbfbe8da181a1ad9",
+    "python/sglang/test/dspark_capture_observer.py": "77110bec37b965fff75ab2498d3b0cb454dc803735716c33f3b6f928ef4426e0",
+    "python/sglang/test/dspark_capture_server.py": "6af462b474e8f12b09c57ffecf85d360059ca3a4360a2287d2dd6bb3324baedc",
+    "python/sglang/test/dspark_ragged_capture_runtime.py": "7784b57249295dce3223f5e15bad80da3e072a26b53e895e01298ab9a4a3ea6b",
+    "test/registered/unit/training_capture/test_coordinator.py": "e2ad2508c3185b84c1c066a0df96b70c2fb5ca5113b785b45f5d11034818c8d6",
+    "test/registered/unit/training_capture/test_config.py": "fa24836ab1073166a537ca66304b57a2ac993acffe5cbb716db78214f35f0f2d",
+    "test/registered/storage/test_training_capture_runtime.py": "fa89df2f69e926245d7279f2bc1f3df8c01ba3b61692b2ce9b069b9138dddf80",
+    "test/registered/storage/test_training_capture_distributed.py": "6fc1270bb7e4ae4e52eda678d8960bbf93e64be93c0e6bab8e30c2ce73cee39c",
+    "test/registered/storage/test_training_snapshot_mooncake.py": "e69bbc57f5500d224396678a765ad3c6295a5828ee788c5098efaac3cb5f4775"
+  },
+  "gpu_source_hashes_match": true,
+  "jobs": [
+    {
+      "job_id": "01790870803754355487-b8c979145eff",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790870852.5254512,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790870803754355487-b8c979145eff.log",
+      "tests_run": 46,
+      "subtests_passed": 6,
+      "elapsed_seconds": 45.29,
+      "scope": "Coordinator file before final row-name and following-request fixture updates.",
+      "log_sha256": "be9f6eecab3d6eb1b8a4f62d8880b2ec25c881bfeeed0ff7eea4c8197f3b2a4e"
+    },
+    {
+      "job_id": "01790870804095411046-70e952f9b258",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790870864.5624475,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790870804095411046-70e952f9b258.log",
+      "tests_run": 7,
+      "subtests_passed": 32,
+      "elapsed_seconds": 9.74,
+      "scope": "Configuration file.",
+      "log_sha256": "3826b829c1657e0491802f63b14e88f59500345854e4ead4ea9e219f99d88b5c"
+    },
+    {
+      "job_id": "01790870804481971476-d5d97efb9449",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790870955.769417,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790870804481971476-d5d97efb9449.log",
+      "tests_run": 1,
+      "subtests_passed": 0,
+      "elapsed_seconds": 80.174,
+      "scope": "Synthetic hidden-input draft requested a missing final-layer capture; fixture now uses hidden layers 0/14/26.",
+      "log_sha256": "2cfaef0e75718d2106d5f55f928bb4eba8139781b7d278f7183e3161a4f09d3d"
+    },
+    {
+      "job_id": "01790871102767714659-655ea1d7cc5c",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790871182.1470108,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790871102767714659-655ea1d7cc5c.log",
+      "tests_run": 1,
+      "subtests_passed": 0,
+      "elapsed_seconds": 67.892,
+      "scope": "Fixture assumed a dictionary management response; endpoint can return bool.",
+      "log_sha256": "c5684f76153065bc07858fa5dd617b825f6ce34c2ac7d136710ab16762328c32"
+    },
+    {
+      "job_id": "01790871288739545276-63c8ac1eaf30",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790871370.4509783,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790871288739545276-63c8ac1eaf30.log",
+      "tests_run": 1,
+      "subtests_passed": 0,
+      "elapsed_seconds": 70.081,
+      "scope": "Oracle inferred committed KV from token equality; corrected to actual commit lengths.",
+      "log_sha256": "3a2fe0971d93a130ed2288438ba03c596a1590a335d7b0f7a459a2c71b8620e7"
+    },
+    {
+      "job_id": "01790871736287433344-a75b7dd7e3d6",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790871881.657699,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790871736287433344-a75b7dd7e3d6.log",
+      "tests_run": 1,
+      "subtests_passed": 0,
+      "elapsed_seconds": 133.635,
+      "scope": "Fixture incorrectly required graph padding during eager execution.",
+      "log_sha256": "1a1f6d2fa2de4d5e0b307a52b547583803212e666b30f046fb59870dead96258"
+    },
+    {
+      "job_id": "01790871920639323161-9dc92c1735f6",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790872096.669964,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790871920639323161-9dc92c1735f6.log",
+      "tests_run": 1,
+      "subtests_passed": 0,
+      "elapsed_seconds": 164.354,
+      "scope": "Triton compact execution fell back to eager; switched compact fixture to FA3 and retained graph/folded assertions.",
+      "log_sha256": "be878865dd85bb0c3287d3e3137d90db8de72562615748f45e5217c9938cdffa"
+    },
+    {
+      "job_id": "01790872384795104248-79c1768047c9",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790872561.0037696,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790872384795104248-79c1768047c9.log",
+      "tests_run": 1,
+      "subtests_passed": 0,
+      "elapsed_seconds": 164.277,
+      "scope": "All four TP1 non-static combinations, twelve exact-readback samples.",
+      "log_sha256": "772301175425a015dda7b9a5375cc907ee3619723cf6c94b44ad79d215f9902d",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "TestTrainingCaptureRuntime.test_ragged_dspark_capture",
+        "-v"
+      ]
+    },
+    {
+      "job_id": "01790872412715823791-b816c34d2563",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790872608.1063,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790872412715823791-b816c34d2563.log",
+      "tests_run": 46,
+      "subtests_passed": 6,
+      "elapsed_seconds": 44.62,
+      "scope": "Final coordinator derived properties and lifecycle regression.",
+      "log_sha256": "039b1073308471aa70a104b770f1e8952b10c39e607b63715ecc3e66025ce460",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_coordinator.py"
+      ]
+    },
+    {
+      "job_id": "01790872413054881662-efd734b66621",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790872620.1394064,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790872413054881662-efd734b66621.log",
+      "tests_run": 7,
+      "subtests_passed": 32,
+      "elapsed_seconds": 9.75,
+      "scope": "Final configuration regression.",
+      "log_sha256": "9cd099dc9165cbfc2ff69edca212c8fffffb2b9948bc22f089cec7a6fd167aad",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_config.py"
+      ]
+    },
+    {
+      "job_id": "01790872413410470796-77c9dd5a1415",
+      "outcome": "timed_out",
+      "returncode": 124,
+      "finished_unix": 1790872800.512995,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790872413410470796-77c9dd5a1415.log",
+      "tests_run": null,
+      "subtests_passed": null,
+      "elapsed_seconds": 180,
+      "scope": "Full Store file reached task timeout after five tests; no assertion failure printed. Repeated with a 360-second limit on the temporary node.",
+      "log_sha256": "f85d30e7d95a052f65167f1f1095186d1190c91502b4ab7aedab460a6eab8870",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/storage/test_training_snapshot_mooncake.py"
+      ]
+    },
+    {
+      "job_id": "01790872599883226014-8dba045cfb82",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790873440.587235,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790872599883226014-8dba045cfb82.log",
+      "tests_run": 2,
+      "elapsed_seconds": 628.904,
+      "scope": "Complete single-H100 runtime file, including existing cache lifecycle, static DSpark, graphs/overlap, pressure, adaptive sampling and latency protection, plus four non-static combinations.",
+      "log_sha256": "76414156c9460461f450bda491bf9505c9ce1ac18b30aa1322f0e678c2f200e7",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "-v"
+      ]
+    }
+  ],
+  "distributed": {
+    "command": "'kubectl' 'exec' '-n' 'qiji' 'job-0cbb9a69991d-20261002002521-master-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' 'timeout' '900' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/test/registered/storage/test_training_capture_distributed.py' '-v' > '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-ragged-tp2-full.log' 2>&1",
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-ragged-tp2-full.log",
+    "returncode": 0,
+    "tests_run": 4,
+    "elapsed_seconds": 503.439,
+    "scope": "Full distributed file: AR TP2, AR PP2, four non-static TP2 combinations, static target-KV DSpark TP2 eager and graph/overlap.",
+    "log_sha256": "2dd8e5449284099712917175cf8e694b7813a08b31eed5784e088c6dc7a9a779"
+  },
+  "non_static_matrix": [
+    {
+      "mode": "cap-accept",
+      "tp_size": 1,
+      "graph_overlap": false,
+      "target_attention_backend": "triton",
+      "published_samples": 3,
+      "aux_owner_verify_graph_forwards": 0,
+      "folded_acceptances_by_rank": {
+        "0": 0
+      },
+      "observed_verify_lengths": [
+        [
+          2
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "observed_commit_lengths": [
+        [
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2
+        ]
+      ],
+      "budget_trimming_observed": true
+    },
+    {
+      "mode": "cap-accept",
+      "tp_size": 1,
+      "graph_overlap": true,
+      "target_attention_backend": "triton",
+      "published_samples": 3,
+      "aux_owner_verify_graph_forwards": 9,
+      "folded_acceptances_by_rank": {
+        "0": 0
+      },
+      "observed_verify_lengths": [
+        null,
+        [
+          2
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "observed_commit_lengths": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "budget_trimming_observed": true
+    },
+    {
+      "mode": "compact",
+      "tp_size": 1,
+      "graph_overlap": false,
+      "target_attention_backend": "fa3",
+      "published_samples": 3,
+      "aux_owner_verify_graph_forwards": 0,
+      "folded_acceptances_by_rank": {
+        "0": 0
+      },
+      "observed_verify_lengths": [
+        [
+          2
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "observed_commit_lengths": [
+        [
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2
+        ]
+      ],
+      "budget_trimming_observed": true
+    },
+    {
+      "mode": "compact",
+      "tp_size": 1,
+      "graph_overlap": true,
+      "target_attention_backend": "fa3",
+      "published_samples": 3,
+      "aux_owner_verify_graph_forwards": 9,
+      "folded_acceptances_by_rank": {
+        "0": 5
+      },
+      "observed_verify_lengths": [
+        [
+          4
+        ],
+        [
+          2
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "observed_commit_lengths": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "budget_trimming_observed": true
+    },
+    {
+      "mode": "cap-accept",
+      "tp_size": 2,
+      "graph_overlap": false,
+      "target_attention_backend": "triton",
+      "published_samples": 3,
+      "aux_owner_verify_graph_forwards": 0,
+      "folded_acceptances_by_rank": {
+        "0": 0,
+        "1": 0
+      },
+      "observed_verify_lengths": [
+        [
+          2
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "observed_commit_lengths": [
+        [
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2
+        ]
+      ],
+      "budget_trimming_observed": true
+    },
+    {
+      "mode": "cap-accept",
+      "tp_size": 2,
+      "graph_overlap": true,
+      "target_attention_backend": "triton",
+      "published_samples": 3,
+      "aux_owner_verify_graph_forwards": 9,
+      "folded_acceptances_by_rank": {
+        "0": 0,
+        "1": 0
+      },
+      "observed_verify_lengths": [
+        null,
+        [
+          2
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "observed_commit_lengths": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "budget_trimming_observed": true
+    },
+    {
+      "mode": "compact",
+      "tp_size": 2,
+      "graph_overlap": false,
+      "target_attention_backend": "fa3",
+      "published_samples": 3,
+      "aux_owner_verify_graph_forwards": 0,
+      "folded_acceptances_by_rank": {
+        "0": 0,
+        "1": 0
+      },
+      "observed_verify_lengths": [
+        [
+          2
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "observed_commit_lengths": [
+        [
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2
+        ]
+      ],
+      "budget_trimming_observed": true
+    },
+    {
+      "mode": "compact",
+      "tp_size": 2,
+      "graph_overlap": true,
+      "target_attention_backend": "fa3",
+      "published_samples": 3,
+      "aux_owner_verify_graph_forwards": 9,
+      "folded_acceptances_by_rank": {
+        "0": 5,
+        "1": 5
+      },
+      "observed_verify_lengths": [
+        [
+          4
+        ],
+        [
+          2
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "observed_commit_lengths": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "budget_trimming_observed": true
+    }
+  ],
+  "assertions": [
+    "After each producer exits, Store reconstruction exactly matches independently owned source K/V and pre-adjustment raw top-128 scores and vocab IDs.",
+    "Prediction positions, response/loss masks, token IDs and KV validity follow the actual accepted path; full-vocabulary LSE uses rtol=atol=1e-6.",
+    "Compact row offsets include unselected requests but exclude graph padding and never cross another request's accepted range.",
+    "Budget trimming and unequal per-request verify lengths occur on real requests.",
+    "Compact graph runs require actual target graph replay and folded acceptance on FA3.",
+    "Unbiased generation equals an AR baseline; logit-biased requests still retain unadjusted teacher data."
+  ],
+  "quality_checks": {
+    "python_files": 12,
+    "compile": true,
+    "ruff_format": true,
+    "ruff_clean_files": 7,
+    "baseline_ruff_diagnostics": {
+      "dspark_verify.py": 13,
+      "coordinator.py": 9,
+      "test_training_capture_runtime.py": 3,
+      "test_config.py": 2,
+      "test_training_snapshot_mooncake.py": 2
+    }
+  },
+  "limits": [
+    "The target-KV v1 checkpoint remains static-only and confidence-disabled; non-static serving uses existing hidden-input DSpark.",
+    "Observers synchronize/copy full source data; these runs are not latency or SLO acceptance.",
+    "No trained draft-quality result, production Catalog/consumer integration, pipeline speculation, PD or RDMA is established.",
+    "Real-model coverage remains Qwen3-0.6B, at most two TP/PP ranks, dense unquantized KV; broader topology/model validation remains open."
+  ],
+  "store_pre_cleanup": {
+    "command": "'kubectl' 'exec' '-n' 'qiji' 'job-0cbb9a69991d-20261002002521-master-0' '-c' 'master' '--' 'env' 'CUDA_VISIBLE_DEVICES=0' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'timeout' '360' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '-m' 'pytest' '-v' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/test/registered/storage/test_training_snapshot_mooncake.py' > '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-ragged-store-full.log' 2>&1",
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-ragged-store-full.log",
+    "returncode": 0,
+    "tests_run": 6,
+    "elapsed_seconds": 187.06,
+    "test_file_sha256": "476a373965455d32c7c86a79fdc700e36124ff74ed89d171c9c96891dbcc6daf",
+    "scope": "All six Store scenarios pass; teardown leaves the SDK launcher's child master alive. Corrected teardown and reran the file.",
+    "log_sha256": "4433a7f4144f767c294fa3c3c241796792688bf38fd11a617029e4a44e5ed579"
+  },
+  "store_final": {
+    "command": "'kubectl' 'exec' '-n' 'qiji' 'job-0cbb9a69991d-20261002002521-master-0' '-c' 'master' '--' 'env' 'CUDA_VISIBLE_DEVICES=0' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'timeout' '360' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '-m' 'pytest' '-v' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/test/registered/storage/test_training_snapshot_mooncake.py' > '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-ragged-store-clean.log' 2>&1",
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-ragged-store-clean.log",
+    "returncode": 0,
+    "tests_run": 6,
+    "elapsed_seconds": 188.37,
+    "scope": "Full Store file after process-tree teardown fix; process inspection confirms only PID 1 sleep and the inspection command remain.",
+    "log_sha256": "9f05ff55b03f5c8699f6023af42e224a98c262f91acc76bdc065727cde58e6f4"
+  },
+  "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+}

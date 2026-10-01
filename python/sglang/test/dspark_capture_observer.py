@@ -28,6 +28,7 @@ def observe(
     logits_output,
     width=None,
     can_run_cuda_graph=False,
+    verify_lens=None,
 ):
     draft_path = get_spec().speculative_draft_model_path
     root = (
@@ -43,8 +44,9 @@ def observe(
     if width is not None:
         _verify_frames[id(coordinator)] = []
     offset = 0
+    lengths = verify_lens.cpu().tolist() if verify_lens is not None else None
     for row, req in enumerate(batch.reqs):
-        count = width or (
+        count = (lengths[row] if lengths is not None else width) or (
             forward_batch.extend_seq_lens_cpu[row]
             if batch.forward_mode.is_extend()
             else 1
@@ -74,41 +76,46 @@ def observe(
             logits = logits_output.next_token_logits[row : row + len(predictions)]
         else:
             start = end
-            region = slice(row * width, (row + 1) * width)
             slots = forward_batch.out_cache_loc[region]
             history = _token_prefixes[req.rid]
             assert len(history) >= start
             verify_tokens = forward_batch.input_ids[region].tolist()
             tokens = history[:start] + verify_tokens
-            _verify_frames[id(coordinator)].append(
-                (req.rid, row, start, verify_tokens[0])
-            )
-            predictions = list(range(start + 1, start + width + 1))
+            predictions = list(range(start + 1, start + count + 1))
             logits = logits_output.next_token_logits[region]
         # Read all raw vocabulary scores. The test computes its own top-k and
         # row alignment from final output tokens, without using capture tickets.
-        torch.save(
-            {
-                "trace_id": hashlib.sha256(req.rid.encode()).hexdigest(),
-                "result_lag": end - len(req.origin_input_ids) - len(req.output_ids),
-                "batch_size": len(batch.reqs),
-                "cuda_graph": can_run_cuda_graph,
-                "tp_rank": tp_rank,
-                "tp_size": tp_size,
-                "tokens": tokens,
-                "kv_start": start,
-                "kv_slots": slots.long().cpu(),
-                "kv": {
-                    name: buffer[slots.long()].cpu()
-                    for name, buffer in coordinator.exporter.buffers.items()
-                }
-                if coordinator.exporter is not None
-                else {},
-                "predictions": predictions,
-                "logits": logits[:, : coordinator.teacher.vocab_size].float().cpu(),
-            },
-            root / f"{next(_sequence):06d}.pt",
-        )
+        reference = {
+            "trace_id": hashlib.sha256(req.rid.encode()).hexdigest(),
+            "result_lag": end - len(req.origin_input_ids) - len(req.output_ids),
+            "batch_size": len(batch.reqs),
+            "cuda_graph": can_run_cuda_graph,
+            "tp_rank": tp_rank,
+            "tp_size": tp_size,
+            "verify_count": count if width is not None else None,
+            "verify_width": width,
+            "verify_padding": forward_batch.input_ids.numel() - sum(lengths)
+            if lengths is not None
+            else 0,
+            "tokens": tokens,
+            "kv_start": start,
+            "kv_slots": slots.long().cpu(),
+            "kv": {
+                name: buffer[slots.long()].cpu()
+                for name, buffer in coordinator.exporter.buffers.items()
+            }
+            if coordinator.exporter is not None
+            else {},
+            "predictions": predictions,
+            "logits": logits[:, : coordinator.teacher.vocab_size].float().cpu(),
+        }
+        path = root / f"{next(_sequence):06d}.pt"
+        if width is None:
+            torch.save(reference, path)
+        else:
+            _verify_frames[id(coordinator)].append(
+                (req.rid, row, start, verify_tokens[0], reference, path)
+            )
 
 
 def after_forward(self, batch, forward_batch, logits_output, **kwargs):
@@ -130,6 +137,7 @@ def after_verify_forward(self, batch, forward_batch, logits_output, **kwargs):
         logits_output,
         width=kwargs["width"],
         can_run_cuda_graph=kwargs["can_run_cuda_graph"],
+        verify_lens=kwargs.get("verify_lens"),
     )
     return _after_verify_forward(self, batch, forward_batch, logits_output, **kwargs)
 
@@ -139,11 +147,13 @@ def after_verify_accept(self, ticket, *, commit_lens, out_tokens):
         self, ticket, commit_lens=commit_lens, out_tokens=out_tokens
     )
     counts, outputs = commit_lens.tolist(), out_tokens.tolist()
-    for rid, row, start, anchor in _verify_frames.pop(id(self), []):
+    for rid, row, start, anchor, reference, path in _verify_frames.pop(id(self), []):
         history = _token_prefixes[rid]
         if start < len(history):
             assert history[start] == anchor
         _token_prefixes[rid] = history[:start] + [anchor] + outputs[row][: counts[row]]
+        reference["num_commit"] = counts[row]
+        torch.save(reference, path)
     return result
 
 
@@ -166,7 +176,9 @@ def check_capture_snapshot(
     for item in references:
         if item["trace_id"] != manifest.provenance.trace_id:
             continue
-        for row, prediction in enumerate(item["predictions"]):
+        # A budget-trimmed token can match a later output without committed KV.
+        num_commit = item.get("num_commit")
+        for row, prediction in enumerate(item["predictions"][:num_commit]):
             if (
                 prediction < len(tokens)
                 and item["tokens"][:prediction] == tokens[:prediction]
@@ -174,7 +186,10 @@ def check_capture_snapshot(
                 teacher[prediction] = item["logits"][row]
         if not item["kv"]:
             continue
-        for row in range(next(iter(item["kv"].values())).shape[0]):
+        num_rows = next(iter(item["kv"].values())).shape[0]
+        if num_commit is not None:
+            num_rows = min(num_rows, num_commit)
+        for row in range(num_rows):
             position = item["kv_start"] + row
             if (
                 position < len(tokens)

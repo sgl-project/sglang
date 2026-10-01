@@ -33,7 +33,7 @@ from sglang.test.test_utils import CustomTestCase, popen_launch_server
 from sglang.test.training_capture_catalog import TestCaptureCatalog
 from sglang.test.training_capture_utils import read_snapshot
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=480, stage="base-b", runner_config="2-gpu-large")
 
 
 def free_port():
@@ -146,6 +146,7 @@ class TestDistributedCaptureRuntime(CustomTestCase):
         }
         path = root / "capture.json"
         path.write_text(json.dumps(config))
+        self.capture_path = path
         self.dump_path = root / "reference"
         self.url = f"http://127.0.0.1:{free_port()}"
         launch = test_utils._launch_server_process
@@ -619,6 +620,41 @@ class TestDistributedCaptureRuntime(CustomTestCase):
                 ),
                 flush=True,
             )
+
+    def test_tensor_parallel_ragged_dspark_capture(self):
+        from sglang.test.dspark_ragged_capture_runtime import exercise_ragged_capture
+
+        self.launch(tp=2, pp=1)
+        prompt = [100, 200, 300, 400] * 40
+        previous = len(self.catalog.publications)
+        try:
+            response = requests.post(
+                self.url + "/generate",
+                json={
+                    "input_ids": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 4,
+                        "ignore_eos": True,
+                    },
+                },
+                timeout=120,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            baseline = response.json()["output_ids"]
+            self.catalog.wait_publications(previous + 1, timeout=45)
+        finally:
+            self.stop_server()
+        for mode in ("cap-accept", "compact"):
+            for cuda_graph in (False, True):
+                exercise_ragged_capture(
+                    self,
+                    prompt=prompt,
+                    baseline=baseline,
+                    mode=mode,
+                    cuda_graph=cuda_graph,
+                    tp_size=2,
+                )
 
 
 if __name__ == "__main__":

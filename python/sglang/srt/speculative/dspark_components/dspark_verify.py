@@ -307,6 +307,11 @@ class TargetVerifyExecutor:
                 target_out.logits_output,
                 width=self.verify_num_draft_tokens,
                 can_run_cuda_graph=target_out.can_run_cuda_graph,
+                verify_lens=(
+                    verify_input.ragged_verify_layout.verify_lens
+                    if verify_input.ragged_verify_layout is not None
+                    else None
+                ),
             )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
@@ -482,7 +487,6 @@ class TargetVerifyExecutor:
 
 
 class CommitInjectCtx(msgspec.Struct):
-
     draft_model: object
     block_pos_offsets: torch.Tensor
     resolve_pool: object
@@ -499,7 +503,6 @@ class AcceptOuts(msgspec.Struct):
 
 
 class DsparkVerifyEpilogue:
-
     def __init__(
         self,
         *,

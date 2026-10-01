@@ -185,8 +185,18 @@ class VerifyCaptureFixture:
             context.commit_token(position=2, token_id=10)
             request.output_ids.append(10)
 
-    def forward(self, *, inputs=(10, 20, 30, 40), prefix=2, selected_row=0):
-        requests = [CaptureTestRequest("not-selected")] * selected_row + [self.request]
+    def forward(
+        self,
+        *,
+        inputs=(10, 20, 30, 40),
+        prefix=2,
+        selected_row=0,
+        verify_lens=None,
+        padding=0,
+    ):
+        num_requests = len(verify_lens) if verify_lens is not None else selected_row + 1
+        requests = [CaptureTestRequest("not-selected") for _ in range(num_requests)]
+        requests[selected_row] = self.request
         width = len(inputs)
         self.forward_batch = SimpleNamespace(
             input_ids=torch.tensor(list(inputs) * len(requests)),
@@ -195,12 +205,32 @@ class VerifyCaptureFixture:
         )
         generator = torch.Generator().manual_seed(prefix)
         self.logits = torch.randn(len(requests) * width, 256, generator=generator)
+        if verify_lens is not None:
+            indices = torch.tensor(
+                [
+                    row * width + column
+                    for row, count in enumerate(verify_lens)
+                    for column in range(count)
+                ],
+                dtype=torch.long,
+            )
+            for name in ("input_ids", "positions", "out_cache_loc"):
+                selected = getattr(self.forward_batch, name).index_select(0, indices)
+                setattr(
+                    self.forward_batch,
+                    name,
+                    torch.nn.functional.pad(selected, (0, padding)),
+                )
+            self.logits = torch.nn.functional.pad(
+                self.logits[indices], (0, 0, 0, padding), value=999
+            )
         return self.coordinator.after_verify_forward(
             SimpleNamespace(reqs=requests, seq_lens_cpu=[prefix] * len(requests)),
             self.forward_batch,
             SimpleNamespace(next_token_logits=self.logits),
             width=width,
             can_run_cuda_graph=False,
+            verify_lens=torch.tensor(verify_lens) if verify_lens is not None else None,
         )
 
     def accept(self, ticket, outputs, count):
