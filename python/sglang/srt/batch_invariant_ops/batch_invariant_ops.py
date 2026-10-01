@@ -15,7 +15,9 @@ from sglang.srt.utils.common import (
     calc_diff,
     get_bool_env_var,
     get_device_core_count,
+    get_device_sm,
     get_dispatch_device_backend,
+    get_int_env_var,
 )
 
 _is_npu = is_npu()
@@ -285,6 +287,61 @@ def _matmul_persistent_deepgemm(
     return out
 
 
+# Small-M bf16 GEMMs on SM120. DeepGEMM's sm120 kernel reads the weight at about a third
+# of DRAM bandwidth when M is small and N is narrow (e.g. 5120). The persistent Triton
+# kernel above issues the same bf16 mma.sync chain as DeepGEMM's sm120 kernel: one fp32
+# accumulator per output, K ascending in 16-wide steps, no split-K, one rounding, so its
+# output equals DeepGEMM's bit for bit (every tile tried did). Only the tile changes.
+# The value is the largest M routed here (0 = off).
+_SMALL_M_TRITON_MAX = (
+    get_int_env_var("SGLANG_BATCH_INVARIANT_OPS_SMALL_M_TRITON", 0)
+    if not _is_npu and get_device_sm() in (120, 121)
+    else 0
+)
+# One tile for every shape; BLOCK_SIZE_M 16 reads each weight once while M <= 16. On an
+# RTX PRO 6000, Qwen3.8-27B's GEMM shapes at M 1-16 run within ~1 % of the best of 32
+# tiles and never slower than DeepGEMM.
+_SMALL_M_TRITON_CONFIG = {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 1,
+    "num_stages": 4,
+    "num_warps": 4,
+}
+
+
+def _matmul_small_m_triton(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype):
+    """One program per output tile (no persistent loop)."""
+    M, K = a.shape
+    N = b.shape[1]
+    cfg = _SMALL_M_TRITON_CONFIG
+    c = torch.empty((M, N), device=a.device, dtype=out_dtype)
+    tiles = triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"])
+    matmul_kernel_persistent[(tiles,)](
+        a,
+        b,
+        c,
+        None,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        NUM_SMS=tiles,
+        A_LARGE=a.numel() > 2**31,
+        B_LARGE=b.numel() > 2**31,
+        C_LARGE=c.numel() > 2**31,
+        HAS_BIAS=False,
+        **cfg,
+    )
+    return c
+
+
 def matmul_persistent(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -309,6 +366,16 @@ def matmul_persistent(
         and N >= MIN_DEEPGEMM_DIM
         and deepgemm_tma_aligned
     ):
+        if (
+            0 < a.shape[0] <= _SMALL_M_TRITON_MAX
+            and out_dtype == torch.bfloat16
+            and not _ENABLE_MM_COMPARISON_TEST
+        ):
+            out = _matmul_small_m_triton(a, b, out_dtype)
+            # Same bias step as the DeepGEMM path below.
+            if bias is not None:
+                out += bias
+            return out
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(
                 a=a, b=b, bias=bias, out_dtype=out_dtype
