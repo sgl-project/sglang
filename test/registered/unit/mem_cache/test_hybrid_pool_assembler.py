@@ -738,7 +738,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
         kv_pool = _dsa_pool_stub(layer_num=3)
         kv_pool.skip_topk_layers = [False, True, False]  # device layer 1: no buffer
         mamba_pool = SimpleNamespace(layer_num=2, size=8)
-        # transfer layers 0,2,4 are DSA (device 0,1,2); 1,3 are Mamba
+        # transfer layers 0,2,4 are DSA (device 0,1,2), 1,3 are Mamba
         full_mapping = {0: 0, 2: 1, 4: 2}
         mamba_mapping = {1: 0, 3: 1}
         params = SimpleNamespace(
@@ -822,7 +822,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
         self.assertEqual(names, [PoolName.KV, PoolName.INDEXER, PoolName.MAMBA])
         indexer = group.entry_map[PoolName.INDEXER]
         kv = group.entry_map[PoolName.KV]
-        # KV still maps every DSA transfer layer; the indexer drops device layer 1.
+        # KV still maps every DSA transfer layer. The indexer drops device layer 1.
         self.assertEqual([kv.layer_mapper(t) for t in range(5)], [0, None, 1, None, 2])
         self.assertEqual(
             [indexer.layer_mapper(t) for t in range(5)], [0, None, None, None, 2]
