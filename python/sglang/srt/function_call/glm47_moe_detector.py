@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import (
     BaseFormatDetector,
     StructuralTag,
@@ -326,6 +327,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._sent_empty_object = (
             False  # Track if empty object has been sent for no-arg functions
         )
+        self._skipping_undeclared_tool = False
         self._reset_streaming_state()
 
     def _reset_streaming_state(self) -> None:
@@ -568,6 +570,19 @@ class Glm47MoeDetector(BaseFormatDetector):
             logger.warning("Empty function name detected, skipping tool call")
             return None
 
+        if (
+            func_name not in self._tool_indices
+            and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+        ):
+            # Same rule as parse_base_json on the non-streaming path: drop the
+            # call through its </tool_call> rather than stream a name the
+            # request never declared.
+            logger.warning(f"Model attempted to call undefined function: {func_name}")
+            self._skipping_undeclared_tool = True
+            del self.prev_tool_call_arr[self.current_tool_id :]
+            del self.streamed_args_for_tool[self.current_tool_id :]
+            return None
+
         # Send tool name
         self.current_tool_name_sent = True
         self._streamed_raw_length = 0
@@ -784,6 +799,13 @@ class Glm47MoeDetector(BaseFormatDetector):
             func_name, func_args_raw, is_tool_end = self._extract_match_groups(
                 partial_match
             )
+
+            if self._skipping_undeclared_tool:
+                if is_tool_end == self.eot_token:
+                    self._buffer = current_text[partial_match.end() :]
+                    self._skipping_undeclared_tool = False
+                    self._reset_streaming_state()
+                return StreamingParseResult(normal_text=normal_text, calls=[])
 
             # Initialize tool call state if needed (keeping existing logic)
             if self.current_tool_id == -1:
