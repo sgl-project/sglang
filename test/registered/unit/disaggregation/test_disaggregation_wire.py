@@ -70,6 +70,61 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class TestMixedSWAKVBlockScales(CustomTestCase):
+    def test_swa_block_scales_follow_each_subpools_dtype(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKVPool,
+            MHATokenToKVPoolMXFP8,
+        )
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        swa_infos = ([0x1000, 0x2000], [1024, 1024], [64, 64])
+        full_scale_infos = ([0x3000, 0x4000], [128, 128], [8, 8])
+        swa_scale_infos = ([0x5000, 0x6000], [128, 128], [8, 8])
+
+        for full_quantized, swa_quantized in (
+            (False, False),
+            (True, False),
+            (False, True),
+            (True, True),
+        ):
+            with self.subTest(full=full_quantized, swa=swa_quantized):
+                target = object.__new__(SWAKVPool)
+                for name, quantized, scale_infos in (
+                    ("full_kv_pool", full_quantized, full_scale_infos),
+                    ("swa_kv_pool", swa_quantized, swa_scale_infos),
+                ):
+                    pool = object.__new__(
+                        MHATokenToKVPoolMXFP8 if quantized else MHATokenToKVPool
+                    )
+                    pool.get_contiguous_buf_infos = Mock(return_value=swa_infos)
+                    if quantized:
+                        pool.get_kv_scale_buf_infos = Mock(return_value=scale_infos)
+                    setattr(target, name, pool)
+
+                kv_args = KVArgs()
+                setup_state_kv_args(kv_args, target)
+
+                expected_types = [StateType.SWA]
+                expected_infos = [swa_infos]
+                if full_quantized:
+                    expected_types.append(StateType.BLOCK_SCALE)
+                    expected_infos.append(full_scale_infos)
+                if swa_quantized:
+                    expected_types.append(StateType.BLOCK_SCALE_SWA)
+                    expected_infos.append(swa_scale_infos)
+                self.assertEqual(kv_args.state_types, expected_types)
+                self.assertEqual(
+                    kv_args.state_data_ptrs, [infos[0] for infos in expected_infos]
+                )
+                self.assertEqual(
+                    kv_args.state_data_lens, [infos[1] for infos in expected_infos]
+                )
+                self.assertEqual(
+                    kv_args.state_item_lens, [infos[2] for infos in expected_infos]
+                )
+
+
 class TestDisaggregationWire(unittest.TestCase):
     def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
         manager = object.__new__(MooncakeKVManager)
@@ -457,6 +512,51 @@ class TestQwen4StateWire(unittest.TestCase):
             ),
             [(0, 2), (1, 3)],
         )
+
+    def _qsa_compressed_manager(self, *, src_item_len):
+        manager = object.__new__(MooncakeKVManager)
+        manager.attn_tp_size = 4
+        manager.pp_size = 1
+        manager.is_mla_backend = False
+        manager.is_hybrid_mla_backend = False
+        manager.kv_args = SimpleNamespace(
+            engine_rank=0,
+            state_types=[StateType.QSA_COMPRESSED],
+            state_data_ptrs=[[1000]],
+            state_item_lens=[[src_item_len]],
+            state_dim_per_tensor=[[]],
+            state_layer_ids=[[24]],
+        )
+        manager.sent = []
+        manager._send_kvcache_generic = lambda **kw: manager.sent.append(kw) or 0
+        return manager
+
+    def test_qsa_compressed_layout_mismatch_rejected_before_transfer(self):
+        """Equal attention TP with fp8 on one peer only halves that peer's
+        compressed item length. The transfer uses the source length as the
+        destination stride, so the mismatch must be rejected before any write."""
+        req = SimpleNamespace(mooncake_session_id="session", dst_state_indices=[[3]])
+        decode_info = SimpleNamespace(
+            dst_attn_tp_size=4,
+            dst_state_data_ptrs=[[2000]],
+            dst_state_item_lens=[[16]],
+            dst_state_dim_per_tensor=[[]],
+            dst_state_layer_ids=[[24]],
+        )
+        manager = self._qsa_compressed_manager(src_item_len=32)
+        with self.assertRaisesRegex(RuntimeError, "QSA_COMPRESSED layout differs"):
+            MooncakeKVManager.maybe_send_extra(
+                manager, req, [[3]], None, target_rank_registration_info=decode_info
+            )
+        self.assertEqual(manager.sent, [])
+
+        manager = self._qsa_compressed_manager(src_item_len=16)
+        rc = MooncakeKVManager.maybe_send_extra(
+            manager, req, [[3]], None, target_rank_registration_info=decode_info
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(manager.sent), 1)
+        self.assertEqual(manager.sent[0]["item_lens"], [16])
 
     def test_replicated_state_tp_policy(self):
         for src_tp, dst_tp, rank, expected in (
