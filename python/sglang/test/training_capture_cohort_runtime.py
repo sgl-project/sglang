@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 import torch.distributed as dist
 
@@ -26,11 +27,13 @@ from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
 from sglang.srt.training_capture.cohort import CaptureCohortAllocator
 from sglang.srt.training_capture.cohort_coordinator import CohortCaptureCoordinator
 from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
+from sglang.srt.training_capture.coordinator import CaptureCoordinator
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.protocol import canonical_bytes
 from sglang.srt.training_capture.resources import CaptureResources
 from sglang.srt.training_capture.topology import plan_capture_layout
+from sglang.test.training_capture_partition import synthetic_rank_contract
 from sglang.test.training_capture_utils import make_snapshot
 
 
@@ -110,7 +113,7 @@ def _forward(coordinator, req, *, end, raw_logits, pp_last, token):
     )
     forward = SimpleNamespace(
         extend_seq_lens_cpu=[2] if extend else None,
-        positions=torch.arange(0 if extend else end - 1, end),
+        positions=torch.arange(0 if extend else end - 1, end, device=raw_logits.device),
         is_prefill_only=False,
         return_logprob=False,
         apply_deprecated_skip_attn_backend_init=lambda _: None,
@@ -151,6 +154,7 @@ def _forward(coordinator, req, *, end, raw_logits, pp_last, token):
 
 def _run_case(rank, root, master, endpoint, case):
     base, tensors = make_snapshot(response_length=4)
+    factory = case == "factory_cuda"
     replicated = case == "replicated"
     ranges = (
         [(0, 4)]
@@ -159,14 +163,18 @@ def _run_case(rank, root, master, endpoint, case):
     )
     tp_size = 4 if replicated else 2
     layout = plan_capture_layout(
-        base.kv, tp_size=tp_size, pp_layer_ranges=ranges, aux_tp_rank=1
+        base.kv,
+        tp_size=tp_size,
+        pp_layer_ranges=ranges,
+        aux_tp_rank=0 if factory else 1,
     )
     partition = layout.partitions[rank]
     config = CaptureConfig(
         dataset_id=f"coordinator-{case}",
-        model_id="fixture",
+        model_id=base.teacher.model_id,
         producer_revision="test",
         selected_layer_ids=base.kv.selected_layer_ids,
+        storage_chunk_tokens=base.kv.storage_chunk_tokens,
         catalog_endpoint=endpoint,
         journal_directory=str(Path(root) / f"journal-{case}-{rank}"),
         store=StoreSetup(local_hostname=f"rank-{rank}", master_server_addr=master),
@@ -176,32 +184,93 @@ def _run_case(rank, root, master, endpoint, case):
         sample_ratio=1.0,
     )
     sources = _sources(base, tensors, partition)
-    resources = CaptureResources()
-    if partition.active:
-        resources.store = _connect(master)
-        resources.catalog = HTTPCaptureCatalog(endpoint)
-        if partition.heads:
-            resources.exporter = SelectedLayerKVExporter(
-                base.kv, sources, partition=partition
+    control = None
+    if factory:
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        torch.cuda.set_device(0)
+        start, end = ranges[rank // tp_size]
+        source_pool = MHATokenToKVPool(
+            size=16,
+            page_size=base.kv.source_page_size,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=4,
+            layer_num=end - start,
+            device="cuda",
+            start_layer=start,
+            end_layer=end,
+            enable_memory_saver=False,
+            enable_alt_stream=False,
+        )
+        for layer in partition.local_layers(base.kv):
+            for component, get_buffer in (
+                ("k", source_pool.get_key_buffer),
+                ("v", source_pool.get_value_buffer),
+            ):
+                name = f"target_{component}.{layer.layer_id}"
+                buffer = get_buffer(layer.layer_id)
+                buffer[:16].copy_(sources[name])
+                sources[name] = buffer
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            hostname = f"127.0.0.1:{sock.getsockname()[1]}"
+        config = msgspec.structs.replace(
+            config, store=StoreSetup(local_hostname=hostname, master_server_addr=master)
+        )
+        path = Path(root) / f"capture-{rank}.json"
+        path.write_bytes(msgspec.json.encode(config))
+        with patch(
+            "sglang.srt.training_capture.coordinator.bind_rank_target_contract",
+            return_value=synthetic_rank_contract(
+                base, rank, tp_size=tp_size, pp_layer_ranges=ranges
+            ),
+        ):
+            coordinator = CaptureCoordinator.create(
+                config_path=str(path),
+                model=None,
+                model_config=None,
+                tokenizer_path=None,
+                pool=source_pool,
+                req_to_token=SimpleNamespace(
+                    req_to_token=torch.arange(16, device="cuda").reshape(2, 8)
+                ),
+                startup_group=dist.group.WORLD,
+                tp_rank=rank % tp_size,
+                tp_size=tp_size,
+                pp_rank=rank // tp_size,
+                pp_size=len(ranges),
             )
-        resources._allocate(config, base.kv, partition, pin_memory=False)
-    control = dist.new_group(backend="gloo", timeout=timedelta(seconds=20))
-    coordinator = CohortCaptureCoordinator(
-        allocator=CaptureCohortAllocator(
-            group=control,
-            layout=layout,
-            config=config,
-            teacher=base.teacher,
-            kv=base.kv,
-            resources=resources,
-            timeout_seconds=15,
-        ),
-        req_to_token=SimpleNamespace(req_to_token=torch.arange(16).reshape(2, 8)),
-        capture_mode="speculative_accepted_target_path"
-        if case == "verify"
-        else "autoregressive",
-        autostart=False,
-    )
+        resources = coordinator.resources
+        assert coordinator.layout == layout
+        assert all(slot.storage.is_pinned() for slot in resources.pool.slots)
+    else:
+        resources = CaptureResources()
+        if partition.active:
+            resources.store = _connect(master)
+            resources.catalog = HTTPCaptureCatalog(endpoint)
+            if partition.heads:
+                resources.exporter = SelectedLayerKVExporter(
+                    base.kv, sources, partition=partition
+                )
+            resources._allocate(config, base.kv, partition, pin_memory=False)
+        control = dist.new_group(backend="gloo", timeout=timedelta(seconds=20))
+        coordinator = CohortCaptureCoordinator(
+            allocator=CaptureCohortAllocator(
+                group=control,
+                layout=layout,
+                config=config,
+                teacher=base.teacher,
+                kv=base.kv,
+                resources=resources,
+                timeout_seconds=15,
+            ),
+            req_to_token=SimpleNamespace(req_to_token=torch.arange(16).reshape(2, 8)),
+            capture_mode="speculative_accepted_target_path"
+            if case == "verify"
+            else "autoregressive",
+            autostart=False,
+        )
     recovery_entered, release_recovery = threading.Event(), threading.Event()
     startup_patch = None
     if case == "inactive_ingress" and partition.include_aux:
@@ -217,7 +286,8 @@ def _run_case(rank, root, master, endpoint, case):
         )
         startup_patch.start()
     try:
-        coordinator.activate()
+        if not factory:
+            coordinator.activate()
         if case == "inactive_ingress":
             if partition.include_aux:
                 assert recovery_entered.wait(10)
@@ -257,6 +327,8 @@ def _run_case(rank, root, master, endpoint, case):
         assert all(record is not None for record in records), coordinator.stats()
         dist.barrier()
         raw_rows = torch.randn(4, 256, generator=torch.Generator().manual_seed(42))
+        if factory:
+            raw_rows = raw_rows.cuda()
         pp_last = rank // tp_size == len(ranges) - 1
         for index in (0, 1) if rank < 2 else (1, 0):
             req = requests[index]
@@ -346,7 +418,8 @@ def _run_case(rank, root, master, endpoint, case):
             startup_patch.stop()
         if not coordinator.close():
             raise RuntimeError("collector still owns live capture state")
-        dist.destroy_process_group(control)
+        if control is not None:
+            dist.destroy_process_group(control)
 
 
 def cohort_runtime_worker(rank, root, master, endpoint):
@@ -360,7 +433,14 @@ def cohort_runtime_worker(rank, root, master, endpoint):
     )
     try:
         results = []
-        for case in ("tp_pp", "replicated", "inactive_ingress", "verify", "abort"):
+        for case in (
+            "tp_pp",
+            "replicated",
+            "inactive_ingress",
+            "verify",
+            "abort",
+            "factory_cuda",
+        ):
             with (
                 get_context().override_server_args(enable_dp_attention=False),
                 get_parallel().override(

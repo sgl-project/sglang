@@ -12,6 +12,7 @@ from safetensors.torch import load_file
 from sglang.srt.training_capture.catalog import CaptureLease, HTTPCaptureCatalog
 from sglang.srt.training_capture.context import RequestCaptureContext
 from sglang.srt.training_capture.host_pool import HostBufferPool
+from sglang.srt.training_capture.identity import LocalLayerContract, RankTargetContract
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.protocol import (
@@ -31,6 +32,43 @@ from sglang.srt.training_capture.snapshot_writer import (
 from sglang.srt.training_capture.teacher import TeacherRows
 from sglang.srt.training_capture.topology import plan_capture_layout
 from sglang.test.training_capture_utils import Registrar, make_snapshot
+
+
+def synthetic_rank_contract(base, rank, *, tp_size, pp_layer_ranges):
+    """Synthetic post-binding metadata; this does not inspect model artifacts."""
+    pp_rank, tp_rank = divmod(rank, tp_size)
+    start, end = pp_layer_ranges[pp_rank]
+    layers = []
+    for layer in base.kv.layers:
+        if start <= layer.layer_id < end:
+            heads = layer.num_kv_heads
+            width = max(1, heads // tp_size)
+            first = (
+                tp_rank * width if heads >= tp_size else tp_rank // (tp_size // heads)
+            )
+            layers.append(
+                LocalLayerContract(
+                    geometry=layer,
+                    head_range=(first, first + width),
+                    rope_config=base.kv.rope_config,
+                    source_k_norm=base.kv.source_k_norm,
+                )
+            )
+    return RankTargetContract(
+        teacher=base.teacher,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        pp_rank=pp_rank,
+        pp_size=len(pp_layer_ranges),
+        dp_rank=0,
+        pp_layer_range=(start, end),
+        num_attention_layers=pp_layer_ranges[-1][1],
+        selected_layer_ids=base.kv.selected_layer_ids,
+        dtype=base.kv.dtype,
+        source_page_size=base.kv.source_page_size,
+        storage_chunk_tokens=base.kv.storage_chunk_tokens,
+        layers=layers,
+    )
 
 
 def prepare_cohort_partition(cohort, layout, rank):

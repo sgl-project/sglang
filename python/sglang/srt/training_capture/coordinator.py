@@ -31,6 +31,7 @@ from sglang.srt.training_capture.protocol import OWNER, ContractError, Provenanc
 from sglang.srt.training_capture.resources import CaptureResources
 from sglang.srt.training_capture.snapshot_writer import SnapshotWriter
 from sglang.srt.training_capture.startup import (
+    coordinate_capture_activation,
     coordinate_resource_startup,
     coordinate_target_startup,
 )
@@ -81,7 +82,7 @@ class VerifyCaptureBatch(msgspec.Struct, frozen=True):
 
 
 class CaptureCoordinator:
-    # Distributed construction will install its cohort-backed request router.
+    # Single-rank capture samples locally; distributed capture installs a router.
     request_router = None
 
     @classmethod
@@ -109,6 +110,11 @@ class CaptureCoordinator:
         from sglang.srt.training_capture.metrics import CaptureMetrics
 
         config = None
+        distributed = tp_size > 1 or pp_size > 1
+        if distributed and startup_group is None:
+            raise ContractError(
+                "distributed capture requires its startup process group"
+            )
 
         def build_local():
             nonlocal config
@@ -137,8 +143,8 @@ class CaptureCoordinator:
             teacher, kv, layout = coordinate_target_startup(
                 group=startup_group, build_local=build_local, **topology
             )
-        if (tp_size, pp_size, dp_rank) != (1, 1, 0):
-            raise ContractError("distributed request capture is not yet connected")
+        if dp_rank != 0:
+            raise ContractError("DP request capture is not yet connected")
         capture_mode = (
             "speculative_accepted_target_path"
             if get_spec().speculative_algorithm == "DSPARK"
@@ -146,6 +152,23 @@ class CaptureCoordinator:
         )
 
         def prepare_local():
+            if distributed:
+                from sglang.srt.training_capture.cohort_startup import (
+                    prepare_cohort_capture,
+                )
+
+                return prepare_cohort_capture(
+                    startup_group=startup_group,
+                    config=config,
+                    teacher=teacher,
+                    kv=kv,
+                    layout=layout,
+                    pool=pool,
+                    req_to_token=req_to_token,
+                    enable_overlap=enable_overlap,
+                    capture_mode=capture_mode,
+                    metrics_labels=metrics_labels,
+                )
             resources = CaptureResources.prepare(
                 config=config,
                 kv=kv,
@@ -190,7 +213,10 @@ class CaptureCoordinator:
                 ),
                 prepare_local=prepare_local,
             )
-        coordinator.activate()
+        if distributed:
+            coordinate_capture_activation(group=startup_group, coordinator=coordinator)
+        else:
+            coordinator.activate()
         atexit.register(coordinator.close)
         return coordinator
 

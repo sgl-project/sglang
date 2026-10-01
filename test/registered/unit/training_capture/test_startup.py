@@ -178,7 +178,11 @@ def startup_worker(rank, root, timeout_case):
                         )
                     elif case == "version":
                         patches.enter_context(
-                            patch.object(startup, "PROTOCOL_VERSION", 3)
+                            patch.object(
+                                startup,
+                                "PROTOCOL_VERSION",
+                                startup.PROTOCOL_VERSION + 1,
+                            )
                         )
                 dist.barrier()
                 if case == "peer_exit" and rank == 3:

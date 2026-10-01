@@ -1979,6 +1979,74 @@ fixtures above do not establish CUDA TP/PP inference, multi-node RDMA,
 production Catalog retention/reconciliation, trained draft quality or SLO
 compliance.
 
+## Distributed Factory And Activation
+
+`CaptureCoordinator.create()` now selects the cohort-backed coordinator for
+TP/PP topologies after rank identity agreement. Common policy and passive
+resource preparation still use the existing startup group. A new owned Gloo
+group carries only background capture control. Group creation precedes
+rank-local Store/pool allocation so a local preparation failure cannot strand
+peers in a different construction phase. The initial factory requires the
+complete PP-major worker group; DP/subgroup serving remains unsupported.
+
+Startup protocol version 3 adds two activation votes. Writer, cohort service
+and handoff threads start behind an activation event, and only a successful
+all-rank acknowledgement releases their work. A rank failing any thread start
+rolls back without issuing capture Catalog/Store work. Close handles an allocated
+but unstarted thread, drains actors, closes transport, and finally destroys an
+owned control group. Failed transport shutdown retains both coordinator and
+control group for a later close attempt.
+
+The first two factory test jobs failed during repeated group construction:
+`01790863815775220186-b893a4c1ec76` (110.22s) and
+`01790864036903616254-42eca573d939` (110.57s). The latter stack dump identifies
+`new_group` as the remaining rank's blocking operation. In the installed
+PyTorch build, local-synchronization group names hash rank membership and the
+current count of live groups; destroy/recreate reused the rendezvous namespace.
+The factory now uses globally ordered group creation for the full worker group.
+The test additionally requires a fresh group name for every construction.
+
+Job `01790864189951423422-cdb3904d13e8` passes the four-process factory test in
+23.52s. It covers TP2/PP2, replicated heads, inactive ingress, policy disagreement,
+rank-local resource failure, each of the three actor thread-start failures,
+then another successful startup. Every created control group is destroyed only
+after its actors exit, every resource closes, and the HTTP Catalog observes
+reservations only for successful cases. Model binding and CUDA exporter identity
+are simulated in this CPU lifecycle test; it does not run model forwards.
+
+The real Store integration adds a CUDA factory scenario. Four processes share
+the resident H100 and construct real `MHATokenToKVPool` GPU buffers, pinned Host
+arenas and Mooncake clients through the factory. Only target artifact binding
+is substituted with synthetic rank contracts; model forward results remain
+deterministic fixtures. The actual worker callbacks copy GPU KV and raw GPU
+teacher rows, source buffers/logits are overwritten, and the factory owns the
+entire control-group shutdown. Job `01790864190248524997-3335ada5b2c9` passes
+in 46.65s: eleven samples across six scenarios publish, including the two CUDA
+factory samples, while one cancelled sample fails. Every reconstructed tensor
+matches after producer exit; an additional reader validates 32 objects / 4532
+bytes for one sample.
+
+The standalone coordinator lifecycle suite passes three cases in job
+`01790864317023823470-25206fb42e44` (12.03s), including retention of an owned
+control group across failed transport close. This extends factory construction
+and startup/rollback implementation; it is not multi-GPU inference or an RDMA
+result. The CLI TP/PP capability gate remains in place pending real model
+scheduling and numerical validation. Production Catalog, training quality and
+performance acceptance remain open.
+
+Regression job `01790864317342206946-dbda1e5cc113` passed 60 tests and 62
+subtests in 122.38s, with one failing startup version-mismatch case: its injected
+version was hardcoded to 3, which is now valid. The test now injects the current
+version plus one. The complete startup file then passed independently in job
+`01790864571182368511-9423ae3b2ce8` (four tests, 25 subtests, 54.64s). No
+production change followed the successful factory/CUDA integration runs.
+
+All 12 changed/added Python files format and compile. Ten pass Ruff; the
+single-rank coordinator and Store test retain their nine and two baseline
+diagnostics respectively. Final files match the GPU checkout. Complete job
+outcomes, commands, source/log hashes and limits are in
+`experiments/capture-cohort-startup.json`.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1986,13 +2054,11 @@ compliance.
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
-3. Connect P9's implemented identity/resource startup agreement, cohort
-   reservations and background lifecycle, scheduler ticket routing, descriptor
-   and receipt agreement, completed-context writer actors and the cohort request
-   coordinator to the serving factory, dedicated control-group lifecycle and
-   coordinated activation/rollback. Collection and publication now pass the
-   four-rank synthetic-forward/real-Store cases; real global teacher scores and
-   TP/PP model scheduling still need end-to-end validation.
+3. Validate P9's connected distributed factory, coordinator and worker callbacks
+   with real TP/PP model scheduling and global teacher scores, then open the CLI
+   gate for verified configurations. Factory lifecycle now passes four-process
+   fault injection and GPU-buffer/real-Store collection, while target binding
+   and distributed model inference still need end-to-end validation together.
    Complete TP/PP runtime validation, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.

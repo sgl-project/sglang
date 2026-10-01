@@ -81,16 +81,18 @@ class CohortSnapshotWriter:
         self.wake = threading.Event()
         self.jobs: dict[str, _Write] = {}
         self.thread = None
+        self.activation = None
         self.stopping = False
         self.ready = False
         self.error = None
         self.recovery_error = None
         self.counters = Counter()
 
-    def start(self):
+    def start(self, *, activation=None):
         with self.lock:
             if self.thread is not None or self.stopping:
                 raise ContractError("cohort writer cannot be restarted")
+            self.activation = activation
             self.thread = threading.Thread(
                 target=self._run, name="cohort-writer", daemon=True
             )
@@ -275,6 +277,10 @@ class CohortSnapshotWriter:
     def _run(self):
         recovery_at = 0.0
         try:
+            if self.activation is not None:
+                while not self.activation.wait(self.poll_seconds):
+                    if self.stopping:
+                        return
             torch.set_num_threads(1)
             if not self.partition.include_aux:
                 with self.lock:
@@ -316,7 +322,7 @@ class CohortSnapshotWriter:
             self.stopping = True
             thread = self.thread
             self.wake.set()
-        if thread is not None:
+        if thread is not None and thread.ident is not None:
             thread.join(timeout)
         with self.lock:
             stopped = not (thread is not None and thread.is_alive()) and not self.jobs

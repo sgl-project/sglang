@@ -809,8 +809,8 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                         self.assertTrue(writer["stopping"])
                         self.assertEqual(writer["pending"], 0)
                         self.assertIsNone(writer["error"])
-                publications = catalog.wait_publications(9)
-                self.assertEqual(len(catalog.publications), 9)
+                publications = catalog.wait_publications(11)
+                self.assertEqual(len(catalog.publications), 11)
                 for capture_id, state in expected_states.items():
                     self.assertEqual(catalog.captures[capture_id]["state"], state)
                 base, expected = make_snapshot(response_length=4)

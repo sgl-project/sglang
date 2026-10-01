@@ -9,6 +9,7 @@ import time
 from collections import Counter, deque
 from typing import ClassVar
 
+import torch.distributed as dist
 from sglang.srt.training_capture.admission import CaptureAdmission
 from sglang.srt.training_capture.cohort_service import CaptureCohortService
 from sglang.srt.training_capture.cohort_writer import CohortSnapshotWriter
@@ -36,7 +37,8 @@ class CohortCaptureCoordinator(CaptureCoordinator):
     The inference thread exclusively owns collecting contexts. Finalization
     detaches and queues them; the handoff thread gives them to the Store actor.
     The dedicated cohort service owns leases and buffer release on every rank.
-    The caller owns the control group and may destroy it only after close=True.
+    An owned control group is destroyed only after every actor and resource has
+    closed. Otherwise the caller may destroy the group only after close=True.
     """
 
     _retained: ClassVar[set[CohortCaptureCoordinator]] = set()
@@ -50,6 +52,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
         capture_mode="autoregressive",
         metrics=None,
         autostart=True,
+        owns_control_group=False,
     ):
         self.config, self.teacher, self.kv = (
             allocator.config,
@@ -57,6 +60,8 @@ class CohortCaptureCoordinator(CaptureCoordinator):
             allocator.kv,
         )
         self.resources = allocator.resources
+        self.control_group = allocator.group
+        self.owns_control_group = owns_control_group
         self.exporter, self.pool = self.resources.exporter, self.resources.pool
         self.req_to_token = req_to_token
         self.capture_mode, self.enable_overlap = capture_mode, enable_overlap
@@ -69,6 +74,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
         self.writer_actor = CohortSnapshotWriter(self.service)
         self.lock = threading.RLock()
         self.stop = threading.Event()
+        self.activation = threading.Event()
         self.work = queue.Queue(maxsize=self.config.max_inflight_samples)
         self.available = deque()
         self.records = {}
@@ -99,16 +105,18 @@ class CohortCaptureCoordinator(CaptureCoordinator):
         if autostart:
             self.activate()
 
-    def activate(self):
+    def activate(self, *, defer=False):
         if self.started or self.closed or self.stop.is_set():
             raise ContractError("cohort coordinator cannot be restarted")
         self.started = True
         try:
-            self.writer_actor.start()
-            self.service.start()
+            self.writer_actor.start(activation=self.activation)
+            self.service.start(activation=self.activation)
             self.handoff_thread.start()
             if self.metrics_thread is not None:
                 self.metrics_thread.start()
+            if not defer:
+                self.activation.set()
         except Exception:
             self.close()
             raise
@@ -336,6 +344,9 @@ class CohortCaptureCoordinator(CaptureCoordinator):
 
     def _handoff_loop(self):
         try:
+            while not self.activation.wait(0.05):
+                if self.stop.is_set():
+                    return
             while not self.stop.is_set() or not self.work.empty():
                 writer = self.writer_actor.stats()
                 self.service.set_admission_ready(
@@ -385,7 +396,14 @@ class CohortCaptureCoordinator(CaptureCoordinator):
         ):
             self._retained.add(self)
             return False
-        self.resources.close()
+        try:
+            self.resources.close()
+            if self.owns_control_group:
+                dist.destroy_process_group(self.control_group)
+                self.owns_control_group = False
+        except Exception:
+            self._retained.add(self)
+            raise
         self.closed = True
         self._retained.discard(self)
         return True

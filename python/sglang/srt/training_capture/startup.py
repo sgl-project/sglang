@@ -22,7 +22,7 @@ from sglang.srt.training_capture.protocol import (
     digest_bytes,
 )
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_RECORD_BYTES = 1 << 20
 MAX_EXCHANGE_BYTES = 64 << 20
 _PHASES = (
@@ -34,6 +34,8 @@ _PHASES = (
     "resources",
     "resources_ready",
     "cleanup",
+    "activation",
+    "activation_ready",
 )
 
 
@@ -161,6 +163,37 @@ def coordinate_resource_startup(
             raise CaptureStartupError("cleanup") from cleanup_error
         raise
     return resource
+
+
+def coordinate_capture_activation(*, group, coordinator, timeout_seconds=120.0):
+    """Start every local actor behind a gate before admitting capture work.
+
+    The startup group is distinct from the coordinator's control group. No
+    background Catalog/Store operation or control collective starts until both
+    activation votes succeed. Failure closes passive actors on every rank.
+    """
+    channel = _StartupCollectives(group, timeout_seconds)
+    error = None
+    try:
+        coordinator.activate(defer=True)
+    except Exception as cause:  # noqa: BLE001 - peers must roll back together
+        error = cause
+    try:
+        channel.vote("activation", error)
+        channel.vote("activation_ready", None)
+    except CaptureStartupError as failure:
+        cleanup_error = None
+        try:
+            if not coordinator.close():
+                raise ContractError("capture activation retained live resources")
+        except Exception as cause:  # noqa: BLE001 - report incomplete rollback
+            cleanup_error = cause
+        if failure.phase != "transport":
+            channel.vote("cleanup", cleanup_error)
+        elif cleanup_error is not None:
+            raise CaptureStartupError("cleanup") from cleanup_error
+        raise
+    coordinator.activation.set()
 
 
 def coordinate_target_startup(

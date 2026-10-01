@@ -89,7 +89,8 @@ class TestCohortCaptureCoordinator(CustomTestCase):
         for gate in self.gates:
             gate.set()
         self.assertTrue(self.coordinator.close(), self.coordinator.stats())
-        dist.destroy_process_group(self.group)
+        if self.group is not None:
+            dist.destroy_process_group(self.group)
         dist.destroy_process_group()
         self.catalog.close()
         self.directory.cleanup()
@@ -137,6 +138,27 @@ class TestCohortCaptureCoordinator(CustomTestCase):
         )
         self.assertEqual(coordinator.records, {})
         self.assertFalse(self.catalog.publications)
+
+    def test_owned_group_remains_alive_until_transport_close_succeeds(self):
+        coordinator = self.coordinator
+        coordinator.owns_control_group = True
+        with (
+            patch.object(
+                self.resources, "close", side_effect=RuntimeError("transport busy")
+            ),
+            self.assertRaisesRegex(RuntimeError, "transport busy"),
+        ):
+            coordinator.close()
+        self.assertIn(coordinator, coordinator._retained)
+        self.assertFalse(coordinator.closed)
+        self.assertFalse(self.resources.closed)
+        self.assertEqual(dist.get_world_size(self.group), 1)
+        self.assertTrue(coordinator.close())
+        self.assertNotIn(coordinator, coordinator._retained)
+        self.assertTrue(self.resources.closed)
+        with self.assertRaises(ValueError):
+            dist.get_backend(self.group)
+        self.group = None
 
     def test_rejected_handoff_waits_for_copy_before_returning_ownership(self):
         coordinator = self.coordinator

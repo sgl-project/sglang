@@ -107,17 +107,19 @@ class CaptureCohortService:
         self.admission_ready = True
         self.error: Exception | None = None
         self.thread: threading.Thread | None = None
+        self.activation: threading.Event | None = None
         shape = (allocator.config.max_inflight_samples + 1, STATE_COLUMNS)
         if math.prod(shape) * 8 * (allocator.size + 1) > 64 << 20:
             raise ContractError("cohort registry exceeds its control memory budget")
         self.frame = torch.zeros(shape, dtype=torch.int64, device="cpu")
         self.frames = [torch.empty_like(self.frame) for _ in range(allocator.size)]
 
-    def start(self):
+    def start(self, *, activation=None):
         """Call on every rank after collective startup validation succeeds."""
         with self.lock:
             if self.thread is not None or self.stopping:
                 raise ContractError("cohort service cannot be restarted")
+            self.activation = activation
             self.thread = threading.Thread(
                 target=self._run, name="capture-cohorts", daemon=True
             )
@@ -561,6 +563,10 @@ class CaptureCohortService:
 
     def _run(self):
         try:
+            if self.activation is not None:
+                while not self.activation.wait(self.poll_seconds):
+                    if self.stopping:
+                        return
             while not self._cycle():
                 self.wake.wait(self.poll_seconds)
                 self.wake.clear()
@@ -583,7 +589,7 @@ class CaptureCohortService:
             self.stopping = True
             thread = self.thread
             self.wake.set()
-        if thread is not None:
+        if thread is not None and thread.ident is not None:
             thread.join(timeout)
         with self.lock:
             self._retain_if_needed()
