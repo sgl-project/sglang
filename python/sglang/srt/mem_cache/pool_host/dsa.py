@@ -424,13 +424,16 @@ class DSAIndexerPoolHost(HostKVCache):
                     page_size=1,
                 )
             elif self.layout == "page_first_direct":
-                transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=self.packed_device_index_buffers,
-                    dst_ptrs=[self.index_k_with_scale_buffer],
-                    src_indices=device_page_indices,
-                    dst_indices=host_page_indices,
-                    page_size=1,
-                )
+                for chunk_device_indices, chunk_host_indices in self.d2h_issue_chunks(
+                    device_page_indices, host_page_indices, slots_per_page=1
+                ):
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=self.packed_device_index_buffers,
+                        dst_ptrs=[self.index_k_with_scale_buffer],
+                        src_indices=chunk_device_indices,
+                        dst_indices=chunk_host_indices,
+                        page_size=1,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:

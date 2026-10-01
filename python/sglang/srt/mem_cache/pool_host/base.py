@@ -10,6 +10,7 @@ import psutil
 import torch
 
 from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -27,6 +28,9 @@ _is_hip = is_hip()
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+_D2H_ISSUE_CHUNK_PAGES = max(0, envs.SGLANG_HICACHE_D2H_ISSUE_CHUNK_PAGES.get())
+_d2h_issue_chunks_logged = False
 
 
 def ranks_per_host() -> int:
@@ -383,6 +387,35 @@ class HostKVCache(abc.ABC):
             f"{indices.numel()} logical slots with dcp_size={self.dcp_size}."
         )
         return indices[self.dcp_rank :: self.dcp_size] // self.dcp_size
+
+    def d2h_issue_chunks(
+        self,
+        device_indices: torch.Tensor,
+        host_indices: torch.Tensor,
+        *,
+        slots_per_page: int,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """(device, host) index slices of SGLANG_HICACHE_D2H_ISSUE_CHUNK_PAGES pages,
+        in order; one pair holding the inputs themselves when unset or small."""
+        chunk = _D2H_ISSUE_CHUNK_PAGES * slots_per_page
+        num_slots = device_indices.numel()
+        if chunk <= 0 or num_slots <= chunk:
+            return [(device_indices, host_indices)]
+        global _d2h_issue_chunks_logged
+        if not _d2h_issue_chunks_logged:
+            _d2h_issue_chunks_logged = True
+            logger.info(
+                "HiCache D2H issue chunking engaged (SGLANG_HICACHE_D2H_ISSUE_CHUNK_PAGES=%d): "
+                "first split backup is %d pages in %d batches (%s)",
+                _D2H_ISSUE_CHUNK_PAGES,
+                num_slots // slots_per_page,
+                -(-num_slots // chunk),
+                type(self).__name__,
+            )
+        return [
+            (device_indices[start : start + chunk], host_indices[start : start + chunk])
+            for start in range(0, num_slots, chunk)
+        ]
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
