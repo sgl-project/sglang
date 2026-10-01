@@ -1447,14 +1447,10 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
-        if enable_glm_nextn_moe_ptpc(quant_config):
-            layer_id = hf_config.num_hidden_layers
-            if should_apply_glm_nextn_moe_ptpc(quant_config, layer_id) and any(
-                name.startswith(f"model.layers.{layer_id}.")
-                and ".mlp.shared_experts" in name
-                for name in (getattr(quant_config, "exclude_layers", None) or [])
-            ):
-                return "GLM NextN PTPC does not support fused BF16 shared experts."
+        # The PTPC cast only rewrites routed experts, so the shared expert never
+        # matches the FP8 per-channel slot it would be fused into.
+        if should_apply_glm_nextn_moe_ptpc(quant_config, hf_config.num_hidden_layers):
+            return "GLM NextN PTPC does not support shared experts fusion."
         return super().shared_experts_fusion_disable_reason(hf_config, quant_config)
 
     @classmethod

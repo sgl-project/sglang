@@ -78,12 +78,13 @@ class TestEnableGlmNextnMoePtpc(CustomTestCase):
             n_shared_experts=1,
             num_hidden_layers=LAYER,
         )
-        quant_config = _quark_cfg(exclude=[EXPERT_LEAF, SHARED_EXPERT_LEAF])
-        with patch(_PTPC_ENV, return_value=True):
-            reason = GlmMoeDsaForCausalLMNextN.shared_experts_fusion_disable_reason(
-                hf_config, quant_config
-            )
-        self.assertIn("PTPC", reason)
+        # Shared expert BF16 (excluded) or still quantized: neither fits the slot.
+        for exclude in ([EXPERT_LEAF, SHARED_EXPERT_LEAF], [EXPERT_LEAF]):
+            with self.subTest(exclude=exclude), patch(_PTPC_ENV, return_value=True):
+                reason = GlmMoeDsaForCausalLMNextN.shared_experts_fusion_disable_reason(
+                    hf_config, _quark_cfg(exclude=exclude)
+                )
+                self.assertIn("PTPC", reason or "")
 
 
 class TestResolveNextnQuantConfigPtpcOn(CustomTestCase):

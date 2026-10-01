@@ -297,6 +297,7 @@ class TestGlmMoeGate(_FusionGateCase):
             architectures=["GlmMoeDsaForCausalLMNextN"],
             n_routed_experts=256,
             n_shared_experts=1,
+            num_hidden_layers=78,
         )
         self.assertNotIn(
             "does not support",
