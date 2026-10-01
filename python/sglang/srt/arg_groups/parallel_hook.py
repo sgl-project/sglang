@@ -68,6 +68,23 @@ def _boundary_parallelism_overrides(cfg, model_type: str) -> dict:
         raise ValueError(
             "LongCat-Flash does not support --enable-prefill-cp with --attn-cp-size > 1"
         )
+    if (
+        model_type == "glm5_next_text"
+        and cfg.enable_prefill_cp
+        and cfg.attn_cp_size > 1
+    ):
+        # KDA heads/state are partitioned across CP ranks. PD still transfers
+        # state only from CP rank zero, assuming CP-replicated recurrent state.
+        if cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "GLM-5.3-Flash prefill CP does not support PD disaggregation: "
+                "KDA state transfer does not yet support CP head partitions."
+            )
+        if not (cfg.language_only or cfg.language_model_only):
+            raise ValueError(
+                "GLM-5.3-Flash prefill CP currently supports text-only serving; "
+                "add --language-only."
+            )
     if (nemotron or longcat) and cfg.enable_attn_tp_input_scattered:
         # Neither model enters the input-scattered attention scope. Preserve
         # their existing ordinary execution and make the effective flag explicit.

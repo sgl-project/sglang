@@ -78,6 +78,74 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     moe_local_token_count: Optional[torch.Tensor] = None
 
 
+def mixer_parallelism():
+    """A sequence mixer uses CP ranks as head-TP ranks, also during decode."""
+    parallel = get_parallel()
+    over_cp = (
+        parallel.enable_prefill_cp
+        and parallel.attn_cp_size > 1
+        and parallel.cp_strategy == "interleave"
+    )
+    if over_cp:
+        assert parallel.attn_tp_size == 1
+        return parallel.attn_cp_size, parallel.attn_cp_rank, True
+    return parallel.attn_tp_size, parallel.attn_tp_rank, False
+
+
+def is_interleave_extend(forward_batch):
+    return forward_batch.forward_mode.is_context_parallel_extend() and isinstance(
+        forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata
+    )
+
+
+def validate_mixer_batch(forward_batch):
+    # The shared CP runner enters the language model after token embedding;
+    # it does not run the model's multimodal embedding routine.
+    if is_interleave_extend(forward_batch) and forward_batch.contains_mm_inputs():
+        raise ValueError(
+            "Interleave CP with sequence mixers currently supports text-only input."
+        )
+
+
+def mixer_to_sequence_order(hidden_states, forward_batch):
+    """Undo the boundary's rank-major gather before sequence-dependent compute.
+
+    The residual and mHC coefficients do not move: only the already-read mixer
+    input is reordered. Remove physical CP padding before the recurrent kernel.
+    """
+    if not is_interleave_extend(forward_batch):
+        return hidden_states
+    metadata = forward_batch.attn_cp_metadata
+    if metadata.gather_index is not None:
+        return hidden_states.index_select(0, metadata.gather_index)
+    size = get_parallel().attn_cp_size
+    rows = hidden_states.shape[0] // size
+    return (
+        hidden_states.reshape(size, rows, *hidden_states.shape[1:])
+        .transpose(0, 1)
+        .flatten(0, 1)[: metadata.total_seq_lens]
+        .contiguous()
+    )
+
+
+def mixer_to_rank_order(hidden_states, forward_batch, gathered_rows):
+    """Restore the declared output rows, ready for the boundary's CP sum."""
+    if not is_interleave_extend(forward_batch):
+        return hidden_states
+    metadata = forward_batch.attn_cp_metadata
+    padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
+    if metadata.gather_index is not None:
+        return padded.index_copy_(0, metadata.gather_index, hidden_states)
+    padded[: hidden_states.shape[0]] = hidden_states
+    size = get_parallel().attn_cp_size
+    return (
+        padded.reshape(-1, size, *hidden_states.shape[1:])
+        .transpose(0, 1)
+        .flatten(0, 1)
+        .contiguous()
+    )
+
+
 class InterleaveCPStrategy(ContextParallelStrategy):
     name = "interleave"
     kind = ContextParallelStrategyKind.INTERLEAVE

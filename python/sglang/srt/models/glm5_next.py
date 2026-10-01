@@ -395,7 +395,11 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        head_shard_size = get_parallel().attn_tp_size
+        from sglang.srt.layers.cp.interleave import mixer_parallelism
+
+        head_shard_size, head_shard_rank, self.tensor_parallel_over_cp = (
+            mixer_parallelism()
+        )
 
         self.hidden_size = hidden_size
         self.config = config
@@ -526,7 +530,7 @@ class Glm5NextLinearAttention(nn.Module):
 
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+            {"weight_loader": sharded_weight_loader(0, lambda: head_shard_rank)},
         )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
@@ -546,7 +550,7 @@ class Glm5NextLinearAttention(nn.Module):
         )
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(2, parallel_group="attn_tp")},
+            {"weight_loader": sharded_weight_loader(2, lambda: head_shard_rank)},
         )
 
         self.o_norm = FusedRMSNormGated(
@@ -629,6 +633,14 @@ class Glm5NextLinearAttention(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
+        from sglang.srt.layers.cp.interleave import (
+            mixer_to_rank_order,
+            mixer_to_sequence_order,
+        )
+
+        gathered_rows = hidden_states.shape[0]
+        hidden_states = mixer_to_sequence_order(hidden_states, forward_batch)
+
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states, forward_batch
@@ -653,7 +665,9 @@ class Glm5NextLinearAttention(nn.Module):
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
-        return self.o_proj(core_attn_out)[0]
+        return mixer_to_rank_order(
+            self.o_proj(core_attn_out)[0], forward_batch, gathered_rows
+        )
 
 
 class Glm5NextDecoderLayer(nn.Module):
@@ -785,7 +799,12 @@ class Glm5NextDecoderLayer(nn.Module):
             ).residual_ops()
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
-                declare_attn(read=residual.attn_readout, update=residual.attn_update),
+                declare_attn(
+                    read=residual.attn_readout,
+                    update=residual.attn_update,
+                    tensor_parallel_over_cp=self.is_linear_attn
+                    and self.self_attn.tensor_parallel_over_cp,
+                ),
                 self.input_layernorm,
                 {
                     "qkv_latent_func": self.self_attn.prepare_qkv_latent
@@ -939,6 +958,7 @@ class Glm5NextDecoderLayer(nn.Module):
             isinstance(self.mlp, Glm5NextMoE)
             and not self.mlp.experts.moe_runner_config.inplace
             and not torch.compiler.is_compiling()
+            and hidden_states_orig.shape[0] == hidden_states.shape[0]
         ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 
@@ -1507,6 +1527,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    def prepare_forward_batch(self, forward_batch: ForwardBatch):
+        from sglang.srt.layers.cp.interleave import validate_mixer_batch
+
+        validate_mixer_batch(forward_batch)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
