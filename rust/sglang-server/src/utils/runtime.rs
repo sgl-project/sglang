@@ -174,11 +174,22 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         cfg.server_args.revision.as_deref(),
         skip_tokenizer_init,
     )?;
-    // The `TextTokenizer` view of it, for the tokenizer pool. The MM workers
-    // never tokenize: a multimodal text prompt passes through the pool first.
-    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
-        .as_ref()
-        .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
+    // Dynamo fixes add_special_tokens at construction. Load the second encode
+    // mode once for rendered chat prompts, then share both handles across the
+    // pool. Stripping IDs afterward cannot preserve padding/truncation behavior.
+    // The MM workers never tokenize: their text passes through this pool first.
+    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = match &dyn_tokenizer {
+        Some(t) => {
+            let without_specials = tokenizer::load_tokenizer_without_special_tokens(
+                &cfg.server_args.tokenizer_path,
+                cfg.server_args.revision.as_deref(),
+            )?;
+            Some(Arc::new(
+                tokenizer::DynamoTokenizer::with_special_token_modes(t.clone(), without_specials),
+            ))
+        }
+        None => None,
+    };
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -208,7 +219,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Only spawned when a real tokenizer is loaded; under `skip_tokenizer_init`
     // there is none and request never routes to the pool, so we skip it.
     if let Some(tokenizer) = &text_tokenizer {
-        // Reuse the single loaded tokenizer (shared with the detok shards).
+        // Reuse the two loaded encode modes across all workers.
         let tokenizer = tokenizer.clone();
         let tok_cores = plan.as_ref().map(|p| p.tok.clone());
         // Workers share the MPMC inbox (`tok_rx`) and the read-only backend, so
