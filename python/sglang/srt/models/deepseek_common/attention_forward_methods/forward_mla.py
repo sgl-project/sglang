@@ -13,7 +13,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
+from sglang.srt.layers.attention.dsa.utils import is_dsa_bcg_prefill
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
@@ -155,7 +155,7 @@ class DeepseekMLAForwardMixin:
             return False
         # Like the DSA indexer eager region, this fusion is enabled for
         # non-speculative CUDA BCG prefill.
-        if not is_graph_dsa_split_op_surface(forward_batch):
+        if not is_dsa_bcg_prefill(forward_batch):
             return False
         if not self.use_dsa:
             return False

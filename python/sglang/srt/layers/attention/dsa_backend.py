@@ -426,13 +426,9 @@ class DeepseekSparseAttnBackend(
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
             is_in_breakable_cuda_graph,
         )
-        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-            is_in_tc_piecewise_cuda_graph,
-        )
         from sglang.srt.utils import get_device_sm, is_blackwell
 
         self._is_in_breakable_cuda_graph = is_in_breakable_cuda_graph
-        self._is_in_tc_piecewise_cuda_graph = is_in_tc_piecewise_cuda_graph
         self._get_device_sm = get_device_sm
         self._is_blackwell = is_blackwell
 
@@ -3595,12 +3591,11 @@ class DeepseekSparseAttnBackend(
         """
         # Hoisted in __init__ (import cost is per-call otherwise).
         is_in_breakable_cuda_graph = self._is_in_breakable_cuda_graph
-        is_in_tc_piecewise_cuda_graph = self._is_in_tc_piecewise_cuda_graph
         get_device_sm = self._get_device_sm
         is_blackwell = self._is_blackwell
 
         # Decide MHA vs MLA
-        if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+        if is_in_breakable_cuda_graph():
             # Can't branch on seq_lens_cpu in graph replay, force MHA off to
             # guarantee correctness.
             self.use_mha = False

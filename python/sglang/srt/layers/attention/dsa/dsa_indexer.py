@@ -19,23 +19,16 @@ from sglang.kernels.ops.attention.fused_store_index_cache import (
     fused_store_index_k_cache,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
-from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
-from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
-    GRAPH_WEIGHTS_PROJ_LORA_ERROR,
-    _is_in_piecewise_or_breakable_cuda_graph,
-    bcg_dsa_indexer_prefill_split,
-    pcg_dsa_indexer_prefill_split,
-)
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
+    is_dsa_bcg_prefill,
     is_dsa_enable_prefill_cp,
-    is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
 from sglang.srt.layers.attention.mqa_logits_utils import (
@@ -49,11 +42,9 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_static_budget_bytes,
 )
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
     is_in_breakable_cuda_graph,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import (
     get_device,
@@ -144,11 +135,19 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
+GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
+    "DSA indexer weights_proj LoRA is incompatible with "
+    "breakable CUDA graph; remove the explicit "
+    "prefill cuda-graph backend override or drop "
+    "indexer.weights_proj from the LoRA target modules."
+)
+
+
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 if _is_cuda or _is_hip:
-    # Plain-torch graph helpers: usable wherever the split-op surface is.
+    # Head-gate custom ops support torch.compile on CUDA and HIP.
     from sglang.srt.layers.attention.dsa.head_gate import (
         logits_head_gate_graph,
         scale_head_gate_graph,
@@ -162,7 +161,6 @@ if _is_cuda:
     from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
 
     @register_custom_op(mutates_args=["topk_indices"])
-    @register_split_op()
     def broadcast_indexer_topk_from_rank0_(topk_indices: torch.Tensor) -> None:
         _broadcast_indexer_topk_from_rank0_impl(topk_indices)
 
@@ -194,10 +192,7 @@ def _broadcast_indexer_topk_from_rank0(
     if topk_indices is None or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
         return topk_indices
 
-    if is_in_tc_piecewise_cuda_graph():
-        broadcast_indexer_topk_from_rank0_(topk_indices)
-    else:
-        _broadcast_indexer_topk_from_rank0_impl(topk_indices)
+    _broadcast_indexer_topk_from_rank0_impl(topk_indices)
     return topk_indices
 
 
@@ -1627,15 +1622,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
-        in_piecewise_or_breakable_cuda_graph = (
-            _is_in_piecewise_or_breakable_cuda_graph()
-        )
+        in_breakable_cuda_graph = is_in_breakable_cuda_graph()
 
-        # In piecewise/breakable CUDA graph mode, metadata is fetched inside
-        # custom ops via get_tc_piecewise_forward_context() to prevent Dynamo
-        # from guarding on forward_metadata identity, which changes each replay
-        # when init_forward_metadata creates a new ForwardMetadata object.
-        if not in_piecewise_or_breakable_cuda_graph:
+        # Eager replay reads refreshed metadata from the active backend.
+        if not in_breakable_cuda_graph:
             metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
             if metadata is None:
                 return None
@@ -1652,7 +1642,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # Determine if should skip topk based on sequence length
         # We can only skip the logits computation if cuda graph is not involved
         skip_logits_computation = False
-        if not in_piecewise_or_breakable_cuda_graph:
+        if not in_breakable_cuda_graph:
             skip_logits_computation = self._should_skip_logits_computation(
                 forward_batch
             )
@@ -1681,7 +1671,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if (
             self._aiter_fused_fp8_active(forward_batch)
-            and not in_piecewise_or_breakable_cuda_graph
+            and not in_breakable_cuda_graph
             and not weights_proj_lora
         ):
             q_fp8, weights = self._aiter_fused_fp8_prepare_and_store(
@@ -1689,16 +1679,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif (
             self.use_dsa_indexer_fusion
-            and not in_piecewise_or_breakable_cuda_graph
+            and not in_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
         ):
             q_fp8, weights = self._fused_q_prepare_and_store(
                 x, q_lora, positions, forward_batch, layer_id, act_quant
             )
-        elif (
-            is_graph_dsa_split_op_surface(forward_batch)
-            and not self.dsa_enable_prefill_cp
-        ):
+        elif is_dsa_bcg_prefill(forward_batch) and not self.dsa_enable_prefill_cp:
             # Default path for non-CP prefill under PCG/BCG: run the whole indexer
             # (q/k proj, head gate, k-cache store, topk) as a single eager split op
             # instead of capturing it piecemeal in the graph. The split op is
@@ -1716,12 +1703,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_result = torch.empty(
                     (0, self.index_topk), device=x.device, dtype=torch.int32
                 )
-            graph_dispatch_fn = (
-                bcg_dsa_indexer_prefill_split
-                if is_in_breakable_cuda_graph()
-                else pcg_dsa_indexer_prefill_split
-            )
-            graph_dispatch_fn(
+            self._eager_indexer(
+                forward_batch=forward_batch,
                 layer_id=layer_id,
                 x=x,
                 q_lora=q_lora,
@@ -1779,7 +1762,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         act_quant=act_quant,
                     )
                 current_stream.wait_stream(self.alt_stream)
-            elif not in_piecewise_or_breakable_cuda_graph:
+            elif not in_breakable_cuda_graph:
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
@@ -1835,7 +1818,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             else:
                 x_for_gate = x
 
-            if in_piecewise_or_breakable_cuda_graph:
+            if in_breakable_cuda_graph:
                 if self.use_dsa_indexer_fusion:
                     weights = scale_head_gate_graph(
                         weights_raw,
@@ -1865,7 +1848,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # In piecewise/breakable CUDA graph, any access to seq_lens_cpu
             # creates a Dynamo shape guard. These graph modes never have empty
             # batches.
-            if not in_piecewise_or_breakable_cuda_graph:
+            if not in_breakable_cuda_graph:
                 if forward_batch.seq_lens.numel() == 0:
                     # this seems b/c max-pad, no worries?
                     # if x.shape[0] != 0:
@@ -1893,7 +1876,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 # In-graph (PCG/BCG) non-CP prefill is handled earlier by the
                 # graph DSA split-op dispatch, so only the eager path reaches
                 # here.
-                assert not in_piecewise_or_breakable_cuda_graph, (
+                assert not in_breakable_cuda_graph, (
                     "Internal error: in-graph DSA prefill must go through the "
                     "graph DSA split-op dispatch"
                 )
@@ -1909,3 +1892,95 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             raise NotImplementedError("DSA indexer only supports CUDA, HIP, and NPU")
         topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)
+
+    @eager_on_graph
+    def _eager_indexer(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        topk_result: torch.Tensor,
+    ) -> None:
+        # Run projections, head gating, cache storage, and top-k in one eager region.
+        # Mutate the caller's padded output so the next segment keeps a stable address.
+        assert _is_cuda, "Internal error: DSA graph dispatch is only supported on CUDA"
+        from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+
+        extend_num_tokens = forward_batch.extend_num_tokens
+        # Empty buffer encodes return_indices=False for graph dispatch.
+        return_indices = topk_result.numel() != 0
+        k_only = not return_indices or (
+            self._should_skip_logits_computation(forward_batch)
+            and not self.dsa_enable_prefill_cp
+        )
+        if k_only:
+            self._forward_cuda_k_only(
+                x,
+                positions,
+                forward_batch,
+                layer_id,
+                act_quant,
+                metadata=metadata,
+                return_indices=return_indices,
+                num_tokens=extend_num_tokens,
+                topk_result=topk_result,
+            )
+            return
+
+        # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
+        # fused kernels, sliced to the unpadded count, on a single stream.
+        if self.use_dsa_indexer_fusion:
+            q_fp8, weights = self._fused_q_prepare_and_store(
+                x,
+                q_lora,
+                positions,
+                forward_batch,
+                layer_id,
+                act_quant,
+                num_tokens=extend_num_tokens,
+                enable_dual_stream=False,
+            )
+            self._get_topk_ragged(
+                False,
+                forward_batch,
+                layer_id,
+                q_fp8,
+                weights,
+                metadata,
+                topk_result,
+            )
+            return
+
+        query, key, _ = self._get_q_k_bf16(
+            q_lora,
+            x,
+            positions,
+            enable_dual_stream=False,
+            forward_batch=forward_batch,
+        )
+        q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+        # Reuse the compiled head-gate util shared with the eager path.
+        weights = self._get_logits_head_gate(x, q_scale)
+        # Store K cache + ragged top-k, sliced to the unpadded count and writing into
+        # the static padded topk_result buffer (the graph contract). Mirrors the eager
+        # path's store + _get_topk_ragged.
+        self._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key[:extend_num_tokens],
+            act_quant=act_quant,
+            out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
+        )
+        self._get_topk_ragged(
+            False,
+            forward_batch,
+            layer_id,
+            q_fp8[:extend_num_tokens],
+            weights,
+            metadata,
+            topk_result,
+        )

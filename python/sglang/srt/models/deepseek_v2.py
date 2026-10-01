@@ -141,20 +141,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
-    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
@@ -212,7 +203,6 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
     from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
@@ -783,19 +773,22 @@ class DeepseekV2MoE(nn.Module):
 
             fc1_n = self.shared_experts.gate_up_proj.output_size_per_partition
             if (
-                get_platform().is_sm100
-                and isinstance(
-                    self.shared_experts.gate_up_proj.quant_method,
-                    ModelOptFp4LinearMethod,
+                (get_platform().is_sm100)
+                and (
+                    isinstance(
+                        self.shared_experts.gate_up_proj.quant_method,
+                        ModelOptFp4LinearMethod,
+                    )
                 )
-                and self.shared_experts.gate_up_proj.quant_method.quant_mode == "w4a4"
-                and isinstance(
-                    self.shared_experts.down_proj.quant_method,
-                    ModelOptFp4LinearMethod,
+                and (self.shared_experts.gate_up_proj.quant_method.quant_mode == "w4a4")
+                and (
+                    isinstance(
+                        self.shared_experts.down_proj.quant_method,
+                        ModelOptFp4LinearMethod,
+                    )
                 )
-                and fc1_n % 128 == 0
-                and self.shared_experts.swiglu_limit is None
-                and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                and (fc1_n % 128 == 0)
+                and (self.shared_experts.swiglu_limit is None)
             ):
                 self.shared_experts.gate_up_proj._interleave_for_swiglu_fusion = True
                 self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
@@ -897,10 +890,22 @@ class DeepseekV2MoE(nn.Module):
             )
         ]
 
+    def _forward_moe_dual_stream_graph(
+        self, hidden_states, fuse_mlp_allreduce, mlp_reduce_scatter
+    ):
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+            flashinfer_trtllm_bypass=True,
+            lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
+            defer_moe_finalize=False,
+        ):
+            return self.forward_normal_dual_stream(hidden_states)
+
     def _can_dual_stream_graph(self, hidden_states: torch.Tensor) -> bool:
         return (
             _enable_pcg_dsv2_dual_stream
-            and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+            and is_in_breakable_cuda_graph()
             and get_moe_runner_backend().is_flashinfer_trtllm()
             and self.alt_stream is not None
             and self.num_fused_shared_experts == 0
@@ -940,9 +945,8 @@ class DeepseekV2MoE(nn.Module):
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
-                return dsv2_flashinfer_moe_dual_stream_graph(
+                return self._forward_moe_dual_stream_graph(
                     hidden_states,
-                    self.layer_id,
                     fwd.fuse_mlp_allreduce,
                     fwd.mlp_reduce_scatter,
                 )
@@ -1795,10 +1799,6 @@ class DeepseekV2MoE(nn.Module):
             return None
         if not self._moe_quant_once_enabled():
             return None
-        if is_in_tc_piecewise_cuda_graph():
-            # The piecewise MoE op quantizes internally; a pre-quant here
-            # would be dead work.
-            return None
         from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8_row_padded,
         )
@@ -1840,12 +1840,10 @@ class DeepseekV2MoE(nn.Module):
     def _should_quant_routed_input_mxfp8(self, hidden_states: torch.Tensor) -> bool:
         return (
             # Capture-only: graph-pool tensors need no record_stream.
-            torch.cuda.is_current_stream_capturing()
-            # The piecewise TC graph's MoE op drops pre_quant_input.
-            and not is_in_tc_piecewise_cuda_graph()
-            and hidden_states.shape[0] > 0
-            and hidden_states.dtype == torch.bfloat16
-            and self._routed_mxfp8_prequant_static_enabled
+            (torch.cuda.is_current_stream_capturing())
+            and (hidden_states.shape[0] > 0)
+            and (hidden_states.dtype == torch.bfloat16)
+            and (self._routed_mxfp8_prequant_static_enabled)
         )
 
     def op_gate(self, state):
@@ -3095,11 +3093,7 @@ class DeepseekV2Model(nn.Module):
         aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(i)
-            )
+            ctx = get_global_expert_distribution_recorder().with_current_layer(i)
             with ctx:
                 layer = self.layers[i]
                 (hidden_states, topk_indices) = layer(
@@ -3440,33 +3434,6 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
-
-
-@register_custom_op(out_shape="hidden_states")
-def dsv2_flashinfer_moe_dual_stream_graph(
-    hidden_states: torch.Tensor,
-    layer_id: int,
-    fuse_mlp_allreduce: bool,
-    mlp_reduce_scatter: bool,
-) -> torch.Tensor:
-    forward_context = get_tc_piecewise_forward_context()
-    assert forward_context is not None
-    assert forward_context.moe_fusions is not None
-
-    moe_fusion = forward_context.moe_fusions[layer_id]
-    assert moe_fusion is not None
-    # Custom-op execution happens outside the caller's Python scope under
-    # torch.compile. Carry graph-varying control state as scalar operands and
-    # republish it for the nested MoE/linear consumers.
-    with get_forward().scoped(
-        fuse_mlp_allreduce=fuse_mlp_allreduce,
-        mlp_reduce_scatter=mlp_reduce_scatter,
-        flashinfer_trtllm_bypass=True,
-        lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
-        # The op's Tensor schema cannot carry a MoeFinalizeHandoff.
-        defer_moe_finalize=False,
-    ):
-        return moe_fusion.forward_normal_dual_stream(hidden_states)
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]

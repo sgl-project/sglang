@@ -45,9 +45,6 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     _select_local_dcp_heads_for_autotune,
     is_dcp_mla_decode_phase,
@@ -254,27 +251,18 @@ def rocm_absorb_v_bmm(
                 transpose_bm_in=True,
                 dtype=torch.bfloat16,
             )
-        elif not is_in_tc_piecewise_cuda_graph():
-            # Same (batch, heads, dim) layout as the quantized paths above, so the
-            # post-GEMM flatten is a view. Skipped under piecewise: torch dynamo
-            # rejects out= with a non-contiguous output tensor.
-            _bmm_buf = torch.empty(
-                attn_output.shape[0],
-                attn.num_local_heads,
-                attn.w_vc.shape[2],
-                device=attn_output.device,
-                dtype=torch.bfloat16,
-            )
-            torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1),
-                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
-                out=_bmm_buf.transpose(0, 1),
-            )
-        else:
-            attn_bmm_output = torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1),
-                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
-            )
+        _bmm_buf = torch.empty(
+            attn_output.shape[0],
+            attn.num_local_heads,
+            attn.w_vc.shape[2],
+            device=attn_output.device,
+            dtype=torch.bfloat16,
+        )
+        torch.bmm(
+            attn_output.to(torch.bfloat16).transpose(0, 1),
+            _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+            out=_bmm_buf.transpose(0, 1),
+        )
 
     if _bmm_buf is not None:
         # _bmm_buf is already (batch, heads, dim) contiguous

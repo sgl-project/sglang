@@ -5,9 +5,6 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
@@ -106,10 +103,10 @@ def _support_mha_one_shot(attn, forward_batch, backend_name):
 
 
 def _handle_attention_backend(attn, forward_batch, backend_name):
-    # Captured prefill (tc_piecewise or breakable) must keep a single attention
+    # Captured prefill (full or breakable) must keep a single attention
     # path: pin the absorbed MLA method — MHA one-shot/chunked shapes vary with
     # kv-len and cannot be captured.
-    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+    if is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
     # Strategy CP gathers latent KV in the backend's absorbed MLA path;
@@ -169,7 +166,7 @@ def handle_attention_fa4(attn, forward_batch):
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
-    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+    if is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
@@ -191,7 +188,7 @@ def handle_attention_aiter(attn, forward_batch):
     # During PCG/BCG capture on ROCm, aiter fp8 MLA prefill has no capture
     # kernels; route through the MHA path (radix_attention swaps attn_mqa for
     # its attn_mha companion) so capture/replay use valid head/dim metadata.
-    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+    if is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
         if not _support_mha_one_shot(attn, forward_batch, "aiter"):
@@ -237,7 +234,7 @@ def _can_use_triton_dense_fp8_prefill(attn, forward_batch) -> bool:
 
 
 def handle_attention_triton(attn, forward_batch):
-    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+    if is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
     # when deterministic inference is enabled, use MLA
