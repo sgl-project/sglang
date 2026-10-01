@@ -79,6 +79,7 @@ class BaseReasoningFormatDetector:
         reasoning_default: str = "always",
         force_nonempty_content: bool = False,
         tool_start_at_line_start: bool = False,
+        defer_tool_start: bool = False,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
@@ -87,6 +88,12 @@ class BaseReasoningFormatDetector:
         # Only a tool_start_token that begins a line interrupts reasoning, so
         # the model mentioning the tag mid-sentence does not end the block.
         self.tool_start_at_line_start = tool_start_at_line_start
+        # Streaming holds a tool_start_token seen inside reasoning until the
+        # block's outcome is known, as detect_and_parse decides it: a later
+        # think_end_token keeps it as reasoning text, the end of the stream
+        # makes it the start of the tool call.
+        self.defer_tool_start = defer_tool_start
+        self._tool_start_pending = False
         self.force_reasoning = force_reasoning
         self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
@@ -243,6 +250,7 @@ class BaseReasoningFormatDetector:
 
             self._buffer = ""
             self._in_reasoning = False
+            self._tool_start_pending = False
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
@@ -251,11 +259,24 @@ class BaseReasoningFormatDetector:
 
         # Continue with reasoning content
         if self._in_reasoning:
+            if self._tool_start_pending:
+                # Held until think_end_token arrives (handled above) or finish().
+                return StreamingParseResult()
             # Check for tool_start_token interruption. Streaming cannot see a
             # think_end_token that has not arrived yet; see the chunk_dependent test.
             tool_idx = self._find_tool_start(
                 current_text, self._streamed_reasoning_tail
             )
+            if tool_idx != -1 and self.defer_tool_start:
+                self._tool_start_pending = True
+                if not self.stream_reasoning:
+                    # The whole block stays buffered; finish() splits it.
+                    return StreamingParseResult()
+                reasoning_text = current_text[:tool_idx]
+                self._buffer = current_text[tool_idx:]
+                if reasoning_text:
+                    self._streamed_reasoning_tail = reasoning_text[-1]
+                return StreamingParseResult(reasoning_text=reasoning_text)
             if tool_idx != -1:
                 reasoning_text = current_text[:tool_idx]
                 # Preserve tool_start_token in normal text
@@ -334,6 +355,21 @@ class BaseReasoningFormatDetector:
             leftover = self._buffer
             self._buffer = ""
             return StreamingParseResult(normal_text=leftover)
+
+        if self._tool_start_pending:
+            # No think_end_token arrived, so the held tool_start_token ends the
+            # reasoning block, exactly as in detect_and_parse.
+            buffer = self._strip_leading_think_start(self._buffer)
+            tool_idx = self._find_tool_start(buffer, self._streamed_reasoning_tail)
+            if tool_idx == -1:
+                tool_idx = len(buffer)
+            self._buffer = ""
+            self._tool_start_pending = False
+            self._in_reasoning = False
+            self._accumulated_reasoning = ""
+            return StreamingParseResult(
+                normal_text=buffer[tool_idx:], reasoning_text=buffer[:tool_idx]
+            )
 
         # Defensive: subclasses that fill _buffer themselves may not have stripped
         # the opening think token that _parse_streaming_increment_impl removes.
@@ -939,6 +975,9 @@ class Glm45Detector(BaseReasoningFormatDetector):
             force_nonempty_content=force_nonempty_content,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            # GLM reasons about tool markup it has read (code, logs, the
+            # format itself) and writes <tool_call> as text before </think>.
+            defer_tool_start=True,
         )
 
 
