@@ -256,8 +256,9 @@ class BaseRunner(ABC):
             get_parallel().tp_group.pcie_ipc_comm is not None
             and not get_exec().kernel.disable_flashinfer_autotune
         ):
-            # PCIe-IPC tunes in its prepare(); winners tuned before the store
-            # attaches are invisible to serving once it does.
+            # Attach before anything tunes, including PCIe-IPC's prepare(),
+            # which tunes even when the model does not: winners tuned before
+            # the attach land outside the store, and serving never sees them.
             attach_flashinfer_autotune_store(mr)
 
         self._pre_initialize_flashinfer_allreduce_workspace()

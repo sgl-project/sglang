@@ -16,9 +16,11 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime
+import errno
 import fcntl
 import functools
 import hashlib
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -139,21 +141,24 @@ def should_run_flashinfer_autotune(
 def flashinfer_autotune_store_root(model_runner: ModelRunner) -> Path:
     """This rank's FlashInfer managed autotune store root.
 
-    FlashInfer namespaces the store below the root by its own environment
-    identity (library versions, GPU), so the root carries only what that
-    identity does not. Per rank: a store shared across ranks would let one rank
-    read a winner another published mid-tuning, so ranks of one TP group could
-    split on a hit.
+    FlashInfer namespaces the store below the root by its environment identity
+    (library versions, GPU) and keys each entry by op, runner and shape bucket
+    plus whatever extras the runner adds, so the root separates deployments.
+    It is resolved once per process, from the runner that attaches first.
+    Per rank: a store shared across ranks would let one rank read a winner
+    another published mid-tuning, so ranks of one TP group could split on a hit.
     """
     mr = model_runner
     model_key_parts = [
         str(get_model().model_path),
+        str(mr.dtype),
         str(get_model().quantization),
         str(get_exec().moe.moe_runner_backend),
         str(get_parallel().tp_size),
         str(get_parallel().pp_size),
         str(get_parallel().attn_dp_size),
         str(get_parallel().moe_ep_size),
+        str(mr.model_config.hf_config.__class__.__name__),
     ]
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
@@ -217,102 +222,158 @@ _attached_store: Optional[_AutotuneStore] = None
 
 
 def _lock_autotune_store(root: Path) -> Optional[IO[bytes]]:
-    """Hold ``root`` exclusively, or return None if another process holds it.
+    """Hold ``root`` exclusively, or return None (with the reason logged).
 
-    FlashInfer reads store entries lazily, so a second server publishing into
+    FlashInfer snapshots the store when it attaches but reads a key published
+    after that from disk on first lookup, so a second server publishing into
     the same root while this one tunes could split a TP group's ranks on a hit.
     """
     try:
         root.mkdir(parents=True, exist_ok=True)
         lock = open(root / ".lock", "ab")
-    except OSError:
+    except OSError as e:
+        logger.warning(
+            "FlashInfer autotune: cannot create the store lock under %s (%s).", root, e
+        )
         return None
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as e:
         lock.close()
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            reason = "another process holds it"
+        else:
+            reason = f"flock is not supported here: {e}"
+        logger.warning("FlashInfer autotune: cannot lock store %s (%s).", root, reason)
         return None
     return lock
 
 
 def _autotune_store_digest(root: Path) -> str:
-    """Hash of every entry this rank could hit under ``root``.
+    """Hash of every entry under ``root``, across all environment namespaces.
 
-    Covers every environment namespace below the root rather than recomputing
-    FlashInfer's environment hash: a rank in a different environment reads a
-    different namespace, and stale namespaces only cost a spurious wipe.
+    Covers every namespace rather than recomputing FlashInfer's environment
+    hash: a rank in a different environment reads a different namespace, and
+    stale namespaces only cost a spurious wipe. An unreadable entry counts by
+    name, so a peer without it disagrees rather than being silently matched.
     """
     digest = hashlib.sha256()
     for entry in sorted(root.glob("**/entries/*.json")):
-        try:
-            data = entry.read_bytes()
-        except OSError:
-            continue  # unreadable is a miss on this rank either way
         digest.update(str(entry.relative_to(root)).encode() + b"\0")
-        digest.update(hashlib.sha256(data).digest())
+        try:
+            digest.update(hashlib.sha256(entry.read_bytes()).digest())
+        except OSError as e:
+            logger.warning("FlashInfer autotune: cannot read %s (%s).", entry, e)
+            digest.update(b"unreadable")
     return digest.hexdigest()
 
 
-def _wipe_autotune_store(root: Path) -> None:
-    for child in root.iterdir():
+def _wipe_autotune_store(root: Path) -> bool:
+    """Delete every entry under ``root`` except the lock; return whether it worked."""
+    try:
+        children = list(root.iterdir())
+    except OSError as e:
+        logger.warning("FlashInfer autotune: cannot list %s (%s).", root, e)
+        return False
+    for child in children:
         if child.name == ".lock":
             continue
-        if child.is_dir():
-            shutil.rmtree(child, ignore_errors=True)
-        else:
-            child.unlink(missing_ok=True)
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("FlashInfer autotune: cannot remove %s (%s).", child, e)
+    left = list(root.glob("**/entries/*.json"))
+    if left:
+        logger.warning(
+            "FlashInfer autotune: %d entries survived wiping %s.", len(left), root
+        )
+    return not left
 
 
 def _agree_on_autotune_store(
-    root: Path, locked: bool, group: Optional[torch.distributed.ProcessGroup]
+    root: Path,
+    locked: bool,
+    group: Optional[torch.distributed.ProcessGroup],
+    env: dict[str, str],
 ) -> bool:
     """Enter tuning with the same store on every rank, or with none at all.
 
     A store hit skips a profile, so stores that disagree desync the reduction:
-    diverged stores are wiped on every rank. A rank that could not lock its
-    store cannot vouch for its contents, so then no rank uses a store.
+    diverged stores are wiped on every rank. The environment is compared too:
+    it picks the namespace a rank reads, so equal stores alone do not mean two
+    ranks hit the same entries. A rank that could not lock, read
+    or wipe its store cannot vouch for its contents, so then no rank uses one.
+    Every branch is decided on gathered values, so all ranks take the same one.
     Returns whether this rank tunes into its on-disk store.
     """
     if group is None:
         return locked
-    mine = (locked, _autotune_store_digest(root) if locked else "")
-    gathered: list = [None] * torch.distributed.get_world_size(group)
-    torch.distributed.all_gather_object(gathered, mine, group=group)
+    digest = ""
+    if locked:
+        try:
+            digest = hashlib.sha256(
+                json.dumps(env, sort_keys=True).encode()
+                + _autotune_store_digest(root).encode()
+            ).hexdigest()
+        except OSError as e:
+            logger.warning("FlashInfer autotune: cannot scan %s (%s).", root, e)
+            locked = False
+    world_size = torch.distributed.get_world_size(group)
+    gathered: list = [None] * world_size
+    torch.distributed.all_gather_object(gathered, (locked, digest), group=group)
     if not all(rank_locked for rank_locked, _ in gathered):
         log_info_on_rank0(
             logger,
-            "FlashInfer autotune: another process holds a rank's autotune store; "
-            "tuning in memory only on every rank.",
+            "FlashInfer autotune: a rank could not lock its autotune store (see "
+            "that rank's warning); tuning in memory only on every rank.",
         )
         return False
-    if len({digest for _, digest in gathered}) > 1:
+    if len({rank_digest for _, rank_digest in gathered}) == 1:
+        return True
+    log_info_on_rank0(
+        logger,
+        "FlashInfer autotune: per-rank stores disagree, discarding them and "
+        "tuning from scratch so all ranks agree on the tactics.",
+    )
+    wiped: list = [None] * world_size
+    torch.distributed.all_gather_object(wiped, _wipe_autotune_store(root), group=group)
+    if not all(wiped):
         log_info_on_rank0(
             logger,
-            "FlashInfer autotune: per-rank stores disagree, discarding them and "
-            "tuning from scratch so all ranks agree on the tactics.",
+            "FlashInfer autotune: a rank could not empty its autotune store (see "
+            "that rank's warning); tuning in memory only on every rank.",
         )
-        _wipe_autotune_store(root)
+        return False
     return True
 
 
 def attach_flashinfer_autotune_store(model_runner: ModelRunner) -> _AutotuneStore:
     """Attach this rank's managed autotune store, once per process.
 
-    ``autotune_v2`` attaches its store for the whole process (last attach wins)
-    and serving then reads only that store's winners, so every tuning pass in
-    the process -- target, extend, draft, and the PCIe-IPC all-reduce -- must
-    tune into one store attached before the first of them runs.
+    ``autotune_v2`` attaches its store for the whole process (last attach wins),
+    and serving then reads tuned winners from that store's partition, not ones
+    tuned in memory under another store or before the attach. So every tuning
+    pass in the process -- target, extend, draft, and the PCIe-IPC all-reduce
+    -- must tune into one store attached before the first of them runs. The
+    gate runs before the attach: attaching loads the store into memory, after
+    which a wipe would no longer reach what the rank serves.
     """
     global _attached_store
     if _attached_store is not None:
         return _attached_store
     from flashinfer import autotune_v2
+    from flashinfer.autotuner import _collect_metadata
 
     root = flashinfer_autotune_store_root(model_runner)
     lock = _lock_autotune_store(root)
     sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
-    if _agree_on_autotune_store(root, lock is not None, sync_group):
-        # Attach and hydrate only; tuning happens in flashinfer_autotune_context.
+    # The environment autotune_v2 namespaces the store by.
+    env = _collect_metadata()
+    if _agree_on_autotune_store(root, lock is not None, sync_group, env):
+        # Attach and load only; tuning happens in flashinfer_autotune_context.
         with autotune_v2(mode="replay", cache_root=root):
             pass
         _attached_store = _AutotuneStore(root, lock)
@@ -418,8 +479,8 @@ def maybe_flashinfer_autotune_extend(
     prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
     wants_prefill_autotune = getattr(mr.model, "wants_prefill_autotune", None)
     if wants_prefill_autotune is not None and not wants_prefill_autotune():
-        # Entering the autotune context attaches the tactic store and syncs
-        # ranks, so a model that has nothing to tune must decline before it.
+        # A model that declines has nothing to tune at the prefill ceiling, so
+        # it skips the autotune context and its timing-reduction setup entirely.
         prefill_autotune = None
     if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
         with flashinfer_autotune_context(mr, run_lm_head=False):

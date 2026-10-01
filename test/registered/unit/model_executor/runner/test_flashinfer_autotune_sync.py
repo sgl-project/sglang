@@ -3,8 +3,8 @@
 Without a cross-rank reduction each rank's ``argmin`` follows local timing noise
 (measured: 20/20 tuned MoE shapes diverged across 4 ranks on gpt-oss-120b). The
 reduction holds only if ranks also enter tuning with the same store, so these
-cover that gate, the digest it decides on, and the lock that keeps another
-process from changing a store mid-tuning.
+cover that gate and what it decides on, the lock that keeps a second server out
+of a store this one is tuning into, and the once-per-process attach.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -12,6 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 register_cpu_ci(est_time=57, suite="base-a-test-cpu")
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
+import datetime
 import multiprocessing
 import os
 import tempfile
@@ -37,6 +38,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
 ENTRY = "v2/0123456789abcdef/entries/{}.json"
+ENV = {"flashinfer_version": "0.7.0", "gpu": "NVIDIA B300"}
 
 
 def _write_entry(root: Path, name: str, body: str) -> Path:
@@ -46,7 +48,7 @@ def _write_entry(root: Path, name: str, body: str) -> Path:
     return path
 
 
-def _gate_worker(rank, world_size, master_port, root, locked, writer):
+def _gate_worker(rank, world_size, master_port, root, locked, wipe_ok, env, writer):
     """Run the entry gate on one rank; report its decision and surviving entries."""
     try:
         os.environ.update(
@@ -55,8 +57,16 @@ def _gate_worker(rank, world_size, master_port, root, locked, writer):
             MASTER_ADDR="localhost",
             MASTER_PORT=str(master_port),
         )
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
-        use_store = _agree_on_autotune_store(Path(root), locked, dist.group.WORLD)
+        # A rank that skips a collective must fail the test, not hang it.
+        dist.init_process_group(
+            "gloo",
+            rank=rank,
+            world_size=world_size,
+            timeout=datetime.timedelta(seconds=60),
+        )
+        if not wipe_ok:
+            autotune._wipe_autotune_store = lambda root: False
+        use_store = _agree_on_autotune_store(Path(root), locked, dist.group.WORLD, env)
         entries = sorted(p.name for p in Path(root).glob("**/entries/*.json"))
         writer.send(("ok", (use_store, entries)))
     except Exception as e:  # noqa: BLE001
@@ -85,7 +95,7 @@ class TestAutotuneStoreDigest(CustomTestCase):
             root.mkdir()
 
     def test_same_entries_digest_alike_across_roots(self):
-        # Ranks keep separate roots; only what they would hit may differ.
+        # Each rank has its own root, so the digest depends only on paths below it.
         for root in (self.rank0, self.rank1):
             _write_entry(root, "a", '{"tactic": 7}')
         self.assertEqual(
@@ -157,12 +167,12 @@ class TestAgreeOnAutotuneStore(CustomTestCase):
         self.dir = Path(self.tmp.name)
 
     def _run_gate(self, per_rank) -> list:
-        """per_rank: (entries {name: body}, locked) for each rank."""
+        """per_rank: (entries {name: body}, locked[, wipe_ok[, env]]) per rank."""
         world_size = len(per_rank)
         port = find_available_port(23456)
         ctx = multiprocessing.get_context("spawn")
         procs, readers = [], []
-        for rank, (entries, locked) in enumerate(per_rank):
+        for rank, (entries, locked, *extra) in enumerate(per_rank):
             root = self.dir / f"rank{rank}"
             root.mkdir()
             (root / ".lock").write_text("")
@@ -171,13 +181,25 @@ class TestAgreeOnAutotuneStore(CustomTestCase):
             reader, writer = ctx.Pipe(duplex=False)
             proc = ctx.Process(
                 target=_gate_worker,
-                args=(rank, world_size, port, str(root), locked, writer),
+                args=(
+                    rank,
+                    world_size,
+                    port,
+                    str(root),
+                    locked,
+                    extra[0] if extra else True,
+                    extra[1] if len(extra) > 1 else ENV,
+                    writer,
+                ),
             )
             proc.start()
             writer.close()
             procs.append(proc)
             readers.append(reader)
-        results = [r.recv() for r in readers]
+        results = []
+        for reader in readers:
+            self.assertTrue(reader.poll(180), msg="gate worker hung")
+            results.append(reader.recv())
         for proc in procs:
             proc.join(timeout=120)
         for status, value in results:
@@ -202,13 +224,105 @@ class TestAgreeOnAutotuneStore(CustomTestCase):
         )
 
     def test_an_unlocked_rank_keeps_every_rank_off_disk(self):
-        # The unlocked rank's store may change mid-tuning, so no rank may trust
-        # its own, and nothing is wiped on another process's behalf.
+        # The unlocked rank cannot vouch for its store; if the others still used
+        # theirs they would hit where it profiles. Nothing is wiped on another
+        # process's behalf.
         entries = {"a": '{"tactic": 7}'}
         self.assertEqual(
             self._run_gate([(entries, True), (entries, False)]),
             [(False, ["a.json"]), (False, ["a.json"])],
         )
+
+    def test_a_drifted_environment_is_wiped_like_diverged_stores(self):
+        # Same entries, but one rank reads another environment's namespace.
+        entries = {"a": '{"tactic": 7}'}
+        self.assertEqual(
+            self._run_gate(
+                [(entries, True), (entries, True, True, {**ENV, "gpu": "B200"})]
+            ),
+            [(True, []), (True, [])],
+        )
+
+    def test_a_failed_wipe_keeps_every_rank_off_disk(self):
+        # A rank whose diverged entries survived the wipe would still hit them.
+        self.assertEqual(
+            self._run_gate([({"a": '{"tactic": 7}'}, True, False), ({}, True)]),
+            [(False, ["a.json"]), (False, [])],
+        )
+
+
+class TestWipeAutotuneStore(CustomTestCase):
+    def test_wipe_keeps_the_lock_and_reports_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".lock").write_text("")
+            _write_entry(root, "a", "{}")
+            self.assertTrue(autotune._wipe_autotune_store(root))
+            self.assertEqual([p.name for p in root.iterdir()], [".lock"])
+
+    def test_a_surviving_entry_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_entry(root, "a", "{}")
+            with patch.object(autotune.shutil, "rmtree", side_effect=OSError("busy")):
+                self.assertFalse(autotune._wipe_autotune_store(root))
+
+
+class TestAutotuneStoreRoot(CustomTestCase):
+    """The root is per rank and per deployment; reuse-off gets a fresh one."""
+
+    def _root(self, *, tp_rank=0, dtype=torch.bfloat16, skip=(), reuse=True):
+        mr = SimpleNamespace(
+            dtype=dtype,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+        parallel = SimpleNamespace(
+            tp_size=2,
+            pp_size=1,
+            attn_dp_size=1,
+            moe_ep_size=1,
+            tp_rank=tp_rank,
+            pp_rank=0,
+            dp_rank=None,
+        )
+        with (
+            patch.object(
+                autotune,
+                "get_model",
+                return_value=SimpleNamespace(model_path="m", quantization=None),
+            ),
+            patch.object(
+                autotune,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(moe_runner_backend="flashinfer_mxfp4")
+                ),
+            ),
+            patch.object(autotune, "get_parallel", return_value=parallel),
+            patch.object(
+                autotune, "get_flashinfer_autotune_skip_ops", return_value=set(skip)
+            ),
+            autotune.envs.SGLANG_CACHE_DIR.override("/cache"),
+            autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(reuse),
+        ):
+            return autotune.flashinfer_autotune_store_root(mr)
+
+    def test_each_rank_gets_its_own_root(self):
+        # A shared root would fail every rank but one on the lock.
+        self.assertNotEqual(self._root(tp_rank=0), self._root(tp_rank=1))
+        self.assertEqual(self._root(tp_rank=1).name, "rank_tp1_pp0_dp0")
+
+    def test_deployment_fields_separate_stores(self):
+        base = self._root()
+        self.assertNotEqual(base.parent, self._root(dtype=torch.float16).parent)
+        self.assertNotEqual(base.parent, self._root(skip=("fp4_gemm",)).parent)
+
+    def test_disabled_reuse_tunes_into_a_fresh_store(self):
+        reused = self._root()
+        fresh = self._root(reuse=False)
+        self.assertNotEqual(reused, fresh)
+        self.assertIn("runs", fresh.parts)
+        self.assertEqual(reused, self._root())
 
 
 class TestModelPrefillAutotune(CustomTestCase):
@@ -347,6 +461,41 @@ class TestAutotuneStoreAttach(CustomTestCase):
                     self.assertEqual(self.tuner._active_managed_store.root, target)
             self.assertEqual(store_root.call_count, 1)
         self.assertEqual(self.tuner._managed_cache.root, target)
+
+    def test_attach_alone_roots_the_process_store_and_holds_it(self):
+        # Warmup attaches before PCIe-IPC tunes, outside any tuning context.
+        root = self.dir / "early"
+        with patch.object(
+            autotune, "flashinfer_autotune_store_root", return_value=root
+        ):
+            autotune.attach_flashinfer_autotune_store(self.runner)
+        self.assertEqual(self.tuner._managed_cache.root, root)
+        # Held for the process lifetime, not just while attaching.
+        self.assertIsNone(_lock_autotune_store(root))
+
+    def test_a_wipe_reaches_what_the_rank_serves(self):
+        # Attaching loads the store into memory, so the gate must run first.
+        from flashinfer.autotune_cache import ManagedAutotuneCache
+        from flashinfer.autotuner import _collect_metadata
+
+        root = self.dir / "wiped"
+        fields = ("sglang::test_op", "TestRunner")
+        ManagedAutotuneCache(_collect_metadata(), root=root).publish(
+            str(fields), "TestRunner", 7, key_fields=fields
+        )
+
+        def wipe_and_agree(root, locked, group, env):
+            autotune._wipe_autotune_store(root)
+            return True
+
+        with (
+            patch.object(autotune, "flashinfer_autotune_store_root", return_value=root),
+            patch.object(
+                autotune, "_agree_on_autotune_store", side_effect=wipe_and_agree
+            ),
+        ):
+            autotune.attach_flashinfer_autotune_store(self.runner)
+        self.assertIsNone(self.tuner._managed_cache.lookup(str(fields)))
 
     def test_a_store_held_elsewhere_tunes_in_memory(self):
         root = self.dir / "held"
