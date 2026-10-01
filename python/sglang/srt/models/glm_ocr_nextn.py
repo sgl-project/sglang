@@ -137,7 +137,6 @@ class GlmOcrForConditionalGenerationNextN(GlmOcrForConditionalGeneration):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         _, rope_scaling = get_rope_config(config)
         self.is_mrope_enabled = "mrope_section" in (rope_scaling or {})

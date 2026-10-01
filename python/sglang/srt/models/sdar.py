@@ -46,7 +46,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_cuda, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, make_pp_layers
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -99,7 +99,6 @@ class SDARAttention(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
-        self.tp_size = get_parallel().tp_size
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
@@ -358,7 +357,7 @@ class SDARModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: SDARBlock(
                 layer_id=idx,
@@ -367,8 +366,6 @@ class SDARModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:

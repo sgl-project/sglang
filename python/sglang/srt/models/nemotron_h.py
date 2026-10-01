@@ -84,7 +84,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
@@ -174,7 +174,6 @@ class NemotronHMoE(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
 
@@ -702,11 +701,9 @@ class NemotronHModel(nn.Module):
             layer_class = ALL_DECODER_LAYER_TYPES[config.hybrid_override_pattern[idx]]
             return layer_class(config, idx, quant_config=quant_config, prefix=prefix)
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             len(config.hybrid_override_pattern),
             get_layer,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
         if self.pp_group.is_last_rank:
