@@ -11,7 +11,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
-from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
@@ -24,7 +23,6 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -38,16 +36,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
+    is_in_full_prefill_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
-    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
@@ -62,7 +57,6 @@ from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
 from sglang.srt.utils import BumpAllocator
-from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -159,9 +153,8 @@ class DeepseekMLAForwardMixin:
     ) -> bool:
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             return False
-        # Shared activation surface with the DSA indexer graph dispatch
-        # (in piecewise/breakable graph + non-speculative extend). Like the indexer
-        # dispatch, this fusion is on by default on that surface.
+        # Like the DSA indexer eager region, this fusion is enabled for
+        # non-speculative CUDA BCG prefill.
         if not is_graph_dsa_split_op_surface(forward_batch):
             return False
         if not self.use_dsa:
@@ -253,11 +246,7 @@ class DeepseekMLAForwardMixin:
             return None
         # Graph/compile surfaces run their own dispatch; the python-side
         # stash handshake is eager-only.
-        if is_graph_dsa_split_op_surface(forward_batch):
-            return None
-        if get_tc_piecewise_forward_context() is not None:
-            return None
-        if is_in_breakable_cuda_graph():
+        if is_in_breakable_cuda_graph() or is_in_full_prefill_graph():
             return None
         if get_is_capture_mode():
             return None
@@ -697,12 +686,7 @@ class DeepseekMLAForwardMixin:
                     llama_4_scaling=llama_4_scaling,
                 )
             if fusion_plan is not None:
-                bmm_attention_fn = (
-                    bcg_mla_bmm_then_unified_attention
-                    if is_in_breakable_cuda_graph()
-                    else mla_bmm_then_unified_attention
-                )
-                bmm_attention_fn(
+                self._eager_bmm_attention(
                     fusion_plan.q_nope_t,
                     self.w_kc,
                     fusion_plan.q_nope_out_buf,
@@ -710,7 +694,7 @@ class DeepseekMLAForwardMixin:
                     k_nope,
                     fusion_plan.attn_output_buf,
                     save_kv_cache,
-                    self.layer_id,
+                    forward_batch,
                     q_pe,
                     k_pe,
                     cos_sin_cache=extra_args.get("cos_sin_cache"),
@@ -882,26 +866,18 @@ class DeepseekMLAForwardMixin:
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
-            if is_in_tc_piecewise_cuda_graph():
-                # torch dynamo requires out= op was called where output tensor was non-contiguous
-                attn_bmm_output = (
-                    torch.bmm(attn_output.transpose(0, 1), self.w_vc)
-                    .transpose(0, 1)
-                    .flatten(1, 2)
-                )
-            else:
-                attn_bmm_output = torch.empty(
-                    (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
-                    dtype=attn_output.dtype,
-                    device=attn_output.device,
-                )
-                torch.bmm(
-                    attn_output.transpose(0, 1),
-                    self.w_vc,
-                    out=attn_bmm_output.view(
-                        -1, self.num_local_heads, self.v_head_dim
-                    ).transpose(0, 1),
-                )
+            attn_bmm_output = torch.empty(
+                (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+            torch.bmm(
+                attn_output.transpose(0, 1),
+                self.w_vc,
+                out=attn_bmm_output.view(
+                    -1, self.num_local_heads, self.v_head_dim
+                ).transpose(0, 1),
+            )
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_v_apply,
@@ -954,53 +930,37 @@ class DeepseekMLAForwardMixin:
             and get_attn_backend().data_type == torch.float8_e4m3fn
         )
 
-
-# Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`
-# into one eager split op under both PCG and BCG. Without this, the bf16
-# fallback BMM is captured alone in its own single-kernel CUDA graph submodule,
-# paying per-submodule host overhead with no fusion benefit.
-#
-# `q_nope_out_view` aliases `q_nope_out_buf` (transposed). The op writes
-# `q_nope_out_buf` via `torch.bmm(..., out=...)` and then reads through
-# `q_nope_out_view`, so the alias's storage is mutated too. Declare it in
-# `mutates_args` to keep the schema honest.
-@register_custom_op(
-    mutates_args=["q_nope_out_buf", "q_nope_out_view", "attn_output_buf"]
-)
-@register_split_op()
-def mla_bmm_then_unified_attention(
-    q_nope_t: torch.Tensor,
-    w_kc: torch.Tensor,
-    q_nope_out_buf: torch.Tensor,
-    q_nope_out_view: torch.Tensor,
-    k_nope: torch.Tensor,
-    attn_output_buf: torch.Tensor,
-    save_kv_cache: bool,
-    layer_id: int,
-    q_pe: torch.Tensor,
-    k_pe: torch.Tensor,
-    cos_sin_cache: Optional[torch.Tensor] = None,
-    is_neox: Optional[bool] = None,
-    llama_4_scaling: Optional[torch.Tensor] = None,
-    topk_indices: Optional[torch.Tensor] = None,
-) -> None:
-    torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
-    unified_attention_with_output(
-        q_nope_out_view,
-        k_nope,
-        k_nope,
-        attn_output_buf,
-        save_kv_cache,
-        layer_id,
-        q_rope=q_pe,
-        k_rope=k_pe,
-        cos_sin_cache=cos_sin_cache,
-        is_neox=is_neox,
-        llama_4_scaling=llama_4_scaling,
-        topk_indices=topk_indices,
-    )
-
-
-bcg_mla_bmm_then_unified_attention = eager_on_graph(True)(
-    mla_bmm_then_unified_attention
-)
+    @eager_on_graph
+    def _eager_bmm_attention(
+        self,
+        q_nope_t: torch.Tensor,
+        w_kc: torch.Tensor,
+        q_nope_out_buf: torch.Tensor,
+        q_nope_out_view: torch.Tensor,
+        k_nope: torch.Tensor,
+        attn_output_buf: torch.Tensor,
+        save_kv_cache: bool,
+        forward_batch: ForwardBatch,
+        q_pe: torch.Tensor,
+        k_pe: torch.Tensor,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
+        self.attn_mqa._eager_attention.__wrapped__(
+            self.attn_mqa,
+            q_nope_out_view,
+            k_nope,
+            k_nope,
+            attn_output_buf,
+            forward_batch,
+            save_kv_cache,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=is_neox,
+            llama_4_scaling=llama_4_scaling,
+            topk_indices=topk_indices,
+        )

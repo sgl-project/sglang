@@ -7,6 +7,9 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_cuda
 
@@ -710,10 +713,9 @@ def scattered_ar_sconv_fusable(
     if not (fm.is_extend() or fm.is_decode()):
         return False
     # Prefill scope: the BCG runner's eager-break sites are not wired (its
-    # baked flags would disagree with the break bodies) and tc_piecewise's
-    # FX pieces can't carry the cross-layer producer/consumer contract, so
-    # both fall back to the unfused chain. The FULL prefill CUDA-graph
-    # backend (context.full_graph -- the whole model captured uniformly) IS
+    # baked flags would disagree with the break bodies), so it falls back
+    # to the unfused chain. The FULL prefill CUDA-graph
+    # backend (the whole model captured uniformly) IS
     # supported: the kernel is capture-safe (barrier epochs advance across
     # replays; validated capture+replay) and all its metadata (qsl/si/
     # cache_mask/safe_idx/track rows) is recomputed in-graph from the
@@ -721,12 +723,8 @@ def scattered_ar_sconv_fusable(
     # rows only write pad rows of the OUT region (the eager tail slices
     # [:raw]), and sentinel request slots have qlen == 0 so the in-kernel
     # cache update/track skip them.
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-        get_tc_piecewise_forward_context,
-    )
 
-    tc_ctx = get_tc_piecewise_forward_context()
-    if tc_ctx is not None and not tc_ctx.full_graph:
+    if is_in_breakable_cuda_graph() and fm.is_extend_without_speculative():
         return False
     comm = group.torch_symm_mem_comm
     if (
@@ -1050,15 +1048,11 @@ def fullwidth_ar_sconv_fusable(
         return False
     if num_tokens < _INKLING_AR_FW_MIN_TOKENS:
         return False
-    # Same prefill-runner scope as the scattered gate: BCG / tc_piecewise
+    # Same prefill-runner scope as the scattered gate: BCG
     # pieces can't carry the cross-layer producer contract; the FULL prefill
     # CUDA-graph backend is supported (capture-safe kernel, in-graph metadata).
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-        get_tc_piecewise_forward_context,
-    )
 
-    tc_ctx = get_tc_piecewise_forward_context()
-    if tc_ctx is not None and not tc_ctx.full_graph:
+    if is_in_breakable_cuda_graph():
         return False
     comm = group.torch_symm_mem_comm
     if (

@@ -40,19 +40,17 @@ from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
-from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    is_in_full_prefill_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
-)
-from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -392,7 +390,7 @@ class HPCOpsAttnBackend(AttentionBackend):
         head_dim]. The subsequent ``self.attn(...)`` call must pass
         ``save_kv_cache=False`` (K/V are already written here).
 
-        Under a captured prefill graph (breakable / tc_piecewise) this routes
+        Under a captured prefill graph (breakable / full) this routes
         through a graph-splitting op — like attention itself — so the Python
         Q-scale hand-off between this op and attention stays alive at replay.
 
@@ -409,29 +407,23 @@ class HPCOpsAttnBackend(AttentionBackend):
             device=qkv.device,
         )
 
-        if is_extend and get_tc_piecewise_forward_context() is not None:
-            # Captured prefill graph: run through the splitting op (eager at
-            # capture AND at replay, keeping the metadata hand-off alive).
-            if is_in_breakable_cuda_graph():
-                breakable_hpc_ops_fp8_rope_store_kv(
-                    qkv,
-                    cos_sin_cache,
-                    out_q,
-                    layer.layer_id,
-                    qk_norm_policy,
-                    q_norm_weight=q_norm_weight,
-                    k_norm_weight=k_norm_weight,
-                )
-            else:
-                hpc_ops_fp8_rope_store_kv(
-                    qkv,
-                    cos_sin_cache,
-                    out_q,
-                    layer.layer_id,
-                    qk_norm_policy,
-                    q_norm_weight=q_norm_weight,
-                    k_norm_weight=k_norm_weight,
-                )
+        if is_extend and (
+            is_in_full_prefill_graph()
+            or (
+                is_in_breakable_cuda_graph()
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
+        ):
+            self._eager_rope_store_kv(
+                qkv,
+                cos_sin_cache,
+                out_q,
+                layer,
+                forward_batch,
+                qk_norm_policy,
+                q_norm_weight=q_norm_weight,
+                k_norm_weight=k_norm_weight,
+            )
         else:
             self._run_fp8_rope_store_kv(
                 layer=layer,
@@ -656,44 +648,37 @@ class HPCOpsAttnBackend(AttentionBackend):
             )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    @eager_on_graph
+    def _eager_rope_store_kv(
+        self,
+        qkv: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        out_q: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+        qk_norm_policy: int,
+        *,
+        q_norm_weight: Optional[torch.Tensor] = None,
+        k_norm_weight: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Graph-splitting wrapper for the fused QKNorm+RoPE+FP8-quant+StoreKV op.
 
-@register_custom_op(mutates_args=["out_q"])
-@register_split_op()
-def hpc_ops_fp8_rope_store_kv(
-    qkv: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    out_q: torch.Tensor,
-    layer_id: int,
-    qk_norm_policy: int,
-    *,
-    q_norm_weight: Optional[torch.Tensor] = None,
-    k_norm_weight: Optional[torch.Tensor] = None,
-) -> None:
-    """Graph-splitting wrapper for the fused QKNorm+RoPE+FP8-quant+StoreKV op.
+        Like ``RadixAttention._eager_attention``, this runs eagerly between captured
+        prefill-graph segments (at capture and at every replay), so the Python
+        hand-off of the dynamic Q scales to the following attention op stays
+        alive. ``out_q`` is preallocated by the captured segment and mutated in
+        place, which is what stitches the surrounding graph segments together.
+        """
+        real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
-    Like ``unified_attention_with_output``, this runs eagerly between captured
-    prefill-graph segments (at capture and at every replay), so the Python
-    hand-off of the dynamic Q scales to the following attention op stays
-    alive. ``out_q`` is preallocated by the captured segment and mutated in
-    place, which is what stitches the surrounding graph segments together.
-    """
-    context = get_tc_piecewise_forward_context()
-    forward_batch = context.forward_batch
-    attention_layer = context.attention_layers[layer_id]
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
-
-    backend = get_attn_backend()
-    backend._run_fp8_rope_store_kv(
-        layer=attention_layer,
-        forward_batch=forward_batch,
-        qkv=qkv[:real_num_tokens],
-        cos_sin_cache=cos_sin_cache,
-        q_norm_weight=q_norm_weight,
-        k_norm_weight=k_norm_weight,
-        qk_norm_policy=qk_norm_policy,
-        is_extend=True,
-        out_q=out_q[:real_num_tokens],
-    )
-
-
-breakable_hpc_ops_fp8_rope_store_kv = eager_on_graph(True)(hpc_ops_fp8_rope_store_kv)
+        get_attn_backend()._run_fp8_rope_store_kv(
+            layer=layer,
+            forward_batch=forward_batch,
+            qkv=qkv[:real_num_tokens],
+            cos_sin_cache=cos_sin_cache,
+            q_norm_weight=q_norm_weight,
+            k_norm_weight=k_norm_weight,
+            qk_norm_policy=qk_norm_policy,
+            is_extend=True,
+            out_q=out_q[:real_num_tokens],
+        )

@@ -20,16 +20,14 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    is_in_full_prefill_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
-)
-from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -85,7 +83,13 @@ class RadixLinearAttention(nn.Module):
         b: torch.Tensor,
     ) -> torch.Tensor:
         is_extend = forward_batch.forward_mode.is_extend()
-        if is_extend and get_tc_piecewise_forward_context() is not None:
+        if is_extend and (
+            is_in_full_prefill_graph()
+            or (
+                is_in_breakable_cuda_graph()
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
+        ):
             # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
             seq_len = mixed_qkv.shape[0]
             output = torch.empty(
@@ -93,22 +97,7 @@ class RadixLinearAttention(nn.Module):
                 dtype=mixed_qkv.dtype,
                 device=mixed_qkv.device,
             )
-            if is_in_breakable_cuda_graph():
-                bcg_unified_linear_attention_with_output(
-                    mixed_qkv,
-                    a,
-                    b,
-                    output,
-                    self.layer_id,
-                )
-            else:
-                unified_linear_attention_with_output(
-                    mixed_qkv,
-                    a,
-                    b,
-                    output,
-                    self.layer_id,
-                )
+            self._eager_linear_attention(mixed_qkv, a, b, output, forward_batch)
             return output
 
         # Target verify rebuilds query_start_loc from the physical padded input,
@@ -117,7 +106,7 @@ class RadixLinearAttention(nn.Module):
             is_extend and not forward_batch.forward_mode.is_target_verify()
         )
         real_num_tokens = (
-            getattr(forward_batch, "global_num_token_non_padded_cpu", None)
+            forward_batch.global_num_token_non_padded_cpu
             if should_trim_padded_extend
             else None
         )
@@ -146,6 +135,13 @@ class RadixLinearAttention(nn.Module):
             a=a,
             b=b,
         )
+
+    def _capture_stub_linear_attention(self, mixed_qkv, a, b, output, forward_batch):
+        output.zero_()
+
+    @eager_on_graph(capture_stub=_capture_stub_linear_attention)
+    def _eager_linear_attention(self, mixed_qkv, a, b, output, forward_batch):
+        _linear_attention_with_output_impl(mixed_qkv, a, b, output, self, forward_batch)
 
 
 def _linear_attention_with_output_impl(
@@ -190,60 +186,3 @@ def _linear_attention_with_output_impl(
     # Physical padding participates in following residual, router, expert/MoE,
     # and collective operations. Keep those inputs finite and deterministic.
     output[:, real_num_tokens:].zero_()
-
-
-def _unified_linear_attention_with_output_impl(
-    mixed_qkv: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    """Eager implementation kept separate for backend-independent tests."""
-    context = get_tc_piecewise_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
-    _linear_attention_with_output_impl(
-        mixed_qkv=mixed_qkv,
-        a=a,
-        b=b,
-        output=output,
-        attention_layer=attention_layer,
-        forward_batch=forward_batch,
-    )
-    return
-
-
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def unified_linear_attention_with_output(
-    mixed_qkv: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    """Custom op wrapper for linear attention computation only."""
-    _unified_linear_attention_with_output_impl(
-        mixed_qkv=mixed_qkv,
-        a=a,
-        b=b,
-        output=output,
-        layer_id=layer_id,
-    )
-
-
-def _linear_attention_capture_stub(
-    mixed_qkv: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    output.zero_()
-
-
-bcg_unified_linear_attention_with_output = eager_on_graph(
-    True, capture_stub=_linear_attention_capture_stub
-)(unified_linear_attention_with_output)

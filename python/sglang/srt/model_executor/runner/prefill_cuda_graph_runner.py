@@ -732,7 +732,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     ):
         with (
             forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ForwardContext(
+                    attn_backend=self.model_runner.attn_backend,
+                    full_graph=self._is_full_backend,
+                    raw_num_tokens=raw_num_tokens,
+                )
             ),
             set_tc_piecewise_forward_context(
                 forward_batch,
@@ -863,7 +867,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         with (
             forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ForwardContext(
+                    attn_backend=self.model_runner.attn_backend,
+                    full_graph=self._is_full_backend,
+                    raw_num_tokens=None,
+                )
             ),
             set_tc_piecewise_forward_context(
                 fb,
