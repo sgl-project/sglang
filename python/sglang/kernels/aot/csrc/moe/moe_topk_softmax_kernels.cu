@@ -90,7 +90,7 @@ __launch_bounds__(TPB) __global__ void moeSoftmax(
   __shared__ float normalizing_factor;
   __shared__ float float_max;
 
-  const int thread_row_offset = blockIdx.x * num_cols;
+  const int64_t thread_row_offset = static_cast<int64_t>(blockIdx.x) * num_cols;
 
   float threadData(-FLT_MAX);
 
@@ -101,7 +101,7 @@ __launch_bounds__(TPB) __global__ void moeSoftmax(
 
   // First pass: Apply transformation, find max, and write transformed values to output
   for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
-    const int idx = thread_row_offset + ii;
+    const int64_t idx = thread_row_offset + ii;
     float val = convert_to_float<T>(input[idx]);
 
     // Apply tanh softcapping if enabled
@@ -128,7 +128,7 @@ __launch_bounds__(TPB) __global__ void moeSoftmax(
   // Second pass: Compute sum using transformed values from output
   threadData = 0;
   for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
-    const int idx = thread_row_offset + ii;
+    const int64_t idx = thread_row_offset + ii;
     threadData += exp((output[idx] - float_max));
   }
 
@@ -141,7 +141,7 @@ __launch_bounds__(TPB) __global__ void moeSoftmax(
 
   // Third pass: Compute final softmax using transformed values from output
   for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
-    const int idx = thread_row_offset + ii;
+    const int64_t idx = thread_row_offset + ii;
     const float softmax_val = exp((output[idx] - float_max)) * normalizing_factor;
     output[idx] = softmax_val;
   }
@@ -202,7 +202,7 @@ __launch_bounds__(TPB) __global__ void moeTopKFast(
   const int block_row = blockIdx.x;
 
   const bool row_is_active = finished ? !finished[block_row] : true;
-  const int thread_read_offset = blockIdx.x * num_experts;
+  const int64_t thread_read_offset = static_cast<int64_t>(blockIdx.x) * num_experts;
   float row_sum_for_renormalize = 0;
   // Each loop finds the top 2 elements,
   // thus requiring only ⌈k/2⌉ loops (calculated as (k + 1) / 2).
@@ -215,7 +215,7 @@ __launch_bounds__(TPB) __global__ void moeTopKFast(
 
     cub_kvp inp_kvp;
     for (int expert = threadIdx.x; expert < num_experts; expert += TPB) {
-      const int idx = thread_read_offset + expert;
+      const int64_t idx = thread_read_offset + expert;
       inp_kvp.key = expert;
       inp_kvp.value = inputs_after_softmax[idx];
       // updating the thread_pair according to inp_kvp's value
@@ -241,7 +241,7 @@ __launch_bounds__(TPB) __global__ void moeTopKFast(
         // The inputs_after_softmax is modified in-place to avoid unnecessary loops for finding the top k-1 value.
         // 1.f represents the minimum value.
         inputs_after_softmax[thread_read_offset + expert] = -1.f;
-        int idx = k * block_row + k_idx * 2 + i;
+        int64_t idx = static_cast<int64_t>(k) * block_row + k_idx * 2 + i;
         output[idx] = result.value;
         indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
         assert(indices[idx] >= 0);
@@ -254,7 +254,7 @@ __launch_bounds__(TPB) __global__ void moeTopKFast(
   if (renormalize && threadIdx.x == 0) {
     float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * block_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }
@@ -281,7 +281,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   const int block_row = blockIdx.x;
 
   const bool row_is_active = finished ? !finished[block_row] : true;
-  const int thread_read_offset = blockIdx.x * num_experts;
+  const int64_t thread_read_offset = static_cast<int64_t>(blockIdx.x) * num_experts;
   float row_sum_for_renormalize = 0;
   for (int k_idx = 0; k_idx < k; ++k_idx) {
     thread_kvp.key = 0;
@@ -289,7 +289,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
 
     cub_kvp inp_kvp;
     for (int expert = threadIdx.x; expert < num_experts; expert += TPB) {
-      const int idx = thread_read_offset + expert;
+      const int64_t idx = thread_read_offset + expert;
       inp_kvp.key = expert;
       inp_kvp.value = inputs_after_softmax[idx];
       thread_kvp = arg_max(inp_kvp, thread_kvp);
@@ -302,7 +302,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       const bool node_uses_expert = expert >= start_expert && expert < end_expert;
       const bool should_process_row = row_is_active && node_uses_expert;
 
-      const int idx = k * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * block_row + k_idx;
       output[idx] = result_kvp.value;
       indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
       assert(indices[idx] >= 0);
@@ -317,7 +317,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   if (renormalize && threadIdx.x == 0) {
     float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * block_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }
@@ -398,7 +398,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 
   // We finally start setting up the read pointers for each thread. First, each thread jumps to the start of the
   // row it will read.
-  const T* thread_row_ptr = input + thread_row * ELTS_PER_ROW;
+  const T* thread_row_ptr = input + static_cast<int64_t>(thread_row) * ELTS_PER_ROW;
 
   // Now, we compute the group each thread belong to in order to determine the first column to start loads.
   const int thread_group_idx = threadIdx.x % THREADS_PER_ROW;
@@ -557,7 +557,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 
       // The lead thread from each sub-group will write out the final results to global memory. (This will be a
       // single) thread per row of the input/output matrices.
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       output[idx] = max_val;
       indices[idx] = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
       row_sum_for_renormalize += max_val;
@@ -582,7 +582,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
     float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
 #pragma unroll
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }
@@ -763,7 +763,7 @@ void topk_softmax(
 
   const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
   const bool needs_workspace = !is_pow_2 || num_experts > 512;
-  const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
+  const int64_t workspace_size = needs_workspace ? static_cast<int64_t>(num_tokens) * num_experts : 0;
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
