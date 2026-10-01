@@ -307,7 +307,7 @@ class KVCacheConfigurator:
         else:
             self.draft_kv_ratio = (
                 get_spec().speculative_draft_kv_ratio
-                if self.spec_algorithm.is_dflash_family()
+                if self.spec_algorithm.is_dflash()
                 else 1.0
             )
             if self.draft_kv_ratio < 1:
