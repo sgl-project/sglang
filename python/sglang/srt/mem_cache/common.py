@@ -315,8 +315,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     owned_kv_len = req.owned_kv_len()
     is_insert = is_insert and not req.skip_radix_cache_insert
     if is_insert:
-        # The tree takes over component state only from a finished request.
-        assert req.finished(), f"inserting an unfinished request {req.rid}"
+        # A tree that takes over component state (mamba) must see the request
+        # finished, or the insert forks the state and the slot leaks.
+        assert req.finished() or not tree_cache.supports_mamba(), (
+            f"releasing unfinished request {req.rid} into a mamba tree"
+        )
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req._refresh_fill_ids()
         tree_cache.insert_req(req, up_to=owned_kv_len)
