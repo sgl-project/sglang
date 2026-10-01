@@ -93,6 +93,9 @@ class _StubFusedMoE:
         use_presharded_weights: bool = False,
     ):
         self.moe_tp_size = moe_tp_size
+        # Set per load() call below, the way the real layer reads it out of
+        # get_parallel() once in __init__.
+        self.moe_tp_rank = 0
         self.use_padded_loading = use_padded_loading
         self.use_presharded_weights = use_presharded_weights
         self._has_fused_shared = has_fused_shared
@@ -132,6 +135,7 @@ class _StubFusedMoE:
         param=None,
         tp_rank=0,
     ):
+        self.moe_tp_rank = tp_rank
         # A presharded checkpoint already holds only this rank's slice; an
         # ordinary one holds the whole intermediate size on every rank.
         loaded_intermediate = (
@@ -151,7 +155,6 @@ class _StubFusedMoE:
             shard_id=shard_id,
             expert_id=expert_id,
             shard_dim=shard_dim,
-            tp_rank=tp_rank,
         )
 
 
