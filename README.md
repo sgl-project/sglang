@@ -48,10 +48,10 @@ SGLang supports a wide range of GPUs, TPUs, NPUs, CPUs, and Apple Silicon platfo
 
 | Platform | Representative hardware |
 | --- | --- |
-| [NVIDIA](https://docs.sglang.io/docs/hardware-platforms/nvidia-gpus) | A100; H100/H200/H800/H20; B200/B300/GB200/GB300; select RTX 30/40/50 series, RTX 6000 Ada / PRO 6000; [DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [Jetson Orin](https://docs.sglang.io/docs/hardware-platforms/nvidia_jetson) |
+| [NVIDIA](https://docs.sglang.io/docs/hardware-platforms/nvidia-gpus) | A100; H100/H200/H800/H20; B200/B300/GB200/GB300; select RTX 30/40/50 series, RTX 6000 Ada / PRO 6000; DGX Spark, Jetson Orin |
 | [AMD](https://docs.sglang.io/docs/hardware-platforms/amd_gpu) | Instinct MI300X, MI325X, MI350X, MI355X |
 | [Google TPU](https://docs.sglang.io/docs/hardware-platforms/tpu) | v6e, v7; [SGL-JAX](https://github.com/sgl-project/sglang-jax) / [SGL-torchtpu](https://lmsys.org/blog/2026-07-30-sglang-google-tpu/) |
-| Intel | [Arc / Arc Pro B-Series GPUs](https://docs.sglang.io/docs/hardware-platforms/xpu), [Xeon CPUs](https://docs.sglang.io/docs/hardware-platforms/cpu_server) |
+| Intel ([GPU](https://docs.sglang.io/docs/hardware-platforms/xpu) / [CPU](https://docs.sglang.io/docs/hardware-platforms/cpu_server)) | Arc / Arc Pro B-Series GPUs, Xeon CPUs |
 | [Apple Silicon](https://docs.sglang.io/docs/hardware-platforms/apple_metal) | Macs via Metal / MLX |
 | [Huawei Ascend](https://docs.sglang.io/docs/hardware-platforms/ascend-npus/getting-started/installation) | A2, A3, 950PR/DT NPUs |
 | [Moore Threads](https://docs.sglang.io/docs/hardware-platforms/mthreads_gpu) | MTT S5000 GPUs |

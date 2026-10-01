@@ -1,14 +1,21 @@
 ---
 title: Install SGLang Diffusion
-description: Install SGLang Diffusion on NVIDIA, AMD, MUSA, and Ascend platforms.
+description: Install the sglang package with diffusion dependencies for image and video generation.
 ---
-You can install SGLang-Diffusion using one of the methods below. The standard installation already includes SGLang's optimized kernel stack, including both `sgl-kernel` and JIT kernels used by diffusion workloads.
+SGLang Diffusion is part of the [SGLang repository](https://github.com/sgl-project/sglang) and ships in the **`sglang` Python package**. Install `sglang[diffusion]` to include the dependencies for image and video generation, then use `sglang generate` or `sglang serve`.
 
-## Standard Installation (NVIDIA GPUs)
+<Note>
+Already have SGLang installed? Run the `sglang[diffusion]` installation command below in the same environment to add the diffusion dependencies. The `[diffusion]` extra belongs to the same `sglang` package.
+</Note>
 
-### Method 1: With pip or uv
+## Install on NVIDIA GPUs
 
-It is recommended to use uv for a faster installation:
+These instructions target Linux with NVIDIA GPUs and Python 3.10 or higher. For the shared CUDA requirements, see [SGLang installation](/docs/get-started/install). Choose one installation method below; other platforms have dedicated instructions further down this page.
+
+<Tabs>
+<Tab title="pip / uv" id="method-1-with-pip-or-uv">
+
+Use uv for faster installation:
 
 ```bash Command
 pip install --upgrade pip
@@ -16,22 +23,33 @@ pip install uv
 uv pip install "sglang[diffusion]" --prerelease=allow
 ```
 
-### Method 2: From source
+With pip, use:
+
+```bash
+pip install "sglang[diffusion]" --pre
+```
+
+</Tab>
+<Tab title="From source" id="method-2-from-source">
+
+Clone the SGLang repository and install its Python package with the diffusion extra:
 
 ```bash Command
-# Use the latest release branch
+# Clone the SGLang repository
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the Python packages
 pip install --upgrade pip
 pip install -e "python[diffusion]"
-
-# With uv
-uv pip install -e "python[diffusion]" --prerelease=allow
 ```
 
-### Method 3: Using Docker
+Or replace the pip installation command with `uv pip install -e "python[diffusion]" --prerelease=allow`.
+
+The diffusion implementation lives in [`python/sglang/multimodal_gen`](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen).
+
+</Tab>
+<Tab title="Docker" id="method-3-using-docker">
 
 The Docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang), built from the [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/Dockerfile).
 Replace `<secret>` below with your HuggingFace Hub [token](https://huggingface.co/docs/hub/en/security-tokens).
@@ -55,7 +73,10 @@ docker run --gpus all \
     '
 ```
 
-## Platform-Specific: ROCm (AMD GPUs)
+</Tab>
+</Tabs>
+
+## AMD GPUs (ROCm)
 
 For AMD Instinct GPUs (e.g., MI300X), use a ROCm-enabled Docker image from [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang). The tag below is an example for ROCm 7.0 on MI300X and may lag the latest release tag:
 
@@ -67,9 +88,9 @@ docker run --device=/dev/kfd --device=/dev/dri --ipc=host \
   sglang generate --model-path black-forest-labs/FLUX.1-dev --prompt "A logo With Bold Large text: SGL Diffusion" --save-output
 ```
 
-For detailed ROCm system configuration and installation from source, see [AMD GPUs](../hardware-platforms/amd_gpu).
+For detailed ROCm system configuration and installation from source, see [AMD GPUs](/docs/hardware-platforms/amd_gpu).
 
-## Platform-Specific: MUSA (Moore Threads GPUs)
+## Moore Threads GPUs (MUSA)
 
 For Moore Threads GPUs (MTGPU) with the MUSA software stack, follow the platform guide first. If the source tree still requires the alternate platform `pyproject` fallback, keep a backup of the default file before switching:
 
@@ -85,13 +106,13 @@ cp python/pyproject_other.toml python/pyproject.toml
 pip install -e "python[all_musa]"
 ```
 
-## Platform-Specific: Intel XPU
+## Intel XPU
 
-For Intel Data Center GPU Max or Arc GPUs, follow the installation with docker in [XPU installation guide](../hardware-platforms/xpu). The dockerfile already include diffusion dependencies:
+For Intel Data Center GPU Max or Arc GPUs, follow the Docker instructions in the [XPU installation guide](/docs/hardware-platforms/xpu). The Dockerfile already includes diffusion dependencies.
 
-## Platform-Specific: Ascend NPU
+## Ascend NPU
 
-For Ascend NPU, please follow the [NPU installation guide](../hardware-platforms/ascend-npus/getting-started/installation).
+For Ascend NPU, please follow the [NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation).
 
 Quick test:
 
@@ -101,7 +122,7 @@ sglang generate --model-path black-forest-labs/FLUX.1-dev \
     --save-output
 ```
 
-## Platform-Specific: Apple MPS
+## Apple Silicon (MPS)
 
 For Apple MPS, follow the instructions below to install from source. If the source tree still requires the alternate platform `pyproject` fallback, keep a backup of the default file before switching:
 
