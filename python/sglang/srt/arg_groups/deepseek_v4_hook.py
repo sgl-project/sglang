@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.model_override_base import context_parallel_attn_dp_size
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
     declare_resolution,
@@ -123,13 +124,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             "reindexes with interleave order."
         )
 
-    # DeepSeek-V4 CP runs data-parallel groups as attention DP.
-    assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
-        f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
-        "data-parallel replicas combined with attention data parallelism "
-        "are not supported."
-    )
-    attn_dp_size = cfg.attn_dp_size * cfg.dp_size
+    attn_dp_size = context_parallel_attn_dp_size(cfg, "DeepSeek-V4 context parallelism")
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
