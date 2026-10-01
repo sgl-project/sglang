@@ -480,8 +480,10 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             pp_group=SimpleNamespace(is_first_rank=True),
             model=SimpleNamespace(
                 # The draft hands its hc stream to the body in the inputs_embeds slot.
-                forward=lambda ids, positions, batch, **_kwargs: runner.layer_model.forward(
-                    ids, positions, batch, torch.zeros((1, 8))
+                forward=lambda ids, positions, batch, **_kwargs: (
+                    runner.layer_model.forward(
+                        ids, positions, batch, torch.zeros((1, 8))
+                    )
                 )
             ),
         )
