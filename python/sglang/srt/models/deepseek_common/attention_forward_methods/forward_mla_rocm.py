@@ -407,17 +407,6 @@ def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
     )
 
 
-def _fuse_bmm_rope_in_mode(forward_mode) -> bool:
-    """Whether the fused absorb + RoPE + KV-write kernel pays off in this mode.
-
-    At decode / verify token counts neither separate kernel fills the CUs, so
-    one fused launch wins. At prefill shapes the two separately tuned launches
-    are faster. Target verify is extend-shaped but decode-sized, and draft
-    extend is small too, so both keep the fused kernel.
-    """
-    return not forward_mode.is_extend_or_draft_extend_or_mixed()
-
-
 def _fused_bmm_rope_cat_and_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope: torch.Tensor,
@@ -628,9 +617,11 @@ class DeepseekMLARocmForwardMixin:
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
+        # The fused kernel wins at decode-sized batches (decode, target verify,
+        # draft extend); prefill shapes run faster as the two separate launches.
         fuse_bmm_rope_cache = (
             not q_replicate_active
-            and _fuse_bmm_rope_in_mode(forward_batch.forward_mode)
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
             and _can_fuse_bmm_rope_cat_and_cache(self)
         )
 

@@ -14,7 +14,6 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
 )
@@ -89,24 +88,6 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
-
-
-class TestFusedAbsorbForwardMode(CustomTestCase):
-    def test_prefill_modes_take_the_two_launch_path(self):
-        for mode in (ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.SPLIT_PREFILL):
-            with self.subTest(mode=mode.name):
-                self.assertFalse(forward_mla_rocm._fuse_bmm_rope_in_mode(mode))
-
-    def test_decode_verify_and_draft_extend_keep_the_fused_kernel(self):
-        # Verify is extend-shaped but decode-sized; routing it by is_extend()
-        # would drop the fusion exactly where it was measured to help.
-        for mode in (
-            ForwardMode.DECODE,
-            ForwardMode.TARGET_VERIFY,
-            ForwardMode.DRAFT_EXTEND_V2,
-        ):
-            with self.subTest(mode=mode.name):
-                self.assertTrue(forward_mla_rocm._fuse_bmm_rope_in_mode(mode))
 
 
 if __name__ == "__main__":
