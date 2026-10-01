@@ -46,7 +46,7 @@ class Cosmos3NanoSimTransferPipeline(ComposedPipelineBase):
         if not isinstance(pipeline_config, CosmosDreamsTransferConfig):
             raise TypeError(
                 "Cosmos3NanoSimTransferPipeline requires CosmosDreamsTransferConfig, got "
-                f"{type(pipeline_config).__name__}; pass --model-id nvidia/Cosmos3-Nano-Sim-Depth "
+                f"{type(pipeline_config).__name__}; pass --model-id nvidia/Cosmos3-Nano-Sim-Transfer "
                 "or make the checkpoint's model_index.json name Cosmos3NanoSimTransferPipeline."
             )
         transformer = self.get_module("transformer")

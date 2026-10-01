@@ -53,7 +53,7 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
 )
 
-# ``transformer/config.json["cosmos3_nano_sim_bimanual"]`` of Cosmos3-Nano-Sim-Depth
+# ``transformer/config.json["cosmos3_nano_sim_bimanual"]`` of Cosmos3-Nano-Sim-Transfer
 # (checkpoint causal_8b_sf_dmd_transfer_4modality_480p_ga_v2_midtrain_
 # causal_control_with_rgb_history_text_dropout_0@iter_000001750).
 TRANSFER_ARTIFACT = {
@@ -203,7 +203,7 @@ class TestCosmosDreamsTransferHistory(unittest.TestCase):
         # No training window recorded (chunk-4 export; its window 96 is an exporter default).
         profile = config.transfer_history_profile(MANIFEST, trained_window=(None, 0))
         self.assertEqual((profile.history_mode, profile.window_frames), ("full", None))
-        # Sim-Depth: kv_cache_inference_size 51, attention_sink_size 1 -> slide like the reference.
+        # Sim-Transfer: kv_cache_inference_size 51, attention_sink_size 1 -> slide like the reference.
         manifest = self._chunk1_manifest()
         profile = config.transfer_history_profile(manifest, trained_window=(51, 1))
         self.assertEqual(
@@ -484,6 +484,9 @@ class TestTransferRegistryAndConfig(unittest.TestCase):
         _discover_and_register_pipelines()
         self.assertIn("Cosmos3NanoSimTransferPipeline", _PIPELINE_REGISTRY)
         for model_path in (
+            "nvidia/Cosmos3-Nano-Sim-Transfer",
+            "/models/Cosmos3-Nano-Sim-Transfer",
+            # pre-rename id of the same Hub repo
             "nvidia/Cosmos3-Nano-Sim-Depth",
             "/models/Cosmos3-Nano-Sim-Depth",
         ):

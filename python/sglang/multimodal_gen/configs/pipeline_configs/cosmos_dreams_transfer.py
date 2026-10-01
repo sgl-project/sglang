@@ -34,7 +34,7 @@ class CosmosDreamsTransferConfig(CosmosDreamsConfig):
         self.transfer_history_profile(manifest)
 
     # "auto" follows the export's training config: the reference slides only when
-    # kv_cache_inference_size was set (Sim-Depth: 51 frames, 1 sink) and keeps the
+    # kv_cache_inference_size was set (Sim-Transfer: 51 frames, 1 sink) and keeps the
     # whole clip otherwise. The artifact's no_eviction flag is an exporter constant.
     history_mode: str = HISTORY_MODE_AUTO
 
@@ -119,7 +119,10 @@ def register():
     register_configs(
         sampling_param_cls=CosmosDreamsTransferSamplingParams,
         pipeline_config_cls=CosmosDreamsTransferConfig,
-        hf_model_paths=["nvidia/Cosmos3-Nano-Sim-Depth"],
+        hf_model_paths=[
+            "nvidia/Cosmos3-Nano-Sim-Transfer",
+            "nvidia/Cosmos3-Nano-Sim-Depth",
+        ],
         # Matches the release ``Cosmos3NanoSimTransferPipeline`` ``_class_name``.
         model_detectors=[
             lambda hf_id: "cosmos3nanosimtransferpipeline" in hf_id.lower()
