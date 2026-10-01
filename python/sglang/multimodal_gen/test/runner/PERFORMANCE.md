@@ -49,9 +49,9 @@ scenarios; use a separate `--out` file when collecting pool-specific candidates.
 
 `b200-cirrascale1-0123` has separate E2E references of 1574.32 ms for
 `flux1_modelopt_nvfp4_t2i` and 17742.04 ms for
-`qwen_image_2512_modelopt_nvfp4_t2i`. The measured Cirrascale 3 runners below also
-have separate references. Other Cirrascale runners retain the defaults until
-calibrated.
+`qwen_image_2512_modelopt_nvfp4_t2i`. The measured Cirrascale 3 and Cirrascale 4
+runners below also have separate references. Other Cirrascale runners retain the
+defaults until calibrated.
 
 Historical jobs on this runner, all using driver 580.126.20, already recorded
 the slower timings before this PR's changes, with unchanged B200 case definitions:
@@ -94,6 +94,26 @@ Keep the 25% tolerance and all other metrics unchanged. In particular, the
 35-second historical Qwen outlier still fails; it is not a new reference.
 These records establish a pre-existing runner-specific mismatch with the Verda
 reference, not the underlying cause of contention or a claim that all runs pass.
+
+### Cirrascale 4 historical CI references
+
+Match `b200-cirrascale4-0123` and `b200-cirrascale4-4567` separately, as for
+Cirrascale 3. Without an override both fell back to the Verda defaults, and every
+`multimodal-gen-test-1-b200` job they ran in the scheduled PR Test Base runs from
+2026-09-21 to 2026-10-01 failed on these two cases.
+
+| Scheduled CI job | Runner suffix | Flux1 E2E (ms) | Qwen2512 E2E (ms) |
+| --- | --- | ---: | ---: |
+| [Scheduled run 161447](https://github.com/sgl-project/sglang/actions/runs/35853030052/job/107178181060) | `4-0123` | 1411.71 | 17338.23 |
+| [Scheduled run 163197](https://github.com/sgl-project/sglang/actions/runs/36278567509/job/108505988531) | `4-0123` | 1390.18 | 17367.66 |
+| [Scheduled run 161023, attempt 2](https://github.com/sgl-project/sglang/actions/runs/35796057792/job/107010103099) | `4-4567` | 1446.10 | 17501.32 |
+| [Scheduled run 163409](https://github.com/sgl-project/sglang/actions/runs/36314828013/job/108607491880) | `4-4567` | 1400.67 | 16861.20 |
+| [Scheduled run 164463](https://github.com/sgl-project/sglang/actions/runs/36560152577/job/109378949066) | `4-4567` | 1448.28 | 17671.62 |
+
+Each row is the minimum of the job's seven retried attempts. These minimums sit
+within 6% below the Cirrascale 3 references, so each half reuses its Cirrascale 3
+counterpart: 1470.24 / 17894.49 ms for `4-0123`, and 1471.19 / 17346.65 ms for
+`4-4567`.
 
 ## Initial loading references
 
