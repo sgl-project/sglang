@@ -317,16 +317,16 @@ class Mxfp4Config(QuantizationConfig):
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
 
         if _is_hip:
-            if is_gfx95_supported():
+            if is_gfx95_supported() or has_triton_kernels:
                 return cls(
                     is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
                 )
-            else:
 
-                platform = torch.cuda.get_device_properties(0).gcnArchName
-                raise ValueError(
-                    f"Current platform {platform} not support mxfp4 computation"
-                )
+            platform = torch.cuda.get_device_properties(0).gcnArchName
+            raise ValueError(
+                f"Current platform {platform} does not support mxfp4 computation "
+                "without triton_kernels"
+            )
 
         return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
 
@@ -1026,10 +1026,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             self.w13_precision_config = PrecisionConfig(
-                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+                b_mx_scale=w13_scale,
+                b_microblock_size=32,
+                flex_ctx=FlexCtx(rhs_data=w13_flex),
             )
             self.w2_precision_config = PrecisionConfig(
-                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+                b_mx_scale=w2_scale,
+                b_microblock_size=32,
+                flex_ctx=FlexCtx(rhs_data=w2_flex),
             )
 
             self.w13_weight_triton_tensor = w13_weight
