@@ -1,19 +1,4 @@
-"""Numerical tests for the varlen absorbed-MLA extend path under a *breakable*
-(segmented, non-torch.compile) captured prefill graph.
-
-Mirrors test_trtllm_mla_piecewise.py exactly, but exercises
-is_in_breakable_cuda_graph() instead of is_in_tc_piecewise_cuda_graph(): the
-two are the OR'd halves of TRTLLMMLABackend's use_varlen_absorbed predicate,
-and neither existing test forces the breakable half to be true in isolation.
-
-Backends without a varlen kernel are covered by test_mla_varlen_absorbed_gate.py:
-the kit builds MLA shapes (576, 512), which they reject, so every case here would
-skip.
-
-The case list and assertions are shared with test_trtllm_mla_piecewise.py via
-sglang.test.kits.attention_unittest.attention_methods.varlen_absorbed_extend_kit:
-see that module's docstring.
-"""
+"""Varlen absorbed-MLA extend under a breakable captured prefill graph."""
 
 import unittest
 
