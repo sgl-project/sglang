@@ -954,6 +954,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
 
+    # Scheduler-owned, bounded capture metadata. Appended for array IPC compatibility.
+    training_capture_ticket: bytes | None = None
+
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
         self.mm_data_mooncake = wrap_as_pickle(self.mm_data_mooncake)

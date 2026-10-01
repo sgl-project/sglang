@@ -1702,6 +1702,74 @@ serving gates remain closed. Validation uses one host, four Gloo processes, a
 Catalog test double and TCP Mooncake; it does not prove multi-GPU inference,
 cross-node RDMA, production Catalog retention or trained draft quality.
 
+## Scheduler Request Ticket Routing
+
+`CaptureRequestRouter` now connects cohort selection to the scheduler's existing
+request communication boundaries. The first PP stage's TP/CP ingress rank
+selects once after input blocking and before TP broadcast. A bounded, versioned
+ticket is appended to the tokenized request's array IPC schema and travels with
+the ordinary TP broadcast and PP request messages. Batch generation requests
+are handled item by item; control messages do not consume cohorts. The ingress
+overwrites supplied capture metadata, excludes unsupported/private requests,
+and skips sampling or capacity pressure without waiting for Catalog.
+
+The ticket binds a fresh request incarnation to the original prompt, complete
+sampling contract, token types, reasoning mode and cache salt. Downstream ranks
+validate this identity before attaching a local route. Selected requests use a
+private copy of sampling parameters, so scheduler clipping cannot change the
+ingress object forwarded to another PP stage. Local bind additionally records
+the effective execution digest after normalization, ready for subsequent owner
+descriptor agreement. Queue rejection/eviction, timeout, grammar rejection and
+queued/running/chunked abort invalidate the corresponding route without releasing
+a bound actor's buffers. Failure after bind but before returning ownership to the
+actor explicitly drains the unused handle; no transfer has started at that point.
+
+The request tests exercise actual message-pack/pickle serialization, receiver
+ordering and scheduler generation/abort/queue methods. Four real Gloo processes
+use TP2/PP2 request broadcasts and point-to-point sends with an inactive ingress
+stage, active second-stage owners and a separate background cohort group. They
+verify one selection, common tickets and effective hashes after per-stage
+clipping, queued cancellation, and delayed release of bound actors. This is a
+request-transport test with a Catalog double and synthetic Host pools, not a
+distributed model forward or published training sample.
+
+Initial job `01790855641040094762-ab69d90c9b68` did not collect tests because the
+GPU checkout lacked several existing manager test files. After staging them,
+job `01790855723592041926-5a72b5421acc` passed 110 tests and 38 subtests but exposed
+missing runtime-config/TP-rank setup in the new fixture. Scoped test configuration
+fixed that setup; job `01790856032411578955-789f006a233e` then passed all 14 request
+tests and 16 subtests in 25.66s, including real Gloo request transport.
+
+Single-H100 runtime job `01790856128671804572-0e5227e0df60` passed in 461.594s,
+generating and validating 90 READY snapshots across the existing AR/DSpark
+scenarios, graph/overlap modes, prefix reuse and retraction/abort coverage. It
+checks compatibility of the shared scheduler/IPC edits with existing single-rank
+capture; it does not activate the distributed router or prove multi-GPU serving.
+The runtime ran before the router-only unused-handle cleanup and the final
+equivalent `bytes | None` annotation edits.
+
+Job `01790856494956635925-6855ab8fdbce` deterministically reproduces a post-bind
+bookkeeping failure that cancelled the cohort without returning the unused actor
+handle. The fix finishes that known handle with `transfer_complete=True` before
+returning admission failure. Final job `01790856653591344549-cb05939a7875` passes
+56 tests and 34 subtests in 25.61s, covering the fixed router and final IPC types.
+Actual running-request cancellation still only invalidates the handle and never
+claims its transfers completed.
+
+The new router and test pass Ruff. Existing-file diagnostic counts match HEAD;
+all seven changed/added Python files compile on Python 3.10. Source hashes match
+the GPU checkout, and unrelated formatting differences in the existing scheduler
+and batch files are preserved. All six jobs are terminal and the resident worker
+has resumed its idle load.
+
+The current single-rank coordinator leaves `request_router=None`; distributed
+factory construction still rejects unsupported topology. The scheduler hooks
+are available, but coordinator activation, partitioned contexts, execution-digest
+agreement, accepted-token delivery, owner descriptor/receipt exchange and global
+teacher rows still need integration. Existing TP/PP serving gates remain closed.
+Validation results and the final source/log hashes are recorded in
+`experiments/capture-request-routing.json`.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1710,7 +1778,8 @@ cross-node RDMA, production Catalog retention or trained draft quality.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
 3. Connect P9's implemented identity/resource startup agreement, cohort
-   reservations and background lifecycle, layout, partitioned request contexts, rank-local buffers and
+   reservations and background lifecycle, scheduler ticket routing, layout,
+   partitioned request contexts, rank-local buffers and
    owner-local Store interface
    to distributed request admission/failure agreement, descriptor exchange,
    global teacher scores

@@ -78,6 +78,9 @@ class VerifyCaptureBatch(msgspec.Struct, frozen=True):
 
 
 class CaptureCoordinator:
+    # Distributed construction will install its cohort-backed request router.
+    request_router = None
+
     @classmethod
     def create(
         cls,

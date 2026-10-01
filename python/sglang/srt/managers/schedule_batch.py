@@ -855,6 +855,7 @@ class Req(ReqDllmMixin):
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
+        training_capture_ticket: bytes | None = None,
     ):
         # Input and output info
         self.rid = rid
@@ -873,6 +874,8 @@ class Req(ReqDllmMixin):
         self.training_capture_context = None
         self.training_capture_finalize = None
         self.training_capture_latency = None
+        self.training_capture_route = None
+        self.training_capture_cancel = None
         self.dspark_projected_context = None
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
@@ -917,6 +920,9 @@ class Req(ReqDllmMixin):
         self._think_end_match_len = 0
 
         # Sampling info
+        if training_capture_ticket is not None:
+            # Keep the ingress contract unchanged when PP forwards recv_req.
+            sampling_params = copy.deepcopy(sampling_params)
         if isinstance(sampling_params.custom_params, dict):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
@@ -1809,6 +1815,8 @@ class Req(ReqDllmMixin):
         self.has_log_time_stats = True
 
     def set_finish_with_abort(self, error_msg: str):
+        if self.training_capture_cancel is not None:
+            self.training_capture_cancel(self, "request_aborted")
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None

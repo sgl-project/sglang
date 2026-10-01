@@ -519,11 +519,63 @@ close does not destroy the dedicated group, close Store, synchronize CUDA, or
 unregister memory. The supervisor owns those actions after a successful close;
 uncertain transfers require explicit transport/device teardown or process exit.
 
-The service does not yet connect to the serving coordinator/scheduler, accepted
-tokens, owner descriptors, receipts or global teacher logits. Those interfaces
-must be wired before opening the distributed serving gates. In particular, an
-all-PP collective inside `before_forward` would deadlock against PP proxy
-receive/send ordering. All service collectives remain on its dedicated group.
+The scheduler request hooks below can carry these tickets, but distributed
+coordinator construction, accepted tokens, owner descriptors, receipts and global
+teacher logits still need integration before opening the distributed serving
+gates. In particular, an all-PP collective inside `before_forward` would deadlock
+against PP proxy receive/send ordering. All service collectives remain on its
+dedicated group.
+
+### Request Ticket Routing
+
+`CaptureRequestRouter` adapts a ready cohort service to the existing request
+transport. Install it as `coordinator.request_router` before scheduler receiver
+construction. `SchedulerRequestReceiver` invokes `prepare()` only on the first
+PP stage's TP/CP ingress rank, after input blocking and before TP broadcast.
+It selects eligible bounded text requests once, consumes a ready ticket locally,
+and appends a bounded metadata field to `TokenizedGenerateReqInput`. The existing
+TP broadcast and PP request send/receive carry that field. Control requests and
+batch wrappers preserve their ordinary routing. A missing ready cohort skips
+capture without retrying from downstream ranks or waiting for Catalog.
+
+The version-1 wire ticket contains a fresh request-incarnation nonce and the
+cohort ticket. Its request hash covers request ID, prompt tokens, every sampling
+parameter field, token types, reasoning mode and cache salt. Stop-token sets
+are canonicalized; mapping insertion order does not change the hash. The nonce
+separates repeated requests that reuse the same ID and input. The wire budget
+is 2048 bytes and the request identity budget is 1 MiB. The ingress overwrites
+client-supplied capture metadata. Excluded inputs include sessions, multimodal
+or embedding inputs, LoRA, custom positions/processors/parameters, health checks,
+requests marked `no_logs`, and requests outside the configured sample capacity.
+Adaptive selection requires an explicit admission-ratio callback.
+
+The normal scheduler request handler calls `attach(incoming, req)` to validate
+the original ingress contract without acquiring local actor ownership. Only a
+selected request gets a private copy of its sampling parameters. Thus scheduler
+clamping of `max_new_tokens`/`min_new_tokens` and later local normalization cannot
+modify the ingress object sent to another PP stage. Appending the optional field
+preserves decoding of older array IPC messages that omit it.
+
+The distributed coordinator must call `bind(req)` before the first capture
+forward. It returns a process-local route containing the cohort handle and a
+separate `execution_sha256` for the effective request after normalization. The
+original ingress identity remains the service's ticket/fence binding. The
+execution hash must join descriptor agreement before publication; merely
+checking the ingress hash does not prove that ranks executed identical effective
+requests. Rebinding, advanced/retracted/aborted requests and unavailable cohorts
+fail capture without rejecting inference.
+
+Queue rejection or priority eviction cancels the removed request's ticket.
+Waiting timeout, explicit queued/running/chunked abort and grammar rejection
+also invalidate its route. These callbacks never finish a bound actor's
+transfers; the coordinator/writer remains responsible for `service.finish()`.
+Unbound captures are reclaimed by the background invalidation protocol.
+
+The current single-rank `CaptureCoordinator` leaves `request_router=None` and
+keeps its established first-forward admission. Distributed construction still
+rejects unsupported topology. The hooks and real TP/PP request transport are
+tested independently with a cohort service; this is not yet a distributed model
+forward, teacher-logit or Store-publication workflow.
 
 ### HTTP Contract
 

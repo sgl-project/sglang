@@ -1,0 +1,672 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "fe94aedc460db45e527cf13c65865a229fc8ab1b",
+  "feature": "Scheduler capture request ticket routing and cancellation hooks",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "namespace": "qiji",
+    "container": "master",
+    "gpu": "one H100 80GB",
+    "distributed_test": "four CPU Gloo processes, TP2/PP2 request groups plus a dedicated cohort group",
+    "runtime_model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "draft": "synthetic DSpark fixture",
+    "store_transport": "TCP",
+    "catalog": "TestCaptureCatalog HTTP test double"
+  },
+  "source_sha256": {
+    "python/sglang/srt/training_capture/request_router.py": "b97ca76fd4621398c617414098c539850e331e0ee42d88e91eb7e0cb41f09824",
+    "python/sglang/srt/training_capture/coordinator.py": "5ce63c6d487533fb4ff633ebcb60fbc6eb8eac6a2ddba8565c8161695e9fabdb",
+    "python/sglang/srt/managers/io_struct.py": "a1738a1b649aae3961aba7c96f1e8a1e43866d9d8b80c4dd06410bf064c27500",
+    "python/sglang/srt/managers/schedule_batch.py": "c62752ce355addc05c55a2c4a04c769ad4a4531df43e56e308f66a78ac2fc2c2",
+    "python/sglang/srt/managers/scheduler_components/request_receiver.py": "74e7e312e4581b84c83d27adc7ce283753603d506a1657712e4153a004193b59",
+    "python/sglang/srt/managers/scheduler.py": "3108e04513e744631e07a2082425d7263033615f6889329731e78b9e6994142e",
+    "test/registered/unit/training_capture/test_request_router.py": "3a090c52b2b2ce64426cb1b927d119106f743215727778e22056a65b8ca4ba3d"
+  },
+  "local_gpu_hashes_match": true,
+  "jobs": [
+    {
+      "job_id": "01790855641040094762-ab69d90c9b68",
+      "outcome": "failed",
+      "returncode": 4,
+      "scope": "No collection: existing manager test files were absent from the GPU checkout. Staged those files before retrying.",
+      "submit_argv": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--timeout-seconds",
+        "240",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_request_router.py",
+        "test/registered/unit/managers/test_pp_cp_rank_offsets.py",
+        "test/registered/unit/managers/test_msgpack_ipc_roundtrip.py",
+        "test/registered/unit/managers/test_io_struct.py",
+        "test/registered/unit/managers/test_priority_scheduling_disaggregation.py",
+        "test/registered/unit/training_capture/test_coordinator.py"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790855641040094762-ab69d90c9b68.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790855641040094762-ab69d90c9b68.log",
+      "log_sha256": "663b49e746688a001f4e9f252d5a9bd91a446112baff33dac9d94d6d16f6a589"
+    },
+    {
+      "job_id": "01790855723592041926-5a72b5421acc",
+      "outcome": "failed",
+      "returncode": 1,
+      "reported_failures": 5,
+      "passed_tests": 110,
+      "passed_subtests": 38,
+      "seconds": 45.3,
+      "scope": "New fixture lacked published runtime configuration and a TP rank override. Existing manager/coordinator tests passed.",
+      "submit_argv": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--timeout-seconds",
+        "240",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_request_router.py",
+        "test/registered/unit/managers/test_pp_cp_rank_offsets.py",
+        "test/registered/unit/managers/test_msgpack_ipc_roundtrip.py",
+        "test/registered/unit/managers/test_io_struct.py",
+        "test/registered/unit/managers/test_priority_scheduling_disaggregation.py",
+        "test/registered/unit/training_capture/test_coordinator.py"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790855723592041926-5a72b5421acc.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790855723592041926-5a72b5421acc.log",
+      "log_sha256": "3f418898af928c3012ab088254bf6109f7bba31eaf22f0bb1ab906130331b390"
+    },
+    {
+      "job_id": "01790856032411578955-789f006a233e",
+      "outcome": "completed",
+      "returncode": 0,
+      "passed_tests": 14,
+      "passed_subtests": 16,
+      "seconds": 25.66,
+      "scope": "Request router before post-bind bookkeeping cleanup; real four-process TP2/PP2 receiver/send and background cohort lifetime included.",
+      "submit_argv": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--timeout-seconds",
+        "180",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_request_router.py"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790856032411578955-789f006a233e.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790856032411578955-789f006a233e.log",
+      "log_sha256": "e819f4d1a1724afb66d309b84576fe5a68f544757ad6ef25aa789fb9a4b4cd67"
+    },
+    {
+      "job_id": "01790856128671804572-0e5227e0df60",
+      "outcome": "completed",
+      "returncode": 0,
+      "passed_tests": 1,
+      "seconds": 461.594,
+      "ready_snapshots": 90,
+      "scope": "Single-H100 AR/DSpark compatibility regression for shared IPC/scheduler changes. Distributed router is not activated. Before unused-handle cleanup and equivalent optional-bytes annotation edits.",
+      "submit_argv": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--timeout-seconds",
+        "1000",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790856128671804572-0e5227e0df60.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790856128671804572-0e5227e0df60.log",
+      "log_sha256": "6cbae6fa405ea0063bfd2e02feb5a29721b072d8bd3d36a28669f5b1e2c91878"
+    },
+    {
+      "job_id": "01790856494956635925-6855ab8fdbce",
+      "outcome": "failed",
+      "returncode": 1,
+      "expected_failure": true,
+      "reported_failures": 1,
+      "seconds": 11.23,
+      "router_sha256": "2326a049fa8bcca643c956a5ac5bfc0eebfdc7edac63c87a474b11cebccdda0a",
+      "scope": "Deterministic post-bind bookkeeping failure: cancellation did not finish the known unused handle, so the finish assertion reported zero calls.",
+      "submit_argv": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--timeout-seconds",
+        "90",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_request_router.py::TestCaptureRequestRouter::test_binding_bookkeeping_failure_returns_unused_actor_ownership"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790856494956635925-6855ab8fdbce.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790856494956635925-6855ab8fdbce.log",
+      "log_sha256": "68b61701c4336324766fe91512e9ff6ddc929cf8f6b1c76b94150b0f60e904d2"
+    },
+    {
+      "job_id": "01790856653591344549-cb05939a7875",
+      "outcome": "completed",
+      "returncode": 0,
+      "passed_tests": 56,
+      "passed_subtests": 34,
+      "seconds": 25.61,
+      "scope": "Final router/IPC source, including cleanup regression, real Gloo transport and message-pack/legacy-array compatibility.",
+      "submit_argv": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--timeout-seconds",
+        "240",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_request_router.py",
+        "test/registered/unit/managers/test_msgpack_ipc_roundtrip.py",
+        "test/registered/unit/managers/test_io_struct.py"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790856653591344549-cb05939a7875.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790856653591344549-cb05939a7875.log",
+      "log_sha256": "0597c46dd8c2eff8a92d4370e3c3c5c270e18be296ac9818fd2934aad9e09d9e"
+    }
+  ],
+  "verification": {
+    "new_router_and_test_ruff": "passed",
+    "existing_file_ruff_counts": [
+      {
+        "path": "python/sglang/srt/managers/io_struct.py",
+        "baseline": [
+          {
+            "code": "I001",
+            "count": 1
+          },
+          {
+            "code": "PIE790",
+            "count": 1
+          },
+          {
+            "code": "PIE810",
+            "count": 1
+          },
+          {
+            "code": "TRY004",
+            "count": 1
+          },
+          {
+            "code": "UP006",
+            "count": 251
+          },
+          {
+            "code": "UP007",
+            "count": 50
+          },
+          {
+            "code": "UP035",
+            "count": 4
+          },
+          {
+            "code": "UP045",
+            "count": 298
+          }
+        ],
+        "current": [
+          {
+            "code": "I001",
+            "count": 1
+          },
+          {
+            "code": "PIE790",
+            "count": 1
+          },
+          {
+            "code": "PIE810",
+            "count": 1
+          },
+          {
+            "code": "TRY004",
+            "count": 1
+          },
+          {
+            "code": "UP006",
+            "count": 251
+          },
+          {
+            "code": "UP007",
+            "count": 50
+          },
+          {
+            "code": "UP035",
+            "count": 4
+          },
+          {
+            "code": "UP045",
+            "count": 298
+          }
+        ]
+      },
+      {
+        "path": "python/sglang/srt/managers/schedule_batch.py",
+        "baseline": [
+          {
+            "code": "EXE002",
+            "count": 1
+          },
+          {
+            "code": "F811",
+            "count": 1
+          },
+          {
+            "code": "I001",
+            "count": 1
+          },
+          {
+            "code": "PERF102",
+            "count": 1
+          },
+          {
+            "code": "PLR1730",
+            "count": 1
+          },
+          {
+            "code": "RUF013",
+            "count": 3
+          },
+          {
+            "code": "SIM102",
+            "count": 2
+          },
+          {
+            "code": "UP006",
+            "count": 86
+          },
+          {
+            "code": "UP007",
+            "count": 10
+          },
+          {
+            "code": "UP035",
+            "count": 5
+          },
+          {
+            "code": "UP045",
+            "count": 162
+          }
+        ],
+        "current": [
+          {
+            "code": "EXE002",
+            "count": 1
+          },
+          {
+            "code": "F811",
+            "count": 1
+          },
+          {
+            "code": "I001",
+            "count": 1
+          },
+          {
+            "code": "PERF102",
+            "count": 1
+          },
+          {
+            "code": "PLR1730",
+            "count": 1
+          },
+          {
+            "code": "RUF013",
+            "count": 3
+          },
+          {
+            "code": "SIM102",
+            "count": 2
+          },
+          {
+            "code": "UP006",
+            "count": 86
+          },
+          {
+            "code": "UP007",
+            "count": 10
+          },
+          {
+            "code": "UP035",
+            "count": 5
+          },
+          {
+            "code": "UP045",
+            "count": 162
+          }
+        ]
+      },
+      {
+        "path": "python/sglang/srt/managers/scheduler.py",
+        "baseline": [
+          {
+            "code": "BLE001",
+            "count": 11
+          },
+          {
+            "code": "C405",
+            "count": 1
+          },
+          {
+            "code": "C408",
+            "count": 2
+          },
+          {
+            "code": "F811",
+            "count": 2
+          },
+          {
+            "code": "LOG015",
+            "count": 7
+          },
+          {
+            "code": "PLR1711",
+            "count": 2
+          },
+          {
+            "code": "PLR1730",
+            "count": 1
+          },
+          {
+            "code": "RET501",
+            "count": 2
+          },
+          {
+            "code": "RUF010",
+            "count": 1
+          },
+          {
+            "code": "S110",
+            "count": 3
+          },
+          {
+            "code": "SIM102",
+            "count": 5
+          },
+          {
+            "code": "UP006",
+            "count": 14
+          },
+          {
+            "code": "UP007",
+            "count": 4
+          },
+          {
+            "code": "UP035",
+            "count": 5
+          },
+          {
+            "code": "UP045",
+            "count": 29
+          }
+        ],
+        "current": [
+          {
+            "code": "BLE001",
+            "count": 11
+          },
+          {
+            "code": "C405",
+            "count": 1
+          },
+          {
+            "code": "C408",
+            "count": 2
+          },
+          {
+            "code": "F811",
+            "count": 2
+          },
+          {
+            "code": "LOG015",
+            "count": 7
+          },
+          {
+            "code": "PLR1711",
+            "count": 2
+          },
+          {
+            "code": "PLR1730",
+            "count": 1
+          },
+          {
+            "code": "RET501",
+            "count": 2
+          },
+          {
+            "code": "RUF010",
+            "count": 1
+          },
+          {
+            "code": "S110",
+            "count": 3
+          },
+          {
+            "code": "SIM102",
+            "count": 5
+          },
+          {
+            "code": "UP006",
+            "count": 14
+          },
+          {
+            "code": "UP007",
+            "count": 4
+          },
+          {
+            "code": "UP035",
+            "count": 5
+          },
+          {
+            "code": "UP045",
+            "count": 29
+          }
+        ]
+      },
+      {
+        "path": "python/sglang/srt/managers/scheduler_components/request_receiver.py",
+        "baseline": [
+          {
+            "code": "I001",
+            "count": 1
+          },
+          {
+            "code": "SIM102",
+            "count": 1
+          },
+          {
+            "code": "UP006",
+            "count": 9
+          },
+          {
+            "code": "UP007",
+            "count": 2
+          },
+          {
+            "code": "UP035",
+            "count": 2
+          },
+          {
+            "code": "UP045",
+            "count": 6
+          }
+        ],
+        "current": [
+          {
+            "code": "I001",
+            "count": 1
+          },
+          {
+            "code": "SIM102",
+            "count": 1
+          },
+          {
+            "code": "UP006",
+            "count": 9
+          },
+          {
+            "code": "UP007",
+            "count": 2
+          },
+          {
+            "code": "UP035",
+            "count": 2
+          },
+          {
+            "code": "UP045",
+            "count": 6
+          }
+        ]
+      },
+      {
+        "path": "python/sglang/srt/training_capture/coordinator.py",
+        "baseline": [
+          {
+            "code": "BLE001",
+            "count": 9
+          }
+        ],
+        "current": [
+          {
+            "code": "BLE001",
+            "count": 9
+          }
+        ]
+      }
+    ],
+    "format": "Five files pass --check; three unrelated baseline formatting hunks in scheduler.py/schedule_batch.py preserved",
+    "python_compile": "All seven changed/added Python files pass Python 3.10 py_compile",
+    "git_diff_check": "passed",
+    "original_root_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "terminal_state": {
+    "all_six_jobs_terminal": true,
+    "resident_idle_load_resumed": true,
+    "idle_pid": 23552
+  },
+  "limitations": [
+    "Single-rank CaptureCoordinator leaves request_router=None; distributed factory still rejects unsupported topology.",
+    "TP2/PP2 tests exercise actual request communication and scheduler request/abort methods with synthetic resources, not distributed model forwards.",
+    "Effective execution digests are produced but must still join owner descriptor agreement before publication.",
+    "Coordinator activation, partitioned runtime contexts, accepted-token delivery, descriptor/receipt exchange and global teacher-logit handling remain.",
+    "Full runtime regression validates existing single-rank capture, not the distributed router.",
+    "One H100, TCP Store and a Catalog double do not prove multi-GPU inference, cross-node RDMA, production retention or trained draft quality.",
+    "Original design performance, compatibility, deployment and remaining feature requirements remain active."
+  ]
+}

@@ -2031,6 +2031,9 @@ class Scheduler(
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
+            training_capture_router=getattr(
+                self.tp_worker.training_capture, "request_router", None
+            ),
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -2370,6 +2373,9 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        capture_router = getattr(
+            getattr(self, "request_receiver", None), "training_capture_router", None
+        )
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -2432,7 +2438,14 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                training_capture_ticket=(
+                    recv_req.training_capture_ticket
+                    if capture_router is not None
+                    else None
+                ),
             )
+            if capture_router is not None:
+                capture_router.attach(recv_req, req)
             req.tokenizer = self.tokenizer
 
             if radix_native_session:
@@ -2718,7 +2731,12 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if getattr(req, "training_capture_cancel", None) is not None and (
+            req.finished() or req.to_finish is not None
+        ):
+            self._cancel_training_capture_request(req, "request_rejected")
         if not self._set_or_validate_priority(req):
+            self._cancel_training_capture_request(req, "priority_rejected")
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
@@ -2740,6 +2758,12 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    @staticmethod
+    def _cancel_training_capture_request(req, reason):
+        callback = getattr(req, "training_capture_cancel", None)
+        if callback is not None:
+            callback(req, reason)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -2812,6 +2836,7 @@ class Scheduler(
             ),
             req_to_abort,
         )
+        self._cancel_training_capture_request(req_to_abort, "queue_rejected")
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
@@ -2839,6 +2864,7 @@ class Scheduler(
                     req,
                 )
                 deleted_reqs.add(req)
+                self._cancel_training_capture_request(req, "waiting_timeout")
 
         if deleted_reqs:
             self.waiting_queue = [
@@ -4446,6 +4472,9 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+                self._cancel_training_capture_request(
+                    chunked_req, "chunked_request_aborted"
+                )
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
@@ -4460,6 +4489,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._cancel_training_capture_request(req, "queued_request_aborted")
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -4577,6 +4607,7 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+                self._cancel_training_capture_request(req, "running_request_aborted")
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
