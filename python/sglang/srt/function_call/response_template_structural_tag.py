@@ -578,12 +578,24 @@ def _reply_format(
     openers, closers = _openers(answer, message_start), _closers(answer)
     if not openers or closers is None:
         return None
+    return _sequence(_const_strings(openers), *_answer_text(closers))
+
+
+def _answer_text(closers: list[str]) -> list[dict[str, Any]]:
     # Text cannot close the answer early, so no unconstrained call can follow
     # it. Like a call, the answer may end at a stop token instead of a closer.
-    elements = [_const_strings(openers), {"type": "any_text", "excludes": closers}]
+    elements = [{"type": "any_text", "excludes": closers}]
     if closers:
         elements.append(_optional(_const_strings(closers)))
-    return _sequence(*elements)
+    return elements
+
+
+def answer_rest_structural_tag(answer: ResponseTemplateField) -> dict[str, Any] | None:
+    """The rest of an `answer` that is already open, or `None` if underivable."""
+    closers = _closers(answer)
+    if closers is None:
+        return None
+    return {"type": "structural_tag", "format": _sequence(*_answer_text(closers))}
 
 
 def supports_tool_call_structural_tag(
@@ -607,10 +619,21 @@ def tool_call_structural_tag(
     thinking: ResponseTemplateField | None = None,
     answer: ResponseTemplateField | None = None,
     message_start: list[str] | None = None,
+    grammar_requires_reasoning: bool = False,
 ) -> dict[str, Any] | None:
-    """Derive native calls, respecting strict arguments, count and optional reasoning.
+    """Derive native calls, respecting strict arguments, count and reasoning.
 
-    Raises `ValueError` for names the template cannot encode."""
+    Without tools, derive only the `answer`, if given. Raises `ValueError` for
+    names the template cannot encode."""
+    if not tools and answer is not None:
+
+        def reply(start: list[str] | None) -> list[dict[str, Any]] | None:
+            format = _reply_format(answer, start)
+            return None if format is None else [format]
+
+        return _structural_tag(
+            reply, thinking, message_start, grammar_requires_reasoning
+        )
     if not tools or not _names_function_by_opener(field):
         return None
     opener = _split_group(field.open_re.pattern, "name")
@@ -662,7 +685,7 @@ def tool_call_structural_tag(
             elements = [_one_of([_sequence(*elements), reply])]
         return elements
 
-    return _structural_tag(output, thinking, message_start)
+    return _structural_tag(output, thinking, message_start, grammar_requires_reasoning)
 
 
 def json_answer_structural_tag(
@@ -673,6 +696,7 @@ def json_answer_structural_tag(
     *,
     thinking: ResponseTemplateField | None = None,
     message_start: list[str] | None = None,
+    grammar_requires_reasoning: bool = False,
 ) -> dict[str, Any] | None:
     """Derive a JSON answer with optional calls to declared tools before it.
 
@@ -727,15 +751,17 @@ def json_answer_structural_tag(
 
     if message_start is None:
         thinking = None
-    return _structural_tag(output, thinking, message_start)
+    return _structural_tag(output, thinking, message_start, grammar_requires_reasoning)
 
 
 def _structural_tag(
     output: Callable[[list[str] | None], list[dict[str, Any]] | None],
     thinking: ResponseTemplateField | None,
     message_start: list[str] | None,
+    grammar_requires_reasoning: bool = False,
 ) -> dict[str, Any] | None:
-    """Frame output at the message start or after optional reasoning."""
+    """Frame output at the message start or after reasoning, which is optional
+    unless `grammar_requires_reasoning` makes the message open with it."""
     rest = output(None)
     if rest is None:
         return None
@@ -748,6 +774,8 @@ def _structural_tag(
         if think is not None:
             rest.insert(0, _optional(think))
         return {"type": "structural_tag", "format": _sequence(*rest)}
+    if think is not None and grammar_requires_reasoning:
+        return {"type": "structural_tag", "format": _sequence(think, *rest)}
     start = output(message_start)
     if start is None:
         return None

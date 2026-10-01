@@ -254,9 +254,9 @@ class TestBeamResponseTemplate(CustomTestCase):
                         calls,
                     )
 
-    def test_tag_from_message_start_covers_skipped_reasoning(self):
-        """A call continuing the start anchor must not be admitted unless it is read
-        back."""
+    def test_tag_from_message_start_requires_reasoning(self):
+        """Output from the start anchor must open with the reasoning, and a call
+        after it must be read back."""
         count = _tool("set_count", {"count": {"type": "integer"}})
         count.function.strict = True
         parser = FunctionCallParser(
@@ -266,7 +266,7 @@ class TestBeamResponseTemplate(CustomTestCase):
         city = _parameter("city", "Paris")
         weather = [("get_weather", {"city": "Paris"})]
         cases = [
-            (_continuation_call("get_weather", city), weather),
+            (_continuation_call("get_weather", city), None),
             (thought + _full_call("get_weather", city), weather),
             (_continuation_call("set_count", _parameter("count", "x")), None),
             (thought + _full_call("set_count", _parameter("count", "x")), None),

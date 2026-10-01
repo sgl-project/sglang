@@ -138,6 +138,35 @@ class TestToolCallStructuralTag(CustomTestCase):
     def test_answer_without_literal_opener_returns_none(self):
         self.assertIsNone(_build(answer=True))
 
+    def test_without_tools_only_the_answer_is_derived(self):
+        cases = [
+            ("<think>plan</think><answer>Sunny.</answer>", True),
+            ("<answer>Sunny.", True),
+            ("<think>plan</think>" + CALL, False),
+            ("Sunny.", False),
+        ]
+        tag = _build(ANSWER_TEMPLATE, tools=(), answer=True)
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertIs(_accepts(tag, text), expected)
+        self.assertIsNone(_build(ANSWER_TEMPLATE, tools=()))
+
+    def test_required_reasoning_opens_the_message(self):
+        loaded = load_response_template(ANSWER_TEMPLATE)
+        for required, expected in ((False, True), (True, False)):
+            tag = tool_call_structural_tag(
+                loaded.fields["tool_calls"],
+                [WEATHER],
+                parallel_tool_calls=True,
+                thinking=loaded.fields["thinking"],
+                answer=loaded.fields["content"],
+                message_start=["<assistant>"],
+                grammar_requires_reasoning=required,
+            )
+            with self.subTest(required=required):
+                self.assertIs(_accepts(tag, "<answer>Sunny."), expected)
+                self.assertTrue(_accepts(tag, "<think></think><answer>Sunny."))
+
     def test_json_arguments_follow_schema(self):
         template = copy.deepcopy(TEMPLATE)
         template["fields"]["tool_calls"].update(content="json", content_args={})

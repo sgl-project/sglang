@@ -374,7 +374,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
         serving = make_serving()
         seen = {}
 
-        def fake_process(chat_request, is_multimodal):
+        def fake_process(chat_request, is_multimodal, **_):
             seen["tools"] = chat_request.tools
             seen["tool_choice"] = chat_request.tool_choice
             seen["parallel_tool_calls"] = chat_request.parallel_tool_calls
@@ -791,6 +791,40 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         ):
             with self.subTest(text=text):
                 self.assertIs(_is_grammar_accept_string(grammar, text), expected)
+
+    def test_unconstrained_turns_take_the_template_grammar(self):
+        """Under Beam's parser, a turn nothing else constrains takes the template's
+        framing, opening with the reasoning, and a JSON `text.format` replaces it."""
+        call = '<call:get_weather>{"city": "Paris"}</call>'
+        answer = "<think>Plan</think><answer>Paris</answer>"
+        json_answer = '<think>Plan</think><answer>{"a": 1}'
+        for constraint, accepted in (
+            (
+                {},
+                {
+                    "<think>Plan</think>" + call: True,
+                    call: False,
+                    answer: True,
+                    json_answer: True,
+                    "Paris": False,
+                },
+            ),
+            (
+                {"text": {"format": {"type": "json_object"}}},
+                {"<think>Plan</think>" + call: True, answer: False, json_answer: True},
+            ),
+        ):
+            with self.subTest(constraint=constraint):
+                self._respond(
+                    stream=False, constraint=constraint, tool_call_parser="beam"
+                )
+                grammar = Grammar.from_structural_tag(
+                    self.sampling_params["structural_tag"]
+                )
+                for text, expected in accepted.items():
+                    self.assertIs(_is_grammar_accept_string(grammar, text), expected)
+        self._respond(stream=False, constraint={})
+        self.assertNotIn("structural_tag", self.sampling_params)
 
     def test_tool_call_is_parsed_under_delimited_template(self):
         """A tool call after the reasoning becomes a completed function call
