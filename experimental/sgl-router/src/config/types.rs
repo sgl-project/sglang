@@ -327,8 +327,8 @@ impl Default for ObservabilityConfig {
 pub struct ModelConfig {
     pub id: String,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
-    /// Resolved by [`crate::tokenizer::adapter::load`].
-    pub tokenizer_path: String,
+    /// Resolved by [`crate::tokenizer::adapter::load`]; `None` (`--no-tokenizer`) disables it.
+    pub tokenizer_path: Option<String>,
     /// Disable router-generated input IDs for this model; keep routing tokenization.
     /// Use when workers have rendering defaults or template stops the router cannot see.
     pub disable_input_ids_forwarding: bool,
@@ -433,6 +433,15 @@ pub struct CacheAwareConfig {
     /// meaningful when a peer selector is set; see
     /// [`K8sDiscoveryConfig::peer_selector`].
     pub bootstrap_timeout_ms: u64,
+    /// Upper bound on the per-fetch timeout derived from `bootstrap_timeout_ms`;
+    /// see `snapshot_fetch_timeout`. Validated by `Config::validate`.
+    pub bootstrap_fetch_timeout_cap_ms: u64,
+    /// Hold `/readyz` at 503 when a sweep over a non-empty candidate set timed
+    /// out. Bounded at max(3x `bootstrap_timeout_ms`, 60s), after which the
+    /// replica serves cache-blind; nothing re-sweeps during the hold, so this
+    /// delays a failed seed's replica and a fleet-wide restart is a delay, not
+    /// an outage.
+    pub bootstrap_seed_required: bool,
 }
 
 impl Default for CacheAwareConfig {
@@ -441,6 +450,8 @@ impl Default for CacheAwareConfig {
             prefix_provider: CachePrefixProvider::default(),
             kv_indexer_endpoint: None,
             bootstrap_timeout_ms: DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+            bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
+            bootstrap_seed_required: false,
         }
     }
 }
@@ -450,6 +461,20 @@ impl Default for CacheAwareConfig {
 /// transfer and the graft). Readiness waits on it, so a pod's startup or
 /// readiness probe must tolerate a replica that stays unready this long.
 pub const DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 600_000;
+
+/// Default cap on one peer-snapshot fetch: past the producer's export build
+/// plus one gzipped transfer + decode of a warm fleet's snapshot body (tens of
+/// MB gzipped, hundreds inflated).
+/// Connect and read timeouts bound a hung peer; this bounds only a transfer
+/// that is progressing. Must agree with
+/// [`crate::state::kv_events::bootstrap::DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP`];
+/// a test pins the two.
+pub const DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 300_000;
+
+/// Floor for `--kv-bootstrap-fetch-timeout-cap-ms`; below it the cap would cut
+/// every fetch short of a body transfer. Equals `SNAPSHOT_FETCH_TIMEOUT_FLOOR`
+/// in `state::kv_events::index::sweep`; a test pins the two.
+pub const MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 30_000;
 
 /// Ceiling on `--kv-bootstrap-timeout-ms` (1 hour); past it, `Instant +
 /// Duration` can overflow and panic.
@@ -657,6 +682,9 @@ pub struct K8sDiscoveryConfig {
     /// Requires the router's ServiceAccount to have `list`/`watch` on
     /// EndpointSlices in that namespace.
     pub peer_selector: Option<String>,
+    /// EndpointSlice label key whose value is a worker's PD version group.
+    /// Set only in PD mode.
+    pub version_group_label: Option<String>,
 }
 
 /// Validated selector mode. Plain selectors run server-side; PD selectors
