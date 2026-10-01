@@ -70,9 +70,7 @@ class TestCFGNormalizationPerSample(unittest.TestCase):
         pred[1] *= 50.0
 
         co_batched = _apply_cfg_normalization(pred, cond, self.CFG_NORMALIZATION)
-        solo = _apply_cfg_normalization(
-            pred[:1], cond[:1], self.CFG_NORMALIZATION
-        )
+        solo = _apply_cfg_normalization(pred[:1], cond[:1], self.CFG_NORMALIZATION)
 
         self.assertTrue(torch.equal(solo, co_batched[:1]))
 
