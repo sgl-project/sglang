@@ -1399,12 +1399,13 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # Initialize Wan-specific parameters
         teacache_params = ctx.teacache_params
         use_ret_steps = teacache_params.use_ret_steps
-        start_skipping, end_skipping = teacache_params.get_skip_boundaries(
-            ctx.num_inference_steps, ctx.do_cfg
+        start_skipping, end_skipping = teacache_params.get_skip_step_range(
+            ctx.num_inference_steps
         )
 
-        # Determine boundary step
-        is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping
+        # Count the window in denoising steps: the number of local forwards per
+        # step varies with CFG parallel and CFG gating.
+        is_boundary_step = not start_skipping <= ctx.current_timestep < end_skipping
 
         timestep_proj = kwargs["timestep_proj"]
         temb = kwargs["temb"]
