@@ -18,6 +18,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import post_experts_all_reduce
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -591,6 +592,7 @@ def load_iquest_q1_weights(
         ("gate_up_proj", "up_proj", 1),
     ]
     params_dict = dict(model.named_parameters())
+    expert_params_mapping = None
     loaded = set()
     loaded_shards = {}
     for name, loaded_weight in weights:
@@ -639,6 +641,33 @@ def load_iquest_q1_weights(
                     shard_id="w2",
                     expert_id=expert_id,
                 )
+            continue
+        if ".experts." in name:
+            if expert_params_mapping is None:
+                expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                    ckpt_gate_proj_name="gate_proj",
+                    ckpt_down_proj_name="down_proj",
+                    ckpt_up_proj_name="up_proj",
+                    num_experts=model.config.num_experts,
+                )
+            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+                if weight_name not in name:
+                    continue
+                mapped_name = name.replace(weight_name, param_name)
+                if mapped_name not in params_dict:
+                    raise ValueError(f"Unexpected IQuest Q1 weight: {name}")
+                param = params_dict[mapped_name]
+                param.weight_loader(
+                    param,
+                    loaded_weight,
+                    mapped_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                loaded.add(mapped_name)
+                break
+            else:
+                raise ValueError(f"Unexpected IQuest Q1 weight: {name}")
             continue
         if "router.weight" in name:
             name = name.replace("router.weight", "gate.weight")
