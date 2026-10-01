@@ -2056,17 +2056,13 @@ class MHATokenToKVPool(KVCache):
                         "expected 'nhd' or 'vectorized_5d'."
                     )
                 self.kv_cache_layout = layout
-                if layout == "vectorized_5d":
-                    # X = 16 / storage itemsize: sized by the STORAGE dtype (not compute
-                    # dtype) since it tiles the 16-byte on-pool vector.
-                    self._kv_vector_x = 16 // self.store_dtype.itemsize
-                    assert (self.size + self.page_size) % self.page_size == 0
-                    assert self.page_size % self._kv_vector_x == 0, (
-                        f"page_size={self.page_size} must be divisible by "
-                        f"X={self._kv_vector_x} for vectorized_5d layout"
-                    )
-                    assert self.head_dim % self._kv_vector_x == 0
-                    assert self.v_head_dim % self._kv_vector_x == 0
+        if self.kv_cache_layout == "vectorized_5d":
+            # Explicit selectors need the same vector geometry as the env path.
+            self._kv_vector_x = 16 // self.store_dtype.itemsize
+            assert (self.size + self.page_size) % self.page_size == 0
+            assert self.page_size % self._kv_vector_x == 0
+            assert self.head_dim % self._kv_vector_x == 0
+            assert self.v_head_dim % self._kv_vector_x == 0
 
         self.quant_method = (
             quant_method if quant_method is not None else UnquantizedKVCacheMethod()
@@ -5485,6 +5481,33 @@ class MiniMaxSparseKVPool(KVCache):
         index_dtype = index_dtype if index_dtype is not None else dtype
         index_pool_size = size * host_to_device_ratio if enable_hisparse else size
 
+        main_layout = {}
+        index_layout = {}
+        if envs.SGLANG_MINIMAX_FLYDSL_DECODE.get():
+            if enable_hisparse or main_pool_cls is not MHATokenToKVPool:
+                raise ValueError("MiniMax FlyDSL requires the standard MHA KV pool")
+            if index_kv_pool_cls is not MHATokenToKVPool:
+                raise ValueError("MiniMax FlyDSL requires the standard index KV pool")
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+
+            from sglang.srt.layers.attention.minimax_sparse_ops.flydsl_decode import (
+                load_flydsl,
+            )
+
+            arch = get_gfx_runtime()
+            expected_dtype = (
+                torch.float8_e4m3fnuz if arch == "gfx942" else torch.float8_e4m3fn
+            )
+            if arch not in ("gfx942", "gfx950") or dtype != expected_dtype:
+                raise ValueError("MiniMax FlyDSL requires gfx942/gfx950 E4M3 KV")
+            if page_size not in (16, 64, 128) or not (
+                head_dim == 64 or (head_dim % 128 == 0 and head_dim <= 1024)
+            ):
+                raise ValueError("Unsupported MiniMax FlyDSL page size/head dimension")
+            load_flydsl()
+            main_layout = {"kv_cache_layout": "vectorized_5d"}
+            index_layout = {"kv_cache_layout": "nhd"}
+
         # Split sparse layers by V policy: kv_sparse (index_kv_pool holds K+V) vs
         # k_only_sparse (index_k_pool holds only K; V is never read).
         disable_set = set(disable_value_sparse_layer_ids or [])
@@ -5555,6 +5578,7 @@ class MiniMaxSparseKVPool(KVCache):
                 enable_memory_saver=enable_memory_saver,
                 start_layer=start_layer,
                 end_layer=end_layer,
+                **main_layout,
             )
 
         self.index_kv_pool: Optional[MHATokenToKVPool] = (
@@ -5567,6 +5591,7 @@ class MiniMaxSparseKVPool(KVCache):
                 layer_num=len(local_kv_sparse_layer_ids),
                 device=device,
                 enable_memory_saver=enable_memory_saver,
+                **index_layout,
             )
             if local_kv_sparse_layer_ids
             else None
@@ -5916,4 +5941,4 @@ class MiniMaxSparseKVPool(KVCache):
     def get_v_head_dim(self):
         # Use start_layer to handle pipeline parallelism where layer 0
         # may not be present in this stage's buffer.
-        return self.main_pool.get_value_buffer(self.main_pool.start_layer).shape[-1]
+        return self.main_pool.v_head_dim

@@ -168,6 +168,32 @@ def minimax_sparse_prefill(
 
     # Reduced top-k cached by the caller for subsequent skip layers.
     reduced_topk_idx = topk_idx
+    if k_cache.ndim == 5:
+        from .flydsl_decode import sparse_prefill
+
+        if (
+            sink is not None
+            or q_scale not in (None, 1.0)
+            or loc_mapping is not None
+            or block_size_q != 1
+        ):
+            raise ValueError("Unsupported MiniMax FlyDSL sparse prefill contract")
+        o = sparse_prefill(
+            q,
+            k_cache,
+            v_cache,
+            topk_idx,
+            req_to_token,
+            slot_ids,
+            cu_seqlens,
+            prefix_lens,
+            max_seqlen_q,
+            block_size_k,
+            sm_scale,
+            k_scale,
+            v_scale,
+        )
+        return (idx_o, o, reduced_topk_idx) if return_topk_idx else (idx_o, o)
     # Step 3: Sparse attention using topk index (main head). The Gluon and
     # MSA paths only replace this step; the indexer above is unchanged. MSA has
     # no attn-sink input, so keep the Triton path when sink is present.
@@ -393,6 +419,29 @@ def minimax_sparse_decode(
         hisparse_slots = (
             hisparse_swap_in_fn(topk_idx) if hisparse_swap_in_fn is not None else None
         )
+        if k_cache.ndim == 5:
+            from .flydsl_decode import sparse_decode
+
+            if (
+                sink is not None
+                or q_scale not in (None, 1.0)
+                or hisparse_slots is not None
+            ):
+                raise ValueError("Unsupported MiniMax FlyDSL sparse decode contract")
+            o = sparse_decode(
+                q,
+                k_cache,
+                v_cache,
+                topk_idx,
+                req_to_token,
+                slot_ids,
+                seq_lens,
+                block_size_k,
+                sm_scale,
+                k_scale,
+                v_scale,
+            )
+            return idx_o, o
         # Step 3: Sparse attention using topk index (main head). The MSA path
         # only replaces this step; keep the Triton path when sink is present.
         if use_msa and sink is None and hisparse_slots is None:

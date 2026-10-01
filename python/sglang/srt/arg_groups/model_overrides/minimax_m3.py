@@ -21,6 +21,48 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
 
+    if envs.SGLANG_MINIMAX_FLYDSL_DECODE.get():
+        # This first integration supports ordinary aggregate decode. Reject
+        # features whose cache movement or verify masks need separate adapters.
+        if not get_platform().is_hip or not envs.SGLANG_USE_AITER.get():
+            raise ValueError("MiniMax FlyDSL requires ROCm and SGLANG_USE_AITER=1")
+        if cfg.attention_backend not in (None, "aiter"):
+            raise ValueError("MiniMax FlyDSL requires --attention-backend aiter")
+        if cfg.prefill_attention_backend not in (
+            None,
+            "aiter",
+        ) or cfg.decode_attention_backend not in (None, "aiter"):
+            raise ValueError(
+                "MiniMax FlyDSL requires AITER for both prefill and decode"
+            )
+        if cfg.kv_cache_dtype != "fp8_e4m3":
+            raise ValueError("MiniMax FlyDSL requires --kv-cache-dtype fp8_e4m3")
+        if cfg.page_size not in (None, 16, 64, 128):
+            raise ValueError("MiniMax FlyDSL requires page size 16, 64 or 128")
+        unsupported = {
+            "speculative decoding": cfg.speculative_algorithm is not None,
+            "HiSparse": cfg.enable_hisparse,
+            "HiCache": cfg.enable_hierarchical_cache,
+            "PD disaggregation": cfg.disaggregation_mode != "null",
+            "DP attention": cfg.enable_dp_attention,
+            "context parallelism": cfg.dcp_size > 1 or cfg.attn_cp_size > 1,
+            "two-batch overlap": cfg.enable_two_batch_overlap,
+            "single-batch overlap": cfg.enable_single_batch_overlap,
+            "HND cache": envs.SGLANG_USE_HND_KVCACHE.get(),
+            "dense sparse decode": envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get(),
+        }
+        for name, enabled in unsupported.items():
+            if enabled:
+                raise ValueError(f"MiniMax FlyDSL does not yet support {name}")
+        overrides["attention_backend"] = "aiter"
+        if cfg.page_size is None:
+            overrides["page_size"] = 16
+        logger.info(
+            "MiniMax FlyDSL decode enabled: SHUFFLE main KV, NHD index KV; "
+            "dense graph planner=%s, sparse static partitions",
+            envs.SGLANG_MINIMAX_FLYDSL_PLAN.get(),
+        )
+
     quant_method = get_quantization_config(hf_config)
     quant_resolved = cfg.quantization
     if (
@@ -32,7 +74,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         quant_resolved = quant_method
 
     if get_platform().is_hip:
-        if is_attention_backend_not_set(cfg):
+        if is_attention_backend_not_set(cfg) and "attention_backend" not in overrides:
             overrides["attention_backend"] = "triton"
         if cfg.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
             overrides["moe_runner_backend"] = "triton"

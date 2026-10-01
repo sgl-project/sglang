@@ -1,0 +1,517 @@
+{
+  "scope": "isolated SGLang sparse decode including FlyDSL page-table construction",
+  "sglang_base": "fc9e1c8d296216ff1e216dfbe7286ef392448d28",
+  "shape": {
+    "q_heads_per_rank": 16,
+    "kv_heads_per_rank": 1,
+    "head_dim": 128,
+    "page_size": 16,
+    "sparse_block_size": 128,
+    "topk_blocks": 16
+  },
+  "checks": [
+    {
+      "case": "sglang-baseline-batch1-uniform",
+      "max_abs_error": 9.050779044628143e-05,
+      "relative_l2_error": 0.0027043980080634356,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "flydsl-candidate-batch1-uniform",
+      "max_abs_error": 0.0007676705718040466,
+      "relative_l2_error": 0.026650289073586464,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sglang-baseline-batch1-mixed",
+      "max_abs_error": 7.698498666286469e-05,
+      "relative_l2_error": 0.0028701683040708303,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "flydsl-candidate-batch1-mixed",
+      "max_abs_error": 0.0006485804915428162,
+      "relative_l2_error": 0.02874397486448288,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sglang-baseline-batch2-uniform",
+      "max_abs_error": 8.979625999927521e-05,
+      "relative_l2_error": 0.002875257283449173,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "flydsl-candidate-batch2-uniform",
+      "max_abs_error": 0.0007658058311790228,
+      "relative_l2_error": 0.02753160521388054,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sglang-baseline-batch2-mixed",
+      "max_abs_error": 9.964406490325928e-05,
+      "relative_l2_error": 0.00293897558003664,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "flydsl-candidate-batch2-mixed",
+      "max_abs_error": 0.0009442698210477829,
+      "relative_l2_error": 0.028829868882894516,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sglang-baseline-batch10-uniform",
+      "max_abs_error": 9.215064346790314e-05,
+      "relative_l2_error": 0.002865564776584506,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "flydsl-candidate-batch10-uniform",
+      "max_abs_error": 0.0008081775158643723,
+      "relative_l2_error": 0.02761678956449032,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sglang-baseline-batch10-mixed",
+      "max_abs_error": 0.00014631450176239014,
+      "relative_l2_error": 0.0029193609952926636,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "flydsl-candidate-batch10-mixed",
+      "max_abs_error": 0.0011777505278587341,
+      "relative_l2_error": 0.02794043906033039,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sglang-baseline-batch15-uniform",
+      "max_abs_error": 0.00010018423199653625,
+      "relative_l2_error": 0.0028799460269510746,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "flydsl-candidate-batch15-uniform",
+      "max_abs_error": 0.0008734208531677723,
+      "relative_l2_error": 0.027830148115754128,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sglang-baseline-batch15-mixed",
+      "max_abs_error": 0.00014648586511611938,
+      "relative_l2_error": 0.002849617274478078,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "flydsl-candidate-batch15-mixed",
+      "max_abs_error": 0.0011643199250102043,
+      "relative_l2_error": 0.027326675131917,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sglang-baseline-batch20-uniform",
+      "max_abs_error": 0.0001232139766216278,
+      "relative_l2_error": 0.002840454690158367,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "flydsl-candidate-batch20-uniform",
+      "max_abs_error": 0.0007824022322893143,
+      "relative_l2_error": 0.02727174200117588,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sglang-baseline-batch20-mixed",
+      "max_abs_error": 0.0001733154058456421,
+      "relative_l2_error": 0.0028780344873666763,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "flydsl-candidate-batch20-mixed",
+      "max_abs_error": 0.0010707932524383068,
+      "relative_l2_error": 0.027787284925580025,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    }
+  ],
+  "benchmarks": [
+    {
+      "batch": 1,
+      "distribution": "uniform",
+      "timings": {
+        "sglang_triton": {
+          "median_us": 7.4425095319747925,
+          "rounds_us": [
+            7.439987659454346,
+            7.4419838190078735,
+            7.4425095319747925,
+            7.445509433746338,
+            7.443333864212036,
+            7.442484498023987,
+            7.44615912437439
+          ]
+        },
+        "flydsl_adapter": {
+          "median_us": 8.171390295028687,
+          "rounds_us": [
+            8.168343305587769,
+            8.168668150901794,
+            8.168990015983582,
+            8.172339797019958,
+            8.174265027046204,
+            8.171390295028687,
+            8.172990083694458
+          ]
+        }
+      },
+      "latency_reduction_pct": -9.793481082186716,
+      "kernel_speedup": 0.9108008873964408
+    },
+    {
+      "batch": 1,
+      "distribution": "mixed",
+      "timings": {
+        "sglang_triton": {
+          "median_us": 7.529234886169434,
+          "rounds_us": [
+            7.530410289764404,
+            7.526310086250305,
+            7.529360055923462,
+            7.529234886169434,
+            7.532335519790649,
+            7.5267863273620605,
+            7.526184916496277
+          ]
+        },
+        "flydsl_adapter": {
+          "median_us": 8.22374165058136,
+          "rounds_us": [
+            8.22104036808014,
+            8.223639130592346,
+            8.22413980960846,
+            8.228290677070618,
+            8.22646677494049,
+            8.22374165058136,
+            8.222315907478333
+          ]
+        }
+      },
+      "latency_reduction_pct": -9.224134655271232,
+      "kernel_speedup": 0.9155485673163347
+    },
+    {
+      "batch": 2,
+      "distribution": "uniform",
+      "timings": {
+        "sglang_triton": {
+          "median_us": 7.584510445594788,
+          "rounds_us": [
+            7.584112882614136,
+            7.583338022232056,
+            7.5870102643966675,
+            7.5817859172821045,
+            7.585885524749756,
+            7.584510445594788,
+            7.58586049079895
+          ]
+        },
+        "flydsl_adapter": {
+          "median_us": 8.23011577129364,
+          "rounds_us": [
+            8.229668140411377,
+            8.232043981552124,
+            8.228015899658203,
+            8.232040405273438,
+            8.226640820503235,
+            8.23011577129364,
+            8.23149025440216
+          ]
+        }
+      },
+      "latency_reduction_pct": -8.512155535019804,
+      "kernel_speedup": 0.9215557419069728
+    },
+    {
+      "batch": 2,
+      "distribution": "mixed",
+      "timings": {
+        "sglang_triton": {
+          "median_us": 7.555960416793823,
+          "rounds_us": [
+            7.559185028076172,
+            7.554334998130798,
+            7.555735111236572,
+            7.558610439300537,
+            7.55343496799469,
+            7.557435035705566,
+            7.555960416793823
+          ]
+        },
+        "flydsl_adapter": {
+          "median_us": 8.209614753723145,
+          "rounds_us": [
+            8.20856511592865,
+            8.209614753723145,
+            8.208815455436707,
+            8.212339878082275,
+            8.216915726661682,
+            8.21004033088684,
+            8.207989931106567
+          ]
+        }
+      },
+      "latency_reduction_pct": -8.650843848738464,
+      "kernel_speedup": 0.9203794140726418
+    },
+    {
+      "batch": 10,
+      "distribution": "uniform",
+      "timings": {
+        "sglang_triton": {
+          "median_us": 8.813045024871826,
+          "rounds_us": [
+            8.83809745311737,
+            8.813045024871826,
+            8.79056990146637,
+            8.83504569530487,
+            8.787419199943542,
+            8.819645643234253,
+            8.792369365692139
+          ]
+        },
+        "flydsl_adapter": {
+          "median_us": 8.5547935962677,
+          "rounds_us": [
+            8.542544841766357,
+            8.56069564819336,
+            8.535867929458618,
+            8.560518026351929,
+            8.5547935962677,
+            8.563268184661865,
+            8.527343273162842
+          ]
+        }
+      },
+      "latency_reduction_pct": 2.930331433406941,
+      "kernel_speedup": 1.030187920456292
+    },
+    {
+      "batch": 10,
+      "distribution": "mixed",
+      "timings": {
+        "sglang_triton": {
+          "median_us": 8.759769201278687,
+          "rounds_us": [
+            8.770620226860046,
+            8.762444853782654,
+            8.74356985092163,
+            8.760994672775269,
+            8.741419911384583,
+            8.759769201278687,
+            8.744770288467407
+          ]
+        },
+        "flydsl_adapter": {
+          "median_us": 8.566043972969055,
+          "rounds_us": [
+            8.562718033790588,
+            8.566043972969055,
+            8.562818765640259,
+            8.57084333896637,
+            8.56799304485321,
+            8.572742938995361,
+            8.561267852783203
+          ]
+        }
+      },
+      "latency_reduction_pct": 2.211533476034422,
+      "kernel_speedup": 1.0226154837543386
+    },
+    {
+      "batch": 15,
+      "distribution": "uniform",
+      "timings": {
+        "sglang_triton": {
+          "median_us": 9.130447506904602,
+          "rounds_us": [
+            9.165300726890564,
+            9.165747165679932,
+            9.044647216796875,
+            9.141772389411926,
+            9.053347110748291,
+            9.130447506904602,
+            9.051346182823181
+          ]
+        },
+        "flydsl_adapter": {
+          "median_us": 8.725619316101074,
+          "rounds_us": [
+            8.72184693813324,
+            8.7559974193573,
+            8.724845051765442,
+            8.763595223426819,
+            8.72344434261322,
+            8.7589693069458,
+            8.725619316101074
+          ]
+        }
+      },
+      "latency_reduction_pct": 4.433826386903705,
+      "kernel_speedup": 1.0463953532852979
+    },
+    {
+      "batch": 15,
+      "distribution": "mixed",
+      "timings": {
+        "sglang_triton": {
+          "median_us": 9.03224766254425,
+          "rounds_us": [
+            9.075197577476501,
+            9.03224766254425,
+            9.003246426582336,
+            9.059322476387024,
+            9.001246094703674,
+            9.037646651268005,
+            9.002546668052673
+          ]
+        },
+        "flydsl_adapter": {
+          "median_us": 8.63031804561615,
+          "rounds_us": [
+            8.629618287086487,
+            8.642318844795227,
+            8.63031804561615,
+            8.64539384841919,
+            8.627743124961853,
+            8.64734411239624,
+            8.626843094825745
+          ]
+        }
+      },
+      "latency_reduction_pct": 4.449940169320854,
+      "kernel_speedup": 1.0465718198105416
+    },
+    {
+      "batch": 20,
+      "distribution": "uniform",
+      "timings": {
+        "sglang_triton": {
+          "median_us": 11.046837568283081,
+          "rounds_us": [
+            11.075865030288696,
+            11.067312955856323,
+            11.043663024902344,
+            11.04298710823059,
+            11.046837568283081,
+            11.041487455368042,
+            11.049162149429321
+          ]
+        },
+        "flydsl_adapter": {
+          "median_us": 8.640743494033813,
+          "rounds_us": [
+            8.637720346450806,
+            8.649244904518127,
+            8.640743494033813,
+            8.641218543052673,
+            8.636219501495361,
+            8.645394444465637,
+            8.632043600082397
+          ]
+        }
+      },
+      "latency_reduction_pct": 21.780840529035018,
+      "kernel_speedup": 1.2784591483256744
+    },
+    {
+      "batch": 20,
+      "distribution": "mixed",
+      "timings": {
+        "sglang_triton": {
+          "median_us": 10.994812250137329,
+          "rounds_us": [
+            11.008862257003784,
+            10.994812250137329,
+            10.994012355804443,
+            11.002037525177002,
+            10.987287759780884,
+            11.003313064575195,
+            10.987536907196045
+          ]
+        },
+        "flydsl_adapter": {
+          "median_us": 8.606643676757812,
+          "rounds_us": [
+            8.606618642807007,
+            8.611568808555603,
+            8.606643676757812,
+            8.613868951797485,
+            8.605718612670898,
+            8.612443208694458,
+            8.60356867313385
+          ]
+        }
+      },
+      "latency_reduction_pct": 21.72086725127742,
+      "kernel_speedup": 1.2774796614188584
+    }
+  ],
+  "passed": true
+}

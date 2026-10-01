@@ -429,6 +429,7 @@ class AiterAttnBackend(AttentionBackend):
         # corresponding branch in forward_decode), since unified_attention's
         # 4D `.view(-1, page, H, D)` cannot be applied to a 5D pool.
         def _pool_is_vec5d(pool):
+            pool = getattr(pool, "main_pool", pool)
             if isinstance(pool, SWAKVPool):
                 return getattr(pool.full_kv_pool, "kv_cache_layout", "nhd") == (
                     "vectorized_5d"
@@ -436,6 +437,19 @@ class AiterAttnBackend(AttentionBackend):
             return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
 
         self.kv_cache_is_vectorized_5d = _pool_is_vec5d(model_runner.token_to_kv_pool)
+        self.minimax_flydsl = envs.SGLANG_MINIMAX_FLYDSL_DECODE.get() and hasattr(
+            self.token_to_kv_pool, "main_pool"
+        )
+        self.flydsl_planner = None
+        if self.minimax_flydsl:
+            from sglang.srt.layers.attention.minimax_sparse_ops.flydsl_decode import (
+                DenseDecodePlanner,
+            )
+
+            self.flydsl_planner = DenseDecodePlanner(
+                self.token_to_kv_pool.main_pool.head_num,
+                enable_plan=envs.SGLANG_MINIMAX_FLYDSL_PLAN.get(),
+            )
 
         if self.use_sliding_window_kv_pool:
             self.use_triton_unified_attention = True
@@ -443,6 +457,10 @@ class AiterAttnBackend(AttentionBackend):
             self.use_triton_unified_attention = get_bool_env_var(
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
+        # Build 2D physical page tables for paged FlyDSL decode. Prefill still
+        # uses the existing flattened token-slot metadata.
+        if self.minimax_flydsl:
+            self.use_triton_unified_attention = True
 
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
         # mask reduces to pure causal and can go through unified_attention
@@ -1502,6 +1520,8 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if self.flydsl_planner is not None:
+            self.flydsl_planner.prepare(forward_batch, in_capture=in_capture)
         reset_verify_attn_plan_cache()
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
@@ -1539,8 +1559,15 @@ class AiterAttnBackend(AttentionBackend):
                 :n
             ]
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        if self.flydsl_planner is not None:
+            self.flydsl_planner.refresh(forward_batch)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
+        if self.flydsl_planner is not None:
+            # Eager forwards must not consume stale graph plans.
+            self.flydsl_planner.prepare_eager(forward_batch)
         reset_verify_attn_plan_cache()
 
         bs = forward_batch.batch_size
