@@ -536,6 +536,11 @@ class GenerateReqInput:
 
         self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
 
+        if self.parallel_sample_num > 1 and isinstance(self.rid, str):
+            # Keep the caller RID only as runtime bookkeeping. A private
+            # attribute avoids adding an internal field to the request schema.
+            self._parallel_sampling_parent_rid = self.rid
+
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
             self.is_single = False
