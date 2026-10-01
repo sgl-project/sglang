@@ -321,7 +321,6 @@ def chunked_sgmv_lora_shrink_forward(
     # shapes and deterministic inference on the original accumulation order.
     if (
         envs.SGLANG_CSGMV_SPLIT_K.get()
-        and S <= 128
         and MAX_RANK == 32
         and K in (4096, 12288)
         and x.dtype == torch.bfloat16
