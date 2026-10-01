@@ -107,7 +107,8 @@ export const config = {
           ],
           hints: [
             "Sparse MLA prefill computes in FP8 over the BF16 KV cache; the cache stays BF16 and decode stays on TileLang.",
-            "Single-GPU microbenchmark of the DSA prefill path: 1.51-1.72x at the 16 local heads TP4 gives, 1.74-1.99x at 64 heads. End to end on 4x H200 (TP4): 7.85-8.78% lower single-request TTFT at 8,000-120,000 input tokens (at 3,500 the two are at parity), and 8.60-9.42% higher total token throughput on a prefill-dominated workload. Prefill only; the gate is SM90 compute capability, so any Hopper GPU is eligible, but the numbers above are H200-only.",
+            "Single-GPU microbenchmark of the DSA prefill path: 1.51-1.72x at the 16 local heads TP4 gives (the same at the 8 local heads this TP8 recipe gives), 1.74-1.99x at 64 heads. End to end on 4x H200 (TP4): 7.85-8.78% lower single-request TTFT at 8,000-120,000 input tokens (at 3,500 the two are at parity), and 8.60-9.42% higher total token throughput on a prefill-dominated workload. Prefill only; the gate is SM90 compute capability, so any Hopper GPU is eligible, but the numbers above are H200-only.",
+            "Requires a build with PR #41790.",
           ],
         },
       ],
