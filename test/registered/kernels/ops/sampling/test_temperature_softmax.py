@@ -7,7 +7,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.speculative.temperature_softmax import temperature_softmax
+from sglang.kernels.ops.sampling import softmax
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -21,7 +21,7 @@ class TestTemperatureSoftmax(CustomTestCase):
 
     def assert_matches_torch(self, logits: torch.Tensor, temperatures: torch.Tensor):
         expected = torch.softmax(logits / temperatures, dim=-1)
-        actual = temperature_softmax(logits, temperatures)
+        actual = softmax(logits, temperatures=temperatures)
 
         torch.testing.assert_close(actual, expected, rtol=2e-5, atol=1e-7)
 

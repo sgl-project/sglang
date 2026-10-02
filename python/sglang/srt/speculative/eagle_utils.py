@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
 )
-from sglang.kernels.ops.speculative.temperature_softmax import temperature_softmax
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
@@ -926,8 +926,8 @@ def eagle_sample(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        target_probs = temperature_softmax(
-            next_token_logits, expanded_temperature
+        target_probs = sampling_softmax(
+            next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:

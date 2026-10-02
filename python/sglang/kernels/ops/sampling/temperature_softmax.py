@@ -1,4 +1,4 @@
-"""Split-row temperature softmax for the speculative sampling shapes."""
+"""Split-row temperature softmax for low-row-count sampling workloads."""
 
 import torch
 import triton
