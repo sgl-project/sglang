@@ -96,6 +96,7 @@ class BaseReasoningFormatDetector:
         self._buffer = ""
         self._streamed_reasoning_tail = ""
         self.stripped_think_start = False
+        self._at_reasoning_start = True
         self.think_start_self_label = ""
 
         self._force_nonempty_content = force_nonempty_content
@@ -234,6 +235,17 @@ class BaseReasoningFormatDetector:
             self._buffer = current_text
             self.stripped_think_start = True
             self._in_reasoning = True
+
+        # Match one-shot parsing's repeated leading markers, including when
+        # the next opening marker is split across streaming chunks.
+        if self._at_reasoning_start:
+            if self.stripped_think_start:
+                while current_text.startswith(think_start_text):
+                    current_text = current_text[len(think_start_text) :]
+                self._buffer = current_text
+                if current_text and think_start_text.startswith(current_text):
+                    return StreamingParseResult()
+            self._at_reasoning_start = not current_text
 
         # Handle end of reasoning block
         if self._in_reasoning and self.think_end_token in current_text:

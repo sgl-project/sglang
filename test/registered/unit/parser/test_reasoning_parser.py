@@ -1148,6 +1148,36 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             ("abc reasoning", "normal text"),
         )
 
+    def test_repeated_leading_think_tokens(self):
+        for detector_class in (DeepSeekR1Detector, Qwen3Detector):
+            for stream_reasoning in (True, False):
+                with self.subTest(
+                    detector=detector_class.__name__, stream_reasoning=stream_reasoning
+                ):
+                    self._assert_invariant(
+                        lambda: detector_class(stream_reasoning=stream_reasoning),
+                        "<think><think><think>abc</think>answer",
+                        ("abc", "answer"),
+                    )
+
+    def test_truncated_repeated_leading_think_token_is_preserved(self):
+        for stream_reasoning in (True, False):
+            with self.subTest(stream_reasoning=stream_reasoning):
+                self._assert_invariant(
+                    lambda: Qwen3Detector(stream_reasoning=stream_reasoning),
+                    "<think><think><think><thi",
+                    ("<thi", ""),
+                )
+
+    def test_think_token_inside_reasoning_payload_is_preserved(self):
+        for stream_reasoning in (True, False):
+            with self.subTest(stream_reasoning=stream_reasoning):
+                self._assert_invariant(
+                    lambda: Qwen3Detector(stream_reasoning=stream_reasoning),
+                    "<think><think>Use <think> as a marker.</think>answer",
+                    ("Use <think> as a marker.", "answer"),
+                )
+
     def test_literal_angle_bracket_in_reasoning_is_not_swallowed(self):
         self._assert_invariant(
             DeepSeekR1Detector,
