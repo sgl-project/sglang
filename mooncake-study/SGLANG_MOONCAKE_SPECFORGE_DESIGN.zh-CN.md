@@ -453,6 +453,24 @@ TP/PP、P/D prefill graph、Inductor、RDMA 组合或服务性能。复现和完
 [`experiments/DISTRIBUTED_PREFILL_CAPTURE.md`](experiments/DISTRIBUTED_PREFILL_CAPTURE.md)
 和 [`experiments/distributed-prefill-capture.json`](experiments/distributed-prefill-capture.json)。
 
+P/D prefill graph 另已通过 TP1/PP1 的九项组合：AR 的 Full 同步/overlap、
+Breakable/piecewise；仅 D 加载 target-KV DSpark 时的 P Full；P/D 都加载时的
+Full 同步/overlap、Breakable/piecewise。P 实际回放图并交接首条 raw teacher，
+D 从接收的 target KV 导出完整样本。测试在 D target forward 入口禁止额外
+prefill，要求所有生成 token 与独立 eager 基线一致。
+
+九项共 90 个 graph 样本，另有 10 个 eager 基线样本，均核对线上原始 KV、
+top128/ID/LSE、token、mask、位置和末尾有效性；两端退出后由新 Store client
+校验所有对象摘要。每项还验证 missing/stale handoff 和取消请求不发布样本，
+三个故障探针本身必须走 P prefill graph。正确性测试在采集配额就绪后发请求，
+并要求 13 次准入、10 次发布和零 admission backpressure；它不代表饱和负载性能。
+
+该新增验收使用同一 H100 上的两个独立进程、FlashInfer target、Triton draft、
+真实 TCP transfer/Store 和测试 Catalog。分布式 P/D prefill、RDMA 组合、
+训练质量和服务 SLO 仍需分别验证。复现和证据见
+[`experiments/PD_PREFILL_CAPTURE.md`](experiments/PD_PREFILL_CAPTURE.md) 和
+[`experiments/pd-prefill-capture.json`](experiments/pd-prefill-capture.json)。
+
 ### 7.4 选层 KV 导出
 
 `SelectedLayerKVExporter` 接收 request logical positions 到物理 slot 的映射，以及当前 target KV pool。它只导出 contract 中明确选择的层和有效位置。

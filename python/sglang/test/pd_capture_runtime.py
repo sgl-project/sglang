@@ -49,6 +49,9 @@ class PDCaptureRuntimeBase(CustomTestCase):
     transfer_protocol = "tcp"
     ib_device = None
     teacher_d2h_batch_tokens = 1
+    target_attention_backend = None
+    observer_module = "sglang.test.pd_capture_server"
+    validate_prefill_graph = False
 
     def new_bootstrap_port(self):
         return free_port(self.prefill_host)
@@ -133,6 +136,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
         ragged_mode="static",
         enable_overlap=None,
         extra_args=(),
+        prefill_backend="disabled",
     ):
         folder = root / role
         folder.mkdir()
@@ -162,10 +166,22 @@ class PDCaptureRuntimeBase(CustomTestCase):
 
         def observed_server(command, *args):
             return launch(
-                [sys.executable, "-m", "sglang.test.pd_capture_server"] + command[2:],
+                [sys.executable, "-m", self.observer_module] + command[2:],
                 *args,
             )
 
+        graph_config = {
+            "prefill": {"backend": prefill_backend},
+            "decode": {
+                "backend": "full" if replay else "disabled",
+                "bs": [1, 2, 4],
+                "max_bs": 4,
+            },
+        }
+        if prefill_backend != "disabled":
+            graph_config["prefill"].update(bs=[16, 32, 64, 128], max_bs=128)
+        if prefill_backend == "full":
+            graph_config["prefill"]["full_prefill_max_req"] = 4
         with patch.object(test_utils, "_launch_server_process", observed_server):
             process = popen_launch_server(
                 self.model,
@@ -219,7 +235,13 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     "--skip-server-warmup",
                     "--skip-tokenizer-init",
                     "--attention-backend",
-                    "fa3" if draft and ragged_mode == "compact" else "triton",
+                    self.target_attention_backend
+                    or ("fa3" if draft and ragged_mode == "compact" else "triton"),
+                    *(
+                        ["--disable-flashinfer-autotune"]
+                        if self.target_attention_backend == "flashinfer"
+                        else []
+                    ),
                     "--mem-fraction-static",
                     "0.20",
                     "--max-total-tokens",
@@ -228,14 +250,13 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     "4",
                     "--chunked-prefill-size",
                     "128",
-                    "--cuda-graph-backend-prefill",
-                    "disabled",
-                    "--cuda-graph-backend-decode",
-                    "full" if replay else "disabled",
-                    "--cuda-graph-bs-decode",
-                    "1",
-                    "2",
-                    "4",
+                    "--cuda-graph-config",
+                    json.dumps(graph_config),
+                    *(
+                        ["--enable-torch-compile-debug-mode"]
+                        if prefill_backend == "tc_piecewise"
+                        else []
+                    ),
                     *(
                         []
                         if (replay if enable_overlap is None else enable_overlap)
@@ -286,6 +307,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
 
     def generate(self, rid, prompt, count, *, biased=False):
         batched = isinstance(rid, list)
+        self.wait_capture_capacity(len(rid) if batched else 1)
         rooms = [self.bootstrap_room + i + 1 for i in range(len(rid) if batched else 1)]
         self.bootstrap_room = rooms[-1]
         sampling = {"temperature": 0, "ignore_eos": True}
@@ -324,12 +346,28 @@ class PDCaptureRuntimeBase(CustomTestCase):
             "internal_states"
         ][0]["training_capture"]
 
-    def abort_capture(self, rid, *, distributed):
+    def wait_capture_capacity(self, count):
+        # Publication and the background refill of capture leases are separate.
+        # Cohort admission reserves lazily when the request reaches the router.
+        deadline = time.monotonic() + 20
+        while True:
+            state = self.capture_state()
+            self.assertIsNone(state["disabled_reason"], state)
+            if (
+                "request_router" in state
+                or state["states"].get("available", 0) >= count
+            ):
+                return
+            self.assertLess(time.monotonic(), deadline, state)
+            time.sleep(0.05)
+
+    def abort_capture(self, rid, *, distributed, prompt=None):
+        self.wait_capture_capacity(1)
         before = self.capture_state()
         self.bootstrap_room += 1
         payload = {
             "rid": rid,
-            "input_ids": [1, 2, 3, 4],
+            "input_ids": prompt if prompt is not None else [1, 2, 3, 4],
             "bootstrap_host": self.prefill_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,
@@ -419,13 +457,37 @@ class PDCaptureRuntimeBase(CustomTestCase):
         draft_kind=None,
         prefill_draft=False,
         ragged_mode="static",
+        prefill_backend="disabled",
+        enable_overlap=None,
     ):
+        baseline_key = (
+            "pd_prefill_outputs",
+            prefill_tp,
+            decode_tp,
+            prefill_pp,
+            decode_pp,
+        )
+        if (
+            self.validate_prefill_graph
+            and prefill_backend != "disabled"
+            and baseline_key not in self.drafts
+        ):
+            self.exercise(
+                replay=False,
+                prefill_tp=prefill_tp,
+                decode_tp=decode_tp,
+                prefill_pp=prefill_pp,
+                decode_pp=decode_pp,
+                enable_overlap=False,
+            )
         draft = self.get_draft(draft_kind) if draft_kind else None
         suffix = (
             f"{replay}-{draft_kind}-{prefill_draft}-{ragged_mode}"
             if draft
             else str(replay)
         )
+        if self.validate_prefill_graph:
+            suffix += f"-prefill-{prefill_backend}-overlap-{enable_overlap}"
         root = self.root / (
             f"p{prefill_tp}x{prefill_pp}-d{decode_tp}x{decode_pp}-replay-{suffix}"
         )
@@ -439,6 +501,8 @@ class PDCaptureRuntimeBase(CustomTestCase):
             pp_size=prefill_pp,
             draft=draft if prefill_draft else None,
             ragged_mode=ragged_mode,
+            prefill_backend=prefill_backend,
+            enable_overlap=enable_overlap,
         )
         decode, self.decode_url = self.launch(
             "decode",
@@ -448,6 +512,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
             pp_size=decode_pp,
             draft=draft,
             ragged_mode=ragged_mode,
+            enable_overlap=enable_overlap,
         )
         if draft and ragged_mode != "static":
             setting = requests.post(
@@ -475,6 +540,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
         )
         first = len(self.catalog.publications)
         responses = {}
+        outputs = {}
         observation_offsets = (
             {
                 path: len(path.read_text().splitlines())
@@ -489,19 +555,56 @@ class PDCaptureRuntimeBase(CustomTestCase):
             ("chunked", prompt, 7, True),
             ("cached", prompt, 5, True),
         ]
-        if draft:
+        if draft or self.validate_prefill_graph:
             cases.append(("rejected", [1, 9, 8, 3], 6, False))
+        if self.validate_prefill_graph:
+            cases.extend(
+                [
+                    ("cached-extension", prompt + list(range(600, 619)), 7, True),
+                    ("unbiased", list(range(8000, 8013)), 6, False),
+                ]
+            )
         for rid, tokens, count, biased in cases:
             name = f"{rid}-{suffix}"
             result = self.generate(name, tokens, count, biased=biased)
+            outputs[rid] = result["output_ids"]
             responses[hashlib.sha256(name.encode()).hexdigest()] = (tokens, result)
             self.catalog.wait_publications(first + len(responses), timeout=45)
-        names = [f"batch-{i}-{suffix}" for i in range(2)]
-        prompts = [[1, 3, 9, 2], [1, 7, 8, 3, 2, 4, 5]]
-        for name, tokens, result in zip(
-            names, prompts, self.generate(names, prompts, 3, biased=True), strict=True
-        ):
-            responses[hashlib.sha256(name.encode()).hexdigest()] = (tokens, result)
+        for iteration in range(2 if self.validate_prefill_graph else 1):
+            labels = [
+                (
+                    f"batch-{iteration}-{i}"
+                    if self.validate_prefill_graph
+                    else f"batch-{i}"
+                )
+                for i in range(2)
+            ]
+            names = [f"{label}-{suffix}" for label in labels]
+            prompts = (
+                [
+                    list(
+                        range(
+                            2000 + iteration * 1000 + i * 100,
+                            2000 + iteration * 1000 + i * 100 + length,
+                        )
+                    )
+                    for i, length in enumerate((33, 37))
+                ]
+                if self.validate_prefill_graph
+                else [[1, 3, 9, 2], [1, 7, 8, 3, 2, 4, 5]]
+            )
+            for label, name, tokens, result in zip(
+                labels,
+                names,
+                prompts,
+                self.generate(names, prompts, 3, biased=True),
+                strict=True,
+            ):
+                outputs[label] = result["output_ids"]
+                responses[hashlib.sha256(name.encode()).hexdigest()] = (tokens, result)
+            self.catalog.wait_publications(first + len(responses), timeout=45)
+        if self.validate_prefill_graph and prefill_backend != "disabled":
+            self.assertEqual(outputs, self.drafts[baseline_key])
         expected = len(responses)
         publications = self.catalog.wait_publications(first + expected, timeout=45)
         paths = self.reference_paths(root)
@@ -512,6 +615,67 @@ class PDCaptureRuntimeBase(CustomTestCase):
             for path in paths
             if (frame := torch.load(path, weights_only=True))["trace_id"] in responses
         ]
+        prefill_replays = []
+        if self.validate_prefill_graph:
+            prefill_frames = [r for r in references if r.get("pd_role") == "prefill"]
+            prefill_replays = [r for r in prefill_frames if r["cuda_graph"]]
+            if prefill_backend == "disabled":
+                self.assertFalse(prefill_replays)
+            else:
+                self.assertEqual(
+                    {(r["tp_rank"], r["pp_rank"]) for r in prefill_replays},
+                    {(tp, pp) for tp in range(prefill_tp) for pp in range(prefill_pp)},
+                )
+                for frame in prefill_replays:
+                    self.assertIsNotNone(frame["prefill_graph"])
+                    self.assertEqual(
+                        frame["prefill_graph"]["capture_hidden_mode"], "NULL"
+                    )
+                    self.assertFalse(frame["prefill_graph"]["output_hidden_states"])
+                self.assertTrue(
+                    any(
+                        r["prefill_graph"]["raw_tokens"]
+                        < r["prefill_graph"]["padded_tokens"]
+                        for r in prefill_replays
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        r["extend_prefix_length"] >= len(prompt)
+                        for r in prefill_replays
+                    )
+                )
+                if prefill_backend == "full":
+                    self.assertTrue(
+                        any(
+                            r["batch_size"] < r["prefill_graph"]["request_slots"]
+                            for r in prefill_replays
+                        )
+                    )
+                buffers = {}
+                for frame in prefill_replays:
+                    key = (
+                        frame["tp_rank"],
+                        frame["pp_rank"],
+                        frame["prefill_graph"]["input_buffer"],
+                    )
+                    buffers.setdefault(key, set()).add(
+                        frame["prefill_graph"]["replay_id"]
+                    )
+                self.assertTrue(any(len(ids) > 1 for ids in buffers.values()))
+            self.assertTrue(any(not r["predictions"] for r in prefill_frames))
+            decode_frames = [
+                r
+                for r in references
+                if r.get("forward_mode") and r.get("pd_role") != "prefill"
+            ]
+            self.assertTrue(decode_frames)
+            self.assertTrue(
+                all(
+                    r["forward_mode"] in ("DECODE", "TARGET_VERIFY")
+                    for r in decode_frames
+                )
+            )
         capture_mode = (
             "pd_speculative_accepted_target_path" if draft else "pd_autoregressive"
         )
@@ -604,12 +768,26 @@ class PDCaptureRuntimeBase(CustomTestCase):
                 self, manifest, tensors, references, capture_mode=capture_mode
             )
         self.assertFalse(responses)
-        for fault in ("missing", "stale"):
+        for fault_index, fault in enumerate(("missing", "stale")):
             with self.catalog.condition:
                 failures_before = sum(
                     v["state"] == "FAILED" for v in self.catalog.captures.values()
                 )
-            self.generate(f"{fault}-{suffix}", [1, 3, 8, 2], 3, biased=True)
+            self.generate(
+                f"{fault}-{suffix}",
+                (
+                    list(
+                        range(
+                            9000 + 20 * fault_index,
+                            9013 + 20 * fault_index,
+                        )
+                    )
+                    if self.validate_prefill_graph
+                    else [1, 3, 8, 2]
+                ),
+                3,
+                biased=True,
+            )
             with self.catalog.condition:
                 self.assertTrue(
                     self.catalog.condition.wait_for(
@@ -623,11 +801,15 @@ class PDCaptureRuntimeBase(CustomTestCase):
                 )
             self.assertEqual(len(self.catalog.publications), first + expected)
         state = self.abort_capture(
-            f"abort-{suffix}", distributed=decode_tp > 1 or decode_pp > 1
+            f"abort-{suffix}",
+            distributed=decode_tp > 1 or decode_pp > 1,
+            prompt=list(range(9100, 9113)) if self.validate_prefill_graph else None,
         )
         self.assertEqual(len(self.catalog.publications), first + expected)
         self.assertGreaterEqual(state["counters"]["pd_handoff_committed"], expected + 1)
         self.assertGreaterEqual(state["counters"]["failed_pd_handoff_failed"], 1)
+        self.assertEqual(state["counters"].get("admission_backpressure", 0), 0, state)
+        self.assertEqual(state["counters"]["admitted"], expected + 3, state)
         if draft:
             self.assertGreater(state["counters"]["speculative_verify_forwards"], 0)
             self.assertGreater(state["counters"]["speculative_commits_copied"], 0)
@@ -635,9 +817,26 @@ class PDCaptureRuntimeBase(CustomTestCase):
         self.assertIsNone(decode.poll())
         self.stop_process(prefill)
         self.stop_process(decode)
+        if self.validate_prefill_graph and prefill_backend != "disabled":
+            for fault in ("missing", "stale", "abort"):
+                trace = hashlib.sha256(f"{fault}-{suffix}".encode()).hexdigest()
+                frames = [
+                    frame
+                    for path in self.reference_paths(root / "prefill")
+                    if (frame := torch.load(path, weights_only=True))["trace_id"]
+                    == trace
+                    and frame.get("pd_role") == "prefill"
+                ]
+                self.assertTrue(
+                    any(r["cuda_graph"] and r["predictions"] for r in frames), fault
+                )
+        reader = MooncakeSnapshotStore.connect(self.store_setup)
+        self.addCleanup(reader.close)
         for publication in publications[first:]:
             # Verify every object digest after both producers have exited.
-            read_snapshot(self.reader, publication)
+            read_snapshot(reader, publication)
+        if self.validate_prefill_graph and prefill_backend == "disabled":
+            self.drafts[baseline_key] = outputs
         print(
             json.dumps(
                 {
@@ -646,6 +845,9 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     "prefill_pp": prefill_pp,
                     "decode_pp": decode_pp,
                     "replay": replay,
+                    "prefill_backend": prefill_backend,
+                    "prefill_replay_frames": len(prefill_replays),
+                    "enable_overlap": enable_overlap,
                     "draft_kind": draft_kind,
                     "prefill_draft": prefill_draft,
                     "ragged_mode": ragged_mode,

@@ -123,6 +123,12 @@ def observed_prefill(self, batch, forward_batch, logits_output, **kwargs):
                 ),
                 "batch_size": len(batch.reqs),
                 "cuda_graph": kwargs.get("can_run_cuda_graph", False),
+                "pd_role": "prefill",
+                "forward_mode": forward_batch.forward_mode.name,
+                "extend_prefix_length": forward_batch.extend_prefix_lens_cpu[row],
+                "prefill_graph": getattr(
+                    forward_batch, "training_capture_test_prefill_graph", None
+                ),
             },
             root / f"prefill-{next(_sequence):06d}.pt",
         )

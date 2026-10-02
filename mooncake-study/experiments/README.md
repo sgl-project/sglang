@@ -27,6 +27,10 @@ stopped and reaped before test execution, then resumed afterward. Distributed
 experiments use separately allocated jobs; the two-node Store lane is described
 in [Remote RDMA Store Validation](RDMA.md).
 
+[P/D Prefill Graph Capture](PD_PREFILL_CAPTURE.md) covers the independent P/D
+workers' Full, Breakable and piecewise graph paths for AR and static target-KV
+DSpark, with raw source comparison and post-exit Store reads on the resident GPU.
+
 ```bash
 LAB=/gpfs/users/fuxuanwei-1/dspark-maas-lab
 python3 "$LAB/bin/gpu_worker.py" --state-dir "$LAB/state" submit \
