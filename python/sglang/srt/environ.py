@@ -166,9 +166,16 @@ class _DeprecatedEnvFallback:
         SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
     """
 
-    def __init__(self, default: Any, deprecated_name: str, secret: bool = False):
+    def __init__(
+        self,
+        default: Any,
+        deprecated_name: str,
+        secret: bool = False,
+        transform: Optional[Callable[[str], str]] = None,
+    ):
         super().__init__(default, secret=secret)
         self.deprecated_name = deprecated_name
+        self.transform = transform
 
     def get(self) -> Any:
         if os.getenv(self.name) is None:
@@ -181,7 +188,9 @@ class _DeprecatedEnvFallback:
                     DeprecationWarning,
                     stacklevel=2,
                 )
-                os.environ[self.name] = fallback
+                os.environ[self.name] = (
+                    self.transform(fallback) if self.transform is not None else fallback
+                )
         return super().get()
 
 
@@ -195,6 +204,10 @@ class EnvIntWithAlias(_DeprecatedEnvFallback, EnvInt):
 
 class EnvStrWithAlias(_DeprecatedEnvFallback, EnvStr):
     pass
+
+
+def _invert_bool_env_value(value: str) -> str:
+    return "false" if EnvBool(False).parse(value) else "true"
 
 
 class EnvFloat(EnvField):
@@ -1340,6 +1353,13 @@ class Envs:
     # ===================================================================
     # Kernel selection and fused backends
     # ===================================================================
+    # Default-on kill switch for the shared model fusion rollout, currently
+    # covering dual GEMM and RMSNorm + static FP8 quantization.
+    SGLANG_DISABLE_FUSIONS = EnvBoolWithAlias(
+        False,
+        deprecated_name="SGLANG_ENABLE_FUSIONS",
+        transform=_invert_bool_env_value,
+    )
     # MiniCPM sparse attention developer switches
     SGLANG_MINICPM_FUSE_TOPK = EnvBool(False)
     SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)

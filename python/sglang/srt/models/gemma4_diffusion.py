@@ -259,9 +259,10 @@ class DiffusionGemmaSelfConditioning(nn.Module):
             config.hidden_size,
             activation="gelu_tanh",
         )
+        self.pre_norm.fuse_input_quant(self.gate_up_proj)
 
     def forward(self, inputs_embeds, signal):
-        signal = self.pre_norm(signal, quant_linear=self.gate_up_proj)
+        signal = self.pre_norm(signal)
         if self.dual_gemm.can_run(signal, self.gate_up_proj):
             h = self.dual_gemm(signal, self.gate_up_proj)
         else:
@@ -338,6 +339,8 @@ class DiffusionGemmaDecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=eps)
         self.post_feedforward_layernorm_1 = RMSNorm(config.hidden_size, eps=eps)
         self.post_feedforward_layernorm_2 = RMSNorm(config.hidden_size, eps=eps)
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
+        self.pre_feedforward_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
 
         # Encoder and decoder use the same weights but distinct per-layer scalars.
         self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
@@ -345,9 +348,7 @@ class DiffusionGemmaDecoderLayer(nn.Module):
 
     def forward(self, positions, hidden_states, forward_batch):
         residual = hidden_states
-        hidden_states = self.input_layernorm(
-            hidden_states, quant_linear=self.self_attn.qkv_proj
-        )
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(positions, hidden_states, forward_batch)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states

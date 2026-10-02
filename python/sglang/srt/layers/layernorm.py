@@ -92,7 +92,7 @@ if _is_cuda or _is_xpu or _is_musa:
             )
             from flashinfer.norm import rmsnorm_quant as _flashinfer_rmsnorm_quant
 
-            _flashinfer_rmsnorm_quant_available = True
+            _flashinfer_rmsnorm_quant_available = not envs.SGLANG_DISABLE_FUSIONS.get()
         except (ImportError, AttributeError):
             _flashinfer_rmsnorm_quant_available = False
     else:
@@ -1110,6 +1110,9 @@ class LayerNorm(BaseFusedOp):
 
 
 class GemmaRMSNorm(BaseFusedOp):
+    # The projection that consumes this norm's output; see fuse_input_quant().
+    _quant_linear: Optional[nn.Module] = None
+
     def __init__(
         self,
         hidden_size: int,
@@ -1131,6 +1134,10 @@ class GemmaRMSNorm(BaseFusedOp):
         param.data.copy_(loaded_weight)
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
         torch.add(param.data, 1.0, out=self.gemma_weight)
+
+    def fuse_input_quant(self, linear: nn.Module) -> None:
+        """Record the projection whose static FP8 input quantization can fuse."""
+        self.__dict__["_quant_linear"] = linear
 
     def _forward_impl(
         self,
@@ -1183,6 +1190,8 @@ class GemmaRMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if quant_linear is None:
+            quant_linear = self._quant_linear
         if quant_linear is not None and _flashinfer_rmsnorm_quant_available:
             scale = _fp8_static_input_scale(quant_linear)
             if scale is not None:
@@ -1342,6 +1351,9 @@ class GemmaRMSNorm(BaseFusedOp):
 
 
 class Gemma3RMSNorm(BaseFusedOp):
+    # The projection that consumes this norm's output; see fuse_input_quant().
+    _quant_linear: Optional[nn.Module] = None
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -1356,6 +1368,10 @@ class Gemma3RMSNorm(BaseFusedOp):
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
         torch.add(param.data, 1.0, out=self.gemma_weight)
+
+    def fuse_input_quant(self, linear: nn.Module) -> None:
+        """Record the projection whose static FP8 input quantization can fuse."""
+        self.__dict__["_quant_linear"] = linear
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -1394,6 +1410,8 @@ class Gemma3RMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ):
+        if quant_linear is None:
+            quant_linear = self._quant_linear
         if quant_linear is not None and _flashinfer_rmsnorm_quant_available:
             scale = _fp8_static_input_scale(quant_linear)
             if scale is not None:

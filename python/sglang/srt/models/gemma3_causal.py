@@ -370,6 +370,8 @@ class Gemma3DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = Gemma3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
+        self.pre_feedforward_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
         self.is_sliding = self.self_attn.is_sliding
         self.layer_id = layer_id
 
@@ -390,13 +392,9 @@ class Gemma3DecoderLayer(nn.Module):
         # residual layout and is safe to capture in a breakable CUDA graph.
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(
-                hidden_states, quant_linear=self.self_attn.qkv_proj
-            )
+            hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual, quant_linear=self.self_attn.qkv_proj
-            )
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # apply global RoPE to non-sliding layer only
         if self.self_attn.is_sliding:
@@ -413,7 +411,7 @@ class Gemma3DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states, residual = self.pre_feedforward_layernorm(
-            hidden_states, residual, quant_linear=self.mlp.gate_up_proj
+            hidden_states, residual
         )
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)

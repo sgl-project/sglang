@@ -57,6 +57,16 @@ class _LogitsProcessorStub(torch.nn.Module):
         return self.output
 
 
+class _FusionAwareIdentity(torch.nn.Identity):
+    def __init__(self):
+        super().__init__()
+        self.qkv_proj = object()
+        self.gate_up_proj = object()
+
+    def fuse_input_quant(self, linear):
+        pass
+
+
 def _diffusion_model_stub():
     model = DiffusionGemmaForBlockDiffusion.__new__(DiffusionGemmaForBlockDiffusion)
     torch.nn.Module.__init__(model)
@@ -200,7 +210,9 @@ class TestGemma4DiffusionExpertActivation(unittest.TestCase):
                 ):
                     stack.enter_context(
                         patch.object(
-                            gemma4_diffusion, name, return_value=torch.nn.Identity()
+                            gemma4_diffusion,
+                            name,
+                            return_value=_FusionAwareIdentity(),
                         )
                     )
                 experts = stack.enter_context(

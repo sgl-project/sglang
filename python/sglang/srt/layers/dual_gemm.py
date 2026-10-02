@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import is_cuda
 
@@ -39,10 +40,10 @@ class DualGemm:
 
     def _select_mode(
         self,
-        gate_up_proj: "MergedColumnParallelLinear",
+        gate_up_proj: MergedColumnParallelLinear,
         hidden_size: int,
-    ) -> Optional["DualGemmQuantMode"]:
-        if not is_cuda():
+    ) -> Optional[DualGemmQuantMode]:
+        if envs.SGLANG_DISABLE_FUSIONS.get() or not is_cuda():
             return None
 
         from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
@@ -115,7 +116,7 @@ class DualGemm:
             return mode
         return None
 
-    def can_run(self, x, gate_up_proj: "MergedColumnParallelLinear") -> bool:
+    def can_run(self, x, gate_up_proj: MergedColumnParallelLinear) -> bool:
         input_tensor = x[0] if isinstance(x, tuple) else x
         return (
             self.mode is not None
@@ -124,7 +125,7 @@ class DualGemm:
             and not (self.tp_size > 1 and get_forward().sp_active)
         )
 
-    def __call__(self, x, gate_up_proj: "MergedColumnParallelLinear"):
+    def __call__(self, x, gate_up_proj: MergedColumnParallelLinear):
         if not self.mode.is_quantized:
             from sglang.kernels.ops.gemm import dual_gemm_swiglu
 

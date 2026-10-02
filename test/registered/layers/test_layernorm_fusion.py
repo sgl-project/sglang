@@ -189,12 +189,13 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
                 expected, expected_residual = layer.forward_native(
                     x.clone(), residual.clone()
                 )
+                layer.fuse_input_quant(object())
 
                 with patch.object(
                     ln_mod, "_fp8_static_input_scale", return_value=scale
                 ):
                     (quantized, actual_scale, out_dtype), actual_residual = layer(
-                        x.clone(), residual.clone(), quant_linear=object()
+                        x.clone(), residual.clone()
                     )
 
                 self.assertIs(actual_scale, scale)
@@ -207,6 +208,31 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
                     dequantized.flatten(), expected.float().flatten(), dim=0
                 )
                 self.assertGreater(cosine.item(), 0.99)
+
+    def test_gemma3n_norm_quant_fusion_preserves_shape(self):
+        """Gemma3n's flattening wrapper must preserve prequantized outputs."""
+        import sglang.srt.layers.layernorm as ln_mod
+        from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm
+
+        torch.manual_seed(self.SEED)
+        shape = (2, 3, 512)
+        scale = torch.tensor([0.05], dtype=torch.float32)
+        x = torch.randn(shape, dtype=torch.bfloat16)
+        layer = Gemma3nRMSNorm(shape[-1]).to(dtype=torch.bfloat16)
+
+        with torch.inference_mode():
+            expected = layer(x.clone())
+            layer.fuse_input_quant(object())
+            with patch.object(ln_mod, "_fp8_static_input_scale", return_value=scale):
+                quantized, actual_scale, output_dtype = layer(x.clone())
+
+        self.assertEqual(quantized.shape, x.shape)
+        self.assertIs(actual_scale, scale)
+        self.assertEqual(output_dtype, x.dtype)
+        cosine = torch.nn.functional.cosine_similarity(
+            (quantized.float() * scale).flatten(), expected.float().flatten(), dim=0
+        )
+        self.assertGreater(cosine.item(), 0.99)
 
 
 if __name__ == "__main__":

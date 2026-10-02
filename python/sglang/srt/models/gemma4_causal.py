@@ -608,6 +608,8 @@ class Gemma4DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
+        self.pre_feedforward_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
 
         # Per-Layer Embedding (PLE) components — present in each decoder layer
         if self.hidden_size_per_layer_input > 0:

@@ -52,12 +52,14 @@ class Gemma3nRMSNorm(RMSNorm):
                 persistent=False,
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         original_shape = x.shape
         x_2d = x.contiguous().reshape(-1, original_shape[-1])
-        x_2d = super().forward(x_2d)
-        x = x_2d.reshape(original_shape)
-        return x
+        output = super().forward(x_2d)
+        if isinstance(output, tuple):
+            quantized, scale, output_dtype = output
+            return quantized.reshape(original_shape), scale, output_dtype
+        return output.reshape(original_shape)
 
 
 class Gemma3nTextScaledWordEmbedding(Gemma3TextScaledWordEmbedding):
@@ -552,6 +554,7 @@ class Gemma3nDecoderLayer(nn.Module):
         self.post_feedforward_layernorm = Gemma3nRMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
         )
+        self.pre_feedforward_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
 
@@ -612,7 +615,7 @@ class Gemma3nDecoderLayer(nn.Module):
         attn_laurel = (attn_gated + laurel_output) / torch.sqrt(torch.tensor(2.0))
 
         attn_norm = self.pre_feedforward_layernorm(
-            attn_laurel, quant_linear=self.mlp.gate_up_proj
+            attn_laurel
         )  # [num_tokens, hidden_size]
         attn_ffw = self.mlp(attn_norm)  # [num_tokens, hidden_size]
         attn_ffw_norm = self.post_feedforward_layernorm(
