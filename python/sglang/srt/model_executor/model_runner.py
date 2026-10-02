@@ -230,6 +230,7 @@ from sglang.srt.utils import (
     slow_rank_detector,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -906,6 +907,7 @@ class ModelRunner:
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
+        get_foundry_adapter().before_alloc_memory_pool(self)
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
@@ -926,6 +928,8 @@ class ModelRunner:
         self._unified_memory_pool = result.unified_memory_pool
 
         self._init_post_memory_pool_components()
+        # Foundry SAVE records the resolved pool config for LOAD.
+        get_foundry_adapter().after_alloc_memory_pool(self)
 
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
@@ -1193,6 +1197,8 @@ class ModelRunner:
         # so keep the PP group it was built with; read every other placement
         # value from the context where it is used.
         self.pp_group = get_parallel().pp_group
+        # Foundry: weight loading starts at the same region offset on SAVE and LOAD.
+        get_foundry_adapter().after_runner_distributed_init(self)
 
     def load_model(self):
         tic_total = time.perf_counter()

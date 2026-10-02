@@ -145,6 +145,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -1557,6 +1558,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
+        # Foundry CUDA graph persistence: SAVE archives the graphs captured by
+        # this loop, LOAD restores them in place of capturing (capture_one).
+        with get_foundry_adapter().capture_scope(self):
+            self._capture_graphs()
+
+    def _capture_graphs(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()

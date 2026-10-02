@@ -168,8 +168,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
         finalize_cuda_graph_prefill_max_context,
         handle_cuda_graph_config,
+        handle_cuda_graph_persistence,
+        validate_cuda_graph_persistence,
+        validate_cuda_graph_persistence_graph_config,
     )
 
+    run_hook(handle_cuda_graph_persistence, server_args)
     run_hook(apply_inkling_prefill_cuda_graph_default, server_args)
     run_hook(apply_muse_glimmer_prefill_cuda_graph_max_bs_default, server_args)
 
@@ -177,6 +181,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_dwdp, server_args)
 
     run_hook(handle_cuda_graph_config, server_args)
+    run_hook(validate_cuda_graph_persistence_graph_config, server_args)
 
     from sglang.srt.arg_groups.platform_hook import (
         handle_amd_specifics,
@@ -330,6 +335,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_debug_utils, server_args)
 
     run_hook(handle_other_validations, server_args)
+    run_hook(validate_cuda_graph_persistence, server_args)
 
     # Apply model-capability constraints after backend selection.
     run_hook(handle_model_capability_adjustments, server_args)

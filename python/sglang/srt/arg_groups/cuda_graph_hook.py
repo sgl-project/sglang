@@ -470,6 +470,42 @@ def apply_deepep_adjustments(server_args: Any):
             )
 
 
+def handle_cuda_graph_persistence(server_args: Any):
+    """--cuda-graph-persistence (Foundry): activate it in this process and pin
+    the graph fields and every flag that selects state a restored graph cannot
+    replay; a contrary explicit value raises. Must run before the model
+    prefill defaults and handle_cuda_graph_config so resolution sees the
+    pins."""
+    cfg = resolving_view(server_args)
+    if cfg.cuda_graph_persistence is None:
+        if cfg.cuda_graph_persistence_config is not None:
+            raise ValueError(
+                "--cuda-graph-persistence-config requires --cuda-graph-persistence "
+                "{save,load}"
+            )
+        return
+    from sglang.srt.utils.foundry_adapter import activate_foundry
+
+    activate_foundry(server_args).pin_server_args(server_args)
+
+
+def validate_cuda_graph_persistence_graph_config(server_args: Any):
+    """After handle_cuda_graph_config: the resolved config (including
+    --cuda-graph-config JSON) must still be decode full, prefill full or
+    disabled."""
+    from sglang.srt.utils.foundry_adapter import get_foundry_adapter
+
+    get_foundry_adapter().validate_graph_config(server_args)
+
+
+def validate_cuda_graph_persistence(server_args: Any):
+    """After handle_other_validations: reject what Foundry cannot persist,
+    re-check the pins after the later cascades and pin the environment."""
+    from sglang.srt.utils.foundry_adapter import get_foundry_adapter
+
+    get_foundry_adapter().validate_resolved_server_args(server_args)
+
+
 def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     """Inkling opts into full-graph prefill CUDA-graph capture. Must run
     before _handle_cuda_graph_config: the generic breakable default is
