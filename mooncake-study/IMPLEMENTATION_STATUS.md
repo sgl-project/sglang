@@ -3554,6 +3554,55 @@ transfer/Store and an HTTP Catalog test double. Mixed TP/PP prefill, asymmetric
 P/D prefill, asynchronous PP, other models, Inductor, RDMA combinations, trained
 quality and serving SLOs remain separate validation requirements.
 
+## Single-Rank Reservation Refill
+
+The single-rank coordinator no longer waits 100 ms after each successful
+Catalog reservation. It fills bounded free Host capacity, checking leases,
+expiry, admission state and shutdown between calls. Writer retirement signals
+the loop after releasing a slot; publication recovery and shutdown also wake
+it. The event is cleared before inspecting capacity so a release between a
+failed acquire and wait is preserved. A separate monotonic error deadline
+retains the 100 ms retry floor despite wakeups; adaptive cooldown and quarantine
+remain effective. Distributed collective reservation is unchanged.
+
+Nine focused CPU tests pass in 4.796s, including the release/wait race,
+heartbeat fairness, error backoff, disable, quarantine and shutdown. The
+existing direct/staged/cohort coordinator tests pass 49 tests in 37.168s, and
+P/D unit tests pass 12 in 9.004s. Actual P/D eager and graph/overlap regressions
+pass two tests in 176.081s, checking ten post-exit snapshots, handoff fault
+exclusion, cancellation and exact online tensor parity.
+
+The full actual-inference suite also passes both methods in 707.379s, covering
+AR, overlap, static target-KV DSpark, real retraction, adaptive/latency recovery
+and four cap-accept/compact ragged modes. The first invocation failed in setup
+because this older test takes `--model-path`, not the model environment
+variable. A corrected local-model invocation passed unchanged code; the failed
+zero-test attempt remains in the evidence index. All 74 final test methods pass.
+
+The unchanged serving benchmark ran two off/on/off repetitions per source on
+the resident H100. Each capture-on phase used 512 requests, 16 input/two output
+tokens, concurrency four, four Host slots and fixed ratio one. Before refill,
+both phases admitted/published 60 samples; afterward they produced 292 and 312.
+Sample throughput rose from 10.30/10.46 to 39.29/40.10 per second. All 724
+benchmark snapshots passed post-producer-exit Store reads, digest and tensor
+validation. Every admitted request published; no quarantine or Catalog error
+occurred. Both versions allocated 5,155,584 registered Host bytes.
+
+The extra capture work reduces serving throughput: afterward it retains
+76.58%/68.37% of its bracketing capture-off baselines, versus 92.77%/91.59%
+before. This is improved sample yield, not a serving speedup or SLO acceptance.
+The experiment uses Qwen3-0.6B BF16, Triton, overlap/decode graphs, real TCP Store
+and an HTTP test Catalog. Longer/representative traffic, distributed saturation,
+RDMA, production retention and trained-model quality remain separate gates.
+See the [runbook](experiments/RESERVATION_REFILL.md) and
+[source-bound evidence](experiments/reservation-refill.json).
+
+All eight submitted jobs are terminal, and the resident H100 has resumed its
+idle workload with an empty queue. No additional GPU was allocated. New Python
+passes full Ruff, and both touched Python files pass Black and I/F; the
+coordinator adds no full-Ruff diagnostic beyond its existing nine BLE001
+warnings. The original checkout's staged index remains unchanged.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph

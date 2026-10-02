@@ -125,6 +125,23 @@ These counters are rank-local. In PP, the READY publication counter belongs to
 the auxiliary owner on the last stage; PP0 reporting zero READY does not imply
 that no global snapshot was published.
 
+### Reservation Refill
+
+The single-rank coordinator fills available Host slots with background Catalog
+reservations. It checks renewals, expiry and admission state between successful
+reservation calls, without a fixed delay after each success. Writer retirement
+wakes this loop after returning a slot; recovery and shutdown also wake it.
+When full or paused, it retains the 100 ms maintenance poll. Failed Catalog
+admissions impose a separate 100 ms retry deadline that slot-release wakeups
+cannot bypass; an enabled adaptive cooldown can delay admission further.
+
+This changes neither the Host/device budgets nor request admission semantics.
+An unavailable slot still skips capture, and a quarantined buffer stays
+unavailable. Startup/recovery/refill do not guarantee that all slots are ready
+when a request arrives. Distributed cohorts retain their separate all-rank
+reservation loop. See the [refill experiment](../../../../mooncake-study/experiments/RESERVATION_REFILL.md)
+for measured capture yield and serving cost.
+
 ### Adaptive Admission
 
 Fixed sampling remains the default. Add an `adaptive` object to the capture

@@ -1,0 +1,456 @@
+{
+  "schema_version": 1,
+  "experiment": "single_rank_training_capture_reservation_refill",
+  "date_utc": "2026-10-02",
+  "baseline_commit": "113f0e3fd1ee6d135553b950e9d52f6fbf7fe92b",
+  "branch": "codex/dspark-maas-capture",
+  "runtime_lock": {
+    "path": "mooncake-study/experiments/h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84",
+    "versions": {
+      "torch": "2.13.0",
+      "transformers": "5.12.1",
+      "sglang-kernel": "0.4.6.post1",
+      "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+    }
+  },
+  "allocation": {
+    "job": "job-fe1ce1dcdea6-20261001023258",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "node": "node064",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "gpu_uuid": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "additional_gpus": 0,
+    "final_worker": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790940137.655627,
+      "idle_pid": 18138,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.09647965431213379
+    },
+    "final_gpu_observation": "NVIDIA H100 80GB HBM3, GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495, 1101 MiB, 59 %",
+    "final_process_observation": "PID COMMAND\n    1 python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60\n18138 /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6"
+  },
+  "source": {
+    "before_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-refill-before",
+    "after_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-refill-v1",
+    "before_coordinator_sha256": "e74b955334cc58ab98a0e5a903345e52329e81ebed6c9157ace2fd1ba34d2f7e",
+    "after_coordinator_sha256": "69791a9fb0ff34342c1427268a26357719aa0380d5466ab3e282882e66018921",
+    "identical_benchmark_driver_sha256": "de3d9a294e6d8dc3982ea0285d800615f5d0e7c2c28f166995c904ed29ae9417",
+    "final_file_sha256": {
+      "python/sglang/srt/training_capture/coordinator.py": "69791a9fb0ff34342c1427268a26357719aa0380d5466ab3e282882e66018921",
+      "test/registered/unit/training_capture/test_reservation_refill.py": "b054a1e5c6a50322147f21f8d0256dd55e62833690c3fcc454fd33f61ebfdbfe",
+      "test/registered/unit/training_capture/test_coordinator.py": "d952cbea226fbf3b44bc661b64707056634d49dcd63aa04eabba0b20d9c9ad6a",
+      "test/registered/unit/training_capture/test_cohort_coordinator.py": "9d294df8347a01a68e0da291ddae92639661f12dfcdcd2aef64cb142f3934ba4",
+      "test/registered/unit/training_capture/test_pd_capture.py": "194488410d0208180ae69710b188d5eb82cd74bfa07c39fb037a022a04f79bf5",
+      "test/registered/storage/test_training_capture_runtime.py": "d61586428b26bc49c16b64e29b4e7f05a83379fc2219c625c9bfa947e0f79ddd",
+      "test/registered/storage/test_training_capture_pd.py": "24cd1594e9938a52a21948bb5d02f4c70f926d35b10c741f548caa7b3626ae7b",
+      "mooncake-study/experiments/benchmark_training_capture.py": "de3d9a294e6d8dc3982ea0285d800615f5d0e7c2c28f166995c904ed29ae9417"
+    },
+    "freeze_validation": "Before tree matched baseline by checksum rsync dry run; all eight listed final files matched the frozen after tree. Test/benchmark sources were not overwritten during jobs."
+  },
+  "scope": {
+    "benchmark": {
+      "transport": "local TCP",
+      "catalog": "HTTP test double",
+      "adaptive": false,
+      "overlap": true,
+      "decode_cuda_graphs": true,
+      "prefill_cuda_graphs": false,
+      "client": "existing sglang.benchmark.serving, streaming native /generate",
+      "workload": "seeded fixed-length random-ids, closed-loop concurrency, not production traffic",
+      "timing": "Client timing excludes warmup, server launch, readback and post-response writer drain",
+      "payload_bytes": "Validated manifest tensor sizes; not D2H or wire byte counters",
+      "gpu_capture_kernel_time": null,
+      "d2h_bytes": null,
+      "rdma_bytes": null,
+      "production_slo_pass": null
+    },
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "dtype": "bfloat16",
+    "target_attention": "triton",
+    "topology": {
+      "tp": 1,
+      "pp": 1
+    },
+    "layers": [
+      0,
+      14,
+      27
+    ],
+    "num_prompts": 512,
+    "input_tokens": 16,
+    "output_tokens": 2,
+    "concurrency": 4,
+    "capture_slots": 4,
+    "sample_ratio": 1,
+    "repeats": 2,
+    "kv_d2h_batch_tokens": 1,
+    "teacher_d2h_batch_tokens": 1,
+    "post_exit_readback": "Every measured READY sample after producer exit; manifest/object digests and tensor content/coverage validated.",
+    "online_source_parity": "Separate runtime and P/D regressions compare selected KV and teacher values with online observations.",
+    "inference_regression": "AR, overlap, target-KV DSpark, memory pressure, adaptive/latency admission and cap-accept/compact ragged DSpark; eager and decode/verify CUDA graphs. P/D eager and graph/overlap.",
+    "excluded": [
+      "distributed cohort refill",
+      "RDMA saturation",
+      "production Catalog retention",
+      "production SLO acceptance",
+      "trained draft quality"
+    ]
+  },
+  "benchmark_results": {
+    "before": {
+      "report": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/reservation-refill-before/report.json",
+      "rounds": [
+        {
+          "repetition": 0,
+          "before_off_requests_per_second": 89.56182220073177,
+          "after_off_requests_per_second": 99.85995520748475,
+          "capture_on": [
+            {
+              "selected_requests": 512,
+              "admitted": 60,
+              "ready": 60,
+              "backpressure": 452,
+              "capture_fraction": 0.1171875,
+              "samples_per_client_second": 10.296313094471532,
+              "serving": {
+                "completed": 512,
+                "duration": 5.827328622341156,
+                "request_throughput": 87.86187173949041,
+                "output_throughput": 175.72374347898082,
+                "median_ttft_ms": 40.96465744078159,
+                "p95_ttft_ms": 44.19974070042371,
+                "p99_ttft_ms": 57.486575655639164,
+                "median_tpot_ms": 3.050638362765312,
+                "p95_tpot_ms": 7.453430816531181,
+                "p99_tpot_ms": 44.86660633236169
+              },
+              "throughput_over_bracketing_off": 0.927685010051851,
+              "readback": {
+                "validated_samples": 60,
+                "manifest_bytes": 516000,
+                "payload_bytes": 13410000,
+                "aux_payload_bytes": 138960,
+                "payload_objects": 840,
+                "kv_payload_bytes": 13271040
+              },
+              "post_client_drain_seconds": 0.008368153125047684,
+              "disabled_reason": null,
+              "host_pool": {
+                "allocated_bytes": 5155584,
+                "device_allocated_bytes": 0,
+                "device_limit_bytes": 0,
+                "free": 1,
+                "filling": 3,
+                "quarantined": 0
+              }
+            }
+          ]
+        },
+        {
+          "repetition": 1,
+          "before_off_requests_per_second": 98.51068851151797,
+          "after_off_requests_per_second": 96.4712139645212,
+          "capture_on": [
+            {
+              "selected_requests": 512,
+              "admitted": 60,
+              "ready": 60,
+              "backpressure": 452,
+              "capture_fraction": 0.1171875,
+              "samples_per_client_second": 10.46385977504484,
+              "serving": {
+                "completed": 512,
+                "duration": 5.734021794050932,
+                "request_throughput": 89.29160341371598,
+                "output_throughput": 178.58320682743195,
+                "median_ttft_ms": 40.33520817756653,
+                "p95_ttft_ms": 43.025544844567776,
+                "p99_ttft_ms": 50.464279763400555,
+                "median_tpot_ms": 3.039410337805748,
+                "p95_tpot_ms": 7.52969179302454,
+                "p99_tpot_ms": 44.335484690964215
+              },
+              "throughput_over_bracketing_off": 0.9158963194000919,
+              "readback": {
+                "validated_samples": 60,
+                "manifest_bytes": 516000,
+                "payload_bytes": 13410000,
+                "aux_payload_bytes": 138960,
+                "payload_objects": 840,
+                "kv_payload_bytes": 13271040
+              },
+              "post_client_drain_seconds": 0.00813138484954834,
+              "disabled_reason": null,
+              "host_pool": {
+                "allocated_bytes": 5155584,
+                "device_allocated_bytes": 0,
+                "device_limit_bytes": 0,
+                "free": 2,
+                "filling": 2,
+                "quarantined": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "after": {
+      "report": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/reservation-refill-after/report.json",
+      "rounds": [
+        {
+          "repetition": 0,
+          "before_off_requests_per_second": 86.01653328589904,
+          "after_off_requests_per_second": 93.92373507808696,
+          "capture_on": [
+            {
+              "selected_requests": 512,
+              "admitted": 292,
+              "ready": 292,
+              "backpressure": 220,
+              "capture_fraction": 0.5703125,
+              "samples_per_client_second": 39.293341418606516,
+              "serving": {
+                "completed": 512,
+                "duration": 7.43128452450037,
+                "request_throughput": 68.89791372029636,
+                "output_throughput": 137.79582744059272,
+                "median_ttft_ms": 52.632831037044525,
+                "p95_ttft_ms": 59.377401135861874,
+                "p99_ttft_ms": 62.519148476421826,
+                "median_tpot_ms": 3.852652385830879,
+                "p95_tpot_ms": 9.082753956317902,
+                "p99_tpot_ms": 60.07436480373144
+              },
+              "throughput_over_bracketing_off": 0.7657864951154633,
+              "readback": {
+                "validated_samples": 292,
+                "manifest_bytes": 2516748,
+                "payload_bytes": 65262000,
+                "aux_payload_bytes": 676272,
+                "payload_objects": 4088,
+                "kv_payload_bytes": 64585728
+              },
+              "post_client_drain_seconds": 0.008187826722860336,
+              "disabled_reason": null,
+              "host_pool": {
+                "allocated_bytes": 5155584,
+                "device_allocated_bytes": 0,
+                "device_limit_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              }
+            }
+          ]
+        },
+        {
+          "repetition": 1,
+          "before_off_requests_per_second": 96.09160290967533,
+          "after_off_requests_per_second": 96.42303002415585,
+          "capture_on": [
+            {
+              "selected_requests": 512,
+              "admitted": 312,
+              "ready": 312,
+              "backpressure": 200,
+              "capture_fraction": 0.609375,
+              "samples_per_client_second": 40.103005092303306,
+              "serving": {
+                "completed": 512,
+                "duration": 7.779965598136187,
+                "request_throughput": 65.81005963865158,
+                "output_throughput": 131.62011927730316,
+                "median_ttft_ms": 54.709292948246,
+                "p95_ttft_ms": 63.11025340110063,
+                "p99_ttft_ms": 85.1424508169293,
+                "median_tpot_ms": 3.8361307233572006,
+                "p95_tpot_ms": 9.262991137802599,
+                "p99_tpot_ms": 61.02854404598474
+              },
+              "throughput_over_bracketing_off": 0.6836889085856764,
+              "readback": {
+                "validated_samples": 312,
+                "manifest_bytes": 2689128,
+                "payload_bytes": 69732000,
+                "aux_payload_bytes": 722592,
+                "payload_objects": 4368,
+                "kv_payload_bytes": 69009408
+              },
+              "post_client_drain_seconds": 0.009425681084394455,
+              "disabled_reason": null,
+              "host_pool": {
+                "allocated_bytes": 5155584,
+                "device_allocated_bytes": 0,
+                "device_limit_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "aggregate": {
+      "before": {
+        "requests": 1024,
+        "samples": 120,
+        "client_seconds": 11.561350416392088,
+        "requests_per_second": 88.57096819313918,
+        "samples_per_second": 10.379410335133498,
+        "capture_fraction": 0.1171875
+      },
+      "after": {
+        "requests": 1024,
+        "samples": 604,
+        "client_seconds": 15.211250122636557,
+        "requests_per_second": 67.31859589082286,
+        "samples_per_second": 39.70745304497755,
+        "capture_fraction": 0.58984375
+      },
+      "sample_throughput_ratio": 3.8255981566285038
+    },
+    "validated_before_and_after_samples": 724,
+    "interpretation": "Removing per-success delay improves sample yield/throughput. More capture work reduces serving throughput; the fixed ratio of one still has bounded-capacity backpressure. Two short repetitions are not an SLO."
+  },
+  "jobs": [
+    {
+      "job_id": "01790938116472092864-7cd78922aa12",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790938496.8316278,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938116472092864-7cd78922aa12.log",
+      "role": "benchmark_before",
+      "test_methods": null,
+      "test_duration_seconds": null,
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-refill-before"
+    },
+    {
+      "job_id": "01790938463132907609-e6932213d866",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790938546.4504528,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938463132907609-e6932213d866.log",
+      "role": "coordinator_cpu",
+      "test_methods": 49,
+      "test_duration_seconds": 37.168,
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-refill-v1"
+    },
+    {
+      "job_id": "01790938463468146708-9808e9f3635e",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790938561.9947758,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938463468146708-9808e9f3635e.log",
+      "role": "refill_cpu",
+      "test_methods": 9,
+      "test_duration_seconds": 4.796,
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-refill-v1"
+    },
+    {
+      "job_id": "01790938463800769425-73617d5b4b42",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790938581.7976947,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938463800769425-73617d5b4b42.log",
+      "role": "pd_cpu",
+      "test_methods": 12,
+      "test_duration_seconds": 9.004,
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-refill-v1"
+    },
+    {
+      "job_id": "01790938607944746504-3290ccc8cfe0",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790938972.5526826,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938607944746504-3290ccc8cfe0.log",
+      "role": "benchmark_after",
+      "test_methods": null,
+      "test_duration_seconds": null,
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-refill-v1"
+    },
+    {
+      "job_id": "01790938608269322695-0bb3d9ed079a",
+      "outcome": "failed",
+      "returncode": 5,
+      "finished_unix": 1790939117.877268,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938608269322695-0bb3d9ed079a.log",
+      "role": "runtime_startup_failure",
+      "test_methods": 0,
+      "test_duration_seconds": 134.156,
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-refill-v1"
+    },
+    {
+      "job_id": "01790938608648279653-52d476012d0e",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790939304.832246,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938608648279653-52d476012d0e.log",
+      "role": "pd_runtime",
+      "test_methods": 2,
+      "test_duration_seconds": 176.081,
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-refill-v1"
+    },
+    {
+      "job_id": "01790939202613041471-4b7fc0a7869e",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790940023.3773782,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790939202613041471-4b7fc0a7869e.log",
+      "role": "runtime",
+      "test_methods": 2,
+      "test_duration_seconds": 707.379,
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-refill-v1"
+    }
+  ],
+  "verification": {
+    "successful_test_methods": 74,
+    "terminal_jobs": 8,
+    "successful_jobs": 7,
+    "failed_startup_jobs": 1,
+    "failed_startup_note": "Initial runtime command supplied TRAINING_CAPTURE_TEST_MODEL, which this older test does not read. setUpClass tried Hugging Face and failed with Network is unreachable; zero tests ran. Corrected command used --model-path with the local Qwen directory and passed unchanged code. Failed result/log retained.",
+    "cpu_new_cases": [
+      "bounded initial fill",
+      "writer retirement wake",
+      "release after failed acquire before wait",
+      "heartbeat between reservations",
+      "Catalog retry deadline despite wakeups",
+      "cooldown between successful calls",
+      "disable during admission",
+      "quarantine excludes reuse",
+      "shutdown wake and spare drain"
+    ],
+    "black": "Both changed/new Python files pass --check.",
+    "ruff": "New test passes full Ruff; both files pass I/F. Coordinator retains nine baseline BLE001 warnings and adds none; baseline import warning removed.",
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "retained_artifact_sha256": {
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790938116472092864-7cd78922aa12.json": "c0e9393382378a6af9b2099ebb6ba57086cf3ab5e81b44ecb8a3396f70884816",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938116472092864-7cd78922aa12.log": "1bc01fa934c9ea78e102b609a69a6a80df79206da7f8ce4afb6ba1a79e155d53",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790938463132907609-e6932213d866.json": "355541de2ec1f28143aff11cedf3d692777d3f811d4543c691286f4d77dbbfb6",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938463132907609-e6932213d866.log": "f1373ba4cc9102cce4b534336d8478205d3c33fe95b02408e95a6373a74aa0a0",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790938463468146708-9808e9f3635e.json": "69df20f5beb6deb4b81d555b853f21165d4493524024b1bf6ca9e793be23efe7",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938463468146708-9808e9f3635e.log": "5a604e3801e065185c70eddcfb95c11a051e51f028a9708e448995f5b5c8b53a",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790938463800769425-73617d5b4b42.json": "a7539c3934c17a14070501897b5c35194c0c91ce364ab7bb2369f7b71586a18b",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938463800769425-73617d5b4b42.log": "6f134fb1d7719c5ae7eba09aebc1c0a3593c2022ddb24d1150b5a81ffc6be977",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790938607944746504-3290ccc8cfe0.json": "e0b76072b1ebdc0670c2b6b22cfa70fee53da3e6c34dd77dd7f9c546ef528634",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938607944746504-3290ccc8cfe0.log": "a273fee9b0898deabeae56c9a485f0698e3ade067f5c3e7372a635fb9c51f3de",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790938608269322695-0bb3d9ed079a.json": "e6adfa644b57c61ba52a83ca3394c60cff6b2a5b8d88cbd7e6f40d1d12071ad5",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938608269322695-0bb3d9ed079a.log": "dd444a2056d733ff06b77c8012c2703ae59cc41192cb2a0d99cbbba83bcdd230",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790938608648279653-52d476012d0e.json": "87734e8e586348eb76f56762a022eb1aa3b92f2ea68bbc4a2934fd6aead63f04",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790938608648279653-52d476012d0e.log": "3849a6c802d070d5f8261d76e1e43f6cea85bd9175cb89e6e53522298c20103e",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790939202613041471-4b7fc0a7869e.json": "3b377e284f52a54953591f28b278763b17e217f1fe548ffb7253075c765219eb",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790939202613041471-4b7fc0a7869e.log": "e6d27e0db161c4d7952529d32a4810bdcf515489856e0edde294e3f5eaf5eda0",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/reservation-refill-before/report.json": "fee8ce21eca6e6ffb42c8de1c3c88ebce364fbdaa5c7f7cabe9fe739f4f1b55e",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/reservation-refill-after/report.json": "0400064b7148719f0c7a6d41bb47c723231596a1286d67c05bbb6c2c6150595b"
+  }
+}

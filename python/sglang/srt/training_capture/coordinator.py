@@ -15,7 +15,6 @@ from typing import Any
 
 import msgspec
 import torch
-
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.training_capture.admission import CaptureAdmission
 from sglang.srt.training_capture.catalog import CaptureLease, CatalogConflict
@@ -272,6 +271,8 @@ class CaptureCoordinator:
         self.writer = SnapshotWriter(self.store, self.catalog, self.journal)
         self.lock = threading.RLock()
         self.stop = threading.Event()
+        self.lease_wake = threading.Event()
+        self.reservation_retry_at = 0.0
         self.writer_stop = threading.Event()
         self.activation = threading.Event()
         self.available = deque()
@@ -394,7 +395,7 @@ class CaptureCoordinator:
     def _reserve(self):
         slot = self.pool.acquire()
         if slot is None:
-            return
+            return False
         sample_id, generation_id = uuid.uuid4().hex, uuid.uuid4().hex
         started = time.monotonic()
         try:
@@ -427,16 +428,21 @@ class CaptureCoordinator:
             with self.lock:
                 self.records[lease.capture_id] = record
                 self.available.append(record)
+            return True
         except Exception:
             self.pool.release(slot, transfer_complete=True)
             self._count("admission_catalog_error")
             self._admission_failure("catalog_error")
+            self.reservation_retry_at = time.monotonic() + 0.1
+            return False
 
     def _lease_loop(self):
         while not self.stop.is_set():
+            # Clear before inspecting the pool so a concurrent release cannot
+            # be lost between a failed acquire and the maintenance wait.
+            self.lease_wake.clear()
             with self.lock:
                 records = list(self.records.values())
-                enabled = self.disabled_reason is None
             now = time.monotonic()
             for record in records:
                 if record.state == "done":
@@ -468,13 +474,17 @@ class CaptureCoordinator:
                         record.renew_at = time.monotonic() + 1
                         self._count("lease_renew_error")
                         self._admission_failure("catalog_error")
-            if enabled:
-                self._admission_ratio()
-                with self.lock:
-                    paused = time.monotonic() < self.admission.pause_until
-                if not paused:
-                    self._reserve()
-            self.stop.wait(0.1)
+            self._admission_ratio()
+            with self.lock:
+                can_reserve = self.disabled_reason is None and time.monotonic() >= max(
+                    self.admission.pause_until, self.reservation_retry_at
+                )
+            if not self.stop.is_set() and can_reserve and self._reserve():
+                # Recheck leases and admission between successful reservations;
+                # only an idle, paused or failed refill needs the polling delay.
+                continue
+            if not self.stop.is_set():
+                self.lease_wake.wait(0.1)
 
     def _queue_record(self, record):
         with self.lock:
@@ -967,6 +977,7 @@ class CaptureCoordinator:
             record.state = "done"
             self.records.pop(record.lease.capture_id, None)
         self.pool.release(record.slot, transfer_complete=complete)
+        self.lease_wake.set()
 
     def _recover_pending(self):
         self.writer.recover()
@@ -982,6 +993,7 @@ class CaptureCoordinator:
         with self.lock:
             if self.disabled_reason == "publication_pending":
                 self.disabled_reason = None
+                self.lease_wake.set()
 
     def _writer_loop(self):
         # Match the CUDA worker's CPU budget in this thread's OpenMP context.
@@ -1077,6 +1089,7 @@ class CaptureCoordinator:
             return
         self.disable("producer_shutdown")
         self.stop.set()
+        self.lease_wake.set()
         self.activation.set()
         if self.metrics_thread is not None and self.metrics_thread.ident is not None:
             self.metrics_thread.join(timeout=5)
