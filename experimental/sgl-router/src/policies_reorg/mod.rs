@@ -6,6 +6,7 @@
 
 pub mod admission;
 pub mod cache_aware;
+pub mod factory;
 pub mod power_of_two;
 pub mod session_aware;
 
@@ -93,6 +94,12 @@ pub trait Policy: Send + Sync + Debug {
     /// Whether this policy may serve `stage`; checked when a resolver is built.
     fn supports(&self, _stage: Stage) -> bool {
         true
+    }
+
+    /// Whether picks read request tokens (prefix matching). Load-only policies
+    /// work from the request-size estimate when no tokenizer is loaded.
+    fn needs_request_tokens(&self) -> bool {
+        false
     }
 
     /// Runs on a miss within the same candidates; never on an admission rejection.

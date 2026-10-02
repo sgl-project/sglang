@@ -4,6 +4,7 @@ import pickle
 import threading
 import unittest
 from array import array
+from contextlib import nullcontext
 from queue import Empty, Queue
 from unittest.mock import Mock, call, patch
 
@@ -49,6 +50,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.storage_stop_event = threading.Event()
         c.prefetch_tokens_occupied = 0
         c.mem_pool_host = Mock(page_size=4)
+        c.mem_pool_host.layout_lease.side_effect = nullcontext
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)
         c._storage_hit_query = Mock(return_value=(["h0", "h1"], 8))
         c._all_reduce = Mock()

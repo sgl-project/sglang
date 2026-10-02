@@ -2,7 +2,7 @@
 
 import math
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Set, Tuple
+from typing import Any, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
 import sympy
@@ -21,7 +21,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.attention.linear.utils import (
+    select_verify_intermediate_state_indices,
+)
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_all_reduce,
@@ -37,6 +40,7 @@ from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
@@ -46,9 +50,13 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
@@ -67,7 +75,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -310,12 +318,19 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         valid_steps = batch.valid_tokens.reshape(
             batch.lengths.shape[0], batch.row_width
         )
+        dst_indices_raw = select_verify_intermediate_state_indices(
+            None,
+            forward_batch.req_pool_indices,
+            batch.lengths.ne(0),
+            pool.size,
+        )
         pool.set_ngram_intermediate_context(
             torch.where(
                 valid_steps.unsqueeze(-1),
                 step_contexts,
                 torch.full_like(step_contexts, batch.ngram_eos_token_id),
-            )
+            ),
+            dst_indices_raw,
         )
         return
 
@@ -636,7 +651,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         contexts = contexts.to(torch.long)
         if self.enable_ple_fusion and decode_sized:
-            from sglang.kernels.ops.qwen4_ple import (
+            from sglang.kernels.ops.embeddings.qwen4_ngram import (
                 can_fuse_qwen4_ngram_hash,
                 fused_qwen4_ngram_hash,
             )
@@ -1016,7 +1031,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if batch.use_decode_fast_path:
             # With row_width=1 the padded/transpose path is x.unsqueeze(-1),
             # and each state boundary is a one-column shift; conv and SiLU stay native.
-            from sglang.kernels.ops.qwen4_ple import (
+            from sglang.kernels.ops.mamba.qwen4_short_conv import (
                 can_fuse_qwen4_short_conv_state,
                 fused_qwen4_short_conv_state,
             )
@@ -1092,9 +1107,23 @@ class Qwen4ExpPLELayer(nn.Module):
                     intermediate_state,
                     torch.zeros_like(intermediate_state),
                 )
-                intermediate_cache[: batch.lengths.shape[0], : batch.row_width].copy_(
-                    intermediate_state.to(dtype=intermediate_cache.dtype)
+                intermediate_state = intermediate_state.to(
+                    dtype=intermediate_cache.dtype
                 )
+                dst_indices_raw = select_verify_intermediate_state_indices(
+                    None,
+                    forward_batch.req_pool_indices,
+                    batch.lengths.ne(0),
+                    get_req_to_token_pool().size,
+                )
+                if dst_indices_raw is None:
+                    intermediate_cache[
+                        : batch.lengths.shape[0], : batch.row_width
+                    ].copy_(intermediate_state)
+                else:
+                    intermediate_cache[
+                        dst_indices_raw.to(dtype=torch.long), : batch.row_width
+                    ] = intermediate_state
         else:
             state_cols = torch.arange(
                 self.short_conv_state_len, device=x.device, dtype=torch.long
@@ -1232,25 +1261,59 @@ class Qwen4ExpPLELayer(nn.Module):
         query = hidden_states.reshape(token_count, hc_count, hidden_size)
         key_normed = self._apply_ple_norm(self.norm_key, key)
         query_normed = self._apply_ple_norm(self.norm_query, query)
-        gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
-        gate = gate / math.sqrt(hidden_size)
-        fused_gate_value = False
-        if batch.use_decode_fast_path:
-            from sglang.kernels.ops.qwen4_ple import (
-                can_fuse_qwen4_gate_value,
-                fused_qwen4_gate_value,
-            )
+        from sglang.kernels.ops.elementwise.qwen4_gate import (
+            can_fuse_qwen4_gate_reduce,
+            fused_qwen4_gate_reduce,
+        )
 
-            fused_gate_value = can_fuse_qwen4_gate_value(gate, value)
-        if fused_gate_value:
-            gated_value = fused_qwen4_gate_value(gate, value)
+        fused_gate_reduce = (
+            self.ple_embedding.enable_ple_fusion
+            and batch.mode.is_target_verify()
+            and can_fuse_qwen4_gate_reduce(key_normed, query_normed, value)
+        )
+        if fused_gate_reduce:
+            gated_value = fused_qwen4_gate_reduce(key_normed, query_normed, value)
         else:
-            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-            gate = torch.sigmoid(gate)
-            gated_value = gate * value.unsqueeze(-2)
+            gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
+            gate = gate / math.sqrt(hidden_size)
+            fused_gate_value = False
+            if batch.use_decode_fast_path:
+                from sglang.kernels.ops.elementwise.qwen4_gate import (
+                    can_fuse_qwen4_gate_value,
+                    fused_qwen4_gate_value,
+                )
+
+                fused_gate_value = can_fuse_qwen4_gate_value(gate, value)
+            if fused_gate_value:
+                gated_value = fused_qwen4_gate_value(gate, value)
+            else:
+                gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+                gate = torch.sigmoid(gate)
+                gated_value = gate * value.unsqueeze(-2)
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
+        if self.ple_embedding.enable_ple_fusion and batch.mode.is_target_verify():
+            from sglang.kernels.ops.mamba.qwen4_short_conv import (
+                can_fuse_qwen4_verify_conv,
+                fused_qwen4_verify_conv,
+            )
+
+            pool = get_req_to_token_pool()
+            conv_args = (
+                gated_value_normed,
+                gated_value,
+                self.conv1d.weight,
+                pool.short_conv_layer_cache(self.layer_id),
+                batch.state_indices,
+                batch.valid_tokens,
+                batch.row_width,
+                self.short_conv_dilation,
+                pool.short_conv_layer_intermediate_cache(self.layer_id),
+            )
+            if can_fuse_qwen4_verify_conv(*conv_args):
+                output = fused_qwen4_verify_conv(*conv_args)
+                return _pad_token_rows(output, batch.physical_tokens)
         conv_output = self._short_conv(
             gated_value_normed,
             forward_batch,
@@ -1281,7 +1344,8 @@ class Qwen4ExpLayerExtensionMixin:
         for attr_name in (
             "input_layernorm",
             "post_attention_layernorm",
-            "layer_communicator",
+            "attn_boundary",
+            "ffn_boundary",
         ):
             if hasattr(self, attr_name):
                 delattr(self, attr_name)
@@ -1400,14 +1464,16 @@ class Qwen4ExpLayerExtensionMixin:
             attn_tp_chunks = list(hidden_states.tensor_split(attn_tp_size))
             hidden_states = attn_tp_chunks[get_parallel().attn_tp_rank].contiguous()
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        use_reduce_scatterv = use_dp_moe_gather and should_use_dp_reduce_scatterv()
+        with get_forward().scoped(mlp_reduce_scatter=use_reduce_scatterv):
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         if use_dp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
-            if should_use_dp_reduce_scatterv():
+            if use_reduce_scatterv:
                 get_parallel().tp_group.reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
@@ -1631,6 +1697,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
     decoder_layer_types = ALL_DECODER_LAYER_TYPES
 
     def _build_embed_tokens(self, config: Qwen4ExpTextConfig) -> nn.Module:
+        if not self.pp_group.is_first_rank:
+            return PPMissingLayer()
         return VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -1648,7 +1716,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         super().__init__(config, quant_config, prefix, is_nextn)
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
-        self.has_ple = bool(config.ple_layer_ids)
+        self.has_ple = any(
+            self.layers[layer_id].ple is not None
+            for layer_id in range(self.start_layer, self.end_layer)
+        )
         self.ple_ngram_size = int(config.ngram_size) if self.has_ple else None
         self.ple_ngram_eos_token_id = (
             int(config.eos_token_id) if self.ple_ngram_size is not None else None
@@ -1663,7 +1734,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
-        self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+        self.hyper_connection_mixer = (
+            GatedResidual(hc_config, use_combine=False)
+            if self.pp_group.is_last_rank
+            else PPMissingLayer()
+        )
 
     def forward(
         self,
@@ -1671,11 +1746,25 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_tokens(input_ids)
+            residual = None
         else:
-            hidden_states = self.embed_tokens(input_ids)
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            # Only the first stage embeds multimodal inputs; the last stage needs
+            # them for the MTP draft prefill, so relay them with the hidden states.
+            mm_input_embeds = pp_proxy_tensors.tensors.get("mm_input_embeds")
+            if mm_input_embeds is not None:
+                forward_batch.mm_input_embeds = mm_input_embeds
+            # The hyper-connection streams ride in the widened hidden state;
+            # there is no separate residual at a PP boundary (hc_hidden_size contract).
+            residual = None
 
         ple_batch = (
             _prepare_ple_batch(
@@ -1687,12 +1776,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.has_ple
             else None
         )
-        residual = None
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
-                next_ple = getattr(self.layers[i + 1], "ple", None)
+                next_ple = self.layers[i + 1].ple
                 if next_ple is not None:
                     next_ple.start_prefetch(ple_batch, forward_batch)
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -1710,6 +1798,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
         _commit_ple_batch(ple_batch, forward_batch)
+
+        if not self.pp_group.is_last_rank:
+            proxy_tensors = {"hidden_states": hidden_states}
+            if forward_batch.mm_input_embeds is not None:
+                proxy_tensors["mm_input_embeds"] = forward_batch.mm_input_embeds
+            return PPProxyTensors(proxy_tensors)
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
@@ -1753,7 +1847,10 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             positions=positions,
             forward_batch=forward_batch,
             inputs_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+        if isinstance(model_output, PPProxyTensors):
+            return model_output
         if isinstance(model_output, tuple):
             hidden_states, self.last_hc_hidden_states = model_output
             return hidden_states
@@ -1788,9 +1885,27 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
 
+    def get_embed_and_head(self):
+        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
+        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        return embed, head
+
     @torch.no_grad()
-    def forward(self, *args, **kwargs):
-        output = super().forward(*args, **kwargs)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        output = super().forward(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            get_embedding=get_embedding,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
         hc_hidden_states = self.model.last_hc_hidden_states
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
             output.hidden_states = hc_hidden_states
@@ -2024,6 +2139,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             elif name.endswith(".v_proj.v_scale"):
                 name = name.replace(".v_proj.v_scale", ".attn.v_scale")
 
+            layer_id = get_layer_id(name)
+            if layer_id is not None and (
+                layer_id < self.start_layer or layer_id >= self.end_layer
+            ):
+                continue
+
             if self._load_qwen4_exp_ple_buffer(
                 name, loaded_weight, buffers, loaded_buffers
             ):
@@ -2049,9 +2170,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 )
                 weight_loader(lm_head_param, loaded_weight)
 
-            layer_id = get_layer_id(name)
-            if layer_id is not None and (
-                layer_id < self.start_layer or layer_id >= self.end_layer
+            if (
+                not self.pp_group.is_last_rank
+                and "model.hyper_connection_mixer." in name
             ):
                 continue
 

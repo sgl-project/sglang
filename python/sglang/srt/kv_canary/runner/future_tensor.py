@@ -6,6 +6,8 @@ from typing import Any, Optional, Union
 
 import torch
 
+from sglang.srt.utils import is_device_stream_capturing
+
 _PayloadDict = dict[str, Any]
 _TensorOrDict = Union[torch.Tensor, _PayloadDict]
 
@@ -15,20 +17,14 @@ _DUMMY_DICT_KEY = "__dummy_key__"
 @dataclass(slots=True, kw_only=True)
 class FutureTensors:
     _data: Optional[_PayloadDict]
-    _event: Optional[torch.cuda.Event]
+    _event: Optional[torch.Event]
     # Device-source clones must outlive the async d2h copy.
     _retained_device_clones: Optional[dict[str, torch.Tensor]] = None
 
     @classmethod
     def device_to_host(
-        cls, xs_device: _TensorOrDict, *, d2h_stream: torch.cuda.Stream
+        cls, xs_device: _TensorOrDict, *, d2h_stream: torch.Stream
     ) -> FutureTensors:
-        assert not torch.cuda.is_current_stream_capturing(), (
-            "FutureTensors.device_to_host must not be called during cuda-graph "
-            "capture: the d2h side-stream copy + pinned-host alloc cannot be "
-            "captured. Upper-layer callers are responsible for placing the d2h "
-            "staging OUTSIDE the cuda graph (not inside it)."
-        )
         if not isinstance(xs_device, dict):
             xs_device = {_DUMMY_DICT_KEY: xs_device}
 
@@ -42,6 +38,13 @@ class FutureTensors:
             )
         device = first_tensor.device
         del first_tensor
+
+        assert not is_device_stream_capturing(device), (
+            "FutureTensors.device_to_host must not be called during cuda-graph "
+            "capture: the d2h side-stream copy + pinned-host alloc cannot be "
+            "captured. Upper-layer callers are responsible for placing the d2h "
+            "staging OUTSIDE the cuda graph (not inside it)."
+        )
 
         tensors_device = {
             k: v for k, v in xs_device.items() if isinstance(v, torch.Tensor)
@@ -61,11 +64,12 @@ class FutureTensors:
             for key, x in tensors_device.items()
         }
 
-        d2h_stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(d2h_stream):
+        device_module = torch.get_device_module(device)
+        d2h_stream.wait_stream(device_module.current_stream(device))
+        with device_module.stream(d2h_stream):
             for key in tensors_device_cloned:
                 tensors_host[key].copy_(tensors_device_cloned[key], non_blocking=True)
-            event = torch.cuda.Event()
+            event = device_module.Event()
             event.record()
 
         return cls(
@@ -100,7 +104,7 @@ class FutureTensors:
 class DelayedDeviceHostHandler:
     """Stage device-side compute at step T, drain + postprocess host copy at step T+1."""
 
-    d2h_stream: torch.cuda.Stream
+    d2h_stream: torch.Stream
     _future: Optional[FutureTensors] = field(default=None)
 
     def step(

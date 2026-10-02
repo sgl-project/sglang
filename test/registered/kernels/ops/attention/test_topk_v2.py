@@ -22,6 +22,9 @@ cluster floor and pool size are per-arch (see topk_v2.cuh), so the (batch, seq)
 grid below brackets the fixed boundaries (8192/8193, 16384/16385) exactly and
 spans the arch-dependent ones, across k in {512,1024,2048} and identity/perm
 page tables.
+
+``test_topk_v2_packed_rows`` covers the DSA extend layout on top of that: all
+requests packed into one score buffer, sharing a table row per request.
 """
 
 from __future__ import annotations
@@ -33,9 +36,11 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
+    topk_transform_packed_v2,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -463,6 +468,144 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
     implicit = _run_ragged(scores.clone(), lengths, None, offsets, k)
     for i in range(len(rows)):
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
+
+
+@pytest.mark.skipif(
+    not is_hip(), reason="packed layout is compiled under USE_ROCM only"
+)
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize(
+    "extend_lens",
+    [
+        [7],  # one request
+        [4, 4],  # equal row counts
+        [1, 13, 2],  # ragged, including a single-row request
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
+    """DSA extend layout: batch-global packed scores + shared page-table rows.
+
+    Rows are causal within a request; a distinct page-table permutation per request
+    catches row/request index mix-ups, and the ragged case leaves most window starts
+    off the 16-byte load boundary (the production case).
+    """
+    torch.manual_seed(4242 + k + len(extend_lens))
+    device = "cuda"
+
+    # Keep every row longer than k so no row takes the trivial path.
+    prefix = k + 1024
+    kv_lens = [prefix + e for e in extend_lens]
+    k_offsets = [0]
+    for kv in kv_lens[:-1]:
+        k_offsets.append(k_offsets[-1] + kv)
+    total_kv = sum(kv_lens)
+
+    row_starts, lengths, row_to_batch = [], [], []
+    for i, e in enumerate(extend_lens):
+        for local in range(e):
+            row_starts.append(k_offsets[i])
+            lengths.append(kv_lens[i] - e + local + 1)
+            row_to_batch.append(i)
+    rows = len(lengths)
+
+    width = (total_kv + 3) & ~3
+    scores = torch.randn(rows, width, dtype=torch.float32, device=device)[:, :total_kv]
+    lengths_t = torch.tensor(lengths, dtype=torch.int32, device=device)
+    row_starts_t = torch.tensor(row_starts, dtype=torch.int32, device=device)
+    row_to_batch_t = torch.tensor(row_to_batch, dtype=torch.int32, device=device)
+
+    num_pages = (max(kv_lens) + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(
+        len(extend_lens), num_pages, "perm", device, per_row=True
+    )
+
+    out = torch.full((rows, k), -1, dtype=torch.int32, device=device)
+    # The kernel masks in place, so reference values must be read before the call.
+    scores_cpu = scores.cpu()
+    topk_transform_packed_v2(
+        scores,
+        lengths_t,
+        page_table,
+        out,
+        PAGE_SIZE,
+        row_starts=row_starts_t,
+        row_to_batch=row_to_batch_t,
+    )
+    torch.cuda.synchronize()
+
+    out_cpu = out.cpu().tolist()
+    for r in range(rows):
+        L, start, req = lengths[r], row_starts[r], row_to_batch[r]
+        window = scores_cpu[r, start : start + L]
+        ref = torch.topk(window, k, sorted=False).indices.tolist()
+        our = _invert(out_cpu[r], inv_cpu[req])
+        _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
+
+
+@pytest.mark.skipif(
+    not is_hip(), reason="packed layout is compiled under USE_ROCM only"
+)
+@pytest.mark.parametrize("residue", [1, 2, 3])
+@pytest.mark.parametrize("boundary", [8192, 16384])
+@torch.inference_mode()
+def test_topk_v2_packed_level_boundary(boundary: int, residue: int) -> None:
+    """Rows whose length sits on an implementation's max_seq_len boundary.
+
+    The masked head widens the problem by ``residue``, so a row of exactly
+    ``boundary`` tokens spills past the register implementation sized for it. The
+    packed kernel picks the implementation per row from the widened length, so
+    these must still be exact; a compile-time choice made from the un-widened
+    length would overflow.
+    """
+    torch.manual_seed(boundary + residue)
+    device = "cuda"
+    k = 512
+
+    # Request 0 exists only to push request 1's window off the 16-byte boundary.
+    kv_lens = [residue, boundary + 1]
+    lengths = [residue] + [boundary - 1, boundary, boundary + 1]
+    row_starts = [0] + [residue] * 3
+    row_to_batch = [0, 1, 1, 1]
+    rows = len(lengths)
+    total_kv = sum(kv_lens)
+
+    width = (total_kv + 3) & ~3
+    scores = torch.randn(rows, width, dtype=torch.float32, device=device)[:, :total_kv]
+    lengths_t = torch.tensor(lengths, dtype=torch.int32, device=device)
+    row_starts_t = torch.tensor(row_starts, dtype=torch.int32, device=device)
+    row_to_batch_t = torch.tensor(row_to_batch, dtype=torch.int32, device=device)
+
+    num_pages = (max(kv_lens) + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(
+        len(kv_lens), num_pages, "perm", device, per_row=True
+    )
+
+    out = torch.full((rows, k), -1, dtype=torch.int32, device=device)
+    scores_cpu = scores.cpu()
+    topk_transform_packed_v2(
+        scores,
+        lengths_t,
+        page_table,
+        out,
+        PAGE_SIZE,
+        row_starts=row_starts_t,
+        row_to_batch=row_to_batch_t,
+    )
+    torch.cuda.synchronize()
+
+    out_cpu = out.cpu().tolist()
+    for r in range(rows):
+        L, start, req = lengths[r], row_starts[r], row_to_batch[r]
+        window = scores_cpu[r, start : start + L]
+        our = _invert(out_cpu[r], inv_cpu[req])
+        if L <= k:
+            # Trivial path: every position, then -1 padding.
+            assert sorted(our[:L]) == list(range(L)), f"row {r} trivial output wrong"
+            assert all(v == -1 for v in out_cpu[r][L:]), f"row {r} padding wrong"
+            continue
+        ref = torch.topk(window, k, sorted=False).indices.tolist()
+        _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
 
 
 if __name__ == "__main__":

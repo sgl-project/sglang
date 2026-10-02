@@ -11,7 +11,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.model_runner_components import kv_pool_runtime
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -60,9 +60,8 @@ class TestCanaryHeadroom(CustomTestCase):
                 ),
             ),
             patch.object(kv_pool_runtime.torch.cuda, "synchronize"),
-            patch(
-                "sglang.srt.distributed.parallel_state.get_world_group",
-                return_value=SimpleNamespace(world_size=1, cpu_group=None),
+            get_parallel().override(
+                world_group=SimpleNamespace(world_size=1, cpu_group=None)
             ),
             patch.object(kv_pool_runtime, "get_available_gpu_memory", return_value=20),
             patch.object(kv_pool_runtime, "mambaish_config", return_value=None),

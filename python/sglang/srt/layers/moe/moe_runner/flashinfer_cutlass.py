@@ -54,11 +54,54 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     w2_weight: torch.Tensor
     quant_scales: Optional[list[torch.Tensor]] = None
     output_dtype: Optional[torch.dtype] = None
+    # Optional per-expert SwiGLU overrides, fp32 [num_local_experts].
+    swiglu_alpha: Optional[torch.Tensor] = None
+    swiglu_beta: Optional[torch.Tensor] = None
+    swiglu_limit: Optional[torch.Tensor] = None
     moe_tp_size: int = 1
     moe_tp_rank: int = 0
     moe_ep_size: int = 1
     moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
+
+
+def materialize_swiglu_params_for_cutlass(
+    runner_config: MoeRunnerConfig,
+    num_local_experts: int,
+    device: torch.device,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Per-expert SwiGLU (alpha, beta, limit) tensors for the CUTLASS kernel.
+
+    Returns all-None unless a clamp limit is configured. ``gemm1_alpha``
+    implies the GPT-OSS-style ``+1`` up term, so beta then defaults to 1.0;
+    without alpha, alpha/beta stay silu-neutral at 1.0 / 0.0. The kernel
+    clamps dequantized values, so the limit is in physical units (no
+    g1_alphas conversion, unlike trtllm-gen). SiTU carries its clamp in the
+    activation itself.
+    """
+    if runner_config.activation == "situ":
+        return None, None, None
+    clamp_limit = runner_config.gemm1_clamp_limit or runner_config.swiglu_limit
+    if clamp_limit is None:
+        return None, None, None
+    alpha = runner_config.gemm1_alpha if runner_config.gemm1_alpha is not None else 1.0
+    beta = runner_config.gemm1_beta
+    if beta is None:
+        beta = 1.0 if runner_config.gemm1_alpha is not None else 0.0
+    return (
+        torch.full(
+            (num_local_experts,), float(alpha), dtype=torch.float32, device=device
+        ),
+        torch.full(
+            (num_local_experts,), float(beta), dtype=torch.float32, device=device
+        ),
+        torch.full(
+            (num_local_experts,),
+            float(clamp_limit),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
 
 
 @dataclass
@@ -160,6 +203,36 @@ def _maybe_apply_routed_scaling_factor(
     return output
 
 
+def _prescale_router_weight_on_input(
+    dispatch_output: StandardDispatchOutput | FlashinferDispatchOutput,
+    runner_config: MoeRunnerConfig,
+) -> StandardDispatchOutput | FlashinferDispatchOutput:
+    if not runner_config.apply_router_weight_on_input:
+        return dispatch_output
+
+    topk_output = dispatch_output.topk_output
+    topk_weights = topk_output.topk_weights
+
+    if dispatch_output.hidden_states_scale is not None:
+        raise NotImplementedError(
+            "apply_router_weight_on_input is not supported when activations are "
+            "quantized before dispatch (flashinfer_cutlass fp4 all-gather path)."
+        )
+
+    assert topk_weights.dim() == 2 and topk_weights.shape[-1] == 1, (
+        "apply_router_weight_on_input requires topk=1"
+    )
+
+    hidden_states = dispatch_output.hidden_states * topk_weights.to(
+        dispatch_output.hidden_states.dtype
+    )
+    unit_scales = torch.ones_like(topk_weights, dtype=torch.float32)
+    return dispatch_output._replace(
+        hidden_states=hidden_states,
+        topk_output=topk_output._replace(topk_weights=unit_scales),
+    )
+
+
 def _prepare_input(
     dispatch_output,
     quant_info: FlashInferCutlassMoeQuantInfo,
@@ -197,8 +270,9 @@ def _run_flashinfer_cutlass(
 ) -> torch.Tensor:
     flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
 
+    dispatch_output = _prescale_router_weight_on_input(dispatch_output, runner_config)
     topk_output = dispatch_output.topk_output
-    topk_weights = topk_output.topk_weights
+    topk_weights = topk_output.topk_weights.to(torch.float32)
     topk_ids = topk_output.topk_ids
     x, x_sf, output_dtype, output_col = _prepare_input(
         dispatch_output, quant_info, runner_config
@@ -241,6 +315,9 @@ def _run_flashinfer_cutlass(
         output_dtype=output_dtype,
         input_sf=x_sf,
         quant_scales=quant_scales,
+        swiglu_alpha=quant_info.swiglu_alpha,
+        swiglu_beta=quant_info.swiglu_beta,
+        swiglu_limit=quant_info.swiglu_limit,
         ep_size=quant_info.moe_ep_size,
         ep_rank=quant_info.moe_ep_rank,
         tp_size=quant_info.moe_tp_size,
@@ -267,9 +344,6 @@ def fused_experts_none_to_flashinfer_cutlass(
     assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
         f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
     )
-    assert not runner_config.apply_router_weight_on_input, (
-        "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
-    )
 
     output = _run_flashinfer_cutlass(
         dispatch_output=dispatch_output,
@@ -291,9 +365,6 @@ def fused_experts_flashinfer_to_flashinfer_cutlass(
 
     assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
         f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
-    )
-    assert not runner_config.apply_router_weight_on_input, (
-        "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
     )
 
     output = _run_flashinfer_cutlass(

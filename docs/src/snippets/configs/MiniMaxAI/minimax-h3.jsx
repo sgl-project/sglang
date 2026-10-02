@@ -1001,16 +1001,11 @@ return {
 
   dockerMounts: ["{{MEDIA_DIR}}:/data/minimax-h3:ro"],
 
-  dockerRunCommand: (s) =>
-    ["mi300x", "mi355x"].includes(s.hw)
-      ? `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion_hip]" && exec sglang serve "$@"' --`
-      : `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion]" && exec sglang serve "$@"' --`,
-
   // Publish Docker only after the platform's H3 image/command has been validated.
   runModes: (s) =>
     ["mi300x", "mi355x", "gb200", "gb300"].includes(s.hw)
       ? ["python"]
-      : ["python", "docker"],
+      : ["docker", "python"],
 
   dockerImages: {
     b200: "lmsysorg/sglang:dev",

@@ -111,10 +111,12 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: model_id.into(),
-            tokenizer_path: tokenizer_path.to_str().unwrap().into(),
+            tokenizer_path: Some(tokenizer_path.to_str().unwrap().into()),
             disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
@@ -123,6 +125,7 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
