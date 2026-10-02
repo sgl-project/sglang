@@ -266,26 +266,47 @@ class BeamAttention(nn.Module):
         # Sliding layers use RoPE; full-attention layers use NoPE with SSMax.
         self.apply_rope = config.layer_types[layer_id] == "sliding_attention"
         self.sliding_window = config.sliding_window - 1 if self.apply_rope else -1
-        self.qkv_proj = QKVParallelLinear(
-            config.hidden_size,
-            self.head_dim,
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            prefix=add_prefix("qkv_proj", prefix),
+        # MergedColumnParallelLinear shards each projection independently, but
+        # does not replicate KV heads. Keep the existing quantized/replicated
+        # paths until their loading and backend contracts are validated.
+        self.use_packed_projection = (
+            quant_config is None and config.num_key_value_heads >= self.tp_size
         )
-        self.gate_proj = ColumnParallelLinear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            prefix=add_prefix("gate_proj", prefix),
-        )
+        if self.use_packed_projection:
+            self.qkv_gate_proj = MergedColumnParallelLinear(
+                config.hidden_size,
+                [
+                    config.num_attention_heads * self.head_dim,
+                    config.num_key_value_heads * self.head_dim,
+                    config.num_key_value_heads * self.head_dim,
+                    config.num_attention_heads * self.head_dim,
+                ],
+                bias=False,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                prefix=add_prefix("qkv_gate_proj", prefix),
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                config.hidden_size,
+                self.head_dim,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
+            self.gate_proj = ColumnParallelLinear(
+                config.hidden_size,
+                config.num_attention_heads * self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                prefix=add_prefix("gate_proj", prefix),
+            )
         self.gate_bias = nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
         set_weight_attrs(self.gate_bias, {"weight_loader": self.load_gate_bias})
         self.o_proj = RowParallelLinear(
@@ -329,8 +350,14 @@ class BeamAttention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.use_packed_projection:
+            qkv_gate, _ = self.qkv_gate_proj(hidden_states)
+            q, k, v, gate = qkv_gate.split(
+                [self.q_size, self.kv_size, self.kv_size, self.q_size], dim=-1
+            )
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = self.q_norm(q.reshape(-1, self.head_dim)).view(-1, self.q_size)
         k = self.k_norm(k.reshape(-1, self.head_dim)).view(-1, self.kv_size)
         if self.rotary_emb is not None:
@@ -338,7 +365,8 @@ class BeamAttention(nn.Module):
         else:
             q = apply_ssmax(q, positions)
         attention_output = self.attn(q, k, v, forward_batch)
-        gate, _ = self.gate_proj(hidden_states)
+        if not self.use_packed_projection:
+            gate, _ = self.gate_proj(hidden_states)
         attention_output = apply_attention_gate(
             attention_output.view(-1, self.num_heads, self.head_dim),
             gate.view(-1, self.num_heads, self.head_dim),
@@ -594,6 +622,9 @@ class BeamForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
         params = dict(self.named_parameters())
+        # Select by the actual destination parameter so PP shards and the
+        # replicated-KV/quantized fallback retain their existing loaders.
+        attention_shards = {"q_proj": 0, "k_proj": 1, "v_proj": 2, "gate_proj": 3}
         loaded = set()
         for name, weight in weights:
             layer_id = get_layer_id(name)
@@ -614,6 +645,19 @@ class BeamForCausalLM(nn.Module):
                 and not self.model.pp_group.is_last_rank
             ):
                 continue
+            if ".self_attn." in name:
+                prefix, suffix = name.split(".self_attn.", 1)
+                projection, separator, field = suffix.partition(".")
+                target_name = f"{prefix}.self_attn.qkv_gate_proj.{field}"
+                if (
+                    separator
+                    and projection in attention_shards
+                    and target_name in params
+                ):
+                    param = params[target_name]
+                    param.weight_loader(param, weight, attention_shards[projection])
+                    loaded.add(target_name)
+                    continue
             for source, target, shard_id in packed_projections:
                 if source in name:
                     target_name = name.replace(source, target)
