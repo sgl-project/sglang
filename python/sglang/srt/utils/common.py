@@ -3861,8 +3861,10 @@ def configure_gc_warning(warn_threshold_secs):
 
 
 def freeze_gc(context: str):
+    from sglang.srt.utils.gc_control import freeze_gc_permanently
+
     g0_before, g1_before, g2_before = gc_object_counts()
-    gc.freeze()
+    freeze_gc_permanently()
     g0_after, g1_after, g2_after = gc_object_counts()
     logger.info(
         f"Freezing GC in {context} process. "

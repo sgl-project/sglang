@@ -212,6 +212,72 @@ def warmup(url, args):
     response.raise_for_status()
 
 
+def gc_snapshot(url, *, collect=False):
+    response = requests.post(
+        url + "/test_training_capture_gc_state",
+        params={"collect": str(collect).lower()},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def apply_gc_policy(url, directory, policy):
+    result = {"policy": policy, "before": gc_snapshot(url)}
+    if policy == "freeze-after-warmup":
+        started = time.monotonic()
+        response = requests.post(url + "/freeze_gc", timeout=30)
+        response.raise_for_status()
+        roles = ("Tokenizer Manager", "Scheduler", "Detokenizer Manager")
+        # HTTP completion acknowledges only the tokenizer. Observe the existing
+        # per-process completion logs before starting client timing.
+        while True:
+            logs = (directory / "server.stderr.log").read_text()
+            acknowledged = [
+                role for role in roles if f"Freezing GC in {role} process." in logs
+            ]
+            if len(acknowledged) == len(roles):
+                break
+            if time.monotonic() - started >= 30:
+                raise TimeoutError(f"Incomplete serving GC freeze: {acknowledged}")
+            time.sleep(0.05)
+        result.update(
+            acknowledged_roles=acknowledged,
+            seconds=time.monotonic() - started,
+        )
+    result["after"] = gc_snapshot(url)
+    if result["after"]["policy"]["serving_freeze_requested"] != (
+        policy == "freeze-after-warmup"
+    ):
+        raise RuntimeError("Tokenizer GC policy differs from the experiment")
+    return result
+
+
+def verify_gc_lifecycle(url, control, count, directory):
+    observed = gc_snapshot(url)
+    collected = gc_snapshot(url, collect=True)
+    observations = {"after_workload": observed, "after_collection": collected}
+    write_json(directory / "gc-lifecycle.json", {"control": control, **observations})
+    before = control["after"]
+    for state in (observed, collected):
+        if state["pid"] != before["pid"] or state["policy"] != before["policy"]:
+            raise RuntimeError("Tokenizer process or GC ownership changed")
+        if (
+            state["enabled"] != before["enabled"]
+            or state["thresholds"] != before["thresholds"]
+        ):
+            raise RuntimeError("Tokenizer GC enablement or thresholds changed")
+        if state["dropped_weakrefs"] or state["active_requests"]:
+            raise RuntimeError("Incomplete request lifetime observation")
+        if state["created_request_states"] - before["created_request_states"] != count:
+            raise RuntimeError("Request lifetime probe missed measured requests")
+    if not collected["new_cycle_collected"]:
+        raise RuntimeError("New cycles were retained after serving GC freeze")
+    if collected["live_request_states"] > before["live_request_states"]:
+        raise RuntimeError("Completed request states remain alive after collection")
+    return observations
+
+
 def capture_config(args, directory, address, catalog, ratio):
     return {
         "dataset_id": "capture-benchmark",
@@ -430,13 +496,32 @@ def run_phase(args, directory, ratio):
                     url,
                     timeout=300,
                     other_args=server_args,
-                    env={"SGLANG_LOG_GC": "1"} if args.latency_diagnostics else None,
+                    env=(
+                        {"SGLANG_LOG_GC": "1"}
+                        | (
+                            {"SGLANG_TEST_CAPTURE_GC_LIFECYCLE": "1"}
+                            if args.gc_lifecycle
+                            else {}
+                        )
+                        if args.latency_diagnostics
+                        else None
+                    ),
                     return_stdout_stderr=tuple(server_logs) if server_logs else None,
                 )
             warmup(url, args)
+            gc_control = (
+                apply_gc_policy(url, directory, args.gc_policy)
+                if args.gc_lifecycle
+                else None
+            )
             with catalog.condition:
                 warmup_publications = set(catalog.publications)
             result = measure(args, url, directory)
+            if gc_control is not None:
+                result["gc_control"] = gc_control
+                result["gc_lifecycle"] = verify_gc_lifecycle(
+                    url, gc_control, args.num_prompts, directory
+                )
             with catalog.condition:
                 publications = [
                     value
@@ -603,9 +688,19 @@ def main():
     parser.add_argument("--phase-timeout", type=int, default=600)
     parser.add_argument("--request-details", action="store_true")
     parser.add_argument("--latency-diagnostics", action="store_true")
+    parser.add_argument("--gc-lifecycle", action="store_true")
+    parser.add_argument(
+        "--gc-policy", choices=("unchanged", "freeze-after-warmup"), default="unchanged"
+    )
     args = parser.parse_args()
     if args.latency_diagnostics and not args.request_details:
         parser.error("--latency-diagnostics requires --request-details")
+    if args.gc_lifecycle and not args.latency_diagnostics:
+        parser.error("--gc-lifecycle requires --latency-diagnostics")
+    if args.gc_policy != "unchanged" and not args.gc_lifecycle:
+        parser.error("--gc-policy freeze-after-warmup requires --gc-lifecycle")
+    if args.gc_lifecycle and args.num_prompts + args.concurrency + 1 > 16000:
+        parser.error("--gc-lifecycle supports at most 16000 requests including warmup")
     if not Path(args.model_path).is_dir():
         parser.error("Use a local model directory")
     if (
@@ -647,6 +742,14 @@ def main():
             )
         },
         "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "gc_source_sha256": {
+            path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+            for path in (
+                "python/sglang/srt/utils/common.py",
+                "python/sglang/srt/utils/gc_control.py",
+                "python/sglang/srt/model_executor/runner/base_cuda_graph_runner.py",
+            )
+        },
         "request_client_source_sha256": (
             {
                 path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
@@ -680,6 +783,8 @@ def main():
             "client": "existing sglang.benchmark.serving, streaming native /generate",
             "request_details": args.request_details,
             "latency_diagnostics": args.latency_diagnostics,
+            "gc_policy": args.gc_policy,
+            "gc_lifecycle": args.gc_lifecycle,
             "workload": "seeded fixed-length random-ids, closed-loop concurrency, not production traffic",
             "timing": "Client timing excludes warmup, server launch, readback and post-response writer drain",
             "payload_bytes": "Validated manifest tensor sizes; not D2H or wire byte counters",

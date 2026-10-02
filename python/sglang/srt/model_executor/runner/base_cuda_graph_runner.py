@@ -16,10 +16,8 @@
 from __future__ import annotations
 
 import bisect
-import gc
 import logging
 from abc import abstractmethod
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
@@ -28,6 +26,7 @@ from sglang.srt.utils import (
     get_cuda_graph_batch_size_alignment,
     get_cuda_graph_max_batch_size,
 )
+from sglang.srt.utils.gc_control import freeze_gc_for_capture
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
@@ -39,23 +38,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@contextmanager
 def freeze_gc(enable_cudagraph_gc: bool):
     """Optimize garbage collection during CUDA graph capture.
 
     Clean up first, then freeze remaining objects from being included in
     future collections if GC is disabled during capture.
     """
-    gc.collect()
-    should_freeze = not enable_cudagraph_gc
-    if should_freeze:
-        gc.freeze()
-    try:
-        yield
-    finally:
-        if should_freeze:
-            gc.unfreeze()
-            gc.collect()
+    return freeze_gc_for_capture(enable_cudagraph_gc)
 
 
 def get_batch_sizes_to_capture(

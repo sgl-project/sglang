@@ -1,0 +1,720 @@
+{
+  "schema_version": 1,
+  "checks": {
+    "passing_unit_methods": 164,
+    "ownership_and_graph_selection_methods": 13,
+    "cuda_and_diagnostic_methods": 25,
+    "frozen_producer_resource_methods": 126,
+    "black_python_files": 7,
+    "full_ruff_clean_python_files": 5,
+    "common_py_baseline_and_candidate_ruff_findings": 130,
+    "base_graph_runner_baseline_and_candidate_ruff_findings": 7,
+    "new_upstream_ruff_findings": 0,
+    "diff_check": "passed"
+  },
+  "limitations": [
+    "The first baseline ownership probe made invalid zero-permanent-generation assumptions. Its four failures are retained but are not all evidence of a product bug. The corrected baseline fails three of four cyclic-object lifetime tests; the candidate passes all six ownership tests.",
+    "The final ownership test class is AST-identical to the tested v1 class. Only formatting and its CI runtime estimate differ in v2.",
+    "One unchanged and one frozen 1024-request off/on/off bracket, in that order, are diagnostic observations, not statistical or production SLO acceptance. Both use the same instrumentation and source.",
+    "Warmup freeze is an explicit existing API request. This patch coordinates SGLang serving/graph ownership and does not enable a new serving default or coordinate third-party raw GC calls.",
+    "Tokenizer request weak references and short-run RSS observations do not prove long-term memory stability or scheduler/detokenizer object lifetime. Unit cancellation tests are not a frozen-policy HTTP cancellation workload.",
+    "Single resident H100, Qwen3-0.6B BF16, synthetic IDs, decode graphs, overlap, local TCP Store, HTTP test Catalog and GPFS journals. Catalog retention, SpecForge integration and trained-draft quality remain unproven."
+  ],
+  "baseline_revision": "e4306b9e49a15d8bb7745759838d5fb444f63e9a",
+  "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2",
+  "source_sha256": {
+    "python/sglang/srt/utils/gc_control.py": "ea30a16d5143686c8e5390f4852f6d8d17148d72c563ed827c148f029e40257a",
+    "python/sglang/srt/utils/common.py": "bb27da8130101a399268323cce7f4935ccb9e1d69b2e256a59a8a6624adefd20",
+    "python/sglang/srt/model_executor/runner/base_cuda_graph_runner.py": "5f83e373d6054dda7024fc6c287b5b7e0bbdc265df50ec07440ce85238a2b515",
+    "python/sglang/test/training_capture_pause_server.py": "b4653a5b3b9e75b9effaa18ce158e18cf67ad3d2ba445fc84161d06007906e8f",
+    "mooncake-study/experiments/benchmark_training_capture.py": "1de40f9023f3f6f9ee44b25dc5aa500e7ed6c1ef6f788899dc6dea967861210c",
+    "test/registered/unit/model_executor/runner/test_graph_gc_ownership.py": "a5fa0ab40d6bb14c9ce49bbc8dbb52ed9f6b3ace31c7b58cda6a4436eb16b727",
+    "test/registered/unit/model_executor/runner/test_graph_gc_cuda.py": "bdbfc890fc29b35d6044a4e9edf8a7143e4a524b2cef6b7ee5bebf01ec773f40"
+  },
+  "runtime_lock": {
+    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/mooncake-study/experiments/h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84"
+  },
+  "offline_auditor": {
+    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/audit_gc_control.py",
+    "sha256": "f7a080120908d8a894b3db8c87c69faf09c884f0b68b0874dcbce1c8862dea81"
+  },
+  "jobs": [
+    {
+      "role": "baseline_gc_ownership_regression",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before/test/registered/unit/model_executor/runner:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before/test/registered/unit -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m unittest test_graph_gc_ownership -v",
+      "id": "01790976446136933425-feab761a65b5",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before",
+      "result": {
+        "job_id": "01790976446136933425-feab761a65b5",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790976506.620401,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790976446136933425-feab761a65b5.log"
+      },
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790976446136933425-feab761a65b5.json",
+        "sha256": "85e0f20f51531ee42cf6e7efc73558a7b7de610691dab142893258389eba8450"
+      },
+      "log_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790976446136933425-feab761a65b5.log",
+        "sha256": "f5b6f6c49da3de2dce0be64eb9923d1e22984d15d337b08c668d6546d7a578b1"
+      },
+      "unittest_summaries": [
+        [
+          "4",
+          "51.207"
+        ]
+      ]
+    },
+    {
+      "role": "baseline_gc_ownership_corrected_probe",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before-v2 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before-v2/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before-v2/test/registered/unit/model_executor/runner:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before-v2/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before-v2/test/registered/unit -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m unittest test_graph_gc_ownership -v",
+      "id": "01790976888325858826-acb37e6d6675",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-before-v2",
+      "result": {
+        "job_id": "01790976888325858826-acb37e6d6675",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790976949.992356,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790976888325858826-acb37e6d6675.log"
+      },
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790976888325858826-acb37e6d6675.json",
+        "sha256": "18fff4967c6fb2d7ca8e2a0a02eb5b6853a256fb710d81bc7e685708836174ee"
+      },
+      "log_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790976888325858826-acb37e6d6675.log",
+        "sha256": "7e79e4cde46115253d2690f400fc03cde2c70f4306851b40cd8174a0d8e02594"
+      },
+      "unittest_summaries": [
+        [
+          "4",
+          "52.651"
+        ]
+      ]
+    },
+    {
+      "role": "candidate_gc_ownership",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v1 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v1/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v1/test/registered/unit/model_executor/runner:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v1/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v1/test/registered/unit -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m unittest test_graph_gc_ownership test_hidden_state_graph_recapture -v",
+      "id": "01790977056801767374-3d3582c968ef",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v1",
+      "result": {
+        "job_id": "01790977056801767374-3d3582c968ef",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790977148.453502,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790977056801767374-3d3582c968ef.log"
+      },
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790977056801767374-3d3582c968ef.json",
+        "sha256": "ab97c80bfda701526dc8b9d489babee2267a90f6778677ae38dd3d9062af5b74"
+      },
+      "log_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790977056801767374-3d3582c968ef.log",
+        "sha256": "1b9d99fa3dd46c74d23b4bc8a31e6c064de3ccfe796a60a74f955aeca57a16e9"
+      },
+      "unittest_summaries": [
+        [
+          "13",
+          "77.057"
+        ]
+      ]
+    },
+    {
+      "role": "gc_cuda_and_diagnostics",
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-fe1ce1dcdea6-20261001023258-master-0' '-c' 'master' '--' 'python3' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py' '--state-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state' 'submit' '--cwd' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2' '--timeout-seconds' '2400' '--env' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' '--env' 'OMP_NUM_THREADS=1' '--env' 'PYTHONDONTWRITEBYTECODE=1' '--env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit/model_executor/runner:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit' '--' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '-m' 'unittest' 'test_graph_gc_cuda' 'test_latency_diagnostics' 'test_benchmark_latency' 'test_bench_sglang_streaming' '-v'",
+      "id": "01790977917238261158-ee205d47520a",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2",
+      "result": {
+        "job_id": "01790977917238261158-ee205d47520a",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790977943.383903,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790977917238261158-ee205d47520a.log"
+      },
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790977917238261158-ee205d47520a.json",
+        "sha256": "8c9fd38b233cfa88123c6ac87eb54ba452167b69452a2c06fd10c4375471af3a"
+      },
+      "log_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790977917238261158-ee205d47520a.log",
+        "sha256": "2c4cc079aac094e2f2fd1292afa5403f3561f0c5711d2b6d281648ca66d0f792"
+      },
+      "unittest_summaries": [
+        [
+          "25",
+          "12.997"
+        ]
+      ]
+    },
+    {
+      "role": "gc_freeze_smoke",
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-fe1ce1dcdea6-20261001023258-master-0' '-c' 'master' '--' 'python3' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py' '--state-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state' 'submit' '--cwd' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2' '--timeout-seconds' '2400' '--env' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' '--env' 'OMP_NUM_THREADS=1' '--env' 'PYTHONDONTWRITEBYTECODE=1' '--env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit/model_executor/runner:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit' '--' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' 'mooncake-study/experiments/benchmark_training_capture.py' '--model-path' '/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' '--source-revision' 'e4306b9e4-plus-gc-control-v2' '--output-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke' '--num-prompts' '64' '--input-len' '16' '--output-len' '32' '--concurrency' '8' '--capture-slots' '16' '--ratios' '1' '--repeats' '1' '--request-details' '--latency-diagnostics' '--gc-lifecycle' '--gc-policy' 'freeze-after-warmup'",
+      "id": "01790977917601847372-3c628bbf7bd4",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2",
+      "result": {
+        "job_id": "01790977917601847372-3c628bbf7bd4",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790978134.2074544,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790977917601847372-3c628bbf7bd4.log"
+      },
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790977917601847372-3c628bbf7bd4.json",
+        "sha256": "ea48b1aed3775336933bf9b3006ec0331ab46fe4d2c5c2a6cc02a403864b7d5d"
+      },
+      "log_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790977917601847372-3c628bbf7bd4.log",
+        "sha256": "dbf5e3a0c52b2b616c7d59c895c72abfe2bd4606f7c01c62cc0376010bb40bd5"
+      },
+      "unittest_summaries": []
+    },
+    {
+      "role": "frozen_capture_resources",
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-fe1ce1dcdea6-20261001023258-master-0' '-c' 'master' '--' 'python3' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py' '--state-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state' 'submit' '--cwd' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2' '--timeout-seconds' '2400' '--env' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' '--env' 'OMP_NUM_THREADS=1' '--env' 'PYTHONDONTWRITEBYTECODE=1' '--env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit/model_executor/runner:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit' '--' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '-c' 'import sys, unittest\nfrom sglang.srt.utils.common import freeze_gc\nnames = ['\\''test_resources'\\'', '\\''test_buffers'\\'', '\\''test_coordinator'\\'', '\\''test_snapshot_writer'\\'', '\\''test_cuda_snapshot'\\'', '\\''test_kv_staging'\\'', '\\''test_teacher_staging'\\'', '\\''test_pd_capture'\\'']\nsuite = unittest.defaultTestLoader.loadTestsFromNames(names)\nfreeze_gc('\\''capture lifecycle regression'\\'')\nresult = unittest.TextTestRunner(verbosity=2).run(suite)\nsys.exit(not result.wasSuccessful())\n'",
+      "id": "01790978016528051316-6446572cee7e",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2",
+      "result": {
+        "job_id": "01790978016528051316-6446572cee7e",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790978213.8978148,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790978016528051316-6446572cee7e.log"
+      },
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790978016528051316-6446572cee7e.json",
+        "sha256": "61f4e4ee7a0ac852246e0fc02afd71f99338d738522a0737472a7469ab789e77"
+      },
+      "log_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790978016528051316-6446572cee7e.log",
+        "sha256": "01c776d132ba63756d30884823d223d66923fd00046101705f5db11b7d550bd6"
+      },
+      "unittest_summaries": [
+        [
+          "126",
+          "68.656"
+        ]
+      ]
+    },
+    {
+      "role": "gc_control_unchanged",
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-fe1ce1dcdea6-20261001023258-master-0' '-c' 'master' '--' 'python3' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py' '--state-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state' 'submit' '--cwd' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2' '--timeout-seconds' '2400' '--env' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' '--env' 'OMP_NUM_THREADS=1' '--env' 'PYTHONDONTWRITEBYTECODE=1' '--env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit/model_executor/runner:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit' '--' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' 'mooncake-study/experiments/benchmark_training_capture.py' '--model-path' '/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' '--source-revision' 'e4306b9e4-plus-gc-control-v2' '--output-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged' '--num-prompts' '1024' '--input-len' '16' '--output-len' '32' '--concurrency' '8' '--capture-slots' '16' '--ratios' '0.1' '--repeats' '1' '--request-details' '--latency-diagnostics' '--gc-lifecycle' '--gc-policy' 'unchanged'",
+      "id": "01790978184732323919-1f2de7085a04",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2",
+      "output": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged",
+      "result": {
+        "job_id": "01790978184732323919-1f2de7085a04",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790978438.488481,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790978184732323919-1f2de7085a04.log"
+      },
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790978184732323919-1f2de7085a04.json",
+        "sha256": "ae3959a13043f33754bdf0335acd69430d582d20d6a31442908191fe9995e719"
+      },
+      "log_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790978184732323919-1f2de7085a04.log",
+        "sha256": "cb0be55ff392a82f579085e843268b24925004d87377ce8c701b703f94fb3d31"
+      },
+      "unittest_summaries": []
+    },
+    {
+      "role": "gc_control_frozen",
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-fe1ce1dcdea6-20261001023258-master-0' '-c' 'master' '--' 'python3' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py' '--state-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state' 'submit' '--cwd' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2' '--timeout-seconds' '2400' '--env' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' '--env' 'OMP_NUM_THREADS=1' '--env' 'PYTHONDONTWRITEBYTECODE=1' '--env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit/model_executor/runner:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2/test/registered/unit' '--' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' 'mooncake-study/experiments/benchmark_training_capture.py' '--model-path' '/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' '--source-revision' 'e4306b9e4-plus-gc-control-v2' '--output-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup' '--num-prompts' '1024' '--input-len' '16' '--output-len' '32' '--concurrency' '8' '--capture-slots' '16' '--ratios' '0.1' '--repeats' '1' '--request-details' '--latency-diagnostics' '--gc-lifecycle' '--gc-policy' 'freeze-after-warmup'",
+      "id": "01790978185028997592-07af415bdd2d",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-gc-control-v2",
+      "output": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup",
+      "result": {
+        "job_id": "01790978185028997592-07af415bdd2d",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790978662.5224414,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790978185028997592-07af415bdd2d.log"
+      },
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790978185028997592-07af415bdd2d.json",
+        "sha256": "87cde4f205ef93a308aa16115d71fedb4e6996c884357599d263ec2acb4d6908"
+      },
+      "log_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790978185028997592-07af415bdd2d.log",
+        "sha256": "5ccd5e079670100944ed29b685a04a9c86c966500e771ae55fbf5192b2651484"
+      },
+      "unittest_summaries": []
+    }
+  ],
+  "reports": [
+    {
+      "variant": "smoke",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke/report.json",
+        "sha256": "73c44a71d624deecabc1c4f32458d0c479e18a5e5de522be440ef3f06bd8536a"
+      },
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "e4306b9e4-plus-gc-control-v2",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke",
+        "num_prompts": 64,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          1.0
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600,
+        "request_details": true,
+        "latency_diagnostics": true,
+        "gc_lifecycle": true,
+        "gc_policy": "freeze-after-warmup"
+      },
+      "phases": [
+        {
+          "measurement": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke/round-0-phase-0-off/measurement.json",
+            "sha256": "bbb880499f295d9f034d1af0a5a721f4f661b0c1b28d5ab2ec72511574a404f9"
+          },
+          "requests": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke/round-0-phase-0-off/requests.json",
+            "sha256": "3eaccb9e5ea29f5d883c9ce261baaaebbfa56fa3749de3392b48e383e77ecf60"
+          },
+          "lifecycle": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke/round-0-phase-0-off/gc-lifecycle.json",
+            "sha256": "ae75e8211809d99b2ce673d5a8716bca02def7157655f5237bf9b73203e75a11"
+          },
+          "sample_ratio": null,
+          "rps": 82.69310875485299,
+          "p99_ttft_ms": 109.37873870134354,
+          "max_ttft_ms": 109.54016074538231,
+          "ttft_over_500ms_requests": 0,
+          "in_flight_long_events": [],
+          "rss_delta_bytes": 8192,
+          "live_request_states": 0,
+          "request_state_count": 64,
+          "new_cycle_collected": true,
+          "readback": {},
+          "capture_counter_delta": {},
+          "stage_metrics_verified": false
+        },
+        {
+          "measurement": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke/round-0-phase-1-1.0/measurement.json",
+            "sha256": "118690bcaea62fa940f6ad9eeb8adc684d5ccfa2939f7799d6999a9d78dd3f28"
+          },
+          "requests": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke/round-0-phase-1-1.0/requests.json",
+            "sha256": "306a6086167c72317d2c76b5a38789d867f19f972f94d4d832d651f948c8a5ea"
+          },
+          "lifecycle": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke/round-0-phase-1-1.0/gc-lifecycle.json",
+            "sha256": "c3001651c6627c391dad91a4ae8d18ae285225271b34193f5568d8b9942ae9ab"
+          },
+          "sample_ratio": 1.0,
+          "rps": 40.161758450585154,
+          "p99_ttft_ms": 65.8186499774456,
+          "max_ttft_ms": 65.90111181139946,
+          "ttft_over_500ms_requests": 0,
+          "in_flight_long_events": [],
+          "rss_delta_bytes": 45056,
+          "live_request_states": 0,
+          "request_state_count": 64,
+          "new_cycle_collected": true,
+          "readback": {
+            "validated_samples": 64,
+            "manifest_bytes": 550464,
+            "payload_bytes": 39905280,
+            "aux_payload_bytes": 2156544,
+            "payload_objects": 896,
+            "kv_payload_bytes": 37748736
+          },
+          "capture_counter_delta": {
+            "considered": 64,
+            "excluded_health_check": 0,
+            "admitted": 64,
+            "overlap_forwards": 272,
+            "eager_forwards": 16,
+            "cuda_graph_forwards": 256,
+            "sealed": 64,
+            "writer_started": 64,
+            "copies_completed": 64,
+            "snapshot_built": 64,
+            "ready": 64
+          },
+          "stage_metrics_verified": true
+        },
+        {
+          "measurement": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke/round-0-phase-2-off/measurement.json",
+            "sha256": "2b21747eb524ce65e6f756c2d9041a5760e93f35f211e597f18d82a200830d4f"
+          },
+          "requests": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke/round-0-phase-2-off/requests.json",
+            "sha256": "a0f277a11019dc6f79fca09e1fd213c191207ce5c9a018eeeca50f96b236bf35"
+          },
+          "lifecycle": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-smoke/round-0-phase-2-off/gc-lifecycle.json",
+            "sha256": "74873372b3b7c6d2a2b5ac592c24010477549ef6925e2c4ba187b9fcbc082d2f"
+          },
+          "sample_ratio": null,
+          "rps": 89.26087846923515,
+          "p99_ttft_ms": 55.5228228867054,
+          "max_ttft_ms": 55.672191083431244,
+          "ttft_over_500ms_requests": 0,
+          "in_flight_long_events": [],
+          "rss_delta_bytes": 8192,
+          "live_request_states": 0,
+          "request_state_count": 64,
+          "new_cycle_collected": true,
+          "readback": {},
+          "capture_counter_delta": {},
+          "stage_metrics_verified": false
+        }
+      ]
+    },
+    {
+      "variant": "unchanged",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged/report.json",
+        "sha256": "eaeeb8afce5bc89d3c3419e011a43b62296d8fb58fb2fa80799936e9917fa6fc"
+      },
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "e4306b9e4-plus-gc-control-v2",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged",
+        "num_prompts": 1024,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600,
+        "request_details": true,
+        "latency_diagnostics": true,
+        "gc_lifecycle": true,
+        "gc_policy": "unchanged"
+      },
+      "phases": [
+        {
+          "measurement": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged/round-0-phase-0-off/measurement.json",
+            "sha256": "1ac6261a5408bfb5eb96b45e23c4214652763eb6e7424f37706e228fbdcf7378"
+          },
+          "requests": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged/round-0-phase-0-off/requests.json",
+            "sha256": "ba498fa38f7df16cae66f9f118fda1a3f6120922104f90b788bab032f00f7e9b"
+          },
+          "lifecycle": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged/round-0-phase-0-off/gc-lifecycle.json",
+            "sha256": "1bac6b010d75dec9276c8bc23a1e382ad4d355c852a7f91aae932132d93f890f"
+          },
+          "sample_ratio": null,
+          "rps": 88.50649758456852,
+          "p99_ttft_ms": 98.32583364099264,
+          "max_ttft_ms": 494.1651076078415,
+          "ttft_over_500ms_requests": 0,
+          "in_flight_long_events": [
+            {
+              "kind": "tokenizer_gc",
+              "duration_ms": 448.4984874725342,
+              "overlapping_requests": [
+                176,
+                177,
+                178,
+                179,
+                180,
+                181,
+                182,
+                183
+              ]
+            }
+          ],
+          "rss_delta_bytes": 507904,
+          "live_request_states": 0,
+          "request_state_count": 1024,
+          "new_cycle_collected": true,
+          "readback": {},
+          "capture_counter_delta": {},
+          "stage_metrics_verified": false
+        },
+        {
+          "measurement": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged/round-0-phase-1-0.1/measurement.json",
+            "sha256": "33101b737e93bf540530cb9d24399074c0e05f81babc09dc7d3082352a6a0906"
+          },
+          "requests": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged/round-0-phase-1-0.1/requests.json",
+            "sha256": "dd7d4a78021eb9c3347474adc4c72015036a43438facc68891c5246ddb762add"
+          },
+          "lifecycle": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged/round-0-phase-1-0.1/gc-lifecycle.json",
+            "sha256": "845929aec78e06588b50289c72ba0e43e645f1ff9515e4c0fa9d2d8b682e3bac"
+          },
+          "sample_ratio": 0.1,
+          "rps": 74.91858270295432,
+          "p99_ttft_ms": 61.7221200466156,
+          "max_ttft_ms": 495.0026161968708,
+          "ttft_over_500ms_requests": 0,
+          "in_flight_long_events": [
+            {
+              "kind": "tokenizer_gc",
+              "duration_ms": 449.37896728515625,
+              "overlapping_requests": [
+                176,
+                177,
+                178,
+                179,
+                180,
+                181,
+                182,
+                183
+              ]
+            }
+          ],
+          "rss_delta_bytes": 487424,
+          "live_request_states": 0,
+          "request_state_count": 1024,
+          "new_cycle_collected": true,
+          "readback": {
+            "validated_samples": 92,
+            "manifest_bytes": 791292,
+            "payload_bytes": 57363840,
+            "aux_payload_bytes": 3100032,
+            "payload_objects": 1288,
+            "kv_payload_bytes": 54263808
+          },
+          "capture_counter_delta": {
+            "considered": 1024,
+            "sampled_out": 932,
+            "admitted": 92,
+            "overlap_forwards": 2382,
+            "eager_forwards": 78,
+            "cuda_graph_forwards": 2304,
+            "sealed": 92,
+            "writer_started": 92,
+            "copies_completed": 92,
+            "snapshot_built": 92,
+            "ready": 92
+          },
+          "stage_metrics_verified": true
+        },
+        {
+          "measurement": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged/round-0-phase-2-off/measurement.json",
+            "sha256": "780882f6cbe933e8d22f90c10d627d7b88bc70f231bb4457b74db17ca51619d5"
+          },
+          "requests": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged/round-0-phase-2-off/requests.json",
+            "sha256": "9d552e01609406ac8fef236c76cfc7eed6598750b750b3f3ad72ea0b1ecf6584"
+          },
+          "lifecycle": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-unchanged/round-0-phase-2-off/gc-lifecycle.json",
+            "sha256": "cdd74af450db16fcdf27ea7924667ebe6b3ead1e3bab84008d82f31564a1dd1a"
+          },
+          "sample_ratio": null,
+          "rps": 88.93515493770217,
+          "p99_ttft_ms": 57.740397565066814,
+          "max_ttft_ms": 477.94685512781143,
+          "ttft_over_500ms_requests": 0,
+          "in_flight_long_events": [
+            {
+              "kind": "tokenizer_gc",
+              "duration_ms": 432.51872062683105,
+              "overlapping_requests": [
+                176,
+                177,
+                178,
+                179,
+                180,
+                181,
+                182,
+                183
+              ]
+            }
+          ],
+          "rss_delta_bytes": 1093632,
+          "live_request_states": 0,
+          "request_state_count": 1024,
+          "new_cycle_collected": true,
+          "readback": {},
+          "capture_counter_delta": {},
+          "stage_metrics_verified": false
+        }
+      ]
+    },
+    {
+      "variant": "freeze-after-warmup",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup/report.json",
+        "sha256": "d80f6bfcdcfafd0f69e0e097e02193deee50043d377438501a1f1fe14030e0d5"
+      },
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "e4306b9e4-plus-gc-control-v2",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup",
+        "num_prompts": 1024,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600,
+        "request_details": true,
+        "latency_diagnostics": true,
+        "gc_lifecycle": true,
+        "gc_policy": "freeze-after-warmup"
+      },
+      "phases": [
+        {
+          "measurement": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup/round-0-phase-0-off/measurement.json",
+            "sha256": "d92843170770593d1db013fba7950461c3f228d8e1eac5b3ffba2bcfe93fef49"
+          },
+          "requests": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup/round-0-phase-0-off/requests.json",
+            "sha256": "1bf715e97a4207790eeb08d09e5735a30b6c0300864f7daa5a2688a6154b54f4"
+          },
+          "lifecycle": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup/round-0-phase-0-off/gc-lifecycle.json",
+            "sha256": "d3d86154f7b87a92a868f906144e17b66e4165592afe2c1e0151ac98f5f8722b"
+          },
+          "sample_ratio": null,
+          "rps": 93.17459488347619,
+          "p99_ttft_ms": 46.84749908745289,
+          "max_ttft_ms": 88.75232189893723,
+          "ttft_over_500ms_requests": 0,
+          "in_flight_long_events": [],
+          "rss_delta_bytes": 897024,
+          "live_request_states": 0,
+          "request_state_count": 1024,
+          "new_cycle_collected": true,
+          "readback": {},
+          "capture_counter_delta": {},
+          "stage_metrics_verified": false
+        },
+        {
+          "measurement": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup/round-0-phase-1-0.1/measurement.json",
+            "sha256": "935fa802287c2a92d7224dec84d2d4289d7e60a011dc1c861a8313f386c1029b"
+          },
+          "requests": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup/round-0-phase-1-0.1/requests.json",
+            "sha256": "8b2a2b08566b235ee69fefed74de9f217f9b7cade7fd5849e39f9c26d0a7141b"
+          },
+          "lifecycle": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup/round-0-phase-1-0.1/gc-lifecycle.json",
+            "sha256": "2f9ddea516721b6b92816de3dc7f03a23a4e4195cbd563246f13eff111eb9cc6"
+          },
+          "sample_ratio": 0.1,
+          "rps": 77.98058940320692,
+          "p99_ttft_ms": 55.69273501634597,
+          "max_ttft_ms": 66.79249927401543,
+          "ttft_over_500ms_requests": 0,
+          "in_flight_long_events": [],
+          "rss_delta_bytes": 69632,
+          "live_request_states": 0,
+          "request_state_count": 1024,
+          "new_cycle_collected": true,
+          "readback": {
+            "validated_samples": 92,
+            "manifest_bytes": 791292,
+            "payload_bytes": 57363840,
+            "aux_payload_bytes": 3100032,
+            "payload_objects": 1288,
+            "kv_payload_bytes": 54263808
+          },
+          "capture_counter_delta": {
+            "considered": 1024,
+            "sampled_out": 932,
+            "admitted": 92,
+            "overlap_forwards": 2446,
+            "eager_forwards": 78,
+            "cuda_graph_forwards": 2368,
+            "sealed": 92,
+            "writer_started": 92,
+            "copies_completed": 92,
+            "snapshot_built": 92,
+            "ready": 92
+          },
+          "stage_metrics_verified": true
+        },
+        {
+          "measurement": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup/round-0-phase-2-off/measurement.json",
+            "sha256": "f240bff7582da80ce5197923e55067d27783d6fd02c46e4f2bffe9badebf9847"
+          },
+          "requests": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup/round-0-phase-2-off/requests.json",
+            "sha256": "578b99c3f78f6add4596a294cc6f938341404178f7a2cdfa8e16c530d0ecb061"
+          },
+          "lifecycle": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/gc-control-v2-freeze-after-warmup/round-0-phase-2-off/gc-lifecycle.json",
+            "sha256": "633aaefb0e816203c313f0cd9d3ee846b5ed5095dbda0ec0ec89c793cc064a8f"
+          },
+          "sample_ratio": null,
+          "rps": 92.80064674440739,
+          "p99_ttft_ms": 44.48562003672123,
+          "max_ttft_ms": 63.22682276368141,
+          "ttft_over_500ms_requests": 0,
+          "in_flight_long_events": [],
+          "rss_delta_bytes": 360448,
+          "live_request_states": 0,
+          "request_state_count": 1024,
+          "new_cycle_collected": true,
+          "readback": {},
+          "capture_counter_delta": {},
+          "stage_metrics_verified": false
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "requests": 6336,
+    "output_tokens": 202752,
+    "snapshots": 248,
+    "payload_bytes": 154632960,
+    "phases": 9,
+    "metrics_scrapes": 3
+  },
+  "ownership_test_class_unchanged_since_v1": true
+}

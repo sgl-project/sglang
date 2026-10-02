@@ -4033,6 +4033,32 @@ and [evidence](experiments/latency-diagnostics.json) retain source versions,
 measurement limits and the tokenizer observation's effect on allocation history.
 No GC policy or production performance acceptance is changed.
 
+## Serving GC Ownership And Warmup Intervention
+
+The shared GC helper now preserves a serving API freeze across temporary,
+nested, overlapping and exceptional graph-capture scopes. A serving request
+during capture promotes the freeze. Existing serving defaults, enablement and
+thresholds remain unchanged. Arbitrary third-party raw GC calls are outside
+this ownership protocol.
+
+A controlled 1,024-request off/on/off pair reproduces 433-449ms tokenizer GC
+pauses under unchanged policy, with maximum TTFT **478-495ms**. Explicit freezing
+after real warmup reduces maximum TTFT to **63-89ms**, with no >=20ms observed
+GC/client timer event overlapping requests. Tokenizer request weak references
+show complete coverage and zero retained request states after collection; new
+cycles remain collectable. Short-run RSS observations do not prove long-term
+memory stability. Capture-on throughput remains **83.86%** of its frozen off
+bracket average, so capture overhead still needs work.
+
+All **164 test methods** pass, including actual CUDA captures/replays and 126
+producer resource tests under a serving freeze. Three serving experiments
+complete **6,336 requests** and **248 post-exit snapshot validations**. Offline
+replay reproduces all nine phase summaries/correlations. All eight worker jobs
+are terminal, with two pre-fix probe failures retained and six candidate jobs
+passing. The resident H100 resumes idle load. See the
+[runbook](experiments/GC_CONTROL.md) and [evidence](experiments/gc-control.json)
+for the one-pair measurement limits and the corrected baseline regression.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
@@ -4075,9 +4101,11 @@ No GC policy or production performance acceptance is changed.
    position metadata comparison reduces repeated CPU work but leaves an
    unattributed historical regression. The new clock-bound diagnostic reproduces
    half-second tokenizer generation-two GC pauses with capture on and off,
-   and exposes them below the p99 fraction. Evaluate existing warmup/GC controls
-   with a controlled intervention and memory/lifecycle checks before changing
-   serving policy; continue investigating the separate client-loop pauses.
+   and exposes them below the p99 fraction. The explicit warmup-freeze comparison
+   removes the reproduced GC pauses for this workload, with request lifetime and
+   resource checks; long-duration memory, broader workloads and production policy
+   acceptance remain open. Continue reducing the residual capture overhead and
+   investigating separate client-loop pauses.
    Existing D2H
    staging comparisons do not justify changing the defaults. Per-model numerical/runtime validation and
    runtime identity coverage also need expansion beyond the tested combination.
