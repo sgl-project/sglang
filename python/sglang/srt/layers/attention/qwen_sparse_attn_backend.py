@@ -748,14 +748,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                     extend_rope_matrix = build_rope_position_matrix(
                         rope_source, token_to_batch_idx.numel()
                     )
-                    if has_cross_prefix_group:
-                        compress_group_ring_locs = build_group_ring_slots(
-                            req_pool_indices=row_req_pool_indices,
-                            group_end_positions=group_positions.long(),
-                            sequence_ids=group_sequence_ids.long(),
-                            compress_ratio=self.compress_ratio,
-                        )
-                else:
+                # Paged eager rows always read their members from the ring;
+                # extend rows only when a group straddles the prefix.
+                if group_member_rows is None or has_cross_prefix_group:
                     compress_group_ring_locs = build_group_ring_slots(
                         req_pool_indices=row_req_pool_indices,
                         group_end_positions=group_positions.long(),
