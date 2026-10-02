@@ -227,7 +227,8 @@ class BaseReasoningFormatDetector:
         ):
             return StreamingParseResult()
 
-        # A prefilled block can close before any generated opening token appears.
+        # Strip a generated opening tag once, before the active block's boundary.
+        # A prefilled opener is absent from output; later content tags must stay intact.
         if not self.stripped_think_start and think_start_text in current_text:
             start_idx = current_text.find(think_start_text)
             end_idx = (
@@ -241,6 +242,7 @@ class BaseReasoningFormatDetector:
                 current_text = current_text.replace(think_start_text, "", 1)
                 # Write back, or stream_reasoning=False carries the token into finish().
                 self._buffer = current_text
+                # Later opening tags must not be stripped again.
                 self.stripped_think_start = True
                 self._in_reasoning = True
 
@@ -252,6 +254,7 @@ class BaseReasoningFormatDetector:
 
             self._buffer = ""
             self._in_reasoning = False
+            # A closed block accounts for its opener, including a prefilled one.
             self.stripped_think_start = True
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
@@ -272,6 +275,7 @@ class BaseReasoningFormatDetector:
                 normal_text = current_text[tool_idx:]
                 self._buffer = ""
                 self._in_reasoning = False
+                # Tool interruption also accounts for a prefilled initial opener.
                 self.stripped_think_start = True
                 return StreamingParseResult(
                     normal_text=normal_text, reasoning_text=reasoning_text
