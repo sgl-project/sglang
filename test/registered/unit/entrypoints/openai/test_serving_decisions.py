@@ -1017,8 +1017,10 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
             "<|im_start|>assistant\n<think>\n\n</think>\n\n",
         )
         self.assertEqual(scored.token_ids_logprob[0], [code_ids[1], code_ids[0]])
+        urgent = json.loads(response.body)["answers"]["urgent"]
+        self.assertEqual(set(urgent), {"type", "noul"})
         torch.testing.assert_close(
-            torch.tensor(json.loads(response.body)["answers"]["urgent"]["noul"]),
+            torch.tensor(urgent["noul"]),
             torch.softmax(manager.logprobs[[code_ids[1], code_ids[0]]] / 2.0, dim=0)[0],
             check_dtype=False,
         )

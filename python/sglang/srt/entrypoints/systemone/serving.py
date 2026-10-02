@@ -202,7 +202,13 @@ class SystemOneServing(OpenAIServingDecisions):
             answers=answers,
             usage=SystemOneUsage(input_tokens=result.prompt_tokens),
         )
-        return ORJSONResponse(content=response.model_dump())
+        # A decision checkpoint's readout has no full-vocabulary distribution.
+        exclude = (
+            None
+            if self.decision_config is None
+            else {"answers": {"__all__": {"x_label_mass"}}}
+        )
+        return ORJSONResponse(content=response.model_dump(exclude=exclude))
 
 
 def _view(question: SystemOneQuestion) -> QuestionView:
