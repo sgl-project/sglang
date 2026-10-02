@@ -81,10 +81,10 @@ class FoundryAdapter:
     def after_runner_distributed_init(self, model_runner: Any) -> None:
         pass
 
-    def begin_memory_pool_resolution(self):
+    def replay_saved_memory_pool_config(self):
         return None
 
-    def end_memory_pool_resolution(self) -> None:
+    def record_memory_pool_overrides(self) -> None:
         pass
 
     def before_alloc_memory_pool(self, model_runner: Any) -> None:
@@ -136,11 +136,11 @@ class _FoundryAdapterReal(FoundryAdapter):
     def after_runner_distributed_init(self, model_runner):
         self._api.after_runner_distributed_init(model_runner)
 
-    def begin_memory_pool_resolution(self):
-        return self._api.begin_memory_pool_resolution()
+    def replay_saved_memory_pool_config(self):
+        return self._api.replay_saved_memory_pool_config()
 
-    def end_memory_pool_resolution(self):
-        self._api.end_memory_pool_resolution()
+    def record_memory_pool_overrides(self):
+        self._api.record_memory_pool_overrides()
 
     def before_alloc_memory_pool(self, model_runner):
         self._api.before_alloc_memory_pool(model_runner)
