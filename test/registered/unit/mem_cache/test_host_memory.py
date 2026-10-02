@@ -31,13 +31,18 @@ class TestHostMemory(unittest.TestCase):
             f"1 0 0:1 {mount_root} {escaped} rw - {filesystem} cgroup {options}\n"
         )
 
-    def memory(self, path, usage, maximum="max", high="max", v1=False):
+    def memory(self, path, usage, maximum="max", high="max", v1=False, stat=None):
         directory = self.mount / path
         directory.mkdir(parents=True, exist_ok=True)
         files = (
             {"memory.limit_in_bytes": maximum, "memory.usage_in_bytes": usage}
             if v1
             else {"memory.max": maximum, "memory.high": high, "memory.current": usage}
+        )
+        prefix = "total_" if v1 else ""
+        stat = {f"{prefix}active_file": 0, f"{prefix}inactive_file": 0} | (stat or {})
+        files["memory.stat"] = "".join(
+            f"{key} {value}\n" for key, value in stat.items()
         )
         for name, value in files.items():
             (directory / name).write_text(str(value))
@@ -73,6 +78,32 @@ class TestHostMemory(unittest.TestCase):
         self.memory("task/engine", 100, 2**63 - 4096, v1=True)
         self.memory("task", 400, 1000, v1=True)
         self.assertEqual(host_memory._cgroup_memory_headroom(self.proc), 600)
+
+    def test_reclaimable_page_cache_is_not_used(self):
+        """Page cache charged to the cgroup, such as a checkpoint just read, is
+        reclaimed under the limit and must not shrink the headroom. Shared
+        memory is counted in file/cache but cannot be reclaimed."""
+        v2 = {"file": 700, "shmem": 200, "active_file": 200, "inactive_file": 300}
+        v1 = {
+            "cache": 700,
+            "shmem": 200,
+            "active_file": 0,
+            "inactive_file": 0,
+            "total_active_file": 200,
+            "total_inactive_file": 300,
+        }
+        for is_v1, stat, usage, expected in [
+            (False, v2, 900, 600),
+            (True, v1, 900, 600),
+            # v1 usage is approximate and may trail the cache counters.
+            (True, v1, 400, 1000),
+        ]:
+            with self.subTest(v1=is_v1, usage=usage):
+                self.configure(v1=is_v1)
+                self.memory("task/engine", usage, 1000, v1=is_v1, stat=stat)
+                self.assertEqual(
+                    host_memory._cgroup_memory_headroom(self.proc), expected
+                )
 
     def test_independent_engines_have_separate_allowances(self):
         # Both engines see the same host RAM but have different charged usage.
