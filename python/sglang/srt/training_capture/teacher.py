@@ -15,7 +15,9 @@ class TeacherRows(msgspec.Struct, frozen=True):
 
 @torch.no_grad()
 def capture_teacher(
-    raw_logits: torch.Tensor, vocab_size: int, row_indices: torch.Tensor | None = None
+    raw_logits: torch.Tensor,
+    vocab_size: int,
+    row_indices: torch.Tensor | list[int] | None = None,
 ) -> TeacherRows:
     """All returned tensors own storage independent of the logits/graph buffer."""
     if raw_logits.ndim != 2 or not raw_logits.is_floating_point():
@@ -25,6 +27,22 @@ def capture_teacher(
     if not 128 <= vocab_size <= raw_logits.shape[1]:
         raise ContractError("teacher capture requires the complete unpadded vocabulary")
     scores = raw_logits[:, :vocab_size]
+    if isinstance(row_indices, list):
+        if any(
+            type(row) is not int or not 0 <= row < scores.shape[0]
+            for row in row_indices
+        ):
+            raise ContractError("teacher row indices are outside the logits batch")
+        start = row_indices[0] if row_indices else 0
+        if all(row == start + offset for offset, row in enumerate(row_indices)):
+            # Host-known contiguous rows need neither an index upload nor a
+            # full-vocabulary gather. Only the owned compact outputs survive.
+            scores = scores.narrow(0, start, len(row_indices))
+            row_indices = None
+        else:
+            row_indices = torch.tensor(
+                row_indices, dtype=torch.long, device=scores.device
+            )
     if row_indices is not None:
         scores = scores.index_select(0, row_indices)
     values, ids = torch.topk(scores, k=128, dim=-1, sorted=True)

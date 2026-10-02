@@ -106,9 +106,7 @@ class PrefillCaptureCoordinator:
                     state.teacher = capture_teacher(
                         logits_output.next_token_logits,
                         self.teacher.vocab_size,
-                        torch.tensor(
-                            [row], device=logits_output.next_token_logits.device
-                        ),
+                        [row],
                     )
                     state.handoff = None
                     self.counters["pd_teacher_copied"] += 1

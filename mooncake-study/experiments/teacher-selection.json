@@ -1,0 +1,2054 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-10-02 18:39:28 UTC",
+  "scope": "SGLang/Mooncake teacher-row selection optimization. The full active implementation goal remains open.",
+  "baseline_revision": "44645fea3b7ebe44a240e96a052b61e7d6be0269",
+  "branch": "codex/dspark-maas-capture",
+  "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+  "runtime_lock": {
+    "path": "mooncake-study/experiments/h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84"
+  },
+  "source_sha256": {
+    "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+    "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+    "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+    "python/sglang/srt/training_capture/cohort.py": "6bd093ee9a219970b08023d279852b07caaacf288f2f617236b6b2e1c7d5af56",
+    "python/sglang/srt/training_capture/cohort_coordinator.py": "b1f4d340cab3b2400e7415c17773b27510524f8d3df55c6ec8af89455e3504f1",
+    "python/sglang/srt/training_capture/cohort_exchange.py": "b37abb0499a23fa8650521fe28c04a7219b887f5d2920e6f8070d4bfacae2ed3",
+    "python/sglang/srt/training_capture/cohort_service.py": "60f8578cf250b4f3dbf97b15d67a2c78a67eb6b836a5bcda85dfdaf90ecf9324",
+    "python/sglang/srt/training_capture/cohort_startup.py": "dfacd1a45203de5f3c08ccf73b06933f7aa4183bd670979981cfe2cb960208ed",
+    "python/sglang/srt/training_capture/cohort_writer.py": "8f47827eb4e8ca2d3e4f68a91a21d56e13e84530952d5f3ea71843b7f3647d69",
+    "python/sglang/srt/training_capture/config.py": "9cf427b9f673c376f728aa4bec45b0b4a31bffb360ce88731b32b8fccc34530d",
+    "python/sglang/srt/training_capture/context.py": "3ff2fcc98ee9ca6c60527d175e2dd8cf01c71c3e7a6017e2d23c56bcc8589a94",
+    "python/sglang/srt/training_capture/coordinator.py": "9e5ad5eac75c1a5337bde61fec32036627e14182458fedf81e22dc81cdb2fb33",
+    "python/sglang/srt/training_capture/host_pool.py": "591086d65bd855dfb671588c4c7e1b0af7270237ef738e0967db32f5e5816bfc",
+    "python/sglang/srt/training_capture/identity.py": "47f91ad994b716d27454eace428d9d0a5ce7468c5708e4dd3d3e385119c8ac24",
+    "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+    "python/sglang/srt/training_capture/kv_exporter.py": "2cecaf4db75bd9b2b0adf664f12fd6c56cfaba74be01b1c755b40cfd62299c8f",
+    "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+    "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+    "python/sglang/srt/training_capture/metrics.py": "422f9522d27718ed015c354c9b1ad7bb6c9b49f366a4e8b02de083f7e424ac1f",
+    "python/sglang/srt/training_capture/mooncake_store.py": "94525a4eb4088ab847c9dffd66d8a3c509b44d30244da76cba7647cd0944e139",
+    "python/sglang/srt/training_capture/pd_capture.py": "a2e239ca22f3318a85d5bd27c872047975843a84676fc70ca85a693256e9f36f",
+    "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+    "python/sglang/srt/training_capture/protocol.py": "e57f130767eb7ca4aef6dc63a7cfdbaa37cc1d02326a068bc973d818a7bb9d62",
+    "python/sglang/srt/training_capture/request_router.py": "b97ca76fd4621398c617414098c539850e331e0ee42d88e91eb7e0cb41f09824",
+    "python/sglang/srt/training_capture/resources.py": "4f615e4b1b79b94637ba664e05e93bdbb827f865a176d06abbf23e8bcd02cd8d",
+    "python/sglang/srt/training_capture/snapshot.py": "82e7dce85b0ecac6538aac26a21d22286e35c19e59a01b0ca2735e4da0dec3b3",
+    "python/sglang/srt/training_capture/snapshot_writer.py": "ec60267c9e9057c3b8fcc3c5b66bcd9987dff65279514f4007637c861dd3a1f5",
+    "python/sglang/srt/training_capture/startup.py": "00d81ee4757ef83347248e419065a81dd8f812837f5589a91fd9b7511e895371",
+    "python/sglang/srt/training_capture/teacher.py": "6a267208c1ca42d209920e7cfcbd9b3441ce6894060b0988ada23375870d82ab",
+    "python/sglang/srt/training_capture/teacher_staging.py": "9afe4b9bb7bdf16e43156377b47d034f9707ed1c09b62dbfdac3795bb7032fd0",
+    "python/sglang/srt/training_capture/timings.py": "9bea8c331ae56ed343f85d79451dfe22b512beef7f339167f00cc8e3da8c9278",
+    "python/sglang/srt/training_capture/topology.py": "b35eef08cd7ac804817c5b22c232e9c1e6dd76fc292220acc928eb58af5f1a35",
+    "python/sglang/srt/layers/logsumexp.py": "43cf9edc381dfe0fd7b86b71dc8ce2b94542fbf2dbbe4ba319d51d79327f0482",
+    "python/sglang/test/pd_capture_runtime.py": "ddee6e187186af801f553db1a703709d2f7d9241aa1fb60aa4acd19b31eaef62",
+    "python/sglang/test/training_capture_profile_server.py": "9b54a9b0d23e62befcd454aa17694c6121e20d2511e52fce0e2b7c9ce75f53bf",
+    "test/registered/unit/training_capture/test_teacher_cuda.py": "00526f844b1ced0ba7ead961b0f8e9fcb561c682ef33a6b7964a5ec350322812",
+    "test/registered/unit/training_capture/test_buffers.py": "1d7ce5bec8fc5bbcc95a9e5d0241ee825d6737614e4d664a69604a40e10cbe3f",
+    "test/registered/unit/training_capture/test_cuda_snapshot.py": "0bc81729318651aa4e1bc2e208d6599635a32d8b69e89b4d871ecccc8904be91",
+    "test/registered/unit/training_capture/test_coordinator.py": "f22f138d9ccef586eb63422b12de92ce22af49a8cc7b8260c40081255d7b3526",
+    "test/registered/unit/training_capture/test_pd_capture.py": "a33208d19a1ab6ae1d636595c355194cab7c92f2646da3654b6e053e005ffa3d",
+    "test/registered/storage/test_training_capture_runtime.py": "d61586428b26bc49c16b64e29b4e7f05a83379fc2219c625c9bfa947e0f79ddd",
+    "test/registered/storage/test_training_capture_pd.py": "24cd1594e9938a52a21948bb5d02f4c70f926d35b10c741f548caa7b3626ae7b",
+    "mooncake-study/experiments/benchmark_training_capture.py": "9e2e7df815f759c7805f669f3805b68ba96dfcf52026fb821c25650ee716c35d",
+    "mooncake-study/experiments/benchmark_teacher_selection.py": "012efcb887d53481c0dc9095eeaca7141c975e241923ffafbebca26b6ba76ed7",
+    "mooncake-study/experiments/profile_training_capture.py": "a1213e86c0ff89ce5927c8033130e8cfba6edc87dde2dd36200dd76d658d707d",
+    "mooncake-study/experiments/summarize_capture_trace.py": "c25c0b9856dd32ea021a953b766eb4fc102814b46ade6217f452d876dfe41ee1"
+  },
+  "source_verification": {
+    "files": 46,
+    "matched_frozen_source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v3",
+    "production_identical_between_candidates": [
+      "v1",
+      "v2",
+      "v3"
+    ],
+    "changed_production_files": [
+      "python/sglang/srt/training_capture/coordinator.py",
+      "python/sglang/srt/training_capture/pd_capture.py",
+      "python/sglang/srt/training_capture/teacher.py"
+    ]
+  },
+  "jobs": [
+    {
+      "id": "01790963839899173271-bfa7d0f1121b",
+      "role": "baseline_profile",
+      "result": {
+        "job_id": "01790963839899173271-bfa7d0f1121b",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790964058.8659813,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790963839899173271-bfa7d0f1121b.log"
+      },
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "timeout_seconds": 900,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/profile_training_capture.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--source-revision",
+        "44645fea3b7ebe44a240e96a052b61e7d6be0269",
+        "--output-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-current-profile-20261003"
+      ],
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790963839899173271-bfa7d0f1121b.json",
+        "sha256": "fe1fc427f6b88f0ad34df28f72336017b122014759547e5443cd127e5f33d3c6"
+      },
+      "log_sha256": "5c6883eec43860df487a908975fa16a9ff10c2a103eb32f776ed6583c80b9fac"
+    },
+    {
+      "id": "01790964327468804522-c8c2a10c74c2",
+      "role": "baseline_serving",
+      "result": {
+        "job_id": "01790964327468804522-c8c2a10c74c2",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790964720.466916,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790964327468804522-c8c2a10c74c2.log"
+      },
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-before",
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-before/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "timeout_seconds": 1200,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/benchmark_training_capture.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--source-revision",
+        "44645fea3b7ebe44a240e96a052b61e7d6be0269",
+        "--output-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-serving-before",
+        "--num-prompts",
+        "512",
+        "--input-len",
+        "16",
+        "--output-len",
+        "32",
+        "--concurrency",
+        "8",
+        "--capture-slots",
+        "16",
+        "--ratios",
+        "0.1",
+        "--repeats",
+        "2"
+      ],
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790964327468804522-c8c2a10c74c2.json",
+        "sha256": "fb9cbea959bbfc6d38125afb4a1d7648d15dead5fe315c5135bb0b6e5b7eca55"
+      },
+      "log_sha256": "294aa31ce97958254cd184666324846fe9b3c3c2fc1aebb66826714a9905cb7c"
+    },
+    {
+      "id": "01790964423249879570-1a7d2697c6f3",
+      "role": "initial_unit_import_failure",
+      "result": {
+        "job_id": "01790964423249879570-1a7d2697c6f3",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790964720.73077,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790964423249879570-1a7d2697c6f3.log"
+      },
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v1",
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "timeout_seconds": 600,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "unittest",
+        "test.registered.unit.training_capture.test_teacher_cuda",
+        "test.registered.unit.training_capture.test_buffers",
+        "test.registered.unit.training_capture.test_cuda_snapshot",
+        "test.registered.unit.training_capture.test_coordinator",
+        "test.registered.unit.training_capture.test_pd_capture"
+      ],
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790964423249879570-1a7d2697c6f3.json",
+        "sha256": "33bdbac27ae353f4e81d90f935473744ec7592e68b376b0fde0a856c4a634772"
+      },
+      "log_sha256": "e3b3a5fb4041d42cdacc03227b45a1135c28c7caa34ad3df29b2fba3b28e831b"
+    },
+    {
+      "id": "01790964455795574671-136a0ea2f22a",
+      "role": "interim_micro_cpu_profiler",
+      "result": {
+        "job_id": "01790964455795574671-136a0ea2f22a",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790964733.013878,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790964455795574671-136a0ea2f22a.log"
+      },
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v1",
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "timeout_seconds": 600,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/benchmark_teacher_selection.py",
+        "--source-revision",
+        "44645fea3+teacher-selection-v1",
+        "--output",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-micro-v1.json"
+      ],
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790964455795574671-136a0ea2f22a.json",
+        "sha256": "115afd6bf436a9dc42688dca082dcf2720b07f724bf669751c3a7e21f8e74afb"
+      },
+      "log_sha256": "f49c23e3ddfa284b5150f977bf78457a88a08192bd7de92ed1b5db1f1139cf4c"
+    },
+    {
+      "id": "01790964830151744708-a8e607532fb6",
+      "role": "unit_cuda_and_cpu_regression",
+      "result": {
+        "job_id": "01790964830151744708-a8e607532fb6",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790964897.2816272,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790964830151744708-a8e607532fb6.log"
+      },
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v1",
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v1/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "timeout_seconds": 600,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "unittest",
+        "test_teacher_cuda",
+        "test_buffers",
+        "test_cuda_snapshot",
+        "test_coordinator",
+        "test_pd_capture"
+      ],
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790964830151744708-a8e607532fb6.json",
+        "sha256": "a6c6b81db08797cdcd8a4808e88b48e1a0ffcc2b1a3c8754da086bb099d9b150"
+      },
+      "log_sha256": "c2d3d63e546b3577a4dc298a2a1f9a7b3ca8e029ddc4c16708dcc3d3b5d5a0b7"
+    },
+    {
+      "id": "01790964911604393996-435419b388e1",
+      "role": "interim_micro_cuda_profiler",
+      "result": {
+        "job_id": "01790964911604393996-435419b388e1",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790964925.9907067,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790964911604393996-435419b388e1.log"
+      },
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v2",
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v2/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      },
+      "timeout_seconds": 1500,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/benchmark_teacher_selection.py",
+        "--source-revision",
+        "44645fea3+teacher-selection-v2",
+        "--output",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-micro-v2.json"
+      ],
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790964911604393996-435419b388e1.json",
+        "sha256": "db67eece5a4700adcd841eef3bbe20d996655b3d9fc56e225a2eaf9d8fd9458b"
+      },
+      "log_sha256": "26a913f11ba7c05d95e80e3720cdb89ea2218e05d8bebdceafb4f741dfea9d09"
+    },
+    {
+      "id": "01790964933139689445-5827d436e5fa",
+      "role": "candidate_serving",
+      "result": {
+        "job_id": "01790964933139689445-5827d436e5fa",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790965327.3119893,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790964933139689445-5827d436e5fa.log"
+      },
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v2",
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v2/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      },
+      "timeout_seconds": 1500,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/benchmark_training_capture.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--source-revision",
+        "44645fea3+teacher-selection-v2",
+        "--output-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-serving-after",
+        "--num-prompts",
+        "512",
+        "--input-len",
+        "16",
+        "--output-len",
+        "32",
+        "--concurrency",
+        "8",
+        "--capture-slots",
+        "16",
+        "--ratios",
+        "0.1",
+        "--repeats",
+        "2"
+      ],
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790964933139689445-5827d436e5fa.json",
+        "sha256": "bbde4dab53991f503433832ff09272a28eb4d45043719e251c005634d35f229e"
+      },
+      "log_sha256": "e39134e723634c875d04d81a2fbb0bf6a1a100a5fbbb2c0e08a8c112293da209"
+    },
+    {
+      "id": "01790964933471404397-899ba7ab881f",
+      "role": "actual_runtime",
+      "result": {
+        "job_id": "01790964933471404397-899ba7ab881f",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790965960.479989,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790964933471404397-899ba7ab881f.log"
+      },
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v2",
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v2/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      },
+      "timeout_seconds": 1500,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      ],
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790964933471404397-899ba7ab881f.json",
+        "sha256": "8712e4cc55ad40d07381f7e0a659b59f35bc52545566c341c07309c439f1ee1d"
+      },
+      "log_sha256": "00b5e4ec8167fb3fb907cd8d95d48bc59c18ca13b9e10a81fee0f15a9bfeb299"
+    },
+    {
+      "id": "01790964933826177561-313839576b3c",
+      "role": "actual_pd",
+      "result": {
+        "job_id": "01790964933826177561-313839576b3c",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790966105.0627804,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790964933826177561-313839576b3c.log"
+      },
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v2",
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v2/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      },
+      "timeout_seconds": 1500,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_pd.py"
+      ],
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790964933826177561-313839576b3c.json",
+        "sha256": "397743b9207ddc021adc3a0603b0776dea4c66a7b74f8bd461796db97433203e"
+      },
+      "log_sha256": "7fba6407717f237ffb2961d79b34023ec3ff0788baed0cd4c7c642eece1a4d12"
+    },
+    {
+      "id": "01790965076284479467-8e03293e193f",
+      "role": "final_micro_deferred_profiler",
+      "result": {
+        "job_id": "01790965076284479467-8e03293e193f",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790966117.3600307,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790965076284479467-8e03293e193f.log"
+      },
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v3",
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-selection-v3/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      },
+      "timeout_seconds": 1500,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/benchmark_teacher_selection.py",
+        "--source-revision",
+        "44645fea3+teacher-selection-v3",
+        "--output",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-micro-v3.json"
+      ],
+      "result_artifact": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790965076284479467-8e03293e193f.json",
+        "sha256": "814920b730dfc4fbc6391917527ae3be2e898e68d29b06df563923ae2684f7b8"
+      },
+      "log_sha256": "493473d748ddf558ed705791bd837d5b4deeee36347f64cc24e7755441e8b541"
+    }
+  ],
+  "validation": {
+    "focused": {
+      "methods": 104,
+      "seconds": 53.938
+    },
+    "actual_runtime": {
+      "methods": 2,
+      "seconds": 621.946
+    },
+    "pd": {
+      "methods": 2,
+      "seconds": 133.555,
+      "post_exit_snapshots": 10
+    },
+    "total_methods": 108,
+    "serving_post_exit_snapshots": 200
+  },
+  "microbenchmark": {
+    "report": {
+      "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-micro-v3.json",
+      "sha256": "a8cd7cd4fce2dcafc8851f2b53165a8cdb1a82070a0a551e186c096ac797ac30"
+    },
+    "scope": "Complete eager teacher extraction, including CPU row selection and any index upload/gather. Alternating order, final synchronization; no serving, D2H, Store or Catalog. Profiler counts are collected separately from timing.",
+    "cases": [
+      {
+        "vocabulary": 32768,
+        "dtype": "torch.float32",
+        "batch_rows": 8,
+        "indices": [
+          3
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            164.69918191432953,
+            160.54484993219376,
+            160.13454645872116,
+            160.57446599006653,
+            159.95685011148453
+          ],
+          "host_indices": [
+            139.46961611509323,
+            138.24574649333954,
+            138.07833194732666,
+            138.13015073537827,
+            137.47364282608032
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 160.54484993219376,
+          "host_indices": 138.13015073537827
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 32768,
+        "dtype": "torch.float32",
+        "batch_rows": 8,
+        "indices": [
+          2,
+          3,
+          4
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            161.72446310520172,
+            160.7922837138176,
+            160.78755259513855,
+            161.35919839143753,
+            160.5169102549553
+          ],
+          "host_indices": [
+            147.47217297554016,
+            147.31116592884064,
+            146.96799218654633,
+            146.90563082695007,
+            147.40284532308578
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 160.7922837138176,
+          "host_indices": 147.31116592884064
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 32768,
+        "dtype": "torch.float32",
+        "batch_rows": 8,
+        "indices": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            164.44124281406403,
+            162.47525811195374,
+            163.23670744895935,
+            163.0876213312149,
+            164.3754169344902
+          ],
+          "host_indices": [
+            149.9531790614128,
+            149.07900243997574,
+            149.72731471061707,
+            150.39950609207153,
+            150.29072761535645
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 163.23670744895935,
+          "host_indices": 149.9531790614128
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 32768,
+        "dtype": "torch.float32",
+        "batch_rows": 8,
+        "indices": [
+          0,
+          3,
+          7
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            162.04442828893661,
+            160.99929809570312,
+            161.11206263303757,
+            161.2287387251854,
+            161.094032227993
+          ],
+          "host_indices": [
+            164.1656830906868,
+            164.254792034626,
+            164.72335904836655,
+            164.29219394922256,
+            163.66619616746902
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 161.11206263303757,
+          "host_indices": 164.254792034626
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          }
+        }
+      },
+      {
+        "vocabulary": 32768,
+        "dtype": "torch.bfloat16",
+        "batch_rows": 8,
+        "indices": [
+          3
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            160.99445521831512,
+            161.76529228687286,
+            161.0282063484192,
+            160.74813902378082,
+            162.0451733469963
+          ],
+          "host_indices": [
+            136.81013137102127,
+            136.81422919034958,
+            136.61976903676987,
+            136.88921928405762,
+            137.37186789512634
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 161.0282063484192,
+          "host_indices": 136.81422919034958
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 32768,
+        "dtype": "torch.bfloat16",
+        "batch_rows": 8,
+        "indices": [
+          2,
+          3,
+          4
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            154.7117531299591,
+            153.88835221529007,
+            184.997096657753,
+            155.19898384809494,
+            153.69486063718796
+          ],
+          "host_indices": [
+            139.34582471847534,
+            138.73331248760223,
+            139.49278742074966,
+            138.95228505134583,
+            140.7121866941452
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 154.7117531299591,
+          "host_indices": 139.34582471847534
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 32768,
+        "dtype": "torch.bfloat16",
+        "batch_rows": 8,
+        "indices": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            157.35622495412827,
+            155.78385442495346,
+            156.28837049007416,
+            156.60248696804047,
+            155.93737363815308
+          ],
+          "host_indices": [
+            142.09341257810593,
+            141.9699192047119,
+            142.14444905519485,
+            141.85145497322083,
+            142.42425560951233
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 156.28837049007416,
+          "host_indices": 142.09341257810593
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 32768,
+        "dtype": "torch.bfloat16",
+        "batch_rows": 8,
+        "indices": [
+          0,
+          3,
+          7
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            154.76003289222717,
+            154.1067659854889,
+            170.97469419240952,
+            153.87777239084244,
+            154.48987483978271
+          ],
+          "host_indices": [
+            198.42177629470825,
+            166.15182161331177,
+            160.41390597820282,
+            157.14801847934723,
+            162.77320683002472
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 154.48987483978271,
+          "host_indices": 162.77320683002472
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          }
+        }
+      },
+      {
+        "vocabulary": 151936,
+        "dtype": "torch.float32",
+        "batch_rows": 8,
+        "indices": [
+          3
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            159.54893082380295,
+            158.82860869169235,
+            159.3479886651039,
+            158.80167484283447,
+            158.56511890888214
+          ],
+          "host_indices": [
+            136.15459203720093,
+            135.49711555242538,
+            137.71936297416687,
+            136.47466897964478,
+            142.4560695886612
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 158.82860869169235,
+          "host_indices": 136.47466897964478
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 151936,
+        "dtype": "torch.float32",
+        "batch_rows": 8,
+        "indices": [
+          2,
+          3,
+          4
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            160.19318252801895,
+            160.63891351222992,
+            160.1012423634529,
+            160.35828739404678,
+            162.2496172785759
+          ],
+          "host_indices": [
+            147.43659645318985,
+            145.76327055692673,
+            146.0064947605133,
+            146.11776918172836,
+            146.6953381896019
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 160.35828739404678,
+          "host_indices": 146.11776918172836
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 151936,
+        "dtype": "torch.float32",
+        "batch_rows": 8,
+        "indices": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            162.75543719530106,
+            164.4406095147133,
+            162.77048736810684,
+            162.94296830892563,
+            163.0556583404541
+          ],
+          "host_indices": [
+            148.9606872200966,
+            149.13633465766907,
+            150.74774622917175,
+            148.9056646823883,
+            149.7359573841095
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 162.94296830892563,
+          "host_indices": 149.13633465766907
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 151936,
+        "dtype": "torch.float32",
+        "batch_rows": 8,
+        "indices": [
+          0,
+          3,
+          7
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            163.9920100569725,
+            160.8883962035179,
+            160.41826456785202,
+            161.51253134012222,
+            160.79995781183243
+          ],
+          "host_indices": [
+            165.85446894168854,
+            165.0363951921463,
+            164.2002910375595,
+            172.40595072507858,
+            164.25099223852158
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 160.8883962035179,
+          "host_indices": 165.0363951921463
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          }
+        }
+      },
+      {
+        "vocabulary": 151936,
+        "dtype": "torch.bfloat16",
+        "batch_rows": 8,
+        "indices": [
+          3
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            160.32971441745758,
+            159.78876501321793,
+            163.76059502363205,
+            158.88676047325134,
+            159.376859664917
+          ],
+          "host_indices": [
+            136.64323836565018,
+            137.44622468948364,
+            137.31993734836578,
+            145.09357511997223,
+            136.9425654411316
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 159.78876501321793,
+          "host_indices": 137.31993734836578
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 151936,
+        "dtype": "torch.bfloat16",
+        "batch_rows": 8,
+        "indices": [
+          2,
+          3,
+          4
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            154.53074127435684,
+            154.5509323477745,
+            206.92773163318634,
+            154.24583107233047,
+            154.1004702448845
+          ],
+          "host_indices": [
+            140.31574130058289,
+            140.40403068065643,
+            139.94991779327393,
+            139.56263661384583,
+            140.75838029384613
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 154.53074127435684,
+          "host_indices": 140.31574130058289
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 151936,
+        "dtype": "torch.bfloat16",
+        "batch_rows": 8,
+        "indices": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            154.8883318901062,
+            155.1857590675354,
+            154.59313988685608,
+            155.23329377174377,
+            154.91563826799393
+          ],
+          "host_indices": [
+            141.35506004095078,
+            141.33378863334656,
+            141.50165021419525,
+            141.30767434835434,
+            141.3961499929428
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 154.91563826799393,
+          "host_indices": 141.35506004095078
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {}
+        }
+      },
+      {
+        "vocabulary": 151936,
+        "dtype": "torch.bfloat16",
+        "batch_rows": 8,
+        "indices": [
+          0,
+          3,
+          7
+        ],
+        "eager_wall_us": {
+          "tensor_indices": [
+            153.3394306898117,
+            153.68502587080002,
+            153.1868427991867,
+            153.52241694927216,
+            153.30590307712555
+          ],
+          "host_indices": [
+            156.51900321245193,
+            156.84805810451508,
+            156.96220099925995,
+            157.18165785074234,
+            156.308151781559
+          ]
+        },
+        "median_us": {
+          "tensor_indices": 153.3394306898117,
+          "host_indices": 156.84805810451508
+        },
+        "profile_calls": {
+          "tensor_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          },
+          "host_indices": {
+            "cudaMemcpyAsync": 1,
+            "cudaStreamSynchronize": 1,
+            "aten::index_select": 1
+          }
+        }
+      }
+    ],
+    "intermediate_reports": [
+      {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-micro-v1.json",
+        "sha256": "8489d2bf61366bac6adc5cc95b89c8c89e43e6d10a0f364ad0f6d8757ad53384"
+      },
+      {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-micro-v2.json",
+        "sha256": "fe001a8f283cc14a2fbfb1659951970bef420ad1a0f75ccc75a2a5ff367c5e81"
+      }
+    ],
+    "intermediate_limitations": [
+      "v1 CPU-only profiling did not observe CUDA runtime calls.",
+      "v2 CUDA probes ran between timing cases; subsequent timings stepped upward. Final v3 completes all timing before initializing CUDA profiling."
+    ]
+  },
+  "serving": [
+    {
+      "name": "baseline",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-serving-before/report.json",
+        "sha256": "2dbd5a3e070d9343930a4ee3f93e5dc67e63f35f432b0b1752214f7aa9e3aff2"
+      },
+      "declared_source_revision": "44645fea3b7ebe44a240e96a052b61e7d6be0269",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "44645fea3b7ebe44a240e96a052b61e7d6be0269",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-serving-before",
+        "num_prompts": 512,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 2,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600
+      },
+      "producer_source_sha256": {
+        "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+        "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+        "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+        "python/sglang/srt/training_capture/cohort.py": "6bd093ee9a219970b08023d279852b07caaacf288f2f617236b6b2e1c7d5af56",
+        "python/sglang/srt/training_capture/cohort_coordinator.py": "b1f4d340cab3b2400e7415c17773b27510524f8d3df55c6ec8af89455e3504f1",
+        "python/sglang/srt/training_capture/cohort_exchange.py": "b37abb0499a23fa8650521fe28c04a7219b887f5d2920e6f8070d4bfacae2ed3",
+        "python/sglang/srt/training_capture/cohort_service.py": "60f8578cf250b4f3dbf97b15d67a2c78a67eb6b836a5bcda85dfdaf90ecf9324",
+        "python/sglang/srt/training_capture/cohort_startup.py": "dfacd1a45203de5f3c08ccf73b06933f7aa4183bd670979981cfe2cb960208ed",
+        "python/sglang/srt/training_capture/cohort_writer.py": "8f47827eb4e8ca2d3e4f68a91a21d56e13e84530952d5f3ea71843b7f3647d69",
+        "python/sglang/srt/training_capture/config.py": "9cf427b9f673c376f728aa4bec45b0b4a31bffb360ce88731b32b8fccc34530d",
+        "python/sglang/srt/training_capture/context.py": "3ff2fcc98ee9ca6c60527d175e2dd8cf01c71c3e7a6017e2d23c56bcc8589a94",
+        "python/sglang/srt/training_capture/coordinator.py": "02ccbb75d426f704f7407ba364e6a098a76d4b2ff5f90feb74b892efa4d27355",
+        "python/sglang/srt/training_capture/host_pool.py": "591086d65bd855dfb671588c4c7e1b0af7270237ef738e0967db32f5e5816bfc",
+        "python/sglang/srt/training_capture/identity.py": "47f91ad994b716d27454eace428d9d0a5ce7468c5708e4dd3d3e385119c8ac24",
+        "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+        "python/sglang/srt/training_capture/kv_exporter.py": "2cecaf4db75bd9b2b0adf664f12fd6c56cfaba74be01b1c755b40cfd62299c8f",
+        "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+        "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+        "python/sglang/srt/training_capture/metrics.py": "422f9522d27718ed015c354c9b1ad7bb6c9b49f366a4e8b02de083f7e424ac1f",
+        "python/sglang/srt/training_capture/mooncake_store.py": "94525a4eb4088ab847c9dffd66d8a3c509b44d30244da76cba7647cd0944e139",
+        "python/sglang/srt/training_capture/pd_capture.py": "ea2a78c9f662f7914da840dcba443404fc69687f29fa50d8c084c4674b07cf08",
+        "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+        "python/sglang/srt/training_capture/protocol.py": "e57f130767eb7ca4aef6dc63a7cfdbaa37cc1d02326a068bc973d818a7bb9d62",
+        "python/sglang/srt/training_capture/request_router.py": "b97ca76fd4621398c617414098c539850e331e0ee42d88e91eb7e0cb41f09824",
+        "python/sglang/srt/training_capture/resources.py": "4f615e4b1b79b94637ba664e05e93bdbb827f865a176d06abbf23e8bcd02cd8d",
+        "python/sglang/srt/training_capture/snapshot.py": "82e7dce85b0ecac6538aac26a21d22286e35c19e59a01b0ca2735e4da0dec3b3",
+        "python/sglang/srt/training_capture/snapshot_writer.py": "ec60267c9e9057c3b8fcc3c5b66bcd9987dff65279514f4007637c861dd3a1f5",
+        "python/sglang/srt/training_capture/startup.py": "00d81ee4757ef83347248e419065a81dd8f812837f5589a91fd9b7511e895371",
+        "python/sglang/srt/training_capture/teacher.py": "02d1343b0d5e8cebc5169a199e2005a0167a22ff9cf1336475953f9825760043",
+        "python/sglang/srt/training_capture/teacher_staging.py": "9afe4b9bb7bdf16e43156377b47d034f9707ed1c09b62dbfdac3795bb7032fd0",
+        "python/sglang/srt/training_capture/timings.py": "9bea8c331ae56ed343f85d79451dfe22b512beef7f339167f00cc8e3da8c9278",
+        "python/sglang/srt/training_capture/topology.py": "b35eef08cd7ac804817c5b22c232e9c1e6dd76fc292220acc928eb58af5f1a35"
+      },
+      "rounds": [
+        {
+          "index": 0,
+          "comparison": {
+            "baseline_bracket_mean": {
+              "median_ttft_ms": 38.8214411213994,
+              "p95_ttft_ms": 44.382032100111246,
+              "p99_ttft_ms": 341.38044303283095,
+              "median_tpot_ms": 1.4753664333012797,
+              "p95_tpot_ms": 1.5756939958420493,
+              "p99_tpot_ms": 1.5846610087300501,
+              "output_throughput": 2812.9388207766115
+            },
+            "baseline_after_over_before": {
+              "median_ttft_ms": 0.9889778892154689,
+              "p95_ttft_ms": 0.9311399674646731,
+              "p99_ttft_ms": 0.2490132892231799,
+              "median_tpot_ms": 0.9986559783628145,
+              "p95_tpot_ms": 0.9976502144568423,
+              "p99_tpot_ms": 0.9994935768128009,
+              "output_throughput": 1.102447459146856
+            },
+            "capture_over_baseline": [
+              {
+                "sample_ratio": 0.1,
+                "ratios": {
+                  "median_ttft_ms": 1.1056319773880778,
+                  "p95_ttft_ms": 1.196096432093878,
+                  "p99_ttft_ms": 0.18152067803577857,
+                  "median_tpot_ms": 2.0945023932659894,
+                  "p95_tpot_ms": 2.1010580142901163,
+                  "p99_tpot_ms": 2.182434030265724,
+                  "output_throughput": 0.7312647296877537
+                }
+              }
+            ]
+          },
+          "phases": [
+            {
+              "sample_ratio": null,
+              "request_throughput": 83.62096067308094,
+              "median_tpot_ms": 1.4763585622272184,
+              "p99_ttft_ms": 546.6402094811201,
+              "p99_tpot_ms": 1.5850623648974205,
+              "readback": {},
+              "capture_counter_delta": {}
+            },
+            {
+              "sample_ratio": 0.1,
+              "request_throughput": 64.28134207510617,
+              "median_tpot_ms": 3.090158525493837,
+              "p99_ttft_ms": 61.96760948747396,
+              "p99_tpot_ms": 3.4584181118876707,
+              "readback": {
+                "validated_samples": 50,
+                "manifest_bytes": 430650,
+                "payload_bytes": 31176000,
+                "aux_payload_bytes": 1684800,
+                "payload_objects": 700,
+                "kv_payload_bytes": 29491200
+              },
+              "capture_counter_delta": {
+                "considered": 512,
+                "sampled_out": 462,
+                "admitted": 50,
+                "overlap_forwards": 1355,
+                "eager_forwards": 43,
+                "cuda_graph_forwards": 1312,
+                "sealed": 50,
+                "writer_started": 50,
+                "copies_completed": 50,
+                "snapshot_built": 50,
+                "ready": 50
+              },
+              "metrics": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-serving-before/round-0-phase-1-0.1/metrics.prom",
+                "sha256": "6088a3ccd6c3a90d3788de7db07a59e0afb0a611ca357573adeb618dfea2c625"
+              },
+              "metrics_verified": true,
+              "stage_delta": {
+                "queue_wait": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.1866077110171318
+                },
+                "copy_wait": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.017473537474870682
+                },
+                "snapshot_build": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.12830113992094994
+                },
+                "validation": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.1800425909459591
+                },
+                "catalog_register": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.04571060463786125
+                },
+                "store_payload": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.09928334131836891
+                },
+                "catalog_written": {
+                  "calls": 100,
+                  "errors": 0,
+                  "seconds": 0.07084724307060242
+                },
+                "journal_save": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.16394603997468948
+                },
+                "catalog_seal": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.06577993929386139
+                },
+                "store_manifest": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.019377712160348892
+                },
+                "catalog_publish": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.02814466878771782
+                },
+                "journal_complete": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.04814508184790611
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0
+                }
+              },
+              "catalog_errors": [],
+              "quarantined": 0
+            },
+            {
+              "sample_ratio": null,
+              "request_throughput": 92.18771562545726,
+              "median_tpot_ms": 1.474374304375341,
+              "p99_ttft_ms": 136.1206765845418,
+              "p99_tpot_ms": 1.5842596525626798,
+              "readback": {},
+              "capture_counter_delta": {}
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "comparison": {
+            "baseline_bracket_mean": {
+              "median_ttft_ms": 38.89469616115093,
+              "p95_ttft_ms": 43.6175343580544,
+              "p99_ttft_ms": 58.47780901938677,
+              "median_tpot_ms": 1.4750233460818567,
+              "p95_tpot_ms": 1.5773684387245486,
+              "p99_tpot_ms": 1.5976945851599016,
+              "output_throughput": 2945.053051542637
+            },
+            "baseline_after_over_before": {
+              "median_ttft_ms": 0.9977949223226276,
+              "p95_ttft_ms": 0.9771330368577568,
+              "p99_ttft_ms": 1.1570766786059659,
+              "median_tpot_ms": 0.9980840254153946,
+              "p95_tpot_ms": 0.9945385477331983,
+              "p99_tpot_ms": 0.979738808219215,
+              "output_throughput": 1.009982596554171
+            },
+            "capture_over_baseline": [
+              {
+                "sample_ratio": 0.1,
+                "ratios": {
+                  "median_ttft_ms": 1.0992702559513283,
+                  "p95_ttft_ms": 1.2065823314588942,
+                  "p99_ttft_ms": 1.0597335101014982,
+                  "median_tpot_ms": 2.0751984281438314,
+                  "p95_tpot_ms": 2.062929714964725,
+                  "p99_tpot_ms": 2.1306758910105286,
+                  "output_throughput": 0.7029903606269963
+                }
+              }
+            ]
+          },
+          "phases": [
+            {
+              "sample_ratio": null,
+              "request_throughput": 91.57582560016661,
+              "median_tpot_ms": 1.4764377546887244,
+              "p99_ttft_ms": 54.21949956566095,
+              "p99_tpot_ms": 1.6140458312246109,
+              "readback": {},
+              "capture_counter_delta": {}
+            },
+            {
+              "sample_ratio": 0.1,
+              "request_throughput": 64.69824708654983,
+              "median_tpot_ms": 3.0609661292645236,
+              "p99_ttft_ms": 61.97089381515979,
+              "p99_tpot_ms": 3.40416933379827,
+              "readback": {
+                "validated_samples": 50,
+                "manifest_bytes": 430650,
+                "payload_bytes": 31176000,
+                "aux_payload_bytes": 1684800,
+                "payload_objects": 700,
+                "kv_payload_bytes": 29491200
+              },
+              "capture_counter_delta": {
+                "considered": 512,
+                "sampled_out": 462,
+                "admitted": 50,
+                "overlap_forwards": 1355,
+                "eager_forwards": 43,
+                "cuda_graph_forwards": 1312,
+                "sealed": 50,
+                "writer_started": 50,
+                "copies_completed": 50,
+                "snapshot_built": 50,
+                "ready": 50
+              },
+              "metrics": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-serving-before/round-1-phase-1-0.1/metrics.prom",
+                "sha256": "508534f6a65bb40ce5d4101454b642f24d0393cca7240903758ede5c17dded10"
+              },
+              "metrics_verified": true,
+              "stage_delta": {
+                "queue_wait": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.18109406903386116
+                },
+                "copy_wait": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.015958577394485474
+                },
+                "snapshot_build": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.13060181587934494
+                },
+                "validation": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.17670782282948494
+                },
+                "catalog_register": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.04406316950917244
+                },
+                "store_payload": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.09637008979916573
+                },
+                "catalog_written": {
+                  "calls": 100,
+                  "errors": 0,
+                  "seconds": 0.0689941868185997
+                },
+                "journal_save": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.16319234296679497
+                },
+                "catalog_seal": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.0634998269379139
+                },
+                "store_manifest": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.017965078353881836
+                },
+                "catalog_publish": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.028262481093406677
+                },
+                "journal_complete": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.05076359212398529
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0
+                }
+              },
+              "catalog_errors": [],
+              "quarantined": 0
+            },
+            {
+              "sample_ratio": null,
+              "request_throughput": 92.48999012124821,
+              "median_tpot_ms": 1.473608937474989,
+              "p99_ttft_ms": 62.73611847311258,
+              "p99_tpot_ms": 1.5813433390951925,
+              "readback": {},
+              "capture_counter_delta": {}
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "candidate",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-serving-after/report.json",
+        "sha256": "53c1ed9c6c193147db0e3b281c329239a948d3ffcf3c08f70656eb7fca5c1261"
+      },
+      "declared_source_revision": "44645fea3+teacher-selection-v2",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "44645fea3+teacher-selection-v2",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-serving-after",
+        "num_prompts": 512,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 2,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600
+      },
+      "producer_source_sha256": {
+        "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+        "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+        "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+        "python/sglang/srt/training_capture/cohort.py": "6bd093ee9a219970b08023d279852b07caaacf288f2f617236b6b2e1c7d5af56",
+        "python/sglang/srt/training_capture/cohort_coordinator.py": "b1f4d340cab3b2400e7415c17773b27510524f8d3df55c6ec8af89455e3504f1",
+        "python/sglang/srt/training_capture/cohort_exchange.py": "b37abb0499a23fa8650521fe28c04a7219b887f5d2920e6f8070d4bfacae2ed3",
+        "python/sglang/srt/training_capture/cohort_service.py": "60f8578cf250b4f3dbf97b15d67a2c78a67eb6b836a5bcda85dfdaf90ecf9324",
+        "python/sglang/srt/training_capture/cohort_startup.py": "dfacd1a45203de5f3c08ccf73b06933f7aa4183bd670979981cfe2cb960208ed",
+        "python/sglang/srt/training_capture/cohort_writer.py": "8f47827eb4e8ca2d3e4f68a91a21d56e13e84530952d5f3ea71843b7f3647d69",
+        "python/sglang/srt/training_capture/config.py": "9cf427b9f673c376f728aa4bec45b0b4a31bffb360ce88731b32b8fccc34530d",
+        "python/sglang/srt/training_capture/context.py": "3ff2fcc98ee9ca6c60527d175e2dd8cf01c71c3e7a6017e2d23c56bcc8589a94",
+        "python/sglang/srt/training_capture/coordinator.py": "9e5ad5eac75c1a5337bde61fec32036627e14182458fedf81e22dc81cdb2fb33",
+        "python/sglang/srt/training_capture/host_pool.py": "591086d65bd855dfb671588c4c7e1b0af7270237ef738e0967db32f5e5816bfc",
+        "python/sglang/srt/training_capture/identity.py": "47f91ad994b716d27454eace428d9d0a5ce7468c5708e4dd3d3e385119c8ac24",
+        "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+        "python/sglang/srt/training_capture/kv_exporter.py": "2cecaf4db75bd9b2b0adf664f12fd6c56cfaba74be01b1c755b40cfd62299c8f",
+        "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+        "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+        "python/sglang/srt/training_capture/metrics.py": "422f9522d27718ed015c354c9b1ad7bb6c9b49f366a4e8b02de083f7e424ac1f",
+        "python/sglang/srt/training_capture/mooncake_store.py": "94525a4eb4088ab847c9dffd66d8a3c509b44d30244da76cba7647cd0944e139",
+        "python/sglang/srt/training_capture/pd_capture.py": "a2e239ca22f3318a85d5bd27c872047975843a84676fc70ca85a693256e9f36f",
+        "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+        "python/sglang/srt/training_capture/protocol.py": "e57f130767eb7ca4aef6dc63a7cfdbaa37cc1d02326a068bc973d818a7bb9d62",
+        "python/sglang/srt/training_capture/request_router.py": "b97ca76fd4621398c617414098c539850e331e0ee42d88e91eb7e0cb41f09824",
+        "python/sglang/srt/training_capture/resources.py": "4f615e4b1b79b94637ba664e05e93bdbb827f865a176d06abbf23e8bcd02cd8d",
+        "python/sglang/srt/training_capture/snapshot.py": "82e7dce85b0ecac6538aac26a21d22286e35c19e59a01b0ca2735e4da0dec3b3",
+        "python/sglang/srt/training_capture/snapshot_writer.py": "ec60267c9e9057c3b8fcc3c5b66bcd9987dff65279514f4007637c861dd3a1f5",
+        "python/sglang/srt/training_capture/startup.py": "00d81ee4757ef83347248e419065a81dd8f812837f5589a91fd9b7511e895371",
+        "python/sglang/srt/training_capture/teacher.py": "6a267208c1ca42d209920e7cfcbd9b3441ce6894060b0988ada23375870d82ab",
+        "python/sglang/srt/training_capture/teacher_staging.py": "9afe4b9bb7bdf16e43156377b47d034f9707ed1c09b62dbfdac3795bb7032fd0",
+        "python/sglang/srt/training_capture/timings.py": "9bea8c331ae56ed343f85d79451dfe22b512beef7f339167f00cc8e3da8c9278",
+        "python/sglang/srt/training_capture/topology.py": "b35eef08cd7ac804817c5b22c232e9c1e6dd76fc292220acc928eb58af5f1a35"
+      },
+      "rounds": [
+        {
+          "index": 0,
+          "comparison": {
+            "baseline_bracket_mean": {
+              "median_ttft_ms": 38.60863670706749,
+              "p95_ttft_ms": 44.086210709065185,
+              "p99_ttft_ms": 298.6828316561878,
+              "median_tpot_ms": 1.4728008799495236,
+              "p95_tpot_ms": 1.584272110654462,
+              "p99_tpot_ms": 1.6649282735682303,
+              "output_throughput": 2823.844439353242
+            },
+            "baseline_after_over_before": {
+              "median_ttft_ms": 1.0066642089826543,
+              "p95_ttft_ms": 0.926582660321175,
+              "p99_ttft_ms": 0.10047706148758324,
+              "median_tpot_ms": 1.000093632672295,
+              "p95_tpot_ms": 0.9892409732954951,
+              "p99_tpot_ms": 0.9867648901630467,
+              "output_throughput": 1.1091824496787248
+            },
+            "capture_over_baseline": [
+              {
+                "sample_ratio": 0.1,
+                "ratios": {
+                  "median_ttft_ms": 1.1139907681711767,
+                  "p95_ttft_ms": 1.1852311873659862,
+                  "p99_ttft_ms": 0.195315389300979,
+                  "median_tpot_ms": 1.3185242753777282,
+                  "p95_tpot_ms": 2.0494349080848595,
+                  "p99_tpot_ms": 3.3054008168617623,
+                  "output_throughput": 0.8593217400716191
+                }
+              }
+            ]
+          },
+          "phases": [
+            {
+              "sample_ratio": null,
+              "request_throughput": 83.67710317638048,
+              "median_tpot_ms": 1.4727319320363383,
+              "p99_ttft_ms": 542.8242752328515,
+              "p99_tpot_ms": 1.6760194241519897,
+              "readback": {},
+              "capture_counter_delta": {}
+            },
+            {
+              "sample_ratio": 0.1,
+              "request_throughput": 75.83096616614354,
+              "median_tpot_ms": 1.9419237130111262,
+              "p99_ttft_ms": 58.33735354244709,
+              "p99_tpot_ms": 5.503255275468672,
+              "readback": {
+                "validated_samples": 50,
+                "manifest_bytes": 430150,
+                "payload_bytes": 31176000,
+                "aux_payload_bytes": 1684800,
+                "payload_objects": 700,
+                "kv_payload_bytes": 29491200
+              },
+              "capture_counter_delta": {
+                "considered": 512,
+                "sampled_out": 462,
+                "admitted": 50,
+                "overlap_forwards": 1355,
+                "eager_forwards": 43,
+                "cuda_graph_forwards": 1312,
+                "sealed": 50,
+                "writer_started": 50,
+                "copies_completed": 50,
+                "snapshot_built": 50,
+                "ready": 50
+              },
+              "metrics": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-serving-after/round-0-phase-1-0.1/metrics.prom",
+                "sha256": "a22bb0c17d6ef930fc4fc018ba70d9ab4df8db7427deb4e4ead1272657bcc052"
+              },
+              "metrics_verified": true,
+              "stage_delta": {
+                "queue_wait": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.19637656956911087
+                },
+                "copy_wait": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.017799440771341324
+                },
+                "snapshot_build": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.12576746940612793
+                },
+                "validation": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.17864824086427689
+                },
+                "catalog_register": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.04543731361627579
+                },
+                "store_payload": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.09743120893836021
+                },
+                "catalog_written": {
+                  "calls": 100,
+                  "errors": 0,
+                  "seconds": 0.06736145541071892
+                },
+                "journal_save": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.17604589089751244
+                },
+                "catalog_seal": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.0642123632133007
+                },
+                "store_manifest": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.017468083649873734
+                },
+                "catalog_publish": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.028450265526771545
+                },
+                "journal_complete": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.04692346230149269
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0
+                }
+              },
+              "catalog_errors": [],
+              "quarantined": 0
+            },
+            {
+              "sample_ratio": null,
+              "request_throughput": 92.81317428319711,
+              "median_tpot_ms": 1.4728698278627088,
+              "p99_ttft_ms": 54.54138807952403,
+              "p99_tpot_ms": 1.6538371229844708,
+              "readback": {},
+              "capture_counter_delta": {}
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "comparison": {
+            "baseline_bracket_mean": {
+              "median_ttft_ms": 38.35119865834713,
+              "p95_ttft_ms": 41.525100171566,
+              "p99_ttft_ms": 55.5083847604692,
+              "median_tpot_ms": 1.4743941625760448,
+              "p95_tpot_ms": 1.576345684307237,
+              "p99_tpot_ms": 1.6609197284185115,
+              "output_throughput": 2981.1372651247375
+            },
+            "baseline_after_over_before": {
+              "median_ttft_ms": 1.0028387497166893,
+              "p95_ttft_ms": 0.9645456448236658,
+              "p99_ttft_ms": 1.0614153910366888,
+              "median_tpot_ms": 0.999007801016345,
+              "p95_tpot_ms": 0.9994091576382085,
+              "p99_tpot_ms": 0.9952134835260031,
+              "output_throughput": 0.9979054992355546
+            },
+            "capture_over_baseline": [
+              {
+                "sample_ratio": 0.1,
+                "ratios": {
+                  "median_ttft_ms": 1.1052951233782926,
+                  "p95_ttft_ms": 1.275431322534883,
+                  "p99_ttft_ms": 1.04706275944332,
+                  "median_tpot_ms": 1.3179082472145272,
+                  "p95_tpot_ms": 2.0545231690110337,
+                  "p99_tpot_ms": 2.0492421123661093,
+                  "output_throughput": 0.8284928495079692
+                }
+              }
+            ]
+          },
+          "phases": [
+            {
+              "sample_ratio": null,
+              "request_throughput": 93.25820422516826,
+              "median_tpot_ms": 1.4751259718210468,
+              "p99_ttft_ms": 53.85463308542967,
+              "p99_tpot_ms": 1.6649042742867624,
+              "readback": {},
+              "capture_counter_delta": {}
+            },
+            {
+              "sample_ratio": 0.1,
+              "request_throughput": 77.18284086117463,
+              "median_tpot_ms": 1.943116226503926,
+              "p99_ttft_ms": 58.1207625195384,
+              "p99_tpot_ms": 3.403626652734895,
+              "readback": {
+                "validated_samples": 50,
+                "manifest_bytes": 430150,
+                "payload_bytes": 31176000,
+                "aux_payload_bytes": 1684800,
+                "payload_objects": 700,
+                "kv_payload_bytes": 29491200
+              },
+              "capture_counter_delta": {
+                "considered": 512,
+                "sampled_out": 462,
+                "admitted": 50,
+                "overlap_forwards": 1355,
+                "eager_forwards": 43,
+                "cuda_graph_forwards": 1312,
+                "sealed": 50,
+                "writer_started": 50,
+                "copies_completed": 50,
+                "snapshot_built": 50,
+                "ready": 50
+              },
+              "metrics": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-selection-serving-after/round-1-phase-1-0.1/metrics.prom",
+                "sha256": "fe6cb6a90ff9b01ab6daf9935a96b626e1d3bfa54f79c658def6e7df2a90e973"
+              },
+              "metrics_verified": true,
+              "stage_delta": {
+                "queue_wait": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.6882440559566021
+                },
+                "copy_wait": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.016605865210294724
+                },
+                "snapshot_build": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.12657436355948448
+                },
+                "validation": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.17925787344574928
+                },
+                "catalog_register": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.0812881626188755
+                },
+                "store_payload": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.10229586064815521
+                },
+                "catalog_written": {
+                  "calls": 100,
+                  "errors": 0,
+                  "seconds": 0.06638792902231216
+                },
+                "journal_save": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.148833516985178
+                },
+                "catalog_seal": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.3957432731986046
+                },
+                "store_manifest": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.01825624704360962
+                },
+                "catalog_publish": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.02718457207083702
+                },
+                "journal_complete": {
+                  "calls": 50,
+                  "errors": 0,
+                  "seconds": 0.049891065806150436
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0
+                }
+              },
+              "catalog_errors": [],
+              "quarantined": 0
+            },
+            {
+              "sample_ratio": null,
+              "request_throughput": 93.06287484512784,
+              "median_tpot_ms": 1.473662353331043,
+              "p99_ttft_ms": 57.16213643550873,
+              "p99_tpot_ms": 1.656935182550261,
+              "readback": {},
+              "capture_counter_delta": {}
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "baseline_profile": {
+    "report": {
+      "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-current-profile-20261003/report.json",
+      "sha256": "0cea242fa1cad4d23ef6ffabbab734ff348f30f95c20f124e185bab8d91d9c76"
+    },
+    "scope": "Five batches of eight requests per workload, after warmup. Profiler-only attribution; no independent snapshot readback in this job.",
+    "enabled_traces": [
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-current-profile-20261003/on/prefill/prefill-1790963960.836629-TP-0.trace.json.gz",
+        "sha256": "30f64800d6266ce61eb6d302a68c06b6fa263d39151d74d06b25c688cef14d25",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {
+          "training_capture.kv": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 25823.016,
+            "gpu_kernel_calls": 270,
+            "gpu_kernel_us": 499.78199999999975,
+            "d2h_calls": 270,
+            "d2h_us": 2045.4160000000006,
+            "d2h_bytes": 62976000,
+            "d2h_events_missing_bytes": 0,
+            "d2d_calls": 0,
+            "d2d_us": 0,
+            "d2d_bytes": 0,
+            "d2d_events_missing_bytes": 0
+          },
+          "training_capture.positions_d2h": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 4585.4659999999985,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 45,
+            "d2h_us": 124.19699999999999,
+            "d2h_bytes": 41000,
+            "d2h_events_missing_bytes": 0,
+            "d2d_calls": 0,
+            "d2d_us": 0,
+            "d2d_bytes": 0,
+            "d2d_events_missing_bytes": 0
+          },
+          "training_capture.teacher": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 20649.213000000007,
+            "gpu_kernel_calls": 1080,
+            "gpu_kernel_us": 3618.4569999999953,
+            "d2h_calls": 0,
+            "d2h_us": 0,
+            "d2h_bytes": 0,
+            "d2h_events_missing_bytes": 0,
+            "d2d_calls": 0,
+            "d2d_us": 0,
+            "d2d_bytes": 0,
+            "d2d_events_missing_bytes": 0
+          },
+          "training_capture.teacher_d2h": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 11284.895000000002,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 135,
+            "d2h_us": 323.4230000000001,
+            "d2h_bytes": 46260,
+            "d2h_events_missing_bytes": 0,
+            "d2d_calls": 0,
+            "d2d_us": 0,
+            "d2d_bytes": 0,
+            "d2d_events_missing_bytes": 0
+          }
+        },
+        "all_kernel_us": 77035.89700000148,
+        "all_d2h_us": 2606.637000000001,
+        "all_d2d_us": 145.2450000000001
+      },
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-current-profile-20261003/on/decode/decode-1790963998.0194378-TP-0.trace.json.gz",
+        "sha256": "54ff7a5a78144f433b04870c4809f52eff8829703751e8b2d86a22e70356221a",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {
+          "training_capture.kv": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 590041.5109999999,
+            "gpu_kernel_calls": 7920,
+            "gpu_kernel_us": 15288.503000000426,
+            "d2h_calls": 7920,
+            "d2h_us": 20760.524000000456,
+            "d2h_bytes": 16220160,
+            "d2h_events_missing_bytes": 0,
+            "d2d_calls": 0,
+            "d2d_us": 0,
+            "d2d_bytes": 0,
+            "d2d_events_missing_bytes": 0
+          },
+          "training_capture.positions_d2h": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 129740.18800000011,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 1320,
+            "d2h_us": 3501.2519999999918,
+            "d2h_bytes": 10560,
+            "d2h_events_missing_bytes": 0,
+            "d2d_calls": 0,
+            "d2d_us": 0,
+            "d2d_bytes": 0,
+            "d2d_events_missing_bytes": 0
+          },
+          "training_capture.teacher": {
+            "cpu_calls": 165,
+            "cpu_scope_us": 81049.73300000007,
+            "gpu_kernel_calls": 3960,
+            "gpu_kernel_us": 15893.294999999913,
+            "d2h_calls": 0,
+            "d2h_us": 0,
+            "d2h_bytes": 0,
+            "d2h_events_missing_bytes": 0,
+            "d2d_calls": 0,
+            "d2d_us": 0,
+            "d2d_bytes": 0,
+            "d2d_events_missing_bytes": 0
+          },
+          "training_capture.teacher_d2h": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 276090.10600000015,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 3960,
+            "d2h_us": 10032.998999999932,
+            "d2h_bytes": 1356960,
+            "d2h_events_missing_bytes": 0,
+            "d2d_calls": 0,
+            "d2d_us": 0,
+            "d2d_bytes": 0,
+            "d2d_events_missing_bytes": 0
+          }
+        },
+        "all_kernel_us": 237920.82199999416,
+        "all_d2h_us": 34721.94800000067,
+        "all_d2d_us": 1913.8479999999893
+      }
+    ]
+  },
+  "checks": {
+    "black_python_files": 5,
+    "full_ruff_clean_files": 4,
+    "coordinator_baseline_BLE001_findings": 9,
+    "coordinator_new_findings": 0,
+    "coordinator_I_F": "passed",
+    "diff_check": "passed"
+  },
+  "resource": {
+    "allocation": "job-fe1ce1dcdea6-20261001023258",
+    "additional_gpu_allocations": 0,
+    "gpu_uuid": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "idle_memory_mib": 1101,
+    "idle_utilization_percent": 58,
+    "worker_status": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790966267.4508834,
+      "idle_pid": 43789,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.20508050918579102
+    }
+  },
+  "limitations": [
+    "Single-rank Qwen3-0.6B with local TCP Store and a test Catalog; no new distributed/RDMA acceptance.",
+    "Contiguous microbenchmark improves 8.14%-15.04%; noncontiguous list dispatch adds 1.95%-5.36%.",
+    "Mean enabled throughput is 64.49 vs 76.51 requests/s, +18.63% for this measured workload, with equal admissions and payloads.",
+    "Candidate first-round p99 TPOT increases from 3.458 to 5.503ms; the second round is 3.404ms for both. Tail cause remains unresolved.",
+    "First off-phase TTFT tails are elevated in both sources. Maximum off-bracket throughput drift is 10.92%.",
+    "Production target/SLO, retention, SpecForge Catalog/consumer integration and trained-model quality remain open."
+  ]
+}

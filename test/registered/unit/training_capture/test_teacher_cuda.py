@@ -4,6 +4,7 @@ import math
 import unittest
 
 import torch
+from sglang.srt.training_capture.protocol import ContractError
 from sglang.srt.training_capture.teacher import capture_teacher, warmup_teacher_capture
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -16,7 +17,14 @@ class TestTeacherCuda(CustomTestCase):
     def check_rows(self, raw, vocab, indices=None):
         scores = raw[:, :vocab]
         if indices is not None:
-            scores = scores.index_select(0, indices)
+            scores = scores.index_select(
+                0,
+                (
+                    torch.tensor(indices, dtype=torch.long, device=raw.device)
+                    if isinstance(indices, list)
+                    else indices
+                ),
+            )
         expected_values, expected_ids = scores.topk(128, dim=-1)
         # The public contract normalizes FP32 scores, including FP64 fallback.
         expected_lse = scores.float().double().logsumexp(-1).float()
@@ -74,6 +82,26 @@ class TestTeacherCuda(CustomTestCase):
             with self.subTest(dtype=dtype):
                 self.check_rows(raw, vocab)
 
+    def test_host_row_selection_and_source_reuse(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for indices in ([], [2], [1, 2, 3], [3, 0, 3, 1]):
+                with self.subTest(dtype=dtype, indices=indices):
+                    raw = torch.randn(8, 1030, device="cuda", dtype=dtype)[::2, ::2]
+                    rows = self.check_rows(raw, 511, indices)
+                    saved = (
+                        rows.token_ids.clone(),
+                        rows.logits.clone(),
+                        rows.logsumexp.clone(),
+                    )
+                    raw.fill_(float("nan"))
+                    for actual, expected in zip(
+                        (rows.token_ids, rows.logits, rows.logsumexp), saved
+                    ):
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for indices in ([-1], [4], [1, 4], [True], [1.0]):
+            with self.subTest(invalid=indices), self.assertRaises(ContractError):
+                capture_teacher(torch.zeros(4, 128, device="cuda"), 128, indices)
+
     def test_warmed_graph_replay_and_owned_outputs(self):
         vocab = 151936
         warmup_teacher_capture(vocab, "cuda")
@@ -92,6 +120,27 @@ class TestTeacherCuda(CustomTestCase):
             expected = raw[:, :vocab].clone()
             graph.replay()
             raw.fill_(-float("inf"))
+            torch.testing.assert_close(
+                rows.logits, expected.gather(1, rows.token_ids.long()), rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                rows.logsumexp,
+                expected.double().logsumexp(-1).float(),
+                rtol=1e-6,
+                atol=1e-6,
+            )
+
+    def test_host_contiguous_rows_in_graph(self):
+        raw = torch.randn(8, 16400, device="cuda")
+        warmup_teacher_capture(16385, "cuda")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            rows = capture_teacher(raw, 16385, [2, 3, 4])
+        for offset in (0.0, 9.0):
+            raw.copy_(torch.randn_like(raw) + offset)
+            expected = raw[2:5, :16385].clone()
+            graph.replay()
+            raw.fill_(float("nan"))
             torch.testing.assert_close(
                 rows.logits, expected.gather(1, rows.token_ids.long()), rtol=0, atol=0
             )

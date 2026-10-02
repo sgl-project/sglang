@@ -411,6 +411,13 @@ binding 阶段投票。启动阶段只同步本设备的当前 stream，热路�
 这项优化的数值范围、微基准与服务测量见
 [`experiments/TEACHER_LSE.md`](experiments/TEACHER_LSE.md)。
 
+普通 AR 与 P/D 首行采集把 CPU 已知的行号列表直接传入 teacher 提取。
+连续行使用 logits 切片，省去索引 H2D 和完整词表 gather；非连续、重复或
+重排列表仍使用原有索引路径，speculative verify 的 tensor 映射保持原有处理。
+切片仅作为提取输入，返回的 top-128 与 LSE 独立持有内存；同 stream 的后续
+采样修改不能影响这些结果。验证和测量范围见
+[`experiments/TEACHER_SELECTION.md`](experiments/TEACHER_SELECTION.md)。
+
 #### 7.3.1 当前 prefill CUDA Graph 验收
 
 现有采集钩子在 graph replay 返回后、sampler 修改 logits 之前运行，使用本轮真实

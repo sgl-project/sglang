@@ -3907,6 +3907,42 @@ resident H100 has resumed idle load. See the
 Mixed TP/PP, asymmetric P/D, cross-node/RDMA control, confidence-scheduled DSpark,
 production retention/SLOs and trained-model quality remain outside this evidence.
 
+## Host-Known Teacher Selection
+
+Ordinary AR and P/D prefill now pass host-known row lists to teacher extraction.
+Consecutive rows use a logits view, avoiding an index upload, its stream
+synchronization and a full-vocabulary gather. Compact top-128 IDs/raw values and
+LSE still own storage independent of the serving/graph buffer. Disjoint,
+duplicate and reordered lists retain the gather path; speculative tensor
+mappings and all publication validation remain unchanged.
+
+The final 16-case H100 microbenchmark validates exact output equality and reduces
+contiguous eager extraction time by **8.14%-15.04%**. Noncontiguous selection is
+**1.95%-5.36% slower** from host validation/dispatch. CUDA probes confirm the
+three removed calls; all timing cases run before profiler initialization to
+avoid the persistent measurement overhead observed in an intermediate driver.
+
+Two 512-request off/on/off rounds per source use Qwen3-0.6B BF16, 16 input/32
+output tokens, concurrency eight, decode graphs/overlap and fixed 10% sampling.
+Mean capture-on throughput rises **18.63%, from 64.49 to 76.51 requests/s**.
+Each enabled phase publishes 50 samples with identical payload sizes and capture
+forward counts; all **200 snapshots** pass post-exit readback, and all four
+metrics scrapes agree with status without measured errors or quarantine.
+
+This is not uniform latency improvement: candidate p99 TPOT is 5.503/3.404ms,
+versus baseline 3.458/3.404ms. The first-round tail increase does not recur in the
+second round. Off-bracket throughput drift reaches 10.92%, and both first off
+phases have elevated TTFT tails. Production performance acceptance remains open.
+
+All **108 regression methods** pass: 104 focused numerical/ownership/coordinator/
+P/D cases, two complete actual-inference/lifecycle methods and two independent
+P/D runtime methods. The latter read ten additional snapshots after both producer
+trees exit. These runs remain single-rank with TCP Store and a test Catalog.
+The initial test-loader import failure and two superseded profiler configurations
+remain recorded. All ten jobs are terminal; the resident H100 resumes idle load
+without an extra allocation. See the [runbook](experiments/TEACHER_SELECTION.md)
+and [source/log evidence](experiments/teacher-selection.json).
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
@@ -3942,9 +3978,9 @@ production retention/SLOs and trained-model quality remain outside this evidence
    Investigate the timing experiment's
    short-request p99 TTFT increase, which the latest unchanged baseline did not
    reproduce. After consolidating single-rank content validation and reducing
-   teacher LSE work, profile the remaining capture and control/durability costs
-   without dropping publication
-   checks. Per-model numerical/runtime validation and
+   teacher LSE and contiguous row-selection overhead, profile the remaining capture
+   and control/durability costs and investigate the latest first-round TPOT tail
+   without dropping publication checks. Per-model numerical/runtime validation and
    runtime identity coverage also need expansion beyond the tested combination.
 5. Integrate with the SpecForge-owned production Catalog and consumer when
    available. Test doubles do not prove retention, consumer checkpoint replay,

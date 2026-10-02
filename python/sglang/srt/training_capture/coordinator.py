@@ -693,13 +693,10 @@ class CaptureCoordinator:
             offset += extend_len
         if teacher_indices:
             try:
-                indices = torch.tensor(
-                    teacher_indices,
-                    dtype=torch.long,
-                    device=logits_output.next_token_logits.device,
-                )
                 rows = capture_teacher(
-                    logits_output.next_token_logits, self.teacher.vocab_size, indices
+                    logits_output.next_token_logits,
+                    self.teacher.vocab_size,
+                    teacher_indices,
                 )
                 for row, (req, record, position) in enumerate(teacher_records):
                     record.context.record_teacher(rows, row=row, position=position)

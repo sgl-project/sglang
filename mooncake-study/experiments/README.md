@@ -27,6 +27,10 @@ stopped and reaped before test execution, then resumed afterward. Distributed
 experiments use separately allocated jobs; the two-node Store lane is described
 in [Remote RDMA Store Validation](RDMA.md).
 
+[Host-Known Teacher Row Selection](TEACHER_SELECTION.md) covers contiguous
+teacher-row views, independent compact output ownership, and microbenchmark and
+serving comparisons against the index-upload/gather path.
+
 [P/D Prefill Graph Capture](PD_PREFILL_CAPTURE.md) covers the independent P/D
 workers' Full, Breakable and piecewise graph paths for AR and static target-KV
 DSpark, with raw source comparison and post-exit Store reads on the resident GPU.
