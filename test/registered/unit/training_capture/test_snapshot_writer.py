@@ -144,6 +144,23 @@ class TestSnapshotPublication(CustomTestCase):
         )
         self.assertFalse(list(self.journal.pending()))
 
+        stages = self.writer.timings.stats()
+        for stage in (
+            "validation",
+            "catalog_register",
+            "store_payload",
+            "journal_save",
+            "catalog_seal",
+            "store_manifest",
+            "catalog_publish",
+            "journal_complete",
+        ):
+            self.assertEqual(stages[stage]["calls"], 1, stage)
+            self.assertEqual(stages[stage]["errors"], 0, stage)
+            self.assertGreaterEqual(stages[stage]["seconds"], 0, stage)
+        self.assertEqual(stages["catalog_written"]["calls"], 2)
+        self.assertEqual(stages["recovery_read"]["calls"], 0)
+
     def test_tensor_put_failure_never_publishes_ready(self):
         self.client.put_status = -1
         with self.assertRaises(TransportError):
@@ -151,6 +168,11 @@ class TestSnapshotPublication(CustomTestCase):
         self.assertIsNone(self.catalog.published)
         self.assertNotIn(self.manifest.key_prefix + "manifest", self.client.data)
         self.assertEqual(self.catalog.events, [("REGISTERED", 0)])
+        stages = self.writer.timings.stats()
+        self.assertEqual(stages["store_payload"]["calls"], 1)
+        self.assertEqual(stages["store_payload"]["errors"], 1)
+        self.assertEqual(stages["journal_save"]["calls"], 0)
+        self.assertEqual(stages["catalog_publish"]["calls"], 0)
 
     def test_lost_publish_response_replays_without_tensor_sources(self):
         self.catalog.fail_publish = True
@@ -200,6 +222,11 @@ class TestSnapshotPublication(CustomTestCase):
         self.writer.recover()
         self.assertIsNotNone(self.catalog.published)
         self.assertEqual(len(self.client.put_keys), len(self.manifest.objects) + 1)
+        stages = self.writer.timings.stats()
+        self.assertEqual(stages["catalog_seal"]["calls"], 2)
+        self.assertEqual(stages["catalog_seal"]["errors"], 1)
+        self.assertEqual(stages["recovery_read"]["calls"], 1)
+        self.assertEqual(stages["catalog_publish"]["calls"], 1)
 
     def test_stale_fence_cannot_recover_or_erase_journal(self):
         self.catalog.fail_publish = True

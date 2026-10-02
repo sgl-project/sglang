@@ -27,6 +27,7 @@ from sglang.srt.training_capture.snapshot_writer import (
     OwnerWriteReceipt,
     SnapshotWriter,
 )
+from sglang.srt.training_capture.timings import CaptureTimings
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +70,13 @@ class CohortSnapshotWriter:
         self.service = service
         self.partition = service.partition
         self.resources = service.allocator.resources
+        self.timings = CaptureTimings()
         self.writer = (
             SnapshotWriter(
-                self.resources.store, self.resources.catalog, self.resources.journal
+                self.resources.store,
+                self.resources.catalog,
+                self.resources.journal,
+                timings=self.timings,
             )
             if self.partition.active
             else None
@@ -155,7 +160,7 @@ class CohortSnapshotWriter:
             self.counters["submitted"] += 1
             self.wake.set()
 
-    def stats(self):
+    def stats(self, *, include_timings=True):
         with self.lock:
             return {
                 "ready": self.ready,
@@ -165,6 +170,7 @@ class CohortSnapshotWriter:
                 "pending": len(self.jobs),
                 "states": dict(Counter(job.phase for job in self.jobs.values())),
                 "counters": dict(self.counters),
+                **({"stage_timings": self.timings.stats()} if include_timings else {}),
                 "oldest_seconds": max(
                     (time.monotonic() - job.queued_at for job in self.jobs.values()),
                     default=0.0,
@@ -189,8 +195,11 @@ class CohortSnapshotWriter:
     def _advance(self, job):
         try:
             if job.phase == "copies":
+                self.timings.observe(
+                    "queue_wait", max(0.0, time.monotonic() - job.queued_at)
+                )
                 if job.context is not None:
-                    job.context.wait_for_copies()
+                    self.timings.call("copy_wait", job.context.wait_for_copies)
                 job.transfer_complete = True
             # An ambiguous publication can have won even after cancel/expiry.
             # Keep its exact manifest/lease until idempotent recovery confirms it.
@@ -215,12 +224,14 @@ class CohortSnapshotWriter:
                         raise ContractError(
                             "writer metadata differs from sealed sequence"
                         )
-                    prepared, job.tensors = job.context.prepare_partition(
+                    prepared, job.tensors = self.timings.call(
+                        "snapshot_build",
+                        job.context.prepare_partition,
                         **{
                             name: getattr(metadata, name)
                             for name in SnapshotMetadata.__struct_fields__
                             if name != "sequence"
-                        }
+                        },
                     )
                 self.service.submit_snapshot(
                     job.handle,
@@ -293,7 +304,7 @@ class CohortSnapshotWriter:
                 if not self.ready and time.monotonic() >= recovery_at:
                     try:
                         self.writer.recover()
-                    except Exception as error:  # noqa: BLE001 - preserve startup journal
+                    except Exception as error:  # noqa: BLE001 - retain journal
                         with self.lock:
                             self.recovery_error = type(error).__name__
                         recovery_at = time.monotonic() + self.retry_seconds

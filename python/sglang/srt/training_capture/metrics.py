@@ -3,6 +3,8 @@
 from collections import Counter
 from time import time
 
+from sglang.srt.training_capture.timings import CaptureTimings
+
 
 class CaptureMetrics:
     EVENTS = (
@@ -69,6 +71,22 @@ class CaptureMetrics:
         )
         self.adjustments = counter(
             "admission_adjustments", "Adaptive capture control actions.", ("action",)
+        )
+        self.stage_calls = counter(
+            "stage_calls", "Completed background capture stage attempts.", ("stage",)
+        )
+        self.stage_failures = counter(
+            "stage_failures",
+            "Background capture stage attempts that raised.",
+            ("stage",),
+        )
+        self.stage_seconds = counter(
+            "stage_seconds",
+            "Wall time in completed capture stage attempts.",
+            ("stage",),
+        )
+        self.stage_max = gauge(
+            "stage_max_seconds", "Lifetime maximum capture stage wall time.", ("stage",)
         )
         self.ratio = gauge("sample_ratio", "Capture admission probability.", ("kind",))
         self.reservations = gauge(
@@ -160,6 +178,22 @@ class CaptureMetrics:
             events[event] += value
         for event in self.EVENTS:
             self._increment(self.events, ("event", event), events[event], event=event)
+        for stage in CaptureTimings.STAGES:
+            value = stats.get("stage_timings", {}).get(stage, {})
+            for field, collector in (
+                ("calls", self.stage_calls),
+                ("errors", self.stage_failures),
+                ("seconds", self.stage_seconds),
+            ):
+                self._increment(
+                    collector,
+                    ("stage", stage, field),
+                    value.get(field, 0),
+                    stage=stage,
+                )
+            self.stage_max.labels(**self.labels, stage=stage).set(
+                value.get("max_seconds", 0)
+            )
         admission = stats["admission"]
         latency = admission.get("latency")
         self.latency_enabled.labels(**self.labels).set(int(latency is not None))

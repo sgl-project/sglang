@@ -3648,6 +3648,54 @@ and Ruff I/F, with no new full-Ruff warnings. The original checkout's staged
 index is unchanged. See the [runbook](experiments/BATCH_STORE_WRITES.md) and
 [source-bound evidence](experiments/batch-store-writes.json).
 
+## Background Writer Stage Timings
+
+Single-rank and cohort writers now expose bounded cumulative wall-time
+accounting for 13 stages through producer status and the existing Prometheus
+exporter. The stages distinguish queue/copy wait, snapshot construction and
+validation, Catalog calls, Store payload/manifest writes, journal save/complete
+and recovery reads. They retain only calls, exceptions, total seconds and a
+lifetime maximum. Measured calls preserve their return values/exceptions; no
+CUDA event or extra synchronization is introduced. Cohort hot-path pressure
+checks skip timing-dictionary copies. Prometheus retries do not double-count,
+and two dashboard panels show mean attempt duration and failure rate.
+
+All 87 regression methods pass: eight timing/metrics, 23 writer, 49 coordinator,
+six real Store/multiprocess and one actual-inference method. The latter covers
+AR/overlap/target-KV DSpark, retraction and adaptive/latency recovery. The
+benchmark driver also validates all timing fields against the actual
+multiprocess `/metrics` endpoint outside client timing and records phase deltas
+excluding warmup. Both short-request capture-on phases pass that comparison.
+
+Two fresh 512-request, 16-input/two-output, concurrency-four benchmark rounds
+per source produce 615 baseline and 619 timed snapshots, all readable and
+validated after producer exit. Every admitted measured request reaches READY;
+there are no measured stage errors, Catalog failures or quarantine. Of the
+17.283 ms/sample covered execution time, construction/validation contributes
+6.695 ms, Catalog 4.624 ms, journal 4.058 ms, Store adapters 1.811 ms and remaining
+copy wait 0.094 ms. Queue wait is separate at 21.471 ms/sample. These figures
+include scheduling/GIL waits and do not measure GPU or isolated wire time.
+
+Performance acceptance remains open: baseline serves 69.22 requests/s versus
+66.41 with timing, and timed p99 TTFT is 118.64/126.68 ms versus baseline
+62.63/67.34 ms. Two short sequential repetitions do not explain the tail or
+separate instrumentation from run-order/system effects. This is a diagnostic
+capability with measured costs, not a serving speedup or negligible-overhead
+claim. Validation and durability checks are retained. See the
+[runbook](experiments/WRITER_STAGE_TIMINGS.md) and
+[source/log evidence](experiments/writer-stage-timings.json).
+
+A longer diagnostic uses 64 requests with 512 input/128 output tokens and one
+off/on/off repetition. It validates all 52 admitted snapshots, with 416,279,552
+payload bytes, no stage errors/quarantine and another passing real metrics
+comparison. Construction/validation now averages 64.202 ms/sample, or 66.46% of
+the 96.604 ms/sample covered execution time; Store adapters take 12.906 ms.
+Capture-on retains 59.26% of bracketing capture-off throughput. This has no
+long-sequence baseline producer comparison and does not isolate GPU costs.
+All 1,286 measured benchmark snapshots pass readback. All eight submitted jobs
+are terminal and successful; the resident H100 is idle-loaded with no additional
+GPU allocated. Ten Python files pass Black and I/F with no new full-Ruff warning.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
@@ -3677,7 +3725,9 @@ index is unchanged. See the [runbook](experiments/BATCH_STORE_WRITES.md) and
    capability gates do not constitute implementation of those paths.
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to
    representative workloads and SLO thresholds, and complete dashboard runtime
-   acceptance and rollout/rollback checks. Per-model numerical/runtime validation and
+   acceptance and rollout/rollback checks. Investigate the timing experiment's
+   short-request p99 TTFT increase; profile repeated construction/validation and
+   control/durability work without dropping publication checks. Per-model numerical/runtime validation and
    runtime identity coverage also need expansion beyond the tested combination.
 5. Integrate with the SpecForge-owned production Catalog and consumer when
    available. Test doubles do not prove retention, consumer checkpoint replay,

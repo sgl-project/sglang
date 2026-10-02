@@ -117,6 +117,48 @@ def wait_capture_idle(url, *, timeout=60):
         time.sleep(0.1)
 
 
+def verify_stage_metrics(url, state, directory):
+    """Check the actual multiprocess endpoint after client timing has stopped."""
+    from prometheus_client.parser import text_string_to_metric_families
+
+    stages = state.get("stage_timings", {}) if state else {}
+    if not stages:
+        return {"verified": False, "reason": "stage timings unavailable"}
+    fields = {
+        "stage_calls_total": "calls",
+        "stage_failures_total": "errors",
+        "stage_seconds_total": "seconds",
+        "stage_max_seconds": "max_seconds",
+    }
+    deadline = time.monotonic() + 10
+    path = directory / "metrics.prom"
+    while True:
+        response = requests.get(url + "/metrics", timeout=10)
+        response.raise_for_status()
+        observed = {stage: {} for stage in stages}
+        for family in text_string_to_metric_families(response.text):
+            for sample in family.samples:
+                suffix = sample.name.removeprefix("sglang:training_capture_")
+                stage = sample.labels.get("stage")
+                if suffix in fields and stage in observed:
+                    field = fields[suffix]
+                    if field in observed[stage]:
+                        raise RuntimeError("Expected one producer per stage metric")
+                    observed[stage][field] = sample.value
+        if all(
+            field in observed[stage]
+            and math.isclose(observed[stage][field], value[field], rel_tol=1e-9)
+            for stage, value in stages.items()
+            for field in fields.values()
+        ):
+            path.write_text(response.text)
+            return {"verified": True, "path": str(path), "observed": observed}
+        if time.monotonic() >= deadline:
+            path.write_text(response.text)
+            raise RuntimeError(f"Stale or mismatched stage metrics; see {path}")
+        time.sleep(0.1)
+
+
 def warmup(url, args):
     for batch_size in (1, args.concurrency):
         response = requests.post(
@@ -247,6 +289,19 @@ def measure(args, url, directory):
         "capture_before": before,
         "capture_after": after,
         "capture_counter_delta": counters,
+        "stage_metrics": verify_stage_metrics(url, after, directory),
+        "capture_stage_delta": (
+            {
+                stage: {
+                    field: value[field]
+                    - before.get("stage_timings", {}).get(stage, {}).get(field, 0)
+                    for field in ("calls", "errors", "seconds")
+                }
+                for stage, value in after.get("stage_timings", {}).items()
+            }
+            if after is not None
+            else {}
+        ),
         "post_client_capture_drain_seconds": drain_seconds,
     }
 

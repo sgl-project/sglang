@@ -153,6 +153,25 @@
       "datasource": {"type": "prometheus", "uid": "$datasource"},
       "fieldConfig": {"defaults": {"unit": "short", "min": 0, "max": 1}, "overrides": []},
       "targets": [{"refId": "A", "expr": "sglang:training_capture_latency_state{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} {{state}}"}]
+    },
+    {
+      "id": 12,
+      "title": "Mean Capture Stage Duration",
+      "description": "Wall time per completed stage attempt, including failures and retries. Queue wait and copy wait are not GPU kernel or RDMA transfer timings. Ranks contribute their local owner work; this is not per-sample end-to-end latency.",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 40, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (instance,stage) (rate(sglang:training_capture_stage_seconds_total{model_name=~\"$model_name\",instance=~\"$instance\"}[$__rate_interval])) / sum by (instance,stage) (rate(sglang:training_capture_stage_calls_total{model_name=~\"$model_name\",instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{instance}} {{stage}}"}]
+    },
+    {
+      "id": 13,
+      "title": "Capture Stage Failures / Second",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 40, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (instance,stage) (rate(sglang:training_capture_stage_failures_total{model_name=~\"$model_name\",instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{instance}} {{stage}}"}]
     }
   ]
 }

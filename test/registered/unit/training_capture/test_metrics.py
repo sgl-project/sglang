@@ -2,6 +2,7 @@
 
 import math
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from prometheus_client import CollectorRegistry, generate_latest
 from sglang.srt.training_capture.admission import CaptureAdmission
@@ -10,6 +11,7 @@ from sglang.srt.training_capture.config import (
     CaptureLatencyConfig,
 )
 from sglang.srt.training_capture.metrics import CaptureMetrics
+from sglang.srt.training_capture.timings import CaptureTimings
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -129,6 +131,79 @@ class TestCaptureMetrics(CustomTestCase):
         self.assertEqual(self.value("latency_state", state="breached"), 0)
         self.assertEqual(self.value("latency_blocked"), 1)
         self.assertEqual(self.value("latency_window_observations", metric="ttft"), 0)
+
+    def test_stage_counters_are_bounded_and_repeated_snapshots_are_idempotent(self):
+        timings = CaptureTimings()
+        timings.observe("store_payload", 0.25)
+        timings.observe("store_payload", 0.5, failed=True)
+        self.stats["stage_timings"] = timings.stats()
+        self.stats["stage_timings"]["private-request-id"] = {
+            "calls": 999,
+            "errors": 0,
+            "seconds": 1,
+            "max_seconds": 1,
+        }
+        self.metrics.update(self.stats)
+        self.metrics.update(self.stats)
+        self.assertEqual(self.value("stage_calls_total", stage="store_payload"), 2)
+        self.assertEqual(self.value("stage_failures_total", stage="store_payload"), 1)
+        self.assertEqual(self.value("stage_seconds_total", stage="store_payload"), 0.75)
+        self.assertEqual(self.value("stage_max_seconds", stage="store_payload"), 0.5)
+        self.assertNotIn("private-request-id", generate_latest(self.registry).decode())
+        timings.observe("store_payload", 0.125)
+        self.stats["stage_timings"] = timings.stats()
+        self.metrics.update(self.stats)
+        self.assertEqual(self.value("stage_calls_total", stage="store_payload"), 3)
+        self.assertEqual(
+            self.value("stage_seconds_total", stage="store_payload"), 0.875
+        )
+        self.assertEqual(self.value("stage_calls_total", stage="recovery_read"), 0)
+
+
+class TestCaptureTimings(CustomTestCase):
+    def test_records_wall_time_and_failure_without_changing_callback_result(self):
+        clock = iter([1.0, 1.25, 2.0, 2.5])
+        timings = CaptureTimings(clock=lambda: next(clock))
+        result = object()
+        self.assertIs(timings.call("store_payload", lambda: result), result)
+        error = OSError("lost response")
+        with self.assertRaises(OSError) as raised, timings.measure("store_payload"):
+            raise error
+        self.assertIs(raised.exception, error)
+        self.assertEqual(
+            timings.stats()["store_payload"],
+            {"calls": 2, "errors": 1, "seconds": 0.75, "max_seconds": 0.5},
+        )
+
+    def test_concurrent_observations_and_detached_snapshots(self):
+        timings = CaptureTimings()
+
+        def observe():
+            for _ in range(100):
+                timings.observe("copy_wait", 0.25)
+                self.assertEqual(set(timings.stats()), set(CaptureTimings.STAGES))
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(observe) for _ in range(4)]
+            for future in futures:
+                future.result(timeout=5)
+        snapshot = timings.stats()
+        self.assertEqual(snapshot["copy_wait"]["calls"], 400)
+        self.assertEqual(snapshot["copy_wait"]["seconds"], 100)
+        snapshot["copy_wait"]["calls"] = -1
+        self.assertEqual(timings.stats()["copy_wait"]["calls"], 400)
+
+    def test_unknown_stage_and_invalid_observations_do_not_grow_state(self):
+        timings = CaptureTimings()
+        for value in (-1, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                timings.observe("store_payload", value)
+        with self.assertRaises(ValueError):
+            timings.observe("private-request-id", 1)
+        with self.assertRaises(ValueError), timings.measure("private-request-id"):
+            self.fail("unknown stage started work")
+        self.assertEqual(set(timings.stats()), set(CaptureTimings.STAGES))
+        self.assertEqual(sum(v["calls"] for v in timings.stats().values()), 0)
 
 
 if __name__ == "__main__":

@@ -1270,6 +1270,15 @@ training:
 
 sample_id/trace_id 用于日志关联，不作为高基数指标 label。日志不输出 token 内容、原始 logits 大数组或内存地址。
 
+SGLang 后台 writer 在 `stage_timings` 中提供固定阶段的累计调用数、异常数、
+墙钟时间和历史最大值，并通过现有 `/metrics` 导出。阶段区分排队、拷贝完成等待、
+快照构造与校验、Store payload/manifest 写入、Catalog 请求、journal 保存/清理和
+恢复读回。单进程与分布式 owner 使用相同统计口径；分布式统计属于当前 rank，
+不等同于全局样本数。计时不增加 CUDA event 或同步，`copy_wait` 不能解释为完整
+D2H 时间，Store 阶段也包含 SDK 之外的校验与重试读回。进行中的操作尚未计入
+阶段累计值，应结合 `writer_age_seconds` 判断阻塞。基准报告记录扣除 warmup 的
+阶段增量，并在客户端计时结束后验证真实 `/metrics` 导出。
+
 多租户训练必须沿用 MaaS 的数据授权和 dataset 隔离配置。KV/tokens 同属样本数据，删除/保留策略覆盖二者；只删文本而保留 KV 不算样本删除。
 
 ## 18. checkpoint 导出与回到 SGLang

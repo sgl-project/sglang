@@ -825,7 +825,7 @@ With both `--training-capture-config` and `--enable-metrics`, the existing
 No capture metrics or monitoring thread are created when either flag is absent.
 The producer inherits the scheduler's model/rank and configured extra labels.
 Request IDs, dataset contents, object keys, exception text and per-sample identity
-are never metric labels. Event/action/state/kind/metric labels have bounded value sets.
+are never metric labels. Event/action/state/kind/metric/stage labels have bounded value sets.
 
 | Suffix | Type / Extra Label | Meaning |
 | --- | --- | --- |
@@ -838,6 +838,10 @@ are never metric labels. Event/action/state/kind/metric labels have bounded valu
 | `occupied_fraction` | Gauge | Busy reservations plus quarantined slots divided by configured capacity |
 | `queue_depth` | Gauge | Work awaiting background processing |
 | `writer_age_seconds` | Gauge | Age of oldest queued, writing or pending-publication work |
+| `stage_calls_total` | Counter / `stage` | Completed background stage attempts, including failures/retries |
+| `stage_failures_total` | Counter / `stage` | Stage attempts that raised an exception |
+| `stage_seconds_total` | Counter / `stage` | Cumulative wall time of completed attempts |
+| `stage_max_seconds` | Gauge / `stage` | Lifetime maximum completed attempt, not a quantile |
 | `adaptive_enabled` | Gauge | Whether adaptive admission is configured |
 | `disabled` | Gauge | Capture disabled by a failure or shutdown, distinct from adaptive cooldown |
 | `cooldown_seconds` | Gauge | Remaining adaptive cooldown |
@@ -868,6 +872,28 @@ Catalog work; it is not RDMA latency. `host_slots{state="filling"}` includes
 spare leases, whereas `occupied_fraction` excludes them. Host bytes report
 allocated capacity, not payload transfer volume. These metrics also work with
 fixed sampling (`adaptive` absent).
+
+`stage_timings` in the existing producer status reports the same cumulative
+`calls`, `errors`, `seconds` and `max_seconds`, even when Prometheus is disabled.
+The fixed stages are `queue_wait`, `copy_wait`, `snapshot_build`, `validation`,
+`catalog_register`, `store_payload`, `catalog_written`, `journal_save`,
+`catalog_seal`, `store_manifest`, `catalog_publish`, `journal_complete` and
+`recovery_read`. State uses constant memory; no samples or request IDs are kept.
+Measurements run in background writers and add no CUDA events/synchronization.
+Pending operations appear in `writer_age_seconds`; their stage duration is
+recorded only when they finish or raise. A zero count means no completed attempt.
+
+These are host wall times including scheduling/GIL waits. `copy_wait` measures
+remaining completion wait, not total D2H time; `store_payload` includes adapter
+validation, existence checks and retry readback, not just wire transfer.
+Journal timing includes the existing durability operations. `catalog_written`
+counts both payload and manifest receipts, while recovery may repeat stages.
+Each distributed rank reports local work; peer wait/collectives and uninstrumented
+metadata work are not included. Do not add these values across ranks or include
+queue wait to estimate end-to-end latency or GPU cost. The benchmark reports
+per-phase count/time deltas excluding warmup, with lifetime maxima retained only
+in the raw status snapshots. The dashboard displays mean completed-attempt time
+and failure rate; full runtime dashboard acceptance remains a deployment gate.
 
 The [monitoring example](../../../../examples/monitoring/README.md) provisions
 a training-capture Grafana dashboard alongside serving metrics. Scheduler

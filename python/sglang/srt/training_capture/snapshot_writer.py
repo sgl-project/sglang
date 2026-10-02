@@ -27,6 +27,7 @@ from sglang.srt.training_capture.protocol import (
     validate_manifest,
     validate_tensors,
 )
+from sglang.srt.training_capture.timings import CaptureTimings
 
 
 class OwnerWriteReceipt(StrictStruct):
@@ -132,10 +133,13 @@ class SnapshotWriter:
         store: MooncakeSnapshotStore,
         catalog: Catalog,
         journal: PublicationJournal,
+        *,
+        timings: CaptureTimings | None = None,
     ):
         self.store = store
         self.catalog = catalog
         self.journal = journal
+        self.timings = timings if timings is not None else CaptureTimings()
 
     @staticmethod
     def _check_identity(manifest: Manifest, lease: CaptureLease):
@@ -187,13 +191,15 @@ class SnapshotWriter:
         lease: CaptureLease,
     ) -> dict:
         self._check_identity(manifest, lease)
-        validate_tensors(manifest, tensors)
+        self.timings.call("validation", validate_tensors, manifest, tensors)
         data = canonical_bytes(manifest)
         if len(data) > manifest_buffer.numel() or manifest_buffer.dtype != torch.uint8:
             raise ContractError("manifest exceeds reserved Host buffer")
         objects = [msgspec.to_builtins(obj) for obj in manifest.objects]
         descriptor = self._manifest_object(manifest, data)
-        self.catalog.objects(
+        self.timings.call(
+            "catalog_register",
+            self.catalog.objects,
             lease,
             {
                 "phase": "REGISTERED",
@@ -201,10 +207,14 @@ class SnapshotWriter:
                 "idempotency_key": f"register-{lease.capture_id}-{descriptor['sha256']}",
             },
         )
-        self.store.put_registered_batch(
-            [(obj.key, tensors[obj.key], obj.sha256) for obj in manifest.objects]
+        self.timings.call(
+            "store_payload",
+            self.store.put_registered_batch,
+            [(obj.key, tensors[obj.key], obj.sha256) for obj in manifest.objects],
         )
-        self.catalog.objects(
+        self.timings.call(
+            "catalog_written",
+            self.catalog.objects,
             lease,
             {
                 "phase": "WRITTEN",
@@ -213,8 +223,8 @@ class SnapshotWriter:
             },
         )
         # A lost seal response must also be recoverable from exact metadata bytes.
-        self.journal.save(lease, data)
-        self._seal(manifest, data, lease)
+        self.timings.call("journal_save", self.journal.save, lease, data)
+        self.timings.call("catalog_seal", self._seal, manifest, data, lease)
         return self._publish(manifest, data, manifest_buffer, lease)
 
     def write_partition(
@@ -235,12 +245,16 @@ class SnapshotWriter:
         self._check_identity(manifest, lease)
         if owner_id not in manifest.topology.owners:
             raise ContractError("unregistered tensor partition owner")
-        validate_tensors(manifest, tensors, owner_id=owner_id)
+        self.timings.call(
+            "validation", validate_tensors, manifest, tensors, owner_id=owner_id
+        )
         digest = digest_bytes(canonical_bytes(manifest))
         objects = [obj for obj in manifest.objects if obj.owner_id == owner_id]
         descriptors = [msgspec.to_builtins(obj) for obj in objects]
         operation = f"{lease.capture_id}-{owner_id}-{digest}"
-        self.catalog.objects(
+        self.timings.call(
+            "catalog_register",
+            self.catalog.objects,
             lease,
             {
                 "phase": "REGISTERED",
@@ -248,10 +262,14 @@ class SnapshotWriter:
                 "idempotency_key": f"register-partition-{operation}",
             },
         )
-        self.store.put_registered_batch(
-            [(obj.key, tensors[obj.key], obj.sha256) for obj in objects]
+        self.timings.call(
+            "store_payload",
+            self.store.put_registered_batch,
+            [(obj.key, tensors[obj.key], obj.sha256) for obj in objects],
         )
-        self.catalog.objects(
+        self.timings.call(
+            "catalog_written",
+            self.catalog.objects,
             lease,
             {
                 "phase": "WRITTEN",
@@ -280,13 +298,15 @@ class SnapshotWriter:
         The durable publication journal then uses the ordinary recovery path.
         """
         self._check_identity(manifest, lease)
-        validate_manifest(manifest)
+        self.timings.call("validation", validate_manifest, manifest)
         data = canonical_bytes(manifest)
         if len(data) > manifest_buffer.numel() or manifest_buffer.dtype != torch.uint8:
             raise ContractError("manifest exceeds reserved Host buffer")
         self._check_receipts(manifest, receipts, lease, data)
         descriptor = self._manifest_object(manifest, data)
-        self.catalog.objects(
+        self.timings.call(
+            "catalog_register",
+            self.catalog.objects,
             lease,
             {
                 "phase": "REGISTERED",
@@ -294,8 +314,8 @@ class SnapshotWriter:
                 "idempotency_key": f"register-manifest-{lease.capture_id}-{descriptor['sha256']}",
             },
         )
-        self.journal.save(lease, data)
-        self._seal(manifest, data, lease)
+        self.timings.call("journal_save", self.journal.save, lease, data)
+        self.timings.call("catalog_seal", self._seal, manifest, data, lease)
         return self._publish(manifest, data, manifest_buffer, lease)
 
     @staticmethod
@@ -343,8 +363,9 @@ class SnapshotWriter:
         validate_manifest(manifest)
         data = canonical_bytes(manifest)
         self._check_receipts(manifest, receipts, lease, data)
-        for obj in manifest.objects:
-            self.store.get_tensor(obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
+        with self.timings.measure("recovery_read"):
+            for obj in manifest.objects:
+                self.store.get_tensor(obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
         with self._recovery_buffer(data) as buffer:
             return self.publish_partitions(manifest, receipts, buffer, lease)
 
@@ -352,8 +373,16 @@ class SnapshotWriter:
         descriptor = self._manifest_object(manifest, data)
         view = manifest_buffer[: len(data)]
         view.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
-        self.store.put_registered(descriptor["key"], view, descriptor["sha256"])
-        self.catalog.objects(
+        self.timings.call(
+            "store_manifest",
+            self.store.put_registered,
+            descriptor["key"],
+            view,
+            descriptor["sha256"],
+        )
+        self.timings.call(
+            "catalog_written",
+            self.catalog.objects,
             lease,
             {
                 "phase": "WRITTEN",
@@ -372,14 +401,15 @@ class SnapshotWriter:
             "contract_id": manifest.contract_id,
             "idempotency_key": f"publish-{manifest.sample_id}-{manifest.generation_id}-{descriptor['sha256']}",
         }
-        receipt = self.catalog.publish(payload)
-        if (
-            receipt.get("state") != "AVAILABLE"
-            or not receipt.get("publication_id")
-            or "catalog_cursor" not in receipt
-        ):
-            raise CatalogConflict("Catalog publication receipt is incomplete")
-        self.journal.complete(lease.capture_id)
+        with self.timings.measure("catalog_publish"):
+            receipt = self.catalog.publish(payload)
+            if (
+                receipt.get("state") != "AVAILABLE"
+                or not receipt.get("publication_id")
+                or "catalog_cursor" not in receipt
+            ):
+                raise CatalogConflict("Catalog publication receipt is incomplete")
+        self.timings.call("journal_complete", self.journal.complete, lease.capture_id)
         return receipt
 
     def recover(self) -> list[dict]:
@@ -392,11 +422,14 @@ class SnapshotWriter:
         for lease, data in self.journal.pending():
             manifest = decode_manifest(data)
             self._check_identity(manifest, lease)
-            self._seal(manifest, data, lease)
+            self.timings.call("catalog_seal", self._seal, manifest, data, lease)
             # A journal survives producer/data-node loss. Confirm every immutable
             # object still exists before making the recovered reference visible.
-            for obj in manifest.objects:
-                self.store.get_tensor(obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
+            with self.timings.measure("recovery_read"):
+                for obj in manifest.objects:
+                    self.store.get_tensor(
+                        obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256
+                    )
             with self._recovery_buffer(data) as buffer:
                 receipts.append(self._publish(manifest, data, buffer, lease))
         return receipts

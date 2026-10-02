@@ -1,0 +1,1422 @@
+{
+  "schema_version": 1,
+  "experiment": "background_writer_stage_timings",
+  "date_utc": "2026-10-02",
+  "baseline_commit": "4673ddb2c7aced317caddf4012f9daa3535a170d",
+  "branch": "codex/dspark-maas-capture",
+  "runtime_lock": {
+    "path": "mooncake-study/experiments/h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84",
+    "versions": {
+      "torch": "2.13.0",
+      "transformers": "5.12.1",
+      "sglang-kernel": "0.4.6.post1",
+      "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+    }
+  },
+  "allocation": {
+    "job": "job-fe1ce1dcdea6-20261001023258",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "node": "node064",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "gpu_uuid": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "additional_gpus": 0,
+    "final_worker": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790946115.766101,
+      "idle_pid": 15396,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.20343399047851562
+    },
+    "final_gpu_observation": "NVIDIA H100 80GB HBM3, GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495, 1101 MiB, 59 %",
+    "final_process_observation": "PID 1 gpu_worker.py serve --duty-cycle 0.60; PID 15396 cuda_load.py --duty-cycle 0.6; both confirmed live via kubectl exec ps after all jobs."
+  },
+  "source": {
+    "before_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-before",
+    "initial_after_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v1",
+    "final_after_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v2",
+    "identical_benchmark_driver_sha256": "9e2e7df815f759c7805f669f3805b68ba96dfcf52026fb821c25650ee716c35d",
+    "initial_driver_sha256": "b00e2cf102bb5c9e94e2dd6d4aa093a51f4d30fe310ad64a1cd319ae346844e4",
+    "changed_producer_modules": [
+      {
+        "path": "python/sglang/srt/training_capture/cohort_coordinator.py",
+        "before_sha256": "c858b29968f2dda7e8ae5353324bae5bfa436f0ea216d10da58d040c33acfa45",
+        "after_sha256": "961190814973e95f106d493a5db10c8c4696d20381de5917e66372193544101e"
+      },
+      {
+        "path": "python/sglang/srt/training_capture/cohort_writer.py",
+        "before_sha256": "fd28ef6229fa89d447aaf53d6bbcf18789371d96ef5dd008c7375d7bbc967dca",
+        "after_sha256": "8f47827eb4e8ca2d3e4f68a91a21d56e13e84530952d5f3ea71843b7f3647d69"
+      },
+      {
+        "path": "python/sglang/srt/training_capture/coordinator.py",
+        "before_sha256": "69791a9fb0ff34342c1427268a26357719aa0380d5466ab3e282882e66018921",
+        "after_sha256": "5902f73185a1f8365b0458bd12b5b6bd1c68b15eb7a10d0eb3c801456319fb46"
+      },
+      {
+        "path": "python/sglang/srt/training_capture/metrics.py",
+        "before_sha256": "17703ff9d2c19b63c7d7d8e83ea3642264ddda6a6f258fc2634117cecf67241f",
+        "after_sha256": "a99419f6013159c0e533b950280d49ed6e5cf4882924197eb485585223f34d98"
+      },
+      {
+        "path": "python/sglang/srt/training_capture/snapshot_writer.py",
+        "before_sha256": "deedaf27ce462cd873d34855b2457c173f8fa0a355895aa2c0d0410be8e48ba4",
+        "after_sha256": "766b9b2b242e71b167a5bf19086f78fd7ce5966aac76dcf8ae200fdf879b280e"
+      },
+      {
+        "path": "python/sglang/srt/training_capture/timings.py",
+        "before_sha256": null,
+        "after_sha256": "9bea8c331ae56ed343f85d79451dfe22b512beef7f339167f00cc8e3da8c9278"
+      }
+    ],
+    "final_file_sha256": {
+      "python/sglang/srt/training_capture/timings.py": "9bea8c331ae56ed343f85d79451dfe22b512beef7f339167f00cc8e3da8c9278",
+      "python/sglang/srt/training_capture/snapshot_writer.py": "766b9b2b242e71b167a5bf19086f78fd7ce5966aac76dcf8ae200fdf879b280e",
+      "python/sglang/srt/training_capture/coordinator.py": "5902f73185a1f8365b0458bd12b5b6bd1c68b15eb7a10d0eb3c801456319fb46",
+      "python/sglang/srt/training_capture/cohort_writer.py": "8f47827eb4e8ca2d3e4f68a91a21d56e13e84530952d5f3ea71843b7f3647d69",
+      "python/sglang/srt/training_capture/cohort_coordinator.py": "961190814973e95f106d493a5db10c8c4696d20381de5917e66372193544101e",
+      "python/sglang/srt/training_capture/metrics.py": "a99419f6013159c0e533b950280d49ed6e5cf4882924197eb485585223f34d98",
+      "mooncake-study/experiments/benchmark_training_capture.py": "9e2e7df815f759c7805f669f3805b68ba96dfcf52026fb821c25650ee716c35d",
+      "test/registered/unit/training_capture/test_metrics.py": "6e0db0dfe1a879061cbb1d17263549b7e0d83166a5e87459b4e5ab7c4a0c958e",
+      "test/registered/unit/training_capture/test_snapshot_writer.py": "306648da9ac7ecd5e5ef124232894ba1fcd7dfa0a9831e8332db8c6d1282b818",
+      "test/registered/unit/training_capture/test_cohort_writer.py": "ee469929a14e3253e5efe0e9ab948118c94503e369607813f165f2302e27401d",
+      "test/registered/unit/training_capture/test_coordinator.py": "d952cbea226fbf3b44bc661b64707056634d49dcd63aa04eabba0b20d9c9ad6a",
+      "test/registered/unit/training_capture/test_cohort_coordinator.py": "9d294df8347a01a68e0da291ddae92639661f12dfcdcd2aef64cb142f3934ba4",
+      "test/registered/storage/test_training_snapshot_mooncake.py": "3de3e80d9320c3100204aca384d45c8c6aa4b2df40715938b95b422553cb43c5",
+      "test/registered/storage/test_training_capture_runtime.py": "d61586428b26bc49c16b64e29b4e7f05a83379fc2219c625c9bfa947e0f79ddd",
+      "examples/monitoring/grafana/dashboards/json/training-capture-dashboard.json": "273e6c8cc37c15ffc1b69e015ad3900a098e3ab2dd85b29b8de3f5dae8aaa414"
+    },
+    "freeze_validation": "All 15 listed final executable/dashboard files match the final frozen tree. The initial frozen tree differs only in the benchmark driver, before endpoint verification was added. Unit/Store jobs did not use that driver. Baseline has only the new benchmark driver over the baseline producer. Frozen sources were not overwritten while jobs used them; documentation was added later."
+  },
+  "measurement_contract": {
+    "status_field": "stage_timings",
+    "fields": [
+      "calls",
+      "errors",
+      "seconds",
+      "max_seconds"
+    ],
+    "known_stages": 13,
+    "clock": "Host perf_counter wall time, including scheduling/GIL waits.",
+    "completion": "Attempts recorded only at return/exception. Retries count again; lifetime maximum is not a quantile. Queue wait can overlap other work.",
+    "prometheus_families": [
+      "sglang:training_capture_stage_calls_total",
+      "sglang:training_capture_stage_failures_total",
+      "sglang:training_capture_stage_seconds_total",
+      "sglang:training_capture_stage_max_seconds"
+    ],
+    "endpoint_verification": "All four fields across all 13 stages match the actual multiprocess endpoint in all three instrumented capture-on phases, outside client timing.",
+    "normal_workload_count_checks": "Each instrumented phase has one completed attempt per published sample for normal stages, twice that for catalog_written and zero for recovery_read. All measured stage errors are zero.",
+    "excluded_costs": [
+      "GPU top-k/LSE kernel time",
+      "total D2H duration or bandwidth",
+      "isolated RDMA/wire time",
+      "inference interference attribution",
+      "reservation/renew RPCs",
+      "distributed peer/collective waits",
+      "some metadata work"
+    ]
+  },
+  "scope": {
+    "benchmark": {
+      "transport": "local TCP",
+      "catalog": "HTTP test double",
+      "adaptive": false,
+      "overlap": true,
+      "decode_cuda_graphs": true,
+      "prefill_cuda_graphs": false,
+      "client": "existing sglang.benchmark.serving, streaming native /generate",
+      "workload": "seeded fixed-length random-ids, closed-loop concurrency, not production traffic",
+      "timing": "Client timing excludes warmup, server launch, readback and post-response writer drain",
+      "payload_bytes": "Validated manifest tensor sizes; not D2H or wire byte counters",
+      "gpu_capture_kernel_time": null,
+      "d2h_bytes": null,
+      "rdma_bytes": null,
+      "production_slo_pass": null
+    },
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "dtype": "bfloat16",
+    "target_attention": "triton",
+    "topology": {
+      "tp": 1,
+      "pp": 1
+    },
+    "selected_layers": [
+      0,
+      14,
+      27
+    ],
+    "correctness": "Actual inference regressions compare captured KV/teacher values with online observations. Benchmark snapshots validate metadata, content and digests after producer exit.",
+    "excluded": [
+      "serving SLO acceptance",
+      "causal attribution of observed short-request p99 increase",
+      "live Grafana rendering/acceptance",
+      "RDMA timings",
+      "distributed serving performance",
+      "production Catalog retention",
+      "trained draft quality"
+    ]
+  },
+  "benchmarks": {
+    "before": {
+      "report": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-before/report.json",
+      "report_sha256": "1c08304915fd406996ed2f1dacb20eccc301ed0380df8231f3a1982b1bc6bbfd",
+      "status": "completed",
+      "declared_source_revision": "4673ddb2c7aced317caddf4012f9daa3535a170d",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "4673ddb2c7aced317caddf4012f9daa3535a170d",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-before",
+        "num_prompts": 512,
+        "input_len": 16,
+        "output_len": 2,
+        "concurrency": 4,
+        "ratios": [
+          1
+        ],
+        "repeats": 2,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 4,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600
+      },
+      "rounds": [
+        {
+          "repetition": 0,
+          "before_off": {
+            "completed": 512,
+            "duration": 5.736358776688576,
+            "request_throughput": 89.25522616902319,
+            "output_throughput": 178.51045233804638,
+            "median_ttft_ms": 37.04154118895531,
+            "p95_ttft_ms": 38.4779691696167,
+            "p99_ttft_ms": 58.22811640799045,
+            "median_tpot_ms": 2.711322158575058,
+            "p95_tpot_ms": 5.259227007627487,
+            "p99_tpot_ms": 39.81249772012234
+          },
+          "after_off": {
+            "completed": 512,
+            "duration": 5.3368659391999245,
+            "request_throughput": 95.93645518417433,
+            "output_throughput": 191.87291036834867,
+            "median_ttft_ms": 36.7280226200819,
+            "p95_ttft_ms": 43.60197577625513,
+            "p99_ttft_ms": 44.933927319943905,
+            "median_tpot_ms": 2.730671316385269,
+            "p95_tpot_ms": 5.47778494656086,
+            "p99_tpot_ms": 39.57464341074228
+          },
+          "capture_on": [
+            {
+              "selected_requests": 512,
+              "counters": {
+                "considered": 512,
+                "excluded_health_check": 0,
+                "admitted": 295,
+                "overlap_forwards": 430,
+                "eager_forwards": 194,
+                "cuda_graph_forwards": 236,
+                "sealed": 295,
+                "writer_started": 295,
+                "copies_completed": 295,
+                "snapshot_built": 295,
+                "admission_backpressure": 217,
+                "ready": 295
+              },
+              "stage_delta": {},
+              "metrics": {
+                "verified": false,
+                "reason": "stage timings unavailable"
+              },
+              "serving": {
+                "completed": 512,
+                "duration": 7.328090988099575,
+                "request_throughput": 69.8681281156935,
+                "output_throughput": 139.736256231387,
+                "median_ttft_ms": 51.7745278775692,
+                "p95_ttft_ms": 59.44388397037983,
+                "p99_ttft_ms": 62.626621648669236,
+                "median_tpot_ms": 4.075348377227783,
+                "p95_tpot_ms": 9.06018279492855,
+                "p99_tpot_ms": 59.607738815247956
+              },
+              "readback": {
+                "validated_samples": 295,
+                "manifest_bytes": 2537000,
+                "payload_bytes": 65932500,
+                "aux_payload_bytes": 683220,
+                "payload_objects": 4130,
+                "kv_payload_bytes": 65249280
+              },
+              "post_client_drain_seconds": 0.00800739973783493,
+              "throughput_over_bracketing_off": 0.7545493145822357,
+              "disabled_reason": null,
+              "host_pool": {
+                "allocated_bytes": 5155584,
+                "device_allocated_bytes": 0,
+                "device_limit_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              }
+            }
+          ]
+        },
+        {
+          "repetition": 1,
+          "before_off": {
+            "completed": 512,
+            "duration": 5.347188502550125,
+            "request_throughput": 95.75125315964124,
+            "output_throughput": 191.50250631928247,
+            "median_ttft_ms": 37.3128317296505,
+            "p95_ttft_ms": 39.714353531599045,
+            "p99_ttft_ms": 42.99748532474041,
+            "median_tpot_ms": 3.0644256621599197,
+            "p95_tpot_ms": 5.8713192120194435,
+            "p99_tpot_ms": 41.57261364161968
+          },
+          "after_off": {
+            "completed": 512,
+            "duration": 5.153155121952295,
+            "request_throughput": 99.35660539673927,
+            "output_throughput": 198.71321079347854,
+            "median_ttft_ms": 36.48027218878269,
+            "p95_ttft_ms": 37.41092886775732,
+            "p99_ttft_ms": 39.37513131648302,
+            "median_tpot_ms": 2.7008652687072754,
+            "p95_tpot_ms": 5.265477113425731,
+            "p99_tpot_ms": 39.34193465858698
+          },
+          "capture_on": [
+            {
+              "selected_requests": 512,
+              "counters": {
+                "considered": 512,
+                "excluded_health_check": 0,
+                "admitted": 320,
+                "overlap_forwards": 489,
+                "eager_forwards": 233,
+                "cuda_graph_forwards": 256,
+                "sealed": 320,
+                "writer_started": 320,
+                "copies_completed": 320,
+                "snapshot_built": 320,
+                "admission_backpressure": 192,
+                "ready": 320
+              },
+              "stage_delta": {},
+              "metrics": {
+                "verified": false,
+                "reason": "stage timings unavailable"
+              },
+              "serving": {
+                "completed": 512,
+                "duration": 7.46518449485302,
+                "request_throughput": 68.58504305593597,
+                "output_throughput": 137.17008611187194,
+                "median_ttft_ms": 51.90056376159191,
+                "p95_ttft_ms": 58.61892085522413,
+                "p99_ttft_ms": 67.33762986958021,
+                "median_tpot_ms": 3.841908648610115,
+                "p95_tpot_ms": 8.943247236311436,
+                "p99_tpot_ms": 59.19379219412802
+              },
+              "readback": {
+                "validated_samples": 320,
+                "manifest_bytes": 2752000,
+                "payload_bytes": 71520000,
+                "aux_payload_bytes": 741120,
+                "payload_objects": 4480,
+                "kv_payload_bytes": 70778880
+              },
+              "post_client_drain_seconds": 0.008110187947750092,
+              "throughput_over_bracketing_off": 0.7030474688554575,
+              "disabled_reason": null,
+              "host_pool": {
+                "allocated_bytes": 5155584,
+                "device_allocated_bytes": 0,
+                "device_limit_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "after": {
+      "report": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-after/report.json",
+      "report_sha256": "2fe7c5f3a5d7c2b138911a1058b1033b1522866c90438ab7b925b04ca1275f68",
+      "status": "completed",
+      "declared_source_revision": "4673ddb2c7aced317caddf4012f9daa3535a170d+stage-timings",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "4673ddb2c7aced317caddf4012f9daa3535a170d+stage-timings",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-after",
+        "num_prompts": 512,
+        "input_len": 16,
+        "output_len": 2,
+        "concurrency": 4,
+        "ratios": [
+          1
+        ],
+        "repeats": 2,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 4,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600
+      },
+      "rounds": [
+        {
+          "repetition": 0,
+          "before_off": {
+            "completed": 512,
+            "duration": 5.683685515075922,
+            "request_throughput": 90.08239436223641,
+            "output_throughput": 180.16478872447283,
+            "median_ttft_ms": 36.468833684921265,
+            "p95_ttft_ms": 38.22873141616583,
+            "p99_ttft_ms": 56.34437028318643,
+            "median_tpot_ms": 2.7075204998254776,
+            "p95_tpot_ms": 5.212441086769104,
+            "p99_tpot_ms": 39.394323602318764
+          },
+          "after_off": {
+            "completed": 512,
+            "duration": 5.24390671402216,
+            "request_throughput": 97.6371297054001,
+            "output_throughput": 195.2742594108002,
+            "median_ttft_ms": 37.13619522750378,
+            "p95_ttft_ms": 38.16262502223253,
+            "p99_ttft_ms": 40.11941187083721,
+            "median_tpot_ms": 2.7333255857229233,
+            "p95_tpot_ms": 5.390980094671249,
+            "p99_tpot_ms": 40.1762780547142
+          },
+          "capture_on": [
+            {
+              "selected_requests": 512,
+              "counters": {
+                "considered": 512,
+                "excluded_health_check": 0,
+                "admitted": 295,
+                "overlap_forwards": 438,
+                "eager_forwards": 202,
+                "cuda_graph_forwards": 236,
+                "sealed": 295,
+                "writer_started": 295,
+                "copies_completed": 295,
+                "snapshot_built": 295,
+                "admission_backpressure": 217,
+                "ready": 295
+              },
+              "stage_delta": {
+                "queue_wait": {
+                  "calls": 295,
+                  "errors": 0,
+                  "seconds": 6.721657995134592
+                },
+                "copy_wait": {
+                  "calls": 295,
+                  "errors": 0,
+                  "seconds": 0.03032980114221573
+                },
+                "snapshot_build": {
+                  "calls": 295,
+                  "errors": 0,
+                  "seconds": 1.3159903474152088
+                },
+                "validation": {
+                  "calls": 295,
+                  "errors": 0,
+                  "seconds": 0.6819884814321995
+                },
+                "catalog_register": {
+                  "calls": 295,
+                  "errors": 0,
+                  "seconds": 0.294600535184145
+                },
+                "store_payload": {
+                  "calls": 295,
+                  "errors": 0,
+                  "seconds": 0.4300985746085644
+                },
+                "catalog_written": {
+                  "calls": 590,
+                  "errors": 0,
+                  "seconds": 0.3887937180697918
+                },
+                "journal_save": {
+                  "calls": 295,
+                  "errors": 0,
+                  "seconds": 0.9476502276957035
+                },
+                "catalog_seal": {
+                  "calls": 295,
+                  "errors": 0,
+                  "seconds": 0.7585802972316742
+                },
+                "store_manifest": {
+                  "calls": 295,
+                  "errors": 0,
+                  "seconds": 0.10272769629955292
+                },
+                "catalog_publish": {
+                  "calls": 295,
+                  "errors": 0,
+                  "seconds": 0.15744679048657417
+                },
+                "journal_complete": {
+                  "calls": 295,
+                  "errors": 0,
+                  "seconds": 0.2916201315820217
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0
+                }
+              },
+              "metrics": {
+                "verified": true,
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-after/round-0-phase-1-1.0/metrics.prom",
+                "sha256": "6d09d9f0b8b5a924a588d029e8d823cda2b4b5669daf4e8a454d5bfca01ee6ef",
+                "compared_fields": [
+                  "calls",
+                  "errors",
+                  "seconds",
+                  "max_seconds"
+                ],
+                "known_stages": 13
+              },
+              "serving": {
+                "completed": 512,
+                "duration": 7.659291155636311,
+                "request_throughput": 66.84691697915544,
+                "output_throughput": 133.69383395831088,
+                "median_ttft_ms": 53.944181650877,
+                "p95_ttft_ms": 62.06658948212862,
+                "p99_ttft_ms": 118.6448485776782,
+                "median_tpot_ms": 4.265947267413139,
+                "p95_tpot_ms": 9.447187557816504,
+                "p99_tpot_ms": 58.111192882061
+              },
+              "readback": {
+                "validated_samples": 295,
+                "manifest_bytes": 2541130,
+                "payload_bytes": 65932500,
+                "aux_payload_bytes": 683220,
+                "payload_objects": 4130,
+                "kv_payload_bytes": 65249280
+              },
+              "post_client_drain_seconds": 0.00848296657204628,
+              "throughput_over_bracketing_off": 0.7121999409616027,
+              "disabled_reason": null,
+              "host_pool": {
+                "allocated_bytes": 5155584,
+                "device_allocated_bytes": 0,
+                "device_limit_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              }
+            }
+          ]
+        },
+        {
+          "repetition": 1,
+          "before_off": {
+            "completed": 512,
+            "duration": 5.285752139985561,
+            "request_throughput": 96.86417116058692,
+            "output_throughput": 193.72834232117384,
+            "median_ttft_ms": 37.55590692162514,
+            "p95_ttft_ms": 38.275510631501675,
+            "p99_ttft_ms": 42.568129375576945,
+            "median_tpot_ms": 2.716291695833206,
+            "p95_tpot_ms": 5.359731428325176,
+            "p99_tpot_ms": 40.41675738990307
+          },
+          "after_off": {
+            "completed": 512,
+            "duration": 5.244474157691002,
+            "request_throughput": 97.62656552500195,
+            "output_throughput": 195.2531310500039,
+            "median_ttft_ms": 37.16788813471794,
+            "p95_ttft_ms": 38.116756454110146,
+            "p99_ttft_ms": 41.889830604195595,
+            "median_tpot_ms": 2.751896157860756,
+            "p95_tpot_ms": 5.409596860408783,
+            "p99_tpot_ms": 40.11154491454363
+          },
+          "capture_on": [
+            {
+              "selected_requests": 512,
+              "counters": {
+                "considered": 512,
+                "excluded_health_check": 0,
+                "admitted": 324,
+                "overlap_forwards": 454,
+                "eager_forwards": 198,
+                "cuda_graph_forwards": 256,
+                "sealed": 324,
+                "writer_started": 324,
+                "copies_completed": 324,
+                "snapshot_built": 324,
+                "admission_backpressure": 188,
+                "ready": 324
+              },
+              "stage_delta": {
+                "queue_wait": {
+                  "calls": 324,
+                  "errors": 0,
+                  "seconds": 6.569043353199959
+                },
+                "copy_wait": {
+                  "calls": 324,
+                  "errors": 0,
+                  "seconds": 0.02786201611161232
+                },
+                "snapshot_build": {
+                  "calls": 324,
+                  "errors": 0,
+                  "seconds": 1.40763433650136
+                },
+                "validation": {
+                  "calls": 324,
+                  "errors": 0,
+                  "seconds": 0.7386889420449734
+                },
+                "catalog_register": {
+                  "calls": 324,
+                  "errors": 0,
+                  "seconds": 0.2516958974301815
+                },
+                "store_payload": {
+                  "calls": 324,
+                  "errors": 0,
+                  "seconds": 0.4772483855485916
+                },
+                "catalog_written": {
+                  "calls": 648,
+                  "errors": 0,
+                  "seconds": 0.42879851534962654
+                },
+                "journal_save": {
+                  "calls": 324,
+                  "errors": 0,
+                  "seconds": 0.9536248259246349
+                },
+                "catalog_seal": {
+                  "calls": 324,
+                  "errors": 0,
+                  "seconds": 0.40507590398192406
+                },
+                "store_manifest": {
+                  "calls": 324,
+                  "errors": 0,
+                  "seconds": 0.11115116253495216
+                },
+                "catalog_publish": {
+                  "calls": 324,
+                  "errors": 0,
+                  "seconds": 0.17751038447022438
+                },
+                "journal_complete": {
+                  "calls": 324,
+                  "errors": 0,
+                  "seconds": 0.3192126452922821
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0
+                }
+              },
+              "metrics": {
+                "verified": true,
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-after/round-1-phase-1-1.0/metrics.prom",
+                "sha256": "30bd6c7aa22d2f52fc02eaae1928a85aa07ab046383bd46a1fe2fd8e5aa545d6",
+                "compared_fields": [
+                  "calls",
+                  "errors",
+                  "seconds",
+                  "max_seconds"
+                ],
+                "known_stages": 13
+              },
+              "serving": {
+                "completed": 512,
+                "duration": 7.761108316481113,
+                "request_throughput": 65.96995933077517,
+                "output_throughput": 131.93991866155034,
+                "median_ttft_ms": 53.42998541891575,
+                "p95_ttft_ms": 65.08104037493466,
+                "p99_ttft_ms": 126.67954724282026,
+                "median_tpot_ms": 4.258699715137482,
+                "p95_tpot_ms": 9.342052601277828,
+                "p99_tpot_ms": 63.17983515560627
+              },
+              "readback": {
+                "validated_samples": 324,
+                "manifest_bytes": 2790936,
+                "payload_bytes": 72414000,
+                "aux_payload_bytes": 750384,
+                "payload_objects": 4536,
+                "kv_payload_bytes": 71663616
+              },
+              "post_client_drain_seconds": 0.008239544928073883,
+              "throughput_over_bracketing_off": 0.6783866466341923,
+              "disabled_reason": null,
+              "host_pool": {
+                "allocated_bytes": 5155584,
+                "device_allocated_bytes": 0,
+                "device_limit_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "longer": {
+      "report": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-longer/report.json",
+      "report_sha256": "37f7f493f4b6cb2d14c278a9fc700d92d72c3e6218baf36266c357754766eaac",
+      "status": "completed",
+      "declared_source_revision": "4673ddb2c7aced317caddf4012f9daa3535a170d+stage-timings",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "4673ddb2c7aced317caddf4012f9daa3535a170d+stage-timings",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-longer",
+        "num_prompts": 64,
+        "input_len": 512,
+        "output_len": 128,
+        "concurrency": 4,
+        "ratios": [
+          1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 4,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600
+      },
+      "rounds": [
+        {
+          "repetition": 0,
+          "before_off": {
+            "completed": 64,
+            "duration": 8.895888794213533,
+            "request_throughput": 7.1943345381778805,
+            "output_throughput": 920.8748208867687,
+            "median_ttft_ms": 198.21122288703918,
+            "p95_ttft_ms": 496.0697341710329,
+            "p99_ttft_ms": 618.8448378816247,
+            "median_tpot_ms": 2.0594206000641573,
+            "p95_tpot_ms": 3.2336122187690473,
+            "p99_tpot_ms": 6.460395836689341
+          },
+          "after_off": {
+            "completed": 64,
+            "duration": 9.107211664319038,
+            "request_throughput": 7.02739788630853,
+            "output_throughput": 899.5069294474919,
+            "median_ttft_ms": 207.2532121092081,
+            "p95_ttft_ms": 512.1326938271523,
+            "p99_ttft_ms": 634.1928339004517,
+            "median_tpot_ms": 2.078118125402083,
+            "p95_tpot_ms": 3.3224437561795463,
+            "p99_tpot_ms": 6.586185196546588
+          },
+          "capture_on": [
+            {
+              "selected_requests": 64,
+              "counters": {
+                "considered": 64,
+                "excluded_health_check": 0,
+                "admitted": 52,
+                "overlap_forwards": 3024,
+                "eager_forwards": 208,
+                "cuda_graph_forwards": 2816,
+                "sealed": 52,
+                "writer_started": 52,
+                "copies_completed": 52,
+                "snapshot_built": 52,
+                "ready": 52,
+                "admission_backpressure": 12
+              },
+              "stage_delta": {
+                "queue_wait": {
+                  "calls": 52,
+                  "errors": 0,
+                  "seconds": 4.499934762716293
+                },
+                "copy_wait": {
+                  "calls": 52,
+                  "errors": 0,
+                  "seconds": 0.013506874442100525
+                },
+                "snapshot_build": {
+                  "calls": 52,
+                  "errors": 0,
+                  "seconds": 1.9414148144423962
+                },
+                "validation": {
+                  "calls": 52,
+                  "errors": 0,
+                  "seconds": 1.3971100524067879
+                },
+                "catalog_register": {
+                  "calls": 52,
+                  "errors": 0,
+                  "seconds": 0.13810379430651665
+                },
+                "store_payload": {
+                  "calls": 52,
+                  "errors": 0,
+                  "seconds": 0.6507147774100304
+                },
+                "catalog_written": {
+                  "calls": 104,
+                  "errors": 0,
+                  "seconds": 0.13887441530823708
+                },
+                "journal_save": {
+                  "calls": 52,
+                  "errors": 0,
+                  "seconds": 0.1939140483736992
+                },
+                "catalog_seal": {
+                  "calls": 52,
+                  "errors": 0,
+                  "seconds": 0.4408777840435505
+                },
+                "store_manifest": {
+                  "calls": 52,
+                  "errors": 0,
+                  "seconds": 0.020414426922798157
+                },
+                "catalog_publish": {
+                  "calls": 52,
+                  "errors": 0,
+                  "seconds": 0.03255057334899902
+                },
+                "journal_complete": {
+                  "calls": 52,
+                  "errors": 0,
+                  "seconds": 0.05593850463628769
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0
+                }
+              },
+              "metrics": {
+                "verified": true,
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-longer/round-0-phase-1-1.0/metrics.prom",
+                "sha256": "9e774c3483a558d0e21d6a7c3436298356ead2484b905348a7dcf399f4f49df9",
+                "compared_fields": [
+                  "calls",
+                  "errors",
+                  "seconds",
+                  "max_seconds"
+                ],
+                "known_stages": 13
+              },
+              "serving": {
+                "completed": 64,
+                "duration": 15.187491174787283,
+                "request_throughput": 4.213994218231793,
+                "output_throughput": 539.3912599336695,
+                "median_ttft_ms": 243.07453073561192,
+                "p95_ttft_ms": 817.0830791816115,
+                "p99_ttft_ms": 984.5712516084312,
+                "median_tpot_ms": 4.062578698077539,
+                "p95_tpot_ms": 5.547845922410488,
+                "p99_tpot_ms": 11.110755790934318
+              },
+              "readback": {
+                "validated_samples": 52,
+                "manifest_bytes": 1748656,
+                "payload_bytes": 416279552,
+                "aux_payload_bytes": 7334912,
+                "payload_objects": 3536,
+                "kv_payload_bytes": 408944640
+              },
+              "post_client_drain_seconds": 0.008330188691616058,
+              "throughput_over_bracketing_off": 0.5926133458925589,
+              "disabled_reason": null,
+              "host_pool": {
+                "allocated_bytes": 38329344,
+                "device_allocated_bytes": 0,
+                "device_limit_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "summary": {
+    "validated_snapshots": 1286,
+    "timed_source_validated_snapshots": 671,
+    "baseline": {
+      "samples": 615,
+      "client_seconds": 14.793275482952595,
+      "requests_per_second": 69.22064022805715,
+      "samples_per_second": 41.57294310571792,
+      "stage_ms_per_sample": {}
+    },
+    "timed": {
+      "samples": 619,
+      "client_seconds": 15.420399472117424,
+      "requests_per_second": 66.40554298554702,
+      "samples_per_second": 40.14163194145859,
+      "stage_ms_per_sample": {
+        "queue_wait": 21.47124612008813,
+        "copy_wait": 0.09400939782524725,
+        "snapshot_build": 4.400039877086541,
+        "validation": 2.295117000770877,
+        "catalog_register": 0.8825467408955194,
+        "store_payload": 1.4658270761828045,
+        "catalog_written": 1.3208275176404172,
+        "journal_save": 3.0715267425207404,
+        "catalog_seal": 1.8798969324936967,
+        "store_manifest": 0.3455231968247255,
+        "catalog_publish": 0.5411262923373159,
+        "journal_complete": 0.9868057784722194,
+        "recovery_read": 0
+      }
+    },
+    "request_throughput_ratio": 0.9593315341603978,
+    "sample_throughput_ratio": 0.9655710888541238,
+    "short_groups": {
+      "milliseconds_per_sample": {
+        "snapshot_build_and_validation": 6.695156877857418,
+        "catalog": 4.62439748336695,
+        "journal": 4.05833252099296,
+        "store": 1.81135027300753,
+        "copy_wait": 0.09400939782524725
+      },
+      "covered_execution_ms_per_sample": 17.283246553050105,
+      "share": {
+        "snapshot_build_and_validation": 0.3873784278495913,
+        "catalog": 0.2675653251356787,
+        "journal": 0.23481308957412028,
+        "store": 0.10480382070855011,
+        "copy_wait": 0.005439336732059563
+      }
+    },
+    "longer": {
+      "samples": 52,
+      "client_seconds": 15.187491174787283,
+      "requests_per_second": 4.213994218231793,
+      "samples_per_second": 3.423870302313332,
+      "throughput_over_off": 0.5926133458925589,
+      "stage_ms_per_sample": {
+        "queue_wait": 86.53720697531334,
+        "copy_wait": 0.2597475854250101,
+        "snapshot_build": 37.334900277738384,
+        "validation": 26.867501007822845,
+        "catalog_register": 2.6558421982022433,
+        "store_payload": 12.51374571942366,
+        "catalog_written": 2.670661832850713,
+        "journal_save": 3.7291163148788304,
+        "catalog_seal": 8.478418923914433,
+        "store_manifest": 0.3925851331307338,
+        "catalog_publish": 0.6259725644038274,
+        "journal_complete": 1.0757404737747633,
+        "recovery_read": 0
+      },
+      "group_ms_per_sample": {
+        "snapshot_build_and_validation": 64.20240128556122,
+        "catalog": 14.430895519371216,
+        "journal": 4.804856788653594,
+        "store": 12.906330852554394,
+        "copy_wait": 0.2597475854250101
+      },
+      "covered_execution_ms_per_sample": 96.60423203156543,
+      "group_share": {
+        "snapshot_build_and_validation": 0.6645920156436117,
+        "catalog": 0.14938160798851877,
+        "journal": 0.04973753931487812,
+        "store": 0.1336000564482232,
+        "copy_wait": 0.0026887806047683044
+      },
+      "serving": {
+        "completed": 64,
+        "duration": 15.187491174787283,
+        "request_throughput": 4.213994218231793,
+        "output_throughput": 539.3912599336695,
+        "median_ttft_ms": 243.07453073561192,
+        "p95_ttft_ms": 817.0830791816115,
+        "p99_ttft_ms": 984.5712516084312,
+        "median_tpot_ms": 4.062578698077539,
+        "p95_tpot_ms": 5.547845922410488,
+        "p99_tpot_ms": 11.110755790934318
+      },
+      "readback": {
+        "validated_samples": 52,
+        "manifest_bytes": 1748656,
+        "payload_bytes": 416279552,
+        "aux_payload_bytes": 7334912,
+        "payload_objects": 3536,
+        "kv_payload_bytes": 408944640
+      },
+      "host_pool": {
+        "allocated_bytes": 38329344,
+        "device_allocated_bytes": 0,
+        "device_limit_bytes": 0,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      },
+      "metrics_verified": true
+    },
+    "performance_conclusion": "Short-request timed throughput is 4.07% lower, and p99 TTFT rises from 62.63/67.34 ms to 118.64/126.68 ms. Two short sequential repetitions cannot isolate instrumentation versus order/system effects. Negligible overhead and serving SLO acceptance are not established. Longer diagnostic lacks a baseline producer comparison.",
+    "optimization_evidence": "Construction/validation contributes 38.74% of measured short-request execution and 66.46% for longer sequences. These host measurements motivate profiling that work but do not predict an end-to-end speedup."
+  },
+  "verification": {
+    "distinct_passing_test_methods": 87,
+    "submitted_jobs": 8,
+    "successful_jobs": 8,
+    "failed_attempts": 0,
+    "black": "All 10 edited/new Python files pass.",
+    "ruff_imports_and_undefined_names": "All 10 edited/new Python files pass I/F.",
+    "full_ruff_baseline": [
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 432,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 473,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 578,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 671,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 686,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 917,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 960,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 1006,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 1082,
+        "message": "Do not catch blind exception: `Exception`"
+      }
+    ],
+    "full_ruff_final": [
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 433,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 474,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 579,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 672,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 687,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 918,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 961,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 1007,
+        "message": "Do not catch blind exception: `Exception`"
+      },
+      {
+        "file": "python/sglang/srt/training_capture/coordinator.py",
+        "code": "BLE001",
+        "line": 1090,
+        "message": "Do not catch blind exception: `Exception`"
+      }
+    ],
+    "dashboard": "JSON parses; all 13 panel IDs unique. No live Grafana rendering claimed.",
+    "diff_check": "Passed",
+    "outer_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "jobs": [
+    {
+      "job_id": "01790944299544410488-7daeaa9f798b",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790944312.7472756,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790944299544410488-7daeaa9f798b.log",
+      "purpose": "metrics",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v1",
+      "timeout_seconds": 600,
+      "python_argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/unit/training_capture/test_metrics.py",
+        "-f"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "CUDA_VISIBLE_DEVICES": "999"
+      },
+      "tests_run": 8,
+      "unittest_seconds": 0.034,
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790944299544410488-7daeaa9f798b.json",
+      "result_sha256": "063300c9cae4e7cd75aa82a62d789922c7d213b8a063e0901651f879b3d67c4a",
+      "log_sha256": "3066120556060046a18c6017075a88af552d041258acc915db122eaf32296792"
+    },
+    {
+      "job_id": "01790944299871611741-78c066567902",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790944329.0392852,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790944299871611741-78c066567902.log",
+      "purpose": "writers",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v1",
+      "timeout_seconds": 600,
+      "python_argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "test/registered/unit/training_capture",
+        "-p",
+        "test_*writer.py",
+        "-f"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "CUDA_VISIBLE_DEVICES": "999"
+      },
+      "tests_run": 23,
+      "unittest_seconds": 5.711,
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790944299871611741-78c066567902.json",
+      "result_sha256": "9a5f04545e237e5f165dff6b3d7ef6c2c1a4b3e7224c57e01602072355427e6b",
+      "log_sha256": "ab13b2e832e54fe674b6de399c5acbef5569f4664b276c8e6a91ed11e5db1acb"
+    },
+    {
+      "job_id": "01790944300246853476-25bd73da3706",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790944376.652485,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790944300246853476-25bd73da3706.log",
+      "purpose": "coordinators",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v1",
+      "timeout_seconds": 600,
+      "python_argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "test/registered/unit/training_capture",
+        "-p",
+        "test_*coordinator.py",
+        "-f"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "CUDA_VISIBLE_DEVICES": "999"
+      },
+      "tests_run": 49,
+      "unittest_seconds": 37.008,
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790944300246853476-25bd73da3706.json",
+      "result_sha256": "8139fe0021ef11705138d17ce40c7021c34b74ddd3b1fa66653e9e6f3e90c15f",
+      "log_sha256": "0e1fddf0575852777a08f87b934f0d0558205b1cbb5bc87eef7d373d837cdab3"
+    },
+    {
+      "job_id": "01790944300563078422-0177dd3d67a4",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790944565.5749774,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790944300563078422-0177dd3d67a4.log",
+      "purpose": "store",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v1",
+      "timeout_seconds": 900,
+      "python_argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_snapshot_mooncake.py",
+        "-f"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "tests_run": 6,
+      "unittest_seconds": 175.354,
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790944300563078422-0177dd3d67a4.json",
+      "result_sha256": "5d67471ec7ae86d9563c4d3715e29d5254a0fa0200a8abb14d656b045e6e7b13",
+      "log_sha256": "d41bdd480233631950ac28483e042b7382746b6b270c7b2254c7f80c51b857b9"
+    },
+    {
+      "job_id": "01790944502911408645-fbb465d1dcf1",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790944939.208576,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790944502911408645-fbb465d1dcf1.log",
+      "purpose": "benchmark_before",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-before",
+      "timeout_seconds": 1800,
+      "python_argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/benchmark_training_capture.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--num-prompts",
+        "512",
+        "--input-len",
+        "16",
+        "--output-len",
+        "2",
+        "--concurrency",
+        "4",
+        "--capture-slots",
+        "4",
+        "--ratios",
+        "1.0",
+        "--repeats",
+        "2",
+        "--source-revision",
+        "4673ddb2c7aced317caddf4012f9daa3535a170d",
+        "--output-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-before"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-before/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "tests_run": null,
+      "unittest_seconds": null,
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790944502911408645-fbb465d1dcf1.json",
+      "result_sha256": "0df93fae3b400c6ea54ad93157a8853fb4e848883a2ac2125bac6f48f6ef4943",
+      "log_sha256": "eb97356852253509cd3c87c95ddd653024029027f5a2785c8c1117f65fb9a254"
+    },
+    {
+      "job_id": "01790944503232350071-be03f7143b9d",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790945303.750671,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790944503232350071-be03f7143b9d.log",
+      "purpose": "benchmark_after",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v2",
+      "timeout_seconds": 1800,
+      "python_argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/benchmark_training_capture.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--num-prompts",
+        "512",
+        "--input-len",
+        "16",
+        "--output-len",
+        "2",
+        "--concurrency",
+        "4",
+        "--capture-slots",
+        "4",
+        "--ratios",
+        "1.0",
+        "--repeats",
+        "2",
+        "--source-revision",
+        "4673ddb2c7aced317caddf4012f9daa3535a170d+stage-timings",
+        "--output-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-after"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v2/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "tests_run": null,
+      "unittest_seconds": null,
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790944503232350071-be03f7143b9d.json",
+      "result_sha256": "fe989a808463982dd521d0d78add7514c4418d480296a127309a54f11fca3097",
+      "log_sha256": "ee0d5fec7a534cd1fecfc13483877295c4298a6bfba3a71388da4afac944f47c"
+    },
+    {
+      "job_id": "01790944503551940825-fd652280850c",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790945821.0191047,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790944503551940825-fd652280850c.log",
+      "purpose": "runtime",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v2",
+      "timeout_seconds": 1800,
+      "python_argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "TestTrainingCaptureRuntime.test_chunk_prefix_single_token_and_raw_teacher_reference",
+        "-f"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v2/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "tests_run": 1,
+      "unittest_seconds": 505.947,
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790944503551940825-fd652280850c.json",
+      "result_sha256": "c83a93430c2198d3a65ddbe5326a2d2145ec7cfa8d4803355995ddfe88f91810",
+      "log_sha256": "869d7f8377d8a8e61415cfb9de27f6bf091148c9524bb491fb32d83f7b2e76d1"
+    },
+    {
+      "job_id": "01790944820875424887-5c880685bc74",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790946032.3024645,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790944820875424887-5c880685bc74.log",
+      "purpose": "benchmark_longer",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v2",
+      "timeout_seconds": 1800,
+      "python_argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/benchmark_training_capture.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--num-prompts",
+        "64",
+        "--input-len",
+        "512",
+        "--output-len",
+        "128",
+        "--concurrency",
+        "4",
+        "--capture-slots",
+        "4",
+        "--ratios",
+        "1.0",
+        "--repeats",
+        "1",
+        "--source-revision",
+        "4673ddb2c7aced317caddf4012f9daa3535a170d+stage-timings",
+        "--output-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/writer-timings-longer"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-timings-v2/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "tests_run": null,
+      "unittest_seconds": null,
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790944820875424887-5c880685bc74.json",
+      "result_sha256": "05387c476dd8f1f909a759ae4bbbe016c37560f685adee7adb770f3a93beb989",
+      "log_sha256": "6fd6281557885c0f4f62923798f0490238044d4ddca4154885d66345f7ecffa3"
+    }
+  ]
+}

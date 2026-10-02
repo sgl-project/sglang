@@ -346,6 +346,7 @@ class CaptureCoordinator:
                 "queued": self.work.qsize(),
                 "occupied_fraction": occupancy,
                 "writer_age_seconds": writer_age,
+                "stage_timings": self.writer.timings.stats(),
                 "host_pool": self.pool.stats(),
                 "admission": self.admission.stats(
                     time.monotonic(), disabled=self.disabled_reason is not None
@@ -1018,11 +1019,16 @@ class CaptureCoordinator:
             except queue.Empty:
                 continue
             record.state = "writing"
+            self.writer.timings.observe(
+                "queue_wait", max(0.0, time.monotonic() - record.queued_at)
+            )
             self._count("writer_started")
             complete = True
             try:
                 if record.context is not None:
-                    record.context.wait_for_copies()
+                    self.writer.timings.call(
+                        "copy_wait", record.context.wait_for_copies
+                    )
                     self._count("copies_completed")
                 if (
                     record.invalid_reason
@@ -1033,7 +1039,9 @@ class CaptureCoordinator:
                         record.lease, record.invalid_reason or "capture_failed"
                     )
                 else:
-                    manifest, tensors = record.context.snapshot(
+                    manifest, tensors = self.writer.timings.call(
+                        "snapshot_build",
+                        record.context.snapshot,
                         dataset_id=record.lease.dataset_id,
                         sample_id=record.lease.sample_id,
                         generation_id=record.lease.generation_id,

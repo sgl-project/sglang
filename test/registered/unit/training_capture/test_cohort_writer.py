@@ -176,6 +176,11 @@ class TestCohortSnapshotWriter(CustomTestCase):
         metadata.provenance.sampling_config["temperature"] = 99
         gate.release.set()
         self.wait_until(lambda: self.worker.stats()["counters"].get("published") == 1)
+        stages = self.worker.stats()["stage_timings"]
+        for stage in ("queue_wait", "copy_wait", "snapshot_build", "store_payload"):
+            self.assertEqual(stages[stage]["calls"], 1, stage)
+            self.assertEqual(stages[stage]["errors"], 0, stage)
+        self.assertEqual(stages["catalog_publish"]["calls"], 1)
         manifest, tensors = read_snapshot(
             self.resources.store, self.catalog.wait_publications(1)[0]
         )

@@ -137,7 +137,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
         )
 
     def _pressure(self, now):
-        writer = self.writer_actor.stats()
+        writer = self.writer_actor.stats(include_timings=False)
         return (
             min(
                 1.0,
@@ -187,6 +187,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
                 "queued": self.work.qsize(),
                 "occupied_fraction": occupancy,
                 "writer_age_seconds": age,
+                "stage_timings": writer["stage_timings"],
                 "host_pool": self._host_stats(),
                 "admission": self.admission.stats(
                     time.monotonic(), disabled=self.disabled_reason is not None
@@ -196,7 +197,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
             }
 
     def _admission_ratio(self):
-        writer = self.writer_actor.stats()
+        writer = self.writer_actor.stats(include_timings=False)
         if (
             self.disabled_reason
             or not writer["ready"]
@@ -331,7 +332,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
             try:
                 if context is not None:
                     context.wait_for_copies()
-            except Exception:  # noqa: BLE001 - failed copy completion quarantines storage
+            except Exception:  # noqa: BLE001 - quarantine failed copies
                 complete = False
             self.service.finish(
                 record.cohort_handle, outcome="failed", transfer_complete=complete
@@ -348,7 +349,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
                 if self.stop.is_set():
                     return
             while not self.stop.is_set() or not self.work.empty():
-                writer = self.writer_actor.stats()
+                writer = self.writer_actor.stats(include_timings=False)
                 self.service.set_admission_ready(
                     bool(
                         not self.disabled_reason
@@ -376,7 +377,10 @@ class CohortCaptureCoordinator(CaptureCoordinator):
             self.service.set_admission_ready(False)
 
     def on_idle(self):
-        if self.work.unfinished_tasks or self.writer_actor.stats()["pending"]:
+        if (
+            self.work.unfinished_tasks
+            or self.writer_actor.stats(include_timings=False)["pending"]
+        ):
             time.sleep(0)
 
     def close(self):
