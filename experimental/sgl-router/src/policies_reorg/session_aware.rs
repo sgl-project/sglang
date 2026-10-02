@@ -15,7 +15,7 @@ use crate::state::load_monitor::engine_reported_load::{
 use crate::state::AffinityStore;
 use crate::workers::Worker;
 
-use super::admission::{AllowAll, Decision, EngineAdmission};
+use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
 use super::power_of_two::PowerOfTwoPolicy;
 use super::{Pick, PickError, PickRequest, Policy, Rejection};
 
@@ -36,7 +36,7 @@ impl SessionAwarePolicy {
             store,
             fallback: PowerOfTwoPolicy::new(Arc::clone(&engine_load)),
             engine_load,
-            admission: Arc::new(AllowAll),
+            admission: Arc::new(AdmissionLimits::default()),
         }
     }
 
@@ -55,16 +55,9 @@ impl SessionAwarePolicy {
         ))
     }
 
-    fn check(
-        &self,
-        engine: &Worker,
-        request: &PickRequest<'_>,
-        load: &EngineReportedLoadSnapshot,
-    ) -> Result<(), PickError> {
-        match self
-            .admission
-            .check(engine, request, load.fresh_load_for_url(&engine.url))?
-        {
+    fn check(&self, engine: &Worker, load: &EngineReportedLoadSnapshot) -> Result<(), PickError> {
+        let metrics = EngineMetrics::observe(engine, load);
+        match self.admission.check(engine, &metrics)? {
             Decision::Allow => Ok(()),
             Decision::Reject(reason) => Err(PickError::AdmissionRejected(Rejection {
                 engine: engine.id.clone(),
@@ -87,18 +80,19 @@ impl Policy for SessionAwarePolicy {
             let key = Self::assignment_key(request);
             if let Some(bound) = key.as_ref().and_then(|key| self.store.bound(key, engines)) {
                 let load = self.engine_load.capture_snapshot(Instant::now());
-                self.check(bound, request, &load)?;
+                self.check(bound, &load)?;
                 return Ok(Pick {
                     engine: Arc::clone(bound),
                     reason: "session_primary",
                 });
             }
 
-            // The nested power-of-two policy uses AllowAll. The session owner
-            // checks its chosen engine before creating or replacing a binding.
+            // The nested power-of-two policy uses AdmissionLimits::default().
+            // The session owner checks its chosen engine before creating or
+            // replacing a binding.
             let mut pick = self.pick_fallback(engines, request).await?;
             let load = self.engine_load.capture_snapshot(Instant::now());
-            self.check(&pick.engine, request, &load)?;
+            self.check(&pick.engine, &load)?;
             let Some(key) = key else {
                 pick.reason = "no_session";
                 return Ok(pick);
@@ -108,7 +102,7 @@ impl Policy for SessionAwarePolicy {
             if !Arc::ptr_eq(effective, &pick.engine) {
                 // A racing first assignment wins. Check it once, without
                 // rewriting a rejected binding or retrying another engine.
-                self.check(effective, request, &load)?;
+                self.check(effective, &load)?;
                 pick.reason = "session_primary";
             } else {
                 pick.reason = "assigned";

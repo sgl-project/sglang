@@ -650,6 +650,10 @@
       "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_flash"
     },
     {
+      "source": "/docs/hardware-platforms/ascend-npus/best_practice/mimo_v2_5_pro",
+      "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_5_pro"
+    },
+    {
       "source": "/docs/hardware-platforms/ascend-npus/best_practice/qwen3-8b",
       "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b"
     },
@@ -887,9 +891,9 @@
             "icon": "play",
             "pages": [
               "index",
-              "docs/get-started/install",
               "docs/get-started/quickstart",
-              "docs/basic_usage/send_request"
+              "docs/get-started/install",
+              "docs/get-started/examples"
             ]
           }
         ]
@@ -902,6 +906,7 @@
             "icon": "book-open",
             "pages": [
               "docs/basic_usage/overview",
+              "docs/basic_usage/send_request",
               {
                 "group": "OpenAI-Compatible APIs",
                 "pages": [
@@ -939,6 +944,7 @@
               "docs/advanced_features/quantized_kv_cache",
               "docs/advanced_features/reasoning_aware_compression",
               "docs/advanced_features/dp_dpa_smg_guide",
+              "docs/advanced_features/prefill_cp",
               "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
               "docs/advanced_features/lora",
@@ -994,7 +1000,8 @@
               {
                 "group": "Specialized Models",
                 "pages": [
-                  "docs/supported-models/reward_models"
+                  "docs/supported-models/reward_models",
+                  "docs/supported-models/decision_models"
                 ]
               },
               {
@@ -1020,7 +1027,8 @@
                 "pages": [
                   "docs/developer_guide/development_guide_using_docker",
                   "docs/developer_guide/development_jit_kernel_guide",
-                  "docs/developer_guide/quantization_contribution_guide"
+                  "docs/developer_guide/quantization_contribution_guide",
+                  "docs/developer_guide/layer_boundary"
                 ]
               },
               {
@@ -1142,6 +1150,7 @@
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_flash",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_5_pro",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b",
@@ -1211,6 +1220,12 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
+                    "group": "IQuestLab",
+                    "pages": [
+                      "cookbook/autoregressive/IQuestLab/IQuest-Q1"
+                    ]
+                  },
+                  {
                     "group": "IFM",
                     "pages": [
                       "cookbook/autoregressive/IFM/K2-Horizon"
@@ -1232,6 +1247,13 @@
                     "pages": [
                       "cookbook/autoregressive/ThinkingMachines/Inkling",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-Small"
+                    ]
+                  },
+                  {
+                    "group": "GigaChat",
+                    "pages": [
+                      "cookbook/autoregressive/GigaChat/GigaChat3.5",
+                      "cookbook/autoregressive/GigaChat/GigaChat3.5-Reasoning"
                     ]
                   },
                   {
@@ -1428,6 +1450,7 @@
                   {
                     "group": "Xiaomi",
                     "pages": [
+                      "cookbook/autoregressive/Xiaomi/MiMo-V2.6",
                       "cookbook/autoregressive/Xiaomi/MiMo-V2.5",
                       "cookbook/autoregressive/Xiaomi/MiMo-V2-Flash"
                     ]
@@ -1515,6 +1538,12 @@
                     ]
                   },
                   {
+                    "group": "CircleStone",
+                    "pages": [
+                      "cookbook/diffusion/CircleStone/Anima"
+                    ]
+                  },
+                  {
                     "group": "SenseNova",
                     "tag": "NEW",
                     "pages": [
@@ -1526,6 +1555,12 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LongCat/LongCat-Image"
+                    ]
+                  },
+                  {
+                    "group": "Ming-Image",
+                    "pages": [
+                      "cookbook/diffusion/inclusionAI/Ming-Image"
                     ]
                   },
                   {
@@ -1598,6 +1633,13 @@
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
                     ]
+                  },
+                  {
+                    "group": "FLUX",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/FLUX/FLUX-3-Action"
+                    ]
                   }
                 ]
               },
@@ -1635,6 +1677,7 @@
                 "pages": [
                   "docs/sglang-diffusion/api/cli",
                   "docs/sglang-diffusion/api/openai_api",
+                  "docs/sglang-diffusion/comfyui",
                   "docs/sglang-diffusion/realtime_models",
                   "docs/sglang-diffusion/models_with_ar",
                   "docs/sglang-diffusion/models_with_pe",

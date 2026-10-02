@@ -145,7 +145,7 @@ class TestScriptedCore(ScriptedTestCase):
         r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        _assert_prefill_twice_decode_once(t, prompt_len=_PROMPT_LEN)
+        _assert_every_node_hit_once(t, prompt_len=_PROMPT_LEN)
 
     def test_nonchunked_prefill_radix_hit_count(self):
         self.server.execute_script(self._script_nonchunked_prefill_radix_hit_count)
@@ -156,27 +156,30 @@ class TestScriptedCore(ScriptedTestCase):
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        _assert_prefill_twice_decode_once(t, prompt_len=prompt_len)
+        _assert_every_node_hit_once(t, prompt_len=prompt_len)
 
 
-def _assert_prefill_twice_decode_once(t: ScriptedContext, *, prompt_len: int) -> None:
-    root = t.scheduler.tree_cache.root_node
+def _assert_every_node_hit_once(t: ScriptedContext, prompt_len: int) -> None:
+    core = t.scheduler.tree_cache.tree_core
     prefill_hits: list[int] = []
     decode_hits: list[int] = []
-    stack = [(child, len(child.key)) for child in root.children.values()]
+    stack = [
+        (node_id, core.get_node_key_length(node_id))
+        for node_id in core.get_child_node_ids(core.root_node_handle())
+    ]
     while stack:
-        node, end_index = stack.pop()
+        node_id, end_index = stack.pop()
         bucket = prefill_hits if end_index <= prompt_len else decode_hits
-        bucket.append(node.hit_count)
-        for child in node.children.values():
-            stack.append((child, end_index + len(child.key)))
+        bucket.append(core.get_node_hit_count(node_id))
+        for child_id in core.get_child_node_ids(node_id):
+            stack.append((child_id, end_index + core.get_node_key_length(child_id)))
 
     assert prefill_hits and decode_hits, (
         f"expected both prefill and decode radix nodes; "
         f"prefill={prefill_hits}, decode={decode_hits}, prompt_len={prompt_len}"
     )
-    assert all(h == 2 for h in prefill_hits), (
-        f"each prefill node must be hit exactly twice; "
+    assert all(h == 1 for h in prefill_hits), (
+        f"each prefill node must be hit exactly once; "
         f"prefill={prefill_hits}, decode={decode_hits}"
     )
     assert all(h == 1 for h in decode_hits), (

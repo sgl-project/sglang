@@ -3,6 +3,9 @@
 
 pub mod adapter;
 pub mod chat_formatter;
+mod deepseek;
+mod kimi;
+pub mod stats;
 
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
@@ -10,6 +13,17 @@ use dashmap::DashMap;
 use dynamo_tokenizers::Tokenizer;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Which chats may carry router-rendered `input_ids`, by how well the model's
+/// renderer is verified against SGLang.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardingScope {
+    Never,
+    /// Only request shapes the per-shape guard allows.
+    Guarded,
+    /// Every non-multimodal chat.
+    AllText,
+}
 
 /// A model's chat formatter plus its fallback-logging state.
 struct ChatFormatterEntry {
@@ -48,6 +62,8 @@ pub struct TokenizerRegistry {
     /// Per-model chat formatter, present only when the model's prompt format is
     /// known; models without one fall back to raw prompt-text tokenization.
     formatters: DashMap<String, Arc<ChatFormatterEntry>>,
+    /// Resolved encode backend and L1 cache counters of the served model's tokenizer.
+    stats: Arc<stats::TokenizerStats>,
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -60,12 +76,21 @@ impl std::fmt::Debug for TokenizerRegistry {
 
 impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
-        let me = TokenizerRegistry::default();
+        let mut me = TokenizerRegistry::default();
         let m = &cfg.model;
-        let t = adapter::load(&m.tokenizer_path)?;
+        let Some(tokenizer_path) = &m.tokenizer_path else {
+            tracing::info!(model = %m.id, "tokenizer disabled; workers tokenize requests");
+            return Ok(me);
+        };
+        let (t, stats) = adapter::load_with(tokenizer_path, m.tokenizer)?;
+        tracing::info!(model = %m.id, backend = stats.backend().as_str(),
+            l1 = stats.l1_state().as_str(), l1_cache_mb = m.tokenizer.l1_cache_mb,
+            "tokenizer loaded");
         me.inner.insert(m.id.clone(), t);
-        match ChatFormatter::load(&m.id, &m.tokenizer_path) {
+        me.stats = stats;
+        match ChatFormatter::load(&m.id, tokenizer_path) {
             Ok(Some(formatter)) => {
+                let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
                 tracing::info!(model = %m.id, "dynamo-render chat rendering enabled");
@@ -79,16 +104,32 @@ impl TokenizerRegistry {
             tracing::info!(model = %m.id,
                 "router-generated input_ids forwarding disabled; workers tokenize messages; \
                  routing tokenization remains available");
-        } else if me.has_chat_formatter(&m.id) {
-            tracing::warn!(model = %m.id,
-                "router-generated input_ids forwarding enabled: requires matching worker model \
-                 files and template defaults; native DeepSeek assumes SGLANG_DEFAULT_THINKING=false \
-                 and no SGLANG_DSV4_REASONING_EFFORT preamble; worker parser overrides \
-                 (including --tool-call-parser deepseekv32), content-format detection, and \
-                 conversation-template stop strings are not replicated. Use \
-                 --disable-input-ids-forwarding for array-only templates or when these assumptions do not hold");
+        } else {
+            match me.forwarding_scope(&m.id) {
+                ForwardingScope::AllText => tracing::info!(model = %m.id,
+                    "router-generated input_ids forwarding enabled for all text chats; requires the \
+                     workers' model files, --default-chat-template-kwargs, SGLANG_DEFAULT_THINKING, \
+                     and SGLANG_DSV4_REASONING_EFFORT"),
+                ForwardingScope::Guarded => tracing::warn!(model = %m.id,
+                    "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
+                     for DeepSeek-V4, so this model forwards only guarded request shapes (plain text \
+                     chat). Requires the workers' model files and --default-chat-template-kwargs; \
+                     worker parser overrides, content-format detection, and conversation-template stop \
+                     strings are not replicated. Pass --disable-input-ids-forwarding unless you have \
+                     verified parity for this model"),
+                ForwardingScope::Never if me.has_chat_formatter(&m.id) => {
+                    tracing::warn!(model = %m.id,
+                    "input_ids forwarding disabled: the DeepSeek-V4.1 renderer is not verified against \
+                     current SGLang; workers tokenize messages")
+                }
+                ForwardingScope::Never => {}
+            }
         }
         Ok(me)
+    }
+
+    pub fn stats(&self) -> &stats::TokenizerStats {
+        &self.stats
     }
 
     pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
@@ -99,6 +140,12 @@ impl TokenizerRegistry {
     /// tokenization path is available for it).
     pub fn has_chat_formatter(&self, model_id: &str) -> bool {
         self.formatters.contains_key(model_id)
+    }
+
+    pub fn forwarding_scope(&self, model_id: &str) -> ForwardingScope {
+        self.formatters
+            .get(model_id)
+            .map_or(ForwardingScope::Never, |e| e.formatter.forwarding_scope())
     }
 
     /// Render with dynamo-render and tokenize; return `None` when unavailable or unsuccessful.
@@ -167,10 +214,12 @@ mod tests {
             observability: Default::default(),
             model: crate::config::ModelConfig {
                 id: "tiny".into(),
-                tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
                 disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
+                dp_aware: false,
                 bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,
@@ -179,6 +228,7 @@ mod tests {
                 fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
@@ -311,9 +361,18 @@ mod tests {
     #[test]
     fn missing_file_errors() {
         let mut c = cfg();
-        c.model.tokenizer_path = "/nonexistent.json".into();
+        c.model.tokenizer_path = Some("/nonexistent.json".into());
         let err = TokenizerRegistry::load_from_config(&c).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("tokenizer"));
+    }
+
+    #[test]
+    fn disabled_tokenizer_loads_an_empty_registry() {
+        let mut c = cfg();
+        c.model.tokenizer_path = None;
+        let registry = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert!(registry.get("tiny").is_none());
+        assert_eq!(registry.forwarding_scope("tiny"), ForwardingScope::Never);
     }
 
     #[test]
@@ -333,7 +392,7 @@ mod tests {
         assert_eq!(cfg["chat_template"], "X");
     }
 
-    /// Families the engine encodes in code skip a shipped template; V4.1 counts as V4.
+    /// Families the engine encodes in code skip a shipped template.
     #[test]
     fn chat_formatter_load_preserves_native_precedence() {
         let dir = tempfile::tempdir().unwrap();
@@ -350,9 +409,15 @@ mod tests {
             assert_eq!(resolve(model_type).unwrap().render(&request).unwrap(), "T");
         }
         assert!(resolve("inkling_mm_model").is_none());
-        assert!(resolve("kimi_k3").is_none());
+        assert!(resolve("kimi_k3")
+            .unwrap()
+            .render(&request)
+            .unwrap()
+            .contains("<|open|>message"));
+        assert_eq!(resolve("deepseek_v41").unwrap().render(&serde_json::json!({"messages":[{"role":"system","content":"S"},{"role":"user","content":"hi"}]})).unwrap(),
+            "<｜begin▁of▁sentence｜><｜System｜>S<｜User｜>hi<｜Assistant｜></think>");
         assert_eq!(
-            resolve("deepseek_v41").unwrap().render(&request).unwrap(),
+            resolve("deepseek_v4").unwrap().render(&request).unwrap(),
             "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
         );
     }
@@ -369,7 +434,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("chat_template.jinja"), "{% invalid %}").unwrap();
         let mut cfg = cfg();
-        cfg.model.tokenizer_path = tok.to_str().unwrap().to_owned();
+        cfg.model.tokenizer_path = Some(tok.to_str().unwrap().to_owned());
 
         let reg = TokenizerRegistry::load_from_config(&cfg).unwrap();
         let tokenizer = reg.get(&cfg.model.id).unwrap();

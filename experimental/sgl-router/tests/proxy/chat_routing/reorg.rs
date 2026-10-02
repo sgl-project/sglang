@@ -6,13 +6,15 @@ use crate::common::mock_worker::MockWorker;
 use futures::future::BoxFuture;
 use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
 use sgl_router::policies::PolicyRegistry;
-use sgl_router::policies_reorg::admission::{AllowAll, Decision, EngineAdmission};
+use sgl_router::policies_reorg::admission::{
+    AdmissionLimits, Decision, EngineAdmission, EngineMetrics,
+};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 use sgl_router::server::app_context::ChatRouting;
-use sgl_router::state::load_monitor::engine_reported_load::EngineReportedWorkerLoad;
 use std::sync::Mutex;
 
 mod session_aware;
+mod slo;
 
 type PickCall = (String, Stage, u64, Option<u64>);
 
@@ -27,7 +29,7 @@ struct FirstPolicy {
 impl Default for FirstPolicy {
     fn default() -> Self {
         Self {
-            admission: Arc::new(AllowAll),
+            admission: Arc::new(AdmissionLimits::default()),
             miss: false,
             invalid: false,
             calls: Mutex::new(Vec::new()),
@@ -58,7 +60,9 @@ impl Policy for FirstPolicy {
                 return Err(PickError::NoCandidates);
             }
             let engine = engines[0].clone();
-            if let Decision::Reject(reason) = self.admission.check(&engine, request, None)? {
+            if let Decision::Reject(reason) =
+                self.admission.check(&engine, &EngineMetrics::default())?
+            {
                 return Err(PickError::AdmissionRejected(Rejection {
                     engine: engine.id.clone(),
                     reason,
@@ -76,12 +80,7 @@ impl Policy for FirstPolicy {
 struct RejectAll;
 
 impl EngineAdmission for RejectAll {
-    fn check(
-        &self,
-        _: &Worker,
-        _: &PickRequest<'_>,
-        _: Option<&EngineReportedWorkerLoad>,
-    ) -> Result<Decision, PickError> {
+    fn check(&self, _: &Worker, _: &EngineMetrics) -> Result<Decision, PickError> {
         Ok(Decision::Reject("full".into()))
     }
 }
@@ -111,6 +110,7 @@ fn context(workers: &[(&str, Stage, &MockWorker)], buckets: Vec<Bucket>) -> Arc<
                 mode,
                 model_ids: vec![ModelId("tiny".into())],
                 bootstrap_port: Some(8998),
+                ..Default::default()
             })
             .unwrap();
     }
@@ -148,6 +148,71 @@ fn body(content: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn configured_limits_reject_before_dispatch_and_admit_after_load_drops() {
+    use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
+    use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
+    use std::time::Instant;
+
+    let worker = MockWorker::start(vec![]).await;
+    let mut ctx = Arc::try_unwrap(context(&[("w", Stage::Plain, &worker)], vec![]))
+        .unwrap_or_else(|_| panic!("context is not shared yet"));
+    let mut policy = PowerOfTwoPolicy::new(ctx.engine_reported_load.clone());
+    policy.admission = Arc::new(AdmissionLimits {
+        max_running_requests: Some(1),
+        max_kv_tokens: Some(100),
+        ..Default::default()
+    });
+    ctx.chat_routing = ChatRouting::Reorg(
+        [(
+            ModelId("tiny".into()),
+            BucketResolver::new(vec![Bucket::new(
+                "default",
+                BucketGroups::Plain(EngineGroup {
+                    worker_ids: Some([WorkerId("w".into())].into()),
+                    policy: Arc::new(policy),
+                }),
+            )])
+            .unwrap(),
+        )]
+        .into(),
+    );
+    let ctx = Arc::new(ctx);
+    let app = build_router(ctx.clone());
+    for (running, kv_tokens, expected) in [
+        (1, 0, StatusCode::SERVICE_UNAVAILABLE),
+        (0, 100, StatusCode::SERVICE_UNAVAILABLE),
+        (0, 0, StatusCode::OK),
+    ] {
+        ctx.engine_reported_load.set(
+            &worker.url,
+            0,
+            LoadStat {
+                num_running_reqs: running,
+                num_waiting_reqs: 0,
+                num_tokens: 0,
+                max_total_num_tokens: 1000,
+                native_cache: Some(NativeCacheRankLoad {
+                    num_waiting_uncached_tokens: 0,
+                    num_total_tokens: kv_tokens,
+                    max_running_requests: 10,
+                    total_prefill_uncached_tokens: 0,
+                    total_prefill_busy_us: 0,
+                }),
+            },
+            Instant::now(),
+        );
+        let response = app.clone().oneshot(request(body("hi"))).await.unwrap();
+        assert_eq!(response.status(), expected);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(
+            worker.captured.lock().unwrap().last_body.is_some(),
+            expected == StatusCode::OK
+        );
+        assert_eq!(ctx.router_inflight_load.inflight_count(), 0);
+    }
+}
+
+#[tokio::test]
 async fn length_selects_plain_bucket_before_engine_selection() {
     let short_worker = MockWorker::start(vec![]).await;
     let long_worker = MockWorker::start(vec![]).await;
@@ -166,7 +231,19 @@ async fn length_selects_plain_bucket_before_engine_selection() {
     let response = app.clone().oneshot(request(body("hi"))).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let _ = response.into_body().collect().await.unwrap();
-    assert!(short_worker.captured.lock().unwrap().last_body.is_some());
+    let forwarded: serde_json::Value = serde_json::from_slice(
+        short_worker
+            .captured
+            .lock()
+            .unwrap()
+            .last_body
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(crate::common::is_engine_shaped_rid(
+        forwarded["rid"].as_str().unwrap()
+    ));
     assert!(long_worker.captured.lock().unwrap().last_body.is_none());
 
     let response = app
@@ -229,6 +306,8 @@ async fn pd_picks_both_groups_from_selected_bucket_and_shares_bootstrap() {
     let d: serde_json::Value =
         serde_json::from_slice(decode.captured.lock().unwrap().last_body.as_ref().unwrap())
             .unwrap();
+    assert!(p["rid"].is_string());
+    assert_eq!(p["rid"], d["rid"]);
     assert!(p["bootstrap_room"].is_number());
     assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
     let calls = policy.calls.lock().unwrap();
@@ -278,7 +357,7 @@ async fn missing_decode_in_all_buckets_does_not_dispatch_prefill() {
     );
     assert!(prefill.captured.lock().unwrap().last_body.is_none());
     assert!(decode.captured.lock().unwrap().last_body.is_none());
-    assert_eq!(policy.calls.lock().unwrap().len(), 2);
+    assert!(policy.calls.lock().unwrap().is_empty());
     assert_eq!(ctx.router_inflight_load.inflight_count(), 0);
     assert_eq!(
         ctx.registry
@@ -458,7 +537,10 @@ async fn decode_failure_retries_both_groups_in_next_bucket_without_dispatching_f
                 .router_inflight_load(),
             0
         );
-        assert_eq!(first.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            first.calls.lock().unwrap().len(),
+            usize::from(reject_decode)
+        );
         let calls = accepted.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!((&*calls[0].0, calls[0].1), ("b-second", Stage::Prefill));
@@ -600,4 +682,290 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     assert!(rejected.captured.lock().unwrap().last_body.is_none());
     assert!(cold.captured.lock().unwrap().last_body.is_none());
     assert!(owner.captured.lock().unwrap().last_body.is_some());
+}
+
+#[tokio::test]
+async fn default_pd_groups_apply_configured_inflight_admission() {
+    use sgl_router::config::{EligibilityConfig, FilterKind, PolicyKind};
+    use std::sync::atomic::Ordering;
+
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let mut ctx = context(
+        &[
+            ("p", Stage::Prefill, &prefill),
+            ("d", Stage::Decode, &decode),
+        ],
+        vec![],
+    );
+    let mutable = Arc::get_mut(&mut ctx).unwrap();
+    mutable.config.model.policy = PolicyKind::PowerOfTwo;
+    mutable.config.model.eligibility = Some(EligibilityConfig {
+        filters: vec![FilterKind::Overloaded],
+        max_in_flight: Some(1),
+        min_prefix_share: None,
+    });
+    let state = sgl_router::state::kv_events::KvEventIndex::new();
+    let (resolver, _) =
+        sgl_router::policies_reorg::factory::build_resolver(&mutable.config.model, &state, None)
+            .unwrap();
+    mutable.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
+    let worker = ctx.registry.get(&WorkerId("d".into())).unwrap();
+    let app = build_router(ctx);
+    for (inflight, expected) in [(1, StatusCode::SERVICE_UNAVAILABLE), (0, StatusCode::OK)] {
+        worker.active_requests.store(inflight, Ordering::Relaxed);
+        let response = app.clone().oneshot(request(body("hi"))).await.unwrap();
+        assert_eq!(response.status(), expected);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(
+            prefill.captured.lock().unwrap().last_body.is_some(),
+            expected == StatusCode::OK
+        );
+        assert_eq!(
+            decode.captured.lock().unwrap().last_body.is_some(),
+            expected == StatusCode::OK
+        );
+    }
+}
+
+/// Runs on both routing paths: the portless-prefill exclusion lives in the
+/// registry both of them read.
+#[tokio::test]
+async fn portless_prefill_is_not_dispatched_until_bootstrap_is_resolved() {
+    for reorg in [true, false] {
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let policy = Arc::new(FirstPolicy::default());
+        let mut ctx = context(
+            &[
+                ("p", Stage::Prefill, &prefill),
+                ("d", Stage::Decode, &decode),
+            ],
+            vec![Bucket::new(
+                "pd",
+                BucketGroups::Pd {
+                    prefill: group("p", policy.clone()),
+                    decode: group("d", policy.clone()),
+                },
+            )],
+        );
+        if !reorg {
+            ctx = Arc::new(AppContext::new(
+                ctx.config.clone(),
+                ctx.tokenizers.clone(),
+                ctx.proxy.clone(),
+                ctx.registry.clone(),
+                Arc::new(build_policy_registry(&ctx.config).unwrap()),
+            ));
+        }
+        let mut spec = WorkerSpec {
+            id: WorkerId("p".into()),
+            url: prefill.url.clone(),
+            mode: Stage::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            ..Default::default()
+        };
+        ctx.registry.add(spec.clone()).unwrap();
+        let app = build_router(ctx.clone());
+        let response = app.clone().oneshot(request(body("hello"))).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reorg={reorg}"
+        );
+        assert!(policy.calls.lock().unwrap().is_empty());
+        assert!(prefill.captured.lock().unwrap().last_body.is_none());
+        assert!(decode.captured.lock().unwrap().last_body.is_none());
+        spec.bootstrap_port = Some(8997);
+        ctx.registry.add(spec).unwrap();
+        let response = app.oneshot(request(body("hello"))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "reorg={reorg}");
+        let d: serde_json::Value =
+            serde_json::from_slice(decode.captured.lock().unwrap().last_body.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(d["bootstrap_port"], 8997, "reorg={reorg}");
+    }
+}
+
+#[tokio::test]
+async fn load_only_routing_forwards_messages_without_a_tokenizer() {
+    for (reorg, pd) in [(false, false), (false, true), (true, false), (true, true)] {
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let workers: &[_] = if pd {
+            &[
+                ("p", Stage::Prefill, &prefill),
+                ("d", Stage::Decode, &decode),
+            ]
+        } else {
+            &[("d", Stage::Plain, &decode)]
+        };
+        let mut ctx = context(workers, vec![]);
+        let mutable = Arc::get_mut(&mut ctx).unwrap();
+        mutable.config.model.policy = PolicyKind::PowerOfTwo;
+        mutable.config.model.tokenizer_path = None;
+        mutable.tokenizers =
+            Arc::new(TokenizerRegistry::load_from_config(&mutable.config).unwrap());
+        if reorg {
+            let state = sgl_router::state::kv_events::KvEventIndex::new();
+            let (resolver, _) = sgl_router::policies_reorg::factory::build_resolver(
+                &mutable.config.model,
+                &state,
+                None,
+            )
+            .unwrap();
+            mutable.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
+        } else {
+            mutable.chat_routing = ChatRouting::Legacy;
+            mutable.policies = Arc::new(build_policy_registry(&mutable.config).unwrap());
+        }
+        let response = build_router(ctx)
+            .oneshot(request(body("hello")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "reorg={reorg} pd={pd}");
+        let forwarded: serde_json::Value =
+            serde_json::from_slice(decode.captured.lock().unwrap().last_body.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(forwarded["messages"], body("hello")["messages"]);
+        assert!(
+            forwarded.get("input_ids").is_none(),
+            "reorg={reorg} pd={pd}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_prefix_reading_routing_needs_request_tokens() {
+    for (policy, needs) in [
+        (PolicyKind::PowerOfTwo, false),
+        (PolicyKind::SessionAware, false),
+        (PolicyKind::CacheAware, true),
+    ] {
+        let mut cfg = config_for("");
+        cfg.model.policy = policy;
+        let legacy = build_policy_registry(&cfg).unwrap();
+        assert_eq!(
+            ChatRouting::Legacy.needs_request_tokens(&legacy),
+            needs,
+            "legacy {policy:?}"
+        );
+        let state = sgl_router::state::kv_events::KvEventIndex::new();
+        let (resolver, _) =
+            sgl_router::policies_reorg::factory::build_resolver(&cfg.model, &state, None).unwrap();
+        let reorg = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
+        assert_eq!(
+            reorg.needs_request_tokens(&PolicyRegistry::default()),
+            needs,
+            "reorg {policy:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reorg_readiness_cannot_pair_workers_across_buckets() {
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let ctx = context(
+        &[
+            ("p", Stage::Prefill, &prefill),
+            ("d", Stage::Decode, &decode),
+        ],
+        vec![
+            Bucket::new(
+                "prefill-only",
+                BucketGroups::Pd {
+                    prefill: group("p", policy.clone()),
+                    decode: group("missing", policy.clone()),
+                },
+            ),
+            Bucket::new(
+                "decode-only",
+                BucketGroups::Pd {
+                    prefill: group("missing", policy.clone()),
+                    decode: group("d", policy.clone()),
+                },
+            ),
+        ],
+    );
+    ctx.mark_ready();
+    let app = build_router(ctx);
+    assert_eq!(
+        app.clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        app.oneshot(request(body("hello"))).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(policy.calls.lock().unwrap().is_empty());
+}
+
+/// Rejects every engine in one version group.
+#[derive(Debug)]
+struct RejectGroup(&'static str);
+
+impl EngineAdmission for RejectGroup {
+    fn check(&self, engine: &Worker, _: &EngineMetrics) -> Result<Decision, PickError> {
+        Ok(match engine.version_group() == Some(self.0) {
+            true => Decision::Reject("full".into()),
+            false => Decision::Allow,
+        })
+    }
+}
+
+/// A version group whose decodes are full falls back to another group.
+#[tokio::test]
+async fn full_decode_group_falls_back_to_another_version_group() {
+    let workers: Vec<_> =
+        futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+    let decode_policy = Arc::new(FirstPolicy {
+        admission: Arc::new(RejectGroup("v1")),
+        ..FirstPolicy::default()
+    });
+    let ctx = context(
+        &[],
+        vec![Bucket::new(
+            "pd",
+            BucketGroups::Pd {
+                prefill: EngineGroup::new(Arc::new(FirstPolicy::default())),
+                decode: EngineGroup::new(decode_policy),
+            },
+        )],
+    );
+    for ((id, mode, group), worker) in [
+        ("p-v1", Stage::Prefill, "v1"),
+        ("p-v2", Stage::Prefill, "v2"),
+        ("d-v1", Stage::Decode, "v1"),
+        ("d-v2", Stage::Decode, "v2"),
+    ]
+    .into_iter()
+    .zip(&workers)
+    {
+        ctx.registry
+            .add(WorkerSpec {
+                id: WorkerId(id.into()),
+                url: worker.url.clone(),
+                mode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8998),
+                version_group: Some(group.into()),
+            })
+            .unwrap();
+    }
+    let response = build_router(ctx)
+        .oneshot(request(body("hello")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let dispatched: Vec<_> = workers
+        .iter()
+        .map(|w| w.captured.lock().unwrap().last_body.is_some())
+        .collect();
+    assert_eq!(dispatched, [false, true, false, true]);
 }

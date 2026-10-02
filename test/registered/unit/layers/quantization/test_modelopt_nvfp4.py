@@ -132,6 +132,28 @@ class TestModelOptNvfp4(CustomTestCase):
                 use_per_token_activation=True,
             )
 
+    def test_shared_expert_fusion_requires_matching_fp4_precision(self):
+        quantized_shared = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+        )
+        bf16_shared = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.*.mlp.shared_experts*"],
+        )
+
+        gate_only_bf16 = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.*.mlp.shared_expert_gate"],
+        )
+
+        self.assertTrue(quantized_shared.can_fuse_shared_expert())
+        self.assertFalse(bf16_shared.can_fuse_shared_expert())
+        # Only the gate is BF16 (Qwen3-Next NVFP4): the FP4 body still fuses.
+        self.assertTrue(gate_only_bf16.can_fuse_shared_expert())
+
 
 if __name__ == "__main__":
     unittest.main()
