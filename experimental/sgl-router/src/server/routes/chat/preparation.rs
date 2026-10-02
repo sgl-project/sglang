@@ -84,9 +84,10 @@ impl PreparedChatRequest {
         })
     }
 
-    pub(super) fn engine_rid(&self, pd_mode: bool) -> Option<String> {
-        // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs; PD must finish KV transfer.
-        if self.caller_set_rid || self.fans_out || pd_mode {
+    pub(super) fn engine_rid(&self) -> Option<String> {
+        // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs.
+        // PD shares the minted ID, but only decode arms abort-on-drop.
+        if self.caller_set_rid || self.fans_out {
             return None;
         }
         Some(uuid::Uuid::new_v4().simple().to_string())
@@ -425,6 +426,12 @@ fn estimate_prefill_tokens(body: &Bytes) -> usize {
 /// The engine stores bootstrap rooms as signed int64 values.
 pub(super) fn generate_room_id() -> u64 {
     rand::random::<u64>() & (i64::MAX as u64)
+}
+
+/// A room with `room % dp_ranks == rank`, which is how decode finds the prefill rank.
+pub(super) fn generate_room_id_for_rank(rank: u32, dp_ranks: u32) -> u64 {
+    let dp_ranks = u64::from(dp_ranks);
+    (generate_room_id() >> 1) / dp_ranks * dp_ranks + u64::from(rank)
 }
 
 pub(super) struct BootstrapFields {
@@ -784,6 +791,14 @@ mod tests {
     fn bucket_routing_requests_tokens_even_for_a_non_token_policy() {
         assert!(should_tokenize_request(false, false, true));
         assert!(!should_tokenize_request(false, false, false));
+    }
+
+    #[test]
+    fn rank_aligned_room_ids_map_back_to_their_rank() {
+        for _ in 0..1_000 {
+            let room = generate_room_id_for_rank(6, 7);
+            assert!(room <= i64::MAX as u64 && room % 7 == 6);
+        }
     }
 
     #[test]

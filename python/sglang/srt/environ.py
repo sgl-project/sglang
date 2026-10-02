@@ -521,6 +521,9 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
+    # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
+    # run the greedy draft/accept path and only the bonus token is temperature-sampled.
+    SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 
@@ -1579,6 +1582,12 @@ class Envs:
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
+    # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
+    SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # DSpark draft block on the HIP radix backend: build the attention metadata inside the
+    # draft CUDA graph from the raw inputs instead of eagerly before every replay.
+    SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
