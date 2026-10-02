@@ -281,6 +281,22 @@ keep strong references to registered source/receive memory until client close.
 Do not unregister quarantined arenas based on an exception alone. Closing a
 producer does not authorize deletion of published Store objects.
 
+`MooncakeSnapshotStore.put_registered_batch()` prevalidates every source and
+rejects duplicate keys before any network operation. When the SDK provides both
+`batch_is_exist` and `batch_put_from`, each snapshot/owner's tensor payloads use
+one existence query and one write for missing keys. Existing keys are read back
+and checked for exact size and digest before any missing key is submitted.
+The same mandatory hard-pin/replica configuration applies to the batch.
+
+Every per-object write result must be an integer zero. Known failed entries
+quarantine their enclosing registered arenas; an exception, malformed result or
+missing status quarantines all submitted sources. No transport-error fallback
+retries an uncertain batch. SDKs lacking either optional batch API use the
+existing checked single-object path. Manifest writes remain separate and last,
+and Catalog WRITTEN/seal/publication cannot advance after a payload failure.
+The [batch-write experiment](../../../../mooncake-study/experiments/BATCH_STORE_WRITES.md)
+records the native SDK checks and serving measurements.
+
 ## Global Target Identity
 
 `bind_rank_target_contract` inspects one loaded target rank at startup. Supply

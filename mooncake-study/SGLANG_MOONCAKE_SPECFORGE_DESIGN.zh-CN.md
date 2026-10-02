@@ -571,6 +571,14 @@ SDK 各接口的成功返回值可能是状态码或传输字节数。adapter �
 
 V1 strict retention 要求 hard pin 可用。SpecForge 现有 Store 对旧客户端有兼容降级，但本模式不能静默降级为可淘汰训练样本。
 
+当前 producer 将一份快照或一个 owner 的 payload 使用 `batch_is_exist` 和
+`batch_put_from` 合并提交。先校验所有源的注册范围、摘要及 key 唯一性，再逐一
+读回验证已存在的对象，仅把缺失对象交给批量写入。每项返回值必须为整数 0；
+明确失败的项隔离其所在注册 arena，返回缺项/非法结果或抛异常则隔离整批未确认
+的源。失败后不能立即重用缓冲区或转为单对象重试。只有 SDK 缺少批量能力时才
+沿用原单对象路径，hard pin 要求不变。所有 payload 成功之后才报告 WRITTEN，
+manifest 仍单独最后写入；批量 RPC 本身不提供跨对象发布事务。
+
 ### 8.2 RDMA 路径
 
 ```text

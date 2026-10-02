@@ -139,6 +139,9 @@ class TestSnapshotPublication(CustomTestCase):
         self.assertEqual(
             self.client.put_keys[-1], self.manifest.key_prefix + "manifest"
         )
+        self.assertEqual(
+            self.client.put_batches, [[obj.key for obj in self.manifest.objects]]
+        )
         self.assertFalse(list(self.journal.pending()))
 
     def test_tensor_put_failure_never_publishes_ready(self):
@@ -168,6 +171,24 @@ class TestSnapshotPublication(CustomTestCase):
         self.assertEqual(len(receipts), 1)
         self.assertEqual(self.catalog.published, original_published)
         self.assertEqual(self.client.put_keys, original_puts)
+        self.assertFalse(list(self.journal.pending()))
+
+    def test_partial_payload_batch_never_records_written_or_publishes(self):
+        original = self.client.batch_put_from
+
+        def partial(keys, pointers, sizes, config):
+            results = original(keys, pointers, sizes, config)
+            results[-1] = -1
+            return results
+
+        with (
+            patch.object(self.client, "batch_put_from", partial),
+            self.assertRaises(TransportError),
+        ):
+            self.write()
+        self.assertEqual(self.catalog.events, [("REGISTERED", 0)])
+        self.assertIsNone(self.catalog.published)
+        self.assertNotIn(self.manifest.key_prefix + "manifest", self.client.data)
         self.assertFalse(list(self.journal.pending()))
 
     def test_lost_seal_response_can_recover_before_manifest_put(self):
@@ -278,6 +299,13 @@ class TestSnapshotPublication(CustomTestCase):
 
     def test_publication_requires_exact_current_owner_receipts(self):
         receipts = self.write_partitions()
+        self.assertEqual(
+            self.client.put_batches,
+            [
+                [obj.key for obj in self.manifest.objects if obj.owner_id == owner]
+                for owner in self.manifest.topology.owners
+            ],
+        )
         before = list(self.catalog.events)
         for invalid in (
             receipts[:1],

@@ -201,8 +201,9 @@ class SnapshotWriter:
                 "idempotency_key": f"register-{lease.capture_id}-{descriptor['sha256']}",
             },
         )
-        for obj in manifest.objects:
-            self.store.put_registered(obj.key, tensors[obj.key], obj.sha256)
+        self.store.put_registered_batch(
+            [(obj.key, tensors[obj.key], obj.sha256) for obj in manifest.objects]
+        )
         self.catalog.objects(
             lease,
             {
@@ -247,8 +248,9 @@ class SnapshotWriter:
                 "idempotency_key": f"register-partition-{operation}",
             },
         )
-        for obj in objects:
-            self.store.put_registered(obj.key, tensors[obj.key], obj.sha256)
+        self.store.put_registered_batch(
+            [(obj.key, tensors[obj.key], obj.sha256) for obj in objects]
+        )
         self.catalog.objects(
             lease,
             {

@@ -221,9 +221,9 @@ def prepare_store_rank(rank, root, master, catalog):
                     row.update(
                         capture_id=cohort.lease.capture_id,
                         reserved_bytes=cohort.reserved_bytes,
-                        local_bytes=resource.pool.allocated_bytes
-                        if partition.active
-                        else 0,
+                        local_bytes=(
+                            resource.pool.allocated_bytes if partition.active else 0
+                        ),
                     )
                     dist.barrier()
                     complete = not partition.active
@@ -409,9 +409,11 @@ def run_cohort_writer_actors(service, rank, root):
         for index in range(2):
             fingerprint = digest_bytes(f"actor-request-{index}".encode())
             tickets = [
-                wait_for(lambda fingerprint=fingerprint: service.claim(fingerprint))
-                if rank == 0
-                else None
+                (
+                    wait_for(lambda fingerprint=fingerprint: service.claim(fingerprint))
+                    if rank == 0
+                    else None
+                )
             ]
             dist.broadcast_object_list(tickets, src=0)
             handle = service.bind(tickets[0], fingerprint)
@@ -865,6 +867,7 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
     def test_manifest_last_and_registered_arena_cross_process_read(self):
         manifest, tensors = make_snapshot(response_length=4)
         store = connect(self.master_address, segment_bytes=64 << 20)
+        store.client = MagicMock(wraps=store.client)
         pool = None
         slot = None
         complete = False
@@ -911,7 +914,25 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
             journal = PublicationJournal(journal_directory.name)
             writer = SnapshotWriter(store, catalog, journal)
             writer.write(manifest, packed, slot.manifest_buffer, lease)
+            self.assertEqual(store.client.batch_put_from.call_count, 1)
+            self.assertEqual(store.client.batch_is_exist.call_count, 1)
+            self.assertEqual(
+                store.client.batch_put_from.call_args.args[0],
+                [obj.key for obj in manifest.objects],
+            )
+            self.assertTrue(store.client.batch_put_from.call_args.args[3].with_hard_pin)
             self.assertFalse(list(journal.pending()))
+            first = manifest.objects[0]
+            mixed = [
+                (first.key, packed[first.key], first.sha256),
+                (first.key + "-batch-retry", packed[first.key], first.sha256),
+            ]
+            store.put_registered_batch(mixed)
+            self.assertEqual(
+                store.client.batch_put_from.call_args.args[0], [mixed[1][0]]
+            )
+            store.put_registered_batch(mixed)
+            self.assertEqual(store.client.batch_put_from.call_count, 2)
             # A separate process has no access to producer tensor pointers.
             result = subprocess.run(
                 [

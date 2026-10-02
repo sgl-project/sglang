@@ -30,7 +30,7 @@ it does not redefine the goal as the modules already implemented.
 | KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode |
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Coordinator admission, renewal, expiry, retract, shutdown and publication tests pass; traffic-scale stress remains open |
 | Teacher D2H batching | Optional bounded aux-owner staging shares the existing device budget with KV | Source reuse, cross-stream tail fencing, CPU P/D handoff and real AR/DSpark/P/D pass; decode transfer work falls, but no serving throughput improvement is established |
-| Mooncake adapter | Required hard pin, registered raw buffers, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including complete reads after producer exit; production retention remains open |
+| Mooncake adapter | Required hard pin, registered raw buffers, optional native payload batching, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including complete reads after producer exit; native batching passes TCP correctness and fault tests without a measured serving speedup; batch RDMA and production retention remain open |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Independent writers and real TP2/PP1, TP1/PP2 and TP2/PP2 serving/P/D tests publish complete snapshots through TCP Store; production retention and saturated load remain open |
 | Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact source-reuse checks and distributed serving publication pass; replicated-head runtime coverage still needs expansion |
@@ -3602,6 +3602,51 @@ idle workload with an empty queue. No additional GPU was allocated. New Python
 passes full Ruff, and both touched Python files pass Black and I/F; the
 coordinator adds no full-Ruff diagnostic beyond its existing nine BLE001
 warnings. The original checkout's staged index remains unchanged.
+
+## Batched Snapshot Store Writes
+
+The snapshot writer submits owner-local tensor payloads through the adapter's
+native `batch_is_exist` / `batch_put_from` path. It validates every registration
+and digest first, reads back existing keys to verify immutable retries, and
+writes only missing objects with mandatory hard pinning. Strict per-object
+statuses determine success. Known failures quarantine their enclosing registered
+allocations; malformed or missing completion statuses quarantine all submitted
+sources. A failed payload batch cannot report WRITTEN or publish its manifest.
+SDKs without either batch method use the checked scalar path; a failed native
+batch never falls back. Manifest-last publication and durable recovery remain
+unchanged.
+
+All 99 distinct regression methods pass: 18 buffer tests, 23 writer tests, 49
+coordinator tests, six actual Store/multiprocess tests, one actual-inference
+test covering AR/DSpark/retraction/admission combinations, and two P/D tests.
+The actual SDK spy proves native batching, hard-pin configuration and retries
+that read existing objects without rewriting them. One initial Store invocation
+hid the GPU and failed when a CUDA-backed cohort collector initialized; the
+corrected GPU-visible invocation passes all six methods. Both attempts are
+retained, alongside the test-only formatting reruns.
+
+Fresh scalar and batch benchmarks each run two off/on/off repetitions with
+512 requests per phase, 16 input/two output tokens, concurrency four and four
+Host slots. The 14 tensor payloads per snapshot now require one native existence
+query and one native write instead of 14 of each. All 1,210 measured snapshots
+pass post-exit readback, with every admitted request reaching READY and no
+Catalog errors or quarantined slots. Both versions allocate 5,155,584 registered
+Host bytes and use no device staging.
+
+Scalar produces 609 samples at 41.03 samples/s and 68.99 requests/s; batch
+produces 601 at 40.51 samples/s and 69.01 requests/s. This does not establish
+an end-to-end speedup. The two batch capture-on phases retain 73.26%/69.88% of
+their bracketing capture-off throughput; further overhead work must identify
+the measured costs. These are Qwen3-0.6B BF16, Triton, overlap/decode graphs,
+same-node TCP Store and an HTTP test Catalog, not production SLO acceptance.
+RDMA batching, broader workloads, production retention and trained quality
+remain separate validation requirements.
+
+All 11 submitted jobs are terminal and the resident H100 has resumed its idle
+workload, with no additional GPU allocated. Six edited Python files pass Black
+and Ruff I/F, with no new full-Ruff warnings. The original checkout's staged
+index is unchanged. See the [runbook](experiments/BATCH_STORE_WRITES.md) and
+[source-bound evidence](experiments/batch-store-writes.json).
 
 ## Next Implementation
 

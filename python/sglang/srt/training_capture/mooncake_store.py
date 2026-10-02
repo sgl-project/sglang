@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import math
+from collections.abc import Sequence
 from typing import ClassVar
 
 import torch
@@ -173,6 +174,74 @@ class MooncakeSnapshotStore:
             raise TransportError(
                 "Mooncake write completion is uncertain; source quarantined"
             ) from error
+
+    def put_registered_batch(
+        self, objects: Sequence[tuple[str, torch.Tensor, str]]
+    ) -> None:
+        """Write immutable payloads together, retaining every uncertain source."""
+        if not objects:
+            return
+        keys = [key for key, _, _ in objects]
+        if len(set(keys)) != len(keys):
+            raise ContractError("duplicate keys in a registered Store batch")
+        registrations = []
+        for _, tensor, expected_digest in objects:
+            registrations.append(self._registration(tensor))
+            if digest_bytes(tensor_bytes(tensor)) != expected_digest:
+                raise ContractError("immutable source changed before Store write")
+        batch_exists = getattr(self.client, "batch_is_exist", None)
+        batch_put = getattr(self.client, "batch_put_from", None)
+        if not callable(batch_exists) or not callable(batch_put):
+            for key, tensor, expected_digest in objects:
+                self.put_registered(key, tensor, expected_digest)
+            return
+        try:
+            exists = batch_exists(keys)
+        except Exception as error:
+            raise TransportError("Mooncake batch existence check failed") from error
+        if (
+            not isinstance(exists, (list, tuple))
+            or len(exists) != len(objects)
+            or any(type(value) is not int or value not in (0, 1) for value in exists)
+        ):
+            raise TransportError("invalid Mooncake batch existence results")
+        pending = []
+        for index, ((key, tensor, digest), present) in enumerate(zip(objects, exists)):
+            if present:
+                # Existence alone never proves an immutable retry is identical.
+                existing = self.get_tensor(
+                    key, list(tensor.shape), tensor.dtype, digest
+                )
+                del existing
+            else:
+                pending.append(index)
+        if not pending:
+            return
+        try:
+            results = batch_put(
+                [keys[i] for i in pending],
+                [objects[i][1].data_ptr() for i in pending],
+                [objects[i][1].numel() * objects[i][1].element_size() for i in pending],
+                self.replicate_config,
+            )
+            if (
+                not isinstance(results, (list, tuple))
+                or len(results) != len(pending)
+                or any(type(value) is not int for value in results)
+            ):
+                raise TransportError("invalid Mooncake batch write results")
+        except Exception as error:
+            self.quarantined.update(registrations[i] for i in pending)
+            raise TransportError(
+                "Mooncake batch write completion is uncertain; sources quarantined"
+            ) from error
+        failed = [i for i, status in zip(pending, results) if status != 0]
+        if failed:
+            self.quarantined.update(registrations[i] for i in failed)
+            raise TransportError(
+                f"Mooncake batch put_from failed for {len(failed)} objects; "
+                "sources quarantined"
+            )
 
     def get_tensor(
         self, key: str, shape: list[int], dtype: torch.dtype, expected_digest: str

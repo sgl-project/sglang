@@ -195,6 +195,169 @@ class TestMooncakeTransferContract(CustomTestCase):
             self.store.put_registered("test", self.tensor, self.digest)
         self.assertFalse(self.client.put_keys)
 
+    def batch_objects(self):
+        second = torch.arange(16, dtype=torch.float32)
+        self.store.register(second)
+        return [
+            ("first", self.tensor, self.digest),
+            ("second", second, digest_bytes(tensor_bytes(second))),
+        ]
+
+    def test_batch_writes_and_mixed_immutable_retries(self):
+        objects = self.batch_objects()
+        self.store.put_registered_batch(objects[:1])
+        self.store.put_registered_batch(objects)
+        self.store.put_registered_batch(objects)
+        self.assertEqual(self.client.put_batches, [["first"], ["second"]])
+        self.assertEqual(
+            self.client.exists_batches,
+            [["first"], ["first", "second"], ["first", "second"]],
+        )
+        self.assertEqual(self.client.put_keys, ["first", "second"])
+        for key, tensor, digest in objects:
+            restored = self.store.get_tensor(
+                key, list(tensor.shape), tensor.dtype, digest
+            )
+            torch.testing.assert_close(restored, tensor, rtol=0, atol=0)
+
+    def test_batch_validates_all_sources_and_unique_keys_before_network(self):
+        objects = self.batch_objects()
+        for invalid in (
+            [objects[0], ("second", objects[1][1], "0" * 64)],
+            [objects[0], ("second", objects[1][1].clone(), objects[1][2])],
+            [objects[0], objects[0]],
+        ):
+            with self.subTest(keys=[item[0] for item in invalid]):
+                with self.assertRaises(ContractError):
+                    self.store.put_registered_batch(invalid)
+                self.assertFalse(self.client.exists_batches)
+                self.assertFalse(self.client.put_keys)
+
+    def test_batch_existing_conflict_prevents_missing_object_writes(self):
+        objects = self.batch_objects()
+        self.client.data["second"] = bytes(objects[1][1].numel() * 4)
+        with self.assertRaisesRegex(ContractError, "digest"):
+            self.store.put_registered_batch(objects)
+        self.assertFalse(self.client.put_keys)
+        self.assertFalse(self.store.quarantined)
+
+    def test_batch_existence_failure_does_not_start_or_quarantine_transfers(self):
+        objects = self.batch_objects()
+        for result in (
+            None,
+            [],
+            [0],
+            [0, -1],
+            [False, 0],
+            [0, 0, 0],
+            OSError("lookup"),
+        ):
+            with self.subTest(result=result), patch.object(
+                self.client,
+                "batch_is_exist",
+                side_effect=result if isinstance(result, Exception) else None,
+                return_value=result,
+            ):
+                with self.assertRaises(TransportError):
+                    self.store.put_registered_batch(objects)
+                self.assertFalse(self.client.put_keys)
+                self.assertFalse(self.store.quarantined)
+
+    def test_batch_partial_failure_quarantines_only_failed_registrations(self):
+        objects = self.batch_objects()
+        for status in (-1, 64):
+            with self.subTest(status=status):
+                client = BufferStore()
+                store = MooncakeSnapshotStore(client, FakeReplicateConfig())
+                try:
+                    for _, tensor, _ in objects:
+                        store.register(tensor)
+                    with (
+                        patch.object(
+                            client, "batch_put_from", return_value=[0, status]
+                        ),
+                        self.assertRaises(TransportError),
+                    ):
+                        store.put_registered_batch(objects)
+                    self.assertEqual(store.quarantined, {objects[1][1].data_ptr()})
+                    store.unregister(objects[0][1])
+                    with self.assertRaises(TransportError):
+                        store.unregister(objects[1][1])
+                finally:
+                    store.close()
+
+    def test_batch_unknown_completion_retains_all_submitted_sources(self):
+        objects = self.batch_objects()
+        for result in (
+            None,
+            [],
+            [0],
+            [0, 0, 0],
+            [0, None],
+            [False, 0],
+            OSError("write"),
+        ):
+            with self.subTest(result=result):
+                client = BufferStore()
+                store = MooncakeSnapshotStore(client, FakeReplicateConfig())
+                try:
+                    for _, tensor, _ in objects:
+                        store.register(tensor)
+                    with (
+                        patch.object(
+                            client,
+                            "batch_put_from",
+                            side_effect=(
+                                result if isinstance(result, Exception) else None
+                            ),
+                            return_value=result,
+                        ),
+                        self.assertRaises(TransportError),
+                    ):
+                        store.put_registered_batch(objects)
+                    self.assertEqual(
+                        store.quarantined, {obj[1].data_ptr() for obj in objects}
+                    )
+                    for _, tensor, _ in objects:
+                        with self.assertRaises(TransportError):
+                            store.unregister(tensor)
+                    with self.assertRaises(TransportError):
+                        store.put_registered_batch(objects)
+                finally:
+                    store.close()
+
+    def test_batch_failed_subview_quarantines_the_whole_registered_arena(self):
+        objects = [
+            (str(index), view, digest_bytes(tensor_bytes(view)))
+            for index, view in enumerate(self.tensor.split(64))
+        ]
+        with (
+            patch.object(self.client, "batch_put_from", return_value=[0, -1]),
+            self.assertRaises(TransportError),
+        ):
+            self.store.put_registered_batch(objects)
+        self.assertEqual(self.store.quarantined, {self.tensor.data_ptr()})
+        with self.assertRaises(TransportError):
+            self.store.put_registered_batch(objects[:1])
+
+    def test_batch_falls_back_when_either_native_method_is_unavailable(self):
+        objects = self.batch_objects()
+        for missing in ("batch_is_exist", "batch_put_from"):
+            with self.subTest(method=missing):
+                self.client.data.clear()
+                self.client.put_keys.clear()
+                with patch.object(self.client, missing, None):
+                    self.store.put_registered_batch(objects)
+                    self.store.put_registered_batch(objects)
+                self.assertEqual(self.client.put_keys, ["first", "second"])
+                self.assertFalse(self.client.put_batches)
+                self.assertFalse(self.client.exists_batches)
+
+    def test_empty_batch_never_calls_the_sdk(self):
+        self.store.put_registered_batch([])
+        self.assertFalse(self.client.put_batches)
+        self.assertFalse(self.client.exists_batches)
+
 
 if __name__ == "__main__":
     unittest.main()
