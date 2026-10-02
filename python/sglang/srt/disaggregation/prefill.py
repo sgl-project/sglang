@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -101,6 +102,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+PREFILL_INPUT_POLL_INTERVAL_S = 0.0001
 
 _is_npu = is_npu()
 
@@ -646,9 +649,12 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
+        should_retry_storage_prefetch: bool = True,
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
-        self._process_hicache_events()
+        self._process_hicache_events(
+            should_retry_storage_prefetch=should_retry_storage_prefetch
+        )
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
@@ -656,7 +662,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.resolve_waiting_queue_bootstrap()
 
-        self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
+        # Skip repeated chunk processing while polling a pending batch.
+        if last_batch is None or not last_batch.prefill_chunk_processed:
+            self.process_prefill_chunk(
+                last_batch=last_batch, running_batch=running_batch
+            )
+            if last_batch is not None:
+                last_batch.prefill_chunk_processed = True
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
@@ -710,49 +722,120 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
+    def _is_continuous_input_polling_enabled(self: Scheduler) -> bool:
+        """Check support once on entry to the prefill overlap loop."""
+        if not envs.SGLANG_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.get():
+            return False
+        parallel = get_parallel()
+        enabled = (
+            parallel.attn_dp_size == 1
+            and parallel.attn_cp_size == 1
+            and self.spec_algorithm.is_none()
+            and self.is_generation
+            and self.dllm_config is None
+        )
+        if not enabled:
+            logger.warning(
+                "Continuous prefill input polling requires attention DP=CP=1 and "
+                "non-speculative autoregressive generation; using the regular overlap loop."
+            )
+        return enabled
+
+    def _yield_gil_if_needed(self: Scheduler) -> None:
+        if self.tp_size == 1:
+            # No collective parks this thread at TP=1. A bounded sleep lets
+            # bootstrap, transfer and cache workers reacquire the GIL.
+            time.sleep(PREFILL_INPUT_POLL_INTERVAL_S)
+
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
+        """Run intake while pending copies finish, keeping at most two forwards.
+
+        A deferred pause stops preparation until the current result wait finishes.
+        Shutdown stops new launches; a wait finishes through the blocking handler.
+        After a failed preparation, only new input or bootstrap arrivals retry
+        during the wait; other readiness is checked after a result finishes.
+        """
+        self.enable_continuous_input_polling = (
+            self._is_continuous_input_polling_enabled()
+        )
         self.result_queue = deque()
+        batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
+        # True when intake repeats while the oldest batch result is unfinished.
+        waiting_for_batch_result = False
+        # Avoid retrying failed batch preparation after every copy poll.
+        skip_batch_creation = False
+        # Keep the newer forward's sampling context across unfinished-result passes.
+        batch = None
+        batch_result = None
 
         while True:
             if self.gracefully_exit:
                 break
 
-            # Receive requests
-            self.ingest_requests()
+            # Stop dispatching at pause requests while waiting for a batch result.
+            received_inputs = self.ingest_requests(
+                stop_at_pause=waiting_for_batch_result
+            )
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
+                self._yield_gil_if_needed()
                 continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            self.waiting_queue.extend(bootstrapped_reqs)
+            # Resume batch creation on completion, new/ready requests, or an idle step.
+            if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
+                skip_batch_creation = False
 
-            # Get the next batch to run
-            plan = self.get_next_disagg_prefill_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
-            self.running_batch = plan.running_batch
-            batch = plan.batch_to_run
-            batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=self.chunked_req
-            )
-            self.cur_batch_for_debug = batch
+            # Keep at most two batches in flight.
+            if (
+                len(self.result_queue) < 2
+                and not self.gracefully_exit
+                and not self._deferred_input_requests
+                and not skip_batch_creation
+            ):
+                # Get the next batch to run
+                plan = self.get_next_disagg_prefill_batch_to_run(
+                    running_batch=self.running_batch,
+                    last_batch=self.last_batch,
+                    # Storage retry deadlines count scheduling steps, not copy polls.
+                    should_retry_storage_prefetch=not waiting_for_batch_result,
+                )
+                self.running_batch = plan.running_batch
+                batch = plan.batch_to_run
+                batch = self.ngram_embedding_manager.prepare_for_forward(
+                    batch, chunked_req=self.chunked_req
+                )
+                self.cur_batch_for_debug = batch
+                # Skip batch creation next round to avoid repeated preparation failures.
+                skip_batch_creation = batch is None
 
-            # Launch the current batch
-            if batch:
-                if self.enable_staging:
-                    self.maybe_prefetch_staging_for_batch(batch)
-                batch_result = self.run_batch(batch)
-                self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
-            else:
-                batch_result = None
-                self._sched_idled = True
+                # Launch the current batch
+                if batch:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(batch)
+                    batch_result = self.run_batch(batch)
+                    self._apply_war_barrier()
+                    self.result_queue.append((batch.copy(), batch_result))
+                else:
+                    batch_result = None
 
-            # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if self.enable_continuous_input_polling:
+                    # Resume intake until the oldest result is ready on all TP ranks.
+                    oldest_batch_result = self.result_queue[0][1]
+                    if (
+                        not self.gracefully_exit
+                        and not self.is_disagg_prefill_batch_result_ready(
+                            oldest_batch_result, batch_result_completion_status
+                        )
+                    ):
+                        waiting_for_batch_result = True
+                        self._yield_gil_if_needed()
+                        continue
+                # Process the oldest batch result.
+                oldest_batch, oldest_batch_result = self.result_queue.popleft()
+                self.process_batch_result(oldest_batch, oldest_batch_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -763,8 +846,36 @@ class SchedulerDisaggregationPrefillMixin:
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
 
-            # Update last_batch
+            # Update last_batch and scheduler status
+            self._sched_idled = batch is None
             self.last_batch = batch
+            waiting_for_batch_result = False
+
+    def is_disagg_prefill_batch_result_ready(
+        self: Scheduler,
+        batch_result: GenerationBatchResult,
+        batch_result_completion_status: torch.Tensor,
+    ) -> bool:
+        # 0: sampling/copy has not been submitted, so polling cannot make progress.
+        state = 0
+        if (
+            batch_result.copy_done is not None
+            and batch_result.delay_sample_func is None
+        ):
+            # 1: copy unfinished; 2: copy finished locally.
+            state = 2 if batch_result.copy_done.query() else 1
+        if self.tp_size > 1:
+            batch_result_completion_status.fill_(state)
+            torch.distributed.all_reduce(
+                batch_result_completion_status,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            state = batch_result_completion_status.item()
+        if state == 0:
+            # Every rank must submit delayed sampling before entering this wait.
+            raise RuntimeError("Prefill result copy must be submitted before polling")
+        return state == 2
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -1264,7 +1375,8 @@ class SchedulerDisaggregationPrefillMixin:
                 elif self.has_bootstrapped_waiting_req():
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
-                    if not self.enable_overlap:
+                    # Retract may drain every result, leaving no handler to requeue.
+                    if not self.enable_overlap or req.inflight_middle_chunks == 0:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
             elif self.enable_overlap:
