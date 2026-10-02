@@ -1002,6 +1002,7 @@ class Envs:
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
+    SGLANG_NPU_INDEXER_INT8 = EnvBool(False)
 
     # ===================================================================
     # MUSA
