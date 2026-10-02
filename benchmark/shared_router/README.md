@@ -110,26 +110,34 @@ made from these sequential, co-located pairs.
 
 ### Completed public-main fallback checks
 
-The same public-main source and protocol completed C4, C8 and C16 qualification:
+The same public-main source and protocol completed C4, C8, C16 and C32 qualification:
 
 | C | Native P50 TPOT (ms) | Fused-enabled P50 TPOT (ms) | Change | Output tokens/s change | Full GSM8K correct, native/fused-enabled |
 | ---: | ---: | ---: | ---: | ---: | --- |
 | 4 | 4.066732 | 4.060509 | -0.153% | +0.137% | 1278/1284 of 1319 |
 | 8 | 5.616812 | 5.612190 | -0.082% | +0.022% | 1285/1285 of 1319 |
 | 16 | 8.473711 | 8.454563 | -0.226% | +0.042% | 1285/1283 of 1319 |
+| 32 | 13.522073 | 13.530773 | +0.064% | +0.102% | 1284/1278 of 1319 |
 
-All three accuracy pairs had zero request errors. Hash-checked traces show graph
+All four accuracy pairs had zero request errors. Hash-checked traces show graph
 replay on all four ranks but no horizontal-fusion launches in steady decode.
 These are native-fallback checks with no observed material regression, not
 evidence of a fusion speedup at these batch sizes. Tail batches can still enter
-the supported small-M path. Other current-main and incremental cases remain
-pending; the historical sweep below cannot substitute for them.
+the supported small-M path. The public-main forward sweep is complete; its C1
+reverse-order check and the incremental C1 reverse/C32 checks remain pending.
+The historical sweep below cannot substitute for them.
 
-C16 used the single-start steady-decode probe in REPRODUCE.md, avoiding the
+At C32 the candidate lost six correct answers (0.455 percentage points), close
+to the local 0.5 pp loss limit. Passing that gate does not establish equivalent
+accuracy. P50 TPOT regressed 0.064%; this is not a fusion speedup claim.
+
+C16 and C32 used the single-start steady-decode probe in REPRODUCE.md, avoiding the
 staged profiler restart that stalled an earlier attempt. Both arms collected
 16 graph launches per rank with correlated GPU kernels. P50 ITL changed
 +0.058% and P50 TTFT -0.059%. Zero fused steady-decode launches make this a
-fallback check, not evidence of a fusion speedup at C16.
+fallback check, not evidence of a fusion speedup at C16. At C32, P50 ITL changed
+-0.198% and P50 TTFT -0.039%; both arms also exported 16 graph launches per rank
+and no fused launches in steady decode.
 
 On the #42055 common source, the C8 fallback check completed with P50 TPOT
 5.558282 to 5.572054 ms (+0.248%) and output throughput -0.083%. Full GSM8K
@@ -147,6 +155,13 @@ traces show graph replay with zero fused launches. The TTFT regression remains
 visible: its cause is not established, and co-location alone does not prove it
 is noise. The minimum per-repeat TPOT increased 0.206%, unlike the median;
 neither summary establishes a meaningful fusion gain at C4.
+
+The #42055 C16 fallback check measured P50 TPOT 8.416674 to 8.396588 ms
+(-0.239%), output throughput +0.065%, P50 ITL -0.244% and P50 TTFT +0.236%.
+Full GSM8K was 1285 to 1286/1319 with zero errors and independently rescored
+responses. Both arms exported 16 graph launches per rank with zero fused
+launches in steady decode. Warmup is excluded: the native 8.725238 ms sample
+was the warmup, not one of the three measured repetitions.
 
 ### Completed common-source folded-expert comparison
 
@@ -199,8 +214,8 @@ questions. Baseline/candidate correct counts were 1287/1285, 1286/1281,
 1283/1282, 1284/1284, 1283/1285 and 1286/1285 at C1/2/4/8/16/32. All passed the
 local 0.5-percentage-point loss tolerance; that tolerance is not an upstream
 standard or proof of numerical equivalence. Synthetic outputs are never used
-as accuracy evidence. Current-main all-concurrency accuracy and reverse-order
-confirmation remain pending.
+as accuracy evidence. Current-main all-concurrency accuracy is now complete;
+remaining incremental and reverse-order qualification is listed above.
 
 ## Prior art and qualification still required
 

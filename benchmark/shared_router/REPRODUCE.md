@@ -175,7 +175,8 @@ the HTTP client. Do not include this request in performance statistics.
 The staged probe below has completed at C1/C2/C4/C8. Do not extrapolate it to
 C16/C32: during qualification a C16 server stalled when the profiler restarted
 between prefill and decode. The single-start, steady-decode protocol below
-passed both arms at C16; C32 qualification remains pending.
+passed both arms at C16 and C32 on the public-main source, and C16 on the
+incremental #42055 source. Incremental C32 qualification remains pending.
 For readiness detection, `spec_verify_calls_total` is not a live per-step
 counter in the pinned source: it increments when a request finishes. It is
 suitable for the completed-request AL audit, not for triggering a profiler
@@ -229,9 +230,11 @@ Use this instead of the staged probe above, after timing is finished. Start
 all requests before enabling profiling, then wait for a full active batch,
 an empty queue and live sequence lengths beyond prefill. The pinned source
 reports full sequence lengths in `decode_sum_seq_lens`, not SWA cache lengths.
-The qualification harness validated this protocol at C16 on both arms; this
-self-contained command uses the same requests, trigger and profiler payload.
-It is not a new timing measurement or a claim that C32 is already qualified.
+The qualification harness validated this protocol at C16 and C32 on both
+public-main arms, and C16 on both incremental #42055 arms. This self-contained
+command uses the same requests, trigger and profiler payload; its payload was
+also checked with CPU mocks. It is not a new timing measurement or a claim
+that this exact standalone snippet was used by the qualification jobs.
 
 ```bash
 export BASE_URL=http://127.0.0.1:30000 CONC=16
@@ -294,8 +297,8 @@ PY
 On the pinned source, `start_step=1` clamps to the next forward. Wait for four
 `steady-decode-*-TP-<rank>.trace.json.gz` files, without the staged `-DECODE`
 suffix, and apply the same raw-hash and graph-correlation checks described
-above. Both C16 arms exported 16 graph launches per rank with correlated GPU
-kernels and no fused launches in steady decode. A timeout or exported trace
+above. Both public-main C16 and C32 arms exported 16 graph launches per rank
+with correlated GPU kernels and no fused launches in steady decode. A timeout or exported trace
 alone is not proof of valid full-batch attribution. Keep trigger metrics and
 server logs; do not restart an active run merely because observation timed out.
 
