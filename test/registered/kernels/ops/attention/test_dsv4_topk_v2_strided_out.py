@@ -19,7 +19,9 @@ PAGE_SIZE = 64
 
 
 @pytest.mark.parametrize("bs", [1, 4, 33, 256])
-@pytest.mark.parametrize("max_seq", [96, 700, 5000])
+# 12000 / 20000 / 40000 cross the kernel's kLevel dispatch thresholds (8192,
+# 16384, cluster floor) so every specialization writes through out_stride.
+@pytest.mark.parametrize("max_seq", [96, 700, 5000, 12000, 20000, 40000])
 def test_topk_v2_strided_out_matches_dense(bs, max_seq):
     torch.manual_seed(bs * 7 + max_seq)
     dev = torch.device("cuda")

@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_rows_per_chunk,
     mqa_logits_should_chunk,
 )
+from sglang.srt.mem_cache.dsv41_request_window import WindowLayout
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -139,7 +140,7 @@ def copy_metadata(
         assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
         if isinstance(dst_val, torch.Tensor) and isinstance(src_val, torch.Tensor):
             copy_unless_aliased(dst_val, src_val)
-        elif hasattr(dst_val, "copy_"):
+        elif isinstance(dst_val, WindowLayout):
             dst_val.copy_(src_val)
         else:
             warnings.warn(
