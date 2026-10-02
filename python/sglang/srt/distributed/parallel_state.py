@@ -94,6 +94,21 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
+# Bounds of the 1-stage fused AR+RMSNorm kernel (AITER, ROCm).
+#
+# The 1-stage kernel launches one block per token, capped by the kMaxBlocks == 80
+# signal slots in aiter/csrc/include/custom_all_reduce.cuh; past that it
+# grid-strides, which is no longer the regime it is fast in.
+_FUSED_AR_RMS_1STAGE_MAX_TOKENS = 80
+# In the 1-stage kernel every rank reads every peer, so it moves
+# `world_size * payload`, while the 2-stage (reduce-scatter + all-gather)
+# kernel moves ~`2 * payload` whatever the world size. What bounds 1-stage is
+# therefore its read volume, not the payload on its own. The budget is the
+# historical 128 KiB payload cutoff expressed at world_size 8, so 8-way TP --
+# the world size the per-group-quant sibling below is tuned against -- keeps
+# the cutoff it had.
+_FUSED_AR_RMS_1STAGE_MAX_READ_BYTES = 8 * 128 * 1024
+
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -836,17 +851,26 @@ class GroupCoordinator:
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
 
-        # 1-stage vs 2-stage selection for fused AR+RMSNorm:
-        # The 1-stage kernel launches one block per token and is capped at
-        # 80 tokens (kMaxBlocks).  Guard with a byte threshold so large
-        # prefill batches fall through to the 2-stage kernel instead of
-        # hitting a runtime error.  AITER's C++ dispatch already gates
-        # which hidden_dims have valid 1-stage support.
+        # 1-stage vs 2-stage selection for fused AR+RMSNorm: stay on the
+        # 1-stage kernel while the batch fits its one-block-per-token budget
+        # and its read volume keeps the collective latency-bound; large
+        # prefill batches still fall through to the 2-stage kernel, which is
+        # what the guard is for.  A cutoff on the payload alone is the wrong
+        # shape for both bounds: it scales with the hidden dim, so at
+        # hidden_size 6144 a 128 KiB budget is spent by 10 tokens and every
+        # decode batch was pushed onto the 2-stage kernel while sitting far
+        # inside the kernel's block budget, and it does not scale with the
+        # world size the 1-stage read volume is proportional to.  AITER's C++
+        # dispatch still gates which hidden_dims have valid 1-stage support.
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
             total_bytes = input_.numel() * input_.element_size()
-            use_1stage_ar = total_bytes <= 128 * 1024
+            num_tokens = input_.numel() // input_.shape[-1]
+            use_1stage_ar = (
+                num_tokens <= _FUSED_AR_RMS_1STAGE_MAX_TOKENS
+                and total_bytes * self.world_size <= _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES
+            )
 
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
