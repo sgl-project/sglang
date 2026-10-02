@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.deep_select import (
+    is_deep_select_supported,
+    topk_page_transform,
+)
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
@@ -48,6 +52,9 @@ class FullTopKIndexer:
         self.req_to_token = req_to_token
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
         self.use_deep_gemm_decode = use_deep_gemm_decode
+        self.use_deep_select_decode = (
+            not use_deep_gemm_decode and is_deep_select_supported()
+        )
 
     def topk_prefill(self, inputs: PrefillInputs, out: Selection) -> None:
         if self.use_deep_gemm_prefill:
@@ -137,6 +144,20 @@ class FullTopKIndexer:
             req_to_token=self.req_to_token,
         )
         if d is None:
+            return
+        # Sparse prefill consumers need raw positions as well as mapped slots;
+        # the fused DeepSelect epilogue intentionally returns mapped slots only.
+        if self.use_deep_select_decode and out.raw_indices is None:
+            metadata = inputs.paged_metadata
+            topk_page_transform(
+                d.scores,
+                inputs.indexer.index_topk,
+                page_table=metadata.page_table[: d.bs],
+                page_size=metadata.compressed_page_size,
+                end=d.lens.to(torch.int32),
+                sorted_index=False,
+                output_idx=out.page_indices[: d.bs],
+            )
             return
         k = min(inputs.indexer.index_topk, d.lmax)
         idx = d.scores.topk(k, dim=-1, sorted=False).indices

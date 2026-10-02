@@ -904,6 +904,145 @@ class TestChunkedTopKMatchesUnchunked(CustomTestCase):
                 self.assertTrue(torch.equal(run(rows_per_chunk), expected))
 
 
+class TestDeepSelectFullTopKDecode(CustomTestCase):
+    @staticmethod
+    def _decode_case(*, raw_indices):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import (
+            DecodeInputs,
+            Selection,
+        )
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import DecodeScores
+
+        scores = torch.tensor(
+            [[1.0, 4.0, 2.0, 3.0], [3.0, 2.0, -torch.inf, -torch.inf]],
+            dtype=torch.float32,
+        )
+        lens = torch.tensor([4, 2], dtype=torch.int64)
+        slots = torch.tensor([[40, 10, 30, 20], [80, 70, 0, 0]], dtype=torch.int64)
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[10], [20]], dtype=torch.int32),
+            compressed_page_size=4,
+        )
+        inputs = DecodeInputs(
+            indexer=SimpleNamespace(index_topk=8),
+            layer_id=0,
+            compress_ratio=1,
+            freqs_cis=None,
+            x=None,
+            q_lora=None,
+            positions=None,
+            req_rows=torch.arange(2),
+            paged_metadata=metadata,
+            is_verify=False,
+        )
+        page_indices = torch.full((2, 8), -1, dtype=torch.int32)
+        selection = Selection(page_indices=page_indices, raw_indices=raw_indices)
+        data = DecodeScores(bs=2, lmax=4, lens=lens, slots=slots, scores=scores)
+        return inputs, selection, data
+
+    def test_constructor_enables_deep_select_only_without_deep_gemm(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk as mod
+
+        with patch.object(mod, "is_deep_select_supported", return_value=True):
+            fused = mod.FullTopKIndexer(
+                token_to_kv_pool=None,
+                req_to_token=torch.empty((0, 0), dtype=torch.int32),
+                use_deep_gemm_prefill=False,
+                use_deep_gemm_decode=False,
+            )
+            deep_gemm = mod.FullTopKIndexer(
+                token_to_kv_pool=None,
+                req_to_token=torch.empty((0, 0), dtype=torch.int32),
+                use_deep_gemm_prefill=False,
+                use_deep_gemm_decode=True,
+            )
+
+        self.assertTrue(fused.use_deep_select_decode)
+        self.assertFalse(deep_gemm.use_deep_select_decode)
+
+    def test_decode_uses_fused_page_transform_without_raw_output(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk as mod
+
+        inputs, selection, data = self._decode_case(raw_indices=None)
+        indexer = object.__new__(mod.FullTopKIndexer)
+        indexer.token_to_kv_pool = None
+        indexer.req_to_token = None
+        indexer.use_deep_gemm_decode = False
+        indexer.use_deep_select_decode = True
+        expected = torch.tensor(
+            [
+                [41, 43, 42, 40, -1, -1, -1, -1],
+                [80, 81, -1, -1, -1, -1, -1, -1],
+            ],
+            dtype=torch.int32,
+        )
+
+        def run_fused(_scores, _topk, *, output_idx, **_kwargs):
+            output_idx.copy_(expected)
+            return output_idx
+
+        with (
+            patch.object(mod, "decode_scores", return_value=data),
+            patch.object(
+                mod, "topk_page_transform", side_effect=run_fused
+            ) as page_transform,
+            patch.object(mod, "write_decode") as write_decode,
+        ):
+            indexer.topk_decode(inputs, selection)
+
+        self.assertTrue(torch.equal(selection.page_indices, expected))
+        write_decode.assert_not_called()
+        args, kwargs = page_transform.call_args
+        self.assertIs(args[0], data.scores)
+        self.assertEqual(args[1], inputs.indexer.index_topk)
+        self.assertTrue(
+            torch.equal(kwargs["page_table"], inputs.paged_metadata.page_table)
+        )
+        self.assertEqual(
+            kwargs["page_size"], inputs.paged_metadata.compressed_page_size
+        )
+        self.assertEqual(kwargs["end"].dtype, torch.int32)
+        self.assertTrue(torch.equal(kwargs["end"], data.lens.to(torch.int32)))
+        self.assertFalse(kwargs["sorted_index"])
+        self.assertEqual(
+            kwargs["output_idx"].data_ptr(), selection.page_indices.data_ptr()
+        )
+
+    def test_decode_keeps_raw_index_fallback(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk as mod
+
+        raw_indices = torch.full((2, 8), -1, dtype=torch.int32)
+        inputs, selection, data = self._decode_case(raw_indices=raw_indices)
+        inputs.indexer.index_topk = 2
+        indexer = object.__new__(mod.FullTopKIndexer)
+        indexer.token_to_kv_pool = None
+        indexer.req_to_token = None
+        indexer.use_deep_gemm_decode = False
+        indexer.use_deep_select_decode = True
+
+        with (
+            patch.object(mod, "decode_scores", return_value=data),
+            patch.object(mod, "topk_page_transform") as page_transform,
+        ):
+            indexer.topk_decode(inputs, selection)
+
+        page_transform.assert_not_called()
+        self.assertTrue(
+            torch.equal(
+                selection.page_indices[:, :2],
+                torch.tensor([[10, 20], [80, 70]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                selection.raw_indices[:, :2],
+                torch.tensor([[1, 3], [0, 1]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(torch.all(selection.page_indices[:, 2:] == -1))
+        self.assertTrue(torch.all(selection.raw_indices[:, 2:] == -1))
+
+
 class TestChunkedPagedDecode(CustomTestCase):
     """An eager decode whose paged-MQA metadata is split into row chunks (#40637):
     every DeepGEMM call must get its own chunk's schedule and every top-k its own
