@@ -10,6 +10,7 @@ from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
     swizzle_blockscale,
 )
+from sglang.srt.layers.utils.common import alias_or_bind_derived_param
 from sglang.srt.utils.weight_checker import (
     _build_check_entries,
     _build_quantized_set,
@@ -26,12 +27,12 @@ _EXPERTS, _HIDDEN, _INTERMEDIATE = 2, 256, 128
 _VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
-def _checkpoint():
+def _checkpoint(hidden=_HIDDEN):
     generator = torch.Generator().manual_seed(42)
     result = {}
     for op, n, k in (
-        ("w13", 2 * _INTERMEDIATE, _HIDDEN),
-        ("w2", _HIDDEN, _INTERMEDIATE),
+        ("w13", 2 * _INTERMEDIATE, hidden),
+        ("w2", hidden, _INTERMEDIATE),
     ):
         codes = torch.randint(
             0, 16, (_EXPERTS, n, k), generator=generator, dtype=torch.uint8
@@ -86,18 +87,19 @@ def _layer(checkpoint, backend):
             gate, up = tensor.chunk(2, dim=1)
             put(f"w13_{suffix}", interleave_w13_halves(torch.cat((up, gate), dim=1)))
         for op in ("w13", "w2"):
-            put(
+            alias_or_bind_derived_param(
+                layer,
                 f"{op}_weight_scale",
+                f"{op}_blockscale_swizzled",
                 swizzle_blockscale(getattr(layer, f"{op}_weight_scale")),
-            )
-            setattr(
-                layer, f"{op}_blockscale_swizzled", getattr(layer, f"{op}_weight_scale")
             )
             q = getattr(layer, f"{op}_weight")
             put(
                 f"{op}_blockscale_mma",
                 convert_sf_to_mma_layout(
-                    getattr(layer, f"{op}_weight_scale").view(torch.uint8).reshape(-1),
+                    getattr(layer, f"{op}_blockscale_swizzled")
+                    .view(torch.uint8)
+                    .reshape(-1),
                     m=q.shape[1],
                     k=q.shape[2] * 2,
                     num_groups=_EXPERTS,
@@ -127,6 +129,18 @@ def _entries(layer, *, snapshot=False):
 
 
 class TestNvfp4WeightChecker(CustomTestCase):
+    def test_unaliased_padded_scales_are_checked(self):
+        checkpoint = _checkpoint(hidden=192)
+        layer = _layer(checkpoint, "cutedsl")
+        self.assertIsNot(layer.w2_weight_scale, layer.w2_blockscale_swizzled)
+        expected = _entries(layer, snapshot=True)
+        _check_tensors(expected, _entries(layer))
+        for field in ("w2_weight_scale", "w2_blockscale_swizzled", "w2_blockscale_mma"):
+            layer = _layer(checkpoint, "cutedsl")
+            getattr(layer, field).view(torch.uint8).fill_(127)
+            with self.assertRaisesRegex(Exception, "check tensor equality failed"):
+                _check_tensors(expected, _entries(layer), allow_quant_error=True)
+
     def test_real_backend_layouts_decode_checkpoint_values(self):
         checkpoint = _checkpoint()
         for backend in ("trtllm", "cutedsl"):

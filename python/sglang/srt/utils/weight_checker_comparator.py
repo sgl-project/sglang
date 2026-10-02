@@ -180,7 +180,12 @@ class Nvfp4MoEComparable(ComparableWeight):
     def _scales(self):
         e, n, k_bytes = self.w_q.shape
         if self.layout == "cutedsl_linear":
-            return self.w_s.view(torch.float8_e4m3fn).reshape(e, n, k_bytes // 8)
+            s = self.w_s.view(torch.uint8)
+            # Non-gated experts can retain unpadded source scales alongside padded weights.
+            s = torch.nn.functional.pad(
+                s, (0, k_bytes // 8 - s.shape[2], 0, n - s.shape[1])
+            )
+            return s.view(torch.float8_e4m3fn)
         s = self.w_s
         if self.layout == "cutedsl_mma":
             assert s.ndim == 6
