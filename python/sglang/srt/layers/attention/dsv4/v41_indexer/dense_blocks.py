@@ -102,7 +102,7 @@ class DenseBlocksBackend:
         )
         k = min(inputs.indexer.index_topk, d.lmax)
         idx = d.scores.topk(k, dim=-1, sorted=False).indices
-        write_decode(out, d, idx)
+        write_decode(out, d, idx, self.req_to_token)
         return published
 
     def consume_decode(
@@ -124,7 +124,12 @@ class DenseBlocksBackend:
         idx = topk_among_blocks(
             d.scores, d.lens, published.blocks, k, block_size=self.block_size
         )
-        write_decode(out, d, idx.masked_fill(idx < 0, d.lmax))
+        write_decode(
+            out,
+            d,
+            idx.masked_fill(idx < 0, d.lmax),
+            self.req_to_token,
+        )
 
     # ---------- DeepGEMM: flattened-K scores ----------
 

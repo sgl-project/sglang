@@ -140,7 +140,7 @@ class FullTopKIndexer:
             return
         k = min(inputs.indexer.index_topk, d.lmax)
         idx = d.scores.topk(k, dim=-1, sorted=False).indices
-        write_decode(out, d, idx)
+        write_decode(out, d, idx, self.req_to_token)
 
     def _deep_gemm_prefill_captured(
         self, inputs: CapturedPrefillInputs, out: Selection
