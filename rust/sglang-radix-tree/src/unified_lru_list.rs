@@ -483,8 +483,65 @@ impl<K: ChildKeyType> EvictionStrategy<K> for SlruStrategy {
     }
 }
 
+/// Tail-optimized LRU: reclaim whole nodes within the conversation's tail
+/// budget before other nodes, using recency within each group.
+pub struct TlruStrategy {
+    /// max(threshold - next_prompt_estimate, 0), in logical tokens.
+    pub tail_budget: usize,
+    /// Preserve Python's operation order when either parameter is a float.
+    pub float_config: Option<TlruFloatConfig>,
+}
+
+#[derive(Clone, Copy)]
+pub struct TlruFloatConfig {
+    pub threshold: f64,
+    pub next_prompt_estimate: TlruPromptEstimate,
+}
+
+/// How Python evaluates history + next_prompt_estimate before subtraction.
+#[derive(Clone, Copy)]
+pub enum TlruPromptEstimate {
+    Float(f64),
+    /// Add the actual history before converting to float, as Python does.
+    Integer(i128),
+}
+
+impl TlruFloatConfig {
+    pub(crate) fn is_tel_safe(&self, history: usize, cached_without_node: usize) -> bool {
+        let next_prompt = match self.next_prompt_estimate {
+            TlruPromptEstimate::Float(estimate) => history as f64 + estimate,
+            TlruPromptEstimate::Integer(estimate) => estimate
+                .checked_add(history as i128)
+                .expect("T-LRU history + next_prompt_estimate overflowed i128")
+                as f64,
+        };
+        let budget = next_prompt - self.threshold;
+        // Match Python's max(budget, 0) and exact int >= float comparison.
+        // NaN stays unsafe; casting the integer to f64 could round it upward.
+        budget <= 0.0
+            || (budget < (usize::MAX as u128 + 1) as f64
+                && cached_without_node >= budget.ceil() as usize)
+    }
+}
+
+impl<K: ChildKeyType> EvictionStrategy<K> for TlruStrategy {
+    fn get_priority(&self, node: &Node<K>) -> PriorityKey {
+        let cached_without_node = node.tlru_cached_prefix_len - node.key.atom_len();
+        let tel_safe = match self.float_config {
+            Some(config) => config.is_tel_safe(node.tlru_history_len, cached_without_node),
+            None => node.tlru_history_len - cached_without_node <= self.tail_budget,
+        };
+        PriorityKey(if tel_safe { -1 } else { 0 }, node.last_access_counter)
+    }
+}
+
 /// The strategy for an eviction-policy name.
-pub fn get_eviction_strategy<K: ChildKeyType>(policy: &str) -> Box<dyn EvictionStrategy<K> + Send> {
+pub fn get_eviction_strategy<K: ChildKeyType>(
+    policy: &str,
+    slru_protected_threshold: i64,
+    tlru_tail_budget: usize,
+    tlru_float_config: Option<TlruFloatConfig>,
+) -> Box<dyn EvictionStrategy<K> + Send> {
     match policy.to_lowercase().as_str() {
         "lru" => Box::new(LruStrategy),
         "lfu" => Box::new(LfuStrategy),
@@ -493,11 +550,15 @@ pub fn get_eviction_strategy<K: ChildKeyType>(policy: &str) -> Box<dyn EvictionS
         "filo" => Box::new(FiloStrategy),
         "priority" => Box::new(PriorityStrategy),
         "slru" => Box::new(SlruStrategy {
-            protected_threshold: 2,
+            protected_threshold: slru_protected_threshold,
+        }),
+        "tlru" => Box::new(TlruStrategy {
+            tail_budget: tlru_tail_budget,
+            float_config: tlru_float_config,
         }),
         other => panic!(
             "Unknown eviction policy: {other}. Supported policies: \
-             'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
+             'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru'."
         ),
     }
 }

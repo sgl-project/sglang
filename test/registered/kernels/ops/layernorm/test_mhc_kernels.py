@@ -143,7 +143,7 @@ def test_mhc_fused_post_pre_matches_unfused(
 
 def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     from sglang.srt.environ import envs
-    from sglang.srt.layers.communicator import MHCState
+    from sglang.srt.layers.layer_boundary import MHCState
     from sglang.srt.layers.layernorm import RMSNorm
     from sglang.srt.models.glm5_next import Glm5NextDecoderLayer
 
@@ -174,7 +174,7 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     ]
     # Literal, not derived from the cutoff constant: deriving it makes this a
     # mirror that stays green when the cutoff moves. None is the empty batch,
-    # which attn_to_mlp short-circuits before reaching the callback.
+    # which update_and_read_ffn_input short-circuits before reaching the callback.
     fused_expected = {1: True, 6: True, 17: False}[x.shape[0]] if x.shape[0] else None
     with envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(True):
         if x.shape[0] > 0:
@@ -193,15 +193,17 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
                 f"num_tokens={x.shape[0]} fused={not declined}, "
                 f"expected fused={fused_expected}"
             )
-        outputs = [s.attn_to_mlp(x, residual.flatten(1), norm) for s in states]
+        outputs = [
+            s.update_and_read_ffn_input(x, residual.flatten(1), norm) for s in states
+        ]
     torch.testing.assert_close(outputs[0][0], outputs[1][0], atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(outputs[0][1], outputs[1][1], atol=0, rtol=0)
     torch.testing.assert_close(states[0].h_res, states[1].h_res, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(states[0].h_post, states[1].h_post, atol=1e-3, rtol=1e-3)
     # The next combine must consume the FFN mixing matrices, not attention's.
     torch.testing.assert_close(
-        states[0].mlp_combine(x, outputs[0][1]),
-        states[1].mlp_combine(x, outputs[1][1]),
+        states[0].apply_post(x, outputs[0][1]),
+        states[1].apply_post(x, outputs[1][1]),
         atol=2e-3,
         rtol=2e-2,
     )
