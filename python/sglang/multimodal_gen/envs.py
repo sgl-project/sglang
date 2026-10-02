@@ -241,7 +241,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "SGLANG_DIFFUSION_ATTENTION_BACKEND"
     ),
     # Cosmos3 Multiview-AV attention backend for masked exports: "auto" (default;
-    # FA4 block-sparse on Blackwell, FlexAttention Triton elsewhere), "triton" or
+    # FA4 block-sparse on Hopper and Blackwell, FlexAttention Triton elsewhere), "triton" or
     # "fa4". Wins over the checkpoint's multiview.backend within its family; an
     # explicit pipeline-config multiview_attention_backend wins over both. The
     # masked and maskless families cannot be swapped: they are different attention.

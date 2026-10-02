@@ -44,8 +44,8 @@ COSMOS3_MULTIVIEW_ATTENTION_SCOPES = ("all_views", "same_view", "decomposed")
 # speed knob.
 COSMOS3_MULTIVIEW_ATTENTION_BACKENDS = ("triton", "fa4", "maskless")
 COSMOS3_MULTIVIEW_MASKED_BACKENDS = ("triton", "fa4")
-# Masked-family kernel left to the device: FA4 block-sparse on Blackwell,
-# FlexAttention's Triton kernel elsewhere.
+# Masked-family kernel left to the device: FA4 block-sparse on Hopper and
+# Blackwell, FlexAttention's Triton kernel elsewhere.
 COSMOS3_MULTIVIEW_AUTO_BACKEND = "auto"
 MULTIVIEW_BACKEND_ENV_VAR = "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
 # Versioned exports this build reads. Version 3 (Oct 1 2026) adds the rig view
@@ -765,8 +765,8 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
     use_system_prompt: bool = True
 
     # Attention kernel for masked exports: None follows the environment override,
-    # then the device ("auto": FA4 block-sparse on Blackwell, FlexAttention
-    # Triton elsewhere); "triton" and "fa4" pin one. Swapping triton and fa4 is
+    # then the device ("auto": FA4 block-sparse on Hopper and Blackwell,
+    # FlexAttention Triton elsewhere); "triton" and "fa4" pin one. Swapping triton and fa4 is
     # safe for A/B measurement; the masked family and "maskless" are different
     # attention patterns and cannot be swapped.
     multiview_attention_backend: str | None = None
@@ -811,7 +811,10 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
         if not backend:
             backend = COSMOS3_MULTIVIEW_AUTO_BACKEND
             source = "transformer/config.json multiview.backend"
-        allowed = (*COSMOS3_MULTIVIEW_ATTENTION_BACKENDS, COSMOS3_MULTIVIEW_AUTO_BACKEND)
+        allowed = (
+            *COSMOS3_MULTIVIEW_ATTENTION_BACKENDS,
+            COSMOS3_MULTIVIEW_AUTO_BACKEND,
+        )
         if backend not in allowed:
             raise ValueError(
                 "Cosmos3 multiview attention backend must be one of "

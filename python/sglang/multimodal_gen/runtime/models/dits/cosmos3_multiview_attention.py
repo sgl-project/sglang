@@ -112,7 +112,10 @@ def fa4_sparse_available(device: torch.device | None = None) -> bool:
         device = torch.device("cuda")
     if device.type != "cuda":
         return False
-    if torch.cuda.get_device_capability(device)[0] not in FA4_SPARSE_BLOCK_SIZES_BY_CAPABILITY:
+    if (
+        torch.cuda.get_device_capability(device)[0]
+        not in FA4_SPARSE_BLOCK_SIZES_BY_CAPABILITY
+    ):
         return False
     try:
         import cutlass  # noqa: F401
@@ -123,19 +126,15 @@ def fa4_sparse_available(device: torch.device | None = None) -> bool:
 
 
 def resolve_masked_backend(device: torch.device | None = None) -> str:
-    """The masked-family kernel for ``device``: FA4 block-sparse on Blackwell, else Triton.
+    """The masked-family kernel for ``device``: FA4 block-sparse where its kernels run
+    (SM90 Hopper, SM100 Blackwell, with the flash-attn CuTe package), else Triton.
 
-    Hopper can run the FA4 kernel when asked for explicitly; the default keeps
-    FlexAttention there until the FA4 path is validated on it at scale.
+    Hopper joined the default on Oct 2 2026 after the H200 A/B: both kernels at
+    bf16 rounding from the dense oracle, FA4 2x faster per call.
     """
     if device is None and torch.cuda.is_available():
         device = torch.device("cuda")
-    if (
-        device is not None
-        and device.type == "cuda"
-        and torch.cuda.get_device_capability(device)[0] >= 10
-        and fa4_sparse_available(device)
-    ):
+    if device is not None and device.type == "cuda" and fa4_sparse_available(device):
         return "fa4"
     return "triton"
 

@@ -61,6 +61,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention impor
     layout_sparse_block_sizes,
     multiview_pair_predicate,
     padded_multiview_flex_attention,
+    resolve_masked_backend,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_layout import (
     MaskItem,
@@ -232,12 +233,18 @@ RIG_VIEW_EMBEDDING = {
 # masked family with a 0.4 s past window, rig view embedding, 1x1 LiDAR patch,
 # LiDAR tokenizer streaming 20 sweeps per chunk with 21 of context.
 SCHEMA3_BLOCK = {
-    **{k: v for k, v in SCHEMA2_BLOCK.items() if k != "separate_view_text_tokenization"},
+    **{
+        k: v for k, v in SCHEMA2_BLOCK.items() if k != "separate_view_text_tokenization"
+    },
     "backend": "triton",
     "decomposed_temporal_window_seconds": 0.4,
     "schema_version": 3,
     "per_view_captions": True,
-    "lidar": {**LIDAR_BLOCK, "streaming_chunk_frames": 20, "streaming_context_frames": 21},
+    "lidar": {
+        **LIDAR_BLOCK,
+        "streaming_chunk_frames": 20,
+        "streaming_context_frames": 21,
+    },
     "lidar_patch_spatial_hw": [1, 1],
     "rig_view_embedding": RIG_VIEW_EMBEDDING,
 }
@@ -543,7 +550,14 @@ class TestVisibilityPredicate(unittest.TestCase):
         items = (
             MaskItem(camera, 2, is_control=True, seconds_per_frame=0.4),
             MaskItem(camera, 2, seconds_per_frame=0.4),
-            MaskItem(lidar, 1, view_offset=2, is_control=True, seconds_per_frame=0.1, is_lidar=True),
+            MaskItem(
+                lidar,
+                1,
+                view_offset=2,
+                is_control=True,
+                seconds_per_frame=0.1,
+                is_lidar=True,
+            ),
             MaskItem(lidar, 1, view_offset=2, seconds_per_frame=0.1, is_lidar=True),
         )
         offsets = [2]
@@ -767,12 +781,21 @@ class TestPaddedFlexAttention(unittest.TestCase):
             items=(
                 MaskItem(camera, 2, is_control=True, seconds_per_frame=0.4),
                 MaskItem(camera, 2, seconds_per_frame=0.4),
-                MaskItem(lidar, 1, view_offset=2, is_control=True, seconds_per_frame=0.1, is_lidar=True),
+                MaskItem(
+                    lidar,
+                    1,
+                    view_offset=2,
+                    is_control=True,
+                    seconds_per_frame=0.1,
+                    is_lidar=True,
+                ),
                 MaskItem(lidar, 1, view_offset=2, seconds_per_frame=0.1, is_lidar=True),
             ),
             caption_lengths=(3, 2),
         )
-        self._run(torch.device("cpu"), torch.float32, atol=1e-4, rtol=1e-4, layout=layout)
+        self._run(
+            torch.device("cpu"), torch.float32, atol=1e-4, rtol=1e-4, layout=layout
+        )
 
     def test_padding_capacity_does_not_change_the_output(self):
         torch.manual_seed(1)
@@ -955,6 +978,42 @@ class TestPaddedFlexAttention(unittest.TestCase):
             MultiviewLayout(backend="flex", **common)
 
 
+class TestMaskedBackendResolution(unittest.TestCase):
+    """``auto`` takes FA4 wherever its block-sparse kernels run, Triton elsewhere."""
+
+    _AVAILABLE = (
+        "sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention"
+        ".fa4_sparse_available"
+    )
+
+    def test_cuda_device_follows_fa4_availability(self):
+        cuda = torch.device("cuda", 0)
+        with mock.patch(self._AVAILABLE, return_value=True) as available:
+            self.assertEqual(resolve_masked_backend(cuda), "fa4")
+            available.assert_called_once_with(cuda)
+        with mock.patch(self._AVAILABLE, return_value=False):
+            self.assertEqual(resolve_masked_backend(cuda), "triton")
+
+    def test_off_cuda_is_triton_without_probing(self):
+        with mock.patch(self._AVAILABLE) as available:
+            self.assertEqual(resolve_masked_backend(torch.device("cpu")), "triton")
+            available.assert_not_called()
+        with (
+            mock.patch("torch.cuda.is_available", return_value=False),
+            mock.patch(self._AVAILABLE) as available,
+        ):
+            self.assertEqual(resolve_masked_backend(None), "triton")
+            available.assert_not_called()
+
+    def test_fa4_block_map_exists_for_hopper_and_blackwell(self):
+        self.assertEqual(fa4_sparse_block_sizes(capability_major=9), (128, 128))
+        self.assertEqual(fa4_sparse_block_sizes(capability_major=10), (256, 128))
+        with self.assertRaisesRegex(
+            ValueError, "not available on compute capability 8"
+        ):
+            fa4_sparse_block_sizes(capability_major=8)
+
+
 class TestSchema3Helpers(unittest.TestCase):
     """Rig view embedding rows and the per-stream LiDAR patch of the Oct-1 export."""
 
@@ -967,13 +1026,16 @@ class TestSchema3Helpers(unittest.TestCase):
         self.assertEqual(lidar_patch_grid(8, 113, (1, 1)), (8, 113, 8, 113))
         # 2x2: the odd width pads to the patch like the camera's _pad_to_patch_size.
         self.assertEqual(lidar_patch_grid(8, 113, (2, 2)), (4, 57, 8, 114))
-        latent = torch.arange(2 * 3 * 2 * 3 * 5, dtype=torch.float32).view(2, 3, 2, 3, 5)
+        latent = torch.arange(2 * 3 * 2 * 3 * 5, dtype=torch.float32).view(
+            2, 3, 2, 3, 5
+        )
         for patch in ((1, 1), (2, 2), (1, 2)):
             with self.subTest(patch=patch):
                 tokens = patchify_lidar(latent, patch)
                 patch_h, patch_w, _, _ = lidar_patch_grid(3, 5, patch)
                 self.assertEqual(
-                    tuple(tokens.shape), (2, 2 * patch_h * patch_w, patch[0] * patch[1] * 3)
+                    tuple(tokens.shape),
+                    (2, 2 * patch_h * patch_w, patch[0] * patch[1] * 3),
                 )
                 back = unpatchify_lidar(tokens, latent.shape[1:], patch)
                 torch.testing.assert_close(back, latent)
@@ -998,13 +1060,20 @@ class TestSchema3Helpers(unittest.TestCase):
             add_rig_view_rows(torch.zeros(1, 7, 4), rows, 2)
 
     def test_deployment_rig_view_ids_follow_physical_camera_ids(self):
-        deployment = parse_multiview_deployment_config(_transformer_config(SCHEMA3_BLOCK))
+        deployment = parse_multiview_deployment_config(
+            _transformer_config(SCHEMA3_BLOCK)
+        )
         # Subsets and reordered views keep their trained rows.
         self.assertEqual(
-            deployment.rig_view_ids(["camera_rear_tele_30fov", "camera_front_wide_120fov"]),
+            deployment.rig_view_ids(
+                ["camera_rear_tele_30fov", "camera_front_wide_120fov"]
+            ),
             [3, 0],
         )
-        self.assertEqual(deployment.rig_view_ids(COSMOS3_MADS_CAMERAS), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        self.assertEqual(
+            deployment.rig_view_ids(COSMOS3_MADS_CAMERAS),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        )
         with self.assertRaisesRegex(ValueError, "no row"):
             deployment.rig_view_ids(["camera_rear_tele_30fov", "camera_x"])
         schema2 = parse_multiview_deployment_config(_transformer_config(SCHEMA2_BLOCK))
@@ -1296,7 +1365,9 @@ class TestDeploymentConfig(unittest.TestCase):
                     "backend": backend,
                     "decomposed_temporal_window_seconds": 0.4,
                 }
-                deployment = parse_multiview_deployment_config(_transformer_config(block))
+                deployment = parse_multiview_deployment_config(
+                    _transformer_config(block)
+                )
                 self.assertEqual(deployment.decomposed_temporal_window_seconds, 0.4)
                 self.assertEqual(deployment.system_prompt_variant, "wsm_controls")
         with self.assertRaisesRegex(ValueError, "temporal window"):
@@ -1311,7 +1382,9 @@ class TestDeploymentConfig(unittest.TestCase):
             )
 
     def test_accepts_the_schema3_contract(self):
-        deployment = parse_multiview_deployment_config(_transformer_config(SCHEMA3_BLOCK))
+        deployment = parse_multiview_deployment_config(
+            _transformer_config(SCHEMA3_BLOCK)
+        )
         self.assertEqual(deployment.schema_version, 3)
         self.assertEqual(deployment.backend, "triton")
         self.assertTrue(deployment.uses_masked_attention)
@@ -1319,7 +1392,10 @@ class TestDeploymentConfig(unittest.TestCase):
         self.assertTrue(deployment.per_view_captions)
         self.assertEqual(deployment.lidar_patch_spatial_hw, (1, 1))
         self.assertEqual(deployment.rig_view_embedding["lidar_id"], 11)
-        self.assertEqual(deployment.rig_view_embedding["camera_ids"]["camera_rear_fisheye_200fov"], 10)
+        self.assertEqual(
+            deployment.rig_view_embedding["camera_ids"]["camera_rear_fisheye_200fov"],
+            10,
+        )
         self.assertEqual(deployment.lidar["streaming_chunk_frames"], 20)
         self.assertEqual(deployment.lidar["streaming_context_frames"], 21)
         self.assertEqual(deployment.system_prompt_variant, "wsm_controls")
@@ -1333,7 +1409,9 @@ class TestDeploymentConfig(unittest.TestCase):
         def parse(block):
             return parse_multiview_deployment_config(_transformer_config(block))
 
-        with self.assertRaisesRegex(ValueError, "Unknown Cosmos3 multiview contract fields"):
+        with self.assertRaisesRegex(
+            ValueError, "Unknown Cosmos3 multiview contract fields"
+        ):
             parse({**SCHEMA3_BLOCK, "radar": {}})
         self.assertIn("system_prompt_variant", COSMOS3_MULTIVIEW_CONTRACT_FIELDS)
         with self.assertRaisesRegex(ValueError, "requires schema_version=3"):
@@ -1343,26 +1421,41 @@ class TestDeploymentConfig(unittest.TestCase):
             del rig["camera_ids"]["camera_rear_tele_30fov"]
             parse({**SCHEMA3_BLOCK, "rig_view_embedding": rig})
         with self.assertRaisesRegex(ValueError, "lidar_id must be the final row"):
-            parse({**SCHEMA3_BLOCK, "rig_view_embedding": {**RIG_VIEW_EMBEDDING, "lidar_id": 3}})
+            parse(
+                {
+                    **SCHEMA3_BLOCK,
+                    "rig_view_embedding": {**RIG_VIEW_EMBEDDING, "lidar_id": 3},
+                }
+            )
         with self.assertRaisesRegex(ValueError, "distinct rows"):
             rig = copy.deepcopy(RIG_VIEW_EMBEDDING)
             rig["camera_ids"]["camera_rear_tele_30fov"] = 0
             parse({**SCHEMA3_BLOCK, "rig_view_embedding": rig})
-        with self.assertRaisesRegex(ValueError, "requires rig_view_embedding or a LiDAR patch"):
+        with self.assertRaisesRegex(
+            ValueError, "requires rig_view_embedding or a LiDAR patch"
+        ):
             parse(
                 {
                     k: v
-                    for k, v in {**SCHEMA3_BLOCK, "lidar_patch_spatial_hw": [2, 2]}.items()
+                    for k, v in {
+                        **SCHEMA3_BLOCK,
+                        "lidar_patch_spatial_hw": [2, 2],
+                    }.items()
                     if k != "rig_view_embedding"
                 }
             )
-        with self.assertRaisesRegex(ValueError, "schema_version=2 requires the LiDAR patch"):
+        with self.assertRaisesRegex(
+            ValueError, "schema_version=2 requires the LiDAR patch"
+        ):
             parse({**SCHEMA2_BLOCK, "lidar_patch_spatial_hw": [1, 1]})
         with self.assertRaisesRegex(ValueError, "requires a lidar block"):
             parse(
                 {
                     k: v
-                    for k, v in {**SCHEMA3_BLOCK, "lidar_patch_spatial_hw": [1, 1]}.items()
+                    for k, v in {
+                        **SCHEMA3_BLOCK,
+                        "lidar_patch_spatial_hw": [1, 1],
+                    }.items()
                     if k != "lidar"
                 }
             )
@@ -1373,7 +1466,11 @@ class TestDeploymentConfig(unittest.TestCase):
         # A LiDAR tokenizer whose context is shorter than its chunk is malformed.
         with self.assertRaisesRegex(ValueError, "streaming context"):
             validate_lidar_config(
-                {**LIDAR_BLOCK, "streaming_chunk_frames": 20, "streaming_context_frames": 19}
+                {
+                    **LIDAR_BLOCK,
+                    "streaming_chunk_frames": 20,
+                    "streaming_context_frames": 19,
+                }
             )
 
     def test_backend_resolution_follows_the_export_family(self):
@@ -2540,7 +2637,9 @@ class TestSchema3Requests(unittest.TestCase):
                 "num_conditional_sweeps": None,
             },
         )
-        with_prefix = validate_lidar_request({**base, "condition_path": " measured.pt "})
+        with_prefix = validate_lidar_request(
+            {**base, "condition_path": " measured.pt "}
+        )
         self.assertEqual(with_prefix["condition_path"], "measured.pt")
         # The reference conditions one measured sweep when no count is given.
         self.assertEqual(with_prefix["num_conditional_sweeps"], 1)
@@ -2553,8 +2652,14 @@ class TestSchema3Requests(unittest.TestCase):
         for bad, message in (
             ({**base, "num_conditional_sweeps": 2}, "requires lidar.condition_path"),
             ({**base, "condition_path": "m.tar"}, "condition_path must be"),
-            ({**base, "condition_path": "m.pt", "num_conditional_sweeps": 0}, "positive integer"),
-            ({**base, "condition_path": "m.pt", "num_conditional_sweeps": True}, "positive integer"),
+            (
+                {**base, "condition_path": "m.pt", "num_conditional_sweeps": 0},
+                "positive integer",
+            ),
+            (
+                {**base, "condition_path": "m.pt", "num_conditional_sweeps": True},
+                "positive integer",
+            ),
             ({**base, "conditional_path": "m.pt"}, "accepts only"),
         ):
             with self.subTest(bad=bad):
@@ -2581,7 +2686,9 @@ class TestSchema3Requests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            Cosmos3MultiviewSamplingParams(per_view_negative_prompt="blurry").per_view_negative_prompt,
+            Cosmos3MultiviewSamplingParams(
+                per_view_negative_prompt="blurry"
+            ).per_view_negative_prompt,
             "blurry",
         )
         with self.assertRaisesRegex(ValueError, "per_view_negative_prompt"):
