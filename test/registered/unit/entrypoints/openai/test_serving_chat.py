@@ -1711,16 +1711,16 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
         call = (
-            "to=get_weather<|channel|>analysis <|constrain|>xml<|message|>"
+            " to=get_weather<|channel|>analysis <|constrain|>xml<|message|>"
             '<rfl:parameter name="city">\nParis\n</rfl:parameter>'
         )
-        full_call = "<|start|>assistant " + call
+        full_call = "<|start|>assistant" + call
         thought = "<|channel|>analysis<|message|>Plan<|end|>"
         for prompt, from_start, texts in (
             (
                 "<|start|>assistant",
                 True,
-                {" " + call: True, thought + full_call: True, " " + "Paris": False},
+                {call: True, thought + full_call: True, " " + "Paris": False},
             ),
             (
                 "<|start|>assistant<|channel|>analysis<|message|>So",
@@ -1728,10 +1728,9 @@ class ServingChatTestCase(CustomTestCase):
                 # The reasoning closer already wrote <|start|>assistant, and a
                 # value must not hold a call closer.
                 {
-                    " " + call: True,
+                    call: True,
                     full_call: False,
-                    " "
-                    + call.replace("Paris", "Pa<|end|><|start|>assistantris"): False,
+                    call.replace("Paris", "Pa<|end|><|start|>assistantris"): False,
                 },
             ),
         ):

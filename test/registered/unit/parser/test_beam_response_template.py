@@ -402,39 +402,26 @@ class TestBeamResponseTemplate(CustomTestCase):
     def test_text_choices_and_names_keep_to_what_is_read_back(self):
         """A text choice must not be written in a framing the parser reads back
         differently."""
-        mode = _tool("set_mode", {"mode": {"type": "string", "enum": ["\nab"]}})
+        # Only the closer after a newline ends the value.
+        choices = ["\nab", "a</rfl:parameter>b"]
+        mode = _tool("set_mode", {"mode": {"type": "string", "enum": choices}})
         mode.function.strict = True
         parser = FunctionCallParser(
             tools=[mode], tool_call_parser="beam", prefix=PREFIX
         )
         _, tag = parser.get_structure_constraint("required")
         grammar = Grammar.from_structural_tag(tag.model_dump_json())
-        framed = _continuation_call("set_mode", _parameter("mode", "\nab"))
-        _, parsed = parser.parse_non_stream(framed)
+        for choice in choices:
+            with self.subTest(choice=choice):
+                framed = _continuation_call("set_mode", _parameter("mode", choice))
+                _, parsed = parser.parse_non_stream(framed)
 
-        self.assertTrue(_is_grammar_accept_string(grammar, framed))
-        self.assertEqual(json.loads(parsed[0].parameters), {"mode": "\nab"})
+                self.assertTrue(_is_grammar_accept_string(grammar, framed))
+                self.assertEqual(json.loads(parsed[0].parameters), {"mode": choice})
         # Read back as "ab".
-        bare = framed.replace("\n\nab\n", "\nab")
+        bare = _continuation_call("set_mode", _parameter("mode", "\nab"))
+        bare = bare.replace("\n\nab\n", "\nab")
         self.assertFalse(_is_grammar_accept_string(grammar, bare))
-        # Only the closer after a newline ends the value.
-        closer = _tool(
-            "set_mode", {"mode": {"type": "string", "enum": ["a</rfl:parameter>b"]}}
-        )
-        closer.function.strict = True
-        parser = FunctionCallParser(
-            tools=[closer], tool_call_parser="beam", prefix=PREFIX
-        )
-        _, tag = parser.get_structure_constraint("required")
-        grammar = Grammar.from_structural_tag(tag.model_dump_json())
-        framed = _continuation_call(
-            "set_mode", _parameter("mode", "a</rfl:parameter>b")
-        )
-        _, parsed = parser.parse_non_stream(framed)
-        self.assertTrue(_is_grammar_accept_string(grammar, framed))
-        self.assertEqual(
-            json.loads(parsed[0].parameters), {"mode": "a</rfl:parameter>b"}
-        )
         for choice in ("a\n</rfl:parameter>b", "a<|end|><|start|>assistantb"):
             with self.subTest(choice=choice):
                 tool = _tool("set_mode", {"mode": {"type": "string", "enum": [choice]}})
