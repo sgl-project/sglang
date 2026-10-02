@@ -417,6 +417,9 @@ class MlxAuxiliaryStateComponent(MambaComponent):
             req.kv.mamba_last_track_seqlen = None
             return
 
+        if not req.kv.holds_mamba:
+            # Already handed to the tree or freed; nothing left to release.
+            return
         auxiliary_value_exists = (
             insert_result.mamba_exist if insert_result is not None else True
         )

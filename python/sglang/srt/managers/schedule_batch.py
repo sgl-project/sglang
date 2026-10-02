@@ -936,9 +936,6 @@ class ReqKvInfo:
     # This request already inserted [0, here) into the tree; later inserts count
     # a hit only on the nodes past it, so a request counts each node once.
     cache_inserted_len: int = 0
-    # The finished request's KV was handed to the tree as final; a release
-    # without it is a discard and the tree drops the request's side state.
-    cache_finalized: bool = False
     kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
 
@@ -1985,7 +1982,6 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.kv.cache_protected_len = 0
         self.kv.cache_inserted_len = 0
-        self.kv.cache_finalized = False
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()

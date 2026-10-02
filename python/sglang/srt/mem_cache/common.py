@@ -171,7 +171,7 @@ def free_kv_row_segments(
 
 def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     """Hand the tree what the request has computed so far; a finished request
-    hands over everything it owns and is marked ``cache_finalized``."""
+    hands over everything it owns."""
     if req.skip_radix_cache_insert:
         return
 
@@ -182,8 +182,6 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     else:
         up_to = req.extend_range.end
     tree_cache.checkpoint(req, up_to=up_to)
-    if req.finished():
-        req.kv.cache_finalized = True
 
 
 def evict_from_tree_cache(

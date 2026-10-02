@@ -522,9 +522,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     def on_release(self, req: Req) -> None:
-        """The row is freed and the lock dropped; ``req.kv.cache_finalized``
-        says whether the tree kept the KV as final. Drop per-request state
-        kept outside the tree."""
+        """The row is freed and the lock dropped. Collect whatever the request
+        still holds outside the tree: how it left decides what that is (a final
+        ``checkpoint`` already handed its state over, an abort left it behind),
+        so implementations read the request's state, not a mode flag."""
 
     def evictable_size(self):
         return 0
