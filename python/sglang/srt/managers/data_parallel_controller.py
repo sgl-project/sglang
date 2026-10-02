@@ -69,6 +69,7 @@ from sglang.srt.utils.common import (
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
+from sglang.srt.utils.foundry_adapter import activate_foundry, get_foundry_adapter
 from sglang.srt.utils.network import (
     NetworkAddress,
     bind_port,
@@ -711,6 +712,7 @@ class DataParallelController:
                     )
                     with (
                         memory_saver_adapter.configure_subprocess(),
+                        get_foundry_adapter().configure_subprocess(server_args),
                         numa_utils.configure_subprocess(server_args, gpu_id),
                     ):
                         proc.start()
@@ -812,6 +814,8 @@ def run_data_parallel_controller_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
+    # Foundry CUDA graph persistence: preloads its hook into the schedulers.
+    activate_foundry(server_args)
     # This process reads the config namespaces before spawning schedulers.
     publish(server_args, role="dp_controller")
     configure_logger(server_args)
