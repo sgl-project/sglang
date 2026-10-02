@@ -379,7 +379,16 @@ def _fp8_mqa_logits_torch(
     q = q_fp8.to(torch.bfloat16)
     k_t = k_fp8.reshape(num_kv, head_dim).to(torch.bfloat16).t()
 
-    logits = torch.zeros(num_q, num_kv, dtype=torch.float32, device=q_fp8.device)
+    # topk_v2.cuh requires score_stride % 4 == 0 for its 16-byte vectorized
+    # load. On the ragged prefill path num_kv is the real key count and is
+    # unaligned for most prompts, so allocate a padded row and hand back a
+    # narrowed view: slicing keeps the padded stride, so the kernel still sees
+    # an aligned one while the logical width stays num_kv.
+    num_kv_padded = (num_kv + 3) // 4 * 4
+    logits_storage = torch.zeros(
+        num_q, num_kv_padded, dtype=torch.float32, device=q_fp8.device
+    )
+    logits = logits_storage[:, :num_kv]
     w = weights.float()
     for h in range(num_heads):
         scores = torch.mm(q[:, h], k_t).float()
