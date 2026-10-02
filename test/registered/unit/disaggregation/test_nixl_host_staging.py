@@ -914,6 +914,98 @@ class HostStagingTest(unittest.TestCase):
         self.assertFalse(rig.receiver.host_allocs)
 
 
+class HostRowValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.handler = H.HostDecodeStagingHandler.__new__(H.HostDecodeStagingHandler)
+        self.handler.region_base = np.array([1000, 2000, 4000, 8000], dtype=np.uint64)
+        self.handler.region_end = np.array([1128, 2256, 4256, 8256], dtype=np.uint64)
+        self.handler.region_item = np.array([16, 32, 64, 8], dtype=np.uint64)
+        self.handler.region_owner = np.array([-1, -1, 0, 1], dtype=np.int64)
+        self.receiver = NS(
+            bootstrap_room=ROOM,
+            host_allowed={
+                "kv": np.array([0, 1, 3, 4, 5, 7], dtype=np.uint64),
+                0: np.array([1, 2], dtype=np.uint64),
+                1: None,  # DSA tail: region bounds only, as before.
+            },
+        )
+
+    def check(self, rows):
+        table = np.asarray(rows, dtype=np.uint64).reshape(-1, 2)
+        self.handler.check_rows(self.receiver, table[:, 0], table[:, 1])
+
+    def test_mixed_owners_partial_items_and_shared_layers(self):
+        rows = [(1049, 46), (2097, 94), (4065, 126), (8001, 255), (1112, 16)]
+        self.check(rows)
+        self.check(rows[::-1] + rows)  # Unsorted and duplicate rows are valid.
+        self.check([])
+
+    def test_rejects_bounds_holes_and_wrong_owner(self):
+        for row in (
+            (999, 1),  # Before the first region.
+            (1500, 1),  # In a gap.
+            (1127, 2),  # Crosses a region end.
+            (1000, 0),
+            (1016, 48),  # Allowed endpoints, but item 2 is missing.
+            (4000, 64),  # KV owns item 0; this state component does not.
+            (8255, 2),  # Even region-only owners cannot cross bounds.
+            (1000, 2**64 - 1),  # Unsigned end-address overflow.
+            (8000, 2**64 - 1),  # Region-only owners must reject overflow too.
+        ):
+            with (
+                self.subTest(row=row),
+                self.assertRaisesRegex(ValueError, "outside room"),
+            ):
+                self.check([row])
+
+    def test_empty_allowed_owner_rejects_rows(self):
+        self.receiver.host_allowed["kv"] = np.array([], dtype=np.uint64)
+        with self.assertRaisesRegex(ValueError, "outside room"):
+            self.check([(1000, 1)])
+        self.check([(4064, 64)])
+
+    def test_large_unsigned_addresses(self):
+        self.handler.region_base += np.uint64(2**63)
+        self.handler.region_end += np.uint64(2**63)
+        self.check([(2**63 + 1048, 48), (2**63 + 4064, 128)])
+        with self.assertRaisesRegex(ValueError, "outside room"):
+            self.check([(2**63 + 1048, 2**63)])
+
+    def test_matches_independent_scalar_validation(self):
+        rng = np.random.default_rng(9321)
+        regions = list(
+            zip(
+                self.handler.region_base.tolist(),
+                self.handler.region_end.tolist(),
+                self.handler.region_item.tolist(),
+                ("kv", "kv", 0, 1),
+                strict=True,
+            )
+        )
+        for _ in range(1000):
+            base, end, _, _ = regions[int(rng.integers(len(regions)))]
+            addr = int(rng.integers(base - 5, end + 5))
+            length = int(rng.integers(0, 300))
+            valid = False
+            for start, stop, item, owner in regions:
+                if start <= addr < stop and 0 < length <= stop - addr:
+                    allowed = self.receiver.host_allowed[owner]
+                    valid = allowed is None or all(
+                        index in allowed
+                        for index in range(
+                            (addr - start) // item,
+                            (addr + length - 1 - start) // item + 1,
+                        )
+                    )
+                    break
+            with self.subTest(addr=addr, length=length):
+                if valid:
+                    self.check([(addr, length)])
+                else:
+                    with self.assertRaisesRegex(ValueError, "outside room"):
+                        self.check([(addr, length)])
+
+
 class CudaByteRanges(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_device_and_pinned_host_ranges(self):

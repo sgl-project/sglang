@@ -536,7 +536,10 @@ class HostDecodeStagingHandler(DecodeStagingHandler):
         self.region_base = np.array([r[0] for r in regions], dtype=np.uint64)
         self.region_end = np.array([r[0] + r[1] for r in regions], dtype=np.uint64)
         self.region_item = np.array([r[2] for r in regions], dtype=np.uint64)
-        self.region_owner = [r[3] for r in regions]
+        # KV uses -1; state owners are their nonnegative component indices.
+        self.region_owner = np.array(
+            [-1 if r[3] == "kv" else r[3] for r in regions], dtype=np.int64
+        )
 
     def allowed_items(self, kv_indices, state_indices):
         """Per region owner, the item indices this room may be written at."""
@@ -554,26 +557,33 @@ class HostDecodeStagingHandler(DecodeStagingHandler):
         return allowed
 
     def check_rows(self, receiver, addr, lens):
+        if not addr.size:
+            return
+        error = f"Host staging row outside room {receiver.bootstrap_room} memory"
         region = np.searchsorted(self.region_base, addr, side="right") - 1
-        ok = (region >= 0) & (lens > 0)
-        region = np.maximum(region, 0)
-        ok &= addr + lens <= self.region_end[region]
-        for r in np.unique(region[ok]):
-            allowed = receiver.host_allowed.get(self.region_owner[r])
+        if (region < 0).any():
+            raise ValueError(error)
+        end = self.region_end[region]
+        # Subtract rather than add the length so uint64 wrap cannot pass bounds.
+        if ((lens == 0) | (addr >= end) | (lens > end - addr)).any():
+            raise ValueError(error)
+
+        offset = addr - self.region_base[region]
+        item = self.region_item[region]
+        lo = offset // item
+        hi = (offset + lens - np.uint64(1)) // item
+        owner = self.region_owner[region]
+        # Layers sharing an owner use the same allowed item indices. Validate
+        # them together instead of scanning the whole row table once per layer.
+        for name, allowed in receiver.host_allowed.items():
             if allowed is None:
                 continue
-            rows = ok & (region == r)
-            base, item = self.region_base[r], self.region_item[r]
-            lo = (addr[rows] - base) // item
-            hi = (addr[rows] + lens[rows] - np.uint64(1) - base) // item
-            covered = np.searchsorted(allowed, hi, side="right") - np.searchsorted(
-                allowed, lo
-            )
-            ok[rows] = covered == (hi - lo + np.uint64(1))
-        if not ok.all():
-            raise ValueError(
-                f"Host staging row outside room {receiver.bootstrap_room} memory"
-            )
+            rows = owner == (-1 if name == "kv" else name)
+            covered = np.searchsorted(
+                allowed, hi[rows], side="right"
+            ) - np.searchsorted(allowed, lo[rows])
+            if (covered != hi[rows] - lo[rows] + np.uint64(1)).any():
+                raise ValueError(error)
 
     def register_wm_subscriber(self, receiver, session_id):
         # One watermark per prefill endpoint set, held while any of its rooms is
