@@ -368,6 +368,27 @@ async fn missing_decode_in_all_buckets_does_not_dispatch_prefill() {
     );
 }
 
+/// A `/generate` batch fits by each prompt's own peak, not max(input) + max(output) = 120.
+#[tokio::test]
+async fn generate_batch_context_limit_pairs_each_prompt_with_its_output_budget() {
+    let worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut bucket = Bucket::new("short", BucketGroups::Plain(group("w", policy)));
+    bucket.max_context_tokens = Some(64);
+    let app = build_router(context(&[("w", Stage::Plain, &worker)], vec![bucket]));
+    for (first_output, status) in [(1, StatusCode::OK), (5, StatusCode::BAD_REQUEST)] {
+        let body = serde_json::json!({
+            "input_ids": [vec![1; 60], vec![1]],
+            "sampling_params": [{"max_new_tokens": first_output}, {"max_new_tokens": 60}]
+        });
+        let request = Request::post("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), status);
+    }
+}
+
 #[tokio::test]
 async fn rejects_unsupported_length_unknown_model_and_overflow_before_policy() {
     let worker = MockWorker::start(vec![]).await;

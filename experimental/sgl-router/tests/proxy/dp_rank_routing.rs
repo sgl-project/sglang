@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! `--dp-aware` forwards the chosen DP rank as `X-Data-Parallel-Rank`.
+//! `--dp-aware` forwards the chosen DP rank as `X-Data-Parallel-Rank` and `routed_dp_rank`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -183,5 +183,61 @@ async fn any_policy_picks_the_rank_with_the_deepest_prefix() {
     let app = router(cfg, &[(&worker, WorkerMode::Plain, 4)], tree);
     for _ in 0..3 {
         assert_eq!(send(&app, &worker, &[]).await.as_deref(), Some("3"));
+    }
+}
+
+/// Sends `body` to `path` under a sticky key over a PD pair with 4 prefill and 2 decode ranks,
+/// returning the prefill and decode bodies.
+async fn send_pd(path: &str, body: serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+    let (prefill, decode) = (
+        MockWorker::start(vec![]).await,
+        MockWorker::start(vec![]).await,
+    );
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 4),
+        (&decode, WorkerMode::Decode, 2),
+    ];
+    let request = Request::post(path)
+        .header("content-type", "application/json")
+        .header(KEY, "conv-pd")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let app = router(sticky_config(), &workers, Default::default());
+    assert!(app.oneshot(request).await.unwrap().status().is_success());
+    (prefill.captured_json().await, decode.captured_json().await)
+}
+
+/// Native `/generate` ignores the rank header, so each PD worker gets its rank in its own body.
+#[tokio::test]
+async fn pd_generate_carries_each_rank_in_its_body() {
+    let (p, d) = send_pd("/generate", json!({"text": "hi"})).await;
+    assert_eq!(
+        p["routed_dp_rank"],
+        p["bootstrap_room"].as_u64().unwrap() % 4
+    );
+    assert!(d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2));
+}
+
+/// The engine gives fan-out item i the room `room + i`, so one pinned prefill rank would break decode.
+#[tokio::test]
+async fn pd_fan_out_leaves_the_prefill_rank_to_the_engine() {
+    let mut chat = body();
+    chat["n"] = 2.into();
+    for (path, mut body) in [
+        ("/v1/chat/completions", chat),
+        ("/generate", json!({"text": ["a", "b"]})),
+    ] {
+        // A caller's rank is replaced too.
+        body["routed_dp_rank"] = 3.into();
+        body["data_parallel_rank"] = 3.into();
+        let (p, d) = send_pd(path, body).await;
+        assert!(
+            p["routed_dp_rank"].is_null() && p["data_parallel_rank"].is_null(),
+            "{path}"
+        );
+        assert!(
+            d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2),
+            "{path}"
+        );
     }
 }
