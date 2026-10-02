@@ -40,9 +40,7 @@ class TestNemotronHOmniModel(CustomTestCase):
         self.assertEqual(architecture, "NemotronH_Omni_Reasoning_V3")
 
     def test_lora_scope_excludes_the_vision_tower(self):
-        """RADIO attention also exposes `qkv_proj` under a `layers.<i>.` path;
-        wrapping it corrupts the LoRA pool's buffer sizing and every adapter
-        request then fails on a buffer/weight shape mismatch."""
+        """RADIO qkv_proj under a layers.<i>. path is outside the LoRA scope."""
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
         nn.Module.__init__(model)
 
@@ -56,8 +54,7 @@ class TestNemotronHOmniModel(CustomTestCase):
         )
 
     def test_lora_shape_hooks_reach_the_language_model(self):
-        """LoRA sizes its buffers from hooks looked up on the top-level model;
-        the wrapper must forward them or Mamba/MoE buffers are silently wrong."""
+        """The LoRA shape hooks forward to the inner language model."""
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
         nn.Module.__init__(model)
         model.language_model = SimpleNamespace(
