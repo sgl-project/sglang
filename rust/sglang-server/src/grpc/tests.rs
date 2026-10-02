@@ -79,7 +79,7 @@ impl Harness {
 fn chunk(rid: &Rid, text: &str, token_id: i64, finished: bool) -> ChunkEvent {
     ChunkEvent {
         rid: rid.clone(),
-        token_ids: vec![token_id],
+        token_ids: vec![token_id].into(),
         finish_reason: finished.then(stop_reason),
         prompt_tokens: 3,
         text: text.into(),

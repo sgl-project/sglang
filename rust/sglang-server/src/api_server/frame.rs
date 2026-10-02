@@ -465,25 +465,25 @@ mod tests {
         let mut acc = OutputAccumulator::default();
         acc.fold(&FrontendOutput {
             text: "he".into(),
-            token_ids: vec![1, 2],
+            token_ids: vec![1, 2].into(),
             completion_tokens: 2,
             ..Default::default()
         });
         {
             let s = acc.snapshot();
             assert_eq!(s.text, "he");
-            assert_eq!(s.token_ids, vec![1, 2]);
+            assert_eq!(s.token_ids.as_slice(), vec![1, 2]);
         }
         acc.fold(&FrontendOutput {
             text: "llo".into(),
-            token_ids: vec![3],
+            token_ids: vec![3].into(),
             completion_tokens: 1,
             ..Default::default()
         });
         {
             let s = acc.snapshot();
             assert_eq!(s.text, "hello"); // cumulative
-            assert_eq!(s.token_ids, vec![1, 2, 3]);
+            assert_eq!(s.token_ids.as_slice(), vec![1, 2, 3]);
             assert_eq!(s.completion_tokens, 3);
         }
         let out = acc.into_output();
@@ -514,28 +514,28 @@ mod tests {
         let deltas = [
             FrontendOutput {
                 text: String::new(),
-                token_ids: vec![],
+                token_ids: vec![].into(),
                 completion_tokens: 0,
                 prompt_tokens: 128,
                 ..Default::default()
             },
             FrontendOutput {
                 text: "He\"llo\n\t".into(),
-                token_ids: vec![1000],
+                token_ids: vec![1000].into(),
                 completion_tokens: 1,
                 prompt_tokens: 128,
                 ..Default::default()
             },
             FrontendOutput {
                 text: " 世界 🌍 \\".into(),
-                token_ids: vec![-2, 3],
+                token_ids: vec![-2, 3].into(),
                 completion_tokens: 2,
                 prompt_tokens: 128,
                 ..Default::default()
             },
             FrontendOutput {
                 text: "!".into(),
-                token_ids: vec![9],
+                token_ids: vec![9].into(),
                 completion_tokens: 1,
                 prompt_tokens: 128,
                 finish_reason: serde_json::from_value(
@@ -599,7 +599,7 @@ mod tests {
                 },
                 FrontendOutput {
                     text: "He\"llo".into(),
-                    token_ids: vec![100],
+                    token_ids: vec![100].into(),
                     completion_tokens: 1,
                     prompt_tokens: 4,
                     extras: Some(Box::new(ChunkExtras {
@@ -620,7 +620,7 @@ mod tests {
                 },
                 FrontendOutput {
                     text: " 世界".into(),
-                    token_ids: vec![-2, 3],
+                    token_ids: vec![-2, 3].into(),
                     completion_tokens: 2,
                     prompt_tokens: 4,
                     finish_reason: serde_json::from_value(

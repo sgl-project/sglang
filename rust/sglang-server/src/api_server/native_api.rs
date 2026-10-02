@@ -669,7 +669,7 @@ mod tests {
         tx.send(ResponseItem::Done(ChunkEvent {
             rid: "internal-rid".into(),
             text: "ok".into(),
-            token_ids: vec![7, 8],
+            token_ids: vec![7, 8].into(),
             prompt_tokens: 5,
             completion_tokens: 2,
             finish_reason: serde_json::from_value(serde_json::json!({

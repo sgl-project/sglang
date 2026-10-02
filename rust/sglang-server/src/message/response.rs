@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use super::finish_reason::FinishReason;
 use crate::message::ids::Rid;
-use crate::message::types::TokenIds;
+use crate::message::types::OutputTokenIds;
 use crate::utils::error::Error;
 
 /// Per-request back-channel the detok shard writes runtime outputs to and the
@@ -29,10 +29,20 @@ pub enum SinkError {
 impl ResponseSink {
     /// Non-blocking send. `Err(Full)` = backpressure, `Err(Closed)` = client gone.
     pub fn try_send(&self, item: ResponseItem) -> Result<(), SinkError> {
+        self.try_send_recover(item).map_err(|(error, _)| error)
+    }
+
+    /// Keep the payload on failure so callers can recover its request identity.
+    // Like mpsc::try_send, return the existing item without a new allocation.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn try_send_recover(
+        &self,
+        item: ResponseItem,
+    ) -> Result<(), (SinkError, ResponseItem)> {
         match self {
             ResponseSink::Local(tx) => tx.try_send(item).map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => SinkError::Full,
-                mpsc::error::TrySendError::Closed(_) => SinkError::Closed,
+                mpsc::error::TrySendError::Full(item) => (SinkError::Full, item),
+                mpsc::error::TrySendError::Closed(item) => (SinkError::Closed, item),
             }),
         }
     }
@@ -90,9 +100,9 @@ fn take_f32(data: &[u8], off: &mut usize, n: usize) -> Option<Vec<f32>> {
 
 /// Read `n` little-endian i64 token ids from `data` at `*off`, advancing `*off`.
 /// The scheduler stores output ids as `array("q")` and emits their bytes as-is,
-/// so this is the crate's [`TokenIds`] width with no conversion. `None` past
+/// so this is the crate's [`OutputTokenIds`] width with no conversion. `None` past
 /// the buffer end.
-fn take_i64(data: &[u8], off: &mut usize, n: usize) -> Option<TokenIds> {
+fn take_i64(data: &[u8], off: &mut usize, n: usize) -> Option<OutputTokenIds> {
     let start = *off;
     let end = start.checked_add(n.checked_mul(8)?)?;
     let out = data
@@ -563,7 +573,7 @@ pub struct ChunkEvent {
     pub rid: Rid,
     /// New token ids for this step, widened from the scheduler's int32 wire
     /// width at parse time. Empty allowed (e.g. metadata-only frames).
-    pub token_ids: TokenIds,
+    pub token_ids: OutputTokenIds,
     /// `None` while streaming, the [`FinishReason`] on the final chunk.
     pub finish_reason: Option<FinishReason>,
     /// Prompt token count for this request (constant across its chunks).
@@ -697,7 +707,7 @@ mod tests {
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].rid, Rid::from("1"));
-        assert_eq!(events[0].token_ids, vec![10, 11]);
+        assert_eq!(events[0].token_ids.as_slice(), vec![10, 11]);
         assert_eq!(events[0].prompt_tokens, 4);
         assert!(events[0].finish_reason.is_none());
         assert_eq!(events[1].rid, Rid::from("2"));
@@ -713,7 +723,7 @@ mod tests {
             )
         );
         assert_eq!(events[2].rid, Rid::from("3"));
-        assert_eq!(events[2].token_ids, vec![12]);
+        assert_eq!(events[2].token_ids.as_slice(), vec![12]);
         assert_eq!(events[2].prompt_tokens, 6);
         // A plain decode frame carries no extras columns at all, so the per-frame
         // `has_extras` guard must skip the extras machinery entirely for every
@@ -965,7 +975,7 @@ mod tests {
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].token_ids, vec![10]);
+        assert_eq!(events[0].token_ids.as_slice(), vec![10]);
         let ex0 = events[0]
             .extras
             .as_deref()
@@ -977,7 +987,7 @@ mod tests {
         assert_eq!(ex0.hidden_val, vec![0.1, 0.2, 0.3]);
         assert_eq!(ex0.hidden_lens, vec![3]);
         // req1 has a token id but no numeric columns → no extras box allocated.
-        assert_eq!(events[1].token_ids, vec![20]);
+        assert_eq!(events[1].token_ids.as_slice(), vec![20]);
         assert!(events[1].extras.is_none());
     }
 
@@ -1150,7 +1160,7 @@ mod tests {
         assert_eq!(ex.hidden_val, vec![7.1, 7.2, 7.3]);
         assert_eq!(ex.hidden_lens, vec![3]);
         // Every byte of the data buffer was consumed by exactly one family.
-        assert_eq!(events[0].token_ids, vec![100]);
+        assert_eq!(events[0].token_ids.as_slice(), vec![100]);
     }
 
     /// Two DISTINCT rids that hash to the same shard must stay separate requests.
@@ -1216,6 +1226,52 @@ mod rid_recovery_tests {
                 vec![Rid::from("a"), Rid::from("b")],
                 "arity {extra_cols}: rids must survive so the caller can fail them"
             );
+        }
+    }
+
+    #[test]
+    fn output_token_storage_preserves_empty_inline_and_spilled_chunks() {
+        for ids in [vec![], vec![7], vec![7, 8, 9]] {
+            let data: Vec<u8> = ids.iter().flat_map(|id: &i64| id.to_le_bytes()).collect();
+            let mut offset = 0;
+            let tokens = take_i64(&data, &mut offset, ids.len()).unwrap();
+            assert_eq!(tokens.as_slice(), ids.as_slice());
+            assert_eq!(offset, data.len());
+            assert_eq!(tokens.spilled(), ids.len() > 1);
+        }
+    }
+
+    #[test]
+    fn recover_send_keeps_the_failed_chunk_identity() {
+        for closed in [false, true] {
+            let (tx, rx) = mpsc::channel(1);
+            if closed {
+                drop(rx);
+            } else {
+                tx.try_send(ResponseItem::Done(ChunkEvent::default()))
+                    .unwrap();
+            }
+            let sink = ResponseSink::Local(tx);
+            let (error, item) = sink
+                .try_send_recover(ResponseItem::Frame(ChunkEvent {
+                    rid: Rid::from("recover"),
+                    token_ids: smallvec::smallvec![7],
+                    ..Default::default()
+                }))
+                .unwrap_err();
+            assert_eq!(
+                error,
+                if closed {
+                    SinkError::Closed
+                } else {
+                    SinkError::Full
+                }
+            );
+            let ResponseItem::Frame(chunk) = item else {
+                panic!("changed payload")
+            };
+            assert_eq!(chunk.rid.as_str(), "recover");
+            assert_eq!(chunk.token_ids.as_slice(), &[7]);
         }
     }
 }

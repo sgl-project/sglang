@@ -27,6 +27,8 @@ use crate::message::detok::DetokMsg;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink, SinkError};
+use crate::message::types::OutputTokenIds;
+#[cfg(test)]
 use crate::message::types::TokenIds;
 use crate::tokenizer_manager::wiring::AbortSource;
 use crate::utils::runtime::Runnable;
@@ -287,11 +289,7 @@ fn handle_chunk(
     backend: &DetokenizerBackend,
     abort: &flume::Sender<AbortSource>,
 ) {
-    // Copied once: `ev` is moved into the sink below, but the rid is still
-    // needed to look the request up and to remove it.
-    let rid = ev.rid.clone();
-
-    let Some(st) = table.get_mut(&rid) else {
+    let Some(st) = table.get_mut(&ev.rid) else {
         // Late chunk after completion/abort — drop.
         return;
     };
@@ -328,6 +326,7 @@ fn handle_chunk(
                 // Abort too: this is terminal for the request, and without it the
                 // scheduler keeps generating for a connection that is already gone
                 // — the other two terminal paths (disconnect, fail) both abort.
+                let rid = ev.rid;
                 let _ = st.fsm.apply(Event::Error(e.clone()));
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
                 let _ = st.sink.try_send(ResponseItem::Error(e));
@@ -366,6 +365,7 @@ fn handle_chunk(
     ev.completion_tokens = n_tok;
 
     if finished {
+        let rid = ev.rid.clone();
         // The Done frame *is* the final frame: Finalizing → Completed.
         let sent = st.sink.try_send(ResponseItem::Done(ev)).is_ok();
         let _ = st.fsm.apply(if sent {
@@ -381,7 +381,11 @@ fn handle_chunk(
         // silently dropping the frame would truncate the response and still look
         // like success at EOS. So treat both as terminal: drop the request AND
         // abort scheduler work for it.
-        if let Err(e) = st.sink.try_send(ResponseItem::Frame(ev)) {
+        if let Err((e, unsent)) = st.sink.try_send_recover(ResponseItem::Frame(ev)) {
+            let ResponseItem::Frame(unsent) = unsent else {
+                unreachable!("sent a frame")
+            };
+            let rid = unsent.rid;
             match e {
                 SinkError::Full => {
                     tracing::warn!(
@@ -408,7 +412,7 @@ fn handle_chunk(
 
 /// Drop a matched stop TOKEN from the final chunk (Python `trim_matched_stop`,
 /// token branch); `no_stop_trim` / non-token match keeps it.
-fn trim_stop_token(token_ids: &mut TokenIds, matched: &Option<Matched>, no_stop_trim: bool) {
+fn trim_stop_token(token_ids: &mut OutputTokenIds, matched: &Option<Matched>, no_stop_trim: bool) {
     // Token id 0 is NOT a match: Python guards with `if not matched`, and 0 is
     // falsy there, so it trims nothing. Trimming on 0 drops a real generated token
     // for any model whose stop id happens to be 0.
@@ -459,7 +463,7 @@ mod tests {
         let (tm_tx, tm_rx) = flume::unbounded::<AbortSource>();
         let ev = ChunkEvent {
             rid: Rid::from("1"),
-            token_ids: vec![5],
+            token_ids: vec![5].into(),
             ..Default::default() // finish_reason None → non-terminal
         };
         handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
@@ -573,7 +577,7 @@ mod tests {
 
         let chunk = |rid: &str, id: i64| ChunkEvent {
             rid: Rid::from(rid.to_string()),
-            token_ids: vec![id],
+            token_ids: vec![id].into(),
             ..Default::default()
         };
         handle_chunk(
@@ -594,12 +598,12 @@ mod tests {
             other => panic!("expected a frame, got {other:?}"),
         };
         assert_eq!(
-            ids(&mut rx_a),
+            ids(&mut rx_a).as_slice(),
             vec![11],
             "alice must not receive bob's tokens"
         );
         assert_eq!(
-            ids(&mut rx_b),
+            ids(&mut rx_b).as_slice(),
             vec![22],
             "bob must not receive alice's tokens"
         );
@@ -628,7 +632,7 @@ mod tests {
         let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
         let ev = ChunkEvent {
             rid: Rid::from("1"),
-            token_ids: ids,
+            token_ids: ids.into(),
             // Parsed from the wire map, so the trim paths are driven by the same
             // shape Python emits rather than a hand-built enum.
             finish_reason: Some(
@@ -648,13 +652,13 @@ mod tests {
     /// generated token for any model whose stop id is 0.
     #[test]
     fn matched_token_zero_does_not_trim() {
-        let mut ids = vec![1, 2, 0];
+        let mut ids: OutputTokenIds = vec![1, 2, 0].into();
         trim_stop_token(&mut ids, &Some(Matched::Token(0)), false);
-        assert_eq!(ids, vec![1, 2, 0], "id 0 is not a matched stop");
+        assert_eq!(ids.as_slice(), vec![1, 2, 0], "id 0 is not a matched stop");
         // A real stop id still trims.
-        let mut ids = vec![1, 2, 3];
+        let mut ids: OutputTokenIds = vec![1, 2, 3].into();
         trim_stop_token(&mut ids, &Some(Matched::Token(3)), false);
-        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(ids.as_slice(), vec![1, 2]);
     }
 
     /// A matched stop TOKEN is dropped from the surfaced `output_ids` by default
@@ -663,14 +667,22 @@ mod tests {
     fn stop_token_trimmed_from_output_ids() {
         let fr = serde_json::json!({ "type": "stop", "matched": 3 });
         let out = final_chunk(false, fr.clone(), vec![1, 2, 3]);
-        assert_eq!(out.token_ids, vec![1, 2], "matched stop token dropped");
+        assert_eq!(
+            out.token_ids.as_slice(),
+            vec![1, 2],
+            "matched stop token dropped"
+        );
         assert_eq!(
             out.completion_tokens, 3,
             "generated count still includes it"
         );
 
         let out = final_chunk(true, fr, vec![1, 2, 3]);
-        assert_eq!(out.token_ids, vec![1, 2, 3], "no_stop_trim keeps it");
+        assert_eq!(
+            out.token_ids.as_slice(),
+            vec![1, 2, 3],
+            "no_stop_trim keeps it"
+        );
     }
 
     /// A non-stop finish (`length`, no `matched`) never trims.
@@ -678,6 +690,6 @@ mod tests {
     fn length_finish_keeps_all_tokens() {
         let fr = serde_json::json!({ "type": "length", "length": 3 });
         let out = final_chunk(false, fr, vec![1, 2, 3]);
-        assert_eq!(out.token_ids, vec![1, 2, 3]);
+        assert_eq!(out.token_ids.as_slice(), vec![1, 2, 3]);
     }
 }
