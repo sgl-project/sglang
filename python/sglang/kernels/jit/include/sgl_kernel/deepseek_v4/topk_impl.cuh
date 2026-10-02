@@ -308,6 +308,79 @@ struct TopKConfig {
     }
   }
 
+  /// All block threads participate; `smem->match` receives the bin b satisfying
+  /// count(bins > b) < need <= count(bins >= b).
+  SGL_DEVICE static void select_desc_bin(const uint32_t* hist, const uint32_t need, TieHandleSmem* smem) {
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = broadcast(tx / kWarpSize);
+    uint32_t count = 0;
+    uint32_t warp_inc = 0;
+    if (tx < kRadixSize) {
+      count = hist[kRadixSize - 1 - tx];
+      warp_inc = warp::inclusive_sum(count, lane_id);
+      if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+    }
+    __syncthreads();
+    if (tx < kRadixSize) {
+      const auto at_or_above = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0) + warp_inc;
+      const auto above = at_or_above - count;
+      if (above < need && at_or_above >= need) smem->match = {kRadixSize - 1 - tx, above, count};
+    }
+    __syncthreads();
+  }
+
+  /// Select the `remain` best values in [v_lo, v_hi) into [base, base + remain).
+  /// All block threads participate; `for_each(fn(val, idx))` must replay the full input.
+  template <typename ForEach>
+  SGL_DEVICE static void overflow_select(
+      const TopKProblem& problem,
+      const uint32_t base,
+      const uint32_t remain,
+      const float v_lo,
+      const float v_hi,
+      TieHandleSmem* smem,
+      const ForEach& for_each) {
+    const auto tx = threadIdx.x;
+    uint32_t prefix = 0;
+    uint32_t prefix_mask = 0;
+    uint32_t need = remain;
+    const auto histogram = smem->histogram[0];
+#pragma unroll 1
+    for (uint32_t round = 0; round < 4; ++round) {
+      const uint32_t shift = 24 - round * 8;
+      if (tx < kRadixSize) histogram[tx] = 0;
+      __syncthreads();
+      for_each([&](float val, uint32_t) {
+        if (val >= v_lo && val < v_hi) {
+          const auto key = extract_exact_bin(val);
+          if ((key & prefix_mask) == prefix) atomicAdd(&histogram[(key >> shift) & 0xFFu], 1);
+        }
+      });
+      __syncthreads();
+      select_desc_bin(histogram, need, smem);
+      const auto match = smem->match;
+      need -= match.above_count;
+      prefix |= match.bin << shift;
+      prefix_mask |= 0xFFu << shift;
+      __syncthreads();  // everyone read `match` before the next round rewrites it
+    }
+    if (tx == 0) smem->counter = smem->counter_final = 0;
+    __syncthreads();
+    const auto num_above = remain - need;  // keys strictly above the exact threshold `prefix`
+    for_each([&](float val, uint32_t idx) {
+      if (val >= v_lo && val < v_hi) {
+        const auto key = extract_exact_bin(val);
+        if (key > prefix) {
+          problem.emit(base + atomicAdd(&smem->counter, 1), idx);
+        } else if (key == prefix) {
+          if (const auto pos = atomicAdd(&smem->counter_final, 1); pos < need)
+            problem.emit(base + num_above + pos, idx);
+        }
+      }
+    });
+  }
+
   /// Exact radix select over the tie candidates: each thread owns kItems
   /// strided elements (inactive beyond num_ties). Requires
   /// num_ties <= kItems * kBlockSize.
@@ -627,6 +700,19 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    if (count_eq > kMaxNumTie && remain_topk > 0) [[unlikely]] {
+      return overflow_select(problem, count_gt, remain_topk, v_lo, v_hi, &smem->tie_handle, [&](auto&& fn) {
+#pragma unroll
+        for (uint32_t i = 0; i < kLocalVecs; ++i) {
+          const auto vi = tx + kBlockSize * i;
+          if (vi >= num_full) break;
+#pragma unroll
+          for (uint32_t j = 0; j < kVecSize; ++j) {
+            fn(local_vecs[i][j], vi * kVecSize + j);
+          }
+        }
+      });
+    }
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
   }
@@ -704,6 +790,11 @@ struct TopKStreaming : TopKRadixBase<12> {
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    if (count_eq > kMaxNumTie && remain_topk > 0) [[unlikely]] {
+      return overflow_select(problem, count_gt, remain_topk, v_lo, v_hi, &smem->tie_handle, [&](auto&& fn) {
+        for_each_input(problem.in, problem.seq_len, fn);
+      });
+    }
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
   }
@@ -822,7 +913,8 @@ struct TopKCluster : TopKRadixBase<10> {
       const auto local_count_eq = min(smem->count_eq, kMaxNumTie);
       if (tx == 0) {
         const auto gt = atomicAdd(&smem_0->count_gt, local_count_gt);
-        const auto eq = atomicAdd(&smem_0->count_eq, local_count_eq);
+        // Uncapped, so rank 0's total detects a single rank's overflow.
+        const auto eq = atomicAdd(&smem_0->count_eq, smem->count_eq);
         smem->local_start_gt = gt;
         smem->local_start_eq = eq;
       }
@@ -884,6 +976,13 @@ struct TopKCluster : TopKRadixBase<10> {
       const auto count_gt = smem->count_gt;
       const auto count_eq = smem->count_eq;
       const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+      if (count_eq > kMaxNumTie && remain_topk > 0) [[unlikely]] {
+        // Rank 0 alone rescans the whole row: peers may already be on their next
+        // item, so no protocol may depend on them past bar-3.
+        return overflow_select(problem, count_gt, remain_topk, v_lo, v_hi, &smem->tie_handle, [&](auto&& fn) {
+          for_each_input(problem.in, problem.seq_len, fn);
+        });
+      }
       const auto tie_count = min(count_eq, kMaxNumTie);
       handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
     }
