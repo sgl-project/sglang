@@ -206,7 +206,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             sampling_seed = (
                 torch.zeros((self.max_bs,), dtype=torch.int64)
                 if get_exec().deterministic.enable_deterministic_inference
-                and self.model_runner.server_args.speculative_use_rejection_sampling
+                and get_spec().speculative_use_rejection_sampling
                 else None
             )
             _hidden_size, _hidden_dtype = get_draft_recurrent_hidden_state_spec(
