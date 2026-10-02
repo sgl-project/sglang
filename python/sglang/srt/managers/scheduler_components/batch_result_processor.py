@@ -30,7 +30,7 @@ from sglang.srt.managers.schedule_batch import (
     mamba_lazy_spec_in_window,
 )
 from sglang.srt.mem_cache.common import (
-    maybe_cache_unfinished_req,
+    checkpoint_kv_cache,
     release_kv_cache,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -381,7 +381,7 @@ class SchedulerBatchResultProcessor:
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -472,7 +472,7 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        checkpoint_kv_cache(req, self.tree_cache)
                 else:
                     # being chunked reqs' prefill is not finished
                     req.inflight_middle_chunks -= 1
