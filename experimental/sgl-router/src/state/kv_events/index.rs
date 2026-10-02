@@ -380,25 +380,24 @@ impl KvEventIndex {
                  --kv-bootstrap-timeout-ms (the fetch cap cannot lift this on its own)",
             );
         }
-        let snapshot_http = match reqwest::Client::builder()
+        let snapshot_http = reqwest::Client::builder()
             .connect_timeout(SNAPSHOT_FETCH_CONNECT_TIMEOUT)
             .read_timeout(SNAPSHOT_FETCH_READ_TIMEOUT)
             .timeout(per_fetch)
+            // A sibling router never redirects this route, so a redirect is
+            // either a misconfigured peer or a hostile one steering the fetch
+            // — and its multi-gigabyte buffering budget — at an arbitrary
+            // in-cluster URL. Refuse to follow: the 3xx lands as
+            // `FetchAnswer::NoBody` and the peer is just not a source.
+            .redirect(reqwest::redirect::Policy::none())
+            // No fallback to the introspection client: it follows redirects,
+            // which would silently reopen the hole the policy above closes
+            // (and its total timeout cannot fit a large snapshot anyway).
+            // Every option set here is an infallible setter — `build()` only
+            // fails when the TLS backend cannot initialize, and `new()`
+            // already treats that as fatal for the introspection client.
             .build()
-        {
-            Ok(client) => client,
-            Err(e) => {
-                // Not silent: the fallback's total timeout is sized for
-                // `/server_info`, so every large snapshot would then time out
-                // and be booked `unreachable` with nothing pointing here.
-                warn!(
-                    error = %e,
-                    "kv-bootstrap: snapshot client failed to build; falling back to the \
-                     introspection client, whose timeout cannot fit a large snapshot",
-                );
-                http.clone()
-            }
-        };
+            .expect("snapshot http client builds: no fallible builder options are set");
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<PumpControl>(16);

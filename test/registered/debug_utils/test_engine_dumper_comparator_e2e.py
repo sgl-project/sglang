@@ -197,7 +197,7 @@ class TestSourcePatcherE2ESGLang:
         _run_e2e_scenario(
             tmp_path=tmp_path,
             target_tp=BASELINE_TP,
-            extra_target_server_args=["--dp", "2", "--enable-dp-attention"],
+            extra_target_server_args=["--attn-dp-size", "2"],
             target_patch_config_yaml=PATCH_CONFIG_DP_ATTENTION_YAML,
             extra_comparator_args=[
                 "--token-aligner",

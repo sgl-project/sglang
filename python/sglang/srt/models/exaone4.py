@@ -38,7 +38,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang.utils import get_exception_traceback, logger
 
 
@@ -244,9 +244,6 @@ class Exaone4DecoderLayer(nn.Module):
 
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
         self.self_attn = Exaone4Attention(
             config=config,
             hidden_size=self.hidden_size,
@@ -341,7 +338,7 @@ class Exaone4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Exaone4DecoderLayer(
                 config=config,
@@ -349,8 +346,6 @@ class Exaone4Model(nn.Module):
                 layer_id=idx,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:

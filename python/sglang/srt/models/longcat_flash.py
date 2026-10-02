@@ -428,9 +428,6 @@ class LongcatFlashDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
         self.attn_boundary, self.moe_boundary = make_stages(
             (
                 declare_attn(),
@@ -676,7 +673,6 @@ class LongcatFlashForCausalLM(nn.Module):
             ]
 
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.model = LongcatFlashModel(
             config, quant_config, prefix=add_prefix("model", prefix)
