@@ -1658,6 +1658,11 @@ def test_qsa_draft_metadata_multi_step_graph(bs, padding):
         ([1, 7], [31, 19]),
         ([17, 33], [23, 0]),
         ([2049, 3], [7, 40]),
+        ([3, 1, 2], [1018, 128, 128]),
+        ([3, 1, 2], [253, 63, 62]),
+        ([3, 1, 2], [254, 63, 62]),
+        ([3, 1, 2], [8189, 2047, 2046]),
+        ([3, 1, 2], [8190, 2047, 2046]),
     ],
 )
 def test_qsa_prefill_kv_packing(
@@ -1730,13 +1735,13 @@ def test_qsa_prefill_kv_packing(
 
     def packed():
         packed_k, packed_v = pack_qsa_prefill_kv(
-            k,
-            v,
-            table,
-            req_indices,
-            cu_k,
-            sum(lens),
-            max(lens),
+            k=k,
+            v=v,
+            req_to_token=table,
+            req_indices=req_indices,
+            cu_k=cu_k,
+            total_k=sum(lens),
+            max_k=max(lens),
             output_dtype=output_dtype,
         )
         if not torch.cuda.is_current_stream_capturing():

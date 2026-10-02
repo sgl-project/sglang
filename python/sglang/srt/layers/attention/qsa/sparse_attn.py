@@ -243,11 +243,8 @@ def _sparse_gqa_chunk_prefill(
             mask=valid[:, None],
             other=0.0,
         )
-        # The chunk-prefill K/V tensors are gathered from the KV pool and can
-        # therefore carry the FP8 storage dtype, which Triton's dot rejects
-        # (`Unsupported rhs dtype fp8e4nv`). Convert to Q's dtype; the QSA
-        # backend writes the pool without per-tensor k/v scales, so this is a
-        # plain cast (no-op for BF16 pools).
+        # Direct callers can pass FP8 K/V; production packing uses Q's dtype.
+        # QSA stores unscaled K/V, so a plain cast supports both callers.
         keys = keys.to(q_values.dtype)
         values = values.to(q_values.dtype)
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
@@ -270,7 +267,7 @@ def _sparse_gqa_chunk_prefill(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOTAL_K", "BS"])
 def _pack_qsa_prefill_kv(
     k,
     v,
@@ -290,15 +287,35 @@ def _pack_qsa_prefill_kv(
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    TOTAL_K,
+    BS,
+    COMPACT: tl.constexpr,
 ):
-    batch = tl.program_id(1)
-    start = tl.load(cu_k + batch).to(tl.int64)
-    end = tl.load(cu_k + batch + 1).to(tl.int64)
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     token = offsets // (HEADS * DIM)
-    valid = token < end - start
-    req = tl.load(req_indices + batch).to(tl.int64)
-    dst = start * HEADS * DIM + offsets
+    if COMPACT:
+        valid = token < TOTAL_K
+        lo = tl.full((BLOCK,), 0, tl.int32)
+        hi = lo + BS
+        steps = BS
+        while steps > 0:
+            mid = (lo + hi + 1) // 2
+            start = tl.load(cu_k + mid).to(tl.int64)
+            after = token >= start
+            lo = tl.where(after, mid, lo)
+            hi = tl.where(after, hi, mid - 1)
+            steps = steps // 2
+        start = tl.load(cu_k + lo, valid, 0).to(tl.int64)
+        req = tl.load(req_indices + lo, valid, 0).to(tl.int64)
+        token = token - start
+        dst = offsets
+    else:
+        batch = tl.program_id(1)
+        start = tl.load(cu_k + batch).to(tl.int64)
+        end = tl.load(cu_k + batch + 1).to(tl.int64)
+        valid = token < end - start
+        req = tl.load(req_indices + batch).to(tl.int64)
+        dst = start * HEADS * DIM + offsets
     head = offsets // DIM % HEADS
     dim = offsets % DIM
     slot = tl.load(req_to_token + req * SR0 + token * SR1, valid, 0).to(tl.int64)
@@ -309,7 +326,7 @@ def _pack_qsa_prefill_kv(
 
 
 def pack_qsa_prefill_kv(
-    k, v, req_to_token, req_indices, cu_k, total_k, max_k, *, output_dtype=None
+    *, k, v, req_to_token, req_indices, cu_k, total_k, max_k, output_dtype=None
 ):
     heads, dim = k.shape[1:]
     packed_k = torch.empty(
@@ -318,7 +335,17 @@ def pack_qsa_prefill_kv(
     packed_v = torch.empty(
         (total_k, heads, dim), dtype=output_dtype or v.dtype, device=v.device
     )
-    _pack_qsa_prefill_kv[(triton.cdiv(max_k * heads * dim, 1024), req_indices.numel())](
+    batch_size = req_indices.numel()
+    blocks_per_request = triton.cdiv(max_k * heads * dim, 1024)
+    compact = (
+        max_k * batch_size > 2 * total_k and blocks_per_request * batch_size >= 4096
+    )
+    grid = (
+        (triton.cdiv(total_k * heads * dim, 1024),)
+        if compact
+        else (blocks_per_request, batch_size)
+    )
+    _pack_qsa_prefill_kv[grid](
         k,
         v,
         packed_k,
@@ -332,6 +359,9 @@ def pack_qsa_prefill_kv(
         HEADS=heads,
         DIM=dim,
         BLOCK=1024,
+        TOTAL_K=total_k,
+        BS=batch_size,
+        COMPACT=compact,
     )
     return packed_k, packed_v
 
@@ -631,6 +661,7 @@ def qwen_sparse_kv_extraction_compact_triton(
 
 
 __all__ = [
+    "pack_qsa_prefill_kv",
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",

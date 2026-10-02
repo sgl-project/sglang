@@ -1497,13 +1497,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         packed_k, packed_v = pack_qsa_prefill_kv(
-            pool.get_key_buffer(layer.layer_id),
-            pool.get_value_buffer(layer.layer_id),
-            self.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            cu_seqlens_k,
-            sum(sequence_lens),
-            max(sequence_lens, default=1),
+            k=pool.get_key_buffer(layer.layer_id),
+            v=pool.get_value_buffer(layer.layer_id),
+            req_to_token=self.req_to_token_pool.req_to_token,
+            req_indices=forward_batch.req_pool_indices,
+            cu_k=cu_seqlens_k,
+            total_k=sum(sequence_lens),
+            max_k=max(sequence_lens, default=1),
             output_dtype=q.dtype,
         )
         output = sparse_gqa_fwd_interface_triton_ck(
