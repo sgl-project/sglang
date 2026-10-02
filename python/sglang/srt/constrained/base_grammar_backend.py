@@ -440,6 +440,9 @@ def create_grammar_backend(
             reasoning_parser,
             tokenizer,
             enable_strict_thinking=get_serving().enable_strict_thinking,
+            model_eos_token_ids=(
+                sorted(eos_token_ids) if eos_token_ids is not None else None
+            ),
         )
 
     return grammar_backend
