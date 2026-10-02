@@ -69,6 +69,7 @@ sglang-grpc-types = { path = "../../proto" }
 # naturally while the crate keeps its own artifact name in the shared target/.
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
 tonic = { workspace = true }
+tokio-stream = { workspace = true }
 
 [dev-dependencies]
 # `Router::oneshot` for handler-level router tests.

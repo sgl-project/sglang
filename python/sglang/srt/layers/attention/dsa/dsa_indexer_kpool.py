@@ -23,7 +23,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.attention.mqa_logits_utils import (
-    MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
     mqa_logits_budget_bytes,
     mqa_logits_row_bytes,
@@ -901,7 +900,8 @@ class IndexerKPool(MultiPlatformOp):
             num_q, num_k = q_fp8.shape[0], k_fp8.shape[0]
             rows_per_call = mqa_logits_rows_per_chunk(
                 num_rows=num_q,
-                row_bytes=num_k * MQA_LOGITS_BYTES_PER_ELEM,
+                # aiter pads each output row to 256 columns
+                row_bytes=mqa_logits_row_bytes(num_k),
                 budget_bytes=MQA_LOGITS_MAX_BYTES_ROCM,
             )
             if rows_per_call is None:
@@ -1693,9 +1693,10 @@ class IndexerKPool(MultiPlatformOp):
         if metadata is None:
             return None
 
-        assert forward_batch.seq_lens_cpu is not None
+        # Spec-v2 decode/verify batches may carry no CPU seq_lens mirror (the
+        # backend opts out of the D2H); test emptiness on the device shape.
         mode = forward_batch.forward_mode
-        if mode.is_idle() or len(forward_batch.seq_lens_cpu) == 0:
+        if mode.is_idle() or forward_batch.seq_lens.shape[0] == 0:
             return torch.full(
                 (x.shape[0], self.index_topk + self.index_kpool - 1),
                 -1,
