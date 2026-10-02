@@ -3863,6 +3863,7 @@ class Scheduler(
                 num_allocatable_reqs=self.get_num_allocatable_reqs(
                     running_bs, running_batch=running_batch
                 ),
+                num_waiting_reqs=len(self.waiting_queue),
             )
         ):
             return None, running_batch
