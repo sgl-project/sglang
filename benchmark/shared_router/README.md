@@ -91,21 +91,45 @@ different common sources or claim statistical significance.
 The preparation tree changes only formatting and reproduction support relative
 to the main measured runtime: Python AST is identical, C++/Triton unchanged.
 
+### Completed C1 qualification
+
+Native-first C1 pairs completed on the same two sources and protocol:
+
+| Common source | Native P50 TPOT (ms) | Fused P50 TPOT (ms) | Change | Output tokens/s change | Full GSM8K correct, native/fused |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Main + this patch, `76d9a6c2a6` | 2.308737 | 2.234317 | -3.223% | +2.945% | 1286/1285 of 1319 |
+| Same + #42055, `56f8583e02` | 2.263725 | 2.225005 | -1.710% | +1.556% | 1282/1281 of 1319 |
+
+Each accuracy comparison lost one correct answer (0.076 percentage points),
+with zero request errors and independently rescored raw responses. Every rank
+passed raw graph-engagement checks for both fused stages. P50 ITL changes were
+-3.216% and -1.671%, respectively; P50 TTFT changed -0.337% and -0.386%.
+These are medians of three per-repetition statistics, not pooled percentiles.
+C1 reverse-order confirmations remain in progress; no significance claim is
+made from these sequential, co-located pairs.
+
 ### Completed public-main fallback checks
 
-The same public-main source and protocol completed C4 and C8 qualification:
+The same public-main source and protocol completed C4, C8 and C16 qualification:
 
 | C | Native P50 TPOT (ms) | Fused-enabled P50 TPOT (ms) | Change | Output tokens/s change | Full GSM8K correct, native/fused-enabled |
 | ---: | ---: | ---: | ---: | ---: | --- |
 | 4 | 4.066732 | 4.060509 | -0.153% | +0.137% | 1278/1284 of 1319 |
 | 8 | 5.616812 | 5.612190 | -0.082% | +0.022% | 1285/1285 of 1319 |
+| 16 | 8.473711 | 8.454563 | -0.226% | +0.042% | 1285/1283 of 1319 |
 
-Both accuracy pairs had zero request errors. Hash-checked traces show graph
+All three accuracy pairs had zero request errors. Hash-checked traces show graph
 replay on all four ranks but no horizontal-fusion launches in steady decode.
 These are native-fallback checks with no observed material regression, not
 evidence of a fusion speedup at these batch sizes. Tail batches can still enter
 the supported small-M path. Other current-main and incremental cases remain
 pending; the historical sweep below cannot substitute for them.
+
+C16 used the single-start steady-decode probe in REPRODUCE.md, avoiding the
+staged profiler restart that stalled an earlier attempt. Both arms collected
+16 graph launches per rank with correlated GPU kernels. P50 ITL changed
++0.058% and P50 TTFT -0.059%. Zero fused steady-decode launches make this a
+fallback check, not evidence of a fusion speedup at C16.
 
 On the #42055 common source, the C8 fallback check completed with P50 TPOT
 5.558282 to 5.572054 ms (+0.248%) and output throughput -0.083%. Full GSM8K

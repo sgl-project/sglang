@@ -174,8 +174,8 @@ the HTTP client. Do not include this request in performance statistics.
 
 The staged probe below has completed at C1/C2/C4/C8. Do not extrapolate it to
 C16/C32: during qualification a C16 server stalled when the profiler restarted
-between prefill and decode. A single-start, steady-decode probe is being
-validated separately; high-concurrency trace qualification remains pending.
+between prefill and decode. The single-start, steady-decode protocol below
+passed both arms at C16; C32 qualification remains pending.
 For readiness detection, `spec_verify_calls_total` is not a live per-step
 counter in the pinned source: it increments when a request finishes. It is
 suitable for the completed-request AL audit, not for triggering a profiler
@@ -222,6 +222,82 @@ not contain these fused stages. High-C traces may legitimately use native
 fallback or include fused small-M tails. Kernel-name counts alone do not prove
 which constexpr specialization ran or provide unbiased performance timings.
 The probe uses synthetic token IDs solely for dispatch attribution, not accuracy.
+
+### C16/C32 single-start steady-decode probe
+
+Use this instead of the staged probe above, after timing is finished. Start
+all requests before enabling profiling, then wait for a full active batch,
+an empty queue and live sequence lengths beyond prefill. The pinned source
+reports full sequence lengths in `decode_sum_seq_lens`, not SWA cache lengths.
+The qualification harness validated this protocol at C16 on both arms; this
+self-contained command uses the same requests, trigger and profiler payload.
+It is not a new timing measurement or a claim that C32 is already qualified.
+
+```bash
+export BASE_URL=http://127.0.0.1:30000 CONC=16
+export TRACE_DIR=/absolute/server-visible/path/candidate-c16-steady-trace
+python3 - <<'PY'
+import json
+import os
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+base = os.environ['BASE_URL']
+conc = int(os.environ['CONC'])
+assert conc in (16, 32)
+
+def post(endpoint, payload):
+    request = urllib.request.Request(
+        base + endpoint, json.dumps(payload).encode(),
+        {'Content-Type': 'application/json'})
+    with urllib.request.urlopen(request, timeout=600) as response:
+        return response.read().decode()
+
+def metric(text, name):
+    values = [float(line.split()[-1]) for line in text.splitlines()
+              if line.startswith(name + '{') or line.startswith(name + ' ')]
+    assert values, 'Missing metric: ' + name
+    return sum(values)
+
+def generate(index):
+    return post('/generate', dict(
+        input_ids=[1000 + index] * 8192,
+        sampling_params=dict(temperature=0, max_new_tokens=1024, ignore_eos=True)))
+
+with ThreadPoolExecutor(max_workers=conc) as pool:
+    futures = [pool.submit(generate, i) for i in range(conc)]
+    deadline = time.monotonic() + 90
+    while True:
+        with urllib.request.urlopen(base + '/metrics', timeout=10) as response:
+            snapshot = response.read().decode()
+        assert not any(f.done() for f in futures), 'Probe ended before trigger'
+        if (metric(snapshot, 'sglang:num_running_reqs') == conc
+                and metric(snapshot, 'sglang:num_queue_reqs') == 0
+                and metric(snapshot, 'sglang:decode_sum_seq_lens')
+                    >= conc * (8192 + 32)):
+            print('Trigger metrics:', snapshot)
+            break
+        assert time.monotonic() < deadline, 'No full-concurrency decode trigger'
+        time.sleep(0.05)
+    receipt = post('/start_profile', dict(
+        output_dir=os.environ['TRACE_DIR'], start_step=1, num_steps=8,
+        activities=['CPU', 'GPU'], with_stack=False, record_shapes=True,
+        profile_by_stage=False, profile_prefix='steady-decode'))
+    assert receipt.strip() == 'Start profiling.', receipt
+    responses = [json.loads(f.result()) for f in futures]
+assert all(r['meta_info']['completion_tokens'] == 1024 for r in responses)
+print('Probe requests completed:', len(responses))
+PY
+```
+
+On the pinned source, `start_step=1` clamps to the next forward. Wait for four
+`steady-decode-*-TP-<rank>.trace.json.gz` files, without the staged `-DECODE`
+suffix, and apply the same raw-hash and graph-correlation checks described
+above. Both C16 arms exported 16 graph launches per rank with correlated GPU
+kernels and no fused launches in steady decode. A timeout or exported trace
+alone is not proof of valid full-batch attribution. Keep trigger metrics and
+server logs; do not restart an active run merely because observation timed out.
 
 ## Qualification beyond timing
 
