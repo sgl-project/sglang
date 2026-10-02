@@ -16,6 +16,7 @@ Comfy checkpoints instead load their INT8 weights and row scales directly.
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 
 import torch
 from torch.nn.parameter import Parameter
@@ -24,6 +25,7 @@ from sglang.multimodal_gen.runtime.layers.linear import LinearMethodBase
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 __all__ = ["KitchenInt8Config", "KitchenInt8LinearMethod"]
@@ -40,17 +42,44 @@ _OUT_DTYPE_CODE = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
 # the identical tile without it. Capping rows per call keeps the plain
 # data-parallel config, and is bit-exact because splitting rows does not change
 # any single row's arithmetic.
+_ROW_SPLIT_OVERRIDDEN = any(
+    name in os.environ
+    for name in ("SGLANG_KITCHEN_INT8_MAX_ROWS", "SGLANG_KITCHEN_INT8_MIN_SPLIT_N")
+)
 _MAX_ROWS_PER_CALL = int(os.environ.get("SGLANG_KITCHEN_INT8_MAX_ROWS", "8192"))
 # Narrow outputs do not recover the cost of writing results back through a
 # preallocated buffer; H3's out_proj and fc2 (N=5376) both measure slower split.
 _MIN_SPLIT_OUTPUT = int(os.environ.get("SGLANG_KITCHEN_INT8_MIN_SPLIT_N", "8192"))
 
 
-def _row_split(rows: int, out_features: int) -> int | None:
+@lru_cache(maxsize=16)
+def _is_sm120(device: torch.device) -> bool:
+    return device.type == "cuda" and current_platform.get_device_capability(
+        device.index if device.index is not None else 0
+    ) == (12, 0)
+
+
+def _row_split(
+    rows: int,
+    out_features: int,
+    in_features: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> int | None:
     """Rows per `int8_linear` call, or None to issue one call for everything."""
     if _MAX_ROWS_PER_CALL <= 0 or rows <= _MAX_ROWS_PER_CALL:
         return None
     if out_features < _MIN_SPLIT_OUTPUT:
+        return None
+    # SM120 handles the narrow-output Stream-K path efficiently. Splitting
+    # adds launches and a full output copy; retain the wide-output policy.
+    if (
+        not _ROW_SPLIT_OVERRIDDEN
+        and dtype == torch.bfloat16
+        and in_features <= 8192
+        and out_features <= 24832
+        and _is_sm120(device)
+    ):
         return None
     return _MAX_ROWS_PER_CALL
 
@@ -193,7 +222,7 @@ class KitchenInt8LinearMethod(LinearMethodBase):
             )
 
         n_rows, n_out = x.shape[0], layer.weight.shape[0]
-        split = _row_split(n_rows, n_out)
+        split = _row_split(n_rows, n_out, x.shape[1], x.device, x.dtype)
         if split is None:
             out = run(x)
         else:
