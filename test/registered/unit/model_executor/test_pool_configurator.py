@@ -735,6 +735,49 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
 
+class TestPerWorkerRequestSplit(CustomTestCase):
+    """A --max-running-requests cap below the attention DP size must still leave
+    every worker one request slot, not zero."""
+
+    def test_max_num_reqs_keeps_one_slot_below_dp_size(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        _publish_config(self, max_running_requests=1)
+        kvc = SimpleNamespace(
+            attn_dp_size=4,
+            mambaish_config=None,
+            model_config=SimpleNamespace(context_len=8192),
+        )
+        self.assertEqual(KVCacheConfigurator.resolve_max_num_reqs(kvc, 1 << 20), 1)
+
+    def test_chunk_cache_cap_sizes_one_request_below_dp_size(self):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            disable_radix_cache=True,
+            chunked_prefill_size=1000,
+            sliding_window_size=4,
+            page_size=1,
+            max_running_requests=1,
+            disaggregation_mode="decode",
+        )
+        mr.attn_dp_size = 4
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(1_000_000, page_size=1)
+
+        # One request per worker at 4 + 1 + 4 + 1 = 10 SWA tokens, the same
+        # per-request cost as test_chunk_cache_cap_drops_prefill_for_disagg_decode.
+        self.assertEqual(config.swa_max_total_num_tokens, 10)
+
+
 class TestAllSWAConfigurator(CustomTestCase):
     """All-SWA (full_layers=0): special case."""
 
