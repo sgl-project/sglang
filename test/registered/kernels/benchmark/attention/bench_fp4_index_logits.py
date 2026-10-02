@@ -18,6 +18,9 @@ register_cuda_ci(
 
 
 def index_topk(q, weights, req, req_table, lens, table, capacity, paged):
+    """Measure scoring and top-k only; exclude final index sorting, KV slot
+    mapping, and selection writeback from both implementations.
+    """
     if paged:
         plan = plan_topk_v2(lens)
         scores = fp4_index_logits_paged(

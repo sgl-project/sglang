@@ -342,6 +342,13 @@ def write_prefill(
 
 
 class PagedDecodeScores(msgspec.Struct, frozen=True):
+    """Paged decode scores with graph-stable capacity ``lmax``.
+
+    Only positions below each device-side ``lens`` are initialized. Top-k
+    consumers must respect those lengths. With ``has_candidate_mask``, masked
+    positions have -inf scores and must be discarded during selection writeback.
+    """
+
     bs: int
     lmax: int
     lens: torch.Tensor
@@ -350,7 +357,7 @@ class PagedDecodeScores(msgspec.Struct, frozen=True):
     req_to_token: torch.Tensor
     ratio: int
     plan: torch.Tensor
-    mask_scores: bool
+    has_candidate_mask: bool
 
 
 def decode_scores(
@@ -410,7 +417,7 @@ def decode_scores(
             req_to_token=req_to_token,
             ratio=ratio,
             plan=plan,
-            mask_scores=candidate_mask is not None,
+            has_candidate_mask=candidate_mask is not None,
         )
     out.reset()
     j = torch.arange(lmax, device=pos.device)
@@ -439,7 +446,7 @@ def select_decode(
             out.page_indices,
             out.raw_indices,
             d.ratio,
-            d.mask_scores,
+            d.has_candidate_mask,
         )
     else:
         write_decode(out, d, d.scores.topk(k, dim=-1, sorted=False).indices)

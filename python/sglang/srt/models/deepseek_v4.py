@@ -3427,33 +3427,21 @@ class DeepseekV4DecoderLayer(nn.Module):
                 parts = getattr(self, "_hc_ffn_tf32_parts", None)
                 bf16_parts = getattr(self, "_hc_ffn_bf16_parts", None)
 
-        if (
-            x.is_cuda
-            and (
-                # gfx950: the fused Triton port wins at every row count (MI350X)
-                _is_gfx95_supported
-                or (
-                    torch.version.cuda is not None
-                    and (
-                        get_platform().is_blackwell
-                        or (
-                            get_platform().is_sm90
-                            and (
-                                x.shape[0] == 1
-                                or (
-                                    bf16_parts is not None and 32 <= x.shape[0] <= 65536
-                                )
-                            )
-                        )
-                    )
-                )
-            )
-            and x.dtype == torch.bfloat16
-        ):
-            # Fusing the split-K reduction with sinkhorn keeps it batch-invariant.
-            if bf16_parts is not None and (
-                hopper_medium or 4096 <= x_flat.shape[0] <= 65536
-            ):
+        use_bf16_projection = bf16_parts is not None and (
+            hopper_medium or 4096 <= x_flat.shape[0] <= 65536
+        )
+        hopper_fused_stats = get_platform().is_sm90 and (
+            x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
+        )
+        # gfx950 uses the fused Triton port at every row count (MI350X).
+        use_fused_stats = _is_gfx95_supported or (
+            torch.version.cuda is not None
+            and (get_platform().is_blackwell or hopper_fused_stats)
+        )
+        if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
+            # The default split-K/Sinkhorn fusion preserves batch invariance;
+            # compensated projections above are disabled in batch-invariant mode.
+            if use_bf16_projection:
                 from sglang.kernels.ops.layernorm.mhc import (
                     hc_mix_stats_sinkhorn_bf16x3,
                 )
