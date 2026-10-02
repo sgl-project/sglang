@@ -11,7 +11,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950():
@@ -230,14 +230,17 @@ class TestSmallMMoeFp8Gfx950(CustomTestCase):
                 ref = torch.einsum("tjdn,tjn,tj->td", d2[ids.long()], h.float(), wts)
                 ref = ref.bfloat16().float()
                 rel = ((out - ref).norm() / ref.norm()).item()
-                self.assertLess(rel, 5e-3, f"inter={inter} tok={tok}: rel_l2={rel:.3e}")
-            # above the cap, with per-channel FP8 scales, or unshuffled weights: stay on aiter
+                self.assertLess(rel, 2e-3, f"inter={inter} tok={tok}: rel_l2={rel:.3e}")
+            # above the cap, with per-channel or non-contiguous FP8 scales, or unshuffled weights: stay on aiter
             x, ids, _ = self._case(cap + 1)
             self.assertFalse(self._supported(x, ids, w13, s13, w2, s2))
             x, ids = x[:4], ids[:4]
             per_channel = torch.ones(self.E, 2 * inter, 1, device=self.dev)
             self.assertFalse(self._supported(x, ids, w13, per_channel, w2, s2))
             self.assertFalse(self._supported(x, ids, w13.clone(), s13, w2, s2))
+            self.assertFalse(self._supported(x, ids, w13, s13, w2.clone(), s2))
+            s13_strided = s13.mT.contiguous().mT
+            self.assertFalse(self._supported(x, ids, w13, s13_strided, w2, s2))
 
 
 if __name__ == "__main__":

@@ -309,11 +309,14 @@ def smallm_moe_supported(
     # FP8 is block-scale only: per-tensor/per-channel FP8 scales have other shapes
     if fp8 and (
         not getattr(w13, "is_shuffled", False)
+        or not getattr(w2, "is_shuffled", False)
         or getattr(w13_scale, "shape", None)
         != (w13.shape[0], 2 * inter // 128, DIM // 128)
         or getattr(w2_scale, "shape", None) != (w13.shape[0], DIM // 128, inter // 128)
         or w13_scale.dtype != torch.float32
         or w2_scale.dtype != torch.float32
+        or not w13_scale.is_contiguous()
+        or not w2_scale.is_contiguous()
     ):
         return False
     # 704 = MAX_TOK (64) * 11 slots: the kernels stage the whole topk_ids table in a
