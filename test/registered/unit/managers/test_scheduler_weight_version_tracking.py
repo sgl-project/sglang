@@ -110,6 +110,7 @@ def _runner(result=(True, "ok")):
         "load_weights_from_distributed",
     ):
         getattr(runner.weight_updater, method).return_value = result
+    runner.weight_updater.receive_weights_from_distributed.return_value = []
     return runner
 
 
@@ -128,6 +129,7 @@ def _request(**fields):
             "shapes": [[1]],
             "group_name": "g",
             "serialized_named_tensors": [b""],
+            "receiver_payload": None,
             **fields,
         }
     )
@@ -169,12 +171,23 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
 
 
 class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
-    def test_successful_update_records_the_version(self):
-        """A refit that reports success advances the scheduler-side version."""
-        output = self._manager(_runner()).update_weights_from_disk(_request())
+    def _assert_update_stages_version_until_end(self, update_call):
+        """Inside a session the version stays pending; recording lands at end."""
+        manager = self._manager(_runner())
+        output = update_call(manager)
 
         self.assertTrue(output.success)
+        self.assertEqual(self.recorded, [])
+        self.assertEqual(manager._session.pending_version, "v2")
+
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
         self.assertEqual(self.recorded, ["v2"])
+
+    def test_successful_update_records_the_version(self):
+        """A refit that reports success advances the scheduler-side version at session end."""
+        self._assert_update_stages_version_until_end(
+            lambda manager: manager.update_weights_from_disk(_request())
+        )
 
     def test_failed_update_does_not_record_the_version(self):
         """A refit that fails must leave the version alone, or later tokens are mislabelled."""
@@ -196,33 +209,32 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
     def test_successful_distributed_update_records_the_version(self):
         """The distributed refit is the path an RL trainer actually drives, so it must record too."""
-        output = self._manager(_runner()).update_weights_from_distributed(_request())
-
-        self.assertTrue(output.success)
-        self.assertEqual(self.recorded, ["v2"])
+        self._assert_update_stages_version_until_end(
+            lambda manager: manager.update_weights_from_distributed(_request())
+        )
 
     def test_failed_distributed_update_does_not_record_the_version(self):
         """A failed distributed refit leaves the version alone, exactly like the disk path."""
-        output = self._manager(
-            _runner((False, "boom"))
-        ).update_weights_from_distributed(_request())
+        runner = _runner()
+        runner.weight_updater.receive_weights_from_distributed.side_effect = (
+            RuntimeError("boom")
+        )
+        output = self._manager(runner).update_weights_from_distributed(_request())
 
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
     def test_successful_tensor_update_records_the_version(self):
         """The tensor refit records the version once the load reports success."""
-        output = self._manager(_runner()).update_weights_from_tensor(_request())
-
-        self.assertTrue(output.success)
-        self.assertEqual(self.recorded, ["v2"])
+        self._assert_update_stages_version_until_end(
+            lambda manager: manager.update_weights_from_tensor(_request())
+        )
 
     def test_successful_ipc_update_records_the_version(self):
         """The checkpoint-engine IPC refit records the version like every other path."""
-        output = self._manager(_runner()).update_weights_from_ipc(_request())
-
-        self.assertTrue(output.success)
-        self.assertEqual(self.recorded, ["v2"])
+        self._assert_update_stages_version_until_end(
+            lambda manager: manager.update_weights_from_ipc(_request())
+        )
 
     def test_failed_ipc_update_does_not_record_the_version(self):
         """The IPC path branches on success separately from the cache flush, so failure must record nothing."""
@@ -238,7 +250,8 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
     def test_distributed_update_receives_once_on_target_loads_into_each(self):
         """A draft runner that received its own broadcast would deadlock the update group."""
         target, draft = _runner(), _runner()
-        weights = target.weight_updater.receive_weights_from_distributed.return_value
+        weights = [("model.layers.0.weight", Mock())]
+        target.weight_updater.receive_weights_from_distributed.return_value = weights
         req = _request()
 
         output = self._manager(target, draft).update_weights_from_distributed(req)
@@ -250,6 +263,7 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
             shapes=req.shapes,
             group_name=req.group_name,
             load_format=req.load_format,
+            receiver_payload=req.receiver_payload,
         )
         target.weight_updater.load_weights_from_distributed.assert_called_once_with(
             weights
@@ -262,6 +276,9 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
     def test_distributed_update_target_only_selector_skips_draft(self):
         """selector="target" must not load into the draft."""
         target, draft = _runner(), _runner()
+        target.weight_updater.receive_weights_from_distributed.return_value = [
+            ("model.layers.0.weight", Mock())
+        ]
 
         output = self._manager(target, draft).update_weights_from_distributed(
             _request(selector="target")
@@ -284,6 +301,25 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
                 run_post_load=True
             )
         self.assertIsNone(manager._session)
+
+    def test_receiver_only_session_ends_with_post_load(self):
+        """Receiver rounds bypass every loader, so end must run post_load_weights
+        on the receiver-written model instead of treating the session as loaded."""
+        target = _runner()
+        manager = self._manager(target)
+        manager._receiver_group_names.add("g")  # as a successful receiver init records
+
+        output = manager.update_weights_from_distributed(
+            _request(names=[], dtypes=[], shapes=[], receiver_payload={"v": "1"})
+        )
+
+        self.assertTrue(output.success)
+        self.assertFalse(manager._session.loaded_weights)
+        target.weight_updater.load_weights_from_distributed.assert_not_called()
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
+        target.weight_updater.end_weight_update.assert_called_once_with(
+            run_post_load=True
+        )
 
     def test_end_skips_post_load_on_both_when_weights_loaded(self):
         """load_weights already ran post_load_weights; running it twice would double-apply."""

@@ -16,7 +16,7 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dynamic_import,
@@ -25,6 +25,10 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.weight_sync.external_receiver import (
+    WeightUpdateReceiverContext,
+    build_weight_update_receiver,
+)
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -89,6 +93,9 @@ class WeightUpdater:
     recapture_cuda_graph: Callable[[], None]
     get_model_runner: Callable[[], ModelRunner]
     _model_update_group: dict = field(default_factory=dict)
+    # Import paths a request may name as receiver (--weight-update-receivers).
+    weight_update_receivers: Optional[List[str]] = None
+    _external_receivers: dict = field(default_factory=dict)
 
     def init_weights_update_group(
         self,
@@ -98,6 +105,8 @@ class WeightUpdater:
         world_size,
         group_name,
         backend="nccl",
+        receiver=None,
+        receiver_init_payload=None,
     ):
         """Initialize the Torch process group for model parameter updates.
 
@@ -116,11 +125,57 @@ class WeightUpdater:
 
         rank = rank_offset + self.tp_rank
 
+        if receiver is None and receiver_init_payload is not None:
+            message = "Failed to initialize custom process group: receiver_init_payload requires receiver."
+            logger.error(message)
+            return False, message
+        if receiver is not None:
+            try:
+                if group_name in self._external_receivers or (
+                    group_name in self._model_update_group
+                ):
+                    raise ValueError(f"group {group_name!r} already exists")
+                self._external_receivers[group_name] = build_weight_update_receiver(
+                    receiver,
+                    self.weight_update_receivers,
+                    WeightUpdateReceiverContext(
+                        model=self.get_model(),
+                        device=torch.device(self.device),
+                        tp_rank=self.tp_rank,
+                        tp_size=get_parallel().tp_size,
+                        group_name=group_name,
+                        master_address=master_address,
+                        master_port=master_port,
+                        world_size=world_size,
+                        rank_offset=rank_offset,
+                        init_payload=receiver_init_payload,
+                    ),
+                )
+                logger.info(
+                    f"init external weight-update receiver: receiver={receiver}, "
+                    f"group_name={group_name}, rank_offset={rank_offset}, "
+                    f"rank={rank}, world_size={world_size}"
+                )
+                return True, "Succeeded to initialize external weight-update receiver."
+            except Exception as e:
+                message = f"Failed to initialize external weight-update receiver: {e}."
+                logger.error(message)
+                return False, message
+
+        # A name owned by an external receiver cannot be reused for a torch
+        # process group: group_name routes both updates and destroy, so the
+        # shadowed group would leak behind the receiver.
+        if group_name in self._external_receivers:
+            message = (
+                f"Failed to initialize custom process group: group {group_name!r} "
+                "already exists as an external weight-update receiver."
+            )
+            logger.error(message)
+            return False, message
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
             f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
-
         try:
             na = NetworkAddress(master_address, master_port)
             self._model_update_group[group_name] = init_custom_process_group(
@@ -137,7 +192,12 @@ class WeightUpdater:
             return False, message
 
     def destroy_weights_update_group(self, group_name):
+        is_receiver = group_name in self._external_receivers
         try:
+            if is_receiver:
+                # Forget the receiver first so a failing destroy() is not retried.
+                self._external_receivers.pop(group_name).destroy()
+                return True, "Succeeded to destroy external weight-update receiver."
             if group_name in self._model_update_group:
                 pg = self._model_update_group.pop(group_name)
                 torch.distributed.destroy_process_group(pg)
@@ -145,7 +205,12 @@ class WeightUpdater:
             else:
                 return False, "The group to be destroyed does not exist."
         except Exception as e:
-            message = f"Failed to destroy custom process group: {e}."
+            kind = (
+                "external weight-update receiver"
+                if is_receiver
+                else "custom process group"
+            )
+            message = f"Failed to destroy {kind}: {e}."
             logger.error(message)
             return False, message
 
@@ -253,8 +318,36 @@ class WeightUpdater:
         shapes,
         group_name,
         load_format: Optional[str] = None,
+        receiver_payload: Optional[dict] = None,
     ):
         """Receive one broadcast without loading it; only the target runner joined the group."""
+        external = self._external_receivers.get(group_name)
+        if external is not None:
+            if names or dtypes or shapes:
+                raise ValueError(
+                    f"Group {group_name!r} is an external receiver: tensor "
+                    "names/dtypes/shapes must be empty; per-round data goes in "
+                    "receiver_payload"
+                )
+            if load_format is not None:
+                raise ValueError(
+                    f"Group {group_name!r} is an external receiver: load_format "
+                    "is not supported on receiver rounds; the receiver writes "
+                    "the model itself, so a load format would be silently ignored"
+                )
+            # A receiver round is an in-place weight mutation, so it takes the
+            # same guards as the load paths; on raise the scheduler reports
+            # failure and records no weight version.
+            self._assert_weight_cache_inactive("update_weights_from_distributed")
+            error = _unsupported_derived_weight_cache_error(self.get_model())
+            if error is not None:
+                raise RuntimeError(error)
+            external.receive(receiver_payload)
+            return []
+        if receiver_payload is not None:
+            raise ValueError(
+                f"Group {group_name!r} has no external receiver to take receiver_payload"
+            )
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
