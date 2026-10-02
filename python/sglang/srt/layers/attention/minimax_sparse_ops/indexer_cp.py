@@ -28,7 +28,7 @@ def unsupported_reason(
     score_type,
     max_context_len,
     radix_topk,
-    speculative,
+    draft_is_chain,
     tbo,
     hisparse,
     fp8_query,
@@ -45,11 +45,23 @@ def unsupported_reason(
         return "requires max scores and the ROCm radix top-k tie ordering"
     if not 0 < max_context_len <= 16384 * 128:
         return "context length exceeds the ROCm radix selector contract"
-    if speculative:
-        return "speculative verification is not implemented"
+    if not draft_is_chain:
+        return "verify rows must be chain drafts: no speculation, or EAGLE with top-k 1"
     if tbo or hisparse or fp8_query or dense_sparse_decode:
         return "TBO, HiSparse, FP8 queries, and dense sparse decode are unsupported"
     return None
+
+
+def draft_is_chain_layout(algorithm, eagle_topk):
+    """Whether verify rows reach the indexer as independent chain rows.
+
+    Allowlisted, not tree-denylisted: an unrecognized algorithm (DSPARK's ragged
+    verify, NGRAM's tree-in-mask) must disable CP rather than silently mis-score.
+    """
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = SpeculativeAlgorithm.from_string(algorithm)
+    return algo.is_none() or (algo.is_eagle() and (eagle_topk or 1) == 1)
 
 
 def make_indexer_cp(backend, runner, sparse_cfg):
@@ -62,6 +74,7 @@ def make_indexer_cp(backend, runner, sparse_cfg):
     from sglang.srt.utils import is_hip
 
     parallel = get_parallel()
+    spec = get_spec()
     arch = (
         torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
         if is_hip()
@@ -81,7 +94,9 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         score_type=backend.score_type,
         max_context_len=backend.max_context_len,
         radix_topk=envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get(),
-        speculative=get_spec().speculative_algorithm is not None,
+        draft_is_chain=draft_is_chain_layout(
+            spec.speculative_algorithm, spec.speculative_eagle_topk
+        ),
         tbo=is_tbo_enabled(),
         hisparse=backend.hisparse_coordinator is not None,
         fp8_query=backend.fp8_attn_gemm,
