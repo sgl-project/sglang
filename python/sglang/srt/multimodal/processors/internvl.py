@@ -137,7 +137,6 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         self.max_context_len = (
             get_model().context_length
-            or getattr(server_args, "max_context_len", None)
             or getattr(hf_config, "max_position_embeddings", None)
             or getattr(text_cfg, "max_position_embeddings", None)
             or self.CONTEXT_FALLBACK
