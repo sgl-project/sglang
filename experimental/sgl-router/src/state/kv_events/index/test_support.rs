@@ -36,6 +36,8 @@ pub(super) struct PumpHarness {
     pub(super) tx: mpsc::Sender<WorkerEvent>,
     pub(super) pump: JoinHandle<()>,
     pub(super) ctrl_tx: mpsc::Sender<PumpControl>,
+    /// Obligations the pump handed back, e.g. a gap-driven retry.
+    pub(super) bootstrap_rx: mpsc::Receiver<ObligationBatch>,
 }
 
 /// Build a tree + cursors + live-set wired through `pump_loop` with
@@ -59,6 +61,8 @@ pub(super) fn spawn_pump_with_bootstrap(
     let cancel = CancellationToken::new();
     let (tx, rx) = mpsc::channel(4);
     let (ctrl_tx, ctrl_rx) = mpsc::channel(4);
+    // Real queue so a gap-driven re-queue is observable rather than dropped.
+    let (bootstrap_tx, bootstrap_rx) = mpsc::channel(16);
     let tally = Arc::new(EventTally::new());
     let pump = tokio::spawn(pump_loop(
         PumpDeps {
@@ -68,6 +72,13 @@ pub(super) fn spawn_pump_with_bootstrap(
             cursors: cursors.clone(),
             live_workers: live_set.clone(),
             bootstrap: bootstrap.clone(),
+            // Empty peer set: a splice probe finds no witness and returns
+            // `Unknown`, so these tests exercise the pump's own gates without
+            // any network. Probe verdicts are driven directly instead.
+            peers: Arc::new(PeerRegistry::new()),
+            snapshot_http: reqwest::Client::new(),
+            bootstrap_tx: bootstrap_tx.clone(),
+            ctrl_tx: ctrl_tx.downgrade(),
         },
         cancel.clone(),
         rx,
@@ -83,6 +94,7 @@ pub(super) fn spawn_pump_with_bootstrap(
         tx,
         pump,
         ctrl_tx,
+        bootstrap_rx,
     }
 }
 

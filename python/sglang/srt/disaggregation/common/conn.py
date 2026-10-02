@@ -200,9 +200,7 @@ class CommonKVManager(BaseKVManager):
         self.dcp_rank = parallel.attn_dcp_rank
         self.attn_dp_size = parallel.attn_dp_size
         self.attn_dp_rank = parallel.attn_dp_rank
-        self.system_dp_size = (
-            1 if get_parallel().enable_dp_attention else get_parallel().dp_size
-        )
+        self.system_dp_size = get_parallel().dp_size
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
@@ -1351,6 +1349,26 @@ class CommonKVManager(BaseKVManager):
         c128_full = sum(1 for r in mla_ratios if r == 128)
         kv_layout_len = 2 * c4_full + c128_full
 
+        # A DSV4 two-pool peer registers a rope group beside each KV group and
+        # doubles the ring, and the switch that turns that on is read per
+        # process. Mixed peers would fall into the cuts below, match whichever
+        # side is shorter, and then index past the other one once per request.
+        if state_type in (StateType.SWA, StateType.DSV4_REQUEST_STATE):
+            single_pool_len = two_pool_len = None
+        elif state_type == StateType.SWA_RING:
+            single_pool_len, two_pool_len = len(mla_ratios), 2 * len(mla_ratios)
+        else:
+            single_pool_len, two_pool_len = kv_layout_len, 3 * c4_full + 2 * c128_full
+        peer_lens = {len(src_kv_ptrs), len(dst_kv_ptrs)}
+        if single_pool_len is not None and peer_lens == {single_pool_len, two_pool_len}:
+            raise ValueError(
+                "PD peers disagree on the compressed-MLA KV layout: prefill "
+                f"registered {len(src_kv_ptrs)} regions, decode "
+                f"{len(dst_kv_ptrs)} ({single_pool_len} is one pool per layer, "
+                f"{two_pool_len} is the fp8 two-pool). "
+                "SGLANG_DSV4_UNIFIED_KV_FP8 must be set the same on both sides."
+            )
+
         c4_off_s = sum(1 for r in mla_ratios[:start_layer] if r == 4)
         c4_off_e = sum(1 for r in mla_ratios[:end_layer] if r == 4)
         c128_off_s = sum(1 for r in mla_ratios[:start_layer] if r == 128)
@@ -1545,14 +1563,15 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if get_parallel().dp_size > 1 and not req_has_disagg_prefill_dp_rank:
+        if get_parallel().num_dp_ranks > 1 and not req_has_disagg_prefill_dp_rank:
             if (
                 get_parallel().load_balance_method != "follow_bootstrap_room"
                 or envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get()
             ):
                 self._register_prefill_dp_rank()
             elif (
-                self.kv_mgr.attn_dp_rank != self.bootstrap_room % get_parallel().dp_size
+                self.kv_mgr.attn_dp_rank
+                != self.bootstrap_room % get_parallel().num_dp_ranks
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
                 self.kv_mgr.record_failure(
@@ -1560,7 +1579,7 @@ class CommonKVSender(BaseKVSender):
                     f"follow_bootstrap_room conflict: dispatched to dp_rank "
                     f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
                     f"{self.bootstrap_room} implies dp_rank "
-                    f"{self.bootstrap_room % get_parallel().dp_size}. "
+                    f"{self.bootstrap_room % get_parallel().num_dp_ranks}. "
                     f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
                     f"to allow mixed routing.",
                 )

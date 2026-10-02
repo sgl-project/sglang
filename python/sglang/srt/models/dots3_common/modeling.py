@@ -131,7 +131,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
 )
 
 _is_cuda = is_cuda()
@@ -1038,7 +1038,7 @@ class Dots3AttentionMLA(nn.Module):
                 swa_loc = get_token_to_kv_pool().translate_loc_from_full_to_swa(
                     out_cache_loc
                 )
-        return KVWriteLoc(forward_batch.out_cache_loc, swa_loc=swa_loc)
+        return KVWriteLoc.for_batch(forward_batch, swa_loc=swa_loc)
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -1718,7 +1718,7 @@ class Dots3Model(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Dots3DecoderLayer(
                 config=config,
@@ -1727,8 +1727,6 @@ class Dots3Model(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -1834,7 +1832,6 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
         self.pp_group = get_parallel().pp_group
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.model = Dots3Model(
@@ -2716,7 +2713,6 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         )
         language_model = self.thinker.language_model
         self.pp_group = language_model.pp_group
-        self.tp_size = language_model.tp_size
         self.quant_config = language_model.quant_config
         self.num_fused_shared_experts = language_model.num_fused_shared_experts
         self.forward = self.thinker.forward
