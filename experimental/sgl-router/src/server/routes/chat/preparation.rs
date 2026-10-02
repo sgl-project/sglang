@@ -119,7 +119,17 @@ impl PreparedRequest {
                 .map_err(|error| ApiError::Internal(error.into()))?
                 .into();
         }
-        let tokens = request_tokens_for(&ctx.tokenizers, &model, &value);
+        // Text left to the engine still routes on its tokens, special tokens included.
+        let prompt = value["text"]
+            .as_str()
+            .filter(|_| !has_caller_input_ids(&value));
+        let tokens = match prompt.and_then(|text| ctx.tokenizers.encode_prompt(&model.0, text)) {
+            Some(ids) => Some(RequestTokens {
+                ids,
+                rendered_from_chat: false,
+            }),
+            None => request_tokens_for(&ctx.tokenizers, &model, &value),
+        };
         let batch = batch_prompt_tokens(ctx, &model, &value);
         let samples = parallel_samples(&value);
         let fans_out = batch.is_some() || samples > 1;
@@ -959,8 +969,18 @@ mod tests {
 
     /// A `/generate` request prepared with the tiny test tokenizer loaded.
     fn prepare_generate(body: Value) -> PreparedRequest {
+        // The tiny tokenizer, with a post-processor that prepends BOS (id 256).
+        let tokenizer = std::fs::read_to_string("tests/fixtures/tiny_tokenizer.json").unwrap();
+        let mut tokenizer: Value = serde_json::from_str(&tokenizer).unwrap();
+        tokenizer["post_processor"] = json!({"type": "TemplateProcessing", "pair": [], "single": [
+            {"SpecialToken": {"id": "<|endoftext|>", "type_id": 0}},
+            {"Sequence": {"id": "A", "type_id": 0}}],
+            "special_tokens": {"<|endoftext|>": {"id": "<|endoftext|>", "ids": [256], "tokens": ["<|endoftext|>"]}}});
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, tokenizer.to_string()).unwrap();
         let mut ctx = AppContext::stub();
-        ctx.config.model.tokenizer_path = Some("tests/fixtures/tiny_tokenizer.json".into());
+        ctx.config.model.tokenizer_path = Some(path.to_str().unwrap().into());
         ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
         let body = Bytes::from(body.to_string());
         PreparedRequest::generate(&ctx, ModelId("stub-model".into()), body).unwrap()
@@ -1026,6 +1046,7 @@ mod tests {
             |request: &PreparedRequest| serde_json::from_slice::<Value>(&request.body).unwrap();
         let single = prepare_generate(json!({"text": "hi", "stream": true}));
         let ids = single.tokens.as_ref().unwrap().ids.clone();
+        assert_eq!(ids[0], 256);
         assert_eq!(body(&single), json!({"stream": true, "input_ids": ids}));
         let batch = prepare_generate(json!({"text": ["hi", "hi"]}));
         assert_eq!(body(&batch)["input_ids"], json!([ids, ids]));
@@ -1033,7 +1054,8 @@ mod tests {
         // The processor expands multimodal placeholders from the text itself.
         let image = prepare_generate(json!({"text": "hi", "image_data": "a.png"}));
         assert_eq!(body(&image)["text"], "hi");
-        // Text left to the engine still counts its tokens, in a batch as for one prompt.
+        // Text left to the engine still routes on its tokens, in a batch as for one prompt.
+        assert_eq!(image.tokens.unwrap().ids, ids);
         let images = prepare_generate(json!({"text": ["hi", "hi"], "image_data": ["a", "b"]}));
         assert_eq!(images.input_token_count, 2 * ids.len());
     }
