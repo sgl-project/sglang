@@ -5,6 +5,7 @@ pub mod admission;
 pub mod buckets;
 pub mod cache_aware;
 pub mod decode;
+pub mod dp_rank;
 pub mod factory;
 pub mod load_based;
 pub mod power_of_two;
@@ -623,7 +624,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("model".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 

@@ -46,6 +46,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             tokenizer: Default::default(),
             policy: PolicyKind::Sticky,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
@@ -75,7 +76,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             url: url.clone(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         });
     }
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
@@ -302,7 +303,7 @@ async fn adding_a_worker_does_not_redistribute_existing_key() {
             url: w2.url.clone(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         })
         .unwrap();
     // Guard the premise: w2 really is an eligible candidate now, so the
