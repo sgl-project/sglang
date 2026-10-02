@@ -54,6 +54,7 @@ mod tests {
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,

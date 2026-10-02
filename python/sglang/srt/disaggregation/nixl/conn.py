@@ -352,6 +352,22 @@ def expand_page_indices_for_slice(
     return (pair_offsets[:, None] + within_pair[None, :]).ravel().astype(np.int32)
 
 
+def num_kv_slots(kv_data_lens: List[int], kv_item_lens: List[int]) -> int:
+    """Slots every registered KV entry can address.
+
+    Prepared dlists index entry i's slot p as i * num_slots + p, so every entry
+    must expose the same count. Entries can have different lengths, so use
+    the shortest.
+    """
+    return min(
+        (
+            data_len // item_len
+            for data_len, item_len in zip(kv_data_lens, kv_item_lens)
+        ),
+        default=0,
+    )
+
+
 def repeat_indices_over_layers(
     indices: npt.NDArray[np.int32], num_layers: int, layer_length: int
 ) -> npt.NDArray[np.int32]:
@@ -512,8 +528,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.kv_args.kv_item_lens:
-                self._num_slots_src = (
-                    self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
+                self._num_slots_src = num_kv_slots(
+                    self.kv_args.kv_data_lens, self.kv_args.kv_item_lens
                 )
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             self.transfer_queues: List[FastQueue] = [
@@ -996,6 +1012,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self.kv_args.kv_item_lens[seg.start : seg.end],
                     self.kv_args.kv_data_lens[seg.start : seg.end],
                     self.kv_args.gpu_id,
+                    num_slots=self._num_slots_src,
                     mem_kind=seg.src_mem_kind,
                 )
                 self.prep_handles_segment_src[src_key] = src_handle
@@ -1159,6 +1176,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     "",
                     self.kv_args.kv_data_ptrs,
                     self.kv_args.gpu_id,
+                    num_slots=self._num_slots_src,
                     mem_kind=src_mem_kind,
                 )
             dst_num_slots = (
@@ -3391,7 +3409,9 @@ class NixlKVReceiver(CommonKVReceiver):
                 staging_total_size_str = b""
             if self.kv_mgr.kv_args.kv_item_lens:
                 dst_kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
-                dst_num_slots = self.kv_mgr.kv_args.kv_data_lens[0] // dst_kv_item_len
+                dst_num_slots = num_kv_slots(
+                    self.kv_mgr.kv_args.kv_data_lens, self.kv_mgr.kv_args.kv_item_lens
+                )
             else:
                 dst_kv_item_len = 0
                 dst_num_slots = 0
