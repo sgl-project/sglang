@@ -38,8 +38,8 @@ class TestAsyncD2HCopyWorkerServer(CustomTestCase):
     """python -m unittest test_async_d2h_copy_worker_server.TestAsyncD2HCopyWorkerServer"""
 
     process = None
-    # Subclasses add their own overrides on top of the force flag.
-    extra_envs: dict = {}
+    # (EnvField, value) pairs that subclasses add on top of the force flag.
+    extra_env_overrides: tuple = ()
 
     @classmethod
     def setUpClass(cls):
@@ -47,8 +47,8 @@ class TestAsyncD2HCopyWorkerServer(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         with ExitStack() as stack:
             stack.enter_context(envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.override(True))
-            for name, value in cls.extra_envs.items():
-                stack.enter_context(getattr(envs, name).override(value))
+            for field, value in cls.extra_env_overrides:
+                stack.enter_context(field.override(value))
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -77,8 +77,6 @@ class TestAsyncD2HCopyWorkerServer(CustomTestCase):
         return r.json()
 
     def test_concurrent_decode_readback(self):
-        # A readback that returned the wrong step's tokens would show up as
-        # diverging text across identical greedy requests.
         with ThreadPoolExecutor(max_workers=N_REQUESTS) as pool:
             results = [
                 f.result()
@@ -89,7 +87,9 @@ class TestAsyncD2HCopyWorkerServer(CustomTestCase):
 
         texts = {r["text"] for r in results}
         self.assertEqual(len(texts), 1, f"greedy decode diverged: {texts}")
-        self.assertTrue(texts.pop().strip(), "empty completion")
+        # Requests sharing a batch read the same bad data on a wrong readback,
+        # so matching texts alone cannot catch it; check the answer too.
+        self.assertIn("Paris", texts.pop())
 
         for r in results:
             meta = r["meta_info"]
@@ -103,7 +103,7 @@ class TestAsyncD2HCopyWorkerServer(CustomTestCase):
 class TestAsyncD2HCopyWorkerServerDelaySample(TestAsyncD2HCopyWorkerServer):
     """Covers the launch_batch_sample_if_needed submit site."""
 
-    extra_envs = {"SGLANG_ENABLE_DELAY_SAMPLE": True}
+    extra_env_overrides = ((envs.SGLANG_ENABLE_DELAY_SAMPLE, True),)
 
 
 if __name__ == "__main__":
