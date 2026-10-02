@@ -412,9 +412,9 @@ class Xing4_0DecoderLayer(nn.Module):
                 is_deepseek_v4=False,
             )
         else:
-            from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
+            from sglang.srt.layers.layer_boundary import is_dense_ffn_fully_dp
 
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
