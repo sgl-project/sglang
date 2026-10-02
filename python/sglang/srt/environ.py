@@ -867,6 +867,9 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # Use AITER block selection for supported gfx950 FP8 index caches.
+    SGLANG_M3_USE_AITER_INDEXER = EnvBool(True)
+    SGLANG_M3_USE_AITER_PREFILL_INDEXER = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
