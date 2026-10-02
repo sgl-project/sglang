@@ -356,6 +356,11 @@ class MiniMaxH3DecodingStage(DecodingStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        from sglang.multimodal_gen.runtime.layers.usp import (
+            _release_minimax_h3_gather_qkv_staging,
+        )
+
+        _release_minimax_h3_gather_qkv_staging()
         _minimax_h3_decoder_task(batch)
         visual_latent = _required_tensor(batch.latents, "batch.latents")
         audio_latent = _required_tensor(batch.audio_latents, "batch.audio_latents")
