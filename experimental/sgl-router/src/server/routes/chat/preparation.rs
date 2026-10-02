@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Request validation, optional tokenization, and outgoing body preparation for
-//! chat completions and the native `/generate` endpoint.
+//! chat completions, the native `/generate` endpoint, and embeddings.
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
@@ -21,6 +21,7 @@ const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
 const GENERATE_PATH: &str = "/generate";
+const EMBEDDINGS_PATH: &str = "/v1/embeddings";
 
 /// Validated routing inputs and the original body, ready for worker selection.
 ///
@@ -43,7 +44,7 @@ pub(super) struct PreparedRequest {
     pub(super) expected_peak_sequence_tokens: Option<u64>,
     caller_set_rid: bool,
     pub(super) fans_out: bool,
-    /// `None` for `/generate`, whose tokens replace `text` during preparation.
+    /// `None` for `/generate` and embeddings, whose tokens replace text during preparation.
     forwarding_scope: Option<ForwardingScope>,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
@@ -173,6 +174,66 @@ impl PreparedRequest {
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
         })
+    }
+
+    /// The engine's OpenAI `EmbeddingRequest`, whose text `input` is forwarded
+    /// as token IDs, as `/generate` forwards `text`.
+    pub(super) fn embeddings(
+        ctx: &AppContext,
+        model: ModelId,
+        mut body: Bytes,
+        mut value: Value,
+    ) -> Result<Self, ApiError> {
+        let batch = is_embedding_batch(&value["input"]);
+        let text_ids = tokenize_input_text(ctx, &model, &value["input"]);
+        let forward = !ctx.config.model.disable_input_ids_forwarding;
+        if let Some(ids) = text_ids.as_ref().filter(|_| forward) {
+            value["input"] = if batch { json!(ids) } else { json!(ids[0]) };
+            body = serde_json::to_vec(&value)
+                .map_err(|error| ApiError::Internal(error.into()))?
+                .into();
+        }
+        let prompts = text_ids.or_else(|| caller_token_rows(&value["input"]));
+        // Context limits apply to each prompt even when the engine must tokenize text;
+        // multimodal items count only their text, as image tokens are the engine's to count.
+        let estimate = |item: &Value| {
+            estimate_prefill_tokens(item.as_str().or(item["text"].as_str()).map_or(0, str::len))
+        };
+        let lengths = match (&prompts, &value["input"]) {
+            (Some(prompts), _) => prompts.iter().map(|ids| ids.len().max(1)).collect(),
+            (None, Value::Array(items)) => items.iter().map(estimate).collect(),
+            (None, input) => vec![estimate(input)],
+        };
+        let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
+        let tokens = prompts
+            .filter(|_| !batch)
+            .and_then(|prompts| prompts.into_iter().next())
+            .map(|ids| RequestTokens {
+                ids,
+                rendered_from_chat: false,
+            });
+        Ok(Self {
+            path: EMBEDDINGS_PATH,
+            model,
+            streaming: false,
+            output_tokens: Some(0),
+            input_token_count: lengths.iter().sum::<usize>().max(1),
+            sequence_token_count: sequence_tokens,
+            expected_peak_sequence_tokens: Some(sequence_tokens as u64),
+            body,
+            tokens,
+            caller_set_rid: !value["rid"].is_null(),
+            fans_out: batch,
+            forwarding_scope: None,
+            // Only PD bootstrap needs the parsed body, and embeddings have no PD.
+            parsed_body: None,
+            sampling_defaults: Vec::new(),
+        })
+    }
+
+    /// Whether the engine endpoint honors a routed DP rank; `/v1/embeddings` takes none.
+    pub(super) fn accepts_dp_rank(&self) -> bool {
+        self.path != EMBEDDINGS_PATH
     }
 
     pub(super) fn engine_rid(&self) -> Option<String> {
@@ -307,6 +368,60 @@ fn parallel_samples(value: &Value) -> u64 {
     match params["beam_width"].as_u64() {
         Some(width) if width > 1 => 1,
         _ => params["n"].as_u64().unwrap_or(1).max(1),
+    }
+}
+
+/// An embeddings body and the model it names; chat completions also require one.
+pub(super) fn parse_embedding_request(body: &Bytes) -> Result<(ModelId, Value), ApiError> {
+    let value = Value::Object(serde_json::from_slice(body).map_err(|_| invalid_request())?);
+    let model = Option::<String>::deserialize(&value["model"])
+        .map_err(|_| invalid_request())?
+        .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
+    Ok((ModelId(model), value))
+}
+
+/// Whether the engine runs an embedding `input` as a batch: any list but one
+/// of token IDs or a single multimodal item (`serving_embedding.py`).
+fn is_embedding_batch(input: &Value) -> bool {
+    match input.as_array().map(Vec::as_slice) {
+        Some([first, ..]) if first.is_number() => false,
+        Some([only]) if only.is_object() => false,
+        Some(items) => !items.is_empty(),
+        None => false,
+    }
+}
+
+/// Text `input` as the engine's tokens, one row per prompt; `None` for other
+/// input and for text the engine rejects: mixed lists and blank prompts.
+fn tokenize_input_text(ctx: &AppContext, model: &ModelId, input: &Value) -> Option<Vec<Vec<u32>>> {
+    let texts = match input {
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(items) if items.first()?.is_string() => {
+            items.iter().map(Value::as_str).collect::<Option<_>>()?
+        }
+        _ => return None,
+    };
+    // Python's `str.strip()` also strips U+001C..U+001F.
+    let blank = |text: &&str| {
+        text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+            .is_empty()
+    };
+    if texts.iter().any(blank) {
+        return None;
+    }
+    texts
+        .into_iter()
+        .map(|text| ctx.tokenizers.encode_prompt(&model.0, text))
+        .collect()
+}
+
+/// Caller token IDs, one flat list or a row per prompt; `None` if malformed,
+/// which the engine reports.
+fn caller_token_rows(input: &Value) -> Option<Vec<Vec<u32>>> {
+    match input.as_array()?.first()? {
+        Value::Number(_) => Some(vec![Vec::deserialize(input).ok()?]),
+        Value::Array(_) => Vec::deserialize(input).ok(),
+        _ => None,
     }
 }
 
@@ -985,9 +1100,8 @@ mod tests {
         }
     }
 
-    /// A `/generate` request prepared with the tiny test tokenizer loaded.
-    fn prepare_generate(body: Value) -> PreparedRequest {
-        // The tiny tokenizer, with a post-processor that prepends BOS (id 256).
+    /// The stub context with the tiny tokenizer, whose post-processor prepends BOS (id 256).
+    fn tokenizer_ctx() -> AppContext {
         let tokenizer = std::fs::read_to_string("tests/fixtures/tiny_tokenizer.json").unwrap();
         let mut tokenizer: Value = serde_json::from_str(&tokenizer).unwrap();
         tokenizer["post_processor"] = json!({"type": "TemplateProcessing", "pair": [], "single": [
@@ -1001,8 +1115,77 @@ mod tests {
         let mut ctx = AppContext::stub();
         ctx.config.model.tokenizer_path = Some(path.to_str().unwrap().into());
         ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+        ctx
+    }
+
+    /// A `/generate` request prepared with the tiny test tokenizer loaded.
+    fn prepare_generate(body: Value) -> PreparedRequest {
         let body = Bytes::from(body.to_string());
-        PreparedRequest::generate(&ctx, ModelId("stub-model".into()), body).unwrap()
+        PreparedRequest::generate(&tokenizer_ctx(), ModelId("stub-model".into()), body).unwrap()
+    }
+
+    fn prepare_embeddings(ctx: &AppContext, input: Value) -> (PreparedRequest, Value) {
+        let body = Bytes::from(json!({"model": "stub-model", "input": input}).to_string());
+        let (model, value) = parse_embedding_request(&body).unwrap();
+        let r = PreparedRequest::embeddings(ctx, model, body, value).unwrap();
+        let input = serde_json::from_slice::<Value>(&r.body).unwrap()["input"].take();
+        (r, input)
+    }
+
+    #[test]
+    fn embeddings_forward_text_input_as_token_ids() {
+        let ctx = tokenizer_ctx();
+        let hi = ctx.tokenizers.encode_prompt("stub-model", "hi").unwrap();
+        let n = hi.len();
+        // (input, forwarded input, fans out, (input total, longest prompt))
+        for (sent, forwarded, fans_out, counts) in [
+            (json!("hi"), json!(hi), false, (n, n)),
+            // The engine runs any text list as a batch, even of one.
+            (json!(["hi"]), json!([hi]), true, (n, n)),
+            (json!([[5, 6], [7]]), json!([[5, 6], [7]]), true, (3, 2)),
+        ] {
+            let (r, input) = prepare_embeddings(&ctx, sent);
+            let got = (r.input_token_count, r.sequence_token_count);
+            assert_eq!((input, r.fans_out, got), (forwarded, fans_out, counts));
+            assert_eq!(r.tokens.is_some(), !fans_out);
+        }
+    }
+
+    #[test]
+    fn embeddings_estimate_fallback_text_per_prompt() {
+        let ctx = AppContext::stub();
+        for (input, total, longest) in [
+            (json!("abcdefgh"), 2, 2),
+            (json!(["abcd", "abcdefgh"]), 3, 2),
+            // An image's bytes are not prompt text.
+            (json!([{"text": "abcd", "image": "x".repeat(4096)}]), 1, 1),
+        ] {
+            let (r, forwarded) = prepare_embeddings(&ctx, input.clone());
+            assert_eq!(forwarded, input);
+            assert!(r.tokens.is_none());
+            assert_eq!(r.input_token_count, total);
+            assert_eq!(r.sequence_token_count, longest);
+            assert_eq!(r.expected_peak_sequence_tokens, Some(longest as u64));
+        }
+    }
+
+    #[test]
+    fn embeddings_leave_other_input_to_the_engine() {
+        let mut ctx = tokenizer_ctx();
+        // The engine rejects blank and mixed lists, and renders multimodal items.
+        for sent in [
+            json!(["hi", " \u{1c}"]),
+            json!(["hi", 5]),
+            json!([{"text": "hi"}]),
+        ] {
+            let (r, input) = prepare_embeddings(&ctx, sent.clone());
+            assert!(input == sent && r.tokens.is_none());
+        }
+        // Without forwarding, routing still sees the engine's tokens.
+        ctx.config.model.disable_input_ids_forwarding = true;
+        let (r, input) = prepare_embeddings(&ctx, json!("hi"));
+        let ids = ctx.tokenizers.encode_prompt("stub-model", "hi");
+        assert_eq!((input, r.tokens.map(|t| t.ids)), (json!("hi"), ids));
     }
 
     #[test]

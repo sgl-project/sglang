@@ -14,6 +14,7 @@ mod bucket_routing;
 mod cache_aware_input_ids;
 mod chat_routing;
 mod dp_rank_routing;
+mod embeddings_routing;
 mod external_indexer_routing;
 mod failover;
 mod generate_routing;

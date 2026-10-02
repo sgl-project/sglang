@@ -990,3 +990,45 @@ async fn full_decode_group_falls_back_to_another_version_group() {
         .collect();
     assert_eq!(dispatched, [false, true, false, true]);
 }
+
+#[tokio::test]
+async fn embeddings_fallback_batches_use_per_prompt_context_limits() {
+    let worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut bucket = Bucket::new("small", BucketGroups::Plain(group("w", policy)));
+    bucket.max_context_tokens = Some(128);
+    let mut ctx = Arc::try_unwrap(context(&[("w", Stage::Plain, &worker)], vec![bucket]))
+        .unwrap_or_else(|_| panic!("context is shared"));
+    // A loadable tokenizer whose engine tokenization cannot be reproduced.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.json");
+    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &path).unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        r#"{"tokenizer_class":"CodeLlamaTokenizerFast"}"#,
+    )
+    .unwrap();
+    ctx.config.model.tokenizer_path = Some(path.to_str().unwrap().into());
+    ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+    assert!(ctx.tokenizers.encode_prompt("tiny", "hello").is_none());
+    let app = build_router(Arc::new(ctx));
+    for (input, expected) in [
+        (serde_json::json!("hello"), StatusCode::OK),
+        (serde_json::json!(vec!["hello"; 128]), StatusCode::OK),
+        (
+            serde_json::json!(["hello", "x".repeat(600)]),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let req = Request::post("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"model":"tiny", "input":input}).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let body = crate::common::streaming::collect_body(response.into_body()).await;
+        assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+    }
+}

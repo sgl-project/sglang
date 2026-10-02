@@ -3,9 +3,9 @@
 Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
 Serves a single model and routes across its workers. Exposes
-`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions` and
-SGLang's native [`/generate`](#native-generate) (buffered and SSE), plus
-`/healthz` / `/readyz` and `/metrics`. Worker
+`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, [`/v1/embeddings`](#embeddings),
+`/v1/chat/completions` and SGLang's native [`/generate`](#native-generate)
+(buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker
 pools come from either a static URL list or Kubernetes EndpointSlice
 discovery. Both edges speak cleartext HTTP/2 where the peer does — see
 [HTTP/2](#http2).
@@ -378,6 +378,19 @@ a single prompt that has none, and `--override-sampling-params` defaults. Under
 `--dp-aware` each worker's body also carries the chosen `routed_dp_rank`; a PD
 batch or `n > 1` request leaves the prefill rank to the engine, which gives item
 `i` the bootstrap room `room + i`.
+
+## Embeddings
+
+`/v1/embeddings` has the engine's interface: the same OpenAI `EmbeddingRequest`
+body and response. As for chat completions, `model` must name the served model.
+A PD fleet answers 400, since prefill and decode engines serve no embeddings.
+
+Text `input` (a string or a list) is tokenized and forwarded as token IDs, as for
+[`/generate`](#native-generate), plus the EOS SGLang appends for EmbeddingGemma.
+Blank prompts and multimodal items stay as sent, for the engine to reject or
+render. A list is a batch for one worker, routed on load. A single prompt with no
+`rid` gets a minted one. Under `--dp-aware` the engine picks the rank, since its
+embeddings endpoint reads none.
 
 ## DeepSeek V4
 

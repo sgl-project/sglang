@@ -74,6 +74,7 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
             .route("/generate", post(generate))
+            .route("/v1/embeddings", post(embeddings))
             .route("/server_info", get(serve_tiny_server_info))
             .route("/abort_request", abort_request_route(abort_log.clone()))
             .with_state(state);
@@ -505,4 +506,16 @@ async fn generate(
         "meta_info": {"id": v["rid"], "finish_reason": {"type": "stop"}},
     }))
     .into_response()
+}
+
+/// An OpenAI embeddings response.
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+async fn embeddings(
+    State(s): State<MockWorkerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    capture_request(&s, &headers, &body);
+    let data = [serde_json::json!({"object": "embedding", "embedding": [0.5], "index": 0})];
+    Json(serde_json::json!({"object": "list", "data": data, "model": "tiny"})).into_response()
 }
