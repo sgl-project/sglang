@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Optional
 
 import msgspec
@@ -6,6 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+
+
+@lru_cache(None)
+def _hc_gate_stream(device: int) -> torch.cuda.Stream:
+    return torch.cuda.Stream(device=device)
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -180,6 +186,16 @@ class GatedResidual(HyperConnectionBase):
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
+            self._gate_stream = None
+            if (
+                self.hc_count == 4
+                and self.hidden_size == 2560
+                and config.hc_per_branch_norm
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] == 10
+            ):
+                # Create before graph capture; all layers on a device share it.
+                self._gate_stream = _hc_gate_stream(torch.cuda.current_device())
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -219,7 +235,11 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
-    def mix(self, hyper_input: torch.Tensor):
+    def mix(
+        self,
+        hyper_input: torch.Tensor,
+        normalized_input: Optional[torch.Tensor] = None,
+    ):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
@@ -227,7 +247,11 @@ class GatedResidual(HyperConnectionBase):
             )
             return mixed_input, (hyper_input, hyper_input)
 
-        if self.config.hc_per_branch_norm:
+        if normalized_input is not None:
+            assert self.config.hc_per_branch_norm
+            assert normalized_input.shape == hyper_input.shape
+            hyper_input_normed = normalized_input
+        elif self.config.hc_per_branch_norm:
             hyper_input_normed = self.hc_norm(hyper_input)
         else:
             hyper_input_normed = self.hc_norm(
@@ -275,9 +299,75 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
-        return mixed_input, (hyper_input, hyper_input_normed)
+        residuals = (hyper_input, hyper_input_normed)
+        stream = getattr(self, "_gate_stream", None)
+        if (
+            stream is not None
+            and hyper_input.shape == (1, 10240)
+            and hyper_input.is_cuda
+            and hyper_input.dtype == torch.bfloat16
+            and hyper_input_normed.dtype == torch.bfloat16
+            and self.block_inject_weight.weight.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import hc_combine_gate
+
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                partials = hc_combine_gate(
+                    hyper_input_normed, self.block_inject_weight.weight
+                )
+            hyper_input_normed.record_stream(stream)
+            residuals = (*residuals, partials)
+        return mixed_input, residuals
+
+    def combine_and_normalize(
+        self,
+        block_output: torch.Tensor,
+        residuals,
+        next_norm: Optional[GroupedGemmaRMSNorm],
+    ):
+        """Return the residual and its next HC normalization explicitly.
+
+        The BF16 combine result is retained before calculating the next norm.
+        Callers must only pass the norm when no PLE or other update intervenes.
+        """
+        if (
+            len(residuals) == 3
+            and next_norm is not None
+            and next_norm.group_size == self.hidden_size
+            and next_norm.weight.shape == (10240,)
+            and next_norm.weight.dtype == torch.bfloat16
+            and block_output.dtype == torch.bfloat16
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import (
+                hc_combine_apply_norm,
+            )
+
+            hyper_input, _, partials = residuals
+            current = torch.cuda.current_stream()
+            current.wait_stream(self._gate_stream)
+            partials.record_stream(current)
+            return hc_combine_apply_norm(
+                block_output,
+                hyper_input,
+                partials,
+                next_norm.weight,
+                next_norm.variance_epsilon,
+            )
+        return self.combine(block_output, residuals), None
 
     def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
+        if len(residuals) == 3:
+            from sglang.kernels.ops.elementwise.hc_combine_decode import (
+                hc_combine_apply,
+            )
+
+            hyper_input, _, partials = residuals
+            current = torch.cuda.current_stream()
+            current.wait_stream(self._gate_stream)
+            partials.record_stream(current)
+            return hc_combine_apply(block_output, hyper_input, partials)
         hyper_input, hyper_input_normed = residuals
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size

@@ -229,3 +229,65 @@ def moe_finalize_all_reduce(
         prefetch_metadata,
     )
     return out
+
+
+@cache_once
+def _jit_shared_gate_module(world_size, hidden_dim, top_k, cluster_size, weight_dtype):
+    require_cluster_launch_arch()
+    assert cluster_size in valid_cluster_sizes(hidden_dim)
+    args = make_cpp_args(
+        world_size,
+        hidden_dim,
+        top_k,
+        cluster_size,
+        is_arch_support_pdl(),
+        weight_dtype,
+        False,
+        False,
+        False,
+        True,
+    )
+    return load_jit(
+        "moe_finalize_shared_gate_all_reduce",
+        *args,
+        cuda_files=["distributed/all_reduce_fusion.cuh"],
+        cuda_wrappers=[("run", f"MoeFinalizeAllReduceKernel<{args}>::run_shared_gate")],
+    )
+
+
+def moe_finalize_shared_gate_all_reduce(
+    gemm2_out,
+    expanded_idx_to_permuted_idx,
+    expert_weights,
+    shared_output,
+    shared_gate,
+    comm,
+    *,
+    cluster_size=None,
+    out=None,
+):
+    """Finalize routed BF16 values, gate the shared branch, then all-reduce.
+
+    ``shared_gate`` is FP32 and is applied after the routed BF16 rounding.
+    The caller owns the communicator and joins all input-producing streams.
+    """
+    tokens, hidden_dim = shared_output.shape
+    assert tokens > 0
+    if out is None:
+        out = torch.empty_like(shared_output)
+    _jit_shared_gate_module(
+        comm.world_size,
+        hidden_dim,
+        expert_weights.shape[1],
+        cluster_size or default_cluster_size(hidden_dim),
+        expert_weights.dtype,
+    ).run(
+        comm,
+        out,
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        shared_output,
+        shared_gate,
+    )
+    return out

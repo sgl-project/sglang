@@ -229,6 +229,8 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                     model = types.SimpleNamespace(
                         dsa_enable_prefill_cp=False,
                         config=types.SimpleNamespace(num_experts=4),
+                        # Attention DP uses the regular MoE completion path.
+                        _decode_moe_comm=None,
                         _qwen4_exp_use_dp_moe_gather=lambda: True,
                         _qwen4_exp_use_attn_tp_a2a_scatter=lambda: False,
                         mlp=lambda value, batch, **kwargs: reduce_moe_output(value),

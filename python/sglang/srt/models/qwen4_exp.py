@@ -2,7 +2,7 @@
 
 import math
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Set, Tuple, Union
+from typing import Any, Iterable, NamedTuple, Optional, Set, Tuple, Union
 
 import msgspec
 import sympy
@@ -38,6 +38,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.hyperconnection import (
     GatedResidual,
+    GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -1329,6 +1330,12 @@ class Qwen4ExpPLELayer(nn.Module):
         return _pad_token_rows(output, batch.physical_tokens)
 
 
+class _PreparedHCNorm(NamedTuple):
+    """Normalization accompanying a layer's widened hidden state, not a residual."""
+
+    normalized: torch.Tensor
+
+
 class Qwen4ExpLayerExtensionMixin:
     def _init_qwen4_exp_layer_extensions(
         self,
@@ -1384,6 +1391,9 @@ class Qwen4ExpLayerExtensionMixin:
             use_mix=True,
             use_combine=True,
         )
+        from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
+
+        self._decode_moe_comm = prepare_qwen4_decode_comm(self.mlp)
 
     def _prepare_qwen4_exp_attn(
         self,
@@ -1393,6 +1403,10 @@ class Qwen4ExpLayerExtensionMixin:
         *,
         ple_batch: Optional[_PLEBatch],
     ):
+        normalized_input = None
+        if isinstance(residual, _PreparedHCNorm):
+            assert self.ple is None
+            normalized_input, residual = residual.normalized, None
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
             assert hidden_states.shape[-1] == self.hidden_size
@@ -1415,7 +1429,9 @@ class Qwen4ExpLayerExtensionMixin:
                     ple_query, forward_batch, ple_batch
                 )
 
-        hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        hidden_states, residual = self.attn_hyper_connection.mix(
+            hidden_states, normalized_input=normalized_input
+        )
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1426,8 +1442,14 @@ class Qwen4ExpLayerExtensionMixin:
     ):
         if not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
-        hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+        hidden_states, normalized_input = (
+            self.attn_hyper_connection.combine_and_normalize(
+                hidden_states, residual, self.mlp_hyper_connection.hc_norm
+            )
+        )
+        hidden_states, residual = self.mlp_hyper_connection.mix(
+            hidden_states, normalized_input=normalized_input
+        )
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
@@ -1443,6 +1465,14 @@ class Qwen4ExpLayerExtensionMixin:
     ) -> torch.Tensor:
         if not self.config.num_experts:
             return self.mlp(hidden_states)
+
+        from sglang.srt.layers.moe.qwen4_decode import (
+            can_use_qwen4_decode_moe,
+            qwen4_decode_moe,
+        )
+
+        if can_use_qwen4_decode_moe(hidden_states, self.mlp, self._decode_moe_comm):
+            return qwen4_decode_moe(hidden_states, self.mlp, self._decode_moe_comm)
 
         use_dp_moe_gather = self._qwen4_exp_use_dp_moe_gather()
         use_attn_tp_a2a_scatter = self._qwen4_exp_use_attn_tp_a2a_scatter()
@@ -1494,9 +1524,14 @@ class Qwen4ExpLayerExtensionMixin:
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        next_hc_norm: Optional[GroupedGemmaRMSNorm] = None,
     ):
-        hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
-        return hidden_states, None
+        hidden_states, normalized = self.mlp_hyper_connection.combine_and_normalize(
+            hidden_states, residual, next_hc_norm
+        )
+        return hidden_states, (
+            _PreparedHCNorm(normalized) if normalized is not None else None
+        )
 
 
 class Qwen4ExpLinearDecoderLayer(
@@ -1536,7 +1571,9 @@ class Qwen4ExpLinearDecoderLayer(
             hidden_states, residual, forward_batch
         )
         hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
-        return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
+        return self._postprocess_qwen4_exp_layer(
+            hidden_states, residual, forward_batch, kwargs.get("next_hc_norm")
+        )
 
 
 class Qwen4ExpAttentionDecoderLayer(
@@ -1683,7 +1720,9 @@ class Qwen4ExpAttentionDecoderLayer(
             hidden_states, residual, forward_batch
         )
         hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
-        return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
+        return self._postprocess_qwen4_exp_layer(
+            hidden_states, residual, forward_batch, kwargs.get("next_hc_norm")
+        )
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -1783,6 +1822,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 next_ple = self.layers[i + 1].ple
                 if next_ple is not None:
                     next_ple.start_prefetch(ple_batch, forward_batch)
+            next_hc_norm = None
+            if i + 1 < self.end_layer:
+                next_layer = self.layers[i + 1]
+                if next_layer.ple is None:
+                    next_hc_norm = next_layer.attn_hyper_connection.hc_norm
+            elif self.pp_group.is_last_rank:
+                next_hc_norm = self.hyper_connection_mixer.hc_norm
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = layer(
                     positions=positions,
@@ -1790,6 +1836,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     residual=residual,
                     forward_batch=forward_batch,
                     ple_batch=ple_batch,
+                    next_hc_norm=next_hc_norm,
                     captured_last_layer_outputs=(
                         aux_hidden_states
                         if getattr(layer, "_is_layer_to_capture", False)
@@ -1806,7 +1853,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             return PPProxyTensors(proxy_tensors)
 
         hc_hidden_states = hidden_states
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        hidden_states, _ = self.hyper_connection_mixer.mix(
+            hidden_states,
+            normalized_input=(
+                residual.normalized if isinstance(residual, _PreparedHCNorm) else None
+            ),
+        )
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 
