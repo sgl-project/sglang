@@ -38,6 +38,16 @@ pub enum ChatRouting {
     Reorg(HashMap<ModelId, BucketResolver>),
 }
 
+impl ChatRouting {
+    /// Whether the built routing reads request tokens; `legacy` holds the legacy policies.
+    pub fn needs_request_tokens(&self, legacy: &PolicyRegistry) -> bool {
+        match self {
+            Self::Legacy => legacy.needs_request_tokens(),
+            Self::Reorg(resolvers) => resolvers.values().any(BucketResolver::needs_request_tokens),
+        }
+    }
+}
+
 pub struct AppContext {
     pub config: Config,
     pub tokenizers: Arc<TokenizerRegistry>,
@@ -60,6 +70,8 @@ pub struct AppContext {
     pub engine_reported_load: Arc<EngineReportedLoadTable>,
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
+    /// Local KV tree for `--dp-aware` rank selection, under any policy.
+    pub dp_rank_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     /// Read-only handles `/metrics` pulls the KV storage-tier series from on
     /// scrape. `None` when this router maintains no local tree (external
@@ -128,6 +140,7 @@ impl AppContext {
             metrics,
             prefix_index: None,
             radix_tree_prefix_provider: None,
+            dp_rank_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
             kv_index: None,
@@ -197,11 +210,12 @@ impl AppContext {
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
                     id: "stub-model".into(),
-                    tokenizer_path: "stub".into(),
+                    tokenizer_path: Some("stub".into()),
                     disable_input_ids_forwarding: false,
                     tokenizer: Default::default(),
                     policy: crate::config::PolicyKind::RoundRobin,
                     decode_policy: Default::default(),
+                    dp_aware: false,
                     bucket_config: None,
                     circuit_breaker: None,
                     cache_aware: None,
@@ -230,6 +244,7 @@ impl AppContext {
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             radix_tree_prefix_provider: None,
+            dp_rank_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
             kv_index: None,

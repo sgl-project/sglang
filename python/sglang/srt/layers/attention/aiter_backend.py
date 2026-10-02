@@ -325,6 +325,19 @@ class AiterAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
         self.dcp_world_size = get_parallel().attn_dcp_size
+        self.mla_dcp_decode_backend = (
+            envs.SGLANG_AITER_MLA_DCP_DECODE_BACKEND.get().lower()
+        )
+        if self.mla_dcp_decode_backend not in ("gluon", "asm"):
+            raise ValueError(
+                "SGLANG_AITER_MLA_DCP_DECODE_BACKEND must be 'gluon' or 'asm', "
+                f"got {self.mla_dcp_decode_backend!r}"
+            )
+        self.use_mla_dcp_asm = (
+            self.use_mla
+            and self.dcp_world_size > 1
+            and self.mla_dcp_decode_backend == "asm"
+        )
 
         # Get v_head_dim based on model type
         if self.use_mla:
@@ -583,9 +596,10 @@ class AiterAttnBackend(AttentionBackend):
                     intra_batch_mode = False
                 log_mla_gluon_capability(logger)
 
-            self.max_split_per_batch = 32 if _use_mla_ps_kernel else None
+            use_any_mla_persist = _use_mla_ps_kernel or self.use_mla_dcp_asm
+            self.max_split_per_batch = 32 if use_any_mla_persist else None
 
-            if self.num_draft_tokens is None and _use_mla_ps_kernel:
+            if self.num_draft_tokens is None and use_any_mla_persist:
                 self.max_split_per_batch = 64
 
             self.fix_max_split_per_batch = self.max_split_per_batch
@@ -640,7 +654,33 @@ class AiterAttnBackend(AttentionBackend):
             return "auto"
         return "fp8_e4m3"
 
-    def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
+    def _use_mla_decode_persist_metadata(self) -> bool:
+        """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
+
+        Matches main's ``_use_mla_ps_kernel and dcp_world_size <= 1`` when ASM
+        is off. DCP ASM needs the same buffers with fast_mode scheduling.
+        """
+        return (_use_mla_ps_kernel and self.dcp_world_size <= 1) or (
+            self.use_mla_dcp_asm and self.dcp_world_size > 1
+        )
+
+    def _mla_decode_metadata_modes(self) -> tuple[bool, bool]:
+        if self.use_mla_dcp_asm and self.dcp_world_size > 1:
+            # Match the AITER/vLLM DCP path: persistent scheduling with the
+            # gathered-head tensor folded internally to qh16.
+            return True, False
+        return fast_mode, intra_batch_mode
+
+    def make_mla_decode_meta_data_buffer(
+        self,
+        max_seqlen_qo,
+        batch_size,
+        *,
+        metadata_fast_mode: Optional[bool] = None,
+        metadata_intra_batch_mode: Optional[bool] = None,
+    ):
+        # Under DCP this is the gathered head count (num_head * dcp_world_size);
+        # equals num_head_padded when DCP is off.
         nhead = self.mla_kernel_num_head_padded
         dtype = self.kv_cache_dtype
 
@@ -651,6 +691,15 @@ class AiterAttnBackend(AttentionBackend):
             self.max_split_per_batch = min(
                 (cu_num + batch_size - 1) // batch_size, self.fix_max_split_per_batch
             )
+
+        metadata_fast_mode = (
+            fast_mode if metadata_fast_mode is None else metadata_fast_mode
+        )
+        metadata_intra_batch_mode = (
+            intra_batch_mode
+            if metadata_intra_batch_mode is None
+            else metadata_intra_batch_mode
+        )
 
         (
             (work_meta_data_size, work_meta_data_type),
@@ -666,9 +715,9 @@ class AiterAttnBackend(AttentionBackend):
             dtype,
             dtype,
             is_sparse=False,
-            fast_mode=fast_mode,
+            fast_mode=metadata_fast_mode,
             num_kv_splits=self.max_split_per_batch,
-            intra_batch_mode=intra_batch_mode,
+            intra_batch_mode=metadata_intra_batch_mode,
         )
 
         # aiter implementation
@@ -1396,6 +1445,52 @@ class AiterAttnBackend(AttentionBackend):
         bs = fm.kv_indptr.shape[0] - 1
         num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
 
+        if self.use_mla_dcp_asm:
+            if fm.work_metadata is None:
+                raise RuntimeError(
+                    "AITER MLA DCP ASM selected without persistent metadata"
+                )
+
+            q_mla = q.view(bs, num_heads, layer.qk_head_dim)
+            q_scale = k_descale
+            if q_mla.dtype != fp8_dtype:
+                q_mla, q_scale = scaled_fp8_quant(q_mla.reshape(bs, -1))
+                q_mla = q_mla.view(bs, num_heads, layer.qk_head_dim)
+
+            out = torch.empty(
+                (bs, num_heads, layer.v_head_dim),
+                dtype=self.input_dtype,
+                device=q.device,
+            )
+            _, lse = mla_decode_fwd(
+                q_mla,
+                k_buffer.view(-1, 1, 1, layer.qk_head_dim),
+                out,
+                fm.qo_indptr,
+                fm.kv_indptr[: bs + 1],
+                fm.kv_indices,
+                fm.kv_last_page_len,
+                fm.max_q_len or 1,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                num_kv_splits=fm.num_kv_splits,
+                work_meta_data=fm.work_metadata,
+                work_indptr=fm.work_indptr,
+                work_info_set=fm.work_info_set,
+                reduce_indptr=fm.reduce_indptr,
+                reduce_final_map=fm.reduce_final_map,
+                reduce_partial_map=fm.reduce_partial_map,
+                q_scale=q_scale,
+                kv_scale=k_descale,
+                intra_batch_mode=False,
+                return_lse=True,
+            )
+            if lse is None:
+                raise RuntimeError(
+                    "aiter mla_decode_fwd(return_lse=True) returned no LSE"
+                )
+            return out, lse.view(bs, num_heads)
+
         out, lse = mla_gluon_decode(
             q=q.view(bs, num_heads, layer.qk_head_dim),
             k_buffer=k_buffer,
@@ -1711,9 +1806,10 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.kv_last_page_len[:bs]
                 max_q_len = 1
 
-                # DCP decode runs the aiter MLA kernel (builds its own block-table
-                # metadata in forward_decode), so skip the persist metadata.
-                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
+                if self._use_mla_decode_persist_metadata():
+                    metadata_fast_mode, metadata_intra_batch_mode = (
+                        self._mla_decode_metadata_modes()
+                    )
                     (
                         work_metadata,
                         work_indptr,
@@ -1721,7 +1817,12 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr,
                         reduce_final_map,
                         reduce_partial_map,
-                    ) = self.make_mla_decode_meta_data_buffer(max_q_len, bs)
+                    ) = self.make_mla_decode_meta_data_buffer(
+                        max_q_len,
+                        bs,
+                        metadata_fast_mode=metadata_fast_mode,
+                        metadata_intra_batch_mode=metadata_intra_batch_mode,
+                    )
 
                     num_kv_splits = self.max_split_per_batch
 
@@ -1736,9 +1837,9 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_final_map,
                         reduce_partial_map,
                         max_q_len,
-                        fast_mode=fast_mode,
+                        fast_mode=metadata_fast_mode,
                         max_split_per_batch=num_kv_splits,
-                        intra_batch_mode=intra_batch_mode,
+                        intra_batch_mode=metadata_intra_batch_mode,
                     )
 
             self.forward_metadata = ForwardMetadata(
@@ -2261,7 +2362,6 @@ class AiterAttnBackend(AttentionBackend):
             v2p,
             self.req_to_token.stride(0),
             q_len * num_cols,
-            translator.full_page_multiplier,
             PHYSICAL_PAGE_SIZE=1,
             DCP_SIZE=self.dcp_world_size,
             DCP_RANK=get_parallel().attn_dcp_rank,
@@ -2380,10 +2480,13 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
-        if self.use_mla and _use_mla_ps_kernel:
+        if self.use_mla and (_use_mla_ps_kernel or self.use_mla_dcp_asm):
             # for persistent mla_decode_fwd
             max_seqlen_qo = (
                 1 if self.num_draft_tokens is None else self.num_draft_tokens
+            )
+            metadata_fast_mode, metadata_intra_batch_mode = (
+                (True, False) if self.use_mla_dcp_asm else (fast_mode, intra_batch_mode)
             )
 
             (
@@ -2393,7 +2496,12 @@ class AiterAttnBackend(AttentionBackend):
                 self.reduce_indptr,
                 self.reduce_final_map,
                 self.reduce_partial_map,
-            ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, max_bs)
+            ) = self.make_mla_decode_meta_data_buffer(
+                max_seqlen_qo,
+                max_bs,
+                metadata_fast_mode=metadata_fast_mode,
+                metadata_intra_batch_mode=metadata_intra_batch_mode,
+            )
 
         else:
             self.work_metadata = None
@@ -2553,9 +2661,10 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
 
-                # DCP decode builds its own block-table metadata in
-                # forward_decode, so the persist metadata is unused here.
-                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
+                if self._use_mla_decode_persist_metadata():
+                    metadata_fast_mode, metadata_intra_batch_mode = (
+                        self._mla_decode_metadata_modes()
+                    )
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
@@ -2569,9 +2678,9 @@ class AiterAttnBackend(AttentionBackend):
                         self.reduce_final_map,
                         self.reduce_partial_map,
                         max_q_len,
-                        fast_mode=fast_mode,
+                        fast_mode=metadata_fast_mode,
                         max_split_per_batch=num_kv_splits,
-                        intra_batch_mode=intra_batch_mode,
+                        intra_batch_mode=metadata_intra_batch_mode,
                     )
 
                     work_metadata = self.work_metadata
@@ -3019,7 +3128,11 @@ class AiterAttnBackend(AttentionBackend):
                 if self.kv_cache_is_vectorized_5d:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc.for_layer(
+                            forward_batch,
+                            layer,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        ),
                         k,
                         v,
                         k_descale,
@@ -3063,12 +3176,17 @@ class AiterAttnBackend(AttentionBackend):
                         kv_lora_rank = v.shape[-1]
                         self.token_to_kv_pool.set_mla_kv_buffer(
                             layer,
-                            cache_loc,
+                            KVWriteLoc.for_layer(forward_batch, layer),
                             k[..., :kv_lora_rank],
                             k[..., kv_lora_rank:],
                         )
                     else:
-                        self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                        self.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            KVWriteLoc.for_layer(forward_batch, layer),
+                            k,
+                            v,
+                        )
                 elif self._use_fused_fp8_kv_write(layer):
                     # FP8: fuse bf16->fp8 cast + paged write in one kernel.
                     k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
@@ -3090,7 +3208,11 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc.for_layer(
+                            forward_batch,
+                            layer,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        ),
                         k,
                         v,
                         k_descale,
@@ -3911,9 +4033,9 @@ class AiterAttnBackend(AttentionBackend):
             if self.kv_cache_is_vectorized_5d:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                     ),
                     k,
                     v,
@@ -3947,7 +4069,10 @@ class AiterAttnBackend(AttentionBackend):
             elif self.use_mla:
                 # MLA pool has its own set_kv_buffer (no scale args).
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer,
+                    KVWriteLoc.for_batch(forward_batch),
+                    k,
+                    v,
                 )
             elif self._use_fused_fp8_kv_write(layer):
                 # FP8: fuse bf16->fp8 cast + paged write in one kernel.
@@ -3969,9 +4094,9 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                     ),
                     k,
                     v,
