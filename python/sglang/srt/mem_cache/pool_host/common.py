@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import mmap
 import os
 from collections import defaultdict
 from functools import lru_cache
+from typing import Optional
 
 import torch
 
@@ -18,6 +20,7 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
+_OS_PAGE_BYTES = mmap.PAGESIZE
 
 
 class HostTensorAllocator:
@@ -137,6 +140,10 @@ def get_allocator_type() -> str:
     return backend or "default"
 
 
+def _host_register_chunk_limit_bytes() -> int:
+    return max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
+
+
 def _cuda_host_register(
     buffer: torch.Tensor, registration_granularity_bytes: int | None = None
 ) -> None:
@@ -144,9 +151,7 @@ def _cuda_host_register(
     cudart = torch.cuda.cudart()
     base = buffer.data_ptr()
     total = buffer.numel() * buffer.element_size()
-    chunk_limit_bytes = (
-        max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
-    )
+    chunk_limit_bytes = _host_register_chunk_limit_bytes()
     # Preserve the legacy single-call behavior unless the caller provides a
     # copy granularity. Splitting an unknown page-first layout at an arbitrary
     # byte offset can make one cudaMemcpyBatchAsync span two registrations.
@@ -320,6 +325,209 @@ def make_kernel_ptr_table(
         dtype=torch.uint64,
         device=device,
     )
+
+
+def _registered_page_segments(
+    buffer: torch.Tensor, page_bytes: int
+) -> tuple[Optional[tuple[tuple[int, int], ...]], str]:
+    """Split ``buffer``'s pages by the host registration that holds them.
+
+    Returns ``((first_page, end_page), ...)`` in order, or ``(None, reason)``.
+    A registration must start on a page boundary and the registrations must
+    tile the buffer, so that every page lies inside exactly one of them.
+    """
+    ranges = getattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, None)
+    if not ranges:
+        return None, "the pool carries no host-registration ranges"
+    base = buffer.data_ptr()
+    total = buffer.numel() * buffer.element_size()
+    if page_bytes <= 0 or total % page_bytes != 0:
+        return (
+            None,
+            f"pool size {total} B is not a whole number of {page_bytes} B pages",
+        )
+    segments = []
+    offset = 0
+    for ptr, size in ranges:
+        if offset >= total:
+            break
+        if ptr - base != offset:
+            return None, (
+                f"host registrations do not tile the pool (registration at offset "
+                f"{ptr - base}, expected {offset})"
+            )
+        if ptr % _OS_PAGE_BYTES != 0:
+            # Two registrations would share an OS page; keep to one per page.
+            return None, (
+                f"a host registration starts inside an OS page (offset {offset})"
+            )
+        end = min(offset + size, total)
+        if end % page_bytes != 0:
+            return None, (
+                f"a host registration ends inside a page (offset {end}, "
+                f"page {page_bytes} B)"
+            )
+        segments.append((offset // page_bytes, end // page_bytes))
+        offset = end
+    if offset < total:
+        return None, f"host registrations cover {offset} of {total} B"
+    return tuple(segments), ""
+
+
+def direct_page_kernel_segments(
+    buffer: Optional[torch.Tensor],
+    *,
+    page_bytes: int,
+    item_bytes: int,
+    pin_memory: bool,
+    target_device,
+    pool_name: str,
+) -> Optional[tuple[tuple[int, int], ...]]:
+    """Page segments for page_first_direct transfers of ``buffer`` via the gather kernel.
+
+    The ``direct`` IO backend moves a page_first_direct pool one (page, layer)
+    block per memcpy. On ROCm that is one hipMemcpyAsync of page_size rows per
+    page and layer (the batched-memcpy path is compiled out), which is CPU-bound
+    at a few GB/s. The AOT gather kernels copy the same blocks with one launch
+    per layer, reading or writing the registered host pool directly.
+
+    A kernel addresses the pool from one device-accessible base, which is only
+    valid inside one host registration. A pool larger than
+    SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB is registered in several page-aligned
+    pieces, so the pages are returned per registration as
+    ``((first_page, end_page), ...)`` and each piece gets its own launch.
+
+    ``item_bytes`` is what one launch moves per (page, layer); the gather
+    kernel needs a multiple of 8 bytes (a 1-token DSA indexer page is 132 B).
+
+    Returns None when the per-page copy path must be used. Logs the path this
+    pool takes, and why, once.
+    """
+    path = None
+    if not _is_hip:
+        reason = "the page gather kernel is used on ROCm only"
+    elif buffer is None:
+        reason = "the pool has no buffer"
+    elif item_bytes % 8 != 0:
+        reason = f"the {item_bytes} B (page, layer) block is not a multiple of 8 bytes"
+    elif not pin_memory:
+        reason = "the pool is not host-registered (pin_memory=False)"
+    elif not torch.cuda.is_available() or torch.device(target_device).type != "cuda":
+        reason = f"the device pool is not on a CUDA/HIP device ({target_device})"
+    else:
+        path, reason = _registered_page_segments(buffer, page_bytes)
+    if path is None:
+        logger.info(
+            "HiCache %s host pool (page_first_direct): io_backend=direct uses "
+            "per-page copies: %s.",
+            pool_name,
+            reason,
+        )
+    else:
+        logger.info(
+            "HiCache %s host pool (page_first_direct): io_backend=direct uses the "
+            "page gather kernel over %d host registration(s) (%d pages of %d B).",
+            pool_name,
+            len(path),
+            path[-1][1],
+            page_bytes,
+        )
+    return path
+
+
+def page_ids_of_tokens(indices: torch.Tensor, page_size: int) -> Optional[torch.Tensor]:
+    """Page ids (int64, on the indices' device) of page-aligned token ``indices``.
+
+    Returns None when ``indices`` do not cover whole pages in order, so the
+    caller can keep its per-page copy path for them.
+    """
+    if indices.numel() % page_size != 0:
+        return None
+    firsts = indices.reshape(-1, page_size)
+    if not indices.is_cuda:
+        # Cheap on CPU: every row must be page_id * page_size + arange(page_size).
+        expected = firsts[:, :1] + torch.arange(page_size, dtype=firsts.dtype)
+        if not torch.equal(firsts, expected) or bool((firsts[:, 0] % page_size).any()):
+            return None
+    return (firsts[:, 0] // page_size).to(torch.int64)
+
+
+class DirectPageIndices:
+    """Per-registration (host, device) page ids for page_first_direct kernel transfers.
+
+    ``get`` returns ``[(first_page, end_page, host_pages, device_pages), ...]``:
+    one entry per host registration that the transfer touches, host page ids
+    relative to ``first_page``, both on the device. None means the indices are
+    not whole pages and the caller keeps its per-page copies (logged once).
+
+    A load hands the same index tensors to every layer, so the entries
+    converted for the most recent load are kept and reused by its other layers.
+    """
+
+    def __init__(self, page_size: int, device, segments, pool_name: str = ""):
+        self.page_size = page_size
+        self.device = device
+        self.segments = tuple(segments)
+        self.pool_name = pool_name
+        self._last = None
+        self._warned_fallback = False
+
+    def _split(self, host_pages, device_pages):
+        if host_pages.numel() == 0:
+            return []
+        if len(self.segments) == 1:
+            first = self.segments[0][0]
+            if first:
+                host_pages = host_pages - first
+            parts = [(first, self.segments[0][1], host_pages, device_pages)]
+        else:
+            # Several host registrations: route each page to the one holding it.
+            # The direct backend keeps its indices on the CPU, so this is cheap.
+            host_pages, device_pages = host_pages.cpu(), device_pages.cpu()
+            parts = []
+            for first, end in self.segments:
+                mask = (host_pages >= first) & (host_pages < end)
+                if bool(mask.any()):
+                    parts.append(
+                        (first, end, host_pages[mask] - first, device_pages[mask])
+                    )
+        return [
+            (
+                first,
+                end,
+                hp.to(self.device, non_blocking=True),
+                dp.to(self.device, non_blocking=True),
+            )
+            for first, end, hp, dp in parts
+        ]
+
+    def get(self, host_indices, device_indices, *, reuse: bool):
+        last = self._last if reuse else None
+        if last is not None and last[0] is host_indices and last[1] is device_indices:
+            return last[2]
+        host_pages = page_ids_of_tokens(host_indices, self.page_size)
+        device_pages = (
+            None
+            if host_pages is None
+            else page_ids_of_tokens(device_indices, self.page_size)
+        )
+        if device_pages is None:
+            if not self._warned_fallback:
+                self._warned_fallback = True
+                logger.warning(
+                    "HiCache %s host pool: a page_first_direct transfer of %d/%d "
+                    "host/device indices is not whole pages of %d tokens; such "
+                    "transfers use per-page copies (logged once).",
+                    self.pool_name,
+                    host_indices.numel(),
+                    device_indices.numel(),
+                    self.page_size,
+                )
+            return None
+        pages = self._split(host_pages, device_pages)
+        if reuse:
+            self._last = (host_indices, device_indices, pages)
+        return pages
 
 
 ALLOC_MEMORY_FUNCS = defaultdict(

@@ -24,6 +24,8 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    DirectPageIndices,
+    direct_page_kernel_segments,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -176,6 +178,7 @@ class DSAIndexerPoolHost(HostKVCache):
 
         self.can_use_jit = False
         self.can_use_write_back_jit = False
+        self.use_direct_page_kernel = False
         if is_dummy:
             self.index_k_with_scale_buffer = None
             self.index_k_device_ptrs = None
@@ -218,6 +221,25 @@ class DSAIndexerPoolHost(HostKVCache):
             )
         self.init_kv_buffer()
         self._init_write_back_staging_buffers()
+        segments = (
+            direct_page_kernel_segments(
+                self.index_k_with_scale_buffer,
+                page_bytes=self.indexer_layout_dim,
+                item_bytes=self.indexer_page_stride_size,
+                pin_memory=self.pin_memory,
+                target_device=self.device_pool.device,
+                pool_name="DSA indexer",
+            )
+            if self.layout == "page_first_direct"
+            else None
+        )
+        self.use_direct_page_kernel = segments is not None
+        self._direct_page_indices = DirectPageIndices(
+            self.page_size,
+            self.device_pool.device,
+            segments or ((0, self.indexer_page_num),),
+            pool_name="DSA indexer",
+        )
         self.lock = threading.RLock()
         self.clear()
 
@@ -328,6 +350,38 @@ class DSAIndexerPoolHost(HostKVCache):
         )
         return host_page_indices, device_page_indices
 
+    def _backup_direct_page_kernel(self, pages) -> None:
+        """page_first_direct D2H of every layer's indexer page via the gather kernel."""
+        buffers = self.packed_device_index_buffers
+        all_layers = all(buffer.shape[0] > 0 for buffer in buffers)
+        for first, end, host_pages, device_pages in pages:
+            host = self.index_k_with_scale_buffer[first:end]
+            if all_layers:
+                transfer_kv_all_layer_mla_lf_pf(
+                    src_layers=self.index_k_device_ptrs,
+                    dst=host,
+                    src_indices=device_pages,
+                    dst_indices=host_pages,
+                    item_size=self.indexer_page_stride_size,
+                    dst_layout_dim=self.indexer_layout_dim,
+                    num_layers=self.layer_num,
+                )
+                continue
+            # Layers that reuse the previous layer's top-k keep a 0-row device
+            # buffer; copy only the layers that have one, each into its host slot.
+            for layer, buffer in enumerate(buffers):
+                if buffer.shape[0] == 0:
+                    continue
+                transfer_kv_all_layer_mla_lf_pf(
+                    src_layers=self.index_k_device_ptrs[layer : layer + 1],
+                    dst=host[:, layer],
+                    src_indices=device_pages,
+                    dst_indices=host_pages,
+                    item_size=self.indexer_page_stride_size,
+                    dst_layout_dim=self.indexer_layout_dim,
+                    num_layers=1,
+                )
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -386,14 +440,36 @@ class DSAIndexerPoolHost(HostKVCache):
                     page_size=1,
                 )
             elif self.layout == "page_first_direct":
-                transfer_kv_per_layer_direct_pf_lf(
-                    src_ptrs=[self.index_k_with_scale_buffer],
-                    dst_ptrs=[device_pool.index_k_with_scale_buffer[device_layer_id]],
-                    src_indices=host_page_indices,
-                    dst_indices=device_page_indices,
-                    layer_id=host_layer_id,
-                    page_size=1,
+                dst = device_pool.index_k_with_scale_buffer[device_layer_id]
+                pages = (
+                    self._direct_page_indices.get(
+                        host_indices, device_indices, reuse=True
+                    )
+                    if self.use_direct_page_kernel
+                    else None
                 )
+                if pages is not None:
+                    if dst.shape[0] == 0:
+                        return  # layer reuses the previous layer's top-k
+                    for first, end, host_pages, device_pages in pages:
+                        transfer_kv_per_layer_mla_pf_lf(
+                            src=self.index_k_with_scale_buffer[first:end],
+                            dst=dst,
+                            src_indices=host_pages,
+                            dst_indices=device_pages,
+                            layer_id=host_layer_id,
+                            item_size=self.indexer_page_stride_size,
+                            src_layout_dim=self.indexer_layout_dim,
+                        )
+                else:
+                    transfer_kv_per_layer_direct_pf_lf(
+                        src_ptrs=[self.index_k_with_scale_buffer],
+                        dst_ptrs=[dst],
+                        src_indices=host_page_indices,
+                        dst_indices=device_page_indices,
+                        layer_id=host_layer_id,
+                        page_size=1,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
@@ -528,13 +604,23 @@ class DSAIndexerPoolHost(HostKVCache):
                     page_size=1,
                 )
             elif self.layout == "page_first_direct":
-                transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=self.packed_device_index_buffers,
-                    dst_ptrs=[self.index_k_with_scale_buffer],
-                    src_indices=device_page_indices,
-                    dst_indices=host_page_indices,
-                    page_size=1,
+                pages = (
+                    self._direct_page_indices.get(
+                        host_indices, device_indices, reuse=False
+                    )
+                    if self.use_direct_page_kernel
+                    else None
                 )
+                if pages is not None:
+                    self._backup_direct_page_kernel(pages)
+                else:
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=self.packed_device_index_buffers,
+                        dst_ptrs=[self.index_k_with_scale_buffer],
+                        src_indices=device_page_indices,
+                        dst_indices=host_page_indices,
+                        page_size=1,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
