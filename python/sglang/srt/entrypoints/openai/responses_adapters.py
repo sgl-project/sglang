@@ -191,6 +191,7 @@ def label_developer_content(content: Any) -> Any:
 
 
 _REASONING_STATE_PREFIX = "sglang-reasoning-v1."
+_MAX_REASONING_STATE_SIZE = 16 * 1024 * 1024
 
 
 def encode_reasoning_state(text: str) -> str:
@@ -205,11 +206,22 @@ def encode_reasoning_state(text: str) -> str:
     return _REASONING_STATE_PREFIX + packed.decode("ascii")
 
 
-def decode_reasoning_state(blob: Any) -> Optional[str]:
+def decode_reasoning_state(
+    blob: Any, *, max_output_size: int = _MAX_REASONING_STATE_SIZE
+) -> Optional[str]:
     if not isinstance(blob, str) or not blob.startswith(_REASONING_STATE_PREFIX):
         return None
     try:
         raw = base64.urlsafe_b64decode(blob[len(_REASONING_STATE_PREFIX) :])
-        return zlib.decompress(raw).decode("utf-8")
+        decompressor = zlib.decompressobj()
+        unpacked = decompressor.decompress(raw, max_output_size + 1)
+        if (
+            len(unpacked) > max_output_size
+            or decompressor.unconsumed_tail
+            or decompressor.unused_data
+            or not decompressor.eof
+        ):
+            return None
+        return unpacked.decode("utf-8")
     except (ValueError, zlib.error, UnicodeDecodeError):
         return None
