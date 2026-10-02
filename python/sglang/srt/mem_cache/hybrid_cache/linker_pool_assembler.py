@@ -263,6 +263,7 @@ def _build_deepseek_v4_device_pool_group(
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _dsv4_compressed_region_buffers,
         _dsv4_indexer_regions,
+        _dsv4_low_ratio_regions,
         _require_single_row_dsv4_swa_pages,
         _resolve_deepseek_v4_layer_mappings,
     )
@@ -320,31 +321,36 @@ def _build_deepseek_v4_device_pool_group(
                 )
             )
 
-    c4_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 4)
-    c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
-
-    add(
-        PoolName.DEEPSEEK_V4_C4,
-        PoolName.KV,
-        kvcache.c4_kv_pool,
-        c4_buffers,
-        mappings.c4,
-    )
-    for region in _dsv4_indexer_regions(kvcache, page_size):
+    if mappings.c4:
+        c4_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 4)
         add(
-            region.name,
+            PoolName.DEEPSEEK_V4_C4,
             PoolName.KV,
-            kvcache.c4_indexer_kv_pool,
-            region.device_buffers,
+            kvcache.c4_kv_pool,
+            c4_buffers,
             mappings.c4,
         )
-    add(
-        PoolName.DEEPSEEK_V4_C128,
-        PoolName.KV,
-        kvcache.c128_kv_pool,
-        c128_buffers,
-        mappings.c128,
-    )
+        for region in _dsv4_indexer_regions(kvcache, page_size):
+            add(
+                region.name,
+                PoolName.KV,
+                kvcache.c4_indexer_kv_pool,
+                region.device_buffers,
+                mappings.c4,
+            )
+    if mappings.c128:
+        c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
+        add(
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.KV,
+            kvcache.c128_kv_pool,
+            c128_buffers,
+            mappings.c128,
+        )
+    for name, pool, buffers, layer_mapping in _dsv4_low_ratio_regions(
+        kvcache, page_size
+    ):
+        add(name, PoolName.KV, pool, buffers, layer_mapping)
 
     # fp8 two-pool unified_kv: one row index addresses both kv_buffer (fp8 nope) and
     # kv_buffer_rope (bf16 rope), but unified_region_buffers() above returns the nope

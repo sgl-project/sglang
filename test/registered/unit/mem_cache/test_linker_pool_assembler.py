@@ -259,6 +259,64 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[3, 17]])
         self.assertEqual(offsets, [[3, 22]])
 
+    def test_deepseek_v41_maps_low_ratio_pools(self):
+        """V4.1 has no C4/C128 pools; the linker must ship its C1/C2 pools instead."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4LayerItem
+
+        def index_pool(num_layers):
+            return SimpleNamespace(
+                page_size=2,
+                index_k_with_scale_buffer=[
+                    torch.zeros((8, 3), dtype=torch.uint8) for _ in range(num_layers)
+                ],
+            )
+
+        kvcache = SimpleNamespace(
+            _unified_kv=False,
+            start_layer=0,
+            end_layer=3,
+            swa_page_size=4,
+            swa_kv_pool=SimpleNamespace(
+                page_size=4,
+                kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)],
+            ),
+            c4_kv_pool=None,
+            c128_kv_pool=None,
+            layer_mapping=[
+                DeepSeekV4LayerItem(2, -1),
+                DeepSeekV4LayerItem(1, -1),
+                DeepSeekV4LayerItem(2, -1),
+            ],
+            sources_by_ratio={1: [1], 2: [0, 2]},
+            kv_pools={
+                1: SimpleNamespace(kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8)]),
+                2: SimpleNamespace(
+                    kv_buffer=[torch.zeros((8, 7), dtype=torch.uint8) for _ in range(2)]
+                ),
+            },
+            index_pools={1: index_pool(1), 2: index_pool(2)},
+            compress_state_pools=[None] * 3,
+            indexer_compress_state_pools=[None] * 3,
+        )
+
+        group = _build_deepseek_v4_device_pool_group(kvcache, page_size=4)
+
+        self.assertEqual(
+            set(group.entry_map),
+            {
+                PoolName.SWA,
+                PoolName.DEEPSEEK_V4_C1,
+                PoolName.DEEPSEEK_V4_C1_INDEXER,
+                PoolName.DEEPSEEK_V4_C2,
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+            },
+        )
+        c2 = group.entry_map[PoolName.DEEPSEEK_V4_C2]
+        self.assertEqual(group.sources[PoolName.DEEPSEEK_V4_C2], PoolName.KV)
+        self.assertEqual(c2.layer_mapping, {0: 0, 2: 1})
+        _, sizes = c2.get_page_buffer_meta(torch.arange(4, 8))
+        self.assertEqual(sizes, [7, 7])
+
     def test_unified_deepseek_v4_uses_only_compressed_pools(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4LayerItem
 
