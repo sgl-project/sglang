@@ -90,7 +90,8 @@ async fn static_urls_pd_role_resolved_end_to_end() {
     use axum::{routing::get, Json, Router};
     use serde_json::json;
     use sgl_router::config::{
-        ActiveLoadConfig, Config, DiscoveryBackend, ObservabilityConfig, ProxyConfig, ServerConfig,
+        Config, DiscoveryBackend, InflightLoadConfig, ObservabilityConfig, ProxyConfig,
+        ServerConfig,
     };
     use sgl_router::discovery::{spawn_discovery, WorkerId};
     use sgl_router::workers::{manager, WorkerRegistry};
@@ -129,9 +130,12 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         observability: ObservabilityConfig::default(),
         model: sgl_router::config::ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
+            disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: sgl_router::config::PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
@@ -140,12 +144,13 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![url.clone()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     };
 
     let registry = Arc::new(WorkerRegistry::default());

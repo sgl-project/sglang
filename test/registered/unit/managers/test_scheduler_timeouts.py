@@ -12,7 +12,12 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -62,7 +67,6 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.beam_coordinator = MagicMock()
-    s.ps = SimpleNamespace(pp_size=1)
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
     return s
@@ -126,6 +130,9 @@ class TestWaitingTimeout(CustomTestCase):
 
 
 class TestRunningTimeout(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_emits_only_stale_unfinished_reqs_without_marking(self):
         now = time.perf_counter()
         stale = _req("stale", forward_entry=now - 10)

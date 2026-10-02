@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -49,7 +49,11 @@ _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
-if _is_cuda or _is_hip or _is_musa:
+if _is_cuda or _is_hip:
+    from sglang.kernels.ops.speculative.tree import (
+        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
+    )
+elif _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
@@ -386,7 +390,10 @@ def verify_tree_greedy_func(
     topk: int = -1,
 ):
     if _is_cuda or _is_hip or _is_musa:
-        from sgl_kernel import verify_tree_greedy
+        if _is_cuda or _is_hip:
+            from sglang.kernels.ops.speculative.tree import verify_tree_greedy
+        else:
+            from sgl_kernel import verify_tree_greedy
 
         verify_tree_greedy(
             predicts=predicts,  # mutable
@@ -559,14 +566,17 @@ def eagle_prepare_for_verify(
         # Uniform variant: end offsets (= start + draft_token_num) are computed
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
         # critical path (bs=1 MTP inter-phase seam).
-        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-        )
+        if verify_input.prepared_out_cache_loc is not None:
+            batch.out_cache_loc = verify_input.prepared_out_cache_loc
+        else:
+            batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+            )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -594,6 +604,7 @@ def eagle_prepare_for_verify(
         target_worker.model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
+        spec_mrope_positions=verify_input.prepared_mrope_positions,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -734,10 +745,10 @@ def eagle_sample(
     """
     import torch.nn.functional as F
 
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
+    from sglang.srt.runtime_context import get_parallel
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
@@ -829,7 +840,7 @@ def eagle_sample(
             tp_group = (
                 get_parallel().attn_tp_group
                 if is_dp_attention_enabled()
-                else get_tp_group()
+                else get_parallel().tp_group
             )
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
@@ -865,7 +876,7 @@ def eagle_sample(
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
-            else get_tp_group()
+            else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
@@ -889,7 +900,11 @@ def eagle_sample(
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
         else:
-            if not _is_npu:
+            if _is_cuda:
+                from sglang.kernels.ops.speculative.sampling import (
+                    tree_speculative_sampling_target_only,
+                )
+            elif not _is_npu:
                 from sgl_kernel import tree_speculative_sampling_target_only
 
             sampling_fn = tree_speculative_sampling_target_only
@@ -902,6 +917,9 @@ def eagle_sample(
             from sglang.kernels.ops.sampling.renorm_triton import (
                 top_p_renorm_probs_triton as top_p_renorm_prob,
             )
+        elif _is_cuda:
+            from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
+            from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
         elif not _is_npu:
             from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
@@ -985,7 +1003,7 @@ def eagle_sample(
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
-            else get_tp_group()
+            else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)

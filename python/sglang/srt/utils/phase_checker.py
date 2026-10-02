@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_device_stream_capturing
 
 
 def _phase_repr(phase: int | IntEnum) -> str:
@@ -51,6 +52,7 @@ class SimplePhaseChecker:
 
     def __init__(self, *, initial_phase: int | IntEnum, device: torch.device) -> None:
         self._initial_phase = int(initial_phase)
+        self._device = device
         self._phase = torch.tensor(
             self._initial_phase, dtype=torch.int32, device=device
         )
@@ -81,7 +83,7 @@ class SimplePhaseChecker:
             f"caller_tag={caller_tag} "
             f"expect={_phase_repr(expect_phase)} "
             f"next={_phase_repr(next_phase)} "
-            f"capturing={torch.cuda.is_current_stream_capturing()}"
+            f"capturing={is_device_stream_capturing(self._device)}"
         )
         _phase_check_kernel[(1,)](
             self._phase,

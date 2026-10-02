@@ -44,7 +44,6 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     is_qwen3_5_mtp_draft,
 )
-from sglang.srt.distributed import get_world_group
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -1007,9 +1006,9 @@ def _prefetch_all_checkpoints(
     # full checkpoint into its own page cache. Global rank would split files
     # across nodes, but page cache is not shared across nodes.
     if torch.distributed.is_initialized():
-        world_group = get_world_group()
+        world_group = get_parallel().world_group
         local_rank = world_group.local_rank
-        local_world_size = world_group.local_size or world_group.world_size
+        local_world_size = world_group.local_size or get_parallel().launch_world_size
     else:
         local_rank = 0
         local_world_size = 1
@@ -1139,8 +1138,9 @@ def safetensors_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
+    prefetch_handle = None
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(
+        prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
 
@@ -1162,6 +1162,8 @@ def safetensors_weights_iterator(
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
+    if prefetch_handle is not None:
+        prefetch_handle.stop()
 
 
 def fastsafetensors_weights_iterator(
@@ -1235,8 +1237,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
+    prefetch_handle = None
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(
+        prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
     enable_tqdm = (
@@ -1288,6 +1291,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
                     # but later mmap-backed tensor access may fault pages again.
                     _drop_file_cache_after_load(st_file)
                 pbar.update(1)
+    if prefetch_handle is not None:
+        prefetch_handle.stop()
 
 
 def _load_pt_file(bin_file: str) -> dict:

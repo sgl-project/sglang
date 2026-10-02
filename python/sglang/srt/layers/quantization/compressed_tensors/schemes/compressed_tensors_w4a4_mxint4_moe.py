@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors import CompressionFormat
 
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -325,7 +324,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         )
 
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             num_tokens = x.shape[0]
             hidden_size = x.shape[-1]

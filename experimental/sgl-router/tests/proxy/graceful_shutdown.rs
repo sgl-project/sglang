@@ -25,7 +25,7 @@
 
 use futures::future::join_all;
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -52,9 +52,12 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
+            disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
@@ -63,12 +66,13 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -78,7 +82,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             url: worker_url.to_string(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         })
         .expect("test worker accepted");
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
@@ -553,7 +557,7 @@ async fn wait_for_inflight_http(ctx: &Arc<AppContext>, want: usize) {
 /// response BODY finishing, not the handler returning. A streaming completion
 /// hands back its headers immediately, so a count released at handler exit
 /// would read 0 for the entire window the heartbeat exists to explain — the
-/// same blind spot `active_load.inflight_count()` has, reproduced in the
+/// same blind spot `router_inflight_load.inflight_count()` has, reproduced in the
 /// replacement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inflight_http_counts_a_streaming_response_until_its_body_finishes() {
@@ -622,7 +626,7 @@ async fn inflight_http_counts_a_streaming_response_until_its_body_finishes() {
 
 /// Every route is instrumented, not only the proxied ones. `/metrics`,
 /// `/readyz` and a 404 are exchanges axum's drain waits on too, and they are
-/// exactly the traffic `active_load` cannot see — so a guard that leaked on a
+/// exactly the traffic `router_inflight_load` cannot see — so a guard that leaked on a
 /// non-proxied route would leave the heartbeat permanently busy and turn the
 /// drain report back into noise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -35,7 +35,6 @@ def _validate_server(**overrides):
         enable_eplb=False,
         elastic_ep_backend=None,
         enable_elastic_expert_backup=False,
-        elastic_ep_rejoin=False,
     )
     server_args.update(overrides)
     return validate_experimental_sgl_marlin_server_args(
@@ -56,7 +55,6 @@ def _validate_server(**overrides):
         {"enable_eplb": True},
         {"elastic_ep_backend": "mooncake"},
         {"enable_elastic_expert_backup": True},
-        {"elastic_ep_rejoin": True},
     ],
     ids=[
         "init_expert_location",
@@ -64,7 +62,6 @@ def _validate_server(**overrides):
         "enable_eplb",
         "elastic_ep_backend",
         "enable_elastic_expert_backup",
-        "elastic_ep_rejoin",
     ],
 )
 def test_lora_ep_placement_validation(placement):

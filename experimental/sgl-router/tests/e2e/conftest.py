@@ -14,8 +14,9 @@ Two flavors of fixtures coexist here:
      topologies. Backed by the ``infra.gateway.Gateway`` and
      ``infra.model_pool.spawn_worker`` helpers.
 
-Both sets share the same release binary; ``SGL_ROUTER_BINARY`` env var
-overrides the path for both.
+Both sets share the same release binary (``SGL_ROUTER_BINARY`` overrides
+the path for both) and the same ``gpu_allocator``, which is what keeps the
+session-scoped server and the per-test workers off each other's cards.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ logger = logging.getLogger(__name__)
 _E2E_DIR = Path(__file__).resolve().parent
 if str(_E2E_DIR) not in sys.path:
     sys.path.insert(0, str(_E2E_DIR))
+
+from infra import model_pool  # noqa: E402  (needs the sys.path entry above)
 
 MODEL = "Qwen/Qwen3-0.6B"
 SGLANG_PORT = 30000
@@ -84,8 +87,42 @@ def _wait_http(url: str, timeout: int = 120) -> None:
 
 
 @pytest.fixture(scope="session")
-def sglang_server():
-    """Launch a real SGLang server on port 30000 and wait until healthy."""
+def sglang_server(gpu_allocator):
+    """Launch a real SGLang server on port 30000 and wait until healthy.
+
+    Holds a ``gpu_allocator`` reservation for the whole session, so this server
+    and a per-test ``chat_completions/`` worker cannot land on the same card:
+    both are confined to the same ``CUDA_VISIBLE_DEVICES`` allotment, where
+    logical index 0 is one specific physical GPU for everyone.
+
+    This server is one card the acceptance tests cannot have. On a two-GPU
+    runner that leaves one, which is why ``GPUAllocator.acquire`` raises rather
+    than skipping when a request it could otherwise satisfy is blocked by this
+    reservation — a multi-GPU test dropped from a green run is invisible.
+    """
+    gpu_ids = gpu_allocator.acquire(1)
+    try:
+        yield from _serve_session_sglang(gpu_ids)
+    finally:
+        gpu_allocator.release(gpu_ids)
+
+
+def _serve_session_sglang(gpu_ids: list[int]) -> Iterator[str]:
+    """Run the session-scoped server on *gpu_ids* and yield its base URL.
+
+    Split out so the reservation above has exactly one release site covering
+    every exit: a raise from the spawn itself, a failed health probe, an error
+    in a test body, or normal teardown.
+    """
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(model_pool.resolve_device_ids(gpu_ids))
+    logger.info(
+        "launching session sglang server: port=%d gpus=%s devices=%s",
+        SGLANG_PORT,
+        gpu_ids,
+        env["CUDA_VISIBLE_DEVICES"],
+    )
+
     # Stream the server's stdout/stderr to a file rather than capturing
     # to subprocess.PIPE. The launch_server startup log is verbose (model
     # download, JIT warmup, NCCL init); once a PIPE'd output fills its
@@ -108,6 +145,7 @@ def sglang_server():
             "--tp",
             "1",
         ],
+        env=env,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
@@ -136,16 +174,25 @@ def sglang_server():
         )
         raise
 
-    yield f"http://localhost:{SGLANG_PORT}"
-
-    proc.send_signal(signal.SIGTERM)
     try:
-        proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-    log_handle.flush()
-    log_handle.close()
+        yield f"http://localhost:{SGLANG_PORT}"
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            # Bounded: an sglang process wedged in the CUDA driver never
+            # reaps, and an unbounded wait here hangs the whole session
+            # behind a fixture that has already done its job.
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "session sglang server %d survived SIGKILL; leaving it", proc.pid
+                )
+        log_handle.flush()
+        log_handle.close()
 
 
 def _find_tokenizer_path(model: str) -> str:
@@ -231,19 +278,49 @@ def router(sglang_server):  # noqa: ARG001  (sglang_server must start first)
 # ---------------------------------------------------------------------------
 
 
-def _detect_gpu_count() -> int:
-    """Count visible GPUs via ``nvidia-smi``. Returns 0 when no NVIDIA GPU
-    is available (CI on CPU-only runners, dev laptops, etc.).
+def _host_gpu_count() -> int:
+    """GPUs the driver reports on this host, or 0 when there is no NVIDIA stack.
+
+    Fails rather than answering 0 when ``nvidia-smi`` exists but cannot answer.
+    Every test in this directory now reaches the GPU through ``gpu_allocator``,
+    so reading a wedged driver or a version mismatch as "no GPUs here" would
+    skip the whole suite and report a green job that ran nothing.
     """
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             timeout=5.0,
         )
-    except (FileNotFoundError, subprocess.SubprocessError):
+    except FileNotFoundError:
         return 0
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            "nvidia-smi did not answer within 5s; this host's GPU or driver is "
+            "wedged. Refusing to report 0 GPUs and skip the GPU suite."
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode(errors="replace").strip()
+        pytest.fail(f"nvidia-smi failed ({exc.returncode}): {stderr}")
     return len([ln for ln in out.decode().splitlines() if ln.strip()])
+
+
+def _detect_gpu_count() -> int:
+    """Count the GPUs this process may use, or 0 if it has none (a CPU-only
+    runner, a dev laptop, or a ``CUDA_VISIBLE_DEVICES`` that hides every card).
+
+    ``CUDA_VISIBLE_DEVICES`` decides the count whenever it is set: CI hands
+    each runner a slice of a shared box through it, while ``nvidia-smi``
+    reports every GPU on the host regardless, and counting the host's would let
+    a test acquire an index this job does not own. The host probe still runs
+    first, so a box with no NVIDIA stack reports 0 even when something in the
+    environment has set the variable anyway.
+    """
+    host = _host_gpu_count()
+    if host == 0:
+        return 0
+    visible = model_pool.visible_devices()
+    return len(visible) if visible is not None else host
 
 
 class GPUAllocator:
@@ -258,10 +335,22 @@ class GPUAllocator:
         self._lock = threading.Lock()
 
     def acquire(self, n: int = 1) -> list[int]:
+        """Reserve *n* GPUs, or skip when this process was never given that many.
+
+        A request the allotment could satisfy but for a reservation someone else
+        is holding raises instead: that is a harness bug, and skipping it would
+        drop a multi-GPU test out of a run that still reports green.
+        """
         with self._lock:
-            if n > len(self._free):
+            if n > self.total:
                 raise pytest.skip.Exception(
-                    f"requested {n} GPUs, only {len(self._free)}/{self.total} free"
+                    f"requested {n} GPUs, this process's allotment is {self.total}"
+                )
+            if n > len(self._free):
+                raise RuntimeError(
+                    f"requested {n} GPUs, only {len(self._free)} of {self.total} "
+                    "free: another fixture in this session is holding a "
+                    "reservation for the rest"
                 )
             picked = self._free[:n]
             self._free = self._free[n:]
@@ -269,6 +358,12 @@ class GPUAllocator:
 
     def release(self, ids: list[int]) -> None:
         with self._lock:
+            already_free = sorted(set(ids) & set(self._free))
+            if already_free:
+                raise RuntimeError(
+                    f"double release of GPU(s) {already_free}: the allocator "
+                    "would hand the same card to two workers"
+                )
             self._free.extend(ids)
             self._free.sort()
 
@@ -298,13 +393,11 @@ def router_binary() -> Path:
 
 @pytest.fixture(scope="session")
 def gpu_allocator() -> Iterator[GPUAllocator]:
-    """Session-scoped GPU index allocator. Skips the entire session when
-    no GPUs are visible — acceptance tests under chat_completions/ are
-    real-GPU.
+    """Session-scoped GPU index allocator. Skips the whole session when the
+    allotment is empty: every fixture that spawns a worker draws from here, the
+    session-scoped ``sglang_server`` included, so all of tests/e2e/ is real-GPU.
     """
     n = _detect_gpu_count()
     if n == 0:
-        pytest.skip(
-            "no NVIDIA GPUs visible to nvidia-smi; acceptance tests are GPU-only"
-        )
+        pytest.skip("no GPUs available to this process; tests/e2e/ is GPU-only")
     yield GPUAllocator(n)
