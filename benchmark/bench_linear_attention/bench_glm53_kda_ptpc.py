@@ -256,7 +256,7 @@ def run_case(tp: int, module_name: str, m: int, args) -> dict:
 @torch.inference_mode()
 def run_fused_decode_case(tp: int, m: int, args) -> dict:
     from sglang.srt.layers.quantization.unquant import (
-        Glm53KdaSplitPtpcLinearMethod,
+        Glm53KdaPackedPtpcLinearMethod,
         UnquantizedLinearMethod,
     )
 
@@ -294,7 +294,7 @@ def run_fused_decode_case(tp: int, m: int, args) -> dict:
     baseline = UnquantizedLinearMethod()
     qkv_size = TP_SHAPES[tp]["qkv_proj"][0]
     beta_size = TP_SHAPES[tp]["b_proj"][0]
-    candidate = Glm53KdaSplitPtpcLinearMethod(
+    candidate = Glm53KdaPackedPtpcLinearMethod(
         bf16_max_m=4095 if tp == 4 else 8191,
         fp8_max_m=16384,
         qkv_size=qkv_size,
@@ -305,8 +305,8 @@ def run_fused_decode_case(tp: int, m: int, args) -> dict:
 
     expected = baseline.apply(layer, x)
     if candidate.is_active(m):
-        qkv, beta, (f_a, g_a) = candidate.apply_ptpc_prefill(layer, x)
-        actual = torch.cat((qkv, beta, f_a, g_a), dim=-1)
+        qkv, beta, fg_a = candidate.apply_ptpc_prefill(layer, x)
+        actual = torch.cat((qkv, beta, fg_a), dim=-1)
     else:
         actual = candidate.apply(layer, x)
     if not candidate.is_active(m):
@@ -320,7 +320,7 @@ def run_fused_decode_case(tp: int, m: int, args) -> dict:
         mean_abs = (actual.float() - expected.float()).abs().mean()
         if cosine.item() <= 0.995 or mean_abs.item() >= 0.01:
             raise AssertionError(
-                f"split PTPC mismatch: cosine={cosine.item():.6f}, "
+                f"no-copy packed PTPC mismatch: cosine={cosine.item():.6f}, "
                 f"mean_abs={mean_abs.item():.6f}"
             )
 
@@ -335,8 +335,7 @@ def run_fused_decode_case(tp: int, m: int, args) -> dict:
     def run_candidate():
         if not candidate.is_active(m):
             return candidate.apply(layer, x)
-        qkv, beta, (f_a, g_a) = candidate.apply_ptpc_prefill(layer, x)
-        return qkv, beta, torch.stack((f_a, g_a))
+        return candidate.apply_ptpc_prefill(layer, x)
 
     candidate_samples = measure_samples(
         run_candidate,

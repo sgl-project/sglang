@@ -60,8 +60,8 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import (
+    Glm53KdaPackedPtpcLinearMethod,
     Glm53KdaPtpcLinearMethod,
-    Glm53KdaSplitPtpcLinearMethod,
     UnquantizedLinearMethod,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
@@ -656,20 +656,20 @@ class Glm5NextLinearAttention(nn.Module):
         if selected_shared_input_modules:
             first_stage_max_m = GLM53_KDA_PTPC_BF16_MAX_M["qkv_proj"]
             if self.do_fuse_qkvbfg:
-                split_bf16_max_m_by_qkv_size = {
+                packed_bf16_max_m_by_qkv_size = {
                     3072: 8191,
                     6144: first_stage_max_m,
                 }
                 qkv_size = self.split_sizes[0]
-                if qkv_size not in split_bf16_max_m_by_qkv_size:
+                if qkv_size not in packed_bf16_max_m_by_qkv_size:
                     raise ValueError(
-                        "GLM-5.3 KDA split PTPC supports fused qkv sizes "
-                        f"{sorted(split_bf16_max_m_by_qkv_size)}, got {qkv_size}"
+                        "GLM-5.3 KDA packed PTPC supports fused qkv sizes "
+                        f"{sorted(packed_bf16_max_m_by_qkv_size)}, got {qkv_size}"
                     )
-                self.fused_qkvbfg_a_proj.quant_method = Glm53KdaSplitPtpcLinearMethod(
-                    bf16_max_m=split_bf16_max_m_by_qkv_size[qkv_size],
-                    # Split PTPC won the real-checkpoint sweep through M=16384;
-                    # larger shapes retain the fused BF16 projection.
+                self.fused_qkvbfg_a_proj.quant_method = Glm53KdaPackedPtpcLinearMethod(
+                    bf16_max_m=packed_bf16_max_m_by_qkv_size[qkv_size],
+                    # No-copy packed PTPC won through M=16384; larger shapes
+                    # retain the fused BF16 projection.
                     fp8_max_m=16384,
                     qkv_size=self.split_sizes[0],
                     beta_size=self.split_sizes[1],
@@ -751,7 +751,7 @@ class Glm5NextLinearAttention(nn.Module):
     def _maybe_quantize_ptpc_input(layer, x: torch.Tensor):
         if isinstance(
             getattr(layer, "quant_method", None),
-            Glm53KdaSplitPtpcLinearMethod,
+            Glm53KdaPackedPtpcLinearMethod,
         ):
             return x
         if not Glm5NextLinearAttention._ptpc_linear_active(
@@ -789,14 +789,14 @@ class Glm5NextLinearAttention(nn.Module):
     ):
         method = self.fused_qkvbfg_a_proj.quant_method
         num_tokens = hidden_states.numel() // hidden_states.shape[-1]
-        if isinstance(method, Glm53KdaSplitPtpcLinearMethod) and method.is_active(
+        if isinstance(method, Glm53KdaPackedPtpcLinearMethod) and method.is_active(
             num_tokens
         ):
             qkv, beta, fg_a_states = method.apply_ptpc_prefill(
                 self.fused_qkvbfg_a_proj,
                 hidden_states,
             )
-            fg_a_states = torch.stack(fg_a_states)
+            fg_a_states = fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
         else:
             fused_states = self.fused_qkvbfg_a_proj(hidden_states)
             qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)

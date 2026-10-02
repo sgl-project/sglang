@@ -12,8 +12,8 @@ import torch.nn.functional as F
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp8_utils, unquant
 from sglang.srt.layers.quantization.unquant import (
+    Glm53KdaPackedPtpcLinearMethod,
     Glm53KdaPtpcLinearMethod,
-    Glm53KdaSplitPtpcLinearMethod,
     UnquantizedLinearMethod,
 )
 from sglang.srt.models.glm5_next import (
@@ -291,7 +291,7 @@ class TestGLM53KDAPTPC(CustomTestCase):
             attention._configure_ptpc_modules()
         self.assertIsInstance(
             attention.fused_qkvbfg_a_proj.quant_method,
-            Glm53KdaSplitPtpcLinearMethod,
+            Glm53KdaPackedPtpcLinearMethod,
         )
         self.assertTrue(attention.do_fuse_qkvbfg)
 
@@ -320,7 +320,7 @@ class TestGLM53KDAPTPC(CustomTestCase):
         attention.split_sizes = [12, 2, 8]
         attention.fused_qkvbfg_a_proj = _RecordingFusedLinear(22)
         attention.fused_fg_b_proj = _RecordingBatchedLinear()
-        method = Glm53KdaSplitPtpcLinearMethod(
+        method = Glm53KdaPackedPtpcLinearMethod(
             bf16_max_m=3,
             fp8_max_m=8,
             qkv_size=12,
@@ -335,15 +335,15 @@ class TestGLM53KDAPTPC(CustomTestCase):
         self.assertIs(attention.fused_qkvbfg_a_proj.inputs[-1], decode_input)
 
         prefill_input = torch.empty(4, 8)
-        split_outputs = (
+        packed_outputs = (
             torch.empty(4, 12),
             torch.empty(4, 2),
-            (torch.empty(4, 4), torch.empty(4, 4)),
+            torch.empty(4, 8),
         )
         with patch.object(
             method,
             "apply_ptpc_prefill",
-            return_value=split_outputs,
+            return_value=packed_outputs,
         ) as apply_ptpc:
             attention.forward_qkvbfg_fused(prefill_input, forward_batch=None)
         self.assertEqual(len(attention.fused_qkvbfg_a_proj.inputs), 1)
