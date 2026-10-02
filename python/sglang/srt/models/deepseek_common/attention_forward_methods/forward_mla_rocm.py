@@ -43,6 +43,7 @@ from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -617,8 +618,12 @@ class DeepseekMLARocmForwardMixin:
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
-        fuse_bmm_rope_cache = not q_replicate_active and (
-            _can_fuse_bmm_rope_cat_and_cache(self)
+        # The fused kernel wins at decode-sized batches (decode, target verify,
+        # draft extend); prefill shapes run faster as the two separate launches.
+        fuse_bmm_rope_cache = (
+            not q_replicate_active
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            and _can_fuse_bmm_rope_cat_and_cache(self)
         )
 
         if q_replicate_active:
@@ -896,7 +901,7 @@ class DeepseekMLARocmForwardMixin:
                 q[..., : self.kv_lora_rank] *= llama_4_scaling
             get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mqa,
-                forward_batch.out_cache_loc,
+                KVWriteLoc.for_batch(forward_batch),
                 k_nope,
                 k_pe,
             )
