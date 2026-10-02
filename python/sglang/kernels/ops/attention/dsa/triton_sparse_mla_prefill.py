@@ -1,49 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""Fused Triton sparse-MLA prefill for DeepSeek Sparse Attention (DSA).
+"""Fused Triton sparse-MLA prefill for DeepSeek Sparse Attention (DSA) on CUDA.
 
-Relationship to ``dsa/triton_sparse_mla.py``
---------------------------------------------
-That module implements the same core form -- one Triton program per query token,
-online softmax held in registers, no split/merge -- and reaches it for the same
-reason: after TP the attention tile is tiny, so a small per-token program beats
-a wide cooperative block. It is reachable only on gfx950, only for an FP8 KV
-cache, and only at one pinned shape (16 heads, ``d_v`` 512, tail 64, topk 2048),
-so on NVIDIA the DSA prefill never takes it.
-
-This module is the CUDA-side sibling: bf16 (the FP8 path quantises ``P`` before
-the ``PV`` product; this one does not), no shape pin, a concatenated ``q``
-matching the FlashMLA entry signature, and one exact fast path the gfx950 path
-does not have. On the base path the two are within ~10% of each other on real
-captured indices; the separation comes from ``union`` (see below).
-
-Against the kernels NVIDIA DSA prefill actually dispatches to, it removes two
-structural costs:
-
-* ``flash_mla_sparse_fwd`` accepts exactly 64 or 128 heads -- its Hopper tile is
-  ``B_H = 64`` on ``GMMA::MMA_64x*x16``, i.e. wgmma's 64-row ``M``. After TP the
-  model has far fewer heads (8 at TP8), so the head dim is zero-padded and 7/8
-  (resp. 15/16) of the tensor-core work is wasted. Measured on H20 at T=8192
-  with captured indices: 17.7 ms at 64 heads and 35.2 at 128 (i.e. linear in
-  heads) against 7.1 ms here, of which 4.5 ms is the gather every kernel of this
-  shape must pay.
-* The split-decode form writes ``O(T * splits)`` partials to HBM and merges
-  them in a second kernel.
-
-This kernel runs **one program per query token** with a ``BLOCK_H=16`` head tile
-(pad-into-tile, not pad-into-grid), keeps the online softmax entirely in
-registers, and reuses ``V`` as ``K[:, :d_v]`` (MLA latent) so the value rows are
-never gathered twice. No global partials, no merge pass.
-
-The ``BLOCK_H`` floor of 16 is deliberate: dropping it to the exact head count
-at H=8 produces bitwise-identical output but runs ~7% slower, because the
-narrower MMA does not pay for the register pressure it saves.
+One Triton program per query token: the heads are padded into a 16-row MMA tile
+rather than into the grid, the online softmax stays in registers, and ``V`` is
+read as ``kv[:, :d_v]``, so there are no partials and no merge pass.
+``dsa/triton_sparse_mla.py`` is the gfx950-only FP8 sibling of this bf16 module.
 
 Interface matches ``sgl_kernel.flash_mla.flash_mla_sparse_fwd``::
 
     q       [T, H, 576] bf16    (absorbed MLA: 512 nope + 64 rope)
     kv      [S, 576]    bf16    (V is kv[:, :512])
-    indices [T, topk]   int32   (-1 marks an invalid slot; no bound check)
+    indices [T, topk]   int32   (-1 marks an invalid slot; no upper-bound check)
     out     [T, H, 512] bf16
 
 A row of ``indices`` must not name the same KV position twice. Top-k selection
@@ -51,22 +19,15 @@ cannot, so this holds for every DSA caller; it is stated because ``union``
 gathers the distinct union of G rows and weights each position once, whereas
 the base path would weight a repeat twice.
 
-Optional exact fast path (opt-in, default off; algebraically equivalent to the
-base path, not an approximation):
+``union`` (opt-in, 2 or 4): G adjacent query tokens share one gathered union
+index set, and a per-row ownership bitmask restores each token's own softmax
+support, so the result is the per-token result up to accumulation order. It
+pays off because neighbouring tokens' selections overlap heavily on real indexer
+output; the measurements are in the PR that added this module.
 
-``union``
-    ``G`` adjacent query tokens share one gathered union index set; a per-row
-    ownership bitmask restores the exact per-token softmax. This is where the
-    win lives: on real GLM-5.1 captures the union of 4 neighbouring tokens'
-    selections is only ~1.03x the size of one token's, because the indexer's
-    scores move slowly in ``t``, so one gather serves four tokens. Uniformly
-    random indices do not have that structure and understate the path badly;
-    benchmark it on captured indices, not synthetic ones.
-
-All tunables are explicit arguments -- the module reads no environment
-variables. If a tuned tile exceeds the device shared-memory budget (e.g. a
-large head count on SM120's 100 KB), the launcher steps down through smaller
-tiles instead of raising ``OutOfResources``.
+All tunables are explicit arguments; the module reads no environment variables.
+If a tuned tile exceeds the device shared-memory budget, the launcher steps down
+through smaller tiles instead of raising ``OutOfResources``.
 """
 
 import logging

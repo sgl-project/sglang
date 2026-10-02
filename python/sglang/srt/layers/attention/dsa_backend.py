@@ -3007,15 +3007,12 @@ class DeepseekSparseAttnBackend(
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
             sparse_mla_prefill,
         )
-        from sglang.srt.model_executor.runner_utils.capture_mode import (
-            get_is_capture_mode,
-        )
 
-        # The union path allocates its per-group scratch on every call, which
-        # stream capture forbids. `get_is_capture_mode` misses the FULL prefill
-        # graph runner without LoRA, so also ask the stream itself. The
-        # per-token path gives the same result.
-        capturing = get_is_capture_mode() or (
+        # Only the stream's own capture state gates union: the breakable prefill
+        # graph runs attention eagerly between its segments while
+        # get_is_capture_mode() stays set for the whole replay. Under real capture
+        # the per-token path runs instead (same result); union is untested there.
+        capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
         union = 0 if capturing else self.dsa_triton_union

@@ -6,13 +6,15 @@ check. The kernel is mocked, so these guard the wiring rather than the numerics
 
 - argument marshalling between the DSA backend and the kernel entry point,
 - the union switch being off unless asked for, at both the CLI layer and the
-  backend layer, and forced off under graph capture or deterministic inference,
+  backend layer, forced off while the stream is capturing or under deterministic
+  inference, and left on inside a breakable-graph replay,
 - the validator's accept/reject boundaries,
 - that registering this backend does not change which backend SM120 selects on
   its own.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -172,18 +174,18 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
         captured, _ = self._call_forward(union=4)
         self.assertEqual(captured["union"], 4)
 
-    def test_union_is_disabled_under_cuda_graph_capture(self):
-        # The union path allocates its per-group scratch on every call, which
-        # stream capture forbids. It must degrade to the per-token path (same
-        # result) rather than break capture.
+    def test_union_stays_on_when_only_the_breakable_graph_flag_is_set(self):
+        # Regression: `get_is_capture_mode()` is true for the whole breakable
+        # prefill graph replay, during which attention runs eagerly between the
+        # graph segments. Gating on it switched union off for every replayed
+        # prefill batch, i.e. for every bucket the default prefill graph covers.
         captured, _ = self._call_forward(union=4, capturing=True)
-        self.assertEqual(captured["union"], 0)
+        self.assertEqual(captured["union"], 4)
 
     def test_union_is_disabled_when_the_stream_itself_is_capturing(self):
-        # Regression: `get_is_capture_mode` is only set when the FULL prefill
-        # graph runner captures LoRA, so under `--cuda-graph-backend-prefill
-        # full` without LoRA the union path ran its allocations inside stream
-        # capture. The stream's own capture state must be honoured too.
+        # Under `--cuda-graph-backend-prefill full` the attention runs inside
+        # stream capture; the union path has not been validated there, so the
+        # per-token path (same result) must run instead.
         captured, _ = self._call_forward(
             union=4, capturing=False, stream_capturing=True
         )
@@ -261,12 +263,56 @@ class TestTritonSparseMLARegistration(CustomTestCase):
             "triton_sparse_mla", actions_by_option["--dsa-prefill-backend"].choices
         )
 
-    def test_defaults_do_not_select_this_backend(self):
+    def test_union_defaults_to_off(self):
         from sglang.srt.server_args import ServerArgs
 
-        args = ServerArgs(model_path="dummy")
-        self.assertNotEqual(args.dsa_prefill_backend, "triton_sparse_mla")
-        self.assertEqual(args.dsa_triton_union, 0)
+        self.assertEqual(ServerArgs(model_path="dummy").dsa_triton_union, 0)
+
+    def test_sm120_glm_fp8_still_resolves_to_flashinfer_on_its_own(self):
+        # Registering this backend must not change what SM120 selects by itself:
+        # the GLM FP8-KV arm of the resolver declares flashinfer_sparse_mla for
+        # both phases unless the user set one, and a user-set prefill backend
+        # is kept as given.
+        from sglang.srt.arg_groups import overrides
+
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], learnable_sink=False
+        )
+        platform = SimpleNamespace(is_npu=False, is_xpu=False, is_hip=False)
+
+        def resolve(prefill):
+            view = SimpleNamespace(
+                dsa_prefill_backend=prefill,
+                dsa_decode_backend=None,
+                kv_cache_dtype="fp8_e4m3",
+                enable_hisparse=False,
+            )
+            with (
+                patch.object(
+                    overrides,
+                    "model_config_of",
+                    return_value=SimpleNamespace(hf_config=hf_config),
+                ),
+                patch.object(overrides, "get_platform", return_value=platform),
+                patch(
+                    "sglang.srt.configs.model_config.is_deepseek_dsa",
+                    return_value=True,
+                ),
+                patch("torch.cuda.get_device_capability", return_value=(12, 0)),
+            ):
+                return overrides._dsa_split_backend_resolution(view)
+
+        self.assertEqual(
+            resolve(None),
+            {
+                "dsa_prefill_backend": "flashinfer_sparse_mla",
+                "dsa_decode_backend": "flashinfer_sparse_mla",
+            },
+        )
+        self.assertEqual(
+            resolve("triton_sparse_mla"),
+            {"dsa_decode_backend": "flashinfer_sparse_mla"},
+        )
 
 
 if __name__ == "__main__":

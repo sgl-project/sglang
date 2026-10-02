@@ -1,19 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Benchmark the fused Triton sparse-MLA prefill against the kernels the DSA
-prefill can otherwise dispatch to.
-
-Index fixture note: the selections are built to look like the indexer's, not
-like ``randint``. Two properties matter and uniform sampling has neither:
-
-* Positions within a token are distinct (top-k cannot pick a slot twice).
-* Neighbouring tokens select mostly the same rows, because the indexer's scores
-  move slowly in ``t``. On captured GLM-5.1 traces the union of 2 adjacent
-  tokens' selections is only ~1.05x the size of one token's, and of 4 tokens
-  ~1.15x.
-
-The second property is the whole point of the ``union`` path, so benchmarking it
-on uniform-random indices understates it by roughly 2x and would make the path
-look useless.
+prefill can otherwise dispatch to. Indices are a calibrated random walk (see
+``_make_inputs``): uniform-random indices lack the token-to-token overlap the
+``union`` path depends on and understate it by about 2x.
 """
 
 from __future__ import annotations
@@ -108,9 +97,8 @@ def _make_inputs(num_tokens: int, num_heads: int, topk: int):
     # Random walk, not i.i.d. draws from a shared pool: the indexer's ranking
     # drifts slowly with t, so token t+1's selection is token t's with a few
     # rows swapped. CHURN is set so the walk reproduces the union sizes measured
-    # on captured GLM-5.1 traces (union of 2 adjacent tokens ~1.05x one token's
-    # set, union of 4 ~1.15x). Drawing each token independently instead gives a
-    # far weaker overlap and understates the union path by roughly 2x.
+    # on captured GLM-5.1 traces: 1.00-1.12x one token's set for 2 adjacent
+    # tokens and 1.01-1.23x for 4, shape dependent.
     perm = torch.randperm(s_kv, device="cuda", generator=generator)
     current, spare = perm[:topk].clone(), perm[topk:].clone()
     n_swap = max(1, int(topk * CHURN))

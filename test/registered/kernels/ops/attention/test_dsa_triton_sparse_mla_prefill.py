@@ -1,22 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical correctness for the fused Triton sparse-MLA prefill kernel.
-
-Gates the base path and the opt-in union fast path against an fp32 reference
-over the sparse-MLA contract. Each case guards a distinct failure mode:
-
-- ``-1`` index padding and ragged rows (the indexer emits fewer than ``topk``
-  selections for short prefixes).
-- The union path's ownership mask: one gathered row set is shared by G query
-  tokens, so a row selected by token A but not token B must be masked out of
-  B's softmax. A mask bug here is invisible unless the shared set is genuinely
-  larger than either token's own set, so the fixture builds overlapping-but-
-  unequal sets rather than uniform-random ones.
-- Head counts whose tuned tile exceeds the device shared-memory budget. Guards
-  the h=32-on-SM120 launch failure (100 KB/CTA): the launcher must step the tile
-  down, not propagate OutOfResources to the request.
-- The union dedup contract on its own: unique ascending rows per group with the
-  exact ownership bits. A duplicated row is weighted twice by the kernel, an
-  error small enough to hide under the cosine gate of the end-to-end check.
+"""Numerical correctness of the fused Triton sparse-MLA prefill kernel against an
+fp32 reference: base path, ragged ``-1`` padding, the union path's ownership mask
+and dedup contract, int64 addressing, determinism, and the shared-memory step-down.
 """
 
 import unittest
@@ -24,6 +9,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+    _FIT_TILE,
     _union_dedup,
     sparse_mla_prefill,
 )
@@ -69,14 +55,9 @@ def _random_indices(T, topk, S, g, pad_frac=0.0):
 
 
 def _overlapping_indices(T, topk, S, g):
-    """Selections that mostly agree between neighbouring tokens, as the real
-    indexer produces. Uniform-random sets are nearly disjoint, which makes the
-    union tile degenerate to the per-token one and hides ownership-mask bugs.
-
-    Rows stay unique within a token: top-k selection cannot pick a position
-    twice, and the union path relies on that (it gathers the distinct union and
-    masks per owner, so a repeated row would be weighted once instead of twice).
-    """
+    """Selections that mostly agree between neighbouring tokens, as the indexer's
+    do; uniform-random sets are nearly disjoint and would hide ownership-mask bugs.
+    Rows stay unique within a token, which the union path relies on."""
     perm = torch.randperm(S, device="cuda", generator=g)
     pool, spare = perm[:topk], perm[topk:]
     n_keep = topk * 3 // 4
@@ -141,28 +122,38 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
             )
 
     def test_large_head_count_steps_down_instead_of_oom(self):
+        # An oversized tile makes the first candidate fail on every GPU (on the
+        # CI H100's 228 KB the tuned tile simply fits and nothing would step
+        # down), and the cache is cleared so an earlier test's fit cannot be
+        # moved to the front. The recorded fit must not be the requested tile.
+        _FIT_TILE.clear()
         T, topk, S = 256, 512, 520
         q, kv, g = _qkv(T, S, 32, seed=9)
         idx = _random_indices(T, topk, S, g)
         self._assert_matches(
-            sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V),
+            sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, config=(256, 8, 4)),
             _reference(q, kv, idx),
             "h=32 smem fallback",
         )
+        self.assertNotEqual(_FIT_TILE[("base", 32, 0, q.device.index)], (256, 4))
 
     def test_union_large_head_count_steps_down(self):
-        # The union Q tile is num_heads * G rows, so its shared-memory demand
-        # grows faster than the per-token path's: 16 heads at G=2 overflows
-        # SM120's 100 KB with the tuned tile. Guards the launch failure that
-        # a TP4 deployment enabling union would otherwise hit.
+        # Same for the union launcher, whose Q tile is num_heads * G rows and
+        # runs out of shared memory sooner (16 heads at G=2 overflows SM120's
+        # 100 KB with the tuned tile). The oversized tile forces the step-down
+        # on every GPU; the union tile that fit must not be the requested one.
+        _FIT_TILE.clear()
         T, topk, S = 512, 512, 1024
         q, kv, g = _qkv(T, S, 16, seed=21)
         idx = _overlapping_indices(T, topk, S, g)
         self._assert_matches(
-            sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, union=2),
+            sparse_mla_prefill(
+                q, kv, idx, SM_SCALE, D_V, union=2, union_config=(256, 4, 4)
+            ),
             _reference(q, kv, idx),
             "union G=2 h=16 smem fallback",
         )
+        self.assertNotEqual(_FIT_TILE[("union", 16, 2, q.device.index)], (256, 4))
 
     def test_union_dedup_contract(self):
         # Each group's rows must come out exactly once, with ownership bits equal
@@ -229,15 +220,9 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSATritonPrefillBackendAdapter(CustomTestCase):
-    """The backend method itself, driving the real kernel.
-
-    The CPU unit test covers this method with the kernel mocked, which pins the
-    argument marshalling but cannot catch a wrong result or a wrong output
-    contract. This runs it for real and checks both: the values against an fp32
-    reference, and the shape against what the sibling `_forward_flashmla_sparse`
-    returns to the same caller, `[num_tokens, num_heads, v_head_dim]`. Returning
-    a different rank here would corrupt every downstream projection.
-    """
+    """The backend method driving the real kernel: values against the fp32
+    reference and the `[num_tokens, num_heads, v_head_dim]` output contract
+    that `_forward_flashmla_sparse` returns to the same caller."""
 
     def _backend(self, *, union=0):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
