@@ -53,6 +53,12 @@ struct ActivationParams {
   // for per-token routing and BLOCK_SIZE_M for sorted/TMA routing.
   const int32_t* __restrict__ expert_ids;
   uint32_t expert_step;
+  // Optional sorted-layout filtering (MoE TMA down path): a row is skipped if it
+  // is at or past *num_tokens_post_padded or its sorted_token_ids entry is the
+  // padding sentinel (>= num_valid_tokens). Must match token_mask in fused_moe_kernel.
+  const int32_t* __restrict__ sorted_token_ids;
+  const int32_t* __restrict__ num_tokens_post_padded;
+  uint32_t num_valid_tokens;
 };
 
 template <
@@ -61,7 +67,8 @@ template <
     bool kUsePDL,
     bool kFilterExpert,
     bool kRoundActivation = false,
-    bool kReuseInput = false>
+    bool kReuseInput = false,
+    bool kFilterSorted = false>
 __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
   using namespace device;
   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
@@ -71,7 +78,16 @@ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams para
   const auto token_id = tid / num_vecs;
 
   if (token_id >= params.num_tokens) return;
-  if constexpr (kFilterExpert) {
+  // Like expert_ids, these are moe_align_block_size outputs the up GEMM already
+  // waited on (gdc_wait) before triggering this launch, so they may be read before
+  // PDLWaitPrimary. The host checks that both arrays cover every row, so the three
+  // loads are issued together instead of one after another.
+  if constexpr (kFilterSorted) {
+    const auto num_post = static_cast<uint32_t>(*params.num_tokens_post_padded);
+    const auto sorted_id = static_cast<uint32_t>(params.sorted_token_ids[token_id]);
+    const auto expert_id = params.expert_ids[token_id / params.expert_step];
+    if (token_id >= num_post || sorted_id >= params.num_valid_tokens || expert_id == -1) return;
+  } else if constexpr (kFilterExpert) {
     if (params.expert_ids[token_id / params.expert_step] == -1) return;
   }
   const auto offset = tid % num_vecs;
@@ -132,21 +148,26 @@ struct ActivationKernel {
   using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
   using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL>);
 
-  template <ActivationKind kAct, bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false>
+  template <
+      ActivationKind kAct,
+      bool kFilterExpert,
+      bool kRoundActivation = false,
+      bool kReuseInput = false,
+      bool kFilterSorted = false>
   static constexpr kernel_fn_t activation_kernel =
-      act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kRoundActivation, kReuseInput>;
+      act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kRoundActivation, kReuseInput, kFilterSorted>;
 
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
 
-  template <bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false>
+  template <bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false, bool kFilterSorted = false>
   static kernel_fn_t select_kernel(const std::string& type) {
     using namespace host;
     if (type == "silu") {
-      return activation_kernel<ActivationKind::kSiLU, kFilterExpert, kRoundActivation, kReuseInput>;
+      return activation_kernel<ActivationKind::kSiLU, kFilterExpert, kRoundActivation, kReuseInput, kFilterSorted>;
     } else if (type == "gelu") {
-      return activation_kernel<ActivationKind::kGELU, kFilterExpert, kRoundActivation, kReuseInput>;
+      return activation_kernel<ActivationKind::kGELU, kFilterExpert, kRoundActivation, kReuseInput, kFilterSorted>;
     } else if (type == "gelu_tanh") {
-      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert, kRoundActivation, kReuseInput>;
+      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert, kRoundActivation, kReuseInput, kFilterSorted>;
     } else {
       Panic("unsupported activation type: ", type);
     }
@@ -159,7 +180,10 @@ struct ActivationKernel {
       const tvm::ffi::TensorView& out,
       const std::string& type,
       const int32_t* expert_ids,
-      uint32_t expert_step) {
+      uint32_t expert_step,
+      const int32_t* sorted_token_ids = nullptr,
+      const int32_t* num_tokens_post_padded = nullptr,
+      uint32_t num_valid_tokens = 0) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -198,8 +222,20 @@ struct ActivationKernel {
         .num_tokens = num_tokens,
         .expert_ids = expert_ids,
         .expert_step = expert_step,
+        .sorted_token_ids = sorted_token_ids,
+        .num_tokens_post_padded = num_tokens_post_padded,
+        .num_valid_tokens = num_valid_tokens,
     };
-    if (expert_ids != nullptr) {
+    if (sorted_token_ids != nullptr) {
+      // Only the plain (non-rounding, out-of-place) path takes the sorted
+      // layout; the sorted layout always comes with block-level expert_ids.
+      if constexpr (kRoundActivation || kReuseInput) {
+        Panic("sorted filtering is not supported for this activation variant");
+      } else {
+        const auto kernel = select_kernel<true, false, false, true>(type);
+        LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+      }
+    } else if (expert_ids != nullptr) {
       RuntimeCheck(expert_step > 0, "expert_step must be positive");
       const auto kernel = select_kernel<true, kRoundActivation, kReuseInput>(type);
       LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
@@ -233,6 +269,40 @@ struct ActivationKernel {
     RuntimeCheck(is_type<int32_t>(expert_ids.dtype()), "expert_ids must have dtype int32");
     RuntimeCheck(expert_step >= 1, "expert_step must be positive");
     launch(input, out, type, static_cast<const int32_t*>(expert_ids.data_ptr()), static_cast<uint32_t>(expert_step));
+  }
+
+  /// \brief Gated activation over the sorted, block-padded MoE layout.
+  /// \param expert_ids Per-block expert ids (-1 = non-local expert), one per expert_step rows.
+  /// \param sorted_token_ids moe_align_block_size output; entries >= num_valid_tokens are padding.
+  /// \param num_tokens_post_padded Device scalar; rows at or past it are padding.
+  /// Rows the MoE GEMM never reads are skipped and left unwritten in out.
+  static void run_activation_sorted_filtered(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView expert_ids,
+      int64_t expert_step,
+      const tvm::ffi::TensorView sorted_token_ids,
+      const tvm::ffi::TensorView num_tokens_post_padded,
+      int64_t num_valid_tokens,
+      std::string type) {
+    using namespace host;
+    CHECK_HOST(is_type<int32_t>(expert_ids.dtype())) << "expert_ids must have dtype int32";
+    CHECK_HOST(is_type<int32_t>(sorted_token_ids.dtype())) << "sorted_token_ids must have dtype int32";
+    CHECK_HOST(is_type<int32_t>(num_tokens_post_padded.dtype())) << "num_tokens_post_padded must have dtype int32";
+    CHECK_HOST(expert_step >= 1) << "expert_step must be positive, got " << expert_step;
+    CHECK_HOST(sorted_token_ids.numel() >= input.size(0)) << "sorted_token_ids must cover every row";
+    CHECK_HOST(expert_ids.numel() * expert_step >= input.size(0)) << "expert_ids must cover every row";
+    CHECK_HOST(0 <= num_valid_tokens && num_valid_tokens <= std::numeric_limits<int32_t>::max())
+        << "num_valid_tokens out of range: " << num_valid_tokens;
+    launch(
+        input,
+        out,
+        type,
+        static_cast<const int32_t*>(expert_ids.data_ptr()),
+        static_cast<uint32_t>(expert_step),
+        static_cast<const int32_t*>(sorted_token_ids.data_ptr()),
+        static_cast<const int32_t*>(num_tokens_post_padded.data_ptr()),
+        static_cast<uint32_t>(num_valid_tokens));
   }
 
   template <ActivationKind kAct>

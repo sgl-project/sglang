@@ -43,6 +43,10 @@ def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
                 f"ActivationKernel<{args}>::run_activation_filtered",
             ),
             (
+                "run_activation_sorted_filtered",
+                f"ActivationKernel<{args}>::run_activation_sorted_filtered",
+            ),
+            (
                 "run_unary_activation",
                 f"ActivationKernel<{args}>::run_unary_activation",
             ),
@@ -102,12 +106,41 @@ def _run_activation_filtered_inplace(
     module.run_activation_filtered(input_2d, out_2d, expert_ids, expert_step, op_name)
 
 
+@register_custom_op(mutates_args=["out"])
+def _run_activation_sorted_filtered_inplace(
+    op_name: str,
+    input: torch.Tensor,
+    out: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_step: int,
+    sorted_token_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    num_valid_tokens: int,
+) -> None:
+    hidden_size = input.shape[-1] // 2
+    module = activation_module(input.dtype)
+    module.run_activation_sorted_filtered(
+        input.view(-1, hidden_size * 2),
+        out.view(-1, hidden_size),
+        expert_ids,
+        expert_step,
+        sorted_token_ids,
+        num_tokens_post_padded,
+        num_valid_tokens,
+        op_name,
+    )
+
+
 def run_activation(
     op_name: str,
     input: torch.Tensor,
     out: Optional[torch.Tensor],
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    *,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
 ) -> torch.Tensor:
     """Apply ``op_name`` activation followed by element-wise multiplication.
 
@@ -115,6 +148,12 @@ def run_activation(
     routed expert id is ``-1``. ``expert_step`` is 1 for per-token routing and
     ``BLOCK_SIZE_M`` for sorted/TMA routing — i.e. ``expert_ids[token_id //
     expert_step]`` is consulted before computing each row.
+
+    For the sorted, block-padded layout (``moe_align_block_size`` output with
+    ``expert_step = BLOCK_SIZE_M``), also pass ``sorted_token_ids``,
+    ``num_tokens_post_padded`` and ``num_valid_tokens`` (``topk_ids.numel()``)
+    to skip the padding rows the down GEMM never reads; skipped rows of ``out``
+    are left unwritten.
     """
     assert op_name in SUPPORTED_ACTIVATIONS, f"Unsupported activation: {op_name}"
     hidden_size = input.shape[-1] // 2
@@ -128,7 +167,21 @@ def run_activation(
         # true dtype, so normalize here instead of asserting downstream.
         if expert_ids.dtype != torch.int32:
             expert_ids = expert_ids.to(torch.int32)
-        _run_activation_filtered_inplace(op_name, input, out, expert_ids, expert_step)
+        if sorted_token_ids is None:
+            _run_activation_filtered_inplace(
+                op_name, input, out, expert_ids, expert_step
+            )
+        else:
+            _run_activation_sorted_filtered_inplace(
+                op_name,
+                input,
+                out,
+                expert_ids,
+                expert_step,
+                sorted_token_ids,
+                num_tokens_post_padded,
+                num_valid_tokens,
+            )
     return out
 
 
@@ -177,8 +230,21 @@ def silu_and_mul(
     out: Optional[torch.Tensor] = None,
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    *,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
 ) -> torch.Tensor:
-    return run_activation("silu", input, out, expert_ids, expert_step)
+    return run_activation(
+        "silu",
+        input,
+        out,
+        expert_ids,
+        expert_step,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        num_valid_tokens=num_valid_tokens,
+    )
 
 
 def silu_and_mul_with_activation_rounding(
@@ -214,8 +280,21 @@ def gelu_and_mul(
     out: Optional[torch.Tensor] = None,
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    *,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
 ) -> torch.Tensor:
-    return run_activation("gelu", input, out, expert_ids, expert_step)
+    return run_activation(
+        "gelu",
+        input,
+        out,
+        expert_ids,
+        expert_step,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        num_valid_tokens=num_valid_tokens,
+    )
 
 
 def gelu_tanh_and_mul(
@@ -223,5 +302,18 @@ def gelu_tanh_and_mul(
     out: Optional[torch.Tensor] = None,
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    *,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
 ) -> torch.Tensor:
-    return run_activation("gelu_tanh", input, out, expert_ids, expert_step)
+    return run_activation(
+        "gelu_tanh",
+        input,
+        out,
+        expert_ids,
+        expert_step,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        num_valid_tokens=num_valid_tokens,
+    )
