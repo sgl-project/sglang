@@ -90,6 +90,46 @@ class WeightUpdater:
     get_model_runner: Callable[[], ModelRunner]
     _model_update_group: dict = field(default_factory=dict)
 
+    def update_weights_from_modelexpress(self, weight_version: str) -> tuple[bool, str]:
+        """Stage and install one version while generation is paused."""
+        self._assert_weight_cache_inactive("update_weights_from_modelexpress")
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            raise RuntimeError(error)
+
+        try:
+            from modelexpress_rl import WeightVersionRef
+            from modelexpress_rl.inference.engines.sglang import (
+                get_modelexpress_generator,
+            )
+
+            generator = get_modelexpress_generator(self.get_model_runner())
+            staged = generator.stage_weight(version=WeightVersionRef(weight_version))
+            try:
+                install_metrics = generator.apply_weight(staged)
+                logger.info(
+                    "ModelExpress refit metrics version=%s: %s",
+                    weight_version,
+                    {**staged.metrics, **(install_metrics or {})},
+                )
+            finally:
+                staged.release()
+            success, message = True, ""
+        except Exception as exc:
+            success, message = False, str(exc)
+
+        # Combine TP results before reporting success to the scheduler.
+        results = [(success, message)]
+        if torch.distributed.is_initialized():
+            group = self.get_model_runner().tp_group.cpu_group
+            results = [None] * torch.distributed.get_world_size(group=group)
+            torch.distributed.all_gather_object(
+                results, (success, message), group=group
+            )
+        return all(ok for ok, _ in results), " | ".join(
+            msg for _, msg in results if msg
+        )
+
     def init_weights_update_group(
         self,
         master_address,
