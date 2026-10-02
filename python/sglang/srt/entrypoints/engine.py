@@ -1527,6 +1527,8 @@ class Engine(EngineScoreMixin, EngineBase):
         world_size: int,
         group_name: str,
         backend: str = "nccl",
+        receiver: Optional[str] = None,
+        receiver_init_payload: Optional[dict] = None,
     ):
         """Initialize parameter update group."""
         obj = InitWeightsUpdateGroupReqInput(
@@ -1536,6 +1538,8 @@ class Engine(EngineScoreMixin, EngineBase):
             world_size=world_size,
             group_name=group_name,
             backend=backend,
+            receiver=receiver,
+            receiver_init_payload=receiver_init_payload,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.init_weights_update_group(obj, None)
@@ -1594,6 +1598,7 @@ class Engine(EngineScoreMixin, EngineBase):
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
         load_format: Optional[str] = None,
+        receiver_payload: Optional[dict] = None,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -1603,6 +1608,7 @@ class Engine(EngineScoreMixin, EngineBase):
             group_name=group_name,
             flush_cache=flush_cache,
             load_format=load_format,
+            receiver_payload=receiver_payload,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
@@ -1788,7 +1794,6 @@ class Engine(EngineScoreMixin, EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
-
     cfg = resolving_view(server_args)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
