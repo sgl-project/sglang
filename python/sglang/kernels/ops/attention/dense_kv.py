@@ -2,7 +2,6 @@
 # Licensed under the Apache License, Version 2.0.
 """Pack a CSR prefix and current K/V into capture-stable dense storage."""
 
-import torch
 import triton
 import triton.language as tl
 
@@ -92,22 +91,3 @@ def pack_prefix_current(k, v, kb, vb, qo, ki, ids, kd, vd, cu, max_length):
         vb.stride(1),
         TILE=1024,
     )
-
-
-class DenseKVWorkspace:
-    def __init__(self, capacity, heads, dim, batch_size, device, dtype):
-        # TMA loads can include the masked tail beyond the packed sequences.
-        self.key = torch.zeros((capacity, heads, dim), device=device, dtype=dtype)
-        self.value = torch.zeros_like(self.key)
-        self.cu_seqlens = torch.empty(batch_size + 1, device=device, dtype=torch.int32)
-        self.indices = torch.arange(capacity, device=device, dtype=torch.int64)
-        self.window_start = torch.zeros(batch_size, device=device, dtype=torch.int32)
-
-    def view(self, capacity, batch_size):
-        return (
-            self.key[:capacity],
-            self.value[:capacity],
-            self.cu_seqlens[: batch_size + 1],
-            self.indices[:capacity],
-            self.window_start[:batch_size],
-        )

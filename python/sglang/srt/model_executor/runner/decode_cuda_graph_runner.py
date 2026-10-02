@@ -1130,7 +1130,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variants = self.attention_graph_variants
         for bs in capture_range:
             attention_variants = (
-                variants.get_capture_labels(bs) if variants is not None else (None,)
+                variants.capture_labels if variants is not None else (None,)
             )
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(

@@ -3234,7 +3234,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=1,
                 # `use_mla_backend` reads the model configuration; a non-MLA
                 # one keeps these assertions about the page constraints.
-                _model_config=SimpleNamespace(attention_arch=None),
+                _model_config=SimpleNamespace(
+                    attention_arch=None,
+                    hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+                ),
             )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
@@ -3287,6 +3290,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     )
                 ),
                 {"page_size": 128},
+            )
+            self.assertEqual(
+                _fa4_page_constraint(
+                    _view(
+                        attention_backend="fa4",
+                        speculative_eagle_topk=None,
+                        _model_config=SimpleNamespace(
+                            attention_arch=None,
+                            hf_config=SimpleNamespace(
+                                architectures=["DiffusionGemmaForBlockDiffusion"]
+                            ),
+                        ),
+                    )
+                ),
+                {"page_size": 1},
             )
             self.assertEqual(
                 _fa4_page_constraint(

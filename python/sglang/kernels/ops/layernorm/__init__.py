@@ -580,3 +580,18 @@ register_kernel(
         target="sglang.kernels.ops.layernorm.rms_normalize_hip:rms_normalize_triton",
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="layernorm.rmsnorm_fanout",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.layernorm.rmsnorm_fanout:rmsnorm_fanout",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=_NORM_DTYPES,
+            description="Three weighted RMSNorm outputs sharing a contiguous [M,2816] input.",
+        ),
+    )
+)

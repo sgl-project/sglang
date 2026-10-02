@@ -34,6 +34,28 @@ def _denoiser_statistics(logits: torch.Tensor, temperatures: torch.Tensor):
 _compiled_denoiser_statistics = torch.compile(_denoiser_statistics, dynamic=True)
 
 
+def _use_split_denoiser_statistics(logits, temperatures):
+    return (
+        logits.dtype == temperatures.dtype == torch.float32
+        and logits.is_contiguous()
+        and temperatures.is_contiguous()
+        and logits.shape[-1] >= 65536
+        and logits.shape[0] * logits.shape[1] >= 32
+        and torch.cuda.get_device_capability(logits.device)[0] == 10
+    )
+
+
+def _denoiser_statistics_cuda(logits, temperatures, soft_probabilities=None):
+    if _use_split_denoiser_statistics(logits, temperatures):
+        from sglang.kernels.ops.sampling.denoiser_statistics import denoiser_statistics
+
+        return denoiser_statistics(logits, temperatures, soft_probabilities)
+    result = _compiled_denoiser_statistics(logits, temperatures)
+    if soft_probabilities is not None:
+        soft_probabilities.copy_(result[0])
+    return result
+
+
 def _sample_denoiser(probabilities: torch.Tensor, generator: torch.Generator):
     # The exponential-race formulation samples the same categorical distribution
     # as multinomial. Probabilities come from softmax, so multinomial's repeated
@@ -363,10 +385,22 @@ class Gemma4Renoise(DllmAlgorithm):
             return [True] * len(states)
 
         temperatures = self._temperatures(logits, states)
-        statistics = (
-            _compiled_denoiser_statistics if logits.is_cuda else _denoiser_statistics
-        )
-        probabilities, token_entropies, argmax_tokens = statistics(logits, temperatures)
+        soft_probabilities = None
+        if (
+            logits.is_cuda
+            and _use_split_denoiser_statistics(logits, temperatures)
+            and self.embed_tokens.weight.dtype == torch.bfloat16
+            and getattr(self.embed_tokens, "tp_size", 1) == 1
+        ):
+            soft_probabilities = torch.empty_like(logits, dtype=torch.bfloat16)
+        if logits.is_cuda:
+            probabilities, token_entropies, argmax_tokens = _denoiser_statistics_cuda(
+                logits, temperatures, soft_probabilities
+            )
+        else:
+            probabilities, token_entropies, argmax_tokens = _denoiser_statistics(
+                logits, temperatures
+            )
         sorted_entropy, indices = torch.sort(token_entropies, dim=-1)
         cumulative_entropy = torch.cumsum(sorted_entropy, dim=-1)
         sorted_selected = cumulative_entropy - sorted_entropy <= self.entropy_bound
@@ -415,7 +449,11 @@ class Gemma4Renoise(DllmAlgorithm):
         soft_embeds = None
         if not all(done):
             soft_embeds = self._soft_embeddings(
-                probabilities.reshape(-1, self.vocab_size)
+                (
+                    soft_probabilities
+                    if soft_probabilities is not None
+                    else probabilities
+                ).reshape(-1, self.vocab_size)
             ).view(len(states), self.block_size, -1)
         for index in active:
             state = states[index]

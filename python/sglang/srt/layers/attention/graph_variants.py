@@ -17,9 +17,8 @@ DLLM_FULL_WINDOW = "dllm_full_window"
 
 
 class AttentionGraphVariants(Protocol):
-    def get_capture_labels(self, batch_size: int) -> tuple[str, ...]:
-        """Ordered variants to capture in the batch's shared graph memory pool."""
-        ...
+    # Ordered variants captured in each batch's shared graph memory pool.
+    capture_labels: tuple[str, ...]
 
     def select(
         self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
@@ -33,9 +32,6 @@ class DllmWindowGraphVariants:
     window_size: int
     block_size: int
     capture_labels: ClassVar[tuple[str, ...]] = (DLLM_VARLEN, DLLM_FULL_WINDOW)
-
-    def get_capture_labels(self, batch_size: int) -> tuple[str, ...]:
-        return self.capture_labels
 
     def select(
         self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
@@ -61,9 +57,6 @@ class DsaGraphVariants:
     index_topk: int
     # Dense comes first: the sparse capture peak subsumes its shared-pool storage.
     capture_labels: ClassVar[tuple[str, ...]] = (DSA_DENSE, DSA_SPARSE)
-
-    def get_capture_labels(self, batch_size: int) -> tuple[str, ...]:
-        return self.capture_labels
 
     def select(
         self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
@@ -118,9 +111,6 @@ class Dsv41CandidateGraphVariants:
     graph_limits: tuple[tuple[str, int], ...]
     capture_labels: tuple[str, ...]
     verify_extra_tokens: int = 0
-
-    def get_capture_labels(self, batch_size: int) -> tuple[str, ...]:
-        return self.capture_labels
 
     def select(
         self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None

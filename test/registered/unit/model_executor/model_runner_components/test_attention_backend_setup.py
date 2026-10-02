@@ -1,10 +1,16 @@
 import sys
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashattention_dense_backend import (
+    FlashAttentionDenseBackend,
+)
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner_components import (
     attention_backend_setup,
 )
@@ -14,6 +20,53 @@ from sglang.srt.model_executor.model_runner_components.attention_backend_setup i
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize("wrapper_type", [HybridAttnBackend, TboAttnBackend])
+def test_prefill_wrappers_forward_graph_capabilities(wrapper_type):
+    wrapper = wrapper_type.__new__(wrapper_type)
+    child = Mock(spec=AttentionBackend)
+    child.full_cuda_graph_uses_chunked_prefix = False
+    child.get_prefill_cuda_graph_max_query_len.return_value = 256
+    if wrapper_type is HybridAttnBackend:
+        wrapper.prefill_backend = child
+        wrapper.decode_backend = Mock(spec=AttentionBackend)
+    else:
+        wrapper.primary = child
+    assert wrapper.full_cuda_graph_uses_chunked_prefix is False
+    assert wrapper.get_prefill_cuda_graph_max_query_len(1024, 8) == 256
+    assert (
+        wrapper.get_cuda_graph_variants(None, ForwardMode.DLLM_EXTEND, 256)
+        is child.get_cuda_graph_variants.return_value
+    )
+
+
+def test_dense_adapter_keeps_quantized_cache_on_native_path():
+    import torch
+
+    backend = FlashAttentionDenseBackend.__new__(FlashAttentionDenseBackend)
+    backend.extend_attention_fwd = Mock(return_value="native")
+    q = torch.empty(2, 16, 256, dtype=torch.bfloat16)
+    k = torch.empty(2, 2, 256, dtype=q.dtype)
+    result = backend._forward_extend_kernel(
+        SimpleNamespace(sliding_window_size=None),
+        q,
+        k,
+        k,
+        torch.empty_like(q),
+        k.to(torch.float8_e4m3fn),
+        k,
+        None,
+        None,
+        None,
+        None,
+        False,
+        None,
+        2,
+        1.0,
+        1.0,
+    )
+    assert result == "native"
 
 
 class _FakeBackend:

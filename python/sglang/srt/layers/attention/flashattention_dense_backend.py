@@ -4,7 +4,7 @@
 
 import torch
 
-from sglang.kernels.ops.attention.dense_kv import DenseKVWorkspace, pack_prefix_current
+from sglang.kernels.ops.attention.dense_kv import pack_prefix_current
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd_unified
 from sglang.kernels.ops.attention.flash_attention_v4 import flash_attn_gqa_512
 from sglang.kernels.ops.attention.flash_attn.cute.interface import (
@@ -30,6 +30,25 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (
 )
 from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.utils import get_device_capability
+
+
+class _DenseKVWorkspace:
+    def __init__(self, capacity, heads, dim, batch_size, device, dtype):
+        # TMA loads can include the masked tail beyond the packed sequences.
+        self.key = torch.zeros((capacity, heads, dim), device=device, dtype=dtype)
+        self.value = torch.zeros_like(self.key)
+        self.cu_seqlens = torch.empty(batch_size + 1, device=device, dtype=torch.int32)
+        self.indices = torch.arange(capacity, device=device, dtype=torch.int64)
+        self.window_start = torch.zeros(batch_size, device=device, dtype=torch.int32)
+
+    def view(self, capacity, batch_size):
+        return (
+            self.key[:capacity],
+            self.value[:capacity],
+            self.cu_seqlens[: batch_size + 1],
+            self.indices[:capacity],
+            self.window_start[:batch_size],
+        )
 
 
 class FlashAttentionDenseBackend(TritonAttnBackend):
@@ -261,7 +280,7 @@ class FlashAttentionDenseBackend(TritonAttnBackend):
         capacity = bs * prefix_capacity + q.shape[0]
         key = (prefix_capacity, heads, dim, q.dtype)
         if key not in self._dense_workspaces:
-            self._dense_workspaces[key] = DenseKVWorkspace(
+            self._dense_workspaces[key] = _DenseKVWorkspace(
                 self._dense_graph_slots * prefix_capacity + self._dense_graph_tokens,
                 heads,
                 dim,
@@ -271,7 +290,7 @@ class FlashAttentionDenseBackend(TritonAttnBackend):
             )
         workspace = self._dense_workspaces[key]
         if capacity > workspace.key.shape[0] or bs > self._dense_graph_slots:
-            workspace = DenseKVWorkspace(capacity, heads, dim, bs, q.device, q.dtype)
+            workspace = _DenseKVWorkspace(capacity, heads, dim, bs, q.device, q.dtype)
         dense_k, dense_v, cu_seqlens, dense_ids, window_start = workspace.view(
             capacity, bs
         )
