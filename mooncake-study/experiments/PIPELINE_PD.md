@@ -120,6 +120,8 @@ remain unsupported.
 These fixtures do not establish trained-draft quality, production Catalog
 retention, real combined TP2/PP2, cross-node pipeline RDMA, asynchronous PP
 microbatch throughput, distributed prefill graphs or performance SLOs. Runtime
-retraction under P/D memory pressure needs its own evidence beyond queue-budget
-checks. Failed internal model collectives or crashed processes still require
+retraction under P/D memory pressure is now exercised separately with exact
+all-layer CPU restore and failed-capture checks in
+[the pressure suite](PD_MEMORY_PRESSURE.md).
+Failed internal model collectives or crashed processes still require
 process-group failure handling and restart.

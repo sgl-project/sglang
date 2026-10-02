@@ -876,6 +876,17 @@ buffer。P 端最后一级的 TP0 在 sampled-token D2H 完成后广播首条 te
 target KV 投影 draft context，不执行 target prefill。完整实现与边界见
 [PP P/D runbook](experiments/PIPELINE_PD.md)。
 
+P/D 的自然容量压力验收使用 512-token KV pool，同时生成四条 208-token 路径。
+PP1 覆盖同步/overlap 与 eager/graph 四种组合，PP2 覆盖同步 eager/graph。
+撤回前独立保存目标模型全部 28 层的本地 K/V，CPU 备份恢复到新槽位后逐元素比较；
+各阶段还必须清空旧 draft context 并重新投影。被撤回请求的原始 capture ID
+必须在 Catalog 进入 FAILED，恢复生成不能重新采集这份不完整样本。
+正常存活请求与随后新增请求仍可发布，P/D 进程树退出后再次校验全部样本。
+测试关闭 debug retract，并等待单 rank 后台采样租约准备完毕后才发送初始批次。
+cohort 允许本地撤回与先收到 peer 失败两种时序，但必须对应同一个失败租约。
+详细检查、测试观测的开销和未覆盖范围见
+[P/D memory-pressure runbook](experiments/PD_MEMORY_PRESSURE.md)。
+
 1. D 在发布 KV 接收地址前，通过原有 Host 配额与 Catalog reservation 申请采集。
    `begin_pd_transfer(req)` 生成有界 MessagePack `CaptureTransferContext`，作为
    `MooncakeKVReceiver.send_metadata(..., training_capture_context=...)` 的可选尾帧。

@@ -1,0 +1,1809 @@
+{
+  "purpose": "Verify natural target-KV DSpark P/D request retraction, exact all-layer CPU restore, failed-capture retirement and post-exit Mooncake readback",
+  "source_baseline": "c8a9e67e18a5c8c6cbe45e80a5cf208aa88f7305",
+  "production_changes": false,
+  "environment_lock": "h100-runtime-lock.json",
+  "source_sha256": {
+    "python/sglang/test/pd_capture_runtime.py": "2718ffc84e916d82fb7c901c97f64eda2d0b6e8be2ef6e276eaa9f0b37f00e45",
+    "python/sglang/test/pd_capture_server.py": "f9501c49a5b89592e36f42afc438090fa0105f1b1c25668e4fa591953f819e2e",
+    "python/sglang/test/pd_capture_pressure.py": "2197c67dfdeefa987427abc14932e6a861385633691a9b7d5a6cb2bb9890ba06",
+    "test/registered/storage/test_training_capture_pd_dspark_pressure.py": "67fac24f5af2ad93ccc15b3b3553f0119976bb02e05ac4873d8f692219a53504",
+    "test/registered/storage/test_training_capture_pd_dspark_pp_pressure.py": "1fc5c09d687dad94aa571aa6ea3f3d834ecbfebafeda207824e55a52bdc33e88"
+  },
+  "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+  "model_dtype": "bfloat16",
+  "draft": "Synthetic target-KV DSpark draft; biased token-100 serving requests are correctness fixtures, not quality evidence",
+  "transport": "Real Mooncake TCP KV transfer and Store",
+  "catalog": "HTTP in-memory test double",
+  "resources": {
+    "resident": {
+      "job_id": "job-fe1ce1dcdea6-20261001023258",
+      "node": "node064",
+      "gpu_uuids": [
+        "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495"
+      ],
+      "final_worker_state": {
+        "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+        "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+        "pid": 1,
+        "mode": "idle_load",
+        "heartbeat_unix": 1790914975.595259,
+        "idle_pid": 53593,
+        "active_job": null,
+        "active_pid": null,
+        "queued": 0,
+        "paused": false,
+        "heartbeat_age_seconds": 0.6033623218536377
+      },
+      "final_live_processes": [
+        "1     0 Ss   python3         python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60",
+        "53593     1 Rsl  python3         /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6"
+      ],
+      "no_live_test_model_or_store_processes": true
+    },
+    "temporary": {
+      "job_id": "job-9637d34248cb-20261002114442",
+      "node": "node071",
+      "gpu_uuids": [
+        "GPU-6020ec4b-adbd-f5a0-ffd3-80af1e7eb225",
+        "GPU-7f16324c-fde5-ce5e-0ee0-81cc3c5872f4"
+      ],
+      "deleted": true,
+      "pod_absent_verified": true,
+      "no_live_model_store_or_gpu_processes_before_delete": true
+    },
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "temporary_image_adjustment": "Uninstalled system flashinfer-cubin 0.6.12 and flashinfer-jit-cache 0.6.12+cu130 to use the shared FlashInfer 0.6.17 environment"
+  },
+  "config": {
+    "tp_size": 1,
+    "pp_sizes": [
+      1,
+      2
+    ],
+    "kv_pool_tokens": 512,
+    "num_reserved_decode_tokens": 16,
+    "requests": 4,
+    "prompt_tokens": 16,
+    "response_tokens": 192,
+    "total_requested_path_tokens": 832,
+    "selected_layer_ids": [
+      0,
+      14,
+      27
+    ],
+    "restore_compared_layers": 28,
+    "attention_backend": "triton",
+    "prefill_graphs": false,
+    "test_retract": false,
+    "batching_barrier": "Only test-tagged initial requests wait for four; resumed requests bypass it",
+    "single_rank_initial_available_leases": 4
+  },
+  "assertions": [
+    "Natural pool exhaustion completes every request; per-stage retraction metrics equal summed per-request retractions.",
+    "Every local target layer K/V exactly equals an independent pre-offload copy after CPU-to-GPU restore into newly allocated slots.",
+    "All stages rebuild an empty projected draft context through the restored prefix.",
+    "The first-retraction capture IDs recorded at handoff agree across ranks, reach Catalog FAILED and never publish.",
+    "Capture context/finalizer detach on restore and the attempted marker remains set.",
+    "Only survivors and a fresh post-pressure request publish; source KV, raw teacher top-128 logits/IDs, LSE, token IDs, masks, positions and terminal validity pass.",
+    "All selected successful snapshots are fully reread with object digest and content validation after both producer process trees exit."
+  ],
+  "limitations": [
+    "Qwen3-0.6B and a synthetic draft only",
+    "TCP and a test Catalog; no production retention or pressure-specific RDMA certification",
+    "No combined TP/PP or asymmetric P/D pressure coverage",
+    "Device KV pool exhaustion, not optional P/D KV offload manager or HiCache host-tier pressure",
+    "Test observers copy and synchronize tensors; no throughput, latency or trained-draft quality claims"
+  ],
+  "runs": [
+    {
+      "suite": "test_training_capture_pd_dspark_pressure.py",
+      "job_id": "01790913915548002004-250838110ce3",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790914933.4845624,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790913915548002004-250838110ce3.log",
+      "tests": 4,
+      "seconds": 337.714,
+      "post_exit_snapshots": 12,
+      "log_sha256": "41990e3a1e5df17b7aeb36646db60954642f0a9118c2e489df7750061330118b",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-pressure-checked",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_pd_dspark_pressure.py",
+        "-v",
+        "-f"
+      ],
+      "observations": [
+        {
+          "pp_size": 1,
+          "replay": false,
+          "enable_overlap": false,
+          "kv_pool_tokens": 512,
+          "requested_path_tokens": 832,
+          "completed_requests": 4,
+          "output_tokens": 768,
+          "num_retractions": 2,
+          "retired_capture_requests": [
+            "pressure-batch-1-False-False-2",
+            "pressure-batch-1-False-False-3"
+          ],
+          "post_exit_snapshots": 3,
+          "rebuilt_contexts": [
+            {
+              "kind": "context",
+              "rid": "pressure-batch-1-False-False-3",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 124,
+              "prefix_end": 124,
+              "pp_rank": 0,
+              "tp_rank": 0
+            },
+            {
+              "kind": "context",
+              "rid": "pressure-batch-1-False-False-2",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 164,
+              "prefix_end": 164,
+              "pp_rank": 0,
+              "tp_rank": 0
+            }
+          ],
+          "kv_restores": [
+            {
+              "rid": "pressure-batch-1-False-False-3",
+              "capture_id": "790e3eea548243e0a1287a5b47e6cc0a",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 124,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            },
+            {
+              "rid": "pressure-batch-1-False-False-2",
+              "capture_id": "54901d4bbff14b7584722580f0f8f1aa",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 164,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "failed_captures": {
+            "pressure-batch-1-False-False-3": "790e3eea548243e0a1287a5b47e6cc0a",
+            "pressure-batch-1-False-False-2": "54901d4bbff14b7584722580f0f8f1aa"
+          },
+          "capture_before": {
+            "counters": {},
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "reservations": 4,
+            "states": {
+              "available": 4
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "free": 0,
+              "filling": 4,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            }
+          },
+          "capture_after": {
+            "counters": {
+              "considered": 5,
+              "admitted": 5,
+              "pd_handoff_committed": 5,
+              "speculative_verify_forwards": 49,
+              "eager_forwards": 49,
+              "speculative_commits_copied": 161,
+              "failed_request_aborted_or_retracted": 2,
+              "writer_started": 5,
+              "copies_completed": 5,
+              "sealed": 3,
+              "snapshot_built": 3,
+              "ready": 3
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "reservations": 3,
+            "states": {
+              "available": 3
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "free": 1,
+              "filling": 3,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            }
+          }
+        },
+        {
+          "pp_size": 1,
+          "replay": true,
+          "enable_overlap": false,
+          "kv_pool_tokens": 512,
+          "requested_path_tokens": 832,
+          "completed_requests": 4,
+          "output_tokens": 768,
+          "num_retractions": 2,
+          "retired_capture_requests": [
+            "pressure-batch-1-True-False-2",
+            "pressure-batch-1-True-False-3"
+          ],
+          "post_exit_snapshots": 3,
+          "rebuilt_contexts": [
+            {
+              "kind": "context",
+              "rid": "pressure-batch-1-True-False-3",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 124,
+              "prefix_end": 124,
+              "pp_rank": 0,
+              "tp_rank": 0
+            },
+            {
+              "kind": "context",
+              "rid": "pressure-batch-1-True-False-2",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 164,
+              "prefix_end": 164,
+              "pp_rank": 0,
+              "tp_rank": 0
+            }
+          ],
+          "kv_restores": [
+            {
+              "rid": "pressure-batch-1-True-False-3",
+              "capture_id": "05b788375e944ebb968a37e1636f756a",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 124,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            },
+            {
+              "rid": "pressure-batch-1-True-False-2",
+              "capture_id": "93d961c1622142258efc7ae9d6517402",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 164,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "failed_captures": {
+            "pressure-batch-1-True-False-3": "05b788375e944ebb968a37e1636f756a",
+            "pressure-batch-1-True-False-2": "93d961c1622142258efc7ae9d6517402"
+          },
+          "capture_before": {
+            "counters": {},
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "reservations": 4,
+            "states": {
+              "available": 4
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "free": 0,
+              "filling": 4,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            }
+          },
+          "capture_after": {
+            "counters": {
+              "considered": 5,
+              "admitted": 5,
+              "pd_handoff_committed": 5,
+              "speculative_verify_forwards": 49,
+              "cuda_graph_forwards": 49,
+              "speculative_commits_copied": 161,
+              "failed_request_aborted_or_retracted": 2,
+              "writer_started": 5,
+              "copies_completed": 5,
+              "sealed": 3,
+              "snapshot_built": 3,
+              "ready": 3
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "reservations": 3,
+            "states": {
+              "available": 3
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "free": 1,
+              "filling": 3,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            }
+          }
+        },
+        {
+          "pp_size": 1,
+          "replay": false,
+          "enable_overlap": true,
+          "kv_pool_tokens": 512,
+          "requested_path_tokens": 832,
+          "completed_requests": 4,
+          "output_tokens": 768,
+          "num_retractions": 2,
+          "retired_capture_requests": [
+            "pressure-batch-1-False-True-2",
+            "pressure-batch-1-False-True-3"
+          ],
+          "post_exit_snapshots": 3,
+          "rebuilt_contexts": [
+            {
+              "kind": "context",
+              "rid": "pressure-batch-1-False-True-3",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 124,
+              "prefix_end": 124,
+              "pp_rank": 0,
+              "tp_rank": 0
+            },
+            {
+              "kind": "context",
+              "rid": "pressure-batch-1-False-True-2",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 164,
+              "prefix_end": 164,
+              "pp_rank": 0,
+              "tp_rank": 0
+            }
+          ],
+          "kv_restores": [
+            {
+              "rid": "pressure-batch-1-False-True-3",
+              "capture_id": "92423c34534e4bf89ca3f1f4222e8c03",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 124,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            },
+            {
+              "rid": "pressure-batch-1-False-True-2",
+              "capture_id": "94631673cbc7499985f8c79235e04d83",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 164,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "failed_captures": {
+            "pressure-batch-1-False-True-2": "94631673cbc7499985f8c79235e04d83",
+            "pressure-batch-1-False-True-3": "92423c34534e4bf89ca3f1f4222e8c03"
+          },
+          "capture_before": {
+            "counters": {},
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "reservations": 4,
+            "states": {
+              "available": 4
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "free": 0,
+              "filling": 4,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            }
+          },
+          "capture_after": {
+            "counters": {
+              "considered": 5,
+              "admitted": 5,
+              "pd_handoff_committed": 5,
+              "speculative_verify_forwards": 51,
+              "overlap_forwards": 51,
+              "eager_forwards": 51,
+              "speculative_commits_copied": 166,
+              "failed_request_aborted_or_retracted": 2,
+              "writer_started": 5,
+              "copies_completed": 5,
+              "sealed": 3,
+              "snapshot_built": 3,
+              "ready": 3
+            },
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "reservations": 3,
+            "states": {
+              "available": 3
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "free": 1,
+              "filling": 3,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            }
+          }
+        },
+        {
+          "pp_size": 1,
+          "replay": true,
+          "enable_overlap": true,
+          "kv_pool_tokens": 512,
+          "requested_path_tokens": 832,
+          "completed_requests": 4,
+          "output_tokens": 768,
+          "num_retractions": 2,
+          "retired_capture_requests": [
+            "pressure-batch-1-True-True-2",
+            "pressure-batch-1-True-True-3"
+          ],
+          "post_exit_snapshots": 3,
+          "rebuilt_contexts": [
+            {
+              "kind": "context",
+              "rid": "pressure-batch-1-True-True-3",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 124,
+              "prefix_end": 124,
+              "pp_rank": 0,
+              "tp_rank": 0
+            },
+            {
+              "kind": "context",
+              "rid": "pressure-batch-1-True-True-2",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 164,
+              "prefix_end": 164,
+              "pp_rank": 0,
+              "tp_rank": 0
+            }
+          ],
+          "kv_restores": [
+            {
+              "rid": "pressure-batch-1-True-True-3",
+              "capture_id": "8fbba12282fc4df2bfcd59ea7c26c125",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 124,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            },
+            {
+              "rid": "pressure-batch-1-True-True-2",
+              "capture_id": "10bdb148f5584e919c50b22e213a01bf",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 164,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "failed_captures": {
+            "pressure-batch-1-True-True-2": "10bdb148f5584e919c50b22e213a01bf",
+            "pressure-batch-1-True-True-3": "8fbba12282fc4df2bfcd59ea7c26c125"
+          },
+          "capture_before": {
+            "counters": {},
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "reservations": 4,
+            "states": {
+              "available": 4
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "free": 0,
+              "filling": 4,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            }
+          },
+          "capture_after": {
+            "counters": {
+              "considered": 5,
+              "admitted": 5,
+              "pd_handoff_committed": 5,
+              "speculative_verify_forwards": 51,
+              "overlap_forwards": 51,
+              "cuda_graph_forwards": 51,
+              "speculative_commits_copied": 166,
+              "failed_request_aborted_or_retracted": 2,
+              "writer_started": 5,
+              "copies_completed": 5,
+              "sealed": 3,
+              "snapshot_built": 3,
+              "ready": 3
+            },
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "reservations": 3,
+            "states": {
+              "available": 3
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 17848320,
+              "device_allocated_bytes": 786432,
+              "device_limit_bytes": 8388608,
+              "free": 1,
+              "filling": 3,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            }
+          }
+        }
+      ]
+    },
+    {
+      "suite": "test_training_capture_pd_dspark_pp_pressure.py",
+      "tests": 2,
+      "seconds": 221.799,
+      "post_exit_snapshots": 6,
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pressure-pp-checked-20261002.log",
+      "log_sha256": "c0e393ca028787047559bad42b56424d5c32754601f36c5f98d32a2e89c69cc3",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-pressure-checked",
+      "observations": [
+        {
+          "pp_size": 2,
+          "replay": false,
+          "enable_overlap": false,
+          "kv_pool_tokens": 512,
+          "requested_path_tokens": 832,
+          "completed_requests": 4,
+          "output_tokens": 768,
+          "num_retractions": 2,
+          "retired_capture_requests": [
+            "pressure-batch-2-False-False-2",
+            "pressure-batch-2-False-False-3"
+          ],
+          "post_exit_snapshots": 3,
+          "rebuilt_contexts": [
+            {
+              "kind": "context",
+              "rid": "pressure-batch-2-False-False-3",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 124,
+              "prefix_end": 124,
+              "pp_rank": 0,
+              "tp_rank": 0
+            },
+            {
+              "kind": "context",
+              "rid": "pressure-batch-2-False-False-2",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 164,
+              "prefix_end": 164,
+              "pp_rank": 0,
+              "tp_rank": 0
+            },
+            {
+              "kind": "context",
+              "rid": "pressure-batch-2-False-False-3",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 124,
+              "prefix_end": 124,
+              "pp_rank": 1,
+              "tp_rank": 0
+            },
+            {
+              "kind": "context",
+              "rid": "pressure-batch-2-False-False-2",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 164,
+              "prefix_end": 164,
+              "pp_rank": 1,
+              "tp_rank": 0
+            }
+          ],
+          "kv_restores": [
+            {
+              "rid": "pressure-batch-2-False-False-3",
+              "capture_id": "107ff83d76a54a0e80476bbc5051e3e9",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 124,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13
+              ]
+            },
+            {
+              "rid": "pressure-batch-2-False-False-2",
+              "capture_id": "d7c3d8f9ff9b414e9977b53996440383",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 164,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13
+              ]
+            },
+            {
+              "rid": "pressure-batch-2-False-False-3",
+              "capture_id": "107ff83d76a54a0e80476bbc5051e3e9",
+              "pp_rank": 1,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 124,
+              "layers": [
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            },
+            {
+              "rid": "pressure-batch-2-False-False-2",
+              "capture_id": "d7c3d8f9ff9b414e9977b53996440383",
+              "pp_rank": 1,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 164,
+              "layers": [
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "failed_captures": {
+            "pressure-batch-2-False-False-2": "d7c3d8f9ff9b414e9977b53996440383",
+            "pressure-batch-2-False-False-3": "107ff83d76a54a0e80476bbc5051e3e9"
+          },
+          "capture_before": {
+            "counters": {
+              "ready": 0
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "writing": 0,
+              "pending_publication": 0
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "free": 0,
+              "filling": 4,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            },
+            "cohort_writer": {
+              "ready": true,
+              "stopping": false,
+              "error": null,
+              "recovery_error": null,
+              "pending": 0,
+              "states": {},
+              "counters": {},
+              "oldest_seconds": 0
+            },
+            "request_router": {
+              "considered": 1,
+              "excluded": 1
+            }
+          },
+          "capture_after": {
+            "counters": {
+              "admitted": 5,
+              "pd_handoff_committed": 5,
+              "speculative_verify_forwards": 49,
+              "eager_forwards": 49,
+              "speculative_commits_copied": 161,
+              "failed_request_aborted_or_retracted": 2,
+              "sealed": 3,
+              "ready": 0
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "writing": 0,
+              "pending_publication": 0
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "free": 0,
+              "filling": 4,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            },
+            "cohort_writer": {
+              "ready": true,
+              "stopping": false,
+              "error": null,
+              "recovery_error": null,
+              "pending": 0,
+              "states": {},
+              "counters": {
+                "submitted": 5,
+                "failed": 2,
+                "stored": 3
+              },
+              "oldest_seconds": 0
+            },
+            "request_router": {
+              "considered": 6,
+              "excluded": 1,
+              "selected": 5,
+              "attached": 5,
+              "bound": 5
+            }
+          }
+        },
+        {
+          "pp_size": 2,
+          "replay": true,
+          "enable_overlap": false,
+          "kv_pool_tokens": 512,
+          "requested_path_tokens": 832,
+          "completed_requests": 4,
+          "output_tokens": 768,
+          "num_retractions": 2,
+          "retired_capture_requests": [
+            "pressure-batch-2-True-False-2",
+            "pressure-batch-2-True-False-3"
+          ],
+          "post_exit_snapshots": 3,
+          "rebuilt_contexts": [
+            {
+              "kind": "context",
+              "rid": "pressure-batch-2-True-False-3",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 124,
+              "prefix_end": 124,
+              "pp_rank": 0,
+              "tp_rank": 0
+            },
+            {
+              "kind": "context",
+              "rid": "pressure-batch-2-True-False-2",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 164,
+              "prefix_end": 164,
+              "pp_rank": 0,
+              "tp_rank": 0
+            },
+            {
+              "kind": "context",
+              "rid": "pressure-batch-2-True-False-3",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 124,
+              "prefix_end": 124,
+              "pp_rank": 1,
+              "tp_rank": 0
+            },
+            {
+              "kind": "context",
+              "rid": "pressure-batch-2-True-False-2",
+              "retraction_ct": 1,
+              "previous_end": null,
+              "projected_end": 164,
+              "prefix_end": 164,
+              "pp_rank": 1,
+              "tp_rank": 0
+            }
+          ],
+          "kv_restores": [
+            {
+              "rid": "pressure-batch-2-True-False-3",
+              "capture_id": "b73b883b3ffc466c96c3aed0b886fbc8",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 124,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13
+              ]
+            },
+            {
+              "rid": "pressure-batch-2-True-False-2",
+              "capture_id": "05efb49e96b74a7c8a9e385582f1d2ed",
+              "pp_rank": 0,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 164,
+              "layers": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13
+              ]
+            },
+            {
+              "rid": "pressure-batch-2-True-False-3",
+              "capture_id": "b73b883b3ffc466c96c3aed0b886fbc8",
+              "pp_rank": 1,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 124,
+              "layers": [
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            },
+            {
+              "rid": "pressure-batch-2-True-False-2",
+              "capture_id": "05efb49e96b74a7c8a9e385582f1d2ed",
+              "pp_rank": 1,
+              "tp_rank": 0,
+              "retraction_ct": 1,
+              "restored_tokens": 164,
+              "layers": [
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "failed_captures": {
+            "pressure-batch-2-True-False-3": "b73b883b3ffc466c96c3aed0b886fbc8",
+            "pressure-batch-2-True-False-2": "05efb49e96b74a7c8a9e385582f1d2ed"
+          },
+          "capture_before": {
+            "counters": {
+              "ready": 0
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "writing": 0,
+              "pending_publication": 0
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "free": 0,
+              "filling": 4,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            },
+            "cohort_writer": {
+              "ready": true,
+              "stopping": false,
+              "error": null,
+              "recovery_error": null,
+              "pending": 0,
+              "states": {},
+              "counters": {},
+              "oldest_seconds": 0
+            },
+            "request_router": {
+              "considered": 1,
+              "excluded": 1
+            }
+          },
+          "capture_after": {
+            "counters": {
+              "admitted": 5,
+              "pd_handoff_committed": 5,
+              "speculative_verify_forwards": 49,
+              "cuda_graph_forwards": 49,
+              "speculative_commits_copied": 161,
+              "failed_request_aborted_or_retracted": 2,
+              "sealed": 3,
+              "ready": 0
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "writing": 0,
+              "pending_publication": 0
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "free": 0,
+              "filling": 4,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            },
+            "cohort_writer": {
+              "ready": true,
+              "stopping": false,
+              "error": null,
+              "recovery_error": null,
+              "pending": 0,
+              "states": {},
+              "counters": {
+                "submitted": 5,
+                "failed": 2,
+                "stored": 3
+              },
+              "oldest_seconds": 0
+            },
+            "request_router": {
+              "considered": 6,
+              "excluded": 1,
+              "selected": 5,
+              "attached": 5,
+              "bound": 5
+            }
+          }
+        }
+      ],
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_pd_dspark_pp_pressure.py",
+        "-v",
+        "-f"
+      ]
+    },
+    {
+      "suite": "test_training_capture_pd_dspark.py",
+      "job_id": "01790913732319691322-30edee7b06b7",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790914182.6529057,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790913732319691322-30edee7b06b7.log",
+      "tests": 4,
+      "seconds": 327.41,
+      "post_exit_snapshots": 24,
+      "log_sha256": "bd04e0fc39f299a63a3de3376442cddb1ab1ceae04a98f4e1e0e03df0b154697",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-pressure-final",
+      "observations": [
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "decode_pp": 1,
+          "replay": false,
+          "draft_kind": "target_kv",
+          "prefill_draft": false,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "decode_pp": 1,
+          "replay": true,
+          "draft_kind": "target_kv",
+          "prefill_draft": false,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "decode_pp": 1,
+          "replay": false,
+          "draft_kind": "target_kv",
+          "prefill_draft": true,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "decode_pp": 1,
+          "replay": true,
+          "draft_kind": "target_kv",
+          "prefill_draft": true,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        }
+      ],
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_pd_dspark.py",
+        "-v",
+        "-f"
+      ]
+    },
+    {
+      "suite": "test_training_capture_pd_dspark_hidden.py",
+      "job_id": "01790913732635701032-fe7b31975533",
+      "tests": 6,
+      "seconds": 389.911,
+      "returncode": 0,
+      "post_exit_snapshots": 36,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790913732635701032-fe7b31975533.log",
+      "log_sha256": "74a345d57337f1e019034ee576fe17eee1f8cf79a95b94ba123d196ed55051f8",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-pressure-final",
+      "observations": [
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "decode_pp": 1,
+          "replay": false,
+          "draft_kind": "target_hidden",
+          "prefill_draft": true,
+          "ragged_mode": "cap-accept",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "decode_pp": 1,
+          "replay": true,
+          "draft_kind": "target_hidden",
+          "prefill_draft": true,
+          "ragged_mode": "cap-accept",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "decode_pp": 1,
+          "replay": false,
+          "draft_kind": "target_hidden",
+          "prefill_draft": true,
+          "ragged_mode": "compact",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "decode_pp": 1,
+          "replay": true,
+          "draft_kind": "target_hidden",
+          "prefill_draft": true,
+          "ragged_mode": "compact",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "decode_pp": 1,
+          "replay": false,
+          "draft_kind": "target_hidden",
+          "prefill_draft": true,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 1,
+          "decode_pp": 1,
+          "replay": true,
+          "draft_kind": "target_hidden",
+          "prefill_draft": true,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        }
+      ],
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_pd_dspark_hidden.py",
+        "-v",
+        "-f"
+      ]
+    },
+    {
+      "suite": "test_training_capture_pd_dspark_pp.py",
+      "tests": 6,
+      "seconds": 493.724,
+      "returncode": 0,
+      "post_exit_snapshots": 36,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pressure-pp-regression-20261002.log",
+      "log_sha256": "90db2bff70e1daa3ac8cea990335687f8190c05a5c76a6eb27d678d1874fa102",
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-pressure-checked",
+      "observations": [
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 2,
+          "decode_pp": 2,
+          "replay": false,
+          "draft_kind": "target_kv",
+          "prefill_draft": false,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 2,
+          "decode_pp": 2,
+          "replay": true,
+          "draft_kind": "target_kv",
+          "prefill_draft": false,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 2,
+          "decode_pp": 2,
+          "replay": false,
+          "draft_kind": "target_kv",
+          "prefill_draft": true,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 2,
+          "decode_pp": 2,
+          "replay": true,
+          "draft_kind": "target_kv",
+          "prefill_draft": true,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 2,
+          "decode_pp": 1,
+          "replay": false,
+          "draft_kind": "target_kv",
+          "prefill_draft": true,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        },
+        {
+          "prefill_tp": 1,
+          "decode_tp": 1,
+          "prefill_pp": 2,
+          "decode_pp": 1,
+          "replay": true,
+          "draft_kind": "target_kv",
+          "prefill_draft": true,
+          "ragged_mode": "static",
+          "post_exit_snapshots": 6
+        }
+      ],
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_pd_dspark_pp.py",
+        "-v",
+        "-f"
+      ]
+    }
+  ],
+  "source_notes": {
+    "final_sources": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-pressure-checked",
+    "normal_and_hidden_regressions": {
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-pressure-final",
+      "pd_capture_runtime_sha256": "2718ffc84e916d82fb7c901c97f64eda2d0b6e8be2ef6e276eaa9f0b37f00e45",
+      "pd_capture_server_sha256": "ecf59ce85202198b3acd2924700efaee190f19a45c1e45c72464bb46aafb07f0",
+      "difference": "Ran before the pressure-only capture-ID handoff observer and peer-failure assertion refinement. These suites use no pressure-tagged requests. All production sources and shared launch defaults match final sources."
+    },
+    "frozen_gpu_sources": true
+  },
+  "earlier_attempts": [
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790912383678591499-564f1a2f66a2.log",
+      "log_sha256": "cc92cd7e0fcc0be107e8f305107bc561b0aaa4d62f712338dd011fff7ddc31bc",
+      "returncode": 1,
+      "tests_run": 4,
+      "passed": 3,
+      "reason": "Initial fixture had no all-layer restore observer and did not wait for four asynchronous capture leases; overlap graph admitted 3/4 captures."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790913085703545310-ee0203f2e6d0.log",
+      "log_sha256": "5fb28b7287b77d609fed5db920419dfcde768e679b3decc68a319d94476c754d",
+      "returncode": 1,
+      "tests_run": 2,
+      "passed": 1,
+      "reason": "All-layer restore observation passed eager; graph again exposed 3/4 admission before the lease-readiness wait."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pressure-pp-strengthened-20261002.log",
+      "log_sha256": "4b2bf80e1ca0d1a2190ad0a2d9c33f7bbc66f7ab0d318dc77d0a0aa1c0b9d9d4",
+      "returncode": 0,
+      "tests_run": 2,
+      "passed": 2,
+      "reason": "Both PP2 modes passed exact restore before adding explicit failed-Catalog-lease checks."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790913492460519192-bdf8641b3da8.log",
+      "log_sha256": "283311944a0c40e8abba5a9b3623a9c8a31bfc9b0610e8503644cf5616b049f0",
+      "returncode": 0,
+      "tests_run": 4,
+      "passed": 4,
+      "reason": "All PP1 modes passed with startup readiness and Catalog checks; final pressure-only capture-ID observation timing is rerun separately."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pressure-pp-final-20261002.log",
+      "log_sha256": "3f830a26ff8cdc0467b8536ce5955b427ded618d8df588f5a136701c8d69596f",
+      "returncode": 1,
+      "tests_run": 2,
+      "passed": 1,
+      "reason": "PP2 graph recorded two peer_capture_failed events on rank 0 after peer retraction. The fixture incorrectly required two local request_aborted_or_retracted events. Final checks retain exact failure totals and explicit original Catalog lease checks, independent of rank ordering."
+    }
+  ],
+  "summary": {
+    "tests": 22,
+    "post_exit_snapshots": 114,
+    "pressure_tests": 6,
+    "pressure_snapshots": 18,
+    "pressure_retractions": 12,
+    "pressure_rank_local_exact_restores": 16,
+    "seed_snapshots_excluded": 4,
+    "earlier_attempts_excluded_from_totals": true
+  },
+  "validation": {
+    "ruff": "all five touched/new Python files pass",
+    "black": "all five Python files pass --check",
+    "git_diff_check": "pass",
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  }
+}

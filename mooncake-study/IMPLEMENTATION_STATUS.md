@@ -43,9 +43,9 @@ it does not redefine the goal as the modules already implemented.
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes synchronous/overlap and eager/graph combinations; retired captures fail once, released slots are reused, fresh admission and exact post-exit Store reads pass; distributed pressure and SLOs remain open |
-| DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes in all four PP1 synchronous/overlap and eager/graph combinations, plus synchronous PP2 eager/graph; failed captures are excluded and fresh capture admission recovers |
+| DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes colocated and P/D PP1 synchronous/overlap and eager/graph combinations, plus synchronous PP2 eager/graph; P/D checks exact all-layer CPU restore and failed Catalog leases |
 | PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2, synchronous P2/D2 and P2/D1, and cross-node TP1 RDMA pass eager/graph source parity and failure exclusion; combined topologies and wider distributed RDMA remain open |
-| Pipeline draft serving | Synchronous static target-KV PP loop, per-stage graph activations, P/D queue agreement and cohort capture | Qwen3 TP1/PP2 eager/graph colocated and P/D serving pass exact Mooncake readback; colocated memory retraction passes; P/D pressure, asynchronous PP and broader topologies remain open |
+| Pipeline draft serving | Synchronous static target-KV PP loop, per-stage graph activations, P/D queue agreement and cohort capture | Qwen3 TP1/PP2 eager/graph colocated and P/D serving pass exact Mooncake readback and memory retraction; asynchronous PP and broader topologies remain open |
 | Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark, colocated and P/D static target-KV PP2 DSpark, TP/PP AR PD, TP1/TP2 target-KV DSpark PD, single-rank cross-node RDMA and single-GPU AR prefill graphs have runtime evidence below; combined topologies and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
@@ -3135,18 +3135,67 @@ has no active or queued experiment and resumed its 60% idle load. The original
 checkout's staged index remains unchanged.
 
 This milestone does not establish trained-draft quality, production Catalog
-retention, P/D memory-pressure retraction, real combined TP2/PP2, cross-node PP
+retention, real combined TP2/PP2, cross-node PP
 RDMA, asynchronous microbatch throughput or performance SLOs. Hidden-input and
 confidence-scheduled PP remain unsupported. See
 [the runtime contract](TARGET_KV_DRAFT.md#disaggregated-context),
 [the runbook](experiments/PIPELINE_PD.md) and
 [retained evidence](experiments/pipeline-dspark-pd.json).
 
+## P/D Memory Pressure And CPU Restore
+
+The new P/D pressure suites exercise the existing static target-KV serving and
+capture paths under natural decode-pool exhaustion. Four 208-token paths compete
+for a 512-token KV pool, with debug retraction disabled. PP1 covers all four
+synchronous/overlap and eager/graph combinations; matching P2/D2 covers
+synchronous eager/graph. A test-only initial-batch barrier ensures actual
+four-request verify execution without changing allocator/retraction decisions.
+
+Before each offload, an independent observer saves every local target layer's
+K/V. After CPU-to-GPU restore into the resumed request's slots, all values must
+match exactly. Draft context is cleared and rebuilt on every stage. Original
+capture IDs recorded at handoff agree across stages, reach Catalog FAILED and
+never publish. Surviving requests and a fresh recovery request still publish
+complete samples with exact online source parity and post-exit Store readback.
+
+Two fixture assumptions were corrected during validation. Initial PP1 admission
+must wait for four asynchronously prepared leases; an idle scheduler can still
+have only three. Distributed retirement may be observed as a local retraction
+or an earlier peer failure. Both reasons must still produce exactly one failed
+capture per retired request and the same original failed Catalog lease. These
+are test changes; the production serving/capture sources remain at the preceding
+commit `c8a9e67e18a5c8c6cbe45e80a5cf208aa88f7305`.
+
+The final PP1 pressure job `01790913915548002004-250838110ce3` passes four tests
+in 337.714 seconds. PP2 pressure passes two tests in 221.799 seconds. Across
+these six cases, all 24 long requests finish, 12 captures retire, 16 rank-local
+full-target-KV restore comparisons pass and 18 published snapshots survive
+complete producer process-tree exit. Restored prefixes contain 124 and 164
+tokens; selected training layers remain 0/14/27 of the 28-layer Qwen3 target.
+
+Complete ordinary target-KV, hidden-input and pipeline P/D regressions pass
+4/6/6 tests in 327.410/389.911/493.724 seconds and verify 24/36/36 post-exit
+snapshots. The final total is **22 tests / 114 post-exit snapshots**, excluding
+four synthetic-draft seed snapshots and all earlier attempts. Ordinary PP1 and
+hidden regressions use the frozen observer before its pressure-only timing
+refinement; final pressure and pipeline regressions use the final observer.
+All production sources and shared launch defaults are identical across them.
+Ruff, Black and `git diff --check` pass; original staged changes are preserved.
+
+Temporary two-H100 job `job-9637d34248cb-20261002114442` was deleted after
+confirming no live model/Store or GPU compute processes. Its pod is absent.
+The resident worker has no active/queued experiment and resumed 60% idle load.
+This is Qwen3-0.6B with synthetic drafts, TCP and a Catalog test double. Combined
+TP/PP pressure, asymmetric P/D pressure, RDMA pressure, HiCache, trained drafts,
+production Catalog retention and performance SLOs remain separate work. See
+[the runbook](experiments/PD_MEMORY_PRESSURE.md) and
+[the retained evidence](experiments/pd-memory-pressure.json).
+
 ## Next Implementation
 
 1. Extend passing single-GPU AR prefill graph coverage to distributed/speculative
    and mixed-batch execution. Extend distributed pressure beyond passing
-   colocated synchronous PP2 DSpark to P/D, AR and combined topologies. Broaden real-request coverage to speculative cache eviction, target weight replacement and
+   colocated and P/D synchronous PP2 DSpark to AR and combined topologies. Broaden real-request coverage to speculative cache eviction, target weight replacement and
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.

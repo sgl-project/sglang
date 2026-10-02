@@ -20,8 +20,12 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.training_capture.pd_capture import PrefillCaptureCoordinator
+from sglang.srt.training_capture.pd_capture import (
+    DecodeCaptureMixin,
+    PrefillCaptureCoordinator,
+)
 from sglang.srt.training_capture.pd_protocol import (
     PrefillTeacherHandoff,
     decode_handoff,
@@ -36,6 +40,12 @@ _prefill_forward = PrefillCaptureCoordinator.after_forward
 _handoff = PrefillCaptureCoordinator.finish_handoff
 _prebuilt = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch
 _send_kv_chunk = SchedulerDisaggregationPrefillMixin.send_kv_chunk
+_offload_kv = Req.offload_kv_cache
+_load_kv = Req.load_kv_cache
+_accept_pd_handoff = DecodeCaptureMixin.accept_pd_handoff
+_pressure_saved = {}
+_pressure_capture_ids = {}
+_pressure_root = None
 
 
 def observe_stage_state(capture, stage):
@@ -56,7 +66,10 @@ def observe_stage_state(capture, stage):
 
 
 def observed_init(self, **kwargs):
+    global _pressure_root
     _init(self, **kwargs)
+    if self.training_capture is not None:
+        _pressure_root = Path(self.training_capture.config.journal_directory).parent
     if isinstance(self.training_capture, PrefillCaptureCoordinator):
         _pools[id(self.training_capture)] = (
             self.model_runner.token_to_kv_pool,
@@ -192,7 +205,82 @@ def grouped_prebuilt(self, running_batch):
         and sum(req.rid.startswith("batch-") for req in self.waiting_queue) == 1
     ):
         return None
+    if running_batch.is_empty():
+        pressure_requests = sum(
+            req.rid.startswith("pressure-batch-") and req.retraction_count == 0
+            for req in self.waiting_queue
+        )
+        if 0 < pressure_requests < 4:
+            return None
     return _prebuilt(self, running_batch)
+
+
+def pressure_kv(req, req_pool, allocator):
+    pool = allocator.get_kvcache()
+    slots = req_pool.req_to_token[req.req_pool_idx, : req.seqlen - 1].long()
+    return {
+        (layer, component): buffer[slots].cpu()
+        for layer in range(pool.start_layer, pool.start_layer + pool.layer_num)
+        for component, buffer in (
+            ("k", pool.get_key_buffer(layer)),
+            ("v", pool.get_value_buffer(layer)),
+        )
+    }
+
+
+def observed_accept_handoff(self, req, payload):
+    result = _accept_pd_handoff(self, req, payload)
+    if req.rid.startswith("pressure-batch-"):
+        record = req.training_capture_context
+        assert record is not None
+        assert req.rid not in _pressure_capture_ids
+        _pressure_capture_ids[req.rid] = record.lease.capture_id
+    return result
+
+
+def observed_offload(req, req_pool, allocator):
+    if req.rid.startswith("pressure-batch-"):
+        assert req.rid not in _pressure_saved
+        _pressure_saved[req.rid] = (
+            pressure_kv(req, req_pool, allocator),
+            _pressure_capture_ids.pop(req.rid, None),
+        )
+    return _offload_kv(req, req_pool, allocator)
+
+
+def observed_load(req, req_pool, allocator):
+    result = _load_kv(req, req_pool, allocator)
+    if req.rid.startswith("pressure-batch-"):
+        before, capture_id = _pressure_saved.pop(req.rid)
+        restored = pressure_kv(req, req_pool, allocator)
+        assert req.training_capture_context is None
+        assert req.training_capture_finalize is None
+        assert req.training_capture_attempted
+        assert restored.keys() == before.keys()
+        for key, tensor in restored.items():
+            assert torch.equal(tensor, before[key]), (req.rid, key)
+        stage, rank = (
+            get_pipeline_model_parallel_rank(),
+            get_tensor_model_parallel_rank(),
+        )
+        with (_pressure_root / f"pressure-restore-pp{stage}-tp{rank}.jsonl").open(
+            "a"
+        ) as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "rid": req.rid,
+                        "capture_id": capture_id,
+                        "pp_rank": stage,
+                        "tp_rank": rank,
+                        "retraction_ct": req.retraction_count,
+                        "restored_tokens": next(iter(restored.values())).shape[0],
+                        "layers": sorted({key[0] for key in restored}),
+                    }
+                )
+                + "\n"
+            )
+    return result
 
 
 TpModelWorker.init_training_capture = observed_init
@@ -210,6 +298,9 @@ if "--speculative-draft-model-path" in sys.argv:
         importlib.import_module("sglang.test.dspark_capture_server")
 SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch = grouped_prebuilt
 SchedulerDisaggregationPrefillMixin.send_kv_chunk = observed_send
+Req.offload_kv_cache = observed_offload
+Req.load_kv_cache = observed_load
+DecodeCaptureMixin.accept_pd_handoff = observed_accept_handoff
 
 
 if __name__ == "__main__":

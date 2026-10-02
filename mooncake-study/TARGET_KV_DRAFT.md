@@ -445,6 +445,14 @@ P may run AR or load a target-KV draft. Real-model coverage includes TP1 P2/D2
 with a draft on D alone or both sides, and P2/D1 with drafts on both sides, in
 eager/graph execution. See [the P/D runbook](experiments/PIPELINE_PD.md).
 
+Under decode KV pool exhaustion, the ordinary request CPU backup/restore path
+preserves target KV while retraction invalidates the draft projection and capture
+lease. Real PP1 synchronous/overlap and PP2 synchronous pressure tests check
+every target layer before/after restore, projection rebuild, failed lease
+exclusion, fresh capture admission and post-exit Store reads. This is distinct
+from enabling the optional P/D KV offload manager or HiCache. See
+[the pressure runbook](experiments/PD_MEMORY_PRESSURE.md).
+
 Example with an exported checkpoint and local target artifacts:
 
 ```bash

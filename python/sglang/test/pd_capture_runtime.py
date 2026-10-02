@@ -121,7 +121,17 @@ class PDCaptureRuntimeBase(CustomTestCase):
         process.wait(timeout=20)
 
     def launch(
-        self, role, root, *, replay, tp_size, pp_size, draft=None, ragged_mode="static"
+        self,
+        role,
+        root,
+        *,
+        replay,
+        tp_size,
+        pp_size,
+        draft=None,
+        ragged_mode="static",
+        enable_overlap=None,
+        extra_args=(),
     ):
         folder = root / role
         folder.mkdir()
@@ -226,9 +236,11 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     "4",
                     *(
                         []
-                        if replay and pp_size == 1
+                        if (replay if enable_overlap is None else enable_overlap)
+                        and pp_size == 1
                         else ["--disable-overlap-schedule"]
                     ),
+                    *extra_args,
                 ],
             )
         self.addCleanup(self.stop_process, process)
