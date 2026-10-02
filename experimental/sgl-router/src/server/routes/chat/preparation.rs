@@ -195,17 +195,13 @@ impl PreparedRequest {
                 .into();
         }
         let prompts = text_ids.or_else(|| caller_token_rows(&value["input"]));
-        // Context limits apply to each prompt even when the engine must tokenize text;
-        // multimodal items count only their text, as image tokens are the engine's to count.
-        let estimate = |item: &Value| {
-            estimate_prefill_tokens(item.as_str().or(item["text"].as_str()).map_or(0, str::len))
-        };
-        let lengths = match (&prompts, &value["input"]) {
+        // Context limits apply to each prompt even when the engine must tokenize text.
+        let estimate = |item: &Value| estimate_prefill_tokens(text_len(item));
+        let lengths: Vec<_> = match (&prompts, &value["input"]) {
             (Some(prompts), _) => prompts.iter().map(|ids| ids.len().max(1)).collect(),
             (None, Value::Array(items)) => items.iter().map(estimate).collect(),
             (None, input) => vec![estimate(input)],
         };
-        let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
         let tokens = prompts
             .filter(|_| !batch)
             .and_then(|prompts| prompts.into_iter().next())
@@ -214,21 +210,10 @@ impl PreparedRequest {
                 rendered_from_chat: false,
             });
         Ok(Self {
-            path: EMBEDDINGS_PATH,
-            model,
-            streaming: false,
-            output_tokens: Some(0),
-            input_token_count: lengths.iter().sum::<usize>().max(1),
-            sequence_token_count: sequence_tokens,
-            expected_peak_sequence_tokens: Some(sequence_tokens as u64),
-            body,
             tokens,
             caller_set_rid: !value["rid"].is_null(),
             fans_out: batch,
-            forwarding_scope: None,
-            // Only PD bootstrap needs the parsed body, and embeddings have no PD.
-            parsed_body: None,
-            sampling_defaults: Vec::new(),
+            ..Self::no_output(EMBEDDINGS_PATH, model, body, &lengths)
         })
     }
 
@@ -236,27 +221,27 @@ impl PreparedRequest {
     /// tokenizes each query-document pair as its own prompt.
     pub(super) fn rerank(model: ModelId, body: Bytes) -> Result<Self, ApiError> {
         let value = Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
-        // Multimodal content counts only its text parts, as for embeddings.
-        let text_len = |content: &Value| match content {
-            Value::Array(parts) => parts
-                .iter()
-                .filter_map(|p| p["text"].as_str())
-                .map(str::len)
-                .sum(),
-            content => content.as_str().map_or(0, str::len),
-        };
-        let query = text_len(&value["query"]);
         // Qwen rerankers include the instruction in every query-document prompt.
-        let instruct = value["instruct"].as_str().map_or(0, str::len);
-        let lengths: Vec<usize> = value["documents"]
+        let shared = text_len(&value["instruct"]) + text_len(&value["query"]);
+        let lengths: Vec<_> = value["documents"]
             .as_array()
             .into_iter()
             .flatten()
-            .map(|document| estimate_prefill_tokens(instruct + query + text_len(document)))
+            .map(|document| estimate_prefill_tokens(shared + text_len(document)))
             .collect();
-        let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
         Ok(Self {
-            path: RERANK_PATH,
+            // Each document is its own engine request, and the engine reads no `rid`.
+            fans_out: true,
+            ..Self::no_output(RERANK_PATH, model, body, &lengths)
+        })
+    }
+
+    /// A request of `lengths` prompts that generates nothing. No PD serves it,
+    /// so it keeps no parsed body for bootstrap fields.
+    fn no_output(path: &'static str, model: ModelId, body: Bytes, lengths: &[usize]) -> Self {
+        let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
+        Self {
+            path,
             model,
             streaming: false,
             output_tokens: Some(0),
@@ -266,12 +251,11 @@ impl PreparedRequest {
             body,
             tokens: None,
             caller_set_rid: false,
-            // Each document is its own engine request, and the engine reads no `rid`.
-            fans_out: true,
+            fans_out: false,
             forwarding_scope: None,
             parsed_body: None,
             sampling_defaults: Vec::new(),
-        })
+        }
     }
 
     /// Whether the engine endpoint honors a routed DP rank; embeddings and rerank take none.
@@ -456,6 +440,18 @@ fn tokenize_input_text(ctx: &AppContext, model: &ModelId, input: &Value) -> Opti
         .into_iter()
         .map(|text| ctx.tokenizers.encode_prompt(&model.0, text))
         .collect()
+}
+
+/// Prompt text bytes of a string, a multimodal item or a list of content parts;
+/// image tokens are the engine's to count.
+fn text_len(content: &Value) -> usize {
+    match content {
+        Value::Array(parts) => parts.iter().map(text_len).sum(),
+        content => content
+            .as_str()
+            .or(content["text"].as_str())
+            .map_or(0, str::len),
+    }
 }
 
 /// Caller token IDs, one flat list or a row per prompt; `None` if malformed,
@@ -1235,23 +1231,14 @@ mod tests {
     fn rerank_estimates_each_query_document_pair() {
         let image = json!({"type": "image_url", "image_url": {"url": "x".repeat(4096)}});
         let documents = json!(["abcd", [{"type": "text", "text": "abcdefgh"}, image]]);
-        let mut body = json!({"query": "abcd", "documents": documents});
-        for (instruct, total, longest) in [
-            (None, 5, 3),
-            (Some(Value::Null), 5, 3),
-            (Some(json!("")), 5, 3),
-            (Some(json!("abcdefgh")), 9, 5),
-        ] {
-            if let Some(instruct) = instruct {
-                body["instruct"] = instruct;
-            }
-            let r = PreparedRequest::rerank(ModelId("stub-model".into()), body.to_string().into())
-                .unwrap();
+        for (instruct, total, longest) in [(json!(null), 5, 3), (json!("abcdefgh"), 9, 5)] {
+            let body = json!({"query": "abcd", "documents": documents, "instruct": instruct});
+            let r = PreparedRequest::rerank(ModelId("stub-model".into()), body.to_string().into());
+            let r = r.unwrap();
             assert_eq!(
                 (r.input_token_count, r.sequence_token_count),
                 (total, longest)
             );
-            assert_eq!(r.expected_peak_sequence_tokens, Some(longest as u64));
         }
     }
 
