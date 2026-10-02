@@ -603,6 +603,34 @@ def test_auto_hook_does_not_swallow_parser_visible_closes():
     assert not _token_accepts(structural_tag, output)
 
 
+def test_parser_drops_orphaned_tool_closers():
+    output = f"answer{ARGUMENT_CLOSE}{CALL_CLOSE}"
+
+    parsed = KimiK3Detector().detect_and_parse(output, [_tool(strict=False)])
+
+    assert parsed.normal_text == "answer"
+    assert parsed.calls == []
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 13])
+def test_streaming_parser_drops_orphaned_tool_closers(chunk_size):
+    output = f"answer{ARGUMENT_CLOSE}{CALL_CLOSE}"
+    detector = KimiK3Detector()
+    chunks = [
+        output[index : index + chunk_size]
+        for index in range(0, len(output), chunk_size)
+    ]
+
+    content = "".join(
+        detector.parse_streaming_increment(chunk, [_tool(strict=False)]).normal_text
+        or ""
+        for chunk in chunks
+    )
+    content += detector.finish([_tool(strict=False)]).normal_text or ""
+
+    assert content == "answer"
+
+
 @pytest.mark.parametrize(
     "tool_strict_level",
     [
