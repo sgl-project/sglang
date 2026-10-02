@@ -1562,6 +1562,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
+    defer_finalize = _deferred_finalize_enabled.get()
+    if defer_finalize and use_routed_topk:
+        raise RuntimeError("BF16 deferred finalize requires bypassed TopK")
 
     with use_symmetric_memory(
         get_parallel().tp_group, disabled=not is_allocation_symmetric()
@@ -1619,7 +1622,12 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 routed_scaling_factor=runner_config.routed_scaling_factor,
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 activation_type=activation_type,
+                do_finalize=not defer_finalize,
             )
+            if defer_finalize:
+                final_hidden_states = _make_deferred_finalize_output(
+                    final_hidden_states, top_k=topk_config.top_k
+                )
 
     return StandardCombineInput(hidden_states=final_hidden_states)
 
