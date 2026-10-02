@@ -418,7 +418,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         topk_ids = None
         topk_weights = None
         if num_tokens > 0:
-            router_logits, _ = self.gate(hidden_states)
+            router_logits, _ = self.gate(hidden_states.to(self.router_dtype))
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
