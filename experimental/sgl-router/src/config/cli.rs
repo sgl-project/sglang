@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
+use reqwest::header::HeaderValue;
 use std::num::NonZeroU32;
 
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
@@ -14,8 +15,8 @@ use crate::config::{
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
     Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
+    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
     DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
@@ -66,6 +67,11 @@ pub struct ModelArgs {
     /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
     #[arg(long)]
     pub tokenizer_path: Option<String>,
+
+    /// Skip loading a tokenizer; workers tokenize requests. Load-only policies only:
+    /// cache-aware routing, prefix-cache terms or filters, and length buckets require one.
+    #[arg(long, conflicts_with = "tokenizer_path")]
+    pub no_tokenizer: bool,
 
     /// Disable generated input_ids; workers tokenize messages, while routing still renders locally.
     /// Use for worker parser/template overrides or template stop strings.
@@ -128,6 +134,11 @@ pub struct ServerArgs {
     #[arg(long)]
     pub termination_grace_secs: Option<u64>,
 
+    /// API key the router sends on its own requests to workers (`/server_info`,
+    /// `/model_info`). Set it to the engines' `--api-key`.
+    #[arg(long)]
+    pub worker_api_key: Option<String>,
+
     /// Per-request upstream timeout in seconds.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
@@ -185,6 +196,11 @@ pub struct DiscoveryArgs {
     /// and every replica starts cold.
     #[arg(long)]
     pub kv_peer_selector: Option<String>,
+    /// EndpointSlice label key whose value is a worker's PD version group; a
+    /// prefill worker is paired only with decode workers of the same group.
+    /// Requires --prefill-selector and --decode-selector.
+    #[arg(long)]
+    pub pd_version_group_label: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -205,6 +221,10 @@ pub struct RoutingArgs {
     /// Policy used to select decode workers for PD requests.
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
+
+    /// Also pick the DP rank inside each selected multi-rank worker.
+    #[arg(long)]
+    pub dp_aware: bool,
 
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
@@ -461,22 +481,30 @@ impl Cli {
             .context("--default-chat-template-kwargs must be a JSON object")?
             .unwrap_or_default();
 
+        let worker_auth = self
+            .server
+            .worker_api_key
+            .as_deref()
+            .map(bearer)
+            .transpose()?;
         let config = Config {
             server: ServerConfig {
                 host: self.server.host,
                 port: self.server.port,
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
+                worker_auth,
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
                 log_format: self.server.log_format,
             },
             model: ModelConfig {
-                tokenizer_path: self
-                    .model
-                    .tokenizer_path
-                    .unwrap_or_else(|| self.model.model_id.clone()),
+                tokenizer_path: (!self.model.no_tokenizer).then(|| {
+                    self.model
+                        .tokenizer_path
+                        .unwrap_or_else(|| self.model.model_id.clone())
+                }),
                 id: self.model.model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 tokenizer: TokenizerConfig {
@@ -485,6 +513,7 @@ impl Cli {
                 },
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
+                dp_aware: self.routing.dp_aware,
                 bucket_config,
                 circuit_breaker,
                 cache_aware,
@@ -532,9 +561,10 @@ impl DiscoveryArgs {
                     self.service_discovery_namespace.is_none()
                         && self.selector.is_empty()
                         && self.prefill_selector.is_empty()
-                        && self.decode_selector.is_empty(),
+                        && self.decode_selector.is_empty()
+                        && self.pd_version_group_label.is_none(),
                     "--service-discovery-namespace / --selector / --prefill-selector / \
-                         --decode-selector require --service-discovery"
+                         --decode-selector / --pd-version-group-label require --service-discovery"
                 );
                 // Peer replicas are found through EndpointSlices too, so with
                 // any other backend the flag would be accepted and then
@@ -554,6 +584,17 @@ impl DiscoveryArgs {
                     join_selector(&self.prefill_selector).as_deref(),
                     join_selector(&self.decode_selector).as_deref(),
                 )?;
+                let version_group_label = self.pd_version_group_label;
+                if let Some(label) = &version_group_label {
+                    ensure!(
+                        matches!(mode, K8sDiscoveryMode::PdDisaggregation { .. }),
+                        "--pd-version-group-label requires --prefill-selector and --decode-selector"
+                    );
+                    ensure!(
+                        !label.trim().is_empty(),
+                        "--pd-version-group-label must not be empty"
+                    );
+                }
                 // An empty selector matches every EndpointSlice in the watched
                 // namespace(s), turning unrelated Services into "siblings".
                 ensure!(
@@ -567,6 +608,7 @@ impl DiscoveryArgs {
                     namespace: self.service_discovery_namespace.unwrap_or_default(),
                     mode,
                     peer_selector: self.kv_peer_selector,
+                    version_group_label,
                 })
             }
         };
@@ -951,11 +993,19 @@ fn join_selector(terms: &[String]) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(","))
 }
 
+/// `Bearer <key>`, marked sensitive so it stays out of `Debug` output.
+fn bearer(key: &str) -> Result<HeaderValue> {
+    let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
+        .context("--worker-api-key is not a valid HTTP header value")?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+        DiscoveryBackend, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
         MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
     };
 
@@ -1195,7 +1245,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
-        assert_eq!(c.model.tokenizer_path, "Qwen/Qwen3-0.6B");
+        assert_eq!(c.model.tokenizer_path.as_deref(), Some("Qwen/Qwen3-0.6B"));
     }
 
     #[test]
@@ -1209,7 +1259,25 @@ mod tests {
             "http://x:30000",
         ])
         .unwrap();
-        assert_eq!(c.model.tokenizer_path, "/models/qwen3/tokenizer.json");
+        assert_eq!(
+            c.model.tokenizer_path.as_deref(),
+            Some("/models/qwen3/tokenizer.json")
+        );
+    }
+
+    #[test]
+    fn no_tokenizer_disables_loading_and_conflicts_with_a_path() {
+        let base = ["--model-id", "qwen3", "--worker-urls", "http://x:30000"];
+        let c = into_config(&[&base[..], &["--no-tokenizer"]].concat()).unwrap();
+        assert_eq!(c.model.tokenizer_path, None);
+        assert!(into_config(
+            &[
+                &base[..],
+                &["--no-tokenizer", "--tokenizer-path", "/t.json"]
+            ]
+            .concat()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1566,6 +1634,69 @@ mod tests {
                 }
             ),
             _ => panic!("expected k8s backend"),
+        }
+    }
+
+    const PD_K8S: [&str; 5] = [
+        "--service-discovery",
+        "--prefill-selector",
+        "app=sglang,role=prefill",
+        "--decode-selector",
+        "app=sglang,role=decode",
+    ];
+
+    #[test]
+    fn pd_version_group_label_reaches_k8s_config() {
+        let args: Vec<_> = PD_K8S
+            .iter()
+            .copied()
+            .chain(["--pd-version-group-label", "sglang.ai/version-group"])
+            .collect();
+        let config = into_config_owned(with_model(&args)).unwrap();
+        let DiscoveryBackend::K8s(discovery) = config.discovery else {
+            panic!("expected k8s")
+        };
+        assert_eq!(
+            discovery.version_group_label.as_deref(),
+            Some("sglang.ai/version-group")
+        );
+    }
+
+    #[test]
+    fn rejects_pd_version_group_label_outside_k8s_pd() {
+        for (args, expected) in [
+            (
+                vec![
+                    "--worker-urls",
+                    "http://x:30000",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "require --service-discovery",
+            ),
+            (
+                vec![
+                    "--service-discovery",
+                    "--selector",
+                    "app=sglang",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "requires --prefill-selector and --decode-selector",
+            ),
+            (
+                PD_K8S
+                    .iter()
+                    .copied()
+                    .chain(["--pd-version-group-label", " "])
+                    .collect(),
+                "must not be empty",
+            ),
+        ] {
+            let err = into_config_owned(with_model(&args))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "args={args:?} got: {err}");
         }
     }
 

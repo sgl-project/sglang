@@ -814,6 +814,7 @@ class CPUGraphRunner:
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
+            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
