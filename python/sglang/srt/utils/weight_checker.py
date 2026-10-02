@@ -13,6 +13,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.weight_checker_comparator import (
     CHUNK_NUMEL,
     ComparableWeight,
+    Nvfp4MoEComparable,
     RawComparable,
     compare_weights,
     select_comparable_weight,
@@ -54,6 +55,78 @@ class QuantizedWeight(NamedTuple):
     comparable_cls: type[ComparableWeight]
     scale_name: str
     is_shuffled: bool = False
+
+
+class Nvfp4Weight(NamedTuple):
+    weight_name: str
+    scale_name: str
+    global_scale_name: str
+    layout: str
+    gated: bool
+    half: Optional[int] = None
+    reciprocal: bool = False
+
+    def comparable(self, raw):
+        global_scale = raw[self.global_scale_name]
+        if self.reciprocal:
+            global_scale = global_scale.reciprocal()
+        return Nvfp4MoEComparable(
+            raw[self.weight_name],
+            raw[self.scale_name],
+            global_scale,
+            layout=self.layout,
+            gated=self.gated,
+            half=self.half,
+        )
+
+
+def _nvfp4_quantized_weights(module, prefix):
+    method = module.quant_method
+    trtllm = method.enable_flashinfer_trtllm_moe
+    layout = "trtllm" if trtllm else "cutedsl"
+    # named_parameters removes aliases; plans must use names present in snapshots.
+    names = {id(param): prefix + name for name, param in module.named_parameters(recurse=False)}
+
+    def name(attr):
+        return names[id(getattr(module, attr))]
+
+    result = {}
+    for op in ("w13", "w2"):
+        gated = op == "w13" and module.moe_runner_config.is_gated
+        weight = name(f"{op}_weight")
+        source_scale = name(f"{op}_weight_scale")
+        scale = source_scale if trtllm else name(f"{op}_blockscale_swizzled")
+        global_scale = name(f"{op}_weight_scale_2")
+        spec = Nvfp4Weight(weight, scale, global_scale, layout, gated)
+        result[weight] = spec
+        if source_scale != scale:
+            result[source_scale] = spec._replace(scale_name=source_scale, layout="cutedsl_linear")
+        if not trtllm:
+            mma_scale = name(f"{op}_blockscale_mma")
+            result[mma_scale] = spec._replace(scale_name=mma_scale, layout="cutedsl_mma")
+
+        # Check execution alphas with their weights: a global-scale change may
+        # be compensated by qweight/blockscale without changing the effective GEMM.
+        if op == "w13":
+            for alpha, half in (("g1_alphas", 0), ("g1_alphas_up", 1)):
+                result[name(alpha)] = spec._replace(
+                    global_scale_name=name(alpha), half=half if gated else None
+                )
+            if trtllm:
+                situ = module.moe_runner_config.activation == "situ"
+                if gated and not situ:
+                    result[name("g1_scale_c")] = spec._replace(
+                        global_scale_name=name("g1_scale_c"), half=1
+                    )
+                for alpha in ("gemm1_clamp_limit", "gemm1_beta"):
+                    # These derived Parameters exist only when the activation config requests them.
+                    if hasattr(module, alpha) and not situ:
+                        result[name(alpha)] = spec._replace(
+                            global_scale_name=name(alpha), half=0 if gated else None, reciprocal=True
+                        )
+        else:
+            result[name("g2_alphas")] = spec._replace(global_scale_name=name("g2_alphas"))
+    return result
 
 
 _NON_PERSISTENT_BUFFER_PATTERNS = (
@@ -332,7 +405,7 @@ def _random_like(t: torch.Tensor):
     )
 
 
-def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
+def _build_quantized_set(model) -> Dict[str, QuantizedWeight | Nvfp4Weight]:
     """Run the router over the model: {weight_name: QuantizedWeight} for each
     quantized weight; weights absent from the set compare raw."""
     quantized_set = {}
@@ -341,6 +414,9 @@ def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
         if comparable_cls is None:
             continue
         prefix = f"{module_name}." if module_name else ""
+        if comparable_cls is Nvfp4MoEComparable:
+            quantized_set.update(_nvfp4_quantized_weights(module, prefix))
+            continue
         own = dict(module.named_parameters(recurse=False))
         for name, parameter in own.items():
             scale = name.replace("weight", comparable_cls.SCALE_SUFFIX)
@@ -356,19 +432,29 @@ def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
 def _build_check_entries(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
-    quantized_set: Optional[Dict[str, QuantizedWeight]] = None,
+    quantized_set: Optional[Dict[str, QuantizedWeight | Nvfp4Weight]] = None,
 ) -> Iterable[CheckEntry]:
     """Yields a CheckEntry per weight; quantized weights consume their scale, everything
     else is raw."""
     skip_compare_names = set(skip_compare_names)
     quantized_set = quantized_set or {}
     scale_names = {qw.scale_name for qw in quantized_set.values()}
+    scale_names.update(
+        qw.global_scale_name for qw in quantized_set.values() if isinstance(qw, Nvfp4Weight)
+    )
 
     for name, tensor in raw.items():
-        if name in scale_names:
+        if name in scale_names and name not in quantized_set:
             continue  # compared via its weight's comparable
         if name in quantized_set:
             qw = quantized_set[name]
+            if isinstance(qw, Nvfp4Weight):
+                yield CheckEntry(
+                    name,
+                    name not in skip_compare_names and qw.weight_name not in skip_compare_names,
+                    qw.comparable(raw),
+                )
+                continue
             yield CheckEntry(
                 name,
                 True,
