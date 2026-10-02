@@ -217,10 +217,9 @@ install_gdrcopy() {
 
     local gdrcopy_root=/opt/gdrcopy
     local gdrcopy_version=2.5.1
-    local -a gdrcopy_packages=(
-        nvidia-dkms-580 devscripts debhelper fakeroot dkms
-        check libsubunit0 libsubunit-dev python3-venv
-    )
+    # Userspace libgdrapi only: the gdrdrv kernel module comes from the host,
+    # and the gdrcopy test tools are unused.
+    local -a gdrcopy_packages=(devscripts debhelper fakeroot)
 
     apt-get update || true
     apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
@@ -237,11 +236,8 @@ install_gdrcopy() {
     git_clone_with_retry https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}" "--branch v${gdrcopy_version}"
     (
         cd "${gdrcopy_root}/packages"
-        CUDA=/usr/local/cuda ./build-deb-packages.sh
-        dpkg -i gdrdrv-dkms_*.deb
+        CUDA=/usr/local/cuda ./build-deb-packages.sh -k -t
         dpkg -i libgdrapi_*.deb
-        dpkg -i gdrcopy-tests_*.deb
-        dpkg -i gdrcopy_*.deb
     )
 
     local lib_path="/usr/lib/${ARCH}-linux-gnu"
