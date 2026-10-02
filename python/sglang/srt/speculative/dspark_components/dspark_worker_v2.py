@@ -107,6 +107,7 @@ class DSparkDecodeStep(msgspec.Struct, kw_only=True):
     verify_ids_2d: torch.Tensor
     grammar_tree: GrammarTree | None
     fold_eligible: bool
+    proposal_replaced: bool = False
     forward_started: bool = False
     accept_started: bool = False
     committed: bool = False
@@ -839,6 +840,33 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._pending_decode_step = step
         return step
+
+    def set_decode_proposal(self, step: DSparkDecodeStep, proposal: DraftProposal):
+        """Install an agreed static PP proposal before any target stage runs."""
+        self._check_decode_step(step)
+        if (
+            step.forward_started
+            or step.proposal_replaced
+            or step.run_compact
+            or step.layout is not None
+            or step.confidence is not None
+            or step.fold_eligible
+        ):
+            raise RuntimeError(
+                "DSpark proposal replacement requires an unlaunched static step"
+            )
+        verify_ids = torch.cat(
+            [proposal.draft_block_ids[:, :1], proposal.draft_block.draft_tokens], dim=1
+        ).contiguous()
+        grammar_tree = (
+            GrammarTree.from_linear_chain(verify_ids)
+            if step.batch.has_grammar
+            else None
+        )
+        step.proposal = proposal
+        step.verify_ids_2d = verify_ids
+        step.grammar_tree = grammar_tree
+        step.proposal_replaced = True
 
     def _check_no_pending_step(self):
         if (

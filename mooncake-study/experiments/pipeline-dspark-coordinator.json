@@ -1,0 +1,562 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-02",
+  "base_commit": "9f6bf2a0c47e7e28cfe2e2d7f2943efd1d94d02a",
+  "feature": "Synchronous DSpark PP stage coordination with canonical proposals, validated acceptance and aligned projected prefixes",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "resident_node": "node064",
+    "resident_gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "temporary_runs": [
+      {
+        "job": "job-f830e0dbc263-20261002083600",
+        "node": "node071",
+        "gpus": [
+          "GPU-6bfcb8c4-9cb0-0ce1-4366-cfb878bd65cd",
+          "GPU-7f16324c-fde5-ce5e-0ee0-81cc3c5872f4"
+        ],
+        "scope": "Initial coordinator NCCL test, before projected-prefix alignment."
+      },
+      {
+        "job": "job-d5f52212d1c5-20261002084834",
+        "node": "node071",
+        "gpus": [
+          "GPU-7dc47845-2810-8101-7c87-dfc12d2bfbd3",
+          "GPU-7f16324c-fde5-ce5e-0ee0-81cc3c5872f4"
+        ],
+        "scope": "Final coordinator NCCL test with projected-prefix alignment."
+      }
+    ],
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "versions": {
+      "python": "3.12.3",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "sglang-kernel": "0.4.6.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "temporary_environment_adjustment": "Removed incompatible flashinfer-cubin 0.6.12 and flashinfer-jit-cache 0.6.12+cu130 from each temporary pod's system Python. Shared venv and resident packages were unchanged."
+  },
+  "implementation": [
+    "Every DP1/CP1 PP-major/TP-minor rank enters a synchronized run_batch, including idle turns. Logical request/step identity is agreed before model execution.",
+    "Compare cached projected-prefix state and draft weight digests. Clear stale or divergent request context on all ranks so source-KV collectives traverse the same ranges. Decode prefix projection completes before local proposal preparation.",
+    "The last PP stage's TP0 supplies canonical proposal tokens and performs acceptance with matching corrected logits. Nonowners discard corrected logits from their local proposals.",
+    "Worker set_decode_proposal rebuilds static verify IDs and grammar trees before forward and rejects duplicate, launched, adaptive or folded replacements.",
+    "Execute target stages sequentially and relay step-bound activation frames before any accepted-context commit.",
+    "Validate accepted lengths, vocabulary, prefix arithmetic, bonus and every accepted draft token on all ranks before local commit.",
+    "Return local capture tickets and common next-draft state. Failed coordinators require worker restart.",
+    "No public scheduler loop, PP speculative serving gate, Mooncake API or training snapshot schema changed."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": "acfdb95328bfc7f6808e353ba52571974885983c1ab93b9e19017c897db45cc5",
+    "python/sglang/srt/speculative/dspark_components/dspark_pp_coordinator.py": "e64a0ef950f2ed387a656cf5ce661f2e02cda5e374bba595cd6f847b65ea5e66",
+    "python/sglang/test/dspark_pp_coordinator_utils.py": "2d373cd7b70e1e8d288eedbe2c9b9ee7f2b6c5664673bbbbc21ed38cd1ac1203",
+    "test/registered/unit/spec/test_dspark_pp_coordinator.py": "4250fd29e1b87b49b184c89290aa4344db7fb3677e2f605763b5e1528bb1e334",
+    "test/registered/storage/test_dspark_pp_coordinator_nccl.py": "0fd99af102c9cc5749a635322de0044d709ef579fdb16bf1eeafed0531a5a1ed",
+    "test/registered/unit/spec/test_dspark_execution_phases.py": "9d6cd66e15eef11639607da298aa09c2e6969e6e1cb2223063fefbc20e71031b",
+    "python/sglang/srt/speculative/dspark_components/dspark_verify.py": "a4ed64ec70f801a711bf661ab267c597301bac8507a28e10f8de5b3abe1f246d",
+    "python/sglang/test/dspark_shared_modules_utils.py": "d6e40eb5f714afb5d22da75865a95fc99721b9d0684e7f61243f0b7969ad3e85",
+    "test/registered/unit/spec/test_dspark_target_kv.py": "495892314e73931e1ebafebd18cf1ceb5c882da51d3b7a9b838086264a8d19ee",
+    "test/registered/storage/test_training_capture_pd_dspark.py": "2842b2114bdc99cea4cc3fd1621f3b516178b25f46499ced899f6d79f9d19668",
+    "test/registered/storage/test_training_capture_pd_dspark_hidden.py": "f439c71f93b63154ac3e3463a894d2a0137fda79a1668518f9aeb7ad8fa0a1fa"
+  },
+  "gpu_source_hashes_match": true,
+  "source_sync_note": "The final alignment change touched only the coordinator and its test helper. Neither is imported by the running PP1 real-model regressions; the worker and capture/runtime test sources were unchanged. Final Gloo/NCCL suites ran the aligned coordinator.",
+  "tests": [
+    {
+      "file": "test/registered/unit/spec/test_dspark_execution_phases.py",
+      "job_id": "01790901502674762185-848c5a579d24",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790901555.4134479,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790901502674762185-848c5a579d24.log",
+      "tests": 9,
+      "seconds": 0.016,
+      "log_sha256": "62acc541dd3268fde5436b8c2e7c886513742927197ffe4f8ed1daa380b3d1ea"
+    },
+    {
+      "file": "test/registered/unit/spec/test_dspark_target_kv.py",
+      "job_id": "01790901503003533496-9e6a3dca0ab0",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790901568.1979144,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790901503003533496-9e6a3dca0ab0.log",
+      "tests": 23,
+      "seconds": 1.542,
+      "log_sha256": "d1497e1b73f9accdeca8b76e420444c36eb3d845d4a083719b43fdaaedffed00"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark.py",
+      "job_id": "01790901503352221921-d556349b0d56",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790901906.4044929,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790901503352221921-d556349b0d56.log",
+      "tests": 4,
+      "seconds": 326.923,
+      "log_sha256": "71fc7c05f285bbde419c5ffd396ad50c1559f2703fea825319dee844c376b5a9"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark_hidden.py",
+      "job_id": "01790901503671237766-4838053c4c1f",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790902305.734934,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790901503671237766-4838053c4c1f.log",
+      "tests": 6,
+      "seconds": 388.24,
+      "log_sha256": "e69622165ce8c6366cd7b4b4a0b8fe0c34ffed2e8daebac1a3d2f08695c1d7f4"
+    },
+    {
+      "file": "test/registered/unit/spec/test_dspark_pp_coordinator.py",
+      "job_id": "01790902192291545596-01aa5ab335dd",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790902346.0785344,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790902192291545596-01aa5ab335dd.log",
+      "tests": 2,
+      "seconds": 27.439,
+      "log_sha256": "bccb1b40d12f824dad228e14c547ae126f58dfe5b0ca01dbd8decc023e736674"
+    },
+    {
+      "file": "test/registered/storage/test_dspark_pp_coordinator_nccl.py",
+      "tests": 1,
+      "seconds": 15.168,
+      "outcome": "completed",
+      "returncode": 0,
+      "exec_session_id": 67235,
+      "temporary_job": "job-d5f52212d1c5-20261002084834",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-coordinator-aligned-nccl-20261002.log",
+      "log_sha256": "400d41b07b0b1c5fe696dc1b0af9c6f2fda08c13acbc1777aa9ce4cd0839450c"
+    }
+  ],
+  "total_final_tests": 45,
+  "distributed_scenarios": {
+    "gloo": [
+      {
+        "tp": 2,
+        "pp": 2
+      },
+      {
+        "tp": 1,
+        "pp": 4
+      }
+    ],
+    "nccl": [
+      {
+        "tp": 1,
+        "pp": 2,
+        "gpus": 2
+      }
+    ],
+    "successes": [
+      "idle and prefill",
+      "two sequential decode steps",
+      "different local proposals, canonical final-PP TP0 owner",
+      "greedy and mixed sampling metadata; matching owner corrected logits",
+      "grammar tree rebuilt from agreed verify IDs",
+      "different local request and physical KV slots",
+      "rejected suffixes excluded from local commit",
+      "raw capture before accepted capture before local commit"
+    ],
+    "projection_alignment": [
+      "missing state on one rank",
+      "shorter valid prefix on one rank",
+      "stale weight version on one rank",
+      "projected end beyond retracted prefix on one rank"
+    ],
+    "failures": [
+      "request order",
+      "token history",
+      "idle/busy disagreement",
+      "CPU/device prefix disagreement",
+      "local proposal preparation",
+      "wrong anchor",
+      "invalid proposal token",
+      "target forward",
+      "stale activation frame",
+      "wrong accepted draft token",
+      "invalid accepted length",
+      "invalid prefill sample",
+      "receiver allocation",
+      "different draft weight digest"
+    ],
+    "failure_reuse": "All ranks reject a subsequent call on the failed coordinator. A fresh deterministic worker/coordinator fixture then succeeds on the same healthy groups; this does not establish real-worker partial-step recovery."
+  },
+  "real_model_cases": [
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "cap-accept",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 14,
+        "speculative_verify_forwards": 13,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "cap-accept",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 16,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 16,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 18,
+        "speculative_verify_forwards": 16,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "compact",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 14,
+        "speculative_verify_forwards": 13,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "compact",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 16,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 16,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 18,
+        "speculative_verify_forwards": 16,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    }
+  ],
+  "checked_snapshots": 60,
+  "earlier_passing_runs": [
+    {
+      "job_id": "01790901270304814538-681422e999c5",
+      "tests": 2,
+      "seconds": 27.216,
+      "scope": "Initial Gloo coordinator coverage, before formatting fixes and added failure/projection-state cases.",
+      "outcome": "completed",
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790901270304814538-681422e999c5.log",
+      "log_sha256": "9ecc19e4cc09bd39bdc9a5aa31cd2000772f0647b2111763164daf264d0c5b5f"
+    },
+    {
+      "job_id": "01790901270619014687-b3749cfcdb91",
+      "tests": 9,
+      "seconds": 0.017,
+      "scope": "Initial worker phase suite; final full-file run is recorded above.",
+      "outcome": "completed",
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790901270619014687-b3749cfcdb91.log",
+      "log_sha256": "12d47f2672ef31e83079f647edc6b5d5dd67d29d83d3989440214324a46ca241"
+    },
+    {
+      "job_id": "01790901502327696008-192cd34ee69b",
+      "tests": 2,
+      "seconds": 26.822,
+      "scope": "Complete Gloo coordinator coverage before projected-prefix alignment.",
+      "outcome": "completed",
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790901502327696008-192cd34ee69b.log",
+      "log_sha256": "2d45a3659696cae49122503e7e830e01aa7735bc58a7093d0ebd004cd72eb0a4"
+    },
+    {
+      "file": "test/registered/storage/test_dspark_pp_coordinator_nccl.py",
+      "tests": 1,
+      "seconds": 15.803,
+      "outcome": "completed",
+      "returncode": 0,
+      "exec_session_id": 55656,
+      "temporary_job": "job-f830e0dbc263-20261002083600",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-coordinator-nccl-20261002.log",
+      "log_sha256": "200913b750aa127839b8cc685599169e08bd74ccddbd7b09fc410dd48a0372f7",
+      "scope": "Before projected-prefix alignment; superseded by final NCCL coverage above."
+    }
+  ],
+  "static_checks": {
+    "black": {
+      "files": 6,
+      "passed": true
+    },
+    "ruff": {
+      "new_and_modified_test_files_clean": true,
+      "worker_baseline": {
+        "baseline_count": 6,
+        "current_count": 6,
+        "same_diagnostics": true
+      }
+    },
+    "diff_check_passed": true
+  },
+  "cleanup": {
+    "temporary_jobs_deleted": [
+      "job-f830e0dbc263-20261002083600",
+      "job-d5f52212d1c5-20261002084834"
+    ],
+    "both_temporary_pods_absent": true,
+    "temporary_live_process_checks": "Only sleep 3600 and inspection ps remained before each deletion.",
+    "resident_status": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790902451.0615678,
+      "idle_pid": 41218,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.5051648616790771
+    },
+    "resident_live_process_check": "Only worker PID 1, idle cuda_load PID 41218 and inspection ps remained.",
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "limits": [
+    "The coordinator is not instantiated by any public scheduler loop. Public PP speculative gates remain closed.",
+    "Distributed tests call production worker phase methods and TargetVerifyExecutor with deterministic model, proposal, acceptance and projection boundaries. Projection uses real collectives only for missing ranges; the actual KV encoder is not executed.",
+    "Real-model regressions are PP1 and do not execute the coordinator. They use actual Mooncake TCP P/D/Store and a Catalog test double.",
+    "Scheduler admission, request readiness, cancellation/retraction, P/D teacher-handoff integration and complete PP model/graph initialization remain to implement or validate.",
+    "Phase-boundary fences do not recover a crashed rank, failed device communication or an exception that strands peers inside an internal model/injector collective. Distributed failure handling and timeout/restart remain required.",
+    "The synchronous coordinator and full-prefix rebuild policy have not been benchmarked; no SLO or throughput claim.",
+    "Full PP speculative capture, source-KV NCCL encoder projection, trained checkpoint quality and production SpecForge integration remain unproven."
+  ]
+}

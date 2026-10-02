@@ -2908,12 +2908,86 @@ checkout's staged index checksum is unchanged.
 
 Native-module and runner-boundary tests do not prove complete PP draft model
 initialization. The real PP2 model regression is AR, and real speculative model
-tests are PP1. Full PP draft initialization, proposal/activation/acceptance
-scheduling, source-KV NCCL assembly, cancellation/recovery and performance remain
-required. Public PP speculative gates are unchanged. See
+tests are PP1. The stage coordinator below adds proposal/activation/acceptance
+ordering for an agreed batch. Full PP draft initialization, scheduler integration,
+source-KV NCCL assembly, cancellation/recovery and performance remain required.
+Public PP speculative gates are unchanged. See
 [the binding contract](TARGET_KV_DRAFT.md#pipeline-shared-modules-prerequisite),
 [the runbook](experiments/PIPELINE_MODULES.md) and
 [retained evidence](experiments/pipeline-dspark-modules.json).
+
+## DSpark Pipeline Stage Coordinator
+
+`DSparkPPCoordinator` now orders a static target-KV batch across DP1/CP1 PP/TP
+ranks. All ranks first agree on ordered request/step identity, token history,
+prefix/input state and static dimensions, including idle turns. The last PP
+stage's TP0 supplies the canonical proposal and performs acceptance using its
+matching corrected draft logits. Other ranks discard their old corrected logits.
+The worker's new `set_decode_proposal` operation replaces unlaunched static verify
+IDs and rebuilds the grammar tree before target execution.
+
+Each target stage sends its step-bound activation before the next stage runs.
+After all target stages finish, the coordinator broadcasts the final prefill
+sample or acceptance and validates lengths, prefix arithmetic, bonus and accepted
+draft tokens before committing through each stage's local physical slots. CPU
+world fences propagate validation/allocation and phase-boundary failures. A failed
+coordinator cannot accept another batch and requires worker restart.
+
+Review of `ensure_context` exposed a further collective-order requirement:
+different cached projected ends could make ranks enter different source-KV
+collectives. The coordinator now compares effective projected-prefix state and
+draft weight digests. Stale or divergent request context is invalidated on every
+rank so its full prefix is rebuilt consistently. Different weights fail. Decode
+prefix projection finishes before local proposal preparation, making that
+preparation's repeated context check a local no-op.
+
+The final complete Gloo coordinator file passed **two tests** in **27.439
+seconds**, job `01790902192291545596-01aa5ab335dd`, covering TP2/PP2 and TP1/PP4.
+The complete two-H100 NCCL coordinator file passed **one test** in **15.168
+seconds**. Each topology covers idle, prefill, two consecutive decode steps,
+different local proposals, greedy/mixed sampling metadata, grammar rebuilding,
+local slot differences and rejected suffix exclusion. Four projected-prefix
+cases cover missing, shorter, stale-version and retracted state on one rank.
+Fourteen failure cases reject inconsistent identities, preparation/forward
+failures, stale frames, invalid proposals/acceptance/prefill samples, receiver
+allocation failure and different weights before accepted-KV commit. Failed
+coordinators reject reuse; a fresh fixture succeeds on the same healthy groups.
+
+The complete modified worker phase file passed **nine tests** in **0.016
+seconds**, job `01790901502674762185-848c5a579d24`. It includes static proposal
+replacement, grammar-tree updates and replacement guards. The target-KV contract
+file passed **23 tests** in **1.542 seconds**, job
+`01790901503003533496-9e6a3dca0ab0`. The existing real-model target-KV P/D suite
+passed **four tests** in **326.923 seconds**, job
+`01790901503352221921-d556349b0d56`; the hidden-input suite passed **six tests** in
+**388.240 seconds**, job `01790901503671237766-4838053c4c1f`. These PP1 regressions
+checked **60 published snapshots** against independent online KV/logit sources
+using actual Mooncake TCP P/D/Store with the Catalog test double. They do not
+execute the new coordinator.
+
+All **45 final tests** passed. Earlier coordinator runs also passed and are
+retained separately; final Gloo/NCCL suites were rerun after prefix-state alignment.
+The later alignment edit touched only the otherwise-unimported coordinator and
+its helper while the PP1 regressions ran; their worker/runtime sources stayed
+unchanged. All 11 retained source hashes match the GPU checkout. Black passes
+for all six changed/new Python files. New files and the modified phase test pass
+Ruff; the worker retains the same six preexisting diagnostics. Both temporary
+two-GPU jobs were deleted, with pod absence verified after live-process checks.
+The resident worker resumed its idle workload with no active/queued experiment
+or remaining model/test/Store process. The original staged index is unchanged.
+
+The distributed fixture calls production worker phase methods, the verify
+executor and actual transport, but uses deterministic model/proposal/acceptance
+and projection boundaries. It does not load a full pipeline model or execute the
+real KV encoder. The scheduler does not yet instantiate the coordinator, and
+public PP speculative gates remain closed. Request admission/readiness,
+cancellation/retraction, P/D teacher-handoff integration, complete model/graph
+initialization, real PP speculative capture and performance remain required.
+Phase fences do not recover failed internal model collectives or crashed ranks;
+distributed timeout/restart handling still applies. See
+[the coordinator contract](TARGET_KV_DRAFT.md#pipeline-stage-coordinator-prerequisite),
+[the runbook](experiments/PIPELINE_COORDINATOR.md) and
+[retained evidence](experiments/pipeline-dspark-coordinator.json).
 
 ## Next Implementation
 

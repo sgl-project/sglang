@@ -240,8 +240,9 @@ API. Neither projection nor commit may be inserted before forwarding a PP frame
 that another participating rank is waiting for.
 
 The serving gates remain closed. Wiring the PP loop to these phases, synchronizing
-proposals and validating actual multi-GPU speculative serving remain required.
-Shared modules are available through the startup operation below. See
+request scheduling and validating actual multi-GPU speculative serving remain
+required. The coordinator below aligns proposals and executes these phases for
+an already agreed batch. Shared modules have a separate startup operation. See
 [the phase test runbook](experiments/PIPELINE_PHASES.md).
 
 ### Pipeline Result Relay Prerequisite
@@ -275,8 +276,8 @@ exercise actual PP dictionary transport and the spec-v2 token resolver with
 deterministic result tensors. They do not execute a PP DSpark target/draft model.
 The worker phases above must be scheduled separately: running a cross-stage KV
 collective inside a stage's forward before it sends activation would strand
-later stages. Proposal/activation scheduling remains required, and the PP
-speculative serving gates stay in place. See
+later stages. The coordinator below provides this ordering for an agreed batch;
+its scheduler integration remains pending and PP speculative gates stay closed. See
 [the result-channel runbook](experiments/PIPELINE_RESULT.md).
 
 ### Pipeline Shared Modules Prerequisite
@@ -315,10 +316,62 @@ Native-module tests exercise TP2/PP2 and TP1/PP4 with real Gloo collectives and
 TP1/PP2 with two-H100 NCCL broadcasts. They verify embedding output and draft
 head logits, tied/untied values, vocabulary padding and coordinated failures.
 The runner tests check factory arguments and real buffer allocation. These are
-not full PP draft-model initialization or speculative serving tests. The PP
-scheduler, proposal agreement, cancellation/recovery and complete model/graph
-initialization still need integration and runtime validation. See
+not full PP draft-model initialization or speculative serving tests. Integrating
+the coordinator below with the PP scheduler, cancellation/recovery and complete
+model/graph initialization still needs runtime validation. See
 [the shared-module runbook](experiments/PIPELINE_MODULES.md).
+
+### Pipeline Stage Coordinator Prerequisite
+
+`DSparkPPCoordinator.run_batch(batch)` executes one static target-KV batch across
+a DP1/CP1, PP-major/TP-minor world. Every rank participates, including idle turns
+with `batch=None`. The caller must first align request admission, readiness and
+batch selection, resolve forward inputs, and enter scheduler field isolation.
+The coordinator does not choose a common subset from different local batches.
+It rejects disagreement before model execution.
+
+The step identity includes a protocol version, coordinator sequence, phase,
+ordered request IDs, committed/output lengths, token-history digests, CPU/device
+prefix lengths, resolved input/anchor digest, prefill ranges, verify stride and
+vocabulary size. Physical request and KV slots intentionally remain rank-local.
+Projected-prefix state is also compared before any projection. Different cached
+ends or stale state invalidate that request's draft context on all ranks, causing
+a common full-prefix rebuild. Different draft weight digests fail. Decode prefix
+projection completes before local proposal preparation, whose repeated context
+check then has no collective work.
+
+Each replica prepares its proposal. The last PP stage's TP0 supplies the canonical
+token block through a world broadcast; only that rank later performs acceptance,
+using its matching corrected draft logits. Other ranks discard their old corrected
+logits. `set_decode_proposal` replaces an unlaunched static step's tokens and rebuilds
+the grammar tree. It rejects duplicate replacement, launched, adaptive or folded
+acceptance steps. Source proposals are validated before broadcasting.
+
+Target stages run in order. Each non-final stage sends a version-bound activation
+frame before the next stage runs. All stages finish target KV production before
+the final sample or acceptance is broadcast. Acceptance validation checks tensor
+shape/device/type, vocabulary bounds, prefix arithmetic, static acceptance limits,
+the bonus token and every accepted draft token against the agreed proposal. Padded
+rejected suffixes are ignored. Each worker then commits through its own physical
+slots and returns its own capture ticket and the common next-draft state.
+
+CPU world fences report local validation/allocation and phase-boundary errors.
+A failed coordinator cannot run another batch; recovery requires worker restart.
+These fences do not recover a crashed rank, a failed device collective or an
+exception that strands peers inside an internal model/injector collective. Those
+still require distributed failure handling and process-group timeout/restart.
+Only one batch is outstanding, and no other traffic may use its PP groups during
+the call. The synchronous implementation adds CPU/device synchronization and
+reconstructs a full draft prefix when cached states diverge; no performance SLO
+is claimed.
+
+The scheduler does not yet instantiate this coordinator. Public PP speculative
+gates remain closed. Its Gloo/NCCL tests use production worker phase methods and
+transport with deterministic target/proposal/acceptance/projection boundaries;
+they do not load a full pipeline draft or execute a real source-KV encoder.
+Scheduler admission, cancellation/retraction, P/D readiness, complete model/graph
+initialization and real PP speculative capture remain required. See
+[the coordinator runbook](experiments/PIPELINE_COORDINATOR.md).
 
 ### Disaggregated Context
 

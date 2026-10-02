@@ -240,6 +240,45 @@ class TestDSparkExecutionPhases(CustomTestCase):
             self.assertEqual(result.training_capture, "ticket")
         torch.testing.assert_close(results[0].next_token_ids, results[1].next_token_ids)
 
+    def test_agreed_proposal_rebuilds_verify_ids_and_grammar(self):
+        worker, step, _, _, _ = make_fixture(final_stage=False)
+        step.batch.has_grammar = True
+        proposal = DraftProposal(
+            draft_block_ids=step.proposal.draft_block_ids,
+            draft_block=DraftBlockResult(
+                draft_tokens=step.proposal.draft_block.draft_tokens + 7,
+                corrected_logits=None,
+                greedy_mask=step.proposal.draft_block.greedy_mask,
+                temperatures=step.proposal.draft_block.temperatures,
+            ),
+            draft_hidden=None,
+        )
+        worker.set_decode_proposal(step, proposal)
+        self.assertIs(step.proposal, proposal)
+        expected = torch.cat(
+            [proposal.draft_block_ids[:, :1], proposal.draft_block.draft_tokens], dim=1
+        )
+        torch.testing.assert_close(step.verify_ids_2d, expected)
+        torch.testing.assert_close(step.grammar_tree.resolve()[2], expected)
+        with self.assertRaisesRegex(RuntimeError, "unlaunched static"):
+            worker.set_decode_proposal(step, proposal)
+
+    def test_proposal_replacement_rejects_started_or_adaptive_steps(self):
+        for name, value in (
+            ("forward_started", True),
+            ("run_compact", True),
+            ("layout", object()),
+            ("confidence", torch.ones(2)),
+            ("fold_eligible", True),
+        ):
+            with self.subTest(name=name):
+                worker, step, _, _, _ = make_fixture(final_stage=False)
+                setattr(step, name, value)
+                original = step.verify_ids_2d
+                with self.assertRaisesRegex(RuntimeError, "unlaunched static"):
+                    worker.set_decode_proposal(step, step.proposal)
+                self.assertIs(step.verify_ids_2d, original)
+
     def test_logits_capture_precedes_adjustment_and_grammar_acceptance(self):
         worker, step, output, _, events = make_fixture(final_stage=True)
         step.sampling_info = object()
