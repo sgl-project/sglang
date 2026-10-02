@@ -1,0 +1,75 @@
+---
+title: pplx-decider-v1-27b
+description: "Serve Perplexity's pplx-decider-v1-27b decision model, fine-tuned from Qwen3.8-27B, through the System One compatible /v1/systemone route of SGLang."
+---
+
+## Model
+
+[pplx-decider-v1-27b](https://huggingface.co/perplexity-ai/pplx-decider-v1-27b) is a decision model fine-tuned from Qwen3.8-27B. It replaces the language model head with a readout over 255 answer codes and answers choice, yes or no (`noul`), and score questions about a text state and optional images, with a probability for every option and no generated text.
+
+## Launch
+
+```bash Command
+sglang serve --model-path perplexity-ai/pplx-decider-v1-27b --host 127.0.0.1 --port 30000
+```
+
+No extra flag is needed, and one H200 serves it in BF16. SGLang reads the checkpoint's `decision_config.json`, loads its readout, and serves `/v1/systemone` with the prompt, answer codes, and calibrated temperature the model was trained with.
+
+## Request
+
+```python Example
+import base64
+from pathlib import Path
+
+import requests
+
+URL = "http://127.0.0.1:30000/v1/systemone"
+teams = {
+    "type": "choice",
+    "instructions": "Which team should handle this request?",
+    "criteria": {
+        "billing": "Charges and refunds",
+        "technical_support": "Integration errors",
+        "sales": "Questions about buying a product",
+    },
+}
+response = requests.post(
+    URL,
+    json={
+        "model": "pplx-decider-v1-27b",
+        "state": "My Stripe integration keeps failing. I'm losing sales. Please help ASAP.",
+        "questions": {
+            "routing": teams,
+            "urgency": {"type": "noul", "instructions": "Does this message express urgency?"},
+        },
+    },
+    timeout=60,
+)
+response.raise_for_status()
+print(response.json()["answers"])
+
+image = base64.b64encode(Path("screenshot.png").read_bytes()).decode("ascii")
+response = requests.post(
+    URL,
+    json={
+        "model": "pplx-decider-v1-27b",
+        "state": "Look at the supplied image.",
+        "images": [image],
+        "questions": {
+            "color": {
+                "type": "choice",
+                "instructions": "What is the dominant color?",
+                "criteria": {"red": "Red", "green": "Green", "blue": "Blue", "other": "Another color"},
+            }
+        },
+    },
+    timeout=60,
+)
+print(response.json()["answers"]["color"])
+```
+
+A `choice` answer has the most probable option, a `noul` answer the probability of true, and a `score` answer the probability-weighted mean level, each with `probabilities` and `confidence`. Clients of the System One API, including the TypeSafe SDKs, work by pointing their base URL at the server. See [System One compatible API](/docs/supported-models/decision_models#system-one-compatible-api) for the request and response reference.
+
+## Limits
+
+Use `/v1/systemone`. `/v1/decisions` refuses this checkpoint because its labels and prompt are not the ones the readout was trained on, and chat or generation requests are not meaningful without a language model head.

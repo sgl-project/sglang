@@ -82,6 +82,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
         self.default_chat_template_kwargs = chat_serving.default_chat_template_kwargs
         self.chat_encoding_spec = chat_serving.chat_encoding_spec
         self.prompt_text_is_lossy = chat_serving._prompt_text_round_trip_is_lossy
+        self.decision_config = self.tokenizer_manager.model_config.decision_config
         tokenizer = self.tokenizer_manager.tokenizer
         # Other tokenizers skip the shortcut in _encode_labels and check the full prompt.
         self.added_tokens = (
@@ -133,6 +134,11 @@ class OpenAIServingDecisions(OpenAIServingBase):
         )
         if error is not None:
             return error
+        if self.decision_config is not None:
+            return (
+                f"{self.route} does not serve decision checkpoints, use /v1/systemone, "
+                "which renders the prompt and answer codes they were trained with"
+            )
         if request.images and request.return_prompt_token_ids:
             return (
                 "return_prompt_token_ids cannot replay image inputs through /v1/score"
@@ -244,11 +250,11 @@ class OpenAIServingDecisions(OpenAIServingBase):
         chat_template_kwargs = self._chat_template_kwargs(request.chat_template_kwargs)
         for question in request.questions:
             view = _decision_view(question)
+            labels = default_labels(view)
             try:
                 encoded = self._encode_question(
-                    text=text,
-                    view=view,
-                    labels=default_labels(view),
+                    content=render_question(text=text, view=view, labels=labels),
+                    labels=labels,
                     chat_template_kwargs=chat_template_kwargs,
                     images=request.images,
                 )
@@ -258,14 +264,13 @@ class OpenAIServingDecisions(OpenAIServingBase):
 
     def _encode_question(
         self,
-        text: str,
-        view: QuestionView,
+        content: str,
         labels: List[str],
         chat_template_kwargs: Dict[str, Any],
         images: List[ChatCompletionMessageContentImageURL],
+        system: Optional[str] = None,
     ) -> EncodedQuestion:
         tokenizer = self.tokenizer_manager.tokenizer
-        content = _render_question(text=text, view=view, labels=labels)
         image_data = []
         message_content = content
         if images:
@@ -287,7 +292,9 @@ class OpenAIServingDecisions(OpenAIServingBase):
                 [],
             )
             message_content = message["content"]
-        prompt = self._apply_chat_template(message_content, chat_template_kwargs)
+        prompt = self._apply_chat_template(
+            message_content, chat_template_kwargs, system
+        )
         if images:
             # Image marker metadata is an optional native processor capability.
             tokens = getattr(self.tokenizer_manager.mm_processor, "mm_tokens", None)
@@ -353,11 +360,15 @@ class OpenAIServingDecisions(OpenAIServingBase):
         return prompt_ids, label_ids, image_data
 
     def _apply_chat_template(
-        self, content: str | List[Dict[str, Any]], chat_template_kwargs: Dict[str, Any]
+        self,
+        content: str | List[Dict[str, Any]],
+        chat_template_kwargs: Dict[str, Any],
+        system: Optional[str] = None,
     ) -> str:
+        messages = [] if system is None else [{"role": "system", "content": system}]
         try:
             return self.tokenizer_manager.tokenizer.apply_chat_template(
-                [{"role": "user", "content": content}],
+                [*messages, {"role": "user", "content": content}],
                 tokenize=False,
                 add_generation_prompt=True,
                 **chat_template_kwargs,
@@ -500,7 +511,7 @@ def default_labels(view: QuestionView) -> List[str]:
     return list(view.names)
 
 
-def _render_question(text: str, view: QuestionView, labels: List[str]) -> str:
+def render_question(text: str, view: QuestionView, labels: List[str]) -> str:
     """Prompt wording of PROMPT_FORMAT_VERSION."""
     # Every /v1/decisions question has text. A question without its own text
     # drops the question line, and a yes or no question keeps its lead in.
