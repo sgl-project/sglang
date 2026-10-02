@@ -2381,8 +2381,9 @@ class KVCacheConfigurator:
             create_memory_pool_configurator,
         )
 
-        # Foundry LOAD reuses the config its SAVE resolved (same pool sizes).
-        replayed = get_foundry_adapter().begin_memory_pool_resolution()
+        # Foundry: the pool sizes come from a free-memory profile that differs
+        # between SAVE and LOAD, so LOAD reuses the config SAVE resolved.
+        replayed = get_foundry_adapter().replay_saved_memory_pool_config()
         if replayed is not None:
             return replayed
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
@@ -2393,7 +2394,7 @@ class KVCacheConfigurator:
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
-        get_foundry_adapter().end_memory_pool_resolution()
+        get_foundry_adapter().record_memory_pool_overrides()
         return config
 
     def config_from_budget(

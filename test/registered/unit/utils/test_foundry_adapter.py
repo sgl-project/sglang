@@ -51,13 +51,15 @@ def _fake_api(version=(FOUNDRY_INTEGRATION_API_MAJOR, 0)):
         "before_parallel_init",
         "after_parallel_init",
         "after_runner_distributed_init",
-        "end_memory_pool_resolution",
+        "record_memory_pool_overrides",
         "before_alloc_memory_pool",
         "after_alloc_memory_pool",
         "capture_one",
     ):
         setattr(api, name, record(name))
-    api.begin_memory_pool_resolution = record("begin_memory_pool_resolution", "cfg")
+    api.replay_saved_memory_pool_config = record(
+        "replay_saved_memory_pool_config", "cfg"
+    )
     api.shared_read_ends_override = record("shared_read_ends_override", "POST")
 
     @contextmanager
@@ -96,7 +98,7 @@ class TestFoundryAdapter(CustomTestCase):
             adapter = activate_foundry(SimpleNamespace(cuda_graph_persistence=None))
             self.assertIs(adapter, get_foundry_adapter())
             self.assertFalse(adapter.enabled)
-            self.assertIsNone(adapter.begin_memory_pool_resolution())
+            self.assertIsNone(adapter.replay_saved_memory_pool_config())
             self.assertIsNone(adapter.shared_read_ends_override(None, None, None))
             with adapter.capture_scope(object()), adapter.configure_subprocess():
                 pass
@@ -152,8 +154,8 @@ class TestFoundryAdapter(CustomTestCase):
             adapter.before_parallel_init("cuda")
             adapter.after_parallel_init()
             adapter.after_runner_distributed_init(runner)
-            self.assertEqual(adapter.begin_memory_pool_resolution(), "cfg")
-            adapter.end_memory_pool_resolution()
+            self.assertEqual(adapter.replay_saved_memory_pool_config(), "cfg")
+            adapter.record_memory_pool_overrides()
             adapter.before_alloc_memory_pool(runner)
             adapter.after_alloc_memory_pool(runner)
             with adapter.capture_scope(runner):
