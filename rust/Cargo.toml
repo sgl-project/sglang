@@ -4,6 +4,7 @@ members = [
     "../proto",
     "sglang-grpc",
     "sglang-mm",
+    "sglang-processor",
     "sglang-renderer",
     "sglang-server"
 ]

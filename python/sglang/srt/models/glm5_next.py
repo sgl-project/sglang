@@ -1,7 +1,6 @@
 import logging
 from array import array
 from contextlib import nullcontext
-from functools import partial
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -26,6 +25,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
     MHCState,
@@ -123,7 +123,7 @@ from sglang.srt.utils.common import (
     LazyValue,
     add_prefix,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
     set_weight_attrs,
 )
 
@@ -318,11 +318,14 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             swiglu_limit=vision_config.swiglu_limit,
         )
 
-        self.downsample = nn.Conv2d(
+        # These non-overlapping patches are equivalent to unfold + linear and
+        # avoid MIOpen's expensive per-shape convolution search on ROCm.
+        self.downsample = Conv2dLayer(
             in_channels=vision_config.hidden_size,
             out_channels=vision_config.out_hidden_size,
             kernel_size=vision_config.spatial_merge_size,
             stride=vision_config.spatial_merge_size,
+            disable_linear=False,
         )
         self.post_layernorm = GlmOcrRMSNorm(
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
@@ -391,10 +394,8 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         head_shard_size = get_parallel().attn_tp_size
         head_shard_rank = get_parallel().attn_tp_rank
-        _head_shard_rank_getter = partial(getattr, get_parallel(), "attn_tp_rank")
 
         self.hidden_size = hidden_size
         self.config = config
@@ -533,7 +534,7 @@ class Glm5NextLinearAttention(nn.Module):
 
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, _head_shard_rank_getter)},
+            {"weight_loader": sharded_weight_loader(0)},
         )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
@@ -554,7 +555,7 @@ class Glm5NextLinearAttention(nn.Module):
         )
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(2, _head_shard_rank_getter)},
+            {"weight_loader": sharded_weight_loader(2)},
         )
 
         self.o_norm = FusedRMSNormGated(
@@ -1011,7 +1012,7 @@ class Glm5NextModel(nn.Module):
             else None
         )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm5NextDecoderLayer(
                 config=config,
@@ -1020,8 +1021,6 @@ class Glm5NextModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -1237,7 +1236,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         self.pp_group = get_parallel().pp_group
         self.config = text_config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.use_dsa = is_deepseek_dsa(text_config)
         self.num_fused_shared_experts = 0
@@ -1602,8 +1600,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
 
         def maybe_map_fp8_block_scale_name(name: str) -> str:
-            if name.endswith("weight_scale"):
-                candidate = name.removesuffix("weight_scale") + "weight_scale_inv"
+            # Quark stores dequantization scales without native block-FP8's
+            # "_inv" suffix, including fused w13/w2 expert parameters.
+            if name not in params_dict and name.endswith("weight_scale"):
+                candidate = name + "_inv"
                 if candidate in params_dict:
                     return candidate
             return name

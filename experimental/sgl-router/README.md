@@ -3,11 +3,12 @@
 Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
 Serves a single model and routes across its workers. Exposes
-`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions`
-(buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker
-pools come from either a static URL list or Kubernetes EndpointSlice
-discovery. Both edges speak cleartext HTTP/2 where the peer does — see
-[HTTP/2](#http2).
+`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, [`/v1/embeddings`](#embeddings),
+[`/v1/rerank`](#rerank), `/v1/chat/completions` and SGLang's native
+[`/generate`](#native-generate) (buffered and SSE), plus `/healthz` / `/readyz`
+and `/metrics`. Worker pools come from either a static URL list or Kubernetes
+EndpointSlice discovery. Both edges speak cleartext HTTP/2 where the peer does —
+see [HTTP/2](#http2).
 
 ## Building
 
@@ -51,6 +52,19 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+To run two engine versions side by side in PD mode (e.g. during a rollout),
+pass `--pd-version-group-label <key>`. A prefill worker is then paired only with
+decode workers that have the same value for that EndpointSlice label (inherited
+from the Service, so use one Service per role and version), so KV never crosses
+versions. Unlabeled workers form their own group.
+
+```bash
+sgl-router --model-id qwen3 --service-discovery \
+  --prefill-selector app=engines-qwen3,role=prefill \
+  --decode-selector app=engines-qwen3,role=decode \
+  --pd-version-group-label sglang.ai/version-group
+```
+
 External KV indexer as the cache-aware signal source:
 
 ```bash
@@ -68,6 +82,52 @@ sgl-router \
 The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
+
+### Peer bootstrap (Kubernetes)
+
+A replica that starts mid-fleet subscribes to each worker's KV topic
+mid-stream, so everything already resident in the engines' caches is invisible
+to it and it routes cache-blind until traffic re-stores those blocks —
+degrading the engines' locality for the whole fleet, once per replica on every
+rolling update. With a peer selector set, a booting replica instead pulls a
+tree snapshot from a warm sibling over `/internal/kv_snapshot` and splices it
+under its own live delta stream, and `/readyz` stays 503 until that bootstrap
+settles. Off unless `--kv-peer-selector` is set; requires `--policy
+cache_aware` with the Router-local radix tree (not an external Indexer) and
+`--service-discovery`, which the CLI enforces.
+
+```bash
+sgl-router \
+  --model-id qwen3 --policy cache_aware \
+  --service-discovery --service-discovery-namespace prod \
+  --selector app=engines-qwen3 \
+  --kv-peer-selector kubernetes.io/service-name=sgl-router
+```
+
+- `--kv-peer-selector` is matched against **EndpointSlice labels** — the
+  router Service's labels plus `kubernetes.io/service-name`, never the pods'
+  labels, so `kubernetes.io/service-name=<router-service>` is the unambiguous
+  choice. A pod-template label matches nothing and every replica boots cold.
+- `--kv-bootstrap-timeout-ms` (default 600000) bounds the whole bootstrap;
+  readiness waits on it, so startup/readiness probes must tolerate a replica
+  staying unready this long.
+- `--kv-bootstrap-fetch-timeout-cap-ms` (default 300000) caps one snapshot
+  fetch within that budget.
+- `--kv-bootstrap-seed-required` (off by default) keeps holding `/readyz` when
+  siblings were present but their tree could not be pulled, bounded at
+  max(3× the bootstrap timeout, 60s) — it delays a failed seed's replica (and
+  with it a rolling update) rather than shipping it cache-blind; it cannot
+  stall a rollout indefinitely.
+
+The deployment needs two things beyond the flags: the router's ServiceAccount
+must hold `get`/`list`/`watch` on `endpointslices` in the watched namespace
+(the worker-discovery Role already grants this), and the pod spec should wire
+`POD_NAME`, `POD_NAMESPACE` and `POD_IP` from the downward API so a replica
+can exclude itself from its own peer list. A rolling update should surge
+(`maxUnavailable: 0`) so new replicas always have warm siblings to copy from.
+`tests/e2e/k8s_integration/manifests/kv-bootstrap.yaml` is a worked example of
+all of it, and the `sgl_router_kv_bootstrap_*` series in
+[monitoring/README.md](monitoring/README.md) make the whole path observable.
 
 ### Reorg routing
 
@@ -88,10 +148,58 @@ buckets and are not accepted on this path.
 
 Omitting `--chat-routing` keeps the existing policies and defaults.
 
+Both reorg affinity policies accept `--affinity-mode prefer` (default) or
+`balanced`. Prefer keeps an admissible session binding or the best admissible
+prefix owner. Balanced samples a power-of-two alternative and switches only
+when the affinity engine's waiting uncached tokens exceed both
+`alternative * --affinity-load-factor` (default 2) and
+`alternative + --affinity-load-gap` (default 1024). Missing fresh native load
+preserves admissible affinity; ties also preserve it.
+
+Both modes fall back within the group when affinity fails admission, excluding
+rejected engines. The fallback winner must pass admission; failure advances to
+the next bucket. Session replacements are bound after admission during selection,
+not after dispatch. Reorg rejects legacy pressure guards, cache switch margins,
+and queue/saturation gates in favor of these shared affinity settings.
+
+### Optional tokenizer for load-only routing
+
+`--no-tokenizer` skips tokenizer loading for load-only policies such as
+`power_of_two` and `session_aware`, on either routing path. Workers tokenize the
+original messages, and `/v1/tokenize` and `/v1/detokenize` are unavailable.
+Cache-aware routing, prefix-cache terms or filters, and `--bucket-config` still
+require a tokenizer.
+
+### DP-rank routing
+
+An engine launched with `--dp-size` or `--attn-dp-size` runs several DP ranks,
+each with its own KV cache, behind one endpoint. With `--dp-aware`, the router
+also picks the rank inside the selected worker. It sends that rank as
+`X-Data-Parallel-Rank`, which the engine honors, and overwrites any value the
+client sent. The router picks the first of these that applies:
+
+1. A hash of the sticky routing key or session id, so a conversation keeps
+   its rank and router replicas agree.
+2. The rank with the deepest cached prefix in the local KV tree.
+3. The rank with the fewest requests this router has in flight on it.
+
+In PD mode, decode is ranked by load only. The bootstrap room satisfies
+`room % prefill_dp_size == prefill_rank`, which is how a decode engine finds
+the prefill rank.
+
+### Engines with `--api-key`
+
+The router reads each worker's `/server_info` and `/model_info` to learn its
+model, KV-event publisher, HTTP/2 support and DP size. An engine launched with
+`--api-key` rejects those requests without the key, so pass the same key as
+`--worker-api-key`. Chat requests and `/flush_cache` forward the caller's
+`Authorization` header instead, so callers still need the engine key.
+
 ### Fleet-wide sampling contract
 
 `--override-sampling-params` fixes the sampling configuration for every client
-of this router, independently of what the engine's own defaults happen to be:
+of this router, independently of what the engine's own defaults happen to be
+(on native [`/generate`](#native-generate), in each prompt's `sampling_params`):
 
 ```bash
 sgl-router \
@@ -258,6 +366,53 @@ case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
 backend and cache state. `/metrics` exposes only
 `sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
 how much tokenization work the cache reuses.
+
+## Native `/generate`
+
+`/generate` (`POST` or `PUT`) has the engine's interface: the same
+`GenerateReqInput` body and the same response, buffered or SSE. The body names no
+model, so requests go to the one this router serves. Worker selection
+(`--chat-routing`, `--policy`), PD dispatch, and abort-on-disconnect are shared
+with chat completions.
+
+With a tokenizer loaded, the router tokenizes `text` (a string or a list) with
+the special tokens SGLang adds (BOS per `add_bos_token` for Llama-, Gemma- and
+Cohere-class tokenizers, otherwise the `tokenizer.json` post-processor's), and
+forwards it as `input_ids`. The engine skips tokenizing and routing sees its exact
+tokens. Multimodal requests keep `text`, since the engine expands placeholders
+from it, and `--disable-input-ids-forwarding` keeps it for every request. So does
+a model whose `tokenizer.json` normalizer transformers replaces on load (legacy
+SentencePiece Llama files, bge-m3), or whose `tokenizer_config.json` the router
+cannot read, as the router cannot reproduce its tokens. A batch goes to one
+worker: load counts every prompt and each of its `n` samples, while bucket and
+context limits bound the longest prompt plus its own `max_new_tokens`.
+
+Otherwise the body passes through, plus PD bootstrap fields, a minted `rid` for
+a single prompt that has none, and `--override-sampling-params` defaults. Under
+`--dp-aware` each worker's body also carries the chosen `routed_dp_rank`; a PD
+batch or `n > 1` request leaves the prefill rank to the engine, which gives item
+`i` the bootstrap room `room + i`.
+
+## Embeddings
+
+`/v1/embeddings` has the engine's interface: the same OpenAI `EmbeddingRequest`
+body and response. As for chat completions, `model` must name the served model.
+A PD fleet answers 400, since prefill and decode engines serve no embeddings.
+
+Text `input` (a string or a list) is tokenized and forwarded as token IDs, as for
+[`/generate`](#native-generate), plus the EOS SGLang appends for EmbeddingGemma.
+Blank prompts and multimodal items stay as sent, for the engine to reject or
+render. A list is a batch for one worker, routed on load. A single prompt with no
+`rid` gets a minted one. Under `--dp-aware` the engine picks the rank, since its
+embeddings endpoint reads none.
+
+## Rerank
+
+`/v1/rerank` has the engine's interface: the same `V1RerankReqInput` body and
+response, sent as `POST` or `PUT` to the model this router serves. The body is
+forwarded as sent, since the engine renders and tokenizes each query-document
+pair. Routing is on load, with each pair's size estimated from its text. As for
+embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 
 ## DeepSeek V4
 
