@@ -100,6 +100,16 @@ place the replay base at least dp_size ports past the PUB base. The engine keeps
 the last `buffer_steps` batches (default 10000); older gaps stay unrepaired.
 `sgl_router_kv_event_replays_total{outcome}` counts the attempts.
 
+### Pending prefixes
+
+Until the engine's KV events arrive, requests that share a cold prefix see no
+cached owner and spread across workers, each prefilling the same prefix. This
+is common with parallel sampling, RL rollouts and agent fan-out.
+`--cache-pending-prefix-ttl-ms` credits a worker with a prompt's prefix for that
+long after routing it there, so the burst stays together. It is off by default
+and needs `--policy cache_aware` with the Router-local radix tree.
+`sgl_router_cache_pending_prefix_hits_total` counts the lookups it decided.
+
 ### Peer bootstrap (Kubernetes)
 
 A replica that starts mid-fleet subscribes to each worker's KV topic

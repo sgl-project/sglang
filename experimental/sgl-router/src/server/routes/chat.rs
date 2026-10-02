@@ -217,6 +217,12 @@ async fn select_workers(
 
     let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context);
     let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
+    if let (Some(provider), Some(signal)) = (
+        &ctx.radix_tree_prefix_provider,
+        &routing_context.prefix_matches,
+    ) {
+        provider.record_route(signal, &prefill.url);
+    }
     let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context, true)?;
     Ok(SelectedWorkers {
         prefill,
@@ -422,6 +428,7 @@ async fn lookup_prefix_matches(
             Some(ExternalPrefixSignal {
                 outcome,
                 query_blocks,
+                block_hashes: None,
             })
         }
         // Without usable indexer inputs, try the in-process radix tree.

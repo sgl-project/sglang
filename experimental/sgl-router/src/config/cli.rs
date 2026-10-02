@@ -264,6 +264,12 @@ pub struct CacheArgs {
     #[arg(long, value_enum)]
     pub cache_prefix_provider: Option<CachePrefixProvider>,
 
+    /// Credit a worker with a prompt's prefix for this many milliseconds after
+    /// routing it there, before the engine's KV events confirm it, so a burst
+    /// sharing a cold prefix lands together. Requires the radix_tree provider.
+    #[arg(long)]
+    pub cache_pending_prefix_ttl_ms: Option<u64>,
+
     /// External KV indexer gRPC endpoint used as the authoritative cache signal.
     /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
     #[arg(long)]
@@ -771,6 +777,12 @@ impl CacheArgs {
             self.kv_indexer_query_max_inflight.is_none() || self.kv_indexer_endpoint.is_some(),
             "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
         );
+        ensure!(
+            self.cache_pending_prefix_ttl_ms.is_none()
+                || (policy == PolicyKind::CacheAware
+                    && cache_prefix_provider == CachePrefixProvider::RadixTree),
+            "--cache-pending-prefix-ttl-ms requires --policy cache_aware with the radix_tree prefix provider"
+        );
         let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
         if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
@@ -808,6 +820,7 @@ impl CacheArgs {
                 .kv_bootstrap_fetch_timeout_cap_ms
                 .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
             bootstrap_seed_required: self.kv_bootstrap_seed_required,
+            pending_prefix_ttl_ms: self.cache_pending_prefix_ttl_ms.unwrap_or(0),
         }))
     }
 }
@@ -2779,6 +2792,23 @@ mod tests {
             .expect("native cache-aware needs its default configuration");
         assert_eq!(cache.prefix_provider, CachePrefixProvider::RadixTree);
         assert!(cache.kv_indexer_endpoint.is_none());
+    }
+
+    #[test]
+    fn pending_prefix_ttl_needs_the_local_radix_tree() {
+        let cache = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
+            .unwrap()
+            .model
+            .cache_aware
+            .unwrap();
+        assert_eq!(cache.pending_prefix_ttl_ms, 500);
+        for args in [
+            "--policy power_of_two --cache-pending-prefix-ttl-ms 500",
+            "--policy cache_aware --kv-indexer-endpoint http://i:1 --cache-pending-prefix-ttl-ms 500",
+        ] {
+            let err = cfg_of(args).unwrap_err().to_string();
+            assert!(err.contains("--cache-pending-prefix-ttl-ms"), "{args}: {err}");
+        }
     }
 
     #[test]
