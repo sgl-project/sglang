@@ -1326,7 +1326,7 @@ def _fused_append_shared_experts_kernel(
     shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
 
     if HAS_PADDING:
-        # Padded rows retain valid ids but contribute zero weight.
+        # Padded rows zero routed ids and all weights.
         if pid >= tl.load(num_token_non_padded_ptr):
             ids = tl.zeros([BLOCK_K], dtype=ids.dtype)
             ws = tl.zeros([BLOCK_K], dtype=ws.dtype)

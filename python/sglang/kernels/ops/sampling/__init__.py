@@ -46,7 +46,7 @@ def softmax(
     """Softmax for sampler logits, optionally with per-row temperatures."""
     import torch
 
-    if temperatures is not None and logits.is_cuda:
+    if temperatures is not None and logits.is_cuda and torch.version.hip is not None:
         from sglang.kernels.ops.sampling.temperature_softmax import (
             temperature_softmax,
         )
