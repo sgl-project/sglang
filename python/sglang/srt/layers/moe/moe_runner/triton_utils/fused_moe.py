@@ -25,6 +25,7 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
@@ -36,6 +37,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
+    is_ppu,
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -53,6 +55,7 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_is_ppu = is_ppu()
 
 
 if _is_cuda:
@@ -82,6 +85,12 @@ elif _is_musa:
     from sgl_kernel import moe_sum_reduce
 
     _silu_and_mul_musa = torch.nn.SwishGLU()
+
+if _is_ppu:
+    from sglang.srt.layers.moe.fused_moe_triton.fused_valu_moe import (
+        invoke_special_optimal_fused_moe_impl,
+        prepare_for_dispatch,
+    )
 
 # Try to import vllm_ops for non-CUDA/HIP/XPU platforms
 _has_vllm_ops = False
@@ -417,6 +426,7 @@ def _prepare_fused_moe_run(
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]],
+    use_ppu_optimal_fusedmoe: bool = False,
 ):
     """Resolve config, down_config, TMA flag, and aligned expert routing ids.
 
@@ -446,6 +456,7 @@ def _prepare_fused_moe_run(
         block_shape=block_shape,
         per_channel_quant=per_channel_quant,
         return_down_config=True,
+        version=2 if use_ppu_optimal_fusedmoe else 1,
     )
     # Copy config to avoid mutating the lru_cached dict returned by
     # get_moe_configs; we pop USE_TMA below.
@@ -525,6 +536,7 @@ def _fused_moe_kernel_sequence(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    use_ppu_optimal_fusedmoe: bool = False,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -622,34 +634,55 @@ def _fused_moe_kernel_sequence(
             dtype=hidden_states.dtype,
         )
 
-    invoke_fused_moe_kernel(
-        a1_q if a1_q is not None else hidden_states,
-        w1,
-        b1,
-        gemm1_out,
-        a1_scale,
-        w1_scale,
-        w1_zp,
-        topk_weights,
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        apply_router_weight_on_input,
-        topk,
-        config,
-        compute_type=compute_type,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        per_channel_quant=per_channel_quant,
-        block_shape=block_shape,
-        c_sorted=down_moe_use_tma,
-        b_use_tma=up_moe_use_tma,
-        filter_expert=filter_expert,
-        fuse_swiglu=fuse_swiglu_interleaved,
-    )
+    if use_ppu_optimal_fusedmoe:
+        # The PPU OPT fused path writes the full-width pre-activation
+        # buffer; it cannot share the fuse_swiglu_interleaved epilogue.
+        assert not fuse_swiglu_interleaved, (
+            "PPU optimal fused MoE path does not support fuse_swiglu_interleaved"
+        )
+        dispatch_tuple = prepare_for_dispatch(topk_ids, config, E)
+        invoke_special_optimal_fused_moe_impl(
+            hidden_states,
+            w1,
+            intermediate_cache1,
+            topk_weights,
+            dispatch_tuple,
+            apply_router_weight_on_input,
+            topk_ids.shape[1],
+            config["UP"] if "UP" in config.keys() else config,
+            compute_type,
+            True,
+        )
+    else:
+        invoke_fused_moe_kernel(
+            a1_q if a1_q is not None else hidden_states,
+            w1,
+            b1,
+            gemm1_out,
+            a1_scale,
+            w1_scale,
+            w1_zp,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            apply_router_weight_on_input,
+            topk,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            block_shape=block_shape,
+            c_sorted=down_moe_use_tma,
+            b_use_tma=up_moe_use_tma,
+            filter_expert=filter_expert,
+            fuse_swiglu=fuse_swiglu_interleaved,
+            use_valu=config.get("USE_VALU", False),
+        )
 
     if hooks and hooks.after_gate_up:
         # Hooks expect intermediate_cache1 shaped (num_tokens, topk, N); the
@@ -845,43 +878,62 @@ def _fused_moe_kernel_sequence(
         out_slice = out_hidden_states
         out_slice.zero_()
 
-    invoke_fused_moe_kernel(
-        intermediate_cache2,
-        w2,
-        b2,
-        (
-            out_slice
-            if use_fused_moe_sum_all_reduce
-            else (
+    if use_ppu_optimal_fusedmoe:
+        invoke_special_optimal_fused_moe_impl(
+            intermediate_cache2,
+            w2,
+            (
                 intermediate_cache3
-                if _use_intermediate
-                else out_hidden_states.unsqueeze(0)
-            )
-        ),
-        a2_scale,
-        w2_scale,
-        w2_zp,
-        topk_weights,
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        not apply_router_weight_on_input and not no_combine,
-        1,
-        down_config or config,
-        compute_type=compute_type,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        per_channel_quant=per_channel_quant,
-        block_shape=block_shape,
-        a_use_tma=down_moe_use_tma,
-        b_use_tma=down_moe_use_tma,
-        filter_expert=filter_expert,
-        fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
-        router_topk=topk,
-    )
+                if not no_combine and topk_ids.shape[1] != 1
+                else out_hidden_states
+            ),
+            topk_weights,
+            dispatch_tuple,
+            not apply_router_weight_on_input,
+            1,
+            config["DOWN"] if "DOWN" in config.keys() else config,
+            compute_type,
+            False,
+        )
+    else:
+        invoke_fused_moe_kernel(
+            intermediate_cache2,
+            w2,
+            b2,
+            (
+                out_slice
+                if use_fused_moe_sum_all_reduce
+                else (
+                    intermediate_cache3
+                    if _use_intermediate
+                    else out_hidden_states.unsqueeze(0)
+                )
+            ),
+            a2_scale,
+            w2_scale,
+            w2_zp,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input and not no_combine,
+            1,
+            down_config or config["DOWN"] if "DOWN" in config.keys() else config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            block_shape=block_shape,
+            a_use_tma=down_moe_use_tma,
+            b_use_tma=down_moe_use_tma,
+            filter_expert=filter_expert,
+            fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
+            router_topk=topk,
+            use_valu=config.get("USE_VALU", False),
+        )
 
     if hooks and hooks.after_down:
         hooks.after_down(
@@ -1030,6 +1082,14 @@ def fused_experts_impl(
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
+    use_ppu_optimal_fusedmoe = (
+        envs.SGLANG_SAIL_FUSEDMOE_OPT.get()
+        and hidden_states.shape[0] <= envs.SGLANG_SAIL_FUSEDMOE_MAX_TOKENS.get()
+        and _is_ppu
+        and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        and (b1 is None and b2 is None)
+    )
+
     (
         config,
         down_config,
@@ -1049,6 +1109,7 @@ def fused_experts_impl(
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
+        use_ppu_optimal_fusedmoe=use_ppu_optimal_fusedmoe,
     )
 
     return _fused_moe_kernel_sequence(
@@ -1092,6 +1153,7 @@ def fused_experts_impl(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        use_ppu_optimal_fusedmoe=use_ppu_optimal_fusedmoe,
     )
 
 

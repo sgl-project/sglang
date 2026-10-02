@@ -1,0 +1,176 @@
+{
+    "48": {
+        "diverse_ratio": 1.0,
+        "head": {
+            "CudaCore": {
+                "BLOCK_SIZE_M": 1,
+                "BLOCK_SIZE_N": 8,
+                "BLOCK_SIZE_K": 128,
+                "num_warps": 2,
+                "num_stages": 2,
+                "loop_unroll_factor": 4
+            }
+        },
+        "tail": {
+            "CudaCore": {
+                "BLOCK_SIZE_M": 1,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 2,
+                "num_stages": 2,
+                "loop_unroll_factor": 4
+            }
+        }
+    },
+    "64": {
+        "diverse_ratio": 0.1,
+        "head": {
+            "TensorCore": {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 128,
+                "num_warps": 2,
+                "num_stages": 4,
+                "loop_unroll_factor": 1
+            },
+            "CudaCore": {
+                "BLOCK_SIZE_M": 1,
+                "BLOCK_SIZE_N": 8,
+                "BLOCK_SIZE_K": 128,
+                "num_warps": 2,
+                "num_stages": 2,
+                "loop_unroll_factor": 4
+            },
+            "num_cores": 24
+        },
+        "tail": {
+            "TensorCore": {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 2,
+                "num_stages": 2,
+                "loop_unroll_factor": 1
+            },
+            "CudaCore": {
+                "BLOCK_SIZE_M": 1,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 2,
+                "num_stages": 2,
+                "loop_unroll_factor": 4
+            },
+            "num_cores": 24
+        }
+    },
+    "192": {
+        "diverse_ratio": 0.1,
+        "head": {
+            "TensorCore": {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 128,
+                "num_warps": 2,
+                "num_stages": 4,
+                "loop_unroll_factor": 1
+            },
+            "CudaCore": {
+                "BLOCK_SIZE_M": 1,
+                "BLOCK_SIZE_N": 8,
+                "BLOCK_SIZE_K": 128,
+                "num_warps": 2,
+                "num_stages": 2,
+                "loop_unroll_factor": 4
+            },
+            "num_cores": 24
+        },
+        "tail": {
+            "TensorCore": {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 2,
+                "num_stages": 2,
+                "loop_unroll_factor": 1
+            },
+            "CudaCore": {
+                "BLOCK_SIZE_M": 1,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 2,
+                "num_stages": 2,
+                "loop_unroll_factor": 4
+            },
+            "num_cores": 24
+        }
+    },
+    "256": {
+        "diverse_ratio": 0.0,
+        "head": {
+            "TensorCore": {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 128,
+                "num_warps": 2,
+                "num_stages": 4,
+                "loop_unroll_factor": 1
+            }
+        },
+        "tail": {
+            "TensorCore": {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 2,
+                "num_stages": 2,
+                "loop_unroll_factor": 1
+            }
+        }
+    },
+    "512": {
+        "diverse_ratio": 0.0,
+        "head": {
+            "TensorCore": {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 128,
+                "num_warps": 2,
+                "num_stages": 2,
+                "loop_unroll_factor": 1
+            }
+        },
+        "tail": {
+            "TensorCore": {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 4,
+                "num_stages": 2,
+                "loop_unroll_factor": 1
+            }
+        }
+    },
+    "1024": {
+        "diverse_ratio": 0.0,
+        "head": {
+            "TensorCore": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 2,
+                "num_stages": 3,
+                "loop_unroll_factor": 1
+            }
+        },
+        "tail": {
+            "TensorCore": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 8,
+                "num_stages": 3,
+                "loop_unroll_factor": 1
+            }
+        }
+    }
+}

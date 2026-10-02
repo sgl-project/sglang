@@ -1846,6 +1846,9 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
+    # SAIL
+    SGLANG_SAIL_FUSEDMOE_OPT = EnvBool(False)
+    SGLANG_SAIL_FUSEDMOE_MAX_TOKENS = EnvInt(32768)
 
 
 envs = Envs()

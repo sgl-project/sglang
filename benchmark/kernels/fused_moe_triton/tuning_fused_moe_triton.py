@@ -2,12 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py
 import argparse
+import copy
 import json
+import os
+import random
 import time
 from contextlib import nullcontext
 from datetime import datetime
+from itertools import product
 from typing import Any, Dict, List, Tuple
 
+import numpy as np
 import ray
 import torch
 import triton
@@ -40,6 +45,42 @@ from sglang.srt.utils.hf_transformers_utils import get_config
 
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def get_heuristics_configs(use_valu: bool = False):
+    if use_valu:
+        block_m_range = [1, 2]
+        block_n_range = [8, 16, 32, 64, 128, 256]
+        block_k_range = [16, 32, 64, 128, 256]
+        group_m_range = [1, 4]
+    else:
+        block_m_range = [16, 32, 64]
+        block_n_range = [16, 32, 64, 128, 256, 512]
+        block_k_range = [16, 32, 64, 128, 256, 512]
+        group_m_range = [1, 16]
+    num_warps_range = [2, 4, 8]
+    num_stage_range = [2, 3, 4, 8]
+
+    independent_param_ranges = {
+        "BLOCK_SIZE_N": block_n_range,
+        "BLOCK_SIZE_K": block_k_range,
+        "GROUP_SIZE_M": group_m_range,
+        "num_warps": num_warps_range,
+        "num_stages": num_stage_range,
+    }
+    keys, values = zip(*independent_param_ranges.items())
+    independent_configs = list()
+    for config_values in product(*values):
+        config = dict(zip(keys, config_values))
+        independent_configs.append(config)
+    configs = {m: independent_configs for m in block_m_range}
+    return configs
 
 
 def benchmark_config(
@@ -161,7 +202,7 @@ def benchmark_config(
         w1 = w1.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
         w2 = w2.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
 
-    input_gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
+    input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
     topk_config = TopKConfig(
         top_k=topk,
         renormalize=True,
@@ -169,11 +210,7 @@ def benchmark_config(
     topk_output = select_experts(x, input_gating, topk_config)
 
     def prepare(i: int):
-        input_gating = gating_output[i]
-        new_topk_output = select_experts(x, input_gating, topk_config)
-        topk_output.topk_weights.copy_(new_topk_output.topk_weights)
-        topk_output.topk_ids.copy_(new_topk_output.topk_ids)
-        topk_output.router_logits.copy_(new_topk_output.router_logits)
+        input_gating.copy_(gating_output[i])
 
     def run():
         model_config = get_config(args.model, trust_remote_code=True)
@@ -373,6 +410,164 @@ class BenchmarkWorker:
         assert best_config is not None
         return best_config
 
+    def heuristics_tune(
+        self,
+        num_tokens: int,
+        num_experts: int,
+        shard_intermediate_size: int,
+        hidden_size: int,
+        topk: int,
+        dtype: torch.dtype,
+        heuristics_space: Dict[int, List[Dict]],
+        valu_thresh: int,
+    ):
+        discard = 1.3
+
+        dummy_config = {
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+        }
+        log_file_name = (
+            os.environ.get("HEURISTICS_TUNE_LOG", "heuristics_tune.log")
+            + f".pid{os.getpid()}"
+        )
+
+        # tune for dispatch config
+        with open(log_file_name, "w") as f:
+            print(
+                f"E={num_experts}, M={num_tokens}, N={shard_intermediate_size}, hidden_size={hidden_size}, topk={topk}, dtype={dtype}",
+                file=f,
+            )
+            best_config = None
+            perfect_time = float("inf")
+
+            for use_valu in [True, False]:
+                if use_valu and num_tokens >= valu_thresh:
+                    continue
+                heuristics_space = get_heuristics_configs(use_valu)
+                for block_m, other_configs in heuristics_space.items():
+                    # keep 'down' config
+                    dummy_config["BLOCK_SIZE_M"] = block_m
+                    best_time = float("inf")
+                    best_up_config = None
+                    for i, up_cfg in tqdm(
+                        enumerate(other_configs),
+                        desc=f"UP bs={num_tokens},bm={block_m},valu={use_valu}",  # codespell:ignore
+                        total=len(other_configs),
+                    ):
+                        try:
+                            up_cfg["BLOCK_SIZE_M"] = block_m
+                            config = {
+                                "BLOCK_SIZE_M": block_m,
+                                "USE_VALU": use_valu,
+                                "UP": up_cfg,
+                                "DOWN": dummy_config,
+                            }
+                            seed_everything(self.seed)
+                            torch.cuda.manual_seed(self.seed)
+                            moe_time = benchmark_config(
+                                config,
+                                num_tokens,
+                                num_experts,
+                                shard_intermediate_size,
+                                hidden_size,
+                                topk,
+                                dtype,
+                                False,
+                                False,
+                                False,
+                                None,
+                                10,
+                                best_time * discard,
+                            )
+                            if moe_time < best_time:
+                                best_time = moe_time
+                                best_up_config = copy.deepcopy(up_cfg)
+                            print(
+                                f"[{(i + 1) / len(other_configs) * 100:.2f}% UP][{i + 1}/{len(other_configs)}] moe_time={moe_time:.2f} best_time={best_time:.2f}, "
+                                f"block_m={block_m}, up_config={up_cfg}",
+                                file=f,
+                            )
+                        except triton.runtime.autotuner.OutOfResources:
+                            print(
+                                f"[{(i + 1) / len(other_configs) * 100:.2f}% UP][{i + 1}/{len(other_configs)}] BREAK DOWN!!! bad_config={up_cfg}",
+                                file=f,
+                            )
+                            continue
+
+                    # keep 'up' best config
+                    best_time = float("inf")
+                    best_dn_config = None
+                    for i, dn_cfg in tqdm(
+                        enumerate(other_configs),
+                        desc=f"DN bs={num_tokens},bm={block_m},valu={use_valu}",  # codespell:ignore
+                        total=len(other_configs),
+                    ):
+                        try:
+                            dn_cfg["BLOCK_SIZE_M"] = block_m
+                            config = {
+                                "BLOCK_SIZE_M": block_m,
+                                "USE_VALU": use_valu,
+                                "UP": best_up_config,
+                                "DOWN": dn_cfg,
+                            }
+                            seed_everything(self.seed)
+                            torch.cuda.manual_seed(self.seed)
+                            moe_time = benchmark_config(
+                                config,
+                                num_tokens,
+                                num_experts,
+                                shard_intermediate_size,
+                                hidden_size,
+                                topk,
+                                dtype,
+                                False,
+                                False,
+                                False,
+                                None,
+                                10,
+                                best_time * discard,
+                            )
+                            if moe_time < best_time:
+                                best_time = moe_time
+                                best_dn_config = copy.deepcopy(dn_cfg)
+
+                            print(
+                                f"[{(i + 1) / len(other_configs) * 100:.2f}% DN][{i + 1}/{len(other_configs)}] moe_time={moe_time:.2f} best_time={best_time:.2f}, "
+                                f"block_m={block_m}, dn_config={dn_cfg}",
+                                file=f,
+                            )
+                        except triton.runtime.autotuner.OutOfResources:
+                            print(
+                                f"[{(i + 1) / len(other_configs) * 100:.2f}% DN][{i + 1}/{len(other_configs)}] BREAK DOWN!!! bad_config={dn_cfg}",
+                                file=f,
+                            )
+                            continue
+
+                    if perfect_time > best_time:
+                        print(f"Alternate at M={block_m}, use_valu={use_valu}", file=f)
+                        perfect_time = best_time
+                        best_config = {
+                            "BLOCK_SIZE_M": block_m,
+                            "USE_VALU": use_valu,
+                            "UP": copy.deepcopy(best_up_config),
+                            "DOWN": copy.deepcopy(best_dn_config),
+                        }
+                    print(
+                        f"TILE_M={block_m}, perfect_time={perfect_time}, canadiate config: {best_config}",
+                        file=f,
+                    )
+            print(
+                f"Tune Over: M={num_tokens}, perfect_time={perfect_time}, best_config={best_config}",
+                file=f,
+                flush=True,
+            )
+        # assert best_config is not None
+        return best_config
+
 
 def main(args: argparse.Namespace):
     server_args = ServerArgs(
@@ -398,10 +593,12 @@ def main(args: argparse.Namespace):
 
     if args.batch_sizes is not None:
         batch_sizes = args.batch_sizes
+        batch_sizes.reverse()
     elif args.batch_size is not None:
         batch_sizes = [args.batch_size]
     else:
         batch_sizes = get_default_batch_sizes()
+        batch_sizes.reverse()
 
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
@@ -455,7 +652,7 @@ def main(args: argparse.Namespace):
             f"Start tuning over {len(search_space)} configurations to create {filename}..."
         )
 
-        start = time.perf_counter()
+        start = time.time()
         configs = _distribute(
             "tune",
             [
@@ -484,7 +681,43 @@ def main(args: argparse.Namespace):
             best_configs,
             filename,
         )
-        end = time.perf_counter()
+        end = time.time()
+        print(f"Tuning took {end - start:.2f} seconds")
+    elif args.heuristics_tune:
+        assert not (use_fp8_w8a8 or use_int8_w8a16 or use_int8_w8a8)
+        heuristics_space = get_heuristics_configs()
+        start = time.time()
+        configs = _distribute(
+            "heuristics_tune",
+            [
+                (
+                    batch_size,
+                    E,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    heuristics_space,
+                    args.valu_thresh,
+                )
+                for batch_size in batch_sizes
+            ],
+        )
+
+        best_configs = {M: config for M, config in zip(batch_sizes, configs)}
+        save_configs(
+            best_configs,
+            E,
+            shard_intermediate_size,
+            hidden_size,
+            topk,
+            dtype,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            block_shape,
+        )
+        end = time.time()
         print(f"Tuning took {end - start:.2f} seconds")
     else:
         outputs = _distribute(
@@ -530,6 +763,14 @@ if __name__ == "__main__":
         "--per-channel-quant",
         action="store_true",
     )
+    parser.add_argument("--heuristics-tune", action="store_true")
+    parser.add_argument("--valu-thresh", type=int, default=0)
+    parser.add_argument(
+        "--n-share-experts-fusion",
+        type=int,
+        default=0,
+        help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument(
@@ -547,4 +788,5 @@ if __name__ == "__main__":
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     args = parser.parse_args()
 
+    os.environ["USE_ACEXT_CUDA"] = "0"
     main(args)
