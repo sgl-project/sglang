@@ -758,9 +758,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
 
-            # dump per-request perf report to the server-mode file path.
+            # all ranks share this path; only the replica's output rank writes it
             if (
-                req.perf_dump_path is not None
+                self.is_output_rank
+                and req.perf_dump_path is not None
                 and not req.is_warmup
                 and output_batch.metrics is not None
             ):
