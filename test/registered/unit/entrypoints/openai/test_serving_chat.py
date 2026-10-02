@@ -761,6 +761,51 @@ class ServingChatTestCase(CustomTestCase):
             "return_sampling_mask requires return_meta_info=true.",
         )
 
+    @staticmethod
+    def _tool_request(parameters):
+        return ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "Look something up.",
+                        "parameters": parameters,
+                    },
+                }
+            ],
+        )
+
+    def test_validate_request_checks_an_unchanged_tool_schema_once(self):
+        """An agent resends its tools on every request: only a new schema is checked."""
+
+        def parameters(marker):
+            return {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": marker}},
+            }
+
+        marker = uuid.uuid4().hex
+        target = "sglang.srt.entrypoints.openai.serving_chat.Draft202012Validator.check_schema"
+        with patch(target) as check_schema:
+            for _ in range(3):
+                request = self._tool_request(parameters(marker))
+                self.assertIsNone(self.chat._validate_request(request))
+            self.assertEqual(check_schema.call_count, 1)
+
+            changed = self._tool_request(parameters(marker + "-changed"))
+            self.assertIsNone(self.chat._validate_request(changed))
+            self.assertEqual(check_schema.call_count, 2)
+
+    def test_validate_request_rejects_an_invalid_tool_schema_every_time(self):
+        for _ in range(2):
+            request = self._tool_request({"type": "objekt"})
+            self.assertIn(
+                "invalid 'parameters' schema", self.chat._validate_request(request)
+            )
+
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
             model="x",
