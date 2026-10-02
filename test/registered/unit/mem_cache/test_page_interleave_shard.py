@@ -798,6 +798,9 @@ class _GraftReq:
     def get_fill_ids(self):
         return array("q", self.fill_ids)
 
+    def refresh_fill_ids(self):
+        pass  # fill ids are fixed for the stand-in
+
     def finished(self):
         return self.finished_reason is not None
 
