@@ -4,22 +4,41 @@
 //! SGLang KV event bridge.
 //!
 //! Subscribes to a worker's ZMQ KV-event stream, decodes each batch, and
-//! forwards it to the indexer over gRPC.
+//! forwards it to one indexer over gRPC ([`Sink::Grpc`]) or to the Valkey event
+//! stream that any number of indexers consume ([`Sink::Stream`]).
 //!
-//! It keeps a reconnect supervisor but does not recover data: no sequence
-//! tracking, no replay of missed batches, no incarnation token, no liveness
-//! heartbeat. A sequence gap is logged and ignored, and events produced while
-//! the bridge is disconnected are lost.
+//! What it recovers, and what it still does not:
+//!
+//! * Missed batches, when `SGLANG_KV_REPLAY_ENDPOINT` names the worker's replay
+//!   socket: on connect and on a sequence gap it asks for everything after the
+//!   last sequence it forwarded, and that sequence is checkpointed in Valkey so
+//!   a restart replays the gap rather than the whole buffer. What the worker's
+//!   bounded buffer has already dropped is unrecoverable; the bridge detects
+//!   that case and clears the worker so the index rebuilds instead of carrying
+//!   a hole.
+//! * A publisher that restarted, told apart from an already-forwarded batch by
+//!   the batch timestamp, and answered with `AllBlocksCleared` because that
+//!   worker's cache is empty.
+//! * Worker liveness, when a Valkey configuration is present: a TTL key
+//!   refreshed while the worker's own port answers, when an address is set.
+//!
+//! Still absent: an incarnation token (a restart is inferred, not announced) and
+//! any acknowledgement of what the indexer actually applied.
 
 use std::io::Cursor;
 use std::time::Duration;
 
+use bytes::Bytes;
 use rmpv::decode::value::read_value;
 use rmpv::Value;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 use tracing::{debug, info, warn};
-use zeromq::{Socket, SocketRecv, SubSocket};
+use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
+
+use crate::liveness::{retire_heartbeat, Heartbeat, DEFAULT_HEARTBEAT_TTL};
+use crate::stream::{StreamSink, DEFAULT_STREAM_MAXLEN};
+use crate::valkey_backend::{connect_conn, Conn, ValkeyConfig, DEFAULT_KEY_PREFIX};
 
 use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::{
@@ -32,6 +51,19 @@ const RECONNECT_MIN_DELAY: Duration = Duration::from_millis(500);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(10);
 const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-frame wait on the worker's replay socket; the worker answers from memory.
+const REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
+/// `ZmqEventPublisher.END_SEQ`: `-1` as a big-endian i64, read here as u64.
+const END_SEQ: u64 = u64::MAX;
+
+/// Where the bridge sends apply batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sink {
+    /// `ApplyExternalKvBatch` RPCs to one indexer server.
+    Grpc,
+    /// `XADD` to the Valkey event stream; any number of indexers consume it.
+    Stream,
+}
 
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -46,6 +78,14 @@ pub struct BridgeConfig {
     /// The worker's component cache spec, forwarded on every apply batch. `None`
     /// for a legacy / full-only worker that reports no component metadata.
     pub cache_spec: Option<WorkerCacheSpec>,
+    pub sink: Sink,
+    /// Required for the stream sink and for heartbeats.
+    pub valkey: Option<ValkeyConfig>,
+    /// `None` disables the liveness heartbeat.
+    pub heartbeat_ttl: Option<Duration>,
+    /// SGLang's replay ROUTER endpoint; when set, missed batches are recovered.
+    pub replay_endpoint: Option<String>,
+    pub stream_maxlen: u64,
 }
 
 impl BridgeConfig {
@@ -64,6 +104,49 @@ impl BridgeConfig {
             &std::env::var("KV_INDEXER_CLEAR_TIERS").unwrap_or_else(|_| "HBM,DRAM,SSD".to_string()),
         )?;
         let cache_spec = cache_spec_from_env()?;
+        let sink = match std::env::var("KV_INDEXER_SINK").as_deref() {
+            Err(_) | Ok("grpc") => Sink::Grpc,
+            Ok("stream") => Sink::Stream,
+            Ok(other) => {
+                return Err(BridgeError::Config(format!(
+                    "KV_INDEXER_SINK must be grpc or stream, got {other:?}"
+                )))
+            }
+        };
+        let valkey = valkey_from_env()?;
+        if sink == Sink::Stream && valkey.is_none() {
+            return Err(BridgeError::Config(
+                "KV_INDEXER_SINK=stream requires KV_INDEXER_VALKEY_URL".to_string(),
+            ));
+        }
+        let heartbeat_ttl = match std::env::var("KV_INDEXER_HEARTBEAT_TTL_MS") {
+            Ok(raw) => match raw.parse::<u64>() {
+                Ok(0) => None,
+                Ok(ms) => Some(Duration::from_millis(ms)),
+                Err(_) => {
+                    return Err(BridgeError::Config(format!(
+                        "KV_INDEXER_HEARTBEAT_TTL_MS must be milliseconds, got {raw:?}"
+                    )))
+                }
+            },
+            Err(_) => valkey.as_ref().map(|_| DEFAULT_HEARTBEAT_TTL),
+        };
+        if heartbeat_ttl.is_some() && valkey.is_none() {
+            return Err(BridgeError::Config(
+                "KV_INDEXER_HEARTBEAT_TTL_MS requires KV_INDEXER_VALKEY_URL".to_string(),
+            ));
+        }
+        let replay_endpoint = std::env::var("SGLANG_KV_REPLAY_ENDPOINT")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let stream_maxlen = match std::env::var("KV_INDEXER_STREAM_MAXLEN") {
+            Ok(raw) => raw.parse::<u64>().map_err(|_| {
+                BridgeError::Config(format!(
+                    "KV_INDEXER_STREAM_MAXLEN must be an integer, got {raw:?}"
+                ))
+            })?,
+            Err(_) => DEFAULT_STREAM_MAXLEN,
+        };
 
         Ok(Self {
             worker_id,
@@ -73,8 +156,36 @@ impl BridgeConfig {
             indexer_endpoint,
             clear_tiers,
             cache_spec,
+            sink,
+            valkey,
+            heartbeat_ttl,
+            replay_endpoint,
+            stream_maxlen,
         })
     }
+}
+
+/// `KV_INDEXER_VALKEY_URL` plus the optional prefix and cluster flag, or `None`.
+fn valkey_from_env() -> Result<Option<ValkeyConfig>, BridgeError> {
+    let Ok(url) = std::env::var("KV_INDEXER_VALKEY_URL") else {
+        return Ok(None);
+    };
+    let prefix = std::env::var("KV_INDEXER_VALKEY_KEY_PREFIX")
+        .unwrap_or_else(|_| DEFAULT_KEY_PREFIX.to_string());
+    let cluster = match std::env::var("KV_INDEXER_VALKEY_CLUSTER").as_deref() {
+        Err(_) | Ok("0") | Ok("false") | Ok("no") => false,
+        Ok("1") | Ok("true") | Ok("yes") => true,
+        Ok(other) => {
+            return Err(BridgeError::Config(format!(
+                "KV_INDEXER_VALKEY_CLUSTER must be 0 or 1, got {other:?}"
+            )))
+        }
+    };
+    Ok(Some(
+        ValkeyConfig::new(url)
+            .with_key_prefix(prefix)
+            .with_cluster(cluster),
+    ))
 }
 
 #[derive(Debug)]
@@ -85,6 +196,8 @@ pub enum BridgeError {
     PermanentRpc(tonic::Status),
     Transport(tonic::transport::Error),
     Zmq(zeromq::ZmqError),
+    /// The Valkey stream sink or heartbeat failed.
+    Sink(Status),
 }
 
 impl std::fmt::Display for BridgeError {
@@ -98,6 +211,7 @@ impl std::fmt::Display for BridgeError {
             }
             BridgeError::Transport(error) => write!(f, "indexer transport error: {error}"),
             BridgeError::Zmq(error) => write!(f, "zmq error: {error}"),
+            BridgeError::Sink(status) => write!(f, "valkey sink error: {status}"),
         }
     }
 }
@@ -106,7 +220,11 @@ impl std::error::Error for BridgeError {}
 
 impl BridgeError {
     fn is_permanent(&self) -> bool {
-        matches!(self, BridgeError::Config(_) | BridgeError::PermanentRpc(_))
+        match self {
+            BridgeError::Config(_) | BridgeError::PermanentRpc(_) => true,
+            BridgeError::Sink(status) => status.code() == Code::InvalidArgument,
+            _ => false,
+        }
     }
 }
 
@@ -240,12 +358,72 @@ pub async fn run_bridge_until<F>(config: BridgeConfig, shutdown: F) -> Result<()
 where
     F: std::future::Future<Output = ()>,
 {
-    tokio::select! {
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let heartbeat = match (&config.valkey, config.heartbeat_ttl) {
+        (Some(valkey), Some(ttl)) => Some(tokio::spawn(heartbeat_task(
+            valkey.clone(),
+            config.worker_id.clone(),
+            config.worker_address.clone(),
+            ttl,
+            stop_rx,
+        ))),
+        // A marker left from an earlier session would read as a worker that
+        // heartbeats and has expired, which liveness clears for good.
+        (Some(valkey), None) => {
+            retire_heartbeat(valkey, &config.worker_id).await;
+            None
+        }
+        _ => None,
+    };
+    let result = tokio::select! {
         result = supervise(config) => result,
         () = shutdown => {
             info!("bridge stopped by shutdown signal");
             Ok(())
         }
+    };
+    let _ = stop_tx.send(true);
+    if let Some(heartbeat) = heartbeat {
+        let _ = heartbeat.await;
+    }
+    result
+}
+
+/// Keeps the worker's heartbeat alive; reconnects to Valkey with backoff.
+async fn heartbeat_task(
+    valkey: ValkeyConfig,
+    worker_id: String,
+    worker_address: String,
+    ttl: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut delay = RECONNECT_MIN_DELAY;
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let connected = tokio::select! {
+            connected = Heartbeat::connect(&valkey, &worker_id, &worker_address, ttl) => connected,
+            _ = stop.changed() => return,
+        };
+        match connected {
+            Ok(heartbeat) => {
+                info!(worker_id = %worker_id, ttl = ?ttl, "heartbeat started");
+                let mut stopped = stop.clone();
+                heartbeat
+                    .run(async move {
+                        let _ = stopped.changed().await;
+                    })
+                    .await;
+                return;
+            }
+            Err(status) => warn!(%status, retry_in = ?delay, "heartbeat connect failed"),
+        }
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            _ = stop.changed() => return,
+        }
+        delay = (delay * 2).min(RECONNECT_MAX_DELAY);
     }
 }
 
@@ -255,20 +433,57 @@ async fn supervise(config: BridgeConfig) -> Result<(), BridgeError> {
         event_endpoint = %config.event_endpoint,
         event_topic = %config.event_topic,
         indexer_endpoint = %config.indexer_endpoint,
+        sink = ?config.sink,
+        replay = config.replay_endpoint.is_some(),
         "starting SGLang KV event bridge"
     );
+    // Survives reconnects so a replay request can resume where we stopped, and
+    // restarts too when Valkey holds the checkpoint.
+    let checkpoint = match &config.valkey {
+        Some(valkey) => match Checkpoint::connect(valkey, &config.worker_id).await {
+            Ok(checkpoint) => Some(checkpoint),
+            Err(status) => {
+                warn!(%status, "sequence checkpoint unavailable; a restart replays the whole worker buffer");
+                None
+            }
+        },
+        None => None,
+    };
+    let mut last_seq: Option<u64> = match &checkpoint {
+        Some(checkpoint) => match checkpoint.load().await {
+            Ok(seq) => {
+                if let Some(seq) = seq {
+                    info!(seq, "resuming from the checkpointed sequence");
+                }
+                seq
+            }
+            Err(status) => {
+                warn!(%status, "could not read the sequence checkpoint");
+                None
+            }
+        },
+        None => None,
+    };
 
     // Supervisor loop: (re)connect to both the indexer and the ZMQ publisher,
     // run until a connection-level error, then back off and retry. Decode-level
     // problems are handled inside the session and never tear down the bridge.
-    // Reconnecting recovers the connection only: events published while
-    // disconnected are lost.
+    // Without a replay endpoint, reconnecting recovers the connection only and
+    // events published while disconnected are lost.
     let mut delay = RECONNECT_MIN_DELAY;
     loop {
         match connect(&config).await {
-            Ok((client, subscriber)) => {
+            Ok((forwarder, subscriber)) => {
                 delay = RECONNECT_MIN_DELAY;
-                match run_session(&config, client, subscriber).await {
+                match run_session(
+                    &config,
+                    forwarder,
+                    subscriber,
+                    &mut last_seq,
+                    checkpoint.as_ref(),
+                )
+                .await
+                {
                     Ok(()) => {
                         info!("bridge shut down cleanly");
                         return Ok(());
@@ -294,20 +509,55 @@ async fn supervise(config: BridgeConfig) -> Result<(), BridgeError> {
     }
 }
 
-async fn connect(
-    config: &BridgeConfig,
-) -> Result<(KvIndexerClient<Channel>, SubSocket), BridgeError> {
-    let channel = Endpoint::from_shared(config.indexer_endpoint.clone())?
-        .connect_timeout(GRPC_CONNECT_TIMEOUT)
-        .timeout(GRPC_REQUEST_TIMEOUT)
-        .connect()
-        .await?;
-    let client = KvIndexerClient::new(channel);
+/// The connected sink of one session.
+enum Forwarder {
+    Grpc(KvIndexerClient<Channel>),
+    Stream(StreamSink),
+}
+
+impl Forwarder {
+    async fn forward(&mut self, request: ApplyExternalKvBatchRequest) -> Result<(), BridgeError> {
+        match self {
+            Forwarder::Grpc(client) => client
+                .apply_external_kv_batch(request)
+                .await
+                .map(|_| ())
+                .map_err(classify_rpc),
+            Forwarder::Stream(sink) => sink
+                .publish(&request)
+                .await
+                .map(|_| ())
+                .map_err(BridgeError::Sink),
+        }
+    }
+}
+
+async fn connect(config: &BridgeConfig) -> Result<(Forwarder, SubSocket), BridgeError> {
+    let forwarder = match (config.sink, &config.valkey) {
+        (Sink::Stream, Some(valkey)) => Forwarder::Stream(
+            StreamSink::connect(valkey, config.stream_maxlen)
+                .await
+                .map_err(BridgeError::Sink)?,
+        ),
+        (Sink::Stream, None) => {
+            return Err(BridgeError::Config(
+                "stream sink needs a Valkey configuration".to_string(),
+            ))
+        }
+        (Sink::Grpc, _) => {
+            let channel = Endpoint::from_shared(config.indexer_endpoint.clone())?
+                .connect_timeout(GRPC_CONNECT_TIMEOUT)
+                .timeout(GRPC_REQUEST_TIMEOUT)
+                .connect()
+                .await?;
+            Forwarder::Grpc(KvIndexerClient::new(channel))
+        }
+    };
     let mut subscriber = SubSocket::new();
     subscriber.subscribe(&config.event_topic).await?;
     subscriber.connect(&config.event_endpoint).await?;
     info!("bridge session established");
-    Ok((client, subscriber))
+    Ok((forwarder, subscriber))
 }
 
 /// Runs a single connected session. Returns `Ok(())` only on a clean shutdown
@@ -315,11 +565,25 @@ async fn connect(
 /// reconnect.
 async fn run_session(
     config: &BridgeConfig,
-    mut client: KvIndexerClient<Channel>,
+    mut forwarder: Forwarder,
     mut subscriber: SubSocket,
+    last_seq: &mut Option<u64>,
+    checkpoint: Option<&Checkpoint>,
 ) -> Result<(), BridgeError> {
-    // Tracked only to log a discontinuity. Nothing acts on it.
-    let mut last_seq: Option<u64> = None;
+    // Whatever the worker still buffers since we last saw it, before live events;
+    // a replay that cannot be served costs recovery, not the session.
+    if let Err(error) = replay(config, &mut forwarder, last_seq, None).await {
+        if error.is_permanent() {
+            return Err(error);
+        }
+        warn!(%error, "replay on connect failed; continuing with live events only");
+    }
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.store(*last_seq).await;
+    }
+    // Newest batch timestamp forwarded: a sequence at or below `last_seq` is a
+    // restarted publisher only if its batch is newer, else a replay overlap.
+    let mut newest_ts = f64::MIN;
 
     loop {
         let message = tokio::select! {
@@ -337,21 +601,181 @@ async fn run_session(
                 continue;
             }
         };
+        if seq == END_SEQ {
+            continue;
+        }
 
-        if let Some(previous) = last_seq {
-            if seq != previous.wrapping_add(1) {
+        let ts = decode_batch_timestamp(&payload);
+        if let Some(previous) = *last_seq {
+            if seq <= previous {
+                if !ts.is_some_and(|ts| ts > newest_ts) {
+                    debug!(
+                        previous,
+                        actual = seq,
+                        "skipping a batch this session already forwarded"
+                    );
+                    continue;
+                }
+                // A publisher counting from zero again: the worker's cache is
+                // empty and every placement the index holds for it is stale.
                 warn!(
                     previous,
                     actual = seq,
-                    "SGLang KV event sequence is not contiguous; this build does not recover the gap"
+                    "SGLang KV event sequence reset; clearing the worker's placements"
                 );
+                forwarder.forward(clear_all_request(config, seq)).await?;
+                *last_seq = None;
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.store(None).await;
+                }
+            } else if seq > previous.wrapping_add(1) {
+                warn!(previous, actual = seq, "SGLang KV event sequence gap");
+                if let Err(error) = replay(config, &mut forwarder, last_seq, Some(seq)).await {
+                    if error.is_permanent() {
+                        return Err(error);
+                    }
+                    warn!(%error, "gap replay failed; the missed batches are lost");
+                }
             }
         }
-        last_seq = Some(seq);
 
-        forward_raw_batch(config, &mut client, seq, &payload).await?;
+        forward_raw_batch(config, &mut forwarder, seq, &payload).await?;
+        *last_seq = Some(seq);
+        if let Some(ts) = ts {
+            newest_ts = newest_ts.max(ts);
+        }
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.store(Some(seq)).await;
+        }
     }
 }
+
+/// The last sequence this worker's bridge forwarded, kept in Valkey so a
+/// restarted bridge replays only what it missed instead of the whole buffer.
+struct Checkpoint {
+    conn: Conn,
+    key: String,
+}
+
+impl Checkpoint {
+    async fn connect(valkey: &ValkeyConfig, worker_id: &str) -> Result<Self, Status> {
+        Ok(Self {
+            conn: connect_conn(valkey).await?,
+            key: format!("{}seq:{worker_id}", valkey.key_prefix),
+        })
+    }
+
+    async fn load(&self) -> Result<Option<u64>, Status> {
+        let mut pipe = redis::pipe();
+        pipe.cmd("GET").arg(&self.key);
+        let values: Vec<Option<u64>> = self.conn.clone().run(&pipe).await?;
+        Ok(values.into_iter().next().flatten())
+    }
+
+    /// Best effort: a failed checkpoint costs a longer replay next time, not data.
+    async fn store(&self, seq: Option<u64>) {
+        let mut pipe = redis::pipe();
+        match seq {
+            Some(seq) => pipe.cmd("SET").arg(&self.key).arg(seq).ignore(),
+            None => pipe.cmd("DEL").arg(&self.key).ignore(),
+        };
+        if let Err(status) = self.conn.clone().exec(&pipe).await {
+            warn!(%status, "sequence checkpoint write failed");
+        }
+    }
+}
+
+/// Forwards what the worker still buffers after `last_seq`, up to `until`
+/// exclusive. A no-op without a replay endpoint.
+async fn replay(
+    config: &BridgeConfig,
+    forwarder: &mut Forwarder,
+    last_seq: &mut Option<u64>,
+    until: Option<u64>,
+) -> Result<(), BridgeError> {
+    let Some(endpoint) = &config.replay_endpoint else {
+        return Ok(());
+    };
+    let start = last_seq.map_or(0, |seq| seq.wrapping_add(1));
+    let mut dealer = DealerSocket::new();
+    // A replay socket nothing is listening on must not stall the session.
+    match tokio::time::timeout(REPLAY_TIMEOUT, dealer.connect(endpoint)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(BridgeError::Decode(format!(
+                "replay endpoint {endpoint} did not accept a connection within {REPLAY_TIMEOUT:?}"
+            )))
+        }
+    }
+    // The publisher's ROUTER expects [identity][empty][start_seq]; the DEALER
+    // supplies the identity, we send the rest.
+    let mut request = ZmqMessage::from(Bytes::new());
+    request.push_back(Bytes::copy_from_slice(&start.to_be_bytes()));
+    dealer.send(request).await?;
+
+    let mut replayed = 0usize;
+    // A first replied batch above the sequence asked for means the publisher's
+    // bounded deque already dropped the rest: no later event will carry it.
+    let mut dropped_before: Option<u64> = None;
+    let mut first_reply = true;
+    loop {
+        let message = match tokio::time::timeout(REPLAY_TIMEOUT, dealer.recv()).await {
+            Ok(message) => message?,
+            Err(_) => {
+                warn!(
+                    start,
+                    replayed, "replay timed out before END_SEQ; continuing with live events"
+                );
+                break;
+            }
+        };
+        let frames = message.into_vec();
+        // Replies arrive as [empty][seq][payload]; the END marker as [empty][-1][empty].
+        let (seq, payload) = match parse_zmq_frames(&frames) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                warn!(%error, "skipping malformed replay frame");
+                continue;
+            }
+        };
+        if seq == END_SEQ {
+            break;
+        }
+        if first_reply {
+            first_reply = false;
+            if seq > start {
+                dropped_before = Some(seq);
+            }
+        }
+        if last_seq.is_some_and(|previous| seq <= previous) || until.is_some_and(|u| seq >= u) {
+            continue;
+        }
+        forward_raw_batch(config, forwarder, seq, payload).await?;
+        *last_seq = Some(seq);
+        replayed += 1;
+    }
+    info!(start, replayed, "replayed buffered KV event batches");
+    if let Some(first) = dropped_before {
+        // A hole would leave the index claiming blocks the worker may no longer
+        // hold, with nothing to correct it; a cleared worker re-reports.
+        warn!(
+            start,
+            first,
+            "the worker's replay buffer no longer holds the missed batches; clearing its placements"
+        );
+        forwarder.forward(clear_all_request(config, start)).await?;
+        *last_seq = None;
+    }
+    Ok(())
+}
+
+/// The batch that forgets everything the index holds for this worker.
+fn clear_all_request(config: &BridgeConfig, seq: u64) -> ApplyExternalKvBatchRequest {
+    let mut events = EventActions::default();
+    events.clear_all();
+    build_apply_request(config, seq, events)
+}
+
 fn parse_zmq_frames(frames: &[bytes::Bytes]) -> Result<(u64, &[u8]), BridgeError> {
     match frames.len() {
         2 => Ok((decode_seq(&frames[0])?, frames[1].as_ref())),
@@ -373,7 +797,7 @@ fn decode_seq(bytes: &[u8]) -> Result<u64, BridgeError> {
 /// that carries no supported mutation, is skipped without an RPC.
 async fn forward_raw_batch(
     config: &BridgeConfig,
-    client: &mut KvIndexerClient<Channel>,
+    forwarder: &mut Forwarder,
     seq: u64,
     payload: &[u8],
 ) -> Result<(), BridgeError> {
@@ -390,10 +814,7 @@ async fn forward_raw_batch(
     // send the parts in order. A later failure leaves an applied prefix, which
     // beats rejecting and losing the whole event batch.
     for request in split_apply_request(request) {
-        client
-            .apply_external_kv_batch(request)
-            .await
-            .map_err(classify_rpc)?;
+        forwarder.forward(request).await?;
     }
     Ok(())
 }
@@ -559,6 +980,19 @@ fn encode_block_sizes(block_sizes: &[Option<u32>]) -> Vec<u32> {
 
 fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
     decode_event_batch_impl(payload, true)
+}
+
+/// The timestamp SGLang stamps on a batch at publish time (`KVEventBatch[0]`).
+/// A replayed batch keeps its original one, a new incarnation's is fresh.
+fn decode_batch_timestamp(payload: &[u8]) -> Option<f64> {
+    let mut cursor = Cursor::new(payload);
+    let value = read_value(&mut cursor).ok()?;
+    match expect_array(&value, "KVEventBatch").ok()?.first()? {
+        Value::F64(ts) => Some(*ts),
+        Value::F32(ts) => Some(*ts as f64),
+        Value::Integer(ts) => ts.as_f64(),
+        _ => None,
+    }
 }
 
 fn decode_event_batch_impl(
@@ -1074,6 +1508,11 @@ mod tests {
             indexer_endpoint: "http://[::1]:50051".to_string(),
             clear_tiers,
             cache_spec: None,
+            sink: Sink::Grpc,
+            valkey: None,
+            heartbeat_ttl: None,
+            replay_endpoint: None,
+            stream_maxlen: DEFAULT_STREAM_MAXLEN,
         }
     }
 

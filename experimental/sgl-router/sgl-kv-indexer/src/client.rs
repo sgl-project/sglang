@@ -7,8 +7,26 @@
 //! failures, deadlines, and server rejections stay distinct errors so the caller
 //! chooses between degrading and failing the request, instead of silently using
 //! a different signal.
+//!
+//! # Several endpoints
+//!
+//! Indexer state can be shared (see the Valkey backend), so a deployment can run
+//! more than one interchangeable server. Given several endpoints this client
+//! keeps querying one of them and moves to the next only when the current one
+//! cannot answer: unreachable, shedding load, or out of time. The endpoint that
+//! answered becomes the preferred one, so an outage costs one failover rather
+//! than a probe per query. A rejection is not a failover: every server would
+//! reject the same request, and retrying it elsewhere only spends the caller's
+//! deadline.
+//!
+//! [`PrefixIndexConfig::query_deadline`] is the budget for the whole query
+//! including failovers, so adding endpoints cannot make a slow query slower.
+//! Within it, every endpoint still to be tried gets an equal share: a preferred
+//! endpoint that hangs must not be able to spend the whole deadline and leave
+//! nothing for a healthy one, which is the failure a black-holed host produces.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tonic::transport::{Channel, Endpoint};
@@ -26,6 +44,9 @@ pub const DEFAULT_QUERY_MAX_INFLIGHT: usize = 32;
 const PREFIX_QUERY_ENCODING_HEADROOM: usize = 16;
 const MAX_PREFIX_HASHES_PER_QUERY: usize =
     (MAX_GRPC_DECODING_MESSAGE_SIZE - PREFIX_QUERY_ENCODING_HEADROOM) / 8;
+/// Below this, an attempt cannot finish a connect plus a round trip, so the
+/// remaining budget is better reported as a timeout than spent on a doomed try.
+const MIN_ATTEMPT_BUDGET: Duration = Duration::from_millis(5);
 
 /// One worker's contiguous prefix hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,19 +128,25 @@ pub enum PrefixOutcome {
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct PrefixIndexConfig {
-    /// gRPC endpoint of the indexer, e.g. `http://10.0.0.1:50051`.
-    pub endpoint: String,
-    /// Per-query deadline.
+    /// Interchangeable indexer endpoints (`http://10.0.0.1:50051`) in preference
+    /// order. They must share state, or the answer changes per query.
+    pub endpoints: Vec<String>,
+    /// Budget for one query, failovers included.
     pub query_deadline: Duration,
     /// Maximum prefix-query RPCs issued concurrently by this client.
     pub max_inflight: usize,
 }
 
 impl PrefixIndexConfig {
-    /// Config with the default query deadline ([`DEFAULT_QUERY_DEADLINE`]).
+    /// One endpoint, with the default query deadline ([`DEFAULT_QUERY_DEADLINE`]).
     pub fn new(endpoint: impl Into<String>) -> Self {
+        Self::with_endpoints(vec![endpoint.into()])
+    }
+
+    /// Several interchangeable endpoints, tried in order from the preferred one.
+    pub fn with_endpoints(endpoints: Vec<String>) -> Self {
         Self {
-            endpoint: endpoint.into(),
+            endpoints,
             query_deadline: DEFAULT_QUERY_DEADLINE,
             max_inflight: DEFAULT_QUERY_MAX_INFLIGHT,
         }
@@ -134,9 +161,18 @@ pub trait PrefixIndex: Send + Sync {
     async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError>;
 }
 
-/// tonic-backed [`PrefixIndex`] with a lazily-established connection.
-pub struct GrpcPrefixIndex {
+struct IndexerEndpoint {
+    /// As configured, for logs.
+    url: String,
     channel: Channel,
+}
+
+/// tonic-backed [`PrefixIndex`] over one or more interchangeable endpoints,
+/// each with a lazily-established connection.
+pub struct GrpcPrefixIndex {
+    endpoints: Vec<IndexerEndpoint>,
+    /// Index into `endpoints` to try first; the last one that answered.
+    preferred: AtomicUsize,
     deadline: Duration,
     prefix_query_semaphore: Semaphore,
 }
@@ -150,8 +186,25 @@ impl GrpcPrefixIndex {
             config.max_inflight > 0,
             "prefix query max inflight must be greater than zero"
         );
+        if config.endpoints.is_empty() {
+            return Err(InvalidEndpoint {
+                endpoint: String::new(),
+                reason: "no endpoint configured",
+            });
+        }
+        let endpoints = config
+            .endpoints
+            .iter()
+            .map(|url| {
+                Ok(IndexerEndpoint {
+                    url: url.clone(),
+                    channel: parse_endpoint(url)?.connect_lazy(),
+                })
+            })
+            .collect::<Result<Vec<_>, InvalidEndpoint>>()?;
         Ok(Self {
-            channel: parse_endpoint(&config.endpoint)?.connect_lazy(),
+            endpoints,
+            preferred: AtomicUsize::new(0),
             deadline: config.query_deadline,
             prefix_query_semaphore: Semaphore::new(config.max_inflight),
         })
@@ -161,6 +214,62 @@ impl GrpcPrefixIndex {
         self.prefix_query_semaphore
             .try_acquire()
             .map_err(|_| PrefixIndexError::Overloaded)
+    }
+
+    /// One attempt against one endpoint, bounded by `budget`.
+    async fn query_endpoint(
+        &self,
+        index: usize,
+        hashes: Vec<i64>,
+        budget: Duration,
+    ) -> Result<PrefixOutcome, PrefixIndexError> {
+        let mut client = KvIndexerClient::new(self.endpoints[index].channel.clone());
+        let mut request = tonic::Request::new(MatchExternalKvPrefixRequest {
+            hashes,
+            // The policy keeps the full query length as its denominator, so a
+            // transport-limited prefix cannot become a perfect hit.
+            max_blocks: 0,
+        });
+        // On the wire so the indexer can drop a query this caller stopped waiting
+        // for; the local timeout below stays the hard stop.
+        request.set_timeout(budget);
+
+        match tokio::time::timeout(budget, client.match_external_kv_prefix(request)).await {
+            Err(_) => Err(PrefixIndexError::Timeout),
+            Ok(Err(status)) => Err(classify(&status)),
+            Ok(Ok(response)) => {
+                let response = response.into_inner();
+                if response.matches.is_empty() {
+                    return Ok(PrefixOutcome::Empty);
+                }
+                let matches = response
+                    .matches
+                    .into_iter()
+                    .map(|m| PrefixMatch {
+                        address: m.worker_address,
+                        matched_prefix_blocks: m.matched_prefix_blocks,
+                        worker_id: m.worker_id,
+                    })
+                    .collect();
+                Ok(PrefixOutcome::Matched {
+                    matches,
+                    best_prefix_blocks: response.best_prefix_blocks,
+                })
+            }
+        }
+    }
+}
+
+/// Whether another endpoint could answer what this one could not. A rejection or
+/// an oversized query is a property of the request, so every server repeats it.
+fn worth_failing_over(error: &PrefixIndexError) -> bool {
+    match error {
+        PrefixIndexError::Unreachable
+        | PrefixIndexError::Timeout
+        // Inside the query loop this is the server shedding load; the client's
+        // own admission limit is checked before any endpoint is tried.
+        | PrefixIndexError::Overloaded => true,
+        PrefixIndexError::QueryTooLarge | PrefixIndexError::Rejected(_) => false,
     }
 }
 
@@ -187,42 +296,55 @@ impl PrefixIndex for GrpcPrefixIndex {
 
         let _permit = self.try_acquire_prefix_query()?;
 
-        let mut client = KvIndexerClient::new(self.channel.clone());
-        let mut request = tonic::Request::new(MatchExternalKvPrefixRequest {
-            hashes,
-            // The policy retains the full query length as its denominator, so a
-            // transport-limited prefix cannot turn a partial scan into a perfect
-            // hit.
-            max_blocks: 0,
-        });
-        // On the wire so the indexer can drop a query this caller already stopped
-        // waiting for. The local timeout below stays the hard stop, since it also
-        // covers a stall before the channel applies its own deadline.
-        request.set_timeout(self.deadline);
-
-        match tokio::time::timeout(self.deadline, client.match_external_kv_prefix(request)).await {
-            Err(_) => Err(PrefixIndexError::Timeout),
-            Ok(Err(status)) => Err(classify(status.code())),
-            Ok(Ok(response)) => {
-                let response = response.into_inner();
-                if response.matches.is_empty() {
-                    return Ok(PrefixOutcome::Empty);
+        let started = Instant::now();
+        let first = self.preferred.load(Ordering::Relaxed) % self.endpoints.len();
+        let mut last_error = None;
+        for offset in 0..self.endpoints.len() {
+            let index = (first + offset) % self.endpoints.len();
+            let Some(remaining) = self.deadline.checked_sub(started.elapsed()) else {
+                break;
+            };
+            // Fair share of what is left, so one hung endpoint cannot consume the
+            // deadline; the last endpoint to try inherits the whole remainder.
+            let still_to_try = (self.endpoints.len() - offset) as u32;
+            let budget = if still_to_try > 1 {
+                remaining / still_to_try
+            } else {
+                remaining
+            };
+            if budget < MIN_ATTEMPT_BUDGET {
+                break;
+            }
+            // Each attempt needs its own copy: the request takes the hashes, and
+            // only a failover pays for the clone.
+            match self.query_endpoint(index, hashes.clone(), budget).await {
+                Ok(outcome) => {
+                    if index != first {
+                        // Sticky, so an outage costs one failover rather than a
+                        // probe of the dead endpoint on every later query.
+                        self.preferred.store(index, Ordering::Relaxed);
+                        tracing::warn!(
+                            from = %self.endpoints[first].url,
+                            to = %self.endpoints[index].url,
+                            "KV Indexer failover: queries now prefer another endpoint"
+                        );
+                    }
+                    return Ok(outcome);
                 }
-                let matches = response
-                    .matches
-                    .into_iter()
-                    .map(|m| PrefixMatch {
-                        address: m.worker_address,
-                        matched_prefix_blocks: m.matched_prefix_blocks,
-                        worker_id: m.worker_id,
-                    })
-                    .collect();
-                Ok(PrefixOutcome::Matched {
-                    matches,
-                    best_prefix_blocks: response.best_prefix_blocks,
-                })
+                Err(error) => {
+                    if !worth_failing_over(&error) {
+                        return Err(error);
+                    }
+                    tracing::debug!(
+                        endpoint = %self.endpoints[index].url,
+                        %error,
+                        "KV Indexer endpoint could not answer; trying the next one"
+                    );
+                    last_error = Some(error);
+                }
             }
         }
+        Err(last_error.unwrap_or(PrefixIndexError::Timeout))
     }
 }
 
@@ -253,7 +375,8 @@ fn parse_endpoint(endpoint: &str) -> Result<Endpoint, InvalidEndpoint> {
     }
 }
 
-fn classify(code: tonic::Code) -> PrefixIndexError {
+fn classify(status: &tonic::Status) -> PrefixIndexError {
+    let code = status.code();
     match code {
         tonic::Code::Unavailable => PrefixIndexError::Unreachable,
         // The indexer sheds an expired query as DEADLINE_EXCEEDED, while tonic
@@ -266,8 +389,17 @@ fn classify(code: tonic::Code) -> PrefixIndexError {
         // the request contract, so it stays separable from `Rejected` and the
         // caller can degrade instead of failing the request.
         tonic::Code::OutOfRange => PrefixIndexError::QueryTooLarge,
+        // A connection lost mid-request arrives as UNKNOWN, INTERNAL or ABORTED,
+        // which the peer could equally have sent, so the transport error decides.
+        _ if from_transport(status) => PrefixIndexError::Unreachable,
         _ => PrefixIndexError::Rejected(code),
     }
+}
+
+/// Whether this process built the status from a transport error rather than
+/// reading it off a peer's trailers, which never carry one.
+fn from_transport(status: &tonic::Status) -> bool {
+    std::error::Error::source(status).is_some()
 }
 
 #[cfg(test)]
@@ -279,7 +411,7 @@ mod tests {
     #[test]
     fn classifies_resource_exhausted_as_overload() {
         assert_eq!(
-            classify(tonic::Code::ResourceExhausted),
+            classify(&tonic::Status::new(tonic::Code::ResourceExhausted, "")),
             PrefixIndexError::Overloaded
         );
     }
@@ -289,13 +421,34 @@ mod tests {
     #[test]
     fn classifies_over_limit_message_as_too_large() {
         assert_eq!(
-            classify(tonic::Code::OutOfRange),
+            classify(&tonic::Status::new(tonic::Code::OutOfRange, "")),
             PrefixIndexError::QueryTooLarge
         );
         assert_eq!(
-            classify(tonic::Code::InvalidArgument),
+            classify(&tonic::Status::new(tonic::Code::InvalidArgument, "")),
             PrefixIndexError::Rejected(tonic::Code::InvalidArgument)
         );
+    }
+
+    /// A server killed mid-request is reported as UNKNOWN or INTERNAL, the same
+    /// codes a server can send itself, so the endpoint list must still fail over.
+    #[test]
+    fn a_broken_connection_is_transient_but_a_served_error_is_not() {
+        let broken = tonic::Status::from_error(Box::new(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "connection reset by peer",
+        )));
+        let error = classify(&broken);
+        assert_eq!(error, PrefixIndexError::Unreachable, "{broken:?}");
+        assert!(worth_failing_over(&error));
+
+        let served = tonic::Status::internal("the backend is down");
+        assert_eq!(
+            classify(&served),
+            PrefixIndexError::Rejected(tonic::Code::Internal),
+            "an error the peer chose to send is not another endpoint's problem"
+        );
+        assert!(!worth_failing_over(&classify(&served)));
     }
 
     #[test]
@@ -318,7 +471,10 @@ mod tests {
     #[test]
     fn classifies_both_deadline_signals_as_timeout() {
         for code in [tonic::Code::DeadlineExceeded, tonic::Code::Cancelled] {
-            assert_eq!(classify(code), PrefixIndexError::Timeout);
+            assert_eq!(
+                classify(&tonic::Status::new(code, "")),
+                PrefixIndexError::Timeout
+            );
         }
     }
 
@@ -361,10 +517,75 @@ mod tests {
         assert!(GrpcPrefixIndex::new(PrefixIndexConfig::new("10.0.0.1:50051")).is_err());
     }
 
+    /// Every configured endpoint is validated, not just the first, and an empty
+    /// list is rejected. Async because endpoint parsing needs a reactor.
+    #[tokio::test]
+    async fn construction_validates_the_whole_endpoint_list() {
+        let error = GrpcPrefixIndex::new(PrefixIndexConfig::with_endpoints(vec![
+            "http://a:50051".to_string(),
+            "b:50051".to_string(),
+        ]))
+        .map(|_| ())
+        .expect_err("a bad endpoint anywhere in the list must be rejected")
+        .to_string();
+        assert!(error.contains("b:50051"), "error should name it: {error}");
+        assert!(GrpcPrefixIndex::new(PrefixIndexConfig::with_endpoints(Vec::new())).is_err());
+        assert!(GrpcPrefixIndex::new(PrefixIndexConfig::with_endpoints(vec![
+            "http://a:50051".to_string(),
+            "http://b:50051".to_string(),
+        ]))
+        .is_ok());
+    }
+
+    /// A rejection is the same from every server, so it must not spend the
+    /// caller's deadline on the rest of the list.
+    #[test]
+    fn only_transient_failures_are_worth_another_endpoint() {
+        for error in [
+            PrefixIndexError::Unreachable,
+            PrefixIndexError::Timeout,
+            PrefixIndexError::Overloaded,
+        ] {
+            assert!(worth_failing_over(&error), "{error} should fail over");
+        }
+        for error in [
+            PrefixIndexError::QueryTooLarge,
+            PrefixIndexError::Rejected(tonic::Code::InvalidArgument),
+        ] {
+            assert!(!worth_failing_over(&error), "{error} should not fail over");
+        }
+    }
+
+    /// Two dead endpoints must not cost two deadlines: the budget covers the
+    /// whole query, failovers included.
+    #[tokio::test]
+    async fn the_deadline_bounds_the_whole_query_not_each_attempt() {
+        let index = GrpcPrefixIndex::new(PrefixIndexConfig {
+            // Both refuse instantly, so the loop is bounded by the budget rather
+            // than by connect latency.
+            endpoints: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            query_deadline: Duration::from_millis(300),
+            max_inflight: 4,
+        })
+        .unwrap_or_else(|error| panic!("valid endpoints: {error}"));
+
+        let started = Instant::now();
+        let error = index.match_prefix(vec![1, 2, 3]).await.unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(worth_failing_over(&error), "unexpected error: {error}");
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "the query took {elapsed:?}, which is more than one deadline"
+        );
+    }
+
     #[tokio::test]
     async fn local_admission_rejects_without_queueing() {
         let index = GrpcPrefixIndex::new(PrefixIndexConfig {
-            endpoint: "http://127.0.0.1:1".to_string(),
+            endpoints: vec!["http://127.0.0.1:1".to_string()],
             query_deadline: DEFAULT_QUERY_DEADLINE,
             max_inflight: 1,
         })
