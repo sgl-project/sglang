@@ -36,8 +36,13 @@ pub(super) async fn chat_completions(
     let resolver = resolvers
         .get(&model)
         .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
-    // Length-based routing needs tokenization even for load-only group policies.
-    let request = PreparedChatRequest::prepare(ctx, model, fields, body, true)?;
+    // Tokenize only for what this model's buckets actually select on: a length
+    // bound, a context-capacity check, or a prefix-matching group policy. The
+    // same predicate gates `--no-tokenizer` at startup, so asking it here keeps
+    // the two in agreement and spares a load-only bucket a body parse whose
+    // result nothing reads.
+    let request =
+        PreparedChatRequest::prepare(ctx, model, fields, body, resolver.needs_request_tokens())?;
     let input_tokens = request.input_token_count as u64;
     let expected_peak_tokens = request
         .max_output_tokens

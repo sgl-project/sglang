@@ -862,3 +862,58 @@ async fn remove_worker_clears_every_rank_before_returning() {
     assert_eq!(tree.node_count(), 0, "cleared chains must prune");
     index.shutdown().await;
 }
+
+/// The snapshot client must not follow redirects: a sibling router never
+/// redirects this route, so a 3xx is a misconfigured or hostile peer steering
+/// the fetch — and its multi-gigabyte buffering budget — at an arbitrary
+/// in-cluster URL. The 3xx must land as `FetchAnswer::NoBody` (peer is not a
+/// source) with the redirect target never contacted.
+///
+/// Asserted against the index's OWN client, not a test-local one: reqwest's
+/// default policy follows up to ten redirects, so a copy built in the test
+/// would prove nothing about the client the sweep and the probe actually use.
+#[tokio::test]
+async fn snapshot_client_refuses_to_follow_a_redirecting_peer() {
+    use crate::state::kv_events::bootstrap::{fetch_snapshot, FetchAnswer, SNAPSHOT_PATH};
+
+    let followed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let poisoned = Arc::clone(&followed);
+    let app = axum::Router::new()
+        .route(
+            SNAPSHOT_PATH,
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, "/poison")],
+                )
+            }),
+        )
+        .route(
+            "/poison",
+            axum::routing::get(move || {
+                let poisoned = Arc::clone(&poisoned);
+                async move {
+                    poisoned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "gotcha"
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let index = KvEventIndex::new();
+    let got = fetch_snapshot(&index.snapshot_http, &base, None)
+        .await
+        .expect("a refused redirect is an answer, not a transport error");
+    assert!(
+        matches!(got, FetchAnswer::NoBody(status) if status.is_redirection()),
+        "a redirecting peer must read as 'no snapshot here'",
+    );
+    assert_eq!(
+        followed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the redirect target must never be contacted",
+    );
+    index.shutdown().await;
+}
