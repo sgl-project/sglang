@@ -35,20 +35,22 @@ class DllmWindowGraphVariants:
     capture_labels: ClassVar[tuple[str, ...]] = (DLLM_VARLEN, DLLM_FULL_WINDOW)
 
     def get_capture_labels(self, batch_size: int) -> tuple[str, ...]:
-        return self.capture_labels if batch_size == 1 else (DLLM_VARLEN,)
+        return self.capture_labels
 
     def select(
         self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
     ) -> str:
         lengths = forward_batch.seq_lens_cpu
         if (
-            forward_batch.batch_size == 1
-            and capture_batch_size in (None, 1)
+            forward_batch.batch_size > 0
+            and capture_batch_size in (None, forward_batch.batch_size)
             and forward_batch.forward_mode.is_dllm_extend()
-            and forward_batch.input_ids.numel() == self.block_size
+            and forward_batch.input_ids.numel()
+            == forward_batch.batch_size * self.block_size
             and lengths is not None
             and lengths.device.type == "cpu"
-            and int(lengths[0]) - self.block_size >= self.window_size
+            and int(lengths[: forward_batch.batch_size].min()) - self.block_size
+            >= self.window_size
         ):
             return DLLM_FULL_WINDOW
         return DLLM_VARLEN

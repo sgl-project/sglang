@@ -32,14 +32,16 @@ def _pack_kv(
     TILE: tl.constexpr,
 ):
     row = tl.program_id(0)
-    qs, qe = tl.load(QO + row), tl.load(QO + row + 1)
-    ps, pe = tl.load(KI + row), tl.load(KI + row + 1)
+    qs = tl.load(QO + row).to(tl.int64)
+    qe = tl.load(QO + row + 1).to(tl.int64)
+    ps = tl.load(KI + row).to(tl.int64)
+    pe = tl.load(KI + row + 1).to(tl.int64)
     prefix = pe - ps
     length = prefix + qe - qs
     start = ps + qs
-    offsets = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    offsets = tl.program_id(1).to(tl.int64) * TILE + tl.arange(0, TILE)
     token, head, channel = offsets // (H * D), offsets // D % H, offsets % D
-    slot = tl.load(IDS + ps + token, token < prefix, other=0)
+    slot = tl.load(IDS + ps + token, token < prefix, other=0).to(tl.int64)
     kp = tl.load(KB + slot * KBS + head * KBH + channel, token < prefix, other=0)
     vp = tl.load(VB + slot * VBS + head * VBH + channel, token < prefix, other=0)
     current = qs + token - prefix
@@ -100,3 +102,12 @@ class DenseKVWorkspace:
         self.cu_seqlens = torch.empty(batch_size + 1, device=device, dtype=torch.int32)
         self.indices = torch.arange(capacity, device=device, dtype=torch.int64)
         self.window_start = torch.zeros(batch_size, device=device, dtype=torch.int32)
+
+    def view(self, capacity, batch_size):
+        return (
+            self.key[:capacity],
+            self.value[:capacity],
+            self.cu_seqlens[: batch_size + 1],
+            self.indices[:capacity],
+            self.window_start[:batch_size],
+        )

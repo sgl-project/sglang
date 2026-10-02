@@ -21,7 +21,10 @@ import torch
 from torch import nn
 from transformers import PreTrainedModel
 
+from sglang.kernels.ops.attention.gemma_qkv_norm_rope import gemma_qkv_norm_rope
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma_qkv_rmsnorm
+from sglang.kernels.ops.layernorm.rmsnorm_fanout import rmsnorm_fanout
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -57,7 +60,7 @@ from sglang.srt.models.gemma4_mm import (
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
+from sglang.srt.utils import add_prefix, is_sm100_supported, make_pp_layers
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +165,28 @@ class DiffusionGemmaAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if q.is_cuda:
+        fuse_rope = (
+            q.is_cuda
+            and q.dtype in (torch.bfloat16, torch.float16)
+            and 0 < q.shape[0] <= 1024
+            and is_sm100_supported()
+        )
+        if fuse_rope:
+            gemma_qkv_norm_rope(
+                q,
+                k,
+                v,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.eps,
+            )
+        elif q.is_cuda:
             gemma_qkv_rmsnorm(
                 q,
                 k,
@@ -185,7 +209,8 @@ class DiffusionGemmaAttention(nn.Module):
                 v.unflatten(-1, (self.num_kv_heads, self.head_dim))
             ).flatten(-2, -1)
 
-        q, k = self.rotary_emb(positions, q, k)
+        if not fuse_rope:
+            q, k = self.rotary_emb(positions, q, k)
 
         attn = (
             self.attn
@@ -310,14 +335,37 @@ class DiffusionGemmaDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        h1 = self.post_feedforward_layernorm_1(
-            self.mlp(self.pre_feedforward_layernorm(residual))
+        use_fanout = (
+            residual.is_cuda
+            and residual.dtype in (torch.bfloat16, torch.float16)
+            and 0 < residual.shape[0] <= 2048
+            and residual.shape[1] == 2816
+            and is_sm100_supported()
+            and not is_batch_invariant_mode_enabled()
         )
+        if use_fanout:
+            if not self.router._scale_fused:
+                self.router.fuse_scale()
+            dense_in, moe_in, router_in = rmsnorm_fanout(
+                residual,
+                self.pre_feedforward_layernorm.weight,
+                self.pre_feedforward_layernorm_2.weight,
+                self.router.norm.weight,
+                self.pre_feedforward_layernorm.variance_epsilon,
+            )
+        else:
+            dense_in = self.pre_feedforward_layernorm(residual)
+        h1 = self.post_feedforward_layernorm_1(self.mlp(dense_in))
+        del dense_in
+        if use_fanout:
+            router_logits, _ = self.router.proj(router_in)
+            del router_in
+        else:
+            moe_in = self.pre_feedforward_layernorm_2(residual)
+            router_logits = self.router(residual)
         # MoE branch: the router gates on the RAW residual (the router's input
         # norm is with_scale=False, so ln2's learned per-channel weights would
         # change the routed direction). Experts still get the ln2-normed input.
-        moe_in = self.pre_feedforward_layernorm_2(residual)
-        router_logits = self.router(residual)
         h2 = self.post_feedforward_layernorm_2(self.moe(moe_in, router_logits))
 
         hidden_states = self.post_feedforward_layernorm(h1 + h2)

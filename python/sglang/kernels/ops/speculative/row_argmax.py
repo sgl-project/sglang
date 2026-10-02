@@ -68,11 +68,16 @@ def _medium_argmax_partial_kernel(
     SX: tl.constexpr,
     SPLITS: tl.constexpr,
     BLOCK: tl.constexpr,
+    DIVISOR=None,
+    SD: tl.constexpr = 0,
 ):
     row, part = tl.program_id(0), tl.program_id(1)
     ix = part * BLOCK + tl.arange(0, BLOCK)
     valid = ix < N
     v = tl.load(X + row * SX + ix, valid, float("-inf"))
+    if DIVISOR is not None:
+        divisor = tl.load(DIVISOR + row * SD + ix, valid, 1.0)
+        v = tl.div_rn(v, divisor)
     i = tl.where(valid, ix, N)
     best_v, best_i = tl.reduce((v, i), 0, _argmax_pair)
     tl.store(PV + row * SPLITS + part, best_v)
@@ -87,6 +92,39 @@ def _medium_argmax_final_kernel(PV, PI, OUT, SPLITS: tl.constexpr, BLOCK: tl.con
     i = tl.load(PI + row * SPLITS + part, part < SPLITS, 0x7FFFFFFF)
     _, index = tl.reduce((v, i), 0, _argmax_pair)
     tl.store(OUT + row, index.to(tl.int64))
+
+
+def div_argmax(x: torch.Tensor, divisor: torch.Tensor) -> torch.Tensor:
+    """FP32 row-wise ``(x / divisor).argmax(-1)`` with unit column strides."""
+    assert x.ndim == 2 and x.dtype == torch.float32 and x.stride(1) == 1
+    assert (
+        divisor.shape == x.shape
+        and divisor.dtype == x.dtype
+        and divisor.device == x.device
+        and divisor.stride(1) == 1
+    )
+    rows, n = x.shape
+    block = 4096 if rows <= 256 else 8192
+    splits = triton.cdiv(n, block)
+    values = torch.empty((rows, splits), dtype=torch.float32, device=x.device)
+    indices = torch.empty((rows, splits), dtype=torch.int32, device=x.device)
+    out = torch.empty(rows, dtype=torch.int64, device=x.device)
+    _medium_argmax_partial_kernel[(rows, splits)](
+        x,
+        values,
+        indices,
+        n,
+        x.stride(0),
+        splits,
+        block,
+        DIVISOR=divisor,
+        SD=divisor.stride(0),
+        num_warps=4,
+    )
+    _medium_argmax_final_kernel[(rows,)](
+        values, indices, out, splits, triton.next_power_of_2(splits), num_warps=1
+    )
+    return out
 
 
 def row_argmax(x: torch.Tensor) -> torch.Tensor:

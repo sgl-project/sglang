@@ -44,6 +44,11 @@ class TboAttnBackend(AttentionBackend):
     def can_run_prefill_cuda_graph(self, forward_batch):
         return self.primary.can_run_prefill_cuda_graph(forward_batch)
 
+    def get_prefill_cuda_graph_max_query_len(self, num_tokens, max_requests):
+        return self.primary.get_prefill_cuda_graph_max_query_len(
+            num_tokens, max_requests
+        )
+
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
         return cls(

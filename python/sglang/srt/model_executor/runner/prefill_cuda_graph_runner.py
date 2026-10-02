@@ -1395,6 +1395,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         context_length = min(
             self.max_context_size or model_context_length, model_context_length
         )
+        if self._is_full_backend:
+            query_limit = (
+                self.model_runner.attn_backend.get_prefill_cuda_graph_max_query_len(
+                    num_tokens, self._capture_req_slots
+                )
+            )
+            if query_limit is not None:
+                context_length = min(context_length, query_limit)
         # A prefill bucket is an aggregate token count. Capture it as the
         # fewest synthetic requests, with every request containing no more
         # than context_length tokens.

@@ -165,6 +165,12 @@ class AttentionBackend(ABC):
         """Apply backend-specific limits after the runner's graph eligibility checks."""
         return True
 
+    def get_prefill_cuda_graph_max_query_len(
+        self, num_tokens: int, max_requests: int
+    ) -> Optional[int]:
+        """Maximum per-request query length represented by a prefill graph."""
+        return None
+
     def get_cuda_graph_variants(
         self, model_runner, forward_mode: ForwardMode, captured_req_width: int
     ) -> Optional[AttentionGraphVariants]:
