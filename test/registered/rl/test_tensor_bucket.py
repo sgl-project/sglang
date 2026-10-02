@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -59,3 +61,7 @@ def test_receive_bucket_preserves_mixed_dtype_wire_bytes(dtype_strings):
 def test_receive_bucket_rejects_invalid_metadata(names, dtypes, shapes):
     with pytest.raises(ValueError):
         FlattenedTensorBucket.empty(names, dtypes, shapes, "cpu")
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
