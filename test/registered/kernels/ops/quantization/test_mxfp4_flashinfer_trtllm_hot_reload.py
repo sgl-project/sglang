@@ -87,7 +87,7 @@ def _build_layer(
     return layer
 
 
-def _load_weights(layer: Module, seed: int) -> None:
+def _load_weights(layer: Module, seed: int, names=LOAD_PARAMS) -> None:
     generator = torch.Generator(device="cuda").manual_seed(seed)
     intermediate_size = layer.quant_method._intermediate_size_unpadded
     for name in LOAD_PARAMS:
@@ -116,6 +116,8 @@ def _load_weights(layer: Module, seed: int) -> None:
                 device="cuda",
                 dtype=torch.int8,
             )
+        if name not in names:
+            continue
         if name.startswith("w13"):
             half = param.shape[1] // 2
             param.data[:, :intermediate_size].copy_(loaded[:, :intermediate_size])
@@ -183,6 +185,34 @@ def test_hot_reload_matches_fresh_load_and_preserves_kernel_addresses(
         assert torch.equal(expected[name].view(torch.uint8), tensor.view(torch.uint8))
 
 
+@pytest.mark.parametrize("intermediate_size", [64, 128])
+@pytest.mark.parametrize("names", [(), ("w2_weight",), ("w13_weight_scale_inv",)])
+def test_partial_update_preserves_untouched_experts(intermediate_size, names):
+    """A session must not reshuffle untouched expert weights or discard scale-only updates."""
+    layer = _build_layer(intermediate_size=intermediate_size)
+    _load_weights(layer, seed=0)
+    DefaultModelLoader.postprocess_weights(layer, torch.device("cuda"))
+    addresses = {
+        name: tensor.data_ptr() for name, tensor in _kernel_tensors(layer).items()
+    }
+
+    reference = _build_layer(intermediate_size=intermediate_size)
+    _load_weights(reference, seed=0)
+    _load_weights(reference, seed=1, names=names)
+    DefaultModelLoader.postprocess_weights(reference, torch.device("cuda"))
+
+    DefaultModelLoader.restore_weights_before_loading(layer, torch.device("cuda"))
+    DefaultModelLoader.restore_weights_before_loading(layer, torch.device("cuda"))
+    _load_weights(layer, seed=1, names=names)
+    DefaultModelLoader.postprocess_weights(layer, torch.device("cuda"))
+    DefaultModelLoader.postprocess_weights(layer, torch.device("cuda"))
+    for name, tensor in _kernel_tensors(layer).items():
+        assert tensor.data_ptr() == addresses[name]
+        assert torch.equal(
+            tensor.view(torch.uint8), getattr(reference, name).view(torch.uint8)
+        )
+
+
 class TestMxfp4KernelForward(CustomTestCase):
     @torch.inference_mode()
     def test_mxfp8_forward_accepts_int8_load_parameters(self):
@@ -196,6 +226,10 @@ class TestMxfp4KernelForward(CustomTestCase):
         from sglang.srt.layers.quantization import mxfp4_flashinfer_trtllm_moe
 
         layer = _build_layer(num_experts=32, hidden_size=4096, intermediate_size=2048)
+        # Module device moves can replace buffers; the kernel must read the live copy.
+        old_clamp = layer._gemm1_clamp_limit_tensor
+        layer._apply(lambda tensor: tensor.clone())
+        old_clamp.zero_()
         generator = torch.Generator(device="cuda").manual_seed(0)
         hidden_states = torch.randn(
             8, 4096, generator=generator, device="cuda", dtype=torch.bfloat16

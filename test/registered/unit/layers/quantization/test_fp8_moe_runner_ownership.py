@@ -151,6 +151,14 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
             torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
             self.assertNotIn(name, layer.state_dict())
 
+        method.moe_runner_config.gemm1_alpha = None
+        with self.assertRaisesRegex(ValueError, "cannot be enabled or disabled"):
+            self._run_post_load(method, layer)
+        self.assertIs(
+            layer._flashinfer_trtllm_gemm1_alpha,
+            retained["_flashinfer_trtllm_gemm1_alpha"],
+        )
+
 
 class TestFp8MoEAiterQuantInfo(CustomTestCase):
     """maybe_get_hip_aiter_quant_info assembles what the AITER runner consumes.

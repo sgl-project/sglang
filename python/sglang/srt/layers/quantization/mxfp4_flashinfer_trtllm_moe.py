@@ -12,6 +12,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 from sglang.srt.layers.utils.common import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_exec,
@@ -131,7 +132,7 @@ def _shuffled_scale_name(name: str) -> str:
     return f"{name}_shuffled"
 
 
-class Mxfp4FlashinferTrtllmMoEMethod:
+class Mxfp4FlashinferTrtllmMoEMethod(QuantizeMethodBase):
     fuse_routed_scaling_factor_in_topk = True
 
     def __init__(self, fp8_method, prefix: str):
@@ -152,7 +153,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         self.runner = None
 
         swiglu_limit = moe_runner_config.swiglu_limit
-        self._gemm1_clamp_limit_tensor = (
+        clamp_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),
                 swiglu_limit,
@@ -164,7 +165,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
         layer.register_buffer(
             "_gemm1_clamp_limit_tensor",
-            self._gemm1_clamp_limit_tensor,
+            clamp_limit_tensor,
             persistent=False,
         )
 
@@ -181,6 +182,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
         fp4_block_k = 32
         self._intermediate_size_unpadded = intermediate_size_per_partition
+        self._weights_in_kernel_layout = False
+        layer.register_buffer("_mxfp4_w13_restore_rows", None, persistent=False)
+        layer.register_buffer("_mxfp4_w2_restore_rows", None, persistent=False)
 
         w13_weight = Parameter(
             torch.empty(
@@ -232,6 +236,18 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        """Restore checkpoint row order without replacing captured weight storage."""
+        if not self._weights_in_kernel_layout:
+            return
+        for weight, rows in (
+            (layer.w13_weight, layer._mxfp4_w13_restore_rows),
+            (layer.w2_weight, layer._mxfp4_w2_restore_rows),
+        ):
+            for expert in weight.data:
+                expert.copy_(expert[rows])
+        self._weights_in_kernel_layout = False
+
     def process_weights_after_loading(self, layer: Module) -> None:
         """Turn the freshly loaded checkpoint layout into what the kernel reads.
 
@@ -246,6 +262,8 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         the checkpoint-layout scales here; the checkpoint-layout scales are
         never modified and stay loadable.
         """
+        if self._weights_in_kernel_layout:
+            return
         self._fp8.process_weights_after_loading(layer)
 
         if getattr(layer, "_mega_moe_weights_built", False):
@@ -311,6 +329,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         w13_sf_rows = w3_w1_rows[w13_sf_rows.to(device)]
         w2_rows = w2_rows.to(device)
         w2_sf_rows = w2_sf_rows.to(device)
+        first_build = layer._mxfp4_w13_restore_rows is None
+        if first_build:
+            layer._mxfp4_w13_restore_rows = torch.argsort(w13_rows)
+            layer._mxfp4_w2_restore_rows = torch.argsort(w2_rows)
 
         g1_s, g2_s = [], []
         for i in range(num_experts):
@@ -319,6 +341,8 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             g1_s.append(block_scale_interleave(w13_s_u8[i][w13_sf_rows].contiguous()))
             g2_s.append(block_scale_interleave(w2_s_u8[i][w2_sf_rows].contiguous()))
 
+        # Keep scales as Parameters: EPLB moves expert-indexed parameters, not buffers.
+        # FP32 load scales stay resident alongside shuffled scales (1/4 of packed weight bytes).
         copy_or_rebind_param(
             layer,
             _shuffled_scale_name("w13_weight_scale_inv"),
@@ -331,7 +355,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
 
         self._register_static_scale_ones(layer)
-        torch.cuda.empty_cache()
+        self._weights_in_kernel_layout = True
+        if first_build:
+            torch.cuda.empty_cache()
 
     def _register_static_scale_ones(self, layer: Module) -> None:
         # Constant across reloads; created once so their addresses stay valid
@@ -405,7 +431,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             torch.float8_e4m3fn
         )
 
-        intermediate_size = w2.shape[2] * 2 if w2.dtype == torch.uint8 else w2.shape[2]
+        intermediate_size = w2.shape[2] * 2
         hidden_size = routed_hidden_size(layer)
 
         num_local_experts = layer.num_local_experts
@@ -493,7 +519,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
+            gemm1_clamp_limit=layer._gemm1_clamp_limit_tensor,
             gemm2_weights=w2,
             gemm2_weights_scale=w2_scale,
             gemm2_bias=None,

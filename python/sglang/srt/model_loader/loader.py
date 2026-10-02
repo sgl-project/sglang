@@ -1095,7 +1095,7 @@ class DefaultModelLoader(BaseModelLoader):
     def restore_weights_before_loading(model, target_device):
         """Undo in-place quant packing so fresh weights can be loaded."""
         for module, quant_method in _modules_with_quant_method(model):
-            # AMX packing and the MXFP4 backend wrappers are duck-typed and cannot restore
+            # Duck-typed methods without the quantization hook contract cannot restore.
             if isinstance(quant_method, QuantizeMethodBase):
                 with device_loading_context(module, target_device):
                     quant_method.restore_weights_before_loading(module)
