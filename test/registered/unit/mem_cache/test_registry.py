@@ -140,23 +140,17 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         default_factory.assert_called_once()
         self.assertIs(result, cache)
 
-    def test_streaming_wrap_when_cache_does_not_support_it(self):
+    def test_streaming_rejected_when_cache_does_not_support_it(self):
         inner = MagicMock()
         inner.supports_streaming_session.return_value = False
         register_radix_cache_backend("nonstreaming", MagicMock(return_value=inner))
 
-        with patch(
-            "sglang.srt.session.streaming_session.StreamingSession"
-        ) as session_cls:
-            session_cls.return_value = MagicMock(name="wrapped")
-            result = create_tree_cache(
+        with self.assertRaisesRegex(NotImplementedError, "not verified"):
+            create_tree_cache(
                 _make_ctx(self, backend="nonstreaming", enable_streaming=True)
             )
 
-        session_cls.assert_called_once_with(inner)
-        self.assertIs(result, session_cls.return_value)
-
-    def test_no_streaming_wrap_when_cache_supports_it(self):
+    def test_streaming_kept_when_cache_supports_it(self):
         inner = MagicMock()
         inner.supports_streaming_session.return_value = True
         register_radix_cache_backend("streaming", MagicMock(return_value=inner))
@@ -214,6 +208,41 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             result = default_radix_cache_factory(ctx)
             PureSWAChunkCache.assert_called_once_with(ctx.params)
             self.assertIs(result, PureSWAChunkCache.return_value)
+
+    def test_streaming_with_disable_radix_uses_unified_radix_cache(self):
+        ctx = _make_ctx(
+            self,
+            effective_chunked_prefill_size=512,
+            disable_radix_cache=True,
+            enable_streaming=True,
+        )
+        with patch(
+            "sglang.srt.mem_cache.registry.create_unified_radix_cache"
+        ) as create_unified:
+            create_unified.return_value = MagicMock()
+            result = default_radix_cache_factory(ctx)
+            create_unified.assert_called_once_with(ctx)
+            self.assertIs(result, create_unified.return_value)
+
+    def test_streaming_with_pure_swa_is_rejected(self):
+        inner = MagicMock()
+        inner.supports_streaming_session.return_value = False
+        with patch(
+            "sglang.srt.mem_cache.registry.default_radix_cache_factory",
+            return_value=inner,
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "not verified"):
+                create_tree_cache(
+                    _make_ctx(
+                        self,
+                        backend=None,
+                        enable_streaming=True,
+                        disable_radix_cache=True,
+                        effective_chunked_prefill_size=512,
+                        is_hybrid_swa=True,
+                        full_tokens_per_layer=0,
+                    )
+                )
 
     def test_unified_radix_cache_is_the_default(self):
         ctx = _make_ctx(
