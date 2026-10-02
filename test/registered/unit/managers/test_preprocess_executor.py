@@ -11,7 +11,11 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest  # noqa: E402
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase  # noqa: E402
+from sglang.srt.entrypoints.openai.serving_chat import (  # noqa: E402
+    OpenAIServingChat,
+)
 from sglang.srt.managers.preprocess_executor import PreprocessExecutor  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
 
@@ -218,6 +222,23 @@ class TestPreprocessExecutor(CustomTestCase):
             thread, job_tokenizer = asyncio.run(run())
         self.assertIs(thread, threading.main_thread())
         self.assertIs(job_tokenizer, tokenizer)
+
+    def test_only_short_plain_text_chats_skip_the_worker(self):
+        """A chat is converted on the loop only when its rendering is cheap; a
+        long conversation, or one whose template output its text length does
+        not bound (tools, content parts), must go to the worker."""
+
+        def cheap(**fields):
+            request = ChatCompletionRequest(model="m", **fields)
+            return OpenAIServingChat._is_cheap_to_preprocess(None, request)
+
+        short = [{"role": "user", "content": SHORT_PROMPT}]
+        tool = {"type": "function", "function": {"name": "f", "parameters": {}}}
+        parts = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        self.assertTrue(cheap(messages=short))
+        self.assertFalse(cheap(messages=[{"role": "user", "content": LONG_PROMPT}]))
+        self.assertFalse(cheap(messages=short, tools=[tool]))
+        self.assertFalse(cheap(messages=parts))
 
 
 if __name__ == "__main__":

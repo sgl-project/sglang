@@ -9,6 +9,10 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# Arbitrary cutoff: inputs this short hold the event loop for well under a
+# millisecond, so preprocessing them inline when idle skips the thread hop.
+INLINE_PREPROCESS_MAX_CHARS = 2048
+
 # (shared tokenizer, the worker's clone of it), bound for the duration of a job.
 _job_tokenizer: ContextVar[Optional[tuple[Any, Any]]] = ContextVar(
     "sglang_preprocess_job_tokenizer", default=None

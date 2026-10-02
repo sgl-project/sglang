@@ -107,6 +107,7 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.preprocess_executor import (
+    INLINE_PREPROCESS_MAX_CHARS,
     PreprocessExecutor,
     resolve_tokenizer,
 )
@@ -192,10 +193,6 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
-
-# Arbitrary cutoff: prompts this short hold the event loop for well under a
-# millisecond, and tokenizing them inline keeps their dispatch timing unchanged.
-_INLINE_TOKENIZE_MAX_CHARS = 2048
 
 logger = logging.getLogger(__name__)
 
@@ -1062,7 +1059,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids, token_type_ids = await self.preprocess_executor.run(
                 tokenize,
                 inline_if_idle=input_format == InputFormat.SINGLE_STRING
-                and len(texts) <= _INLINE_TOKENIZE_MAX_CHARS,
+                and len(texts) <= INLINE_PREPROCESS_MAX_CHARS,
             )
 
         # vLLM's OpenAI embeddings endpoint includes special tokens for
