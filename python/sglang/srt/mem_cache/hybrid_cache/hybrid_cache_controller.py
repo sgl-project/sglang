@@ -1535,7 +1535,7 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             if entry.device_indices_from_anchor_fn is not None:
                 # Allocate independent pools first: their allocation/eviction
-                # can compact SWA before its kernel-facing IDs are captured.
+                # can compact SWA before its physical IDs are captured.
                 anchor_transfers.append((pool, entry))
                 continue
             # device_alloc_fn / device_free_fn override entry.device_pool's

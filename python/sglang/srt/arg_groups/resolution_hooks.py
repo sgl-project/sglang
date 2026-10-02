@@ -40,7 +40,6 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "apply_muse_glimmer_prefill_cuda_graph_max_bs_default",
         "handle_dwdp",
         "handle_cuda_graph_config",
-        "apply_glm5_chunked_prefill_default",
         "handle_hpu_backends",
         "handle_cpu_backends",
         "handle_npu_backends",
