@@ -690,9 +690,7 @@ class PortArgs:
         num_dp_ranks = (
             num_dp_ranks_of(cfg) if hasattr(cfg, "attn_dp_size") else cfg.dp_size
         )
-        ports = [
-            server_args.port + dp_rank for dp_rank in range(num_dp_ranks)
-        ] + [
+        ports = [server_args.port + dp_rank for dp_rank in range(num_dp_ranks)] + [
             server_args.disaggregation_bootstrap_port,
             server_args.encoder_bootstrap_port,
             server_args.engine_info_bootstrap_port,
