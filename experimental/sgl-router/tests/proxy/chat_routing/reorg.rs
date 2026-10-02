@@ -992,6 +992,39 @@ async fn full_decode_group_falls_back_to_another_version_group() {
 }
 
 #[tokio::test]
+async fn rerank_instructions_count_toward_bucket_context_limits() {
+    let short_worker = MockWorker::start(vec![]).await;
+    let long_worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut short = Bucket::new("short", BucketGroups::Plain(group("short", policy.clone())));
+    short.max_context_tokens = Some(1024);
+    let long = Bucket::new("long", BucketGroups::Plain(group("long", policy)));
+    let app = build_router(context(
+        &[
+            ("short", Stage::Plain, &short_worker),
+            ("long", Stage::Plain, &long_worker),
+        ],
+        vec![long, short],
+    ));
+
+    // Qwen rerankers include the instruction in every query-document prompt.
+    for (instruct, worker) in [
+        ("Rank relevant documents.".to_owned(), &short_worker),
+        ("instruction ".repeat(8192), &long_worker),
+    ] {
+        let body = serde_json::json!({"query": "hi", "documents": ["yo"], "instruct": instruct});
+        let req = Request::post("/v1/rerank")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(worker.captured_json().await, body);
+    }
+}
+
+#[tokio::test]
 async fn embeddings_fallback_batches_use_per_prompt_context_limits() {
     let worker = MockWorker::start(vec![]).await;
     let policy = Arc::new(FirstPolicy::default());
