@@ -8,7 +8,7 @@ from sglang.srt.configs.nano_nemotron_vl import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestNemotronHOmniConfig(CustomTestCase):
@@ -45,6 +45,20 @@ class TestNemotronHOmniConfig(CustomTestCase):
             llm_config["layers_block_type"],
             ["linear_attention", "moe", "full_attention"],
         )
+
+    def test_text_config_resolves_to_the_language_model_config(self):
+        """LoRAManager sizes its pools from base_hf_config.get_text_config();
+        without the override that returns the VL config itself, which carries no
+        num_hidden_layers, and LoRA init dies before serving a single request."""
+        config = NemotronH_Omni_Reasoning_V3_Config(
+            vision_config={"args": {"model": "radio"}},
+            llm_config={},
+        )
+
+        self.assertIs(config.get_text_config(), config.llm_config)
+        # Without the override this raises AttributeError rather than comparing
+        # unequal, which is the reported failure.
+        self.assertIsInstance(config.get_text_config().num_hidden_layers, int)
 
 
 if __name__ == "__main__":
