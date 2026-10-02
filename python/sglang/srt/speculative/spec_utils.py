@@ -35,12 +35,12 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
     get_self_pp_group,
     patch_pipeline_parallel_group,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.allocation import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_spec,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
@@ -312,6 +313,8 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
                     "draft_token",
                     "custom_mask",
                     "positions",
+                    "prepared_out_cache_loc",
+                    "prepared_mrope_positions",
                     "retrieve_index",
                     "retrieve_next_token",
                     "retrieve_next_sibling",
@@ -746,12 +749,19 @@ def draft_pp_context():
         yield
 
 
-@contextmanager
-def draft_tp_context(tp_group: GroupCoordinator, *, owns_attention: bool):
-    # Draft model doesn't use dp and has its own tp group.
-    # We disable mscclpp now because it doesn't support 2 comm groups.
-    with patch_tensor_parallel_group(tp_group, owns_attention=owns_attention):
-        yield
+def draft_tp_context(owns_attention: bool):
+    """Enter the TP placement that draft work runs under.
+
+    Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
+    sync) runs on the target's attention-TP group; other draft work keeps the
+    target's TP placement. Enter it from outside any draft scope, where
+    ``attn_tp_group`` is still the target's.
+    """
+    if not owns_attention:
+        return contextlib.nullcontext()
+    return patch_tensor_parallel_group(
+        get_parallel().attn_tp_group, owns_attention=True
+    )
 
 
 def spec_stage_span(name: str):
@@ -924,6 +934,7 @@ def commit_mamba_states_after_verify(
     accept_lens: torch.Tensor,
     accept_index: torch.Tensor,
     draft_token_num: int,
+    prepared_step_indices: Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]] = None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -950,6 +961,10 @@ def commit_mamba_states_after_verify(
     # ring is allocated only then; KDA never allocates the cursors.
     req_pool = model_runner.req_to_token_pool
     mamba_pool = getattr(req_pool, "mamba_pool", None)
+    bs = accept_lens.shape[0]
+    src_indices_raw = (
+        batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
+    )
 
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
@@ -967,12 +982,17 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
+        if prepared_step_indices is None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
+            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
         commit_gdn_replayssm_fold_after_verify(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
@@ -980,6 +1000,7 @@ def commit_mamba_states_after_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
+            src_indices_raw=src_indices_raw,
             null_block_id=-1,
         )
         return
@@ -1000,15 +1021,19 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         replay_indices = batch.req_pool_indices
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
+        if prepared_step_indices is None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
+            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
         # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
         commit_gdn_replayssm_spec(
@@ -1047,6 +1072,7 @@ def commit_mamba_states_after_verify(
             spec_state.intermediate_conv_window[0],
             state_batch_indices,
             last_correct_step_indices,
+            src_indices_raw,
         )
         if batch.mamba_track_indices is not None:
             fused_conv_window_scatter_with_mask(
@@ -1054,6 +1080,7 @@ def commit_mamba_states_after_verify(
                 spec_state.intermediate_conv_window[0],
                 batch.mamba_track_indices,
                 mamba_steps_to_track,
+                src_indices_raw,
             )
         return
 
@@ -1075,7 +1102,6 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         accept_indices_offset = torch.arange(
             0,
@@ -1115,21 +1141,26 @@ def commit_mamba_states_after_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
+            src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
         )
         return
 
     attn_backend = model_runner.attn_backend
 
-    bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
+        if prepared_step_indices is None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
+            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
 
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             attn_backend.update_mamba_state_after_mtp_verify(

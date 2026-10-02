@@ -240,6 +240,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             num_fused_shared_experts=0,
             layer_id=0,
             routed_scaling_factor=1.0,
+            mega_shared_l1_weights=None,
+            mega_shared_l2_weights=None,
         )
 
         with (

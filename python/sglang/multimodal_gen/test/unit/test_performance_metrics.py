@@ -186,10 +186,19 @@ def test_worker_records_replica_load_and_runtime_peaks():
     worker._runtime_peak_allocated_mb = 0.0
     output = OutputBatch()
     metrics = RequestMetrics("request")
-    replica_group = Mock()
-    replica_group.all_reduce.return_value = torch.tensor(
-        [5120.0, 3584.0, 6144.0, 3500.0, 2560.0], dtype=torch.float64
-    )
+    replica_group = SimpleNamespace(world_size=2, cpu_group=object())
+    reduced = []
+
+    def all_reduce(tensor, op, group):
+        # five host counters over the gloo group, never a device collective
+        assert tensor.device.type == "cpu"
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is replica_group.cpu_group
+        reduced.append(tensor.tolist())
+        tensor.copy_(
+            torch.tensor([5120.0, 3584.0, 6144.0, 3500.0, 2560.0], dtype=torch.float64)
+        )
+
     snapshots = [
         MemorySnapshot(0.0, 0.0, 2048.0, 3072.0),
         MemorySnapshot(0.0, 0.0, 2048.0, 3072.0),
@@ -205,6 +214,9 @@ def test_worker_records_replica_load_and_runtime_peaks():
         patch.object(
             gpu_worker_module, "get_replica_group", return_value=replica_group
         ),
+        patch.object(
+            gpu_worker_module.torch.distributed, "all_reduce", side_effect=all_reduce
+        ),
     ):
         worker._record_output_peak_memory(output)
         worker._record_replica_peak_memory([metrics])
@@ -218,6 +230,7 @@ def test_worker_records_replica_load_and_runtime_peaks():
     assert metrics.memory_snapshots["load_peak"].peak_allocated_mb == 3500.0
     assert metrics.memory_snapshots["runtime_peak"].peak_allocated_mb == 2560.0
     assert metrics.memory_snapshots["warmup_peak"].peak_reserved_mb == 6144.0
+    assert reduced == [[4096.0, 3072.0, 0.0, 3000.0, 2048.0]]
 
 
 def test_server_warmup_preserves_peak_after_managed_stage_timeline():

@@ -32,6 +32,9 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.method_names import (
+    canonical_quantization_method,
+)
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
@@ -609,6 +612,8 @@ class ServerArgs(DisaggServerArgsMixin):
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
     enable_cache_report: bool = False
+    disable_conditioning_cache: bool = False
+    conditioning_cache_max_size_mb: float = 512.0
 
     # Tracing
     enable_trace: bool = False
@@ -1932,6 +1937,10 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(f"Could not parse attention backend config: {config_str}")
 
     def __post_init__(self):
+        if not 0 <= self.conditioning_cache_max_size_mb < float("inf"):
+            raise ValueError(
+                "conditioning_cache_max_size_mb must be finite and nonnegative"
+            )
         if not self._explicit_arg_names:
             self._explicit_arg_names = _infer_direct_constructor_explicit_arg_names(
                 self
@@ -1975,10 +1984,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
             normalized_direct_gpu_loading[component_name] = enabled
         self.component_direct_gpu_weight_loading = normalized_direct_gpu_loading
+        if self.quantization is not None:
+            self.quantization = canonical_quantization_method(self.quantization)
         normalized_quantizations: dict[str, str] = {}
         for component, quantization in self.component_quantizations.items():
             component = str(component).strip().replace("-", "_")
-            quantization = str(quantization).strip().lower()
+            quantization = canonical_quantization_method(
+                str(quantization).strip().lower()
+            )
             if not component or not quantization:
                 raise ValueError(
                     "Component quantization entries require a component and method"
@@ -2783,7 +2796,11 @@ class ServerArgs(DisaggServerArgsMixin):
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Use this flag to override auto-detection. "
                 "Online (post-load) quantization from a BF16/FP16 checkpoint "
-                "is supported for 'fp8' and 'mxfp4'. Other methods "
+                "is supported for 'fp8', 'mxfp4' and 'convrot_int8' (ConvRot INT8 "
+                "W8A8; runs on SGLang's JIT-compiled fused ops on CC 9.0, 10.0, "
+                "12.0 and 12.1, else on comfy_kitchen; see "
+                "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND; 'kitchen_int8' is a "
+                "deprecated alias). Other methods "
                 "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
                 "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
@@ -2797,7 +2814,8 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.quantization_ignored_layers,
             help=(
                 "Layer name patterns to keep unquantized during online quantization "
-                "(fp8/mxfp4). Each pattern is matched against the layer prefix. "
+                "(fp8/mxfp4/convrot_int8). Each pattern is matched against the "
+                "layer prefix. "
                 "Example: --quantization-ignored-layers img_mod txt_mod to_out"
             ),
         )
@@ -3025,6 +3043,18 @@ class ServerArgs(DisaggServerArgsMixin):
             action="store_true",
             default=ServerArgs.enable_cache_report,
             help="Return number of cached tokens in usage.prompt_tokens_details for each OpenAI-compatible request.",
+        )
+        parser.add_argument(
+            "--disable-conditioning-cache",
+            action="store_true",
+            default=ServerArgs.disable_conditioning_cache,
+            help="Disable cross-request text/image and VAE posterior caching; reuse within a grouped stage remains enabled.",
+        )
+        parser.add_argument(
+            "--conditioning-cache-max-size-mb",
+            type=float,
+            default=ServerArgs.conditioning_cache_max_size_mb,
+            help="Per-worker conditioning cache capacity across CPU and device entries in MiB (default: 512; 0 disables cross-request caching).",
         )
         parser.add_argument(
             "--backend",
