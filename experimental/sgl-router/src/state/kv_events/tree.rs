@@ -116,6 +116,8 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, error};
 
+use super::pending::PendingPrefixes;
+
 mod snapshot;
 
 pub(super) use snapshot::ShapeViolation;
@@ -1185,6 +1187,8 @@ pub struct HashTree {
     /// cross-shard scan that chose its target are atomic against the other
     /// writer. Readers never take it.
     writer: Mutex<()>,
+    /// Route-time predictions, kept apart from the event-driven shards.
+    pending: PendingPrefixes,
 }
 
 impl Default for HashTree {
@@ -1202,7 +1206,12 @@ impl HashTree {
         Self {
             shards,
             writer: Mutex::new(()),
+            pending: PendingPrefixes::default(),
         }
+    }
+
+    pub fn pending(&self) -> &PendingPrefixes {
+        &self.pending
     }
 
     /// Resolve an `insert`'s `parent_hash` over the COMPLETE carrier set and
