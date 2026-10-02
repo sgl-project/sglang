@@ -10,7 +10,7 @@ pub mod stats;
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
-use dynamo_tokenizers::Tokenizer;
+use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -148,7 +148,14 @@ impl TokenizerRegistry {
     /// Encode a raw prompt as the engine's `tokenizer(text)` does, special tokens included.
     pub fn encode_prompt(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
         let (prefix, suffix) = self.prompt_affixes.as_ref()?;
-        let ids = adapter::encode(&*self.get(model_id)?, text).ok()?;
+        let tokenizer = self.get(model_id)?;
+        // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
+        let ids = if self.stats.backend() == stats::EncodeBackend::Tiktoken {
+            kimi::encode(&tokenizer, &[EncodeSegment::control(text)])
+        } else {
+            adapter::encode(&tokenizer, text)
+        }
+        .ok()?;
         (!ids.is_empty()).then(|| [prefix.as_slice(), &ids, suffix].concat())
     }
 
