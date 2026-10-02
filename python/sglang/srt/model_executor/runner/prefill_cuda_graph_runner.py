@@ -2042,13 +2042,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # text-only batches they are get_input_embeddings()(input_ids).
             # Copy them into the slot before replay so the graph sees the
             # current request's embeddings (mirrors main's BCG closure).
-            # The Qwen4-Exp MTP draft passes its hyper-connection stream
-            # (hidden x hc_count) in the `inputs_embeds` position; it is not
-            # an embedding, so leave the slot alone.
+            # The Qwen MTP draft passes its HC stream as inputs_embeds;
+            # its slot is registered at hidden_size * hc_count width.
             if (
                 self.model_runner.pp_group.is_first_rank
                 and self.buffer_registry.has_slot("input_embeds")
-                and not self._qwen_bcg_mtp_draft
             ):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)

@@ -464,16 +464,15 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
 
         self.assertIs(output, live_embeds)
 
-    def test_bcg_mtp_draft_replay_leaves_input_embeds_slot_alone(self):
+    def test_bcg_mtp_draft_replay_fills_hc_width_input_embeds_slot(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
         runner._qwen_bcg_hc_sidechannel = False
         runner._qwen_bcg_mtp_draft = True
         runner._input_embeds_arg_idx = 3
         runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: True)
-        runner._fill_input_embeds_slot = lambda *_args, **_kwargs: self.fail(
-            "draft hc stream copied into the input_embeds slot"
-        )
+        slot = torch.empty((8, 2 * 4))
+        runner._fill_input_embeds_slot = Mock(side_effect=lambda args, *_: slot[:1].copy_(args[3]))
         runner.backend = SimpleNamespace(replay=lambda *_args, **_kwargs: "replayed")
         runner.layer_model = SimpleNamespace(forward=None)
         runner.model_runner = SimpleNamespace(
@@ -494,6 +493,8 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             batch, batch, static_num_tokens=8, raw_num_tokens=1, shape_key=object()
         )
         self.assertEqual(output, "replayed")
+        runner._fill_input_embeds_slot.assert_called_once()
+        self.assertEqual(runner._fill_input_embeds_slot.call_args.args[0][3].shape[1], slot.shape[1])
 
 
 if __name__ == "__main__":
