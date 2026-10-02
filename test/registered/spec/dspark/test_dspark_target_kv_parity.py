@@ -1,5 +1,6 @@
 """Compare the serving KV-input draft against the installed SpecForge source."""
 
+import copy
 import importlib.util
 import json
 import tempfile
@@ -9,7 +10,10 @@ from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
-from sglang.srt.training_capture.protocol import ContractError
+from sglang.srt.speculative.dspark_components.dspark_target_kv_export import (
+    export_target_kv_checkpoint,
+)
+from sglang.srt.training_capture.protocol import ContractError, digest_bytes
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.dspark_target_kv_parity import (
     FixedInputParityError,
@@ -32,6 +36,19 @@ register_cuda_ci(
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestTargetKVServingParity(CustomTestCase):
+    def export_checkpoint(self, config, weights, tensors, directory):
+        fixture = directory.with_suffix(".inputs.safetensors")
+        save_file(
+            {name: value.contiguous() for name, value in tensors.items()}, fixture
+        )
+        config = copy.deepcopy(config.to_dict())
+        config["target_kv_contract"]["validation"]["golden_fixture_sha256"] = (
+            digest_bytes(fixture.read_bytes())
+        )
+        return export_target_kv_checkpoint(
+            config, weights, golden_fixture=fixture, output_dir=directory
+        )
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -75,13 +92,11 @@ class TestTargetKVServingParity(CustomTestCase):
                     torch.equal(before, reference.backbone.kv_encoder.projection.weight)
                 )
                 updated_path = Path(temp) / "updated"
-                reference.backbone.config.save_pretrained(updated_path)
-                save_file(
-                    {
-                        name: value.detach().cpu().contiguous()
-                        for name, value in reference.backbone.state_dict().items()
-                    },
-                    str(updated_path / "model.safetensors"),
+                self.export_checkpoint(
+                    reference.backbone.config,
+                    reference.backbone.state_dict(),
+                    tensors,
+                    updated_path,
                 )
                 updated = ServingKVParityRunner(updated_path, embed=embed, head=head)
                 report = check_fixed_input_parity(
@@ -93,6 +108,32 @@ class TestTargetKVServingParity(CustomTestCase):
                     ),
                     flush=True,
                 )
+
+    def test_packed_serving_weights_export_to_the_same_model(self):
+        with tempfile.TemporaryDirectory() as temp:
+            reference, embed, head, tensors = make_parity_checkpoint(
+                Path(temp) / "draft", "gated"
+            )
+            reference, embed, head = (
+                module.cuda() for module in (reference, embed, head)
+            )
+            serving = ServingKVParityRunner(
+                Path(temp) / "draft", embed=embed, head=head
+            )
+            weights = {
+                name: value
+                for name, value in serving.model.named_parameters()
+                if not name.startswith(("embed_tokens.", "lm_head."))
+            }
+            exported = Path(temp) / "packed-export"
+            self.export_checkpoint(
+                reference.backbone.config, weights, tensors, exported
+            )
+            reloaded = ServingKVParityRunner(exported, embed=embed, head=head)
+            report = check_fixed_input_parity(
+                reference, reloaded, embed, head, tensors, [1, 5, 12]
+            )
+            self.assertTrue(all(stage["passed"] for stage in report["stages"].values()))
 
     def test_future_tokens_and_kv_do_not_enter_backbone(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -167,9 +208,11 @@ class TestTargetKVServingParity(CustomTestCase):
             fused = serving.forward(**inputs)
             expected = [
                 {
-                    name: [layer[row : row + 1] for layer in value]
-                    if name == "layers"
-                    else value[row : row + 1]
+                    name: (
+                        [layer[row : row + 1] for layer in value]
+                        if name == "layers"
+                        else value[row : row + 1]
+                    )
                     for name, value in fused.items()
                 }
                 for row in range(3)

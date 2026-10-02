@@ -1197,6 +1197,20 @@ validation: golden fixtures digest, parity tolerances, acceptance benchmark repo
 
 不把整个在线 target decoder 保存进 draft checkpoint。shared embedding/lm_head 的引用或副本需明确版本，head scaling 不能重复应用。
 
+SGLang 已提供 `export_target_kv_checkpoint(config, weights, golden_fixture=...,
+output_dir=..., acceptance_report=None)`，接收已停止修改、完成全局汇总的训练
+state dict。配置使用实际 Hugging Face 解析结果，必须显式声明 KV-input 架构、
+model_type、dtype 和三方契约。导出检查完整参数集合、全局形状、数值有限性及
+目标 dtype 溢出；支持完整 QKV/MLP 融合权重或分片，统一输出 HF 风格分片，
+保留 vanilla/gated/RNN Markov head。不会静默丢弃 target decoder、共享 head
+或旧 hidden-input 权重。
+
+golden fixture 按原字节复制并匹配契约摘要，所有文件在私有临时目录完成后才
+发布到新目录。`export.json` 标记必须重新做 fixed-input parity，不继承旧的
+通过报告。CLI 读取 safetensors，不解析任意 trainer pickle。SpecForge 仍需在
+checkpoint manager 的全局汇总边界接入此 API；接口和复现见
+[export runbook](experiments/TARGET_KV_EXPORT.md)。
+
 ### 18.2 SGLang 需要新增的服务接口
 
 ```python

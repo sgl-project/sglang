@@ -4,7 +4,8 @@ This implements the SGLang serving side of design package P8. It consumes an
 explicit KV-input checkpoint. A fixed-input numerical gate now exercises the
 existing SpecForge backbone through a test-only KV adapter. The retained Qwen3
 BF16 fixture passes against the pinned FlexAttention reference with exact layer
-and logit equality. A production SpecForge exporter and trained-checkpoint
+and logit equality. The SGLang export API accepts consolidated KV-input training
+weights; SpecForge checkpoint-manager integration and trained-checkpoint
 validation remain integration work. Synthetic test
 checkpoints are wiring fixtures, not trained drafts or acceptance benchmarks.
 
@@ -36,6 +37,48 @@ comes from the checkpoint's data contract. A mismatch rejects startup. Storage
 chunk size and source page size may differ between capture and serving; they do
 not change the logical feature representation. Layer order and numerical codec
 must match exactly.
+
+## Export API
+
+`export_target_kv_checkpoint(config, weights, golden_fixture=..., output_dir=...,
+acceptance_report=None)` in
+`sglang.srt.speculative.dspark_components.dspark_target_kv_export` packages a
+quiescent, consolidated training state without loading a target decoder.
+`config` may be a mapping or a Hugging Face config object. It must explicitly
+declare the architecture, `model_type`, input contract and FP32/FP16/BF16 dtype.
+Hugging Face resolves configuration defaults before shape validation/export;
+conflicting dtype, sequence or Markov aliases fail.
+
+The exporter requires the exact global draft parameter set. It accepts complete
+packed QKV/MLP weights or their split counterparts, including attention biases,
+and preserves vanilla/gated/RNN Markov parameters. It normalizes an optional
+`model.` prefix and writes split HF-style weights with private contiguous CPU
+storage. Missing, unknown, duplicate, partial or mixed parameters, wrong shapes,
+nonfinite values and overflow in the destination dtype fail. Source tensors and
+the caller's configuration are not mutated. Target embedding/head/decoder and
+legacy hidden-input weights are rejected rather than silently discarded.
+
+The fixture is copied byte-for-byte and must match the declared golden digest.
+An acceptance artifact and its contract digest must be supplied together. Files
+are assembled in a private sibling directory before the completed directory is
+renamed into place; existing output paths are rejected. Failure before
+publication removes staging files. Export does not copy or create a passing
+parity report: `export.json` explicitly requires a new fixed-input run.
+
+The CLI takes safetensors weights, avoiding trainer-specific pickle loading:
+
+```bash
+python -m sglang.srt.speculative.dspark_components.dspark_target_kv_export \
+  --config /checkpoints/draft-config.json \
+  --weights /checkpoints/draft-state.safetensors \
+  --golden-fixture /checkpoints/inputs.safetensors \
+  --output-dir /models/kv-draft-version-1
+```
+
+Checkpoint managers must consolidate TP/FSDP state and pause mutations before
+calling the API. This is the SGLang serialization endpoint; the SpecForge trainer,
+checkpoint-manager adapter and trained-quality acceptance remain separate. See
+[the export runbook](experiments/TARGET_KV_EXPORT.md).
 
 ## Parameters and Math
 
@@ -470,7 +513,7 @@ SGLANG_RAGGED_VERIFY_MODE=static python -m sglang.launch_server \
 
 The checkpoint's golden-fixture/acceptance metadata is recorded and validated
 structurally; startup does not execute or certify a SpecForge validation report.
-Production exporter compatibility, trained-model quality/throughput gates,
+Production checkpoint-manager compatibility, trained-model quality/throughput gates,
 broader parallel topologies, non-static verification, RDMA and production rollout
 remain open. The retained Qwen3 BF16 fixture now passes the complete backbone
 and logits gate against the pinned FlexAttention training reference; this is

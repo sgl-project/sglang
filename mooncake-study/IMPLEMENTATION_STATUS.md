@@ -38,8 +38,9 @@ it does not redefine the goal as the modules already implemented.
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Prefill graph collection | Capture uses live request lengths after graph replay and owns compact teacher/KV buffers | Full synchronous/overlap, Breakable and default torch.compile piecewise pass token/request padding, chunked/cached prefixes, batch reuse and post-exit Store parity; distributed/speculative prefill graphs remain open |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
-| Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production exporter and trained-model validation still open |
+| Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production checkpoint-manager integration and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
+| Draft checkpoint export | SGLang API/CLI packages consolidated training state, resolved HF config and pinned validation artifacts | Split/native packed weights, all Markov heads, optimizer-step export/reload and a retained BF16 export pass; SpecForge checkpoint-manager adapter and trained-quality validation remain open |
 | Checkpoint artifact audit | Offline API/CLI binds config, weights, golden fixture and complete numerical report; optional pinned acceptance artifact | Nine CPU tests, five parity regressions and a fresh retained BF16 parity/audit run pass; production exporter, report trust and quality/SLO acceptance remain separate |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
@@ -3292,6 +3293,49 @@ numerical calculations during audit. It does not certify a different installed
 runtime, implement SpecForge's production KV exporter/trainer, or establish
 trained-model quality, production Catalog retention or serving performance.
 
+## Consolidated Target-KV Checkpoint Export
+
+`export_target_kv_checkpoint` is now the SGLang-side serialization endpoint for
+consolidated training state. It accepts a mapping or iterable of parameters and a
+typed KV-input config, resolves the actual Hugging Face config defaults, and
+checks the exact logical parameter set and global shapes. Complete packed QKV
+and gate-up weights normalize to split HF-style parameters. Attention biases,
+GQA geometry and vanilla/gated/RNN Markov heads are preserved. Missing, duplicate,
+mixed, unknown or incorrectly shaped parameters fail, as do unsupported tensor
+types, nonfinite values and destination-dtype overflow. Shared target modules
+and hidden-input weights are rejected instead of silently omitted.
+
+The exporter owns its CPU tensor copies and does not mutate caller state. Golden
+fixture and optional acceptance bytes must match their existing contract digests.
+Files are assembled in a private sibling staging directory, then published as a
+complete new directory. Existing paths are rejected and pre-publication failures
+clean up staging. `export.json` contains artifact/contract hashes, tensor counts
+and an explicit requirement to rerun fixed-input parity. No old pass is copied.
+The CLI accepts safetensors rather than trainer-specific pickle state.
+
+Final source tests pass **10 CPU cases in 0.093 seconds** and **six GPU parity
+cases in 3.257 seconds**. The GPU file now uses the production export API after
+an actual optimizer step for all three Markov heads and separately exports
+native packed serving parameters before reloading. Complete layer/hidden/logit
+comparisons and cached-teacher gradient checks pass. A retained real-size BF16
+checkpoint exports 27 tensors / 80,372,736 tensor bytes, retains its original
+teacher/KV contract fingerprint, and passes a fresh two-layer/hidden/base/
+corrected numerical gate with zero error. The independent artifact audit also
+binds that new directory's config, weights and fixture to its new parity report.
+
+Initial passing runs preceded HF config resolution and are excluded from final
+counts. Final tests use the same source hashes as the checkout. The original
+retained fixture is untouched. All jobs used the resident H100, which has no
+active/queued experiment and resumed its 60% idle workload; no extra allocation
+was needed. See [the runbook](experiments/TARGET_KV_EXPORT.md) and
+[retained evidence](experiments/target-kv-export.json).
+
+The API assumes a quiescent consolidated state. It does not implement TP/FSDP
+state gathering, SpecForge's checkpoint-manager adapter or a production KV
+trainer. FP32/FP16/BF16 validation is structural; retained full-model numerical
+evidence is BF16. These fixtures do not establish trained quality, serving SLOs,
+production Catalog retention or automatic rollout.
+
 ## Next Implementation
 
 1. Extend passing single-GPU AR prefill graph coverage to distributed/speculative
@@ -3300,8 +3344,8 @@ trained-model quality, production Catalog retention or serving performance.
    combined topologies. Broaden real-request coverage to speculative cache
    eviction, target weight replacement and
    saturated backpressure.
-2. Extend P8's passing retained BF16 fixture to production-exported and trained
-   checkpoints, complete exporter compatibility and artifact/quality validation.
+2. Connect P8's SGLang export API to the SpecForge checkpoint manager and validate
+   trained checkpoints, including artifact compatibility and quality acceptance.
 3. Extend P9's real TP2/PP1, TP1/PP2 and TP2/PP2 Qwen3 capture validation to
    replicated heads, saturated distributed backpressure and additional
    model identities. Extend passing colocated and P/D static PP speculative
