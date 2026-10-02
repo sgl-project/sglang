@@ -1600,7 +1600,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         *self._kv_write_scales(layer),
                     )
 
-        is_decode_mode = (
+        uses_decode_kernel = (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         )
@@ -1610,7 +1610,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             q = q.to(torch.float8_e4m3fn)
         elif (
             self.data_type == torch.float8_e4m3fn
-            and (not self.is_xqa_impl or not is_decode_mode)
+            and (not self.is_xqa_impl or not uses_decode_kernel)
             and not use_fused_qkv
         ):
             q = q.to(torch.float8_e4m3fn)
@@ -1628,7 +1628,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
-            if not self.use_fmha_v2 or is_decode_mode:
+            if not self.use_fmha_v2 or uses_decode_kernel:
                 # Decode and SM100 batch_context kernels require HND layout.
                 k_cache, v_cache = self._reshape_paged_kv_cache(
                     k_cache_raw, v_cache_raw, layer, layer.head_dim
@@ -1655,7 +1655,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         page_table = self._get_layer_page_table(layer, forward_batch)
         native_out = self._nvfp4_output_view(q) if uses_native_fp4 else None
 
-        if is_decode_mode:
+        if uses_decode_kernel:
             if (
                 forward_batch.forward_mode.is_target_verify()
                 and layer.attn_type == AttentionType.ENCODER_ONLY
