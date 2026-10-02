@@ -84,15 +84,13 @@ def _assert_matches(case, out, ref, tag, cos_min=0.999, max_abs=0.05):
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSATritonSparseMLAPrefill(CustomTestCase):
-    def _assert_matches(self, out, ref, tag, **kw):
-        _assert_matches(self, out, ref, tag, **kw)
-
     def test_base_path(self):
         for T, topk in ((512, 512), (2048, 2048), (37, 2048)):
             S = max(T, topk + 8)
             q, kv, g = _qkv(T, S, 8, seed=T)
             idx = _random_indices(T, topk, S, g)
-            self._assert_matches(
+            _assert_matches(
+                self,
                 sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V),
                 _reference(q, kv, idx),
                 f"base T={T} topk={topk}",
@@ -102,7 +100,8 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
         T, topk, S = 1024, 2048, 2056
         q, kv, g = _qkv(T, S, 8, seed=7)
         idx = _random_indices(T, topk, S, g, pad_frac=0.6)
-        self._assert_matches(
+        _assert_matches(
+            self,
             sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V),
             _reference(q, kv, idx),
             "ragged -1 padding",
@@ -115,7 +114,8 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
             T, topk, S = (2048 // group) * group, 2048, 4096
             q, kv, g = _qkv(T, S, 8, seed=100 + group)
             idx = _overlapping_indices(T, topk, S, g)
-            self._assert_matches(
+            _assert_matches(
+                self,
                 sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, union=group),
                 _reference(q, kv, idx),
                 f"union G={group}",
@@ -130,7 +130,8 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
         T, topk, S = 256, 512, 520
         q, kv, g = _qkv(T, S, 32, seed=9)
         idx = _random_indices(T, topk, S, g)
-        self._assert_matches(
+        _assert_matches(
+            self,
             sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, config=(256, 8, 4)),
             _reference(q, kv, idx),
             "h=32 smem fallback",
@@ -146,7 +147,8 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
         T, topk, S = 512, 512, 1024
         q, kv, g = _qkv(T, S, 16, seed=21)
         idx = _overlapping_indices(T, topk, S, g)
-        self._assert_matches(
+        _assert_matches(
+            self,
             sparse_mla_prefill(
                 q, kv, idx, SM_SCALE, D_V, union=2, union_config=(256, 4, 4)
             ),
@@ -187,7 +189,8 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
         T, topk, S = 256, 256, 512
         q, kv, g = _qkv(T, S, 4, seed=91)
         idx = _overlapping_indices(T, topk, S, g)
-        self._assert_matches(
+        _assert_matches(
+            self,
             sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, union=2),
             _reference(q, kv, idx),
             "union G=2 h=4 falls back",

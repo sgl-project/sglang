@@ -38,8 +38,8 @@ class TestTritonSparseMLAValidator(CustomTestCase):
         return _validate_triton_sparse_mla_backend(**defaults)
 
     def test_sm_major_boundary_is_hopper(self):
-        # The kernel needs an SM90+ MMA for the [16, D_V] head tile; SM80 and
-        # below must be refused at startup rather than failing mid-request.
+        # The kernel is validated on SM90+ only (tiles swept on SM90 and SM120);
+        # SM80 and below are refused at startup rather than run unmeasured.
         with self.assertRaisesRegex(ValueError, "SM90"):
             self._validate(device_sm_major=8)
         for sm in (9, 10, 12):
@@ -52,8 +52,9 @@ class TestTritonSparseMLAValidator(CustomTestCase):
             self._validate(union=3)
 
     def test_union_tile_capacity(self):
-        # The union tile holds 32 rows total, shared as num_q_heads * union.
-        # Exceeding it would silently drop heads, so it is a startup error.
+        # The union tile is at most 32 rows of num_q_heads * union; above that
+        # the kernel would fall back to the per-token path on every call, so
+        # it is a startup error instead of a silent no-op.
         with self.assertRaisesRegex(ValueError, "union"):
             self._validate(num_q_heads=16, union=4)
         self.assertIsNone(self._validate(num_q_heads=16, union=2))
@@ -65,9 +66,11 @@ class TestTritonSparseMLAValidator(CustomTestCase):
         # The launcher only catches OutOfResources, so the compile error reached
         # the request. Both shapes must be refused at startup instead.
         for heads, group in ((4, 2), (12, 2), (6, 4)):
-            with self.subTest(heads=heads, group=group):
-                with self.assertRaisesRegex(ValueError, "power of two"):
-                    self._validate(num_q_heads=heads, union=group)
+            with (
+                self.subTest(heads=heads, group=group),
+                self.assertRaisesRegex(ValueError, "power of two"),
+            ):
+                self._validate(num_q_heads=heads, union=group)
         for heads, group in ((4, 4), (8, 2), (8, 4), (16, 2)):
             with self.subTest(heads=heads, group=group):
                 self.assertIsNone(self._validate(num_q_heads=heads, union=group))
@@ -133,8 +136,8 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
         backend.dsa_triton_union = union
 
-        # `is_available` is patched too so the stream check is reached on the
-        # CPU CI lane, where it would otherwise short-circuit.
+        # `get_is_capture_mode` is patched although the method no longer reads
+        # it, so the breakable-graph regression below stays a real check.
         with (
             patch(
                 "sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill.sparse_mla_prefill",
@@ -144,7 +147,6 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
                 "sglang.srt.model_executor.runner_utils.capture_mode.get_is_capture_mode",
                 lambda: capturing,
             ),
-            patch("torch.cuda.is_available", lambda: True),
             patch("torch.cuda.is_current_stream_capturing", lambda: stream_capturing),
         ):
             out = backend._forward_triton_sparse_mla(

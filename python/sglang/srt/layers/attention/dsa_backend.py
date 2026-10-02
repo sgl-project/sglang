@@ -3012,9 +3012,7 @@ class DeepseekSparseAttnBackend(
         # graph runs attention eagerly between its segments while
         # get_is_capture_mode() stays set for the whole replay. Under real capture
         # the per-token path runs instead (same result); union is untested there.
-        capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
+        capturing = torch.cuda.is_current_stream_capturing()
         union = 0 if capturing else self.dsa_triton_union
 
         # Same contract as `_forward_flashmla_sparse`: metadata rows are expected

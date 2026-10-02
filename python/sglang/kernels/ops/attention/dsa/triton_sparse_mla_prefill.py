@@ -42,13 +42,14 @@ logger = logging.getLogger(__name__)
 _PINNED = {
     (9, 0): (64, 8, 2),  # SM90, swept at T=8192
     (12, 0): (64, 4, 2),  # SM120, swept at T=8192
-    (12, 1): (64, 4, 2),
+    (12, 1): (64, 4, 2),  # SM121: SM120's tile, not swept separately
 }
 _UNTUNED_DEFAULT = (64, 8, 3)
+_UNTUNED_ARCH_WARNED = set()
 
 
 @triton.jit
-def _nsa_prefill_kernel(
+def _sparse_mla_prefill_kernel(
     q_ptr,
     kv_ptr,
     idx_ptr,
@@ -61,8 +62,7 @@ def _nsa_prefill_kernel(
     D_QK: tl.constexpr,
     D_V: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    IDX64: tl.constexpr,  # int64 row addressing only when the KV pool can overflow
-    # int32*D_QK (rows > ~3.7M); the int32 path keeps the gather loop on IMAD.
+    IDX64: tl.constexpr,
 ):
     t = tl.program_id(0)
     # Token offsets in int64: at h=128 the q offset t*H*D_QK passes 2^31 from
@@ -176,18 +176,12 @@ def _union_dedup_kernel(
     tl.store(ulen_ptr + g, cursor)
 
 
+# Per-group unique rows and ownership bits for [NG*G, K] indices: uidx [NG, G*K]
+# int32 holds each group's distinct rows in its first ulen[g] slots (token-major,
+# each token's new rows ascending, the rest unspecified), ubits [NG, G*K] int32
+# has bit i set when token i selected the row, ulen [NG] int32. torch sorts each
+# K-wide row in shared memory; one Triton pass does the cross-token membership.
 def _union_dedup(idx_main, G):
-    """Per-group unique rows and ownership bits for ``[NG*G, K]`` indices.
-
-    Returns ``(uidx, ubits, ulen)``: ``uidx`` ``[NG, G*K]`` int32 holds the
-    group's distinct rows in the first ``ulen[g]`` slots (token-major, each
-    token's new rows ascending; the rest is unspecified); ``ubits`` ``[NG, G*K]``
-    int32 has bit ``i`` set when token ``i`` selected that row; ``ulen`` ``[NG]``
-    int32. Each token's rows are sorted on their own (a ``K``-wide segment, which
-    torch sorts in shared memory) and one Triton pass does the cross-token
-    membership tests. Nothing here depends on the KV span, reads back to the
-    host, or outlives the call.
-    """
     T_main, K = idx_main.shape
     NG = T_main // G
     srt = torch.sort(idx_main, dim=1)[0]
@@ -203,13 +197,13 @@ def _union_dedup(idx_main, G):
         G=G,
         # log2(K) + 1 halvings: the last one resolves a one-element interval.
         LOG_K=K.bit_length(),
-        num_warps=16 if G == 4 else 8,
+        num_warps=16 if G == 4 else 8,  # swept on H20 at K=2048
     )
     return uidx, ubits, ulen
 
 
 @triton.jit
-def _nsa_prefill_union_kernel(
+def _sparse_mla_prefill_union_kernel(
     q_ptr,
     kv_ptr,
     uidx_ptr,
@@ -217,7 +211,7 @@ def _nsa_prefill_union_kernel(
     ulen_ptr,
     o_ptr,
     sm_scale,
-    U_CAP,
+    U_STRIDE,
     H: tl.constexpr,
     G: tl.constexpr,
     D_QK: tl.constexpr,
@@ -243,7 +237,7 @@ def _nsa_prefill_union_kernel(
 
     n = tl.arange(0, BLOCK_N)
     u_len = tl.load(ulen_ptr + g)
-    ub = g.to(tl.int64) * U_CAP
+    ub = g.to(tl.int64) * U_STRIDE
     for k0 in tl.range(0, u_len, BLOCK_N):
         inb = (k0 + n) < u_len
         uidx = tl.load(uidx_ptr + ub + k0 + n, mask=inb, other=-1)
@@ -277,8 +271,8 @@ def _nsa_prefill_union_kernel(
     )
 
 
+# Returns True if handled; the T % G tail rows go through the per-token path.
 def _union_path(*, q, kv, indices, sm_scale, d_v, out, G, union_config):
-    """Returns True if handled; tail rows (T % G) go through the per-token path."""
     T, h, d_qk = q.shape
     K = indices.shape[-1]
     rows = G * h
@@ -293,12 +287,12 @@ def _union_path(*, q, kv, indices, sm_scale, d_v, out, G, union_config):
         return False
     NG = T_main // G
     uidx, ubits, ulen = _union_dedup(idx_main=indices[:T_main], G=G)
-    U_CAP = G * K
+    U_STRIDE = G * K
     if union_config is not None:
         bn, warps, stages = union_config
     elif torch.cuda.get_device_capability(q.device)[0] >= 12:
         # SM120 sweeps on real indices: (64,4,3) at G=2. At G=4 the 32-row Q
-        # tile pushes BN=64 past 115 KB, and (32,4,2) beats every neighbour.
+        # tile makes BN=64 exceed the 100 KB budget; (32,4,2) beats every neighbour.
         bn, warps, stages = (64, 4, 3) if G == 2 else (32, 4, 2)
     else:
         bn, warps, stages = (64, 4, 2) if G == 4 else (64, 8, 2)
@@ -307,7 +301,7 @@ def _union_path(*, q, kv, indices, sm_scale, d_v, out, G, union_config):
     # tile). Step down like the per-token launcher rather than fail the request.
     for bn_try, ns_try in _tile_candidates("union", h, G, q.device, bn, stages):
         try:
-            _nsa_prefill_union_kernel[(NG,)](
+            _sparse_mla_prefill_union_kernel[(NG,)](
                 q[:T_main],
                 kv,
                 uidx,
@@ -315,7 +309,7 @@ def _union_path(*, q, kv, indices, sm_scale, d_v, out, G, union_config):
                 ulen,
                 out[:T_main],
                 sm_scale,
-                U_CAP,
+                U_STRIDE,
                 H=h,
                 G=G,
                 D_QK=d_qk,
@@ -350,11 +344,8 @@ def _topk_length(indices, topk):
     return torch.where(any_valid, last, torch.zeros_like(last)).to(torch.int32)
 
 
-_UNTUNED_ARCH_WARNED = set()
-
-
+# Per-arch tuned (BLOCK_N, num_warps, num_stages); see _PINNED.
 def _config(device):
-    """Per-arch tuned (BLOCK_N, num_warps, num_stages); see _PINNED."""
     cap = torch.cuda.get_device_capability(device)
     if cap in _PINNED:
         return _PINNED[cap]
@@ -373,10 +364,10 @@ def _config(device):
     return _UNTUNED_DEFAULT
 
 
+# Ordered (BLOCK_N, num_stages) candidates: the tuned config first, then
+# progressively smaller shared-memory footprints, so one pinned config serves
+# head counts and devices whose budget the tuned tile would exceed.
 def _smem_fallbacks(bn, stages):
-    """Ordered (BLOCK_N, num_stages) candidates: the tuned config first, then
-    progressively smaller smem footprints. Lets one pinned config serve head
-    counts / devices whose smem budget the tuned tile would exceed."""
     seen, out = set(), []
     for cand in (
         (bn, stages),
@@ -399,8 +390,8 @@ def _smem_fallbacks(bn, stages):
 _FIT_TILE = {}
 
 
+# _smem_fallbacks with the tile that fit last time moved to the front.
 def _tile_candidates(path, h, G, device, bn, stages):
-    """``_smem_fallbacks`` with the tile that fit last time moved to the front."""
     cands = _smem_fallbacks(bn, stages)
     fit = _FIT_TILE.get((path, h, G, device.index))
     if fit in cands:
@@ -480,10 +471,10 @@ def sparse_mla_prefill(
         topk_length = _topk_length(indices, topk)
 
     bn, warps, stages = config or _config(q.device)
-    # int32 gather addressing unless the pool could overflow int32 element offsets
-    # (row*d_qk + d_qk-1 must fit in int32); production pools can exceed this.
-    # The threshold is ~3.7M rows at d_qk=576, which no test can allocate, so the
-    # mode is overridable to keep the int64 path reachable from a test.
+    # int32 gather addressing keeps the gather loop on IMAD; int64 only when the
+    # pool could overflow int32 element offsets (row*d_qk + d_qk-1), i.e. above
+    # ~3.7M rows at d_qk=576. No test can allocate that pool, so the mode is
+    # overridable to keep the int64 path reachable from a test.
     if int64_indexing is None:
         idx64 = kv.shape[0] > (2**31 - 1 - (d_qk - 1)) // d_qk
     else:
@@ -491,7 +482,7 @@ def sparse_mla_prefill(
     block_h = max(16, triton.next_power_of_2(h))
     for bn_try, ns_try in _tile_candidates("base", h, 0, q.device, bn, stages):
         try:
-            _nsa_prefill_kernel[(T,)](
+            _sparse_mla_prefill_kernel[(T,)](
                 q,
                 kv,
                 indices,
