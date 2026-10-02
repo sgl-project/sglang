@@ -115,6 +115,11 @@ class Memory(msgspec.Struct):
         Optional[float],
         "Fraction of the available host memory, bounded by visible cgroup memory.max/memory.high or v1 memory limits (after a 10 GiB reserve) that the HiCache host pools of all ranks on this machine may use. Applies only when neither --hicache-ratio nor --hicache-size is set: the default ratio is then reduced until the pools fit. Lower it when several engines share a memory cgroup.",
     ] = 0.8
+
+    hicache_mamba_size_gb: A[
+        Optional[str],
+        "Hybrid (attention + Mamba) models only, with --hicache-size: host memory for the Mamba state-checkpoint pool, in gigabytes, or 'auto'. Unset keeps the default split of --hicache-size between the KV and Mamba host pools in proportion to their device bytes. A number reserves that many GB for Mamba checkpoints and gives the rest to KV; 'auto' sizes the Mamba pool to one checkpoint per --chunked-prefill-size tokens of the KV host tier plus 4 x max-running-requests. Boot logs the resulting coverage.",
+    ] = None
     hicache_write_policy: A[
         str,
         Arg(
