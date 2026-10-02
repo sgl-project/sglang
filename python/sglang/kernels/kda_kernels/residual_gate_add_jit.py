@@ -269,8 +269,8 @@ def _rga_transposed(
 
 
 def _residual_gate_add_triton(residual, update, gate):
-    if not can_use_residual_gate_add_cuda(residual, update, gate):
-        raise RuntimeError("unsupported input for residual_gate_add CUDA")
+    # Both callers validate the inputs first; repeating the predicate here cost
+    # ~2.7us of host time on every call.
     out = torch.empty_strided(
         residual.shape, residual.stride(), dtype=residual.dtype, device=residual.device
     )
@@ -420,7 +420,12 @@ def _residual_gate_add_custom_op(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
     with torch.cuda.device(residual.device):
-        return _residual_gate_add_triton(residual, update, gate)
+        # Take the Triton path only for the transposed-dense layout it was
+        # benchmarked on. For the contiguous layouts every other diffusion model
+        # uses, the existing JIT CUDA kernel is faster at every measured shape.
+        if _is_transposed_dense_residual(residual, update, gate):
+            return _residual_gate_add_triton(residual, update, gate)
+        return _residual_gate_add_cuda_impl(residual, update, gate)
 
 
 def _gate_mode(residual: torch.Tensor, gate: torch.Tensor) -> int:
@@ -513,7 +518,7 @@ def residual_gate_add(
         and can_use_residual_gate_add_cuda(residual, update, gate)
     ):
         try:
-            return residual_gate_add_cuda(residual, update, gate)
+            return _residual_gate_add_custom_op(residual, update, gate)
         except Exception as exc:
             if torch.compiler.is_compiling():
                 raise
