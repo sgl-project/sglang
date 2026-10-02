@@ -91,6 +91,7 @@ class AsyncD2HCopyWorker:
         # can enqueue onto it (see class docstring). Created on the caller's
         # thread, so it lands on the current device.
         self.d2h_copy_stream = device_module.Stream()
+        self._device_index = device_module.current_device()
         self._queue: queue.Queue = queue.Queue()
         self._thread = threading.Thread(
             target=self._loop, name="sglang-d2h-copy-worker", daemon=True
@@ -114,6 +115,7 @@ class AsyncD2HCopyWorker:
         return done
 
     def _loop(self):
+        self.device_module.set_device(self._device_index)
         while True:
             item = self._queue.get()
             if item is None:

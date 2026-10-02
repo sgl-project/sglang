@@ -4986,18 +4986,18 @@ def is_confidential_compute() -> bool:
     """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
 
     Detected once via NVML and cached.
-    Overridable with ``SGLANG_CONFIDENTIAL_COMPUTE=1/0``
+    Overridable with ``SGLANG_FORCE_CONFIDENTIAL_COMPUTE``.
     """
-    forced = os.environ.get("SGLANG_CONFIDENTIAL_COMPUTE")
+    forced = envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.get()
     if forced is not None:
-        return forced == "1"
-    if not torch.cuda.is_available():
+        return forced
+    if not is_cuda():
         return False
 
     try:
         import pynvml
     except ImportError:
-        logger.error("pynvml not available; assuming Confidential Computing is off")
+        logger.warning("pynvml not available; assuming Confidential Computing is off")
         return False
 
     cc_enabled = False
@@ -5020,9 +5020,9 @@ def is_confidential_compute() -> bool:
             cc_state = pynvml.nvmlSystemGetConfComputeState()
             cc_enabled = cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
         except pynvml.NVMLError as error:
-            logger.error(f"Error querying CC state: {error!s}")
+            logger.warning(f"Error querying CC state: {error!s}")
     except pynvml.NVMLError as error:
-        logger.error(f"Error querying CC state: {error!s}")
+        logger.warning(f"Error querying CC state: {error!s}")
     finally:
         # Shutdown
         try:
