@@ -1,13 +1,13 @@
 """CPU correctness tests for the page-major envelope Mamba state views.
 
-Covers the standalone ``build_page_major_mamba_views`` builder (no allocator /
+Covers the standalone ``build_mamba_entry_views`` builder (no allocator /
 shared pool): conv / temporal state views with correct shapes and no aliasing
 across layers / slots. The unified pool stores its Mamba/KDA state through
 these views.
 
 Runs on CPU — pure-torch advanced indexing, no Triton.
 
-    python -m pytest test/registered/unit/mem_cache/test_page_major_layout.py -v
+    python -m pytest test/registered/unit/mem_cache/test_token_major_layout.py -v
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -18,8 +18,8 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.layout.page_major import (
-    build_page_major_mamba_views,
+from sglang.srt.mem_cache.layout.token_major import (
+    build_mamba_entry_views,
     mamba_entry_bytes,
 )
 
@@ -40,7 +40,7 @@ class TestMambaEnvelopeViews(unittest.TestCase):
             temporal_dtype=temp_dt,
         )
         raw = torch.zeros(slots * entry, dtype=torch.uint8, device=_DEV)
-        conv_views, temporal = build_page_major_mamba_views(
+        conv_views, temporal = build_mamba_entry_views(
             raw,
             layer_num=layers,
             conv_state_shapes=conv_shapes,

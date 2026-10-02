@@ -26,7 +26,7 @@ Families the router emits. The dashboard graphs all of them except the
 | `sgl_router_worker_requests_total` | Counter | Per-worker **dispatches** by `worker_url`, `model_id`, `mode`, `outcome` (recorded after dispatch; blind to pre-dispatch drops). See [Dispatch outcomes](#dispatch-outcomes) |
 | `sgl_router_request_duration_seconds` | Histogram | End-to-end request latency by `model_id` |
 | `sgl_router_ttft_seconds` | Histogram | Time to first token (streaming) by `model_id` |
-| `sgl_router_stream_outcome_total` | Counter | Streaming outcomes by `worker_url`, `model_id`, and `outcome` (`ok`, `stream_error_event`, `upstream_error`, or `client_disconnect`). Counts committed 2xx streams only — non-2xx responses are counted by status in `responses_total` |
+| `sgl_router_stream_outcome_total` | Counter | Streaming outcomes by `worker_url`, `model_id`, and `outcome` (`ok`, `stream_error_event`, `upstream_error`, `client_disconnect`, `expired`, or `aborted`). Counts committed 2xx streams only — non-2xx responses are counted by status in `responses_total` |
 | `sgl_router_active_load` | Gauge | Per-worker prefill-token / decode-block load |
 | `sgl_router_workers` | Gauge | Registered worker count by `mode` |
 | `sgl_router_worker_health` | Gauge | Per-worker health (1=breaker admits, 0=open) |
@@ -126,7 +126,7 @@ worker error the router forwards is a successful *proxy* operation and a failed
 | `client_error` | 4xx except 429 | no — the caller sent something invalid |
 | `backpressure` | 429, 503 | no — responsive but at capacity |
 | `error` | 5xx except 503, plus transport failures, timeouts and incomplete bodies | **yes** |
-| `cancelled` | the router's own stale-request deadline | no |
+| `cancelled` | the router's own stale-request deadline, or a PD decode dispatch dropped because prefill failed first | no |
 
 `error` is the only bucket that means *this worker failed*, which is why the
 Error-ratio panel uses it alone. The split matters during an incident: a
@@ -136,8 +136,11 @@ statuses — so the two agree, and the error ratio keeps pointing at genuine
 faults instead of pegging at 100% exactly when it is being read.
 
 A hung worker surfaces as `error` (the router's upstream timeout), *not* as
-`cancelled`. Only the stale-request deadline produces `cancelled`;
-`sgl_router_stale_requests_total{outcome="expired"}` counts the same events.
+`cancelled`. Two things produce `cancelled`: the stale-request deadline, which
+`sgl_router_stale_requests_total{outcome="expired"}` counts the same events of,
+and a PD decode worker whose dispatch was dropped because prefill failed first —
+the client's status is then prefill's, booked against the prefill worker, so
+decode's abandoned dispatch is counted here rather than disappearing.
 
 ## Access log
 
