@@ -87,10 +87,6 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(kwargs["ssl"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestFreezeGcAfterWarmup(unittest.TestCase):
     """The freeze must survive a listener that is not accepting yet.
 
@@ -154,3 +150,7 @@ class TestFreezeGcAfterWarmup(unittest.TestCase):
         ):
             log = self._run(post)
         log.warning.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()
