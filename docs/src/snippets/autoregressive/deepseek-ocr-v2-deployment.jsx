@@ -26,7 +26,6 @@ export const DeepSeekOCR2Deployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' || v.hardware === 'arc_b', disabledReason: 'Only Tensor Parallel (TP) is supported on this hardware' },
         { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' || v.hardware === 'arc_b', disabledReason: 'Only Tensor Parallel (TP) is supported on this hardware' }
       ]
     },
@@ -50,10 +49,6 @@ export const DeepSeekOCR2Deployment = () => {
 
     if (strategyArray.includes('tp')) {
       cmd += ` \\\n  --tp 1`;
-    }
-
-    if (strategyArray.includes('dp')) {
-      cmd += ` \\\n  --dp 1 \\\n  --enable-dp-attention`;
     }
 
     if (strategyArray.includes('ep')) {

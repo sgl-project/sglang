@@ -1885,7 +1885,7 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -2360,7 +2360,7 @@ fn insert_priority_floor_applies_along_the_path() {
 }
 
 #[test]
-fn insert_chunked_skips_the_hit_count() {
+fn insert_below_the_hit_watermark_skips_the_hit_count() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let a = tc
@@ -2372,7 +2372,7 @@ fn insert_chunked_skips_the_hit_count() {
         .hit_count;
     tc.insert(&InsertParams {
         rotation_base: None,
-        chunked: true,
+        inserted_len: 2,
         ..insert_params(&vec![1, 2], &[20, 21])
     });
     assert_eq!(
@@ -3333,7 +3333,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -6191,7 +6191,7 @@ fn inc_hit_count_bumps_and_stays_quiet_without_hicache() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
     assert_eq!(tc.arena.node(a).hit_count, 1);
     // The tree defaults keep the host tier off and the threshold at 256.
     assert!(!tc.enable_hicache);
@@ -6199,7 +6199,7 @@ fn inc_hit_count_bumps_and_stays_quiet_without_hicache() {
 }
 
 #[test]
-fn inc_hit_count_skips_evicted_or_chunked_nodes() {
+fn inc_hit_count_skips_evicted_nodes() {
     let mut tc = core();
     let root = tc.arena.root();
     let evicted = tc
@@ -6211,21 +6211,8 @@ fn inc_hit_count_skips_evicted_or_chunked_nodes() {
             /* extra_key = */ None,
         )
         .unwrap();
-    let chunked = tc
-        .arena
-        .alloc_child(
-            root,
-            /* key = */ vec![2],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    tc.arena
-        .set_device_value(chunked, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(evicted, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(evicted));
     assert_eq!(tc.arena.node(evicted).hit_count, 0);
-    assert!(!tc.inc_hit_count_and_check_(chunked, /* chunked = */ true));
-    assert_eq!(tc.arena.node(chunked).hit_count, 0);
 }
 
 #[test]
@@ -6247,7 +6234,7 @@ fn inc_hit_count_is_a_noop_in_write_back_mode() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
     assert_eq!(tc.arena.node(a).hit_count, 0);
 }
 
@@ -6268,12 +6255,12 @@ fn inc_hit_count_fires_the_write_through_check() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
-    assert!(tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
+    assert!(tc.inc_hit_count_and_check_(a));
     // A backuped node never re-fires.
     tc.arena
         .set_host_value(a, FULL, Tensor::from_slice(&[0i64]));
-    assert!(!tc.inc_hit_count_and_check_(a, /* chunked = */ false));
+    assert!(!tc.inc_hit_count_and_check_(a));
     assert_eq!(tc.arena.node(a).hit_count, 3);
 }
 
@@ -8751,7 +8738,7 @@ fn sequence_insert_params<'k>(
         prev_prefix_len,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
