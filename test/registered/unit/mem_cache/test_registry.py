@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,
     create_tree_cache,
+    create_unified_radix_cache,
     default_radix_cache_factory,
     get_radix_cache_factory,
     register_radix_cache_backend,
@@ -302,6 +303,23 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             counter
         )
         self.assertIs(result, cache)
+
+    def test_custom_unified_cache_keeps_host_pool_setup(self):
+        ctx = _make_ctx(self)
+        enter_override(
+            self,
+            get_context().override_server_args(
+                disaggregation_decode_retraction_backup="host_pool"
+            ),
+        )
+        cache_class = MagicMock()
+        result = create_unified_radix_cache(ctx, cache_class=cache_class)
+        cache_class.assert_called_once_with(ctx.params)
+        result.init_hicache.assert_called_once_with(ctx.server_args, ctx.params)
+        ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once_with(
+            result.cache_controller.layer_done_counter
+        )
+        self.assertIs(result, cache_class.return_value)
 
     def test_pure_swa_radix_cache_when_all_swa(self):
         ctx = _make_ctx(self, is_hybrid_swa=True, full_tokens_per_layer=0)

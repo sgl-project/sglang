@@ -359,7 +359,7 @@ def build_kv_cache(
         ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
-            attn_tp_cpu_group if get_parallel().enable_dp_attention else tp_cpu_group
+            attn_tp_cpu_group if get_parallel().attn_dp_enabled else tp_cpu_group
         ),
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,

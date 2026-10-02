@@ -115,7 +115,6 @@ from sglang.srt.mem_cache.common import (
     RetractionBackup,
     backup_kv_cache,
     evict_from_tree_cache,
-    free_swa_out_of_window_slots,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -953,6 +952,9 @@ class ReqKvInfo:
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
     # Seq len of the last cached mamba state
     mamba_last_track_seqlen: Optional[int] = None
+    # Seq len of the other ping-pong slot's state. None means what is in
+    # that slot cannot be named (never written, donated, freed).
+    mamba_prev_track_seqlen: Optional[int] = None
     # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -1476,7 +1478,14 @@ class Req(ReqDllmMixin):
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv.kv_committed_len, len(self.origin_input_ids))
-        return self.kv.kv_committed_len
+        if self.finished_len is None:
+            return self.kv.kv_committed_len
+        # A verify step commits a whole accepted chunk, so output_ids can run
+        # past the stop; the client never sees those tokens, so nothing matches.
+        return min(
+            self.kv.kv_committed_len,
+            len(self.origin_input_ids) + len(self.output_ids_through_stop),
+        )
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Record one step accepted draft count (excludes bonus token) into the histogram."""
@@ -1989,6 +1998,7 @@ class Req(ReqDllmMixin):
         self.kv.mamba_next_track_idx = None
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
+        self.kv.mamba_prev_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
@@ -2213,7 +2223,8 @@ def set_mamba_track_indices_from_reqs(
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
         # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
-        # Default to 0 (first ping-pong slot) to avoid TypeError.
+        # Keep the gather in bounds for those requests. Freed rows are
+        # invalidated below so they cannot scatter into a recycled slot.
         track_positions = [
             (
                 req.kv.mamba_next_track_idx
@@ -2222,6 +2233,9 @@ def set_mamba_track_indices_from_reqs(
             )
             for req in batch.reqs
         ]
+    freed_rows = [
+        i for i, req in enumerate(batch.reqs) if req.kv.mamba_next_track_idx is None
+    ]
     batch.mamba_track_buffer_indices = list(track_positions)
     idx = (
         torch.tensor(
@@ -2235,6 +2249,12 @@ def set_mamba_track_indices_from_reqs(
     batch.mamba_track_indices = (
         torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
     )
+    if freed_rows:
+        # Overlap can leave a request in TARGET_VERIFY after its Mamba state has
+        # been freed and reused by another request. The downstream scatter
+        # treats a negative destination as a no-op, while the old fallback to
+        # position 0 could overwrite the reused live slot.
+        batch.mamba_track_indices[freed_rows] = -1
 
 
 def release_req(
@@ -2472,6 +2492,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     is_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
+    # Rank-consistent EAGLE draft replay gate. Keep it separate so missing
+    # draft-only state does not disable target verification or draft extend.
+    can_run_dp_draft_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     tbo_split_seq_index: Optional[int] = None
@@ -2525,6 +2548,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    # The draft model can use a different MoE A2A backend than the target.
+    draft_global_num_tokens: Optional[List[int]] = None
+    draft_global_num_tokens_for_logprob: Optional[List[int]] = None
     # Full DP token vector retained for Aiter MegaMoE even when the normal MLP
     # TP gather path stores only this rank's token count.
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
@@ -3832,6 +3858,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
+            can_run_dp_draft_cuda_graph=self.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
             is_extend_in_batch=self.is_extend_in_batch,
@@ -3882,6 +3909,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
+            # Auxiliary windows check their own cursors and prefix locks.
+            has_auxiliary_swa = self.tree_cache.supports_auxiliary_swa()
 
             release_leaf_lock = (
                 envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
@@ -3901,9 +3930,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if (
                         req.decode_batch_idx >= 1
                         and req.kv.holds_kv
-                        and swa_evict_due(req)
+                        and (has_auxiliary_swa or swa_evict_due(req))
                     ):
-                        self._evict_swa(req, req.seqlen - 1)
+                        # The scheduler already gated the primary window,
+                        # including backends that use a forward-based cadence.
+                        self._evict_swa(
+                            req,
+                            req.seqlen - 1,
+                            eviction_interval=(
+                                eviction_interval if has_auxiliary_swa else 1
+                            ),
+                        )
 
                     # Once the decode position has moved past the sliding window,
                     # the SWA portion of the prefill-time tree lock is no longer
@@ -3938,17 +3975,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self._evict_swa(req, pre_len)
             self.token_to_kv_pool_allocator.free_group_end()
 
-    def _evict_swa(self, req: Req, pre_len: int):
+    def _evict_swa(self, req: Req, pre_len: int, *, eviction_interval: int = 1):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
-        free_swa_out_of_window_slots(
-            req,
-            pre_len,
-            sliding_window_size=self.tree_cache.sliding_window_size,
-            page_size=self.tree_cache.page_size,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            is_chunk_cache=self.tree_cache.is_chunk_cache(),
-            retain_floor=self.tree_cache.swa_retain_floor(req),
+        self.tree_cache.evict_sliding_windows(
+            req, pre_len, eviction_interval=eviction_interval
         )
 
     def __str__(self):

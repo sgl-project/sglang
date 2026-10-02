@@ -81,6 +81,8 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    # The ping-pong slot prepare picked; cleanup keeps that same slot.
+    mamba_keep_idx: Optional[int] = None
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
@@ -455,12 +457,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs):
-        """Hand a finished request's KV to the tree: insert what can be keyed
-        (advancing ``cache_protected_len``), ``free_kv_row`` the rest of
-        ``[cache_protected_len, owned_kv_len)``, ``unpin``. Slicing the row by
-        token count instead strands the slots up to ``owned_kv_len``; the
-        caller frees everything past it."""
+    def insert_req(self, req: Req, *, up_to: int, **kwargs):
+        """Hand a finished request's KV up to row position ``up_to`` to the
+        tree: insert what can be keyed and advance ``cache_protected_len``
+        past it. The caller then frees ``[cache_protected_len, up_to)`` and
+        everything after, and unpins; nothing here releases a slot."""
 
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):
@@ -604,6 +605,27 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_swa(self) -> bool:
         return False
+
+    def supports_auxiliary_swa(self) -> bool:
+        return False
+
+    def evict_sliding_windows(
+        self, req: Req, pre_len: int, *, eviction_interval: int = 1
+    ) -> None:
+        """Slide request-owned windows at the scheduler's safe eviction frontier."""
+        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+
+        free_swa_out_of_window_slots(
+            req,
+            pre_len,
+            sliding_window_size=self.sliding_window_size,
+            page_size=self.page_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            is_chunk_cache=self.is_chunk_cache(),
+            retain_floor=self.swa_retain_floor(req),
+            eviction_interval=eviction_interval,
+        )
 
     def swa_retain_floor(self, req) -> int | None:
         # A match lands on a state checkpoint rather than on the tail, so a cache

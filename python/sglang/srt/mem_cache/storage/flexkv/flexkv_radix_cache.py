@@ -382,18 +382,16 @@ class FlexKVRadixCache(RadixCache):
         return fetched_slots, new_node
 
     # ------------------------------------------------------------------
-    # cache_finished_req (STORE)
+    # insert_req (STORE)
     # ------------------------------------------------------------------
 
     def on_release(self, req: Req, *, inserted: bool) -> None:
         if not inserted:
             self._load_markers.pop(req.cache_request_handle, None)
 
-    def cache_finished_req(  # type: ignore[override]
-        self, req: Req, *, owned_kv_len: int
-    ) -> None:
-        """Base cache_finished_req then fire an async FlexKV store."""
-        super().cache_finished_req(req, owned_kv_len=owned_kv_len)
+    def insert_req(self, req: Req, *, up_to: int) -> None:  # type: ignore[override]
+        """Base insert_req then fire an async FlexKV store."""
+        super().insert_req(req, up_to=up_to)
 
         # Compute the committed prefix.
         topk = get_spec().speculative_eagle_topk

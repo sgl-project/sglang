@@ -59,7 +59,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_pp_layers
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,6 @@ class ExaoneMoESparseMoEBlock(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
-        self.moe_ep_size = get_parallel().moe_ep_size
         self.layer_id = layer_id
         self.routed_scaling_factor = config.routed_scaling_factor
         self.alt_stream = alt_stream
@@ -172,6 +171,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
@@ -199,7 +199,6 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             )
 
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
@@ -449,8 +448,6 @@ class ExaoneMoEDecoderLayer(nn.Module):
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False
         )
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.self_attn = ExaoneMoEAttention(
             config=config,
@@ -540,7 +537,7 @@ class ExaoneMoEModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: ExaoneMoEDecoderLayer(
                 layer_id=idx,
@@ -549,8 +546,6 @@ class ExaoneMoEModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
 
