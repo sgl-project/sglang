@@ -1113,9 +1113,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_device_kv_ptrs = set(dst_kv_ptrs[c4_layer_num:])
         num_src = len(self.kv_args.kv_data_ptrs)
         num_target = num_src
+        # A zero draft head count marks a replicated (MLA) draft: its pages are
+        # copied whole like the target, even when the attention TP differs.
         slice_draft = (
             self.is_hybrid_mla_backend
-            and getattr(self.kv_args, "num_draft_entries", 0) > 0
+            and self.kv_args.num_draft_entries > 0
+            and self.kv_args.draft_total_kv_head_num > 0
             and dst_attn_tp_size is not None
             and dst_attn_tp_size != self.attn_tp_size
         )
@@ -1126,9 +1129,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 or dst_kv_item_lens is None
             ):
                 raise ValueError("Hybrid draft TP slicing requires destination layout")
-            draft_total_kv_heads = getattr(self.kv_args, "draft_total_kv_head_num", 0)
-            if draft_total_kv_heads <= 0:
-                raise ValueError("Hybrid draft TP slicing requires draft KV head count")
+            draft_total_kv_heads = self.kv_args.draft_total_kv_head_num
             num_target -= self.kv_args.num_draft_entries
             if num_target < 0:
                 raise ValueError("Invalid draft KV entry count")
@@ -1454,7 +1455,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         # Use total KV head count (not per-rank) for correct head distribution.
         # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
-        total_kv_heads = total_kv_heads or getattr(self.kv_args, "total_kv_head_num", 0)
+        total_kv_heads = total_kv_heads or self.kv_args.total_kv_head_num
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
 

@@ -210,6 +210,8 @@ _DECODE_TP8_PTRS = [5000, 6000, 7000, 8000]
 _TARGET_BLOCKS = [(1064, 5192, 64), (2064, 6192, 64)]
 # Decode TP8 rank 2 receives its 32-byte head slice of each draft K/V page.
 _DRAFT_BLOCKS = [(3320, 7192, 32), (3448, 7224, 32), (4320, 8192, 32), (4448, 8224, 32)]
+# A replicated MLA draft (256 B/token on both sides) is copied as whole pages.
+_MLA_DRAFT_BLOCKS = [(3256, 7768, 256), (4256, 8768, 256)]
 
 
 def _tp2_hybrid_sender(*, hybrid: bool) -> _RecordingKVManager:
@@ -245,21 +247,27 @@ def _decode_tp8_rank2_kwargs(executor) -> dict:
 
 
 class TestHybridDraftHeterogeneousTp(CustomTestCase):
-    def test_slice_accepts_explicit_entries_with_distinct_item_lengths(self):
-        """The public slicer takes a source entry tail with its own item lengths
-        and head count; treating every entry as the target width would slice
-        the target or write the draft past its destination page."""
-        manager = _tp2_hybrid_sender(hybrid=False)
+    def test_mla_draft_keeps_full_page_copy_under_tp_mismatch(self):
+        """Bug regression: a hybrid-MLA sender whose speculative draft is itself
+        MLA (one replicated latent per rank, same item length on both sides) must
+        copy the draft pages whole under a TP mismatch; head-slicing a replicated
+        draft raised on the head width and killed the transfer worker."""
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+        manager = _tp2_hybrid_sender(hybrid=True)
+        manager.kv_args.draft_total_kv_head_num = 0
+        manager._validate_envelope_kv_layout = lambda *args: None
+        manager._send_kvcache_generic = MooncakeKVManager._send_kvcache_generic.__get__(
+            manager
+        )
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            rc = MooncakeKVManager.send_kvcache_slice(
+            rc = MooncakeKVManager.send_kvcache(
                 manager,
                 **_decode_tp8_rank2_kwargs(executor),
-                src_entry_start=2,
-                dst_kv_item_lens=[64] * 4,
-                total_kv_heads=8,
+                dst_kv_item_lens=[64, 64, 256, 256],
             )
         self.assertEqual(rc, 0)
-        self.assertEqual(manager.blocks, _DRAFT_BLOCKS)
+        self.assertEqual(manager.blocks, _TARGET_BLOCKS + _MLA_DRAFT_BLOCKS)
 
     def test_mha_draft_is_head_sliced_while_target_stays_replicated(self):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
@@ -278,10 +286,6 @@ class TestHybridDraftHeterogeneousTp(CustomTestCase):
         self.assertEqual(rc, 0)
         # Replicated target pages keep the page transfer; the draft tail is head-sliced.
         self.assertEqual(manager.blocks, _TARGET_BLOCKS + _DRAFT_BLOCKS)
-        # No draft write may cross the destination page registered for index 3.
-        for _, dst, width in manager.blocks[2:]:
-            page_end = 7000 + 4 * 64 if dst < 8000 else 8000 + 4 * 64
-            self.assertLessEqual(dst + width, page_end)
 
 
 class _RecordingAscendManager:

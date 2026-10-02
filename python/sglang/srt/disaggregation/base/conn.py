@@ -81,7 +81,7 @@ class KVArgs:
     ib_device: str
     gpu_id: int
     kv_head_num: int
-    total_kv_head_num: int
+    total_kv_head_num: int = 0
     page_size: int
     # for system dp
     system_dp_rank: int
