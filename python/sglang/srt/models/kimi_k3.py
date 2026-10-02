@@ -1865,8 +1865,14 @@ class KimiK3DeltaAttention(nn.Module):
             pad = (-sum(sizes)) % 8
             if pad:
                 weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
-            self._bfa_w = torch.cat(weights, dim=0).contiguous()
-            self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
+            bfa_w = torch.cat(weights, dim=0).contiguous()
+            f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
+            if self._bfa_w is None:
+                self._bfa_w, self._bfa_f_b_w = bfa_w, f_b_w
+            else:
+                # Keep the buffer addresses stable for graph replay after weight reloads
+                self._bfa_w.copy_(bfa_w)
+                self._bfa_f_b_w.copy_(f_b_w)
         else:
             if any(getattr(mod, "weight", None) is None for mod in mods):
                 return
