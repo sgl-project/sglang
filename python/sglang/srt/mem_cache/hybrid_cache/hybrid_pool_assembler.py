@@ -10,13 +10,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     SidecarPoolSpec,
 )
-from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
-    HostPoolGroupConfig,
-    check_packed_kv_rows,
-    is_mla_pool,
-    prepare_host_pool_config,
-    with_packed_draft_layer_mapping,
-)
 from sglang.srt.mem_cache.hybrid_cache.hicache_mamba_sizing import (
     MambaHostSplit,
     all_sizes_or_none,
@@ -24,6 +17,13 @@ from sglang.srt.mem_cache.hybrid_cache.hicache_mamba_sizing import (
     parse_mamba_host_size,
     proportional_split,
     resolve_mamba_host_split,
+)
+from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+    HostPoolGroupConfig,
+    check_packed_kv_rows,
+    is_mla_pool,
+    prepare_host_pool_config,
+    with_packed_draft_layer_mapping,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
