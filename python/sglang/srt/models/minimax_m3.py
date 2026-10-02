@@ -1045,9 +1045,11 @@ class MiniMaxM3Attention(nn.Module):
                 positions, q, k, idx_q, idx_k
             )
             and getattr(forward_batch, "out_cache_loc", None) is not None
-            and v.dim() == 2
+            # V agreeing with K on rank and shape is the kernel's contract, and
+            # `sparse_qk_index_gemma_rmsnorm_rope_cache` already asserts it. The
+            # fallback never touches V, so screening it here would let a split
+            # bug reach `set_kv_buffer` unreported instead.
             and v.dtype == q.dtype
-            and v.shape == k.shape
         )
         if can_use_cache_fusion and kv_pool is not None:
             layer_id = self.attn.layer_id

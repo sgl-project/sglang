@@ -78,17 +78,24 @@ def vdn_delta_factors(
 def can_use_vdn_delta_factors(
     A: torch.Tensor, B: torch.Tensor, alpha: torch.Tensor
 ) -> bool:
+    """Return whether the fused kernel is applicable to these operands.
+
+    Operand agreement -- a shared device, ``B`` matching ``A``, ``alpha``
+    matching ``A.shape[:-1]`` -- is the kernel's contract, enforced by the
+    launcher's shared ``SymbolicSize`` / ``SymbolicDevice`` before the launch.
+    Only the restrictions that make the eager cholesky path the correct answer
+    stay here: it handles any square head dimension and any fp32 layout.
+    """
     return (
         A.is_cuda
         and A.dtype is torch.float32
         and B.dtype is torch.float32
         and alpha.dtype is torch.float32
-        and A.device == B.device == alpha.device
+        # Rank floor guards this predicate's own ``shape[-2]`` index, and the
+        # head dimension is a kernel capacity limit, not a contract.
         and A.dim() >= 2
         and A.shape[-1] == HEAD_DIM
         and A.shape[-2] == HEAD_DIM
-        and B.shape == A.shape
-        and alpha.shape == A.shape[:-1]
         and A.is_contiguous()
         and B.is_contiguous()
         and alpha.is_contiguous()

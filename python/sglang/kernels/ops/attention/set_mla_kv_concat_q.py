@@ -100,20 +100,16 @@ def covered(
         return False
     if loc.dim() != 1 or not loc.is_contiguous():
         return False
-    if not (
-        k_nope.shape[0]
-        == k_rope.shape[0]
-        == loc.shape[0]
-        == q_nope.shape[0]
-        == q_rope.shape[0]
-    ):
-        return False
-    if q_nope.shape[1] != q_rope.shape[1]:
+    # The k sources are reshaped to ``loc``'s length before the launch, which
+    # erases a batch disagreement there, so that one has to be caught here. The
+    # q operands are passed through unreshaped: the launcher binds one
+    # ``batch_size`` and one ``num_heads`` across them and pins their last dims
+    # to the specialisation picked from the k rows, so a q that disagrees is
+    # reported instead of silently taking the two-kernel path.
+    if k_nope.shape[0] != k_rope.shape[0] or k_nope.shape[0] != loc.shape[0]:
         return False
     nope_bytes = k_nope.shape[-1] * 2
     rope_bytes = k_rope.shape[-1] * 2
-    if q_nope.shape[-1] * 2 != nope_bytes or q_rope.shape[-1] * 2 != rope_bytes:
-        return False
     if not can_use_set_mla_kv_concat_q(nope_bytes, rope_bytes):
         return False
     # Last dims must be dense for the vectorised row accesses.

@@ -126,10 +126,16 @@ def _can_use_fused_rope_for_shape(
     device: torch.device,
     freqs_cis: torch.Tensor,
 ) -> bool:
+    """Whether the fused vision RoPE is applicable to this activation shape.
+
+    ``freqs_cis`` sharing the activation's device is the kernel's contract, not
+    a dispatch choice -- ``get_freqs_cis`` builds the table on that very device,
+    and the eager ``apply_rope`` multiply fails on a mismatch just as the kernel
+    does. ``apply_fused_qk_complex_rope`` reports it, so screening it here would
+    only trade the error for a silent eager fallback.
+    """
     if not (
         device.type == "cuda"
-        and freqs_cis.is_cuda
-        and device == freqs_cis.device
         and dtype in (torch.bfloat16, torch.float16)
         and freqs_cis.dtype == torch.complex64
     ):

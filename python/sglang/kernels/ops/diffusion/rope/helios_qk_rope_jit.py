@@ -51,26 +51,30 @@ def can_use_helios_qk_rope(
     k: torch.Tensor,
     freqs: torch.Tensor,
 ) -> bool:
-    """Return whether tensors match the native Helios paired-RoPE contract."""
-    if q.dim() != 4 or freqs.dim() != 3:
-        return False
-    # Dynamo cannot trace pointer or storage-offset queries. Compiled Helios Q/K
-    # come directly from aligned linear outputs; eager callers retain the guard.
+    """Return whether the fused kernel is applicable to these operands.
+
+    Only conditions whose failure makes the eager path the *correct* answer
+    belong here. Operand agreement -- rank, matching Q/K shape, a ``freqs``
+    layout of ``2 * head_dim``, an even head dimension -- is the kernel's
+    contract, enforced by ``HeliosQKRoPEKernel::run`` before the launch, so a
+    caller that violates it gets an error instead of a silent eager fallback.
+    """
+    # Emptiness and contiguity are contract for the kernel but capability here:
+    # the launcher rejects both, and the eager path computes them correctly, so
+    # route around the kernel rather than raising. Q/K dtype agreement is the
+    # same: the eager path rotates the two independently and type-promotes, so
+    # a mixed pair is a bit-exactness limit of this kernel, not a caller bug.
+    # Dynamo cannot trace storage-offset queries; compiled Helios Q/K come
+    # directly from aligned linear outputs, so only eager callers pay the guard.
     pair_aligned = True
     if not torch.compiler.is_compiling():
         pair_aligned = q.storage_offset() % 2 == 0 and k.storage_offset() % 2 == 0
     return (
         q.is_cuda
-        and k.is_cuda
-        and freqs.is_cuda
         and q.dtype in (torch.float16, torch.bfloat16)
         and k.dtype == q.dtype
         and freqs.dtype is torch.float32
-        and q.device == k.device == freqs.device
-        and k.shape == q.shape
-        and all(size > 0 for size in q.shape)
-        and freqs.shape == (*q.shape[:2], 2 * q.shape[-1])
-        and q.shape[-1] % 2 == 0
+        and q.numel() > 0
         and q.is_contiguous()
         and k.is_contiguous()
         and freqs.is_contiguous()

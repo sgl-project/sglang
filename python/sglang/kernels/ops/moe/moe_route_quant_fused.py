@@ -74,11 +74,16 @@ def covered(
     scores: torch.Tensor, bias: torch.Tensor, topk: int, x: torch.Tensor
 ) -> bool:
     """route_radix coverage plus the quant half: [M<=64, 3584] bf16 rows with
-    32B-aligned starts (base and stride), same token count as the scores."""
+    32B-aligned starts (base and stride).
+
+    Activations disagreeing with the scores on token count is a caller bug, not
+    an unsupported layout, so it is left to the launcher, which reports it as
+    "scores and activations must have the same token count". Screening it here
+    would hand the caller a silent unfused route instead.
+    """
     return (
         moe_route_radix.covered(scores, bias, topk)
         and x.dim() == 2
-        and x.shape[0] == scores.shape[0]
         and 0 < x.shape[0] <= _MAX_TOKENS
         and x.shape[1] == _HIDDEN
         and x.dtype in (torch.bfloat16, torch.float32)
