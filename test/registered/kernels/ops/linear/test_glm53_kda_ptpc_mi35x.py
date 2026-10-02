@@ -4,7 +4,11 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    Glm53KdaPtpcLinearMethod,
+    Glm53KdaSplitPtpcLinearMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.models.glm5_next import (
     GLM53_KDA_PTPC_BF16_MAX_M,
     Glm5NextLinearAttention,
@@ -13,7 +17,11 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=300, suite="jit-kernel-unit-test-amd")
+register_amd_ci(
+    est_time=300,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd-mi35x",
+)
 
 
 @unittest.skipUnless(
@@ -63,10 +71,12 @@ class TestGLM53KDAPTPC(CustomTestCase):
         layer = torch.nn.Module()
         parameter = torch.nn.Parameter(weight, requires_grad=False)
         layer.register_parameter("weight", parameter)
-        layer._glm53_kda_ptpc_module = module_name
-        layer._fp8_ptpc_bf16_max_m = GLM53_KDA_PTPC_BF16_MAX_M[module_name]
-        method = UnquantizedLinearMethod()
-        method._repack_bf16_to_fp8_ptpc(layer)
+        method = Glm53KdaPtpcLinearMethod(
+            module_name,
+            bf16_max_m=GLM53_KDA_PTPC_BF16_MAX_M[module_name],
+        )
+        layer.quant_method = method
+        method.process_weights_after_loading(layer)
 
         expected = tgemm.mm(x, parameter, otype=torch.bfloat16)
         ptpc_input = Glm5NextLinearAttention._maybe_quantize_ptpc_input(layer, x)
@@ -136,10 +146,12 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 requires_grad=False,
             ),
         )
-        layer._glm53_kda_ptpc_module = "f_a_proj"
-        layer._fp8_ptpc_bf16_max_m = GLM53_KDA_PTPC_BF16_MAX_M["f_a_proj"]
-        method = UnquantizedLinearMethod()
-        method._repack_bf16_to_fp8_ptpc(layer)
+        method = Glm53KdaPtpcLinearMethod(
+            "f_a_proj",
+            bf16_max_m=GLM53_KDA_PTPC_BF16_MAX_M["f_a_proj"],
+        )
+        layer.quant_method = method
+        method.process_weights_after_loading(layer)
 
         def run():
             ptpc_input = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
@@ -159,6 +171,78 @@ class TestGLM53KDAPTPC(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.isfinite(output).all())
         self.assertIn("_fp8_ptpc_weight", dict(layer.named_buffers()))
+
+    def test_split_first_stage_preserves_decode_and_uses_ptpc_prefill(self):
+        for tp, (qkv_size, beta_size) in {
+            4: (6144, 16),
+            8: (3072, 8),
+        }.items():
+            fg_size = 256
+            output_size = qkv_size + beta_size + fg_size
+            generator = torch.Generator(device="cuda").manual_seed(tp)
+            weight = (
+                torch.randn(
+                    output_size,
+                    4096,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=generator,
+                )
+                * 0.01
+            )
+            layer = torch.nn.Module()
+            layer.register_parameter(
+                "weight",
+                torch.nn.Parameter(weight, requires_grad=False),
+            )
+            baseline = UnquantizedLinearMethod()
+            candidate = Glm53KdaSplitPtpcLinearMethod(
+                bf16_max_m=4095 if tp == 4 else 8191,
+                fp8_max_m=16384,
+                qkv_size=qkv_size,
+                beta_size=beta_size,
+                fg_size=fg_size,
+            )
+            candidate.process_weights_after_loading(layer)
+            self.assertEqual(layer._fp8_ptpc_qkv_weight.shape[0], qkv_size)
+            self.assertEqual(layer._fp8_ptpc_f_weight.shape[0], fg_size // 2)
+            self.assertEqual(layer._fp8_ptpc_g_weight.shape[0], fg_size // 2)
+            for m in (1, 8192):
+                x = (
+                    torch.randn(
+                        m,
+                        4096,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                        generator=generator,
+                    )
+                    * 0.1
+                )
+                expected = baseline.apply(layer, x)
+                with self.subTest(tp=tp, m=m):
+                    if m == 1:
+                        actual = candidate.apply(layer, x)
+                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    else:
+                        qkv, beta, (f_a, g_a) = candidate.apply_ptpc_prefill(
+                            layer,
+                            x,
+                        )
+                        actual = torch.cat((qkv, beta, f_a, g_a), dim=-1)
+                        cosine = torch.nn.functional.cosine_similarity(
+                            actual.float().flatten(),
+                            expected.float().flatten(),
+                            dim=0,
+                        )
+                        mean_abs = (actual.float() - expected.float()).abs().mean()
+                        self.assertGreater(cosine.item(), 0.995)
+                        self.assertLess(mean_abs.item(), 0.01)
+                    self.assertTrue(torch.isfinite(actual).all())
+            self.assertNotIn("_fp8_ptpc_qkv_weight", layer.state_dict())
+            self.assertNotIn("_fp8_ptpc_f_weight", layer.state_dict())
+            self.assertNotIn("_fp8_ptpc_g_weight", layer.state_dict())
+            del actual, baseline, candidate, expected, layer, weight, x
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

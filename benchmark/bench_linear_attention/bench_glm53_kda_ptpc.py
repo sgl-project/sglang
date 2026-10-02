@@ -24,6 +24,7 @@ TP_SHAPES = {
         "o_path": (4096, 2048),
         "shared_qkvfg": (6400, 4096),
         "packed_qkvfg": (6400, 4096),
+        "fused_decode": (6416, 4096),
     },
     8: {
         "qkv_proj": (3072, 4096),
@@ -36,6 +37,7 @@ TP_SHAPES = {
         "o_path": (4096, 1024),
         "shared_qkvfg": (3328, 4096),
         "packed_qkvfg": (3328, 4096),
+        "fused_decode": (3336, 4096),
     },
 }
 
@@ -133,13 +135,37 @@ def load_checkpoint_weight(
         with safe_open(shard, framework="pt", device="cpu") as file:
             return file.get_tensor(key)
 
-    if module_name == "qkv_proj":
+    if module_name in {"qkv_proj", "fused_decode"}:
         shards = []
         for name in ("q_proj", "k_proj", "v_proj"):
             weight = load(f"{prefix}.{name}.weight")
             shard_size = weight.shape[0] // tp
             shards.append(weight.narrow(0, tp_rank * shard_size, shard_size))
-        return torch.cat(shards).contiguous()
+        qkv = torch.cat(shards)
+        if module_name == "qkv_proj":
+            return qkv.contiguous()
+        b = load_checkpoint_weight(
+            checkpoint,
+            layer,
+            "b_proj",
+            tp,
+            tp_rank,
+        )
+        f_a = load_checkpoint_weight(
+            checkpoint,
+            layer,
+            "f_a_proj",
+            tp,
+            tp_rank,
+        )
+        g_a = load_checkpoint_weight(
+            checkpoint,
+            layer,
+            "g_a_proj",
+            tp,
+            tp_rank,
+        )
+        return torch.cat((qkv, b, f_a, g_a)).contiguous()
 
     checkpoint_module_name = "o_proj" if module_name == "o_path" else module_name
     weight = load(f"{prefix}.{checkpoint_module_name}.weight")
@@ -222,6 +248,121 @@ def run_case(tp: int, module_name: str, m: int, args) -> dict:
         ),
         "median_delta": delta,
         "unsupported_reason": unsupported_reason,
+    }
+    torch.cuda.empty_cache()
+    return result
+
+
+@torch.inference_mode()
+def run_fused_decode_case(tp: int, m: int, args) -> dict:
+    from sglang.srt.layers.quantization.unquant import (
+        Glm53KdaSplitPtpcLinearMethod,
+        UnquantizedLinearMethod,
+    )
+
+    n, k = TP_SHAPES[tp]["fused_decode"]
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(args.seed + tp + m + n + k)
+    x = (
+        torch.randn(m, k, generator=generator, device="cuda", dtype=torch.bfloat16)
+        * 0.1
+    )
+    if args.checkpoint is None:
+        weight = torch.randn(
+            n,
+            k,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        weight_source = "synthetic"
+    else:
+        weight = load_checkpoint_weight(
+            args.checkpoint,
+            args.layer,
+            "fused_decode",
+            tp,
+            args.tp_rank,
+        ).to(device="cuda")
+        weight_source = str(args.checkpoint)
+
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(weight, requires_grad=False),
+    )
+    baseline = UnquantizedLinearMethod()
+    qkv_size = TP_SHAPES[tp]["qkv_proj"][0]
+    beta_size = TP_SHAPES[tp]["b_proj"][0]
+    candidate = Glm53KdaSplitPtpcLinearMethod(
+        bf16_max_m=4095 if tp == 4 else 8191,
+        fp8_max_m=16384,
+        qkv_size=qkv_size,
+        beta_size=beta_size,
+        fg_size=n - qkv_size - beta_size,
+    )
+    candidate.process_weights_after_loading(layer)
+
+    expected = baseline.apply(layer, x)
+    if candidate.is_active(m):
+        qkv, beta, (f_a, g_a) = candidate.apply_ptpc_prefill(layer, x)
+        actual = torch.cat((qkv, beta, f_a, g_a), dim=-1)
+    else:
+        actual = candidate.apply(layer, x)
+    if not candidate.is_active(m):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    else:
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.float().flatten(),
+            expected.float().flatten(),
+            dim=0,
+        )
+        mean_abs = (actual.float() - expected.float()).abs().mean()
+        if cosine.item() <= 0.995 or mean_abs.item() >= 0.01:
+            raise AssertionError(
+                f"split PTPC mismatch: cosine={cosine.item():.6f}, "
+                f"mean_abs={mean_abs.item():.6f}"
+            )
+
+    iters = args.iters
+    baseline_samples = measure_samples(
+        lambda: baseline.apply(layer, x),
+        args.warmup,
+        iters,
+        args.inner_iters,
+    )
+
+    def run_candidate():
+        if not candidate.is_active(m):
+            return candidate.apply(layer, x)
+        qkv, beta, (f_a, g_a) = candidate.apply_ptpc_prefill(layer, x)
+        return qkv, beta, torch.stack((f_a, g_a))
+
+    candidate_samples = measure_samples(
+        run_candidate,
+        args.warmup,
+        iters,
+        args.inner_iters,
+    )
+    baseline_summary = summarize(baseline_samples)
+    candidate_summary = summarize(candidate_samples)
+    result = {
+        "tp": tp,
+        "module": "fused_decode",
+        "m": m,
+        "n": n,
+        "k": k,
+        "warmup": args.warmup,
+        "iters": iters,
+        "inner_iters": args.inner_iters,
+        "seed": args.seed,
+        "weight_source": weight_source,
+        "bf16": {**baseline_summary, "samples_ms": baseline_samples},
+        "ptpc": {**candidate_summary, "samples_ms": candidate_samples},
+        "median_delta": (
+            candidate_summary["median_ms"] / baseline_summary["median_ms"] - 1
+        ),
+        "unsupported_reason": None,
     }
     torch.cuda.empty_cache()
     return result
@@ -559,9 +700,13 @@ def main():
             run_o_path_case(args.tp, m, args)
             if module_name == "o_path"
             else (
-                run_first_stage_case(args.tp, module_name, m, args)
-                if module_name in {"shared_qkvfg", "packed_qkvfg"}
-                else run_case(args.tp, module_name, m, args)
+                run_fused_decode_case(args.tp, m, args)
+                if module_name == "fused_decode"
+                else (
+                    run_first_stage_case(args.tp, module_name, m, args)
+                    if module_name in {"shared_qkvfg", "packed_qkvfg"}
+                    else run_case(args.tp, module_name, m, args)
+                )
             )
         )
         for module_name in args.modules
