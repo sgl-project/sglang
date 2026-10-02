@@ -119,9 +119,11 @@ class RainFusionAttentionImpl(AttentionImpl):
         self.block_size = 128
         self.tile_size = 8
         self._is_a5 = torch_npu.npu.get_soc_version() == 260
+
         sparse_config = get_global_server_args().attention_backend_config or {}
         self.skip_first_steps = int(sparse_config.get("skip_first_steps", 10))
         self.sparsity = float(sparse_config.get("sparsity", 0.2))
+
         if self.skip_first_steps < 0 or not 0.0 <= self.sparsity < 1.0:
             raise ValueError(
                 "Invalid Rain Fusion attention config: "
@@ -595,10 +597,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             len(boundaries) < 2
             or boundaries[0] != 0
             or boundaries[-1] != query.shape[0]
-            or any(
-                stop < start
-                for start, stop in zip(boundaries[:-1], boundaries[1:])
-            )
+            or any(stop < start for start, stop in zip(boundaries[:-1], boundaries[1:]))
         ):
             raise ValueError(
                 "cu_seqlens must start at 0, be non-decreasing, and end at "

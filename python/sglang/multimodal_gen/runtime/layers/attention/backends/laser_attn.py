@@ -6,7 +6,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import AscendFABackend
+from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+    AscendFABackend,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 # The current NPU kernel stores QK scores and V in FP16 even for BF16 inputs.
@@ -55,7 +57,6 @@ class LaserAttentionImpl(AttentionImpl):
         self.dim_index = 3
         self.dim_base = 128
         self.max_token = 2**31 - 1
-        self.seq_len_pad_base = 256
 
         # the laser attention operator has issues with small seq_len
         self.min_seqlen = 2048
@@ -202,10 +203,10 @@ class LaserAttentionImpl(AttentionImpl):
             )
         else:
             pre_tokens = self.max_token
-            if kv_seqlen % self.seq_len_pad_base != 0:
+            if kv_seqlen % self.seqlen_base != 0:
                 pre_tokens = (
-                    kv_seqlen // self.seq_len_pad_base + 1
-                ) * self.seq_len_pad_base - kv_seqlen
+                    kv_seqlen // self.seqlen_base + 1
+                ) * self.seqlen_base - kv_seqlen
 
             q, k, v, qk_scale, value_scale = self._la_preprocess_input(
                 query,
