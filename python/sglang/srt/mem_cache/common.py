@@ -313,11 +313,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     owned_kv_len = req.owned_kv_len()
     is_insert = is_insert and not req.skip_radix_cache_insert
     if is_insert:
-        tree_cache.cache_finished_req(req, owned_kv_len=owned_kv_len)
-    else:
-        # The protected prefix is not this req's to free.
-        tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-        tree_cache.unpin(req)
+        tree_cache.insert_req(req, up_to=owned_kv_len)
+    # The protected prefix is not this req's to free.
+    tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+    tree_cache.unpin(req)
     _release_overallocated_kv_indices(
         req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
     )
@@ -347,7 +346,12 @@ def _release_overallocated_kv_indices(
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not get_serving().strip_thinking_cache:
-        assert start_p == end_p, (
+        # A stop landing before the last committed token does the same, via
+        # effective_kv_committed_len().
+        assert start_p == end_p or (
+            req.finished_len is not None
+            and len(req.origin_input_ids) + req.finished_len < req.kv.kv_committed_len
+        ), (
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
         )
 
@@ -360,7 +364,7 @@ def _release_overallocated_kv_indices(
 
     if start_p < end_p:
         # start_p is aligned to the allocator's page above, so it never shares a
-        # page with cache_finished_req's tail free in this group.
+        # page with the tail free_kv_row in this group.
         tree_cache.free_kv_row(req.kv, [(start_p, end_p)])
 
 

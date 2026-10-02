@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from types import SimpleNamespace
@@ -115,6 +116,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.is_npu = is_npu()
+        self.is_hip = is_hip()
         self.kv_pool = runner.token_to_kv_pool
         self.hisparse_coordinator = runner.hisparse_coordinator
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
@@ -159,6 +161,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._extend_meta_key: Optional[int] = None
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
+        self._linear_verify_meta: Optional[SimpleNamespace] = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -274,6 +277,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         spec = get_spec()
         self.speculative_num_draft_tokens = spec.speculative_num_draft_tokens
+        if self.is_hip and spec.speculative_algorithm is not None:
+            if spec.speculative_eagle_topk != 1:
+                raise NotImplementedError(
+                    "MiniMax-M3 ROCm speculative attention requires a linear "
+                    "draft chain (--speculative-eagle-topk 1)."
+                )
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
@@ -309,8 +318,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # that wide. Head split mirrors MiniMaxM3 sparse attention's.
         self._idx_group_size = 1
         if self.index_cache_enabled:
-            from sglang.srt.runtime_context import get_parallel
-
             _num_idx_heads = max(
                 sparse_cfg["sparse_num_index_heads"] // get_parallel().attn_tp_size, 1
             )
@@ -416,8 +423,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._topk_cache_owner = None
         # Decode top-k reuse: pre-allocate the per-bs persistent buffer so graph
         # capture never allocates. num_kv_heads == 1 at TP>=4 for M3.
-        if self.index_cache_enabled and forward_batch.forward_mode.is_decode_or_idle():
+        if self.index_cache_enabled and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or (self.is_hip and forward_batch.forward_mode.is_target_verify())
+        ):
             bs = forward_batch.seq_lens.shape[0]
+            if forward_batch.forward_mode.is_target_verify():
+                bs *= self.speculative_num_draft_tokens
             if bs > 0 and bs not in self._decode_topk_buf:
                 _nkv = self.kv_pool.main_pool.head_num
                 self._decode_topk_buf[bs] = torch.empty(
@@ -439,13 +451,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._max_seqlen_q = 1
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
-            or (self.is_npu and forward_batch.forward_mode.is_target_verify())
+            or (
+                (self.is_npu or self.is_hip)
+                and forward_batch.forward_mode.is_target_verify()
+            )
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+            if self.is_hip and forward_batch.forward_mode.is_target_verify():
+                self._max_seqlen_k += self.speculative_num_draft_tokens
 
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.
@@ -533,8 +550,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self._msa_dec_meta = (kv_indices_buf, plan)
 
+    def _init_rocm_linear_verify_metadata(self, forward_batch: ForwardBatch):
+        ndt = self.speculative_num_draft_tokens
+        # GPU seq_lens are the accepted prefix lengths. A linear EAGLE
+        # chain exposes one more KV token to each successive query.
+        offsets = torch.arange(
+            1,
+            ndt + 1,
+            device=forward_batch.seq_lens.device,
+            dtype=forward_batch.seq_lens.dtype,
+        )
+        self._linear_verify_meta = SimpleNamespace(
+            seq_lens=(forward_batch.seq_lens[:, None] + offsets[None, :]).reshape(-1),
+            req_pool_indices=forward_batch.req_pool_indices.repeat_interleave(ndt),
+        )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         if not self.is_npu:
+            if self.is_hip and forward_batch.forward_mode.is_target_verify():
+                self._init_rocm_linear_verify_metadata(forward_batch)
             return
         # Layer-invariant decode/verify metadata as captured ops (re-read at replay).
         fm = forward_batch.forward_mode
@@ -1420,6 +1454,27 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_k: torch.Tensor,
         idx_v: Optional[torch.Tensor],
     ):
+        if self.is_hip and forward_batch.forward_mode.is_target_verify():
+            meta = self._linear_verify_meta
+            if meta is None or meta.seq_lens.numel() != q.shape[0]:
+                raise RuntimeError("Missing MiniMax-M3 linear verify metadata")
+            # Keep the dense backend's original per-request metadata intact.
+            # Sparse decode accepts one causal query per row; cache stores
+            # still use the original flattened out_cache_loc exactly once.
+            verify_batch = copy.copy(forward_batch)
+            verify_batch.seq_lens = meta.seq_lens
+            verify_batch.req_pool_indices = meta.req_pool_indices
+            return self.forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                verify_batch,
+                save_kv_cache,
+                idx_q=idx_q,
+                idx_k=idx_k,
+                idx_v=idx_v,
+            )
         disable_value = layer.layer_id in self.disable_value_layer_ids
         kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
             forward_batch, layer.layer_id
