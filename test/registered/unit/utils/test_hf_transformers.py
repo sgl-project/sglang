@@ -10,6 +10,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
 from transformers import PretrainedConfig
 from transformers.image_processing_utils import BaseImageProcessor
 
@@ -539,6 +540,62 @@ class TestGetHfTextConfig(CustomTestCase):
         result = get_hf_text_config(cfg)
         self.assertIsInstance(cfg.text_config, PretrainedConfig)
         self.assertEqual(result.num_attention_heads, 32)
+
+    def test_converts_nested_thinker_text_dict(self):
+        for dict_thinker in (False, True):
+            for thinker_dtype in (None, torch.float16):
+                with self.subTest(
+                    dict_thinker=dict_thinker, thinker_dtype=thinker_dtype
+                ):
+                    inner_text = {
+                        "model_type": "qwen2",
+                        "num_attention_heads": 8,
+                        "hidden_size": 1024,
+                        "max_position_embeddings": 8192,
+                        "rope_scaling": {
+                            "rope_type": "yarn",
+                            "factor": 2.0,
+                            "original_max_position_embeddings": 4096,
+                        },
+                    }
+                    thinker = {
+                        "model_type": "qwen2_5_omni_thinker",
+                        "text_config": inner_text,
+                        "dtype": thinker_dtype,
+                    }
+                    if not dict_thinker:
+                        thinker = PretrainedConfig(**thinker)
+                    cfg = PretrainedConfig(
+                        architectures=["Qwen2_5OmniForConditionalGeneration"],
+                        thinker_config=thinker,
+                        dtype=torch.bfloat16,
+                        pad_token_id=0,
+                    )
+
+                    result = get_hf_text_config(cfg)
+
+                    self.assertIsInstance(result, PretrainedConfig)
+                    self.assertIs(result, cfg.thinker_config.text_config)
+                    self.assertEqual(result.num_attention_heads, 8)
+                    self.assertEqual(result.hidden_size, 1024)
+                    self.assertEqual(result.dtype, thinker_dtype or torch.bfloat16)
+                    self.assertEqual(result.pad_token_id, 0)
+                    self.assertEqual(result.rope_scaling["type"], "yarn")
+                    self.assertIs(get_hf_text_config(cfg), result)
+
+    def test_nested_thinker_text_dict_without_dtype(self):
+        cfg = PretrainedConfig(
+            architectures=["Qwen2_5OmniForConditionalGeneration"],
+            thinker_config={"text_config": {"num_attention_heads": 8}},
+            text_config={"num_attention_heads": 32},
+        )
+
+        result = get_hf_text_config(cfg)
+
+        self.assertIsInstance(result, PretrainedConfig)
+        self.assertIs(result, cfg.thinker_config.text_config)
+        self.assertEqual(result.num_attention_heads, 8)
+        self.assertIsNone(result.dtype)
 
     def test_llava_returns_parent_config(self):
         cfg = PretrainedConfig()

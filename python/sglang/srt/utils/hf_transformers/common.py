@@ -580,6 +580,11 @@ def get_hf_text_config(config: PretrainedConfig):
         # qwen2.5 omni
         thinker_config = config.thinker_config
         if hasattr(thinker_config, "text_config"):
+            # The top-level conversion does not normalize nested sub-configs.
+            if isinstance(thinker_config.text_config, dict):
+                thinker_config.text_config = PretrainedConfig(
+                    **thinker_config.text_config
+                )
             setattr(
                 thinker_config.text_config,
                 "dtype",
