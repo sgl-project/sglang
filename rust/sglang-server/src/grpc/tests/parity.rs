@@ -161,7 +161,7 @@ async fn static_metadata_and_model_listing_use_frontend_metadata() {
 
 #[tokio::test]
 async fn server_info_round_trips_and_does_not_leak_private_scheduler_fields() {
-    let harness = Harness::new(4, false, Duration::from_secs(1));
+    let harness = Harness::new(4, true, Duration::from_secs(1));
     let rpc = harness
         .service
         .get_server_info(Request::new(Default::default()));
@@ -189,6 +189,7 @@ async fn server_info_round_trips_and_does_not_leak_private_scheduler_fields() {
     let text = result.unwrap().into_inner().json_info;
     let info: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(info["model_path"], "/model");
+    assert_eq!(info["incremental_streaming_output"], true);
     assert_eq!(info["max_context_length"], 4096);
     assert_eq!(info["internal_states"][0]["last_gen_throughput"], 1.5);
     assert!(!text.contains("must-not-leak"));

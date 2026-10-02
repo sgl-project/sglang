@@ -36,6 +36,7 @@ impl Harness {
         let activity: crate::tokenizer_manager::from_scheduler::ActivityCounter =
             Default::default();
         let args = crate::message::config::ServerArgs {
+            incremental_streaming_output: incremental,
             model_path: "/model".into(),
             served_model_name: "model".into(),
             model_config: crate::message::config::ModelConfig {

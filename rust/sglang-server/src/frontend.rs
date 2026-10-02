@@ -53,6 +53,7 @@ pub(crate) struct FrontendConfig {
 /// depend on the full launch-configuration object.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FrontendMetadata {
+    incremental_streaming_output: bool,
     model_path: String,
     served_model_name: String,
     tokenizer_path: String,
@@ -70,6 +71,7 @@ pub(crate) struct FrontendMetadata {
 impl From<&ServerArgs> for FrontendMetadata {
     fn from(args: &ServerArgs) -> Self {
         Self {
+            incremental_streaming_output: args.incremental_streaming_output,
             model_path: args.model_path.clone(),
             served_model_name: args.served_model_name.clone(),
             tokenizer_path: args.tokenizer_path.clone(),
@@ -211,6 +213,7 @@ impl FrontendHandle {
         let internal_state = self.internal_state().await?;
         let metadata = &self.inner.metadata;
         Ok(ServerInfo {
+            incremental_streaming_output: metadata.incremental_streaming_output,
             model_path: metadata.model_path.clone(),
             served_model_name: metadata.served_model_name.clone(),
             tokenizer_path: metadata.tokenizer_path.clone(),
