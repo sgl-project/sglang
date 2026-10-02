@@ -44,6 +44,11 @@ BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
 
 
+def _seeded(seed: int) -> torch.Generator:
+    """CPU generator so the two branches see byte-identical inputs."""
+    return torch.Generator().manual_seed(seed)
+
+
 def test_qsa_write_plan_tracks_group_crossing_extend_prefix():
     """Plan math for a prefix that starts mid compression group.
 
@@ -62,6 +67,8 @@ def test_qsa_write_plan_tracks_group_crossing_extend_prefix():
         rows,
         member_rows,
         prefix_members,
+        cross_rows,
+        cross_prefix_members,
     ) = QwenSparseAttnBackend._qsa_write_plan(
         token_slot_table=token_slot_table,
         start_blocks=prefix_lens // COMPRESS_RATIO,
@@ -77,6 +84,96 @@ def test_qsa_write_plan_tracks_group_crossing_extend_prefix():
     assert rows[:3].tolist() == [0, 1, 1]
     assert member_rows[:3].tolist() == [-2, 4, 8]
     assert prefix_members[:3].tolist() == [2, 0, 0]
+    # One entry per row, and it is that row's first; every straddling entry in
+    # the full plan must be reachable from here, else the recompress misses it.
+    assert cross_rows.tolist() == [0, 1]
+    assert cross_prefix_members.tolist() == [2, 0]
+    straddling = (prefix_members > 0).nonzero().flatten().tolist()
+    assert set(straddling) <= set(cross_rows.tolist())
+
+
+def test_qsa_write_plan_cross_rows_skip_rows_without_entries():
+    """A row that compresses no group must not borrow another row's entry.
+
+    Its `starts` offset points at the next row's first entry, so without the
+    `counts > 0` mask the recompress would rewrite a group it does not own.
+    """
+    token_slot_table = torch.arange(28, dtype=torch.int32).view(2, 14)
+    # Row 0 spans no whole group (prefix 10, extend 1 -> no block completes).
+    prefix_lens = torch.tensor([10, 0], dtype=torch.long)
+    extend_lens = torch.tensor([1, 8], dtype=torch.long)
+    sequence_lengths = prefix_lens + extend_lens
+
+    (*_, prefix_members, cross_rows, cross_prefix_members) = (
+        QwenSparseAttnBackend._qsa_write_plan(
+            token_slot_table=token_slot_table,
+            start_blocks=prefix_lens // COMPRESS_RATIO,
+            end_blocks=sequence_lengths // COMPRESS_RATIO,
+            capacity=5,
+            compress_ratio=COMPRESS_RATIO,
+            row_token_starts=torch.tensor([0, 1], dtype=torch.long),
+            prefix_lens=prefix_lens,
+        )
+    )
+
+    # Row 0 borrows row 1's entry index, so it must be zeroed out.
+    assert cross_rows.tolist() == [0, 0]
+    assert cross_prefix_members.tolist() == [0, 0]
+    assert prefix_members[0].item() == 0
+
+
+def test_qsa_write_plan_cross_rows_cover_every_straddling_entry():
+    """The O(batch) recompress is only correct if these rows are exhaustive.
+
+    Narrowing the pass from the whole plan to one entry per row rests on
+    `start_blocks = prefix_lens // ratio` making a row's first entry its only
+    straddling one. Sweep random batches: a straddling entry outside
+    `cross_rows` would be silently left compressed from the wrong tokens.
+    """
+    generator = _seeded(7)
+    for _ in range(200):
+        rows = int(torch.randint(1, 6, (1,), generator=generator))
+        prefix_lens = torch.randint(0, 20, (rows,), generator=generator).long()
+        extend_lens = torch.randint(1, 20, (rows,), generator=generator).long()
+        sequence_lengths = prefix_lens + extend_lens
+        capacity = int(extend_lens.sum()) // COMPRESS_RATIO + rows
+        token_slot_table = torch.arange(
+            rows * (int(sequence_lengths.max()) + COMPRESS_RATIO), dtype=torch.int32
+        ).view(rows, -1)
+
+        (
+            _write_locs,
+            _group_positions,
+            entry_rows,
+            _member_rows,
+            prefix_members,
+            cross_rows,
+            cross_prefix_members,
+        ) = QwenSparseAttnBackend._qsa_write_plan(
+            token_slot_table=token_slot_table,
+            start_blocks=prefix_lens // COMPRESS_RATIO,
+            end_blocks=sequence_lengths // COMPRESS_RATIO,
+            capacity=capacity,
+            compress_ratio=COMPRESS_RATIO,
+            row_token_starts=torch.cumsum(extend_lens, 0) - extend_lens,
+            prefix_lens=prefix_lens,
+        )
+
+        case = (
+            f"{prefix_lens.tolist()=} {extend_lens.tolist()=} "
+            f"{prefix_members.tolist()=} {cross_rows.tolist()=}"
+        )
+        # Exhaustive: no straddling entry may fall outside the narrowed pass.
+        straddling = set((prefix_members > 0).nonzero().flatten().tolist())
+        assert straddling <= set(cross_rows.tolist()), case
+        # Faithful: a row that reports members must own the entry it points at,
+        # never borrow a neighbour's when it compresses no group of its own.
+        for row, (entry, members) in enumerate(
+            zip(cross_rows.tolist(), cross_prefix_members.tolist())
+        ):
+            if members:
+                assert entry_rows[entry].item() == row, case
+                assert prefix_members[entry].item() == members, case
 
 
 class _CrossPrefixPool:
@@ -118,7 +215,7 @@ def test_qsa_cross_prefix_recompress_reads_the_pre_store_ring(monkeypatch):
         # Group [8, 12) for request 1, oldest member first; the trailing
         # entry is a group wholly inside this extend.
         compress_group_ring_locs=torch.tensor([[4, 5, 6, 7], [4, 5, 6, 7]]),
-        compress_prefix_members=torch.tensor([2, 0]),
+        compress_cross_prefix_members=torch.tensor([2, 0]),
         token_to_kv_pool=pool,
     )
 

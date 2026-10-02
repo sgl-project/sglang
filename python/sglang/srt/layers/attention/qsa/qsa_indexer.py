@@ -408,8 +408,15 @@ class QSAIndexer(MultiPlatformOp):
             pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
 
         if is_extend and cross_prefix_state is not None:
+            # Only a row's first entry can straddle, so recompress those rows
+            # rather than the whole plan.
+            cross_rows = metadata.compress_cross_rows
             self._overwrite_cross_prefix_groups(
-                token_k, metadata, group_locs, compressed_locs, cross_prefix_state
+                token_k,
+                metadata,
+                group_locs[cross_rows],
+                compressed_locs[cross_rows],
+                cross_prefix_state,
             )
 
     def _overwrite_cross_prefix_groups(
@@ -422,14 +429,15 @@ class QSAIndexer(MultiPlatformOp):
     ) -> None:
         """Recompress groups spanning a retained private prefix and this extend.
 
-        Runs over every planned group so the selection stays shape-derived:
-        a group wholly inside this extend has ``prefix_members == 0``, takes
-        no ring member, and is routed to the inert reserved slot 0 rather
-        than rewriting what the main pass already stored.
+        Runs over one entry per metadata row -- the only one that can straddle
+        -- so the selection stays shape-derived with no sync. A row whose entry
+        does not straddle has ``prefix_members == 0``, takes no ring member, and
+        is routed to the inert reserved slot 0 rather than rewriting what the
+        main pass already stored.
         """
 
         ring_keys, ring_rope = cross_prefix_state
-        prefix_members = metadata.compress_prefix_members.long()
+        prefix_members = metadata.compress_cross_prefix_members.long()
         pool = metadata.token_to_kv_pool
         current_keys = token_k[current_group_locs]
         use_ring = (
