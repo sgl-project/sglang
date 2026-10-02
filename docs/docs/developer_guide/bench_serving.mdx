@@ -192,6 +192,36 @@ python3 -m sglang.bench_serving \
     --num-prompts 512
 ```
 
+### Kimi K2.5 image benchmarks
+
+Start a Kimi K2.5 server, then run the benchmark client on CPU. For Ascend A2/A3,
+follow the [Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation).
+Set `MODEL_PATH` to the checkpoint directory or Hugging Face model ID containing
+the tokenizer, processor, and configuration files.
+
+```bash Command
+MODEL_PATH=/path/to/Kimi-K2.5
+HOST=127.0.0.1
+PORT=30000
+python3 -m sglang.benchmark.serving \
+  --backend sglang-oai-chat \
+  --host "$HOST" --port "$PORT" \
+  --model "$MODEL_PATH" --tokenizer "$MODEL_PATH" \
+  --dataset-name image \
+  --image-count 2 --image-resolution 448x448 \
+  --image-format png --image-content blank \
+  --random-input-len 128 --random-output-len 32 \
+  --random-range-ratio 1 --num-prompts 16 \
+  --max-concurrency 2 --warmup-requests 2 --seed 1095 \
+  --output-file kimi-k25-images.jsonl
+```
+
+Use `--backend sglang` to exercise the native `/generate` endpoint instead.
+The client loads Kimi's custom tokenizer and accounts for the image token expansion
+using the processor's resize rules. Text-token counts include the chat template;
+vision-token counts include the expanded image tokens and surrounding media markers.
+The same accounting applies to the `mmmu` dataset.
+
 ### Choosing model and tokenizer
 
 - `--model` is required unless the backend exposes `GET /v1/models`, in which case the first model ID is auto-selected.
