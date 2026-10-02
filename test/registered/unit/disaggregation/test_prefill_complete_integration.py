@@ -504,7 +504,7 @@ class TestAllocationIntegration(CustomTestCase):
             processed_tokens_counter=0,
         )
         with (
-            patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"),
+            patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
@@ -536,13 +536,13 @@ class TestAllocationIntegration(CustomTestCase):
                             has_bootstrapped_waiting_req=Mock(return_value=True),
                             optimistic_release_and_requeue=Mock(),
                         )
-                        scheduler.cache_unfinished_disagg_prefill = MethodType(
-                            SchedulerDisaggregationPrefillMixin.cache_unfinished_disagg_prefill,
+                        scheduler.checkpoint_disagg_prefill = MethodType(
+                            SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill,
                             scheduler,
                         )
                         running = SimpleNamespace(batch_is_full=True)
                         with patch(
-                            "sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"
+                            "sglang.srt.disaggregation.prefill.checkpoint_kv_cache"
                         ):
                             SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
                                 scheduler, None, running
@@ -590,9 +590,12 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
             finalize_bootstrap=Mock(side_effect=finalize)
         )
-        with patch(
-            "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
-            side_effect=lambda senders, *groups: [s.poll() for s in senders],
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                side_effect=lambda senders, *groups: [s.poll() for s in senders],
+            ),
+            patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
         ):
             self.assertEqual(scheduler.process_disagg_prefill_inflight_queue(), [])
             self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
