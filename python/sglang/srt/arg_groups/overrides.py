@@ -1136,11 +1136,16 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 @register_post_process
 def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     """Validate resolved KV-cache dtype for TRTLLM and tokenspeed MLA backends."""
-    if (
-        view.attention_backend == "trtllm_mla"
-        or view.decode_attention_backend == "trtllm_mla"
-    ):
-        if not get_platform().is_blackwell:
+    prefill_backend, decode_backend = attention_backends_of(view)
+    if "trtllm_mla" in (prefill_backend, decode_backend):
+        platform = get_platform()
+        if prefill_backend == "trtllm_mla" and not platform.is_sm100:
+            raise ValueError(
+                "TRTLLM MLA prefill requires SM10x (datacenter Blackwell). "
+                "On SM120/SM121, use a supported prefill backend such as "
+                "--prefill-attention-backend flashinfer."
+            )
+        if decode_backend == "trtllm_mla" and not platform.is_blackwell:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )
