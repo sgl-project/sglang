@@ -115,6 +115,7 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
     loaded_weights: bool = False
     sync_base: bool = True
     pending_version: Optional[str] = None
+    requires_post_load: bool = False
 
 
 @dataclass(kw_only=True, slots=True)
@@ -131,7 +132,6 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
-    _weight_update_requires_post_load: bool = False
     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
 
@@ -269,7 +269,7 @@ class SchedulerWeightUpdaterManager:
         with self._observe_weight_load("distributed"):
             if recv_req.load_format == "nccl_m2n":
                 try:
-                    if not self._weight_update_sync_base:
+                    if not self._session.sync_base:
                         raise ValueError("M2N requires a sync_base=True session")
                     if recv_req.selector not in ("target", "all"):
                         raise ValueError(
@@ -277,7 +277,7 @@ class SchedulerWeightUpdaterManager:
                         )
                     if self.draft_worker is not None and (
                         recv_req.selector != "target"
-                        or self._weight_update_selector != "target"
+                        or self._session.selector != "target"
                     ):
                         raise ValueError(
                             "NCCL M2N with a draft requires a target-only weight-update session"
@@ -312,17 +312,18 @@ class SchedulerWeightUpdaterManager:
                 if success:
                     # M2N writes model storage directly, bypassing load_weights().
                     # Residual broadcast updates may subsequently set
-                    # _weight_update_loaded, so remember independently that the
+                    # loaded_weights, so remember independently that the
                     # session still needs model-level post-load processing.
-                    self._weight_update_requires_post_load = True
+                    self._session = msgspec.structs.replace(
+                        self._session, requires_post_load=True
+                    )
                     self.flush_cache_after_weight_update(recv_req)
+                    self.record_weight_version_after_update(recv_req.weight_version)
                 return UpdateWeightsFromDistributedReqOutput(
                     success=success, message=message
                 )
 
-            # The target (main) model owns this process's connection to the training
-            # engine, so it receives the broadcast once; the received weights are then
-            # loaded into each selected runner locally.
+            # only the target runner joined the update group; drafts load its receive
             target = self.tp_worker.model_runner.weight_updater
             try:
                 weights = target.receive_weights_from_distributed(
@@ -484,7 +485,6 @@ class SchedulerWeightUpdaterManager:
         self._session = _WeightUpdateSession(
             selector=recv_req.selector, sync_base=recv_req.sync_base
         )
-        self._weight_update_requires_post_load = False
         torch.distributed.barrier(group=self.tp_cpu_group)
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
@@ -497,7 +497,7 @@ class SchedulerWeightUpdaterManager:
             )
         if self._session.sync_base:
             run_post_load = (
-                self._weight_update_requires_post_load or not self._session.loaded_weights
+                self._session.requires_post_load or not self._session.loaded_weights
             )
             for _, runner in self._select_runners(self._session.selector):
                 runner.weight_updater.end_weight_update(run_post_load=run_post_load)

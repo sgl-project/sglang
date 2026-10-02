@@ -243,7 +243,7 @@ class WeightUpdater:
 
     def _assert_m2n_update_allowed(self) -> None:
         self._assert_weight_cache_inactive("receive_weights_from_m2n")
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             raise RuntimeError(error)
 

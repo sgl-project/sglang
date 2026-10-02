@@ -103,6 +103,10 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
 
 def _runner(result=(True, "ok")):
     runner = Mock()
+    runner.weight_updater._m2n_receivers = {}
+    runner.weight_updater.receive_weights_from_distributed.return_value = [
+        ("model.layers.0.weight", object())
+    ]
     for method in (
         "update_weights_from_disk",
         "update_weights_from_tensor",
@@ -127,6 +131,7 @@ def _request(**fields):
             "dtypes": ["float32"],
             "shapes": [[1]],
             "group_name": "g",
+            "m2n_group_names": None,
             "serialized_named_tensors": [b""],
             **fields,
         }
@@ -169,12 +174,19 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
 
 
 class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
+    def _assert_version_commits_at_end(self, manager):
+        self.assertEqual(self.recorded, [])
+        self.assertEqual(manager._session.pending_version, "v2")
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
+        self.assertEqual(self.recorded, ["v2"])
+
     def test_successful_update_records_the_version(self):
         """A refit that reports success advances the scheduler-side version."""
-        output = self._manager(_runner()).update_weights_from_disk(_request())
+        manager = self._manager(_runner())
+        output = manager.update_weights_from_disk(_request())
 
         self.assertTrue(output.success)
-        self.assertEqual(self.recorded, ["v2"])
+        self._assert_version_commits_at_end(manager)
 
     def test_failed_update_does_not_record_the_version(self):
         """A refit that fails must leave the version alone, or later tokens are mislabelled."""
@@ -196,10 +208,11 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
     def test_successful_distributed_update_records_the_version(self):
         """The distributed refit is the path an RL trainer actually drives, so it must record too."""
-        output = self._manager(_runner()).update_weights_from_distributed(_request())
+        manager = self._manager(_runner())
+        output = manager.update_weights_from_distributed(_request())
 
         self.assertTrue(output.success)
-        self.assertEqual(self.recorded, ["v2"])
+        self._assert_version_commits_at_end(manager)
 
     def test_failed_distributed_update_does_not_record_the_version(self):
         """A failed distributed refit leaves the version alone, exactly like the disk path."""
@@ -212,17 +225,19 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
     def test_successful_tensor_update_records_the_version(self):
         """The tensor refit records the version once the load reports success."""
-        output = self._manager(_runner()).update_weights_from_tensor(_request())
+        manager = self._manager(_runner())
+        output = manager.update_weights_from_tensor(_request())
 
         self.assertTrue(output.success)
-        self.assertEqual(self.recorded, ["v2"])
+        self._assert_version_commits_at_end(manager)
 
     def test_successful_ipc_update_records_the_version(self):
         """The checkpoint-engine IPC refit records the version like every other path."""
-        output = self._manager(_runner()).update_weights_from_ipc(_request())
+        manager = self._manager(_runner())
+        output = manager.update_weights_from_ipc(_request())
 
         self.assertTrue(output.success)
-        self.assertEqual(self.recorded, ["v2"])
+        self._assert_version_commits_at_end(manager)
 
     def test_failed_ipc_update_does_not_record_the_version(self):
         """The IPC path branches on success separately from the cache flush, so failure must record nothing."""
