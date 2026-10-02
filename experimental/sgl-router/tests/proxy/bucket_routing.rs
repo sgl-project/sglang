@@ -10,17 +10,17 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
 use sgl_router::config::{
-    ActiveLoadConfig, AffinityConfig, BucketConfig, BucketSpec, BucketStage, CacheAwareConfig,
-    CachePrefixProvider, Config, DiscoveryBackend, KvIndexerEndpointConfig, ModelConfig,
+    AffinityConfig, BucketConfig, BucketSpec, BucketStage, CacheAwareConfig, CachePrefixProvider,
+    Config, DiscoveryBackend, InflightLoadConfig, KvIndexerEndpointConfig, ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     SloBucketPolicy, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
+use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,11 +55,14 @@ fn build_app_context(
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
+            disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy,
             decode_policy: Default::default(),
             bucket_config: Some(bucket_config),
@@ -69,12 +72,14 @@ fn build_app_context(
             affinity,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&config).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -201,6 +206,7 @@ fn build_cache_ctx_with_affinity(
             query_timeout_ms: 100,
             query_max_inflight: 32,
         }),
+        ..Default::default()
     });
     context.prefix_index = Some(prefix_index);
     context.block_size_oracle.try_set(1).unwrap();
@@ -214,6 +220,7 @@ fn worker_spec(id: &str, url: String, mode: WorkerMode) -> WorkerSpec {
         mode,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: (mode == WorkerMode::Prefill).then_some(8997),
+        ..Default::default()
     }
 }
 
@@ -233,7 +240,7 @@ fn set_native_load_with_waiting(
     max_total_num_tokens: u64,
     num_waiting_uncached_tokens: u64,
 ) {
-    ctx.engine_load.set(
+    ctx.engine_reported_load.set(
         worker_url,
         0,
         LoadStat {
@@ -985,4 +992,122 @@ async fn cache_no_signal_restarts_normal_prompt_length_bucket_fallback() {
         "without a cache winner the request must restart the normal full-input Bucket path"
     );
     assert_eq!(index.calls.load(Ordering::Relaxed), 1);
+}
+
+/// A version group with no decode bucket that fits falls back to another group,
+/// without a discarded prefill pick.
+#[tokio::test]
+async fn decode_bucket_mismatch_falls_back_to_another_version_group() {
+    use crate::common::mock_worker::MockWorker;
+    let workers: Vec<_> =
+        futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+    let mut short = bucket("d-v1", BucketStage::Decode, 20, "d-v1");
+    short.max_sequence_tokens = Some(1_024);
+    let bucket_config = BucketConfig {
+        buckets: vec![
+            bucket("p-v1", BucketStage::Prefill, 10, "p-v1"),
+            bucket("p-v2", BucketStage::Prefill, 11, "p-v2"),
+            short,
+            bucket("d-v2", BucketStage::Decode, 30, "d-v2"),
+        ],
+        ttft_slo_policy: SloBucketPolicy::Disabled,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    };
+    let specs = [
+        ("p-v1", WorkerMode::Prefill, "v1"),
+        ("p-v2", WorkerMode::Prefill, "v2"),
+        ("d-v1", WorkerMode::Decode, "v1"),
+        ("d-v2", WorkerMode::Decode, "v2"),
+    ]
+    .into_iter()
+    .zip(&workers)
+    .map(|((id, mode, group), worker)| WorkerSpec {
+        version_group: Some(group.into()),
+        ..worker_spec(id, worker.url.clone(), mode)
+    })
+    .collect();
+    let ctx = build_ctx(specs, bucket_config, PolicyKind::PowerOfTwo, None);
+    let response = build_router(ctx.clone())
+        .oneshot(chat_request(None, Some(2_000)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let dispatched: Vec<_> = workers
+        .iter()
+        .map(|w| w.captured.lock().unwrap().last_body.is_some())
+        .collect();
+    assert_eq!(dispatched, [false, true, false, true]);
+    let prefill_picks: u64 = ctx
+        .metrics
+        .render()
+        .lines()
+        .filter(|line| line.starts_with("sgl_router_policy_decisions_total{"))
+        .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+        .sum();
+    assert_eq!(prefill_picks, 1);
+}
+
+/// Prefer a group with decode capacity, but retain capacity fallback when all
+/// groups are full, without relaxing their token-length limits.
+#[tokio::test]
+async fn version_group_capacity_fallback_preserves_decode_limits() {
+    use crate::common::mock_worker::MockWorker;
+    for (short_first, second_full) in [(false, false), (false, true), (true, true)] {
+        let workers: Vec<_> =
+            futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+        let specs = [
+            ("p1", WorkerMode::Prefill, "v1"),
+            ("p2", WorkerMode::Prefill, "v2"),
+            ("d1", WorkerMode::Decode, "v1"),
+            ("d2", WorkerMode::Decode, "v2"),
+        ]
+        .into_iter()
+        .zip(&workers)
+        .map(|((id, mode, group), worker)| WorkerSpec {
+            version_group: Some(group.into()),
+            ..worker_spec(id, worker.url.clone(), mode)
+        })
+        .collect();
+        let mut first_decode = bucket("d-first", BucketStage::Decode, 0, "d1");
+        if short_first {
+            first_decode.max_sequence_tokens = Some(10);
+        }
+        let ctx = build_ctx(
+            specs,
+            BucketConfig {
+                buckets: vec![
+                    bucket("p-first", BucketStage::Prefill, 0, "p1"),
+                    bucket("p-second", BucketStage::Prefill, 1, "p2"),
+                    first_decode,
+                    bucket("d-second", BucketStage::Decode, 1, "d2"),
+                ],
+                ttft_slo_policy: SloBucketPolicy::Disabled,
+                tps_slo_policy: SloBucketPolicy::Disabled,
+            },
+            PolicyKind::PowerOfTwo,
+            None,
+        );
+        set_native_load(&ctx, &workers[2].url, 1_000, 1_000);
+        set_native_load(
+            &ctx,
+            &workers[3].url,
+            if second_full { 1_000 } else { 0 },
+            1_000,
+        );
+        let response = build_router(ctx)
+            .oneshot(chat_request(None, Some(100)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let dispatched: Vec<_> = workers
+            .iter()
+            .map(|w| w.captured.lock().unwrap().last_body.is_some())
+            .collect();
+        let use_first = second_full && !short_first;
+        assert_eq!(
+            dispatched,
+            [use_first, !use_first, use_first, !use_first],
+            "short_first={short_first}, second_full={second_full}"
+        );
+    }
 }

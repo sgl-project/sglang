@@ -1,6 +1,7 @@
 """Tests for the DeepEP v2 expanded/masked repack kernels."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -113,6 +114,80 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
     def test_empty_experts(self):
         self._check_expand_roundtrip([0, 0, 0, 0], torch.bfloat16, with_scale=False)
 
+    def test_runner_defers_expanded_route_weighting(self):
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            DeepGemmRunnerOutput,
+            post_permute_deep_gemm_to_deepep_v2,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.base import RoutewiseLayout
+
+        counts = [3, 0, 2]
+        recv_x, _, psum, starts, total = _build_layout(
+            counts, self.ALIGN, self.HIDDEN, torch.bfloat16
+        )
+        masked_x, _, _ = expand_to_masked_slab(
+            recv_x, None, psum, len(counts), self.MAX_M, self.ALIGN
+        )
+        weights = torch.full((total,), 0.25, device=DEVICE)
+        state = {
+            "deepep_v2_expanded": True,
+            "deepep_v2_masked": True,
+            "deepep_v2_psum": psum,
+            "deepep_v2_total_expanded": total,
+            "deepep_v2_expert_alignment": self.ALIGN,
+            "topk_weights": weights,
+        }
+        rows = _real_rows(starts, counts)
+        for no_combine in (False, True):
+            with self.subTest(no_combine=no_combine):
+                output = post_permute_deep_gemm_to_deepep_v2(
+                    DeepGemmRunnerOutput(masked_x),
+                    None,
+                    MoeRunnerConfig(no_combine=no_combine),
+                    state,
+                )
+                expected = recv_x[rows] if no_combine else recv_x[rows] * 0.25
+                self.assertTrue(torch.equal(output.hidden_states[rows], expected))
+                self.assertEqual(
+                    output.routewise_layout,
+                    RoutewiseLayout.EXPANDED if no_combine else None,
+                )
+                if no_combine:
+                    self.assertTrue(torch.equal(output.topk_weights, weights))
+
+    def test_runner_restores_token_topk_routes_and_masks_nonlocal_slots(self):
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            DeepGemmRunnerOutput,
+            post_permute_deep_gemm_to_deepep_v2,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.base import RoutewiseLayout
+
+        hidden = torch.tensor([[3.0], [5.0], [7.0]], device=DEVICE)
+        weights = torch.tensor([[0.25, 0.0], [0.5, 0.75]], device=DEVICE)
+        state = {
+            "topk_ids": torch.tensor([[0, -1], [1, 0]], device=DEVICE),
+            "topk_weights": weights,
+            "output_index": torch.tensor([[1, -1], [0, 2]], device=DEVICE),
+        }
+        for empty in (False, True):
+            with self.subTest(empty=empty):
+                if empty:
+                    state["output_index"] = torch.full((2, 2), -1, device=DEVICE)
+                output = post_permute_deep_gemm_to_deepep_v2(
+                    DeepGemmRunnerOutput(hidden[:0] if empty else hidden),
+                    None,
+                    MoeRunnerConfig(no_combine=True),
+                    state,
+                )
+                expected = torch.tensor([[[5.0], [0.0]], [[3.0], [7.0]]], device=DEVICE)
+                if empty:
+                    expected.zero_()
+                self.assertTrue(torch.equal(output.hidden_states, expected))
+                self.assertIs(output.topk_weights, weights)
+                self.assertEqual(output.routewise_layout, RoutewiseLayout.TOKEN_TOPK)
+
     def test_single_hot_expert(self):
         self._check_expand_roundtrip(
             [0, self.MAX_M, 0, 0], torch.bfloat16, with_scale=False, topk=True
@@ -133,7 +208,7 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
                 recv_x, None, psum, len(counts), self.MAX_M, self.ALIGN
             )
 
-    def _production_packed_ue8m0_layout(self, counts):
+    def _production_packed_ue8m0_layout(self, counts, group_size):
         """Build expanded rows with the production packed UE8M0 quantizer."""
         from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
@@ -146,7 +221,7 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
         )
         recv_x, recv_x_scale = sglang_per_token_group_quant_fp8(
             raw,
-            128,
+            group_size,
             column_major_scales=True,
             scale_tma_aligned=True,
             scale_ue8m0=True,
@@ -157,9 +232,14 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
         return recv_x, recv_x_scale, psum, starts, total, hidden
 
     def test_fp8_packed_ue8m0_scale_from_production_quantizer(self):
+        for group_size in (32, 128):
+            with self.subTest(group_size=group_size):
+                self._check_packed_scale(group_size)
+
+    def _check_packed_scale(self, group_size):
         counts = [3, 1, 6, 2]
         recv_x, recv_x_scale, psum, starts, _, hidden = (
-            self._production_packed_ue8m0_layout(counts)
+            self._production_packed_ue8m0_layout(counts, group_size)
         )
         E = len(counts)
         masked_x, masked_x_scale, masked_m = expand_to_masked_slab(
@@ -175,10 +255,15 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
                 torch.testing.assert_close(masked_x_scale[e, j], recv_x_scale[s + j])
 
     def test_expand_under_cuda_graph_capture(self):
+        for group_size in (32, 128):
+            with self.subTest(group_size=group_size):
+                self._check_graph_capture(group_size)
+
+    def _check_graph_capture(self, group_size):
         # Exercise replay with the production packed scale layout.
         counts = [3, 1, 6, 2]
         recv_x, recv_x_scale, psum, starts, _, _ = self._production_packed_ue8m0_layout(
-            counts
+            counts, group_size
         )
         E = len(counts)
         warm = torch.cuda.Stream()
@@ -235,9 +320,33 @@ class TestDeepEPv2HandleLifecycle(CustomTestCase):
 
         impl._get_buffer = _boom
         with self.assertRaisesRegex(RuntimeError, "boom"):
-            impl.combine(None)
+            impl.combine(SimpleNamespace(routewise_layout=None))
         self.assertIsNone(impl._handle)
         self.assertFalse(impl._pad_empty_combine)
+
+    def test_unfinalized_routes_are_rejected_and_release_handle(self):
+        from sglang.srt.layers.moe.token_dispatcher.base import (
+            CombineInputChecker,
+            RoutewiseLayout,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
+            DeepEPv2CombineInput,
+        )
+
+        impl = self._bare_impl()
+        impl._handle = object()
+        output = DeepEPv2CombineInput(
+            torch.empty(2, 8), torch.ones(2), RoutewiseLayout.EXPANDED
+        )
+        self.assertTrue(CombineInputChecker.needs_model_route_finalization(output))
+        with self.assertRaisesRegex(ValueError, "model route finalization"):
+            impl.combine(output)
+        self.assertIsNone(impl._handle)
+        self.assertFalse(
+            CombineInputChecker.needs_model_route_finalization(
+                DeepEPv2CombineInput(torch.empty(2, 8), None)
+            )
+        )
 
 
 if __name__ == "__main__":

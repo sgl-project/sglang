@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary._dispatch import use_torch_reference
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -118,6 +119,16 @@ class RealKvSource:
             raise ValueError(
                 f"kv-canary: RealKvSource.tensor dim-1 byte width must be a multiple of 16, "
                 f"got {row_stride_bytes} bytes (shape={tuple(self.tensor.shape)}, "
+                f"dtype={self.tensor.dtype})"
+            )
+        # A row is addressed as page_size slots of num_bytes_per_token, unchecked at fold time;
+        # a narrower row hashes fewer bytes than asked and still reports the chain clean.
+        min_row_bytes = self.page_size * self.num_bytes_per_token
+        if row_stride_bytes < min_row_bytes:
+            raise ValueError(
+                f"kv-canary: RealKvSource.tensor dim-1 is {row_stride_bytes} bytes but "
+                f"page_size={self.page_size} x num_bytes_per_token={self.num_bytes_per_token} "
+                f"needs {min_row_bytes} (shape={tuple(self.tensor.shape)}, "
                 f"dtype={self.tensor.dtype})"
             )
 
@@ -301,7 +312,8 @@ def launch_canary_verify_kernel(
         - Pure side-effect; never raises. Host polls violation_write_index[0] > 0 for is_errored and
           violation_ring[0] for the first violation.
         - kernel_run_counter is bumped every call (canary-ran health signal).
-        - Safe in cuda-graph capture; caller refills plan in-place before replay.
+        - Safe in cuda-graph capture; caller refills plan in-place before replay. The reference
+          path is not (host work, D2H) and must not be launched under capture.
 
     Pinned by torch reference
     :func:`sglang.kernels.ops.kv_canary.verify_ref.launch_canary_verify_kernel_torch_reference`; CUDA must match
@@ -309,11 +321,27 @@ def launch_canary_verify_kernel(
     """
     canary_buf = context.canary_buf
     real_kv_sources = context.real_kv_sources
+    # Enforce the source-count cap before dispatching: the torch reference is
+    # pinned to match the CUDA ABI byte-for-byte, so the limit is a cross-backend
+    # contract, not a CUDA-only guard. Checking after the reference early-return
+    # (XPU / CPU path) would silently skip it.
     if len(real_kv_sources) > consts.MAX_REAL_KV_SOURCES:
         raise ValueError(
             f"kv-canary: at most {consts.MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
             f"got {len(real_kv_sources)}"
         )
+
+    if use_torch_reference(canary_buf.device):
+        from sglang.kernels.ops.kv_canary.verify_ref import (
+            launch_canary_verify_kernel_torch_reference,
+        )
+
+        launch_canary_verify_kernel_torch_reference(
+            context=context,
+            plan=plan,
+            check_verify_expected_token=check_verify_expected_token,
+        )
+        return
 
     _assert_contiguous(canary_buf, "canary_buf")
     _assert_contiguous(plan.verify_slot_indices, "plan.verify_slot_indices")

@@ -50,6 +50,10 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
@@ -239,6 +243,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self._kv_shard_pool = get_kv_shard_pool(model_runner.token_to_kv_pool)
+        self.needs_cpu_seq_lens |= self._kv_shard_pool is not None
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
@@ -806,6 +812,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
+        if self._kv_shard_pool is not None:
+            prepare_kv_shard_forward(
+                self._kv_shard_pool,
+                self.req_to_token,
+                forward_batch,
+            )
+
         self._decode_kernel_loc = None
         # Delegate to parent for non-decode modes.
         if (
@@ -1227,12 +1240,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def _dummy_dcp_decode_for_autotune(
         self, q: torch.Tensor, layer: RadixAttention
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Skip decode during FlashInfer MoE autotune dummy forwards.
+        """Skip DCP decode / target-verify during FlashInfer autotune dummy forwards.
 
         That pass discards attention/logits. Under DCP the synthetic
         full-head metadata can overflow the trtllm-gen workspace (and on
-        multi-node GB300 has also produced NVLink errors). Real requests
-        and CUDA-graph capture must not take this path.
+        multi-node GB300 has also produced NVLink errors), and the FlashInfer
+        kernels (trtllm-gen, cute-dsl) start their own tuning, whose synthetic
+        inputs can OOM on some ranks only and hang the cross-rank reduction.
+        Real requests and CUDA-graph capture must not take this path.
         """
         output = torch.zeros(
             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
@@ -1463,6 +1478,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # A speculative runner's autotune dummy forward is TARGET_VERIFY-shaped,
+        # so it never reaches forward_decode's guard.
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and get_parallel().dcp_enabled
+            and get_in_autotune_dummy_run()
+        ):
+            return self._dummy_dcp_decode_for_autotune(q, layer)
 
         # The fallback belongs to genuine extend forwards only. Target-verify /
         # draft-extend must never honor it: `forward_prefill_metadata` is a

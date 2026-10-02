@@ -14,9 +14,9 @@ from sglang.srt.runtime_context import get_exec
 @lru_cache(maxsize=1)
 def checkpointing_kernel():
     installed = version("flashinfer-python")
-    if installed.split("+")[0] != "0.6.18":
+    if installed.split("+")[0] != "0.7.0.post1":
         raise ValueError(
-            "--enable-mamba2-spec-replay requires validated FlashInfer 0.6.18; "
+            "--enable-mamba2-spec-replay requires FlashInfer 0.7.0.post1; "
             f"found {installed}"
         )
     from flashinfer.mamba import checkpointing_ssu
@@ -51,19 +51,15 @@ def verify_mamba2_replay(
     assert retrieve_parent_token is None
     assert x.shape[1] == cache_steps == 4
     assert layer_cache.intermediate_ssm is None
-    cfg = get_exec().mamba
-    seed = None
-    if cfg.enable_mamba_cache_stochastic_rounding:
-        # Fixed storage is retained through acceptance and safe in CUDA graphs.
-        seed = layer_cache.mamba2_replay_seed
-        seed.random_(0, 2**32)
+    # The native materializer needs per-head A, which the old cumulative-decay
+    # record encoded implicitly. Copy into graph-stable pool-owned storage.
+    layer_cache.mamba2_replay_A.copy_(A[:, 0, 0])
     checkpointing_kernel()(
         state=state,
-        old_x=layer_cache.mamba2_replay_x,
-        old_B=layer_cache.mamba2_replay_B,
-        old_dt=layer_cache.mamba2_replay_dt,
-        old_cumAdt=layer_cache.mamba2_replay_cum_adt,
-        cache_buf_idx=layer_cache.mamba2_replay_bank,
+        x_cache=layer_cache.mamba2_replay_x,
+        B_cache=layer_cache.mamba2_replay_B,
+        dt_cache=layer_cache.mamba2_replay_dt,
+        ring_start=layer_cache.mamba2_replay_ring_start,
         prev_num_accepted_tokens=layer_cache.mamba2_replay_pending,
         x=x,
         dt=dt,
@@ -77,8 +73,9 @@ def verify_mamba2_replay(
         dt_softplus=dt_softplus,
         state_batch_indices=state_batch_indices,
         pad_slot_id=pad_slot_id,
-        rand_seed=seed,
-        philox_rounds=cfg.mamba_cache_philox_rounds or 10,
+        # p=0 and ring_len=2*T prevent checkpoint writes. SR is only needed
+        # when acceptance materializes a state, not for verification outputs.
+        algorithm="monolith",
     )
 
 
@@ -89,18 +86,23 @@ def commit_mamba2_replay(cache, slots, last, tracks=None, track_steps=None):
     )
 
     cfg = get_exec().mamba
+    seed = None
+    if cfg.enable_mamba_cache_stochastic_rounding:
+        # Native all-layer materialization derives independent layer seeds.
+        seed = cache.mamba2_replay_seed[:1]
+        seed.random_(0, 2**32)
     materialize_flashinfer_mamba2(
         cache.temporal,
         cache.mamba2_replay_x,
         cache.mamba2_replay_B,
         cache.mamba2_replay_dt,
-        cache.mamba2_replay_cum_adt,
-        cache.mamba2_replay_bank,
+        cache.mamba2_replay_A,
+        cache.mamba2_replay_ptrs,
         slots,
         last,
         tracks,
         track_steps,
-        seeds=cache.mamba2_replay_seed,
+        seed=seed,
         philox_rounds=(
             (cfg.mamba_cache_philox_rounds or 10)
             if cfg.enable_mamba_cache_stochastic_rounding

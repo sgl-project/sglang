@@ -12,9 +12,10 @@ two transpose copies the unfused path needs to feed the conv kernel.
 
 Scope (v1): chain speculation only (``speculative_eagle_topk == 1``, i.e.
 ``retrieve_next_token is None``). The tree path keeps the unfused reference
-kernels. Requires ``T >= kernel_width - 1`` (the rolled conv state is then
-exactly the last ``kernel_width - 1`` input tokens, matching the reference
-kernel's store).
+kernels. Requires ``T >= kernel_width - 1``.
+
+State: conv_state and the SSM state are read-only. Verify is speculative, and
+the commit scatter advances them from the selected intermediate window.
 
 ReplaySSM (``cache_ring``): instead of per-step [HV, V, K] fp32 state
 snapshots, stash each step's raw inputs (pre-l2norm k, pre-delta v, gate,
@@ -383,19 +384,8 @@ def fused_kda_conv_gating_verify_kernel(
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
-    # Rolled conv state after consuming T >= W-1 tokens is exactly the last
-    # W-1 input tokens — which are the current window registers. The verify
-    # pass never writes the ssm state back (rollback happens at commit).
-    if is_qk_owner:
-        tl.store(cs_base + q_ch + 0 * stride_cs_tok, q_c0, mask=mask_k)
-        tl.store(cs_base + q_ch + 1 * stride_cs_tok, q_c1, mask=mask_k)
-        tl.store(cs_base + q_ch + 2 * stride_cs_tok, q_c2, mask=mask_k)
-        tl.store(cs_base + k_ch + 0 * stride_cs_tok, k_c0, mask=mask_k)
-        tl.store(cs_base + k_ch + 1 * stride_cs_tok, k_c1, mask=mask_k)
-        tl.store(cs_base + k_ch + 2 * stride_cs_tok, k_c2, mask=mask_k)
-    tl.store(cs_base + v_ch + 0 * stride_cs_tok, v_c0, mask=mask_v)
-    tl.store(cs_base + v_ch + 1 * stride_cs_tok, v_c1, mask=mask_v)
-    tl.store(cs_base + v_ch + 2 * stride_cs_tok, v_c2, mask=mask_v)
+    # No conv-state writeback: every V tile reads the same Q/K history, so a
+    # tile in a later wave would read what i_v == 0 had overwritten.
 
 
 def fused_kda_conv_gating_verify(
@@ -423,13 +413,11 @@ def fused_kda_conv_gating_verify(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     use_qk_l2norm_in_kernel: bool = True,
-    # num_warps=4 is ~1.3x faster than the unfused pair in-graph; conv_state
-    # and the conv-window cache stay bit-identical to the reference, the bf16
-    # output within one ulp (the BV=4 tile reduces K in a different order).
-    # The fp32 intermediate-ssm rollback cache carries that ~1 ulp/step delta
-    # through the delta-rule recurrence — measured ~6e-8 at T=4 standard gate
-    # (the production MTP shape), ~1.5e-5 at T=4 safe gate, ~2e-3 at T=8 safe
-    # gate. num_warps=1 is ~2.4x slower in-graph — numerics debugging only.
+    # num_warps=4 is ~1.3x faster than the unfused pair in-graph; 1 restores the
+    # reference reduction order but is ~2.4x slower, for numerics debugging only.
+    # The fp32 intermediate-ssm rollback cache carries the reduction-order delta
+    # furthest: ~6e-8 at T=4 standard gate (the production MTP shape), ~2e-3 at
+    # T=8 safe gate. conv_state is not comparable to the reference at all.
     # The ReplaySSM ring values are bit-exact at any num_warps: they are
     # elementwise (conv FMA chain, gate, sigmoid), upstream of every tl.sum.
     num_warps: int = 4,

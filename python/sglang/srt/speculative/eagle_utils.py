@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -49,7 +49,11 @@ _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
-if _is_cuda or _is_hip or _is_musa:
+if _is_cuda or _is_hip:
+    from sglang.kernels.ops.speculative.tree import (
+        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
+    )
+elif _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
@@ -386,7 +390,10 @@ def verify_tree_greedy_func(
     topk: int = -1,
 ):
     if _is_cuda or _is_hip or _is_musa:
-        from sgl_kernel import verify_tree_greedy
+        if _is_cuda or _is_hip:
+            from sglang.kernels.ops.speculative.tree import verify_tree_greedy
+        else:
+            from sgl_kernel import verify_tree_greedy
 
         verify_tree_greedy(
             predicts=predicts,  # mutable
@@ -685,6 +692,24 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _verify_uses_greedy(
+    *,
+    is_all_greedy: bool,
+    is_cpu: bool,
+    is_hip: bool,
+    is_xpu: bool,
+    use_rejection_sampling: bool,
+) -> bool:
+    """Whether EAGLE verify must commit argmax instead of taking the sampling path.
+
+    HIP has no CUDA/MUSA sampling-verify kernels, so it used to be listed here
+    unconditionally. Rejection sampling routes it through the pure-Triton chain
+    sampler instead, so only a HIP run without that still has to go greedy. Every
+    other platform reduces to the original predicate.
+    """
+    return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
+
+
 def _can_use_sparse_uno_tree_target_sampling(
     max_top_k: Optional[int],
     sampling_info: SamplingBatchInfo,
@@ -716,10 +741,10 @@ def eagle_sample(
     """
     import torch.nn.functional as F
 
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
+    from sglang.srt.runtime_context import get_parallel
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
@@ -781,7 +806,14 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_hip or _is_xpu:
+    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+    if _verify_uses_greedy(
+        is_all_greedy=sampling_info.is_all_greedy,
+        is_cpu=_is_cpu,
+        is_hip=_is_hip,
+        is_xpu=_is_xpu,
+        use_rejection_sampling=use_rejection_sampling,
+    ):
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -804,7 +836,7 @@ def eagle_sample(
             tp_group = (
                 get_parallel().attn_tp_group
                 if is_dp_attention_enabled()
-                else get_tp_group()
+                else get_parallel().tp_group
             )
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
@@ -840,7 +872,7 @@ def eagle_sample(
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
-            else get_tp_group()
+            else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
@@ -855,23 +887,37 @@ def eagle_sample(
                 tree_speculative_sampling_target_only,
             )
         else:
-            from sgl_kernel import (
-                top_k_renorm_prob,
-                top_p_renorm_prob,
-                tree_speculative_sampling_target_only,
-            )
-
             from sglang.kernels.ops.speculative.reject_sampling import (
                 chain_speculative_sampling_triton,
             )
 
-        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+        # if/else, not a ternary: the CUDA-only name still has to resolve in the
+        # branch not taken, and HIP only reaches here with rejection sampling on.
+        if use_rejection_sampling:
+            sampling_fn = chain_speculative_sampling_triton
+        else:
+            if _is_cuda:
+                from sglang.kernels.ops.speculative.sampling import (
+                    tree_speculative_sampling_target_only,
+                )
+            elif not _is_npu:
+                from sgl_kernel import tree_speculative_sampling_target_only
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
+            sampling_fn = tree_speculative_sampling_target_only
+
+        if _is_hip:
+            # Same names, same contract: dflash_utils.py aliases these too.
+            from sglang.kernels.ops.sampling.renorm_triton import (
+                top_k_renorm_probs_triton as top_k_renorm_prob,
+            )
+            from sglang.kernels.ops.sampling.renorm_triton import (
+                top_p_renorm_probs_triton as top_p_renorm_prob,
+            )
+        elif _is_cuda:
+            from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
+            from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
+        elif not _is_npu:
+            from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
@@ -953,7 +999,7 @@ def eagle_sample(
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
-            else get_tp_group()
+            else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)

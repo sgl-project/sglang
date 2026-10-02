@@ -4,11 +4,15 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 from test_mamba2_flashinfer_replay import check_numerics
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class TestMamba2SpecReplay(unittest.TestCase):
+class TestMamba2SpecReplay(CustomTestCase):
     @torch.inference_mode()
     def test_mixer_and_backend_commit(self):
         from sglang.kernels.ops.mamba.triton_ops.ssu_dispatch import (
@@ -208,7 +212,7 @@ class TestMamba2SpecReplay(unittest.TestCase):
                 baseline.mamba_cache.conv[0], replay.mamba_cache.conv[0], rtol=0, atol=0
             )
         self.assertEqual(replay.mamba_cache.mamba2_replay_pending.count_nonzero(), 0)
-        self.assertEqual(replay.mamba_cache.mamba2_replay_bank.count_nonzero(), 0)
+        self.assertEqual(replay.mamba_cache.mamba2_replay_ring_start.count_nonzero(), 0)
 
     def test_pool_allocation_accounting(self):
         from sglang.srt.configs.mamba2_spec_replay import Mamba2ReplaySizing
@@ -249,7 +253,7 @@ class TestMamba2SpecReplay(unittest.TestCase):
         )
         self.assertEqual(round(pool.mem_usage * (1 << 30)), costs.bytes_for(32, 8, 4))
         self.assertEqual(
-            pool.mamba2_layer_cache(1).mamba2_replay_x.shape, (33, 4, 128, 64)
+            pool.mamba2_layer_cache(1).mamba2_replay_x.shape, (33, 128, 8, 64)
         )
         self.assertEqual(
             {entry[0] for entry in pool._iter_transfer_state_entries()},

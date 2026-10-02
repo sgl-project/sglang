@@ -201,13 +201,21 @@ class BaseTopkCapturer:
         slice_gpu = self._get_local_slice(
             forward_batch, can_run_graph, cuda_graph_batch
         )
+        # get_topk reads req_to_token IDs; attention may have rebound the write
+        # loc to kernel-facing IDs, which are neither stable nor the same space.
+        out_cache_loc = forward_batch.out_cache_loc_virtual
+        if out_cache_loc is None:
+            out_cache_loc = forward_batch.out_cache_loc
+        else:
+            # Kernel batches may be padded; only real request tokens are stored.
+            slice_gpu = slice_gpu[: out_cache_loc.shape[0]]
         if no_copy_to_cpu:
             # Clone before the next overlapping forward reuses these buffers.
             return TopkCaptureOutput(
-                out_cache_loc=forward_batch.out_cache_loc.clone(),
+                out_cache_loc=out_cache_loc.clone(),
                 topk=slice_gpu.clone(),
                 host_cache=self.host_cache,
             )
-        out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
+        out_cache_loc_cpu = out_cache_loc.cpu()
         self.host_cache.buffer[out_cache_loc_cpu] = slice_gpu.cpu()
         return None

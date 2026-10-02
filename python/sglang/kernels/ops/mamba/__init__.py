@@ -18,6 +18,27 @@ if TYPE_CHECKING:
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 
+register_kernel(
+    KernelSpec(
+        op="mamba.verify_mamba2_replay",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.mamba.mamba2_spec_replay:verify_mamba2_replay",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.materialize_flashinfer_mamba2",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.mamba.flashinfer_replay_materialize:materialize_flashinfer_mamba2",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0))}
+        ),
+    )
+)
+
 # JIT is the only backend: the AOT kernel it replaced was built for CUDA alone,
 # never by the ROCm / MUSA / Metal extensions. Non-CUDA resolves nothing here --
 # the Triton fallback is picked by the serving wrapper's `_HAS_CONV1D_KERNEL`
@@ -114,3 +135,38 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_qwen4_short_conv_state",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_short_conv_state",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_qwen4_verify_conv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_verify_conv",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_lfm_short_conv_prefill",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.lfm_short_conv:fused_lfm_short_conv_prefill",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_lfm_short_conv_decode",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.lfm_short_conv:fused_lfm_short_conv_decode",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)

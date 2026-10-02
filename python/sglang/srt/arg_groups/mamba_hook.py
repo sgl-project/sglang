@@ -92,12 +92,10 @@ def handle_mamba_backend(server_args: Any):
 
 
 def handle_int8_mamba_checkpoint(server_args: Any):
-    # The int8 mamba checkpoint pool is only wired into the built-in
-    # MambaRadixCache. The host-offload path (enabled by
-    # --enable-hierarchical-cache) and custom radix-cache backends are NOT
-    # int8-aware: they would read int8 checkpoint slots as bf16 active slots
-    # (wrong pool / out-of-range). Reject the combination up front rather than
-    # silently corrupting state.
+    # The host-offload path (enabled by --enable-hierarchical-cache) and
+    # custom radix-cache backends are NOT int8-aware: they would read int8
+    # checkpoint slots as bf16 active slots (wrong pool / out-of-range).
+    # Reject the combination up front rather than silently corrupting state.
     cfg = resolving_view(server_args)
     if not cfg.enable_int8_mamba_checkpoint:
         return
@@ -113,11 +111,17 @@ def handle_int8_mamba_checkpoint(server_args: Any):
             f"radix cache; --radix-cache-backend={cfg.radix_cache_backend!r} "
             "is not int8-aware. Omit --radix-cache-backend."
         )
+    if cfg.enable_lmcache:
+        raise ValueError(
+            "--enable-int8-mamba-checkpoint is not supported together with "
+            "--enable-lmcache: LMCache is not int8-aware. Disable one of them."
+        )
 
 
-def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size_of):
-    assert supports_mamba_cache_extra_buffer(view, model_arch), (
-        f"extra_buffer is not supported for {model_arch}; use no_buffer."
+def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_of):
+
+    assert supports_mamba_cache_extra_buffer(view, hf_config), (
+        f"extra_buffer is not supported for {hf_config.architectures[0]}; use no_buffer."
     )
     assert (
         get_platform().is_cuda

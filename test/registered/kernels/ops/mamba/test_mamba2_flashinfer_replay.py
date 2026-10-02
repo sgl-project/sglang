@@ -1,4 +1,4 @@
-"""Isolated validation of the pinned FlashInfer 0.6.18 replay contract.
+"""Isolated validation of the pinned FlashInfer 0.7.0.post1 replay contract.
 
 No model or server is loaded. JSON measurements distinguish numerical error
 from exact state/buffer lifetime invariants. Run directly with Python on CUDA.
@@ -14,6 +14,10 @@ from pathlib import Path
 import torch
 import triton
 from flashinfer.mamba import checkpointing_ssu, selective_state_update
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 DIAGNOSTIC = False
 
@@ -66,12 +70,11 @@ class FlashInferCase:
         self.reference = self.initial.clone()
         self.slots = torch.arange(batch, device=device, dtype=torch.int32) * 2 + 1
         self.rows = torch.arange(batch, device=device, dtype=torch.int32)
-        self.bank = torch.zeros(k, device=device, dtype=torch.int32)
-        self.pending = torch.zeros_like(self.bank)
-        self.old_x = torch.zeros(k, w, h, p, device=device, dtype=dtype)
-        self.old_B = torch.zeros(k, 2, w, g, n, device=device, dtype=dtype)
-        self.old_dt = torch.zeros(k, 2, h, w, device=device)
-        self.old_cumAdt = torch.zeros_like(self.old_dt)
+        self.ring_start = torch.zeros(k, device=device, dtype=torch.int32)
+        self.pending = torch.zeros_like(self.ring_start)
+        self.old_x = torch.zeros(k, h, w + width, p, device=device, dtype=dtype)
+        self.old_B = torch.zeros(k, g, w + width, n, device=device, dtype=dtype)
+        self.old_dt = torch.zeros(k, h, w + width, device=device)
         self.A_base = -torch.rand(h, device=device) - 0.5
         self.A = self.A_base[:, None, None].expand(h, p, n)
         self.bias_base = torch.randn(h, device=device, dtype=dtype) - 2
@@ -123,10 +126,10 @@ class FlashInferCase:
                 self.old_x,
                 self.old_B,
                 self.old_dt,
-                self.old_cumAdt,
-                self.bank,
+                self.ring_start,
                 self.pending,
                 out=self.out,
+                algorithm="monolith",
                 **shared,
             )
         else:
@@ -144,25 +147,25 @@ class FlashInferCase:
         valid = self.slots >= 0
         slots = self.slots[valid].long()
         torch.testing.assert_close(
-            self.old_x[slots, : self.width], self.x[valid], rtol=0, atol=0
+            self.old_x[slots, :, : self.width],
+            self.x[valid].transpose(1, 2),
+            rtol=0,
+            atol=0,
         )
         torch.testing.assert_close(
-            self.old_B[slots, 0, : self.width], self.B[valid], rtol=0, atol=0
+            self.old_B[slots, :, : self.width],
+            self.B[valid].transpose(1, 2),
+            rtol=0,
+            atol=0,
         )
         dt = torch.nn.functional.softplus(
             self.raw_dt[valid].float() + self.bias_base.float()
         )
-        cumulative = (dt * self.A_base).cumsum(1).transpose(1, 2)
         for name, actual, expected in (
             (
                 "processed_dt",
-                self.old_dt[slots, 0, :, : self.width],
+                self.old_dt[slots, :, : self.width],
                 dt.transpose(1, 2),
-            ),
-            (
-                "cumulative_decay",
-                self.old_cumAdt[slots, 0, :, : self.width],
-                cumulative,
             ),
         ):
             if DIAGNOSTIC:
@@ -184,11 +187,13 @@ class FlashInferCase:
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class TestFlashInferReplayContract(unittest.TestCase):
+class TestFlashInferReplayContract(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         version = importlib.metadata.version("flashinfer-python")
-        assert version == "0.6.18", f"Test requires our pinned release, got {version}"
+        assert version == "0.7.0.post1", (
+            f"Test requires our pinned release, got {version}"
+        )
         print(
             json.dumps({"flashinfer": version, "gpu": torch.cuda.get_device_name()}),
             flush=True,

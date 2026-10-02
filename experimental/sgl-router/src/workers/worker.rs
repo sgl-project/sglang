@@ -6,7 +6,38 @@ use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long a prefill stays unroutable, after joining its model pool, while
+/// `/server_info` has not reported its bootstrap port. Afterwards the router sends
+/// a null port, which the engine resolves to its own configured default, and keeps
+/// re-introspecting at the reconcile interval in case a port is reported later.
+pub const BOOTSTRAP_PORT_GRACE: Duration = Duration::from_secs(30);
+
+/// Which forwarding client the proxy uses for a worker.
+///
+/// Fixed for the worker's lifetime: it is derived by `manager::resolve_protocol`
+/// from the engine's `--enable-http2` launch flag and the dialed URL scheme,
+/// neither of which changes while the process runs. The asymmetry that drives
+/// the default: the negotiating client is accepted by every engine, while h2c
+/// is prior-knowledge only and fails outright against an engine that does not
+/// serve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireProtocol {
+    /// The negotiating client. Safe for every engine, so it is also the
+    /// fallback.
+    ///
+    /// HTTP/1.1 in cleartext, ALPN-negotiated over TLS: this crate enables
+    /// reqwest's `http2` feature (see `Cargo.toml`), so the client advertises
+    /// `h2, http/1.1` and a TLS engine running `--enable-http2` reaches HTTP/2
+    /// on its own. Dropping that feature silently reduces this variant to
+    /// HTTP/1.1 everywhere.
+    #[default]
+    Http1,
+    /// Cleartext HTTP/2 with prior knowledge (h2c). Used only when a worker
+    /// reports `--enable-http2` on a cleartext URL.
+    H2c,
+}
 
 /// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
 /// fallback chain: parse as-is, retry with `http://` prefix if missing,
@@ -134,6 +165,9 @@ pub struct Worker {
     /// Interior-mutable mode so `ModeChanged` can update in place without
     /// dropping the Worker (which would reset `active_requests` + breaker).
     mode: AtomicU8,
+    /// Forwarding wire protocol, resolved from `/server_info` before this
+    /// worker was constructed. Immutable: see [`WireProtocol`].
+    protocol: WireProtocol,
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
@@ -151,18 +185,26 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
+    /// When this worker joined its current model pools, starting the grace of
+    /// [`Self::awaiting_bootstrap_port`]. Tokio's clock so tests can advance it.
+    pub(crate) pooled_at: tokio::time::Instant,
+    /// PD pairing scope; carried from `WorkerSpec`. See
+    /// [`crate::discovery::WorkerSpec`].
+    version_group: Option<String>,
 }
 
 impl Worker {
     pub fn new(spec: crate::discovery::WorkerSpec) -> Self {
-        Self::with_cb_config(spec, None)
+        Self::with_cb_config(spec, None, WireProtocol::default())
     }
 
-    /// Construct a worker with an explicit circuit-breaker configuration.
-    /// Pass `None` to use the default config (threshold = 3, cool_down = 30 s).
+    /// Construct a worker with an explicit circuit-breaker configuration and
+    /// forwarding protocol. Pass `None` for the default breaker config
+    /// (threshold = 3, cool_down = 30 s).
     pub fn with_cb_config(
         spec: crate::discovery::WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
+        protocol: WireProtocol,
     ) -> Self {
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -175,12 +217,15 @@ impl Worker {
             id: spec.id,
             url: spec.url,
             mode: AtomicU8::new(spec.mode.as_u8()),
+            protocol,
             model_ids: spec.model_ids,
             breaker,
             active_requests,
             slots,
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
+            pooled_at: tokio::time::Instant::now(),
+            version_group: spec.version_group,
         }
     }
 
@@ -192,6 +237,36 @@ impl Worker {
     /// SGLang bootstrap server port. `None` for decode / plain workers.
     pub fn bootstrap_port(&self) -> Option<u16> {
         self.bootstrap_port
+    }
+
+    /// Continue `prev`'s identity on re-registration: its load counters (which
+    /// in-flight guards still hold), its breaker unless the config changed, and its
+    /// grace clock unless it joined a new pool.
+    pub(crate) fn inherit(&mut self, prev: &Worker) {
+        if (&prev.model_ids, prev.mode()) == (&self.model_ids, self.mode()) {
+            self.pooled_at = prev.pooled_at;
+        }
+        if prev.breaker.config() == self.breaker.config() {
+            self.breaker = Arc::clone(&prev.breaker);
+        }
+        self.active_requests = Arc::clone(&prev.active_requests);
+        self.slots = Arc::clone(&prev.slots);
+    }
+
+    /// A prefill whose bootstrap port `/server_info` has not reported.
+    pub(crate) fn lacks_bootstrap_port(&self) -> bool {
+        self.mode() == WorkerMode::Prefill && self.bootstrap_port.is_none()
+    }
+
+    /// A portless prefill still within [`BOOTSTRAP_PORT_GRACE`], and so unroutable.
+    pub(crate) fn awaiting_bootstrap_port(&self) -> bool {
+        self.lacks_bootstrap_port() && self.pooled_at.elapsed() < BOOTSTRAP_PORT_GRACE
+    }
+
+    /// PD version group. A prefill worker pairs only with decode workers
+    /// of the same group; `None` is a group of its own.
+    pub fn version_group(&self) -> Option<&str> {
+        self.version_group.as_deref()
     }
 
     /// Returns the current [`WorkerMode`] of this worker.
@@ -210,7 +285,12 @@ impl Worker {
         self.mode.store(m.as_u8(), Ordering::Relaxed);
     }
 
-    pub fn active_load(&self) -> usize {
+    /// The wire protocol the proxy uses when forwarding to this worker.
+    pub fn protocol(&self) -> WireProtocol {
+        self.protocol
+    }
+
+    pub fn router_inflight_load(&self) -> usize {
         self.active_requests.load(Ordering::Relaxed)
     }
 
@@ -241,13 +321,25 @@ impl Worker {
     }
 }
 
+/// Prefills whose version group has a decode in `decoders` to receive their KV.
+pub fn paired_prefills(
+    mut prefills: Vec<Arc<Worker>>,
+    decoders: &[Arc<Worker>],
+) -> Vec<Arc<Worker>> {
+    let groups: std::collections::HashSet<_> = decoders.iter().map(|d| d.version_group()).collect();
+    prefills.retain(|p| groups.contains(&p.version_group()));
+    prefills
+}
+
 impl std::fmt::Debug for Worker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")
             .field("id", &self.id)
             .field("url", &self.url)
             .field("mode", &self.mode())
-            .field("active_load", &self.active_load())
+            .field("protocol", &self.protocol)
+            .field("version_group", &self.version_group)
+            .field("router_inflight_load", &self.router_inflight_load())
             .finish()
     }
 }
@@ -265,17 +357,17 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
-            bootstrap_port: None,
+            ..Default::default()
         });
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
         let g = w.load_guard();
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         let g2 = w.load_guard();
-        assert_eq!(w.active_load(), 2);
+        assert_eq!(w.router_inflight_load(), 2);
         drop(g);
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         drop(g2);
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
     }
 
     #[test]
@@ -284,11 +376,11 @@ mod tests {
         let cutoff = Instant::now() - Duration::from_secs(1);
         let guard = w.load_guard();
 
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         assert_eq!(w.slots_acquired_since(cutoff), 0);
 
         drop(guard);
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
     }
 
     #[test]
@@ -297,11 +389,11 @@ mod tests {
         let cutoff = Instant::now() - Duration::from_secs(1);
         let guard = w.timestamped_load_guard();
 
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         assert_eq!(w.slots_acquired_since(cutoff), 1);
 
         drop(guard);
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
         assert_eq!(w.slots_acquired_since(cutoff), 0);
     }
 
@@ -313,7 +405,7 @@ mod tests {
                 url: "http://x".into(),
                 mode: m,
                 model_ids: vec![],
-                bootstrap_port: None,
+                ..Default::default()
             });
             assert_eq!(w.mode(), m);
         }
@@ -326,13 +418,31 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Prefill,
             model_ids: vec![],
-            bootstrap_port: None,
+            ..Default::default()
         });
         assert_eq!(w.mode(), WorkerMode::Prefill);
         w.set_mode(WorkerMode::Decode);
         assert_eq!(w.mode(), WorkerMode::Decode);
         w.set_mode(WorkerMode::Plain);
         assert_eq!(w.mode(), WorkerMode::Plain);
+    }
+
+    #[test]
+    fn protocol_is_carried_from_construction() {
+        let spec = || WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![],
+            ..Default::default()
+        };
+        // `new` takes the always-safe default; the resolved protocol reaches a
+        // worker only through the constructor the registry uses.
+        assert_eq!(Worker::new(spec()).protocol(), WireProtocol::Http1);
+        assert_eq!(
+            Worker::with_cb_config(spec(), None, WireProtocol::H2c).protocol(),
+            WireProtocol::H2c,
+        );
     }
 
     #[test]
@@ -343,6 +453,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: Some(8997),
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_port(), Some(8997));
     }
@@ -354,9 +465,33 @@ mod tests {
             url: "http://10.0.0.1:30000".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![],
-            bootstrap_port: None,
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_port(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn portless_prefill_grace_runs_from_joining_its_pool() {
+        let prefill = |models: &[&str]| {
+            Worker::new(WorkerSpec {
+                id: WorkerId("p".into()),
+                url: "http://10.0.0.1:30000".into(),
+                mode: WorkerMode::Prefill,
+                model_ids: models.iter().map(|m| ModelId((*m).into())).collect(),
+                ..Default::default()
+            })
+        };
+        let model_less = prefill(&[]);
+        tokio::time::advance(BOOTSTRAP_PORT_GRACE).await;
+        assert!(!model_less.awaiting_bootstrap_port());
+        let mut pooled = prefill(&["m"]);
+        pooled.inherit(&model_less);
+        assert!(pooled.awaiting_bootstrap_port());
+        tokio::time::advance(BOOTSTRAP_PORT_GRACE).await;
+        let mut repaired = prefill(&["m"]);
+        repaired.inherit(&pooled);
+        assert!(!repaired.awaiting_bootstrap_port());
+        assert!(repaired.lacks_bootstrap_port());
     }
 
     #[test]
@@ -367,6 +502,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_host(), "10.0.0.1");
     }
@@ -379,6 +515,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_host(), "prefill-0.svc.cluster.local");
     }
@@ -395,6 +532,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_host(), "localhost");
     }
@@ -405,7 +543,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
-            bootstrap_port: None,
+            ..Default::default()
         })
     }
 
@@ -422,7 +560,7 @@ mod tests {
         let cutoff = Instant::now();
         let _g_new1 = w.timestamped_load_guard();
         let _g_new2 = w.timestamped_load_guard();
-        assert_eq!(w.active_load(), 3);
+        assert_eq!(w.router_inflight_load(), 3);
         assert_eq!(
             w.slots_acquired_since(cutoff),
             2,

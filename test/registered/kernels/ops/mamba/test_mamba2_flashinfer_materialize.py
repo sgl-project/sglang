@@ -6,25 +6,49 @@ import unittest
 import test_mamba2_flashinfer_replay as replay_tests
 import torch
 from sglang.kernels.ops.mamba.flashinfer_replay_materialize import (
+    make_replay_pointer_table,
     materialize_flashinfer_mamba2,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 from test_mamba2_flashinfer_replay import FlashInferCase, check_numerics
 
 
-class TestFlashInferMaterialization(unittest.TestCase):
+class TestFlashInferMaterialization(CustomTestCase):
+    @torch.inference_mode()
+    def test_invalid_endpoints_do_not_write(self):
+        # Mask invalid lengths before the native kernel (its GPU metadata is
+        # unchecked), without letting a padding row hide later valid rows.
+        c = FlashInferCase()
+        c.verify(True)
+        last = torch.tensor([-1, 4, -7, 99, -1], device="cuda", dtype=torch.int32)
+        c.slots[-1] = c.capacity
+        self.commit(c, last, torch.zeros_like(last), torch.zeros_like(last))
+        torch.testing.assert_close(c.state, c.initial, rtol=0, atol=0)
+
     def commit(self, c, last, tracks=None, steps=None, seeds=None):
+        if not hasattr(c, "pointer_table"):
+            c.pointer_table = make_replay_pointer_table(
+                c.state.unsqueeze(0),
+                c.old_x.unsqueeze(0),
+                c.old_B.unsqueeze(0),
+                c.old_dt.unsqueeze(0),
+                c.A_base.unsqueeze(0),
+            )
         materialize_flashinfer_mamba2(
             c.state.unsqueeze(0),
             c.old_x.unsqueeze(0),
             c.old_B.unsqueeze(0),
             c.old_dt.unsqueeze(0),
-            c.old_cumAdt.unsqueeze(0),
-            c.bank.unsqueeze(0),
+            c.A_base.unsqueeze(0),
+            c.pointer_table,
             c.slots,
             last,
             tracks,
             steps,
-            seeds=seeds,
+            seed=seeds,
             philox_rounds=5 if seeds is not None else 0,
         )
 

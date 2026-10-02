@@ -317,9 +317,12 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for PreferredSamplingParams {
     from_py_object,
     module = "sglang.srt.rust_extensions._server"
 )]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Lowercase to match the values Python reports for the same field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DisaggregationMode {
     /// Unified prefill + decode.
+    #[default]
     Null,
     Prefill,
     Decode,
@@ -461,7 +464,7 @@ impl MmSpec {
     fn py_new(
         family: MmFamily,
         feature_shm: bool,
-        image_token_id: i32,
+        image_token_id: i64,
         patch_size: usize,
         merge_size: usize,
         temporal_patch_size: usize,
@@ -617,6 +620,14 @@ mod tests {
         };
         assert_eq!(sa.bind(), "[::]:30001");
         assert_eq!(ServerArgs::default().bind(), "127.0.0.1:30000");
+    }
+
+    #[test]
+    fn disaggregation_mode_wire_values_match_python() {
+        let json = |m| serde_json::to_string(&m).unwrap();
+        assert_eq!(json(DisaggregationMode::Null), "\"null\"");
+        assert_eq!(json(DisaggregationMode::Prefill), "\"prefill\"");
+        assert_eq!(json(DisaggregationMode::Decode), "\"decode\"");
     }
 
     #[test]

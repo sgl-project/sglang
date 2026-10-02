@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 class CanaryEnableWarner:
     def __init__(
-        self, *, verify_capacity: int, d2h_stream: Optional[torch.cuda.Stream]
+        self, *, verify_capacity: int, d2h_stream: Optional[torch.Stream]
     ) -> None:
         self._verify_capacity = verify_capacity
         self._overflow_count_total: int = 0

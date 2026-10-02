@@ -1,7 +1,4 @@
-"""Config-time override declarations for deepseek_v2.
-
-Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, Glm5NextForConditionalGeneration, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
-"""
+"""Config-time override declarations for deepseek_v2."""
 
 import logging
 from typing import Any, Dict
@@ -32,11 +29,7 @@ logger = logging.getLogger(__name__)
     "Dots3NoteForCausalLM",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
-    """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
-    writes (enable_dp_attention/ep_size/moe_a2a_backend have post-monolith
-    writers), the kv-cache/split-backend defaults, the quant/moe block (read
-    before it by _set_default_dsa_kv_cache_dtype) and the env writes stay in
-    the branch."""
+    """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         is_deepseek_dsa,
@@ -92,7 +85,15 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 logger.warning(
                     "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                 )
-                overrides["enable_dp_attention"] = True
+                # DSA CP runs data-parallel groups as attention DP.
+                assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
+                    f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
+                    "data-parallel replicas combined with attention data parallelism "
+                    "are not supported."
+                )
+                attn_dp_size = cfg.attn_dp_size * cfg.dp_size
+                overrides["attn_dp_size"] = attn_dp_size
+                overrides["dp_size"] = 1
                 overrides["moe_dense_tp_size"] = 1
                 if cfg.cp_strategy == "zigzag":
                     overrides["moe_a2a_backend"] = "deepep"
@@ -102,20 +103,20 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                         "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
                     )
                 else:
-                    assert cfg.dp_size == 1, (
+                    assert attn_dp_size == 1, (
                         "interleave DSA CP does not support DP attention."
                     )
                 assert cfg.tp_size <= 8, (
                     "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                 )
                 # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
-                # DSACPLayerCommunicator does not all-reduce attention-TP
-                # partial o_proj outputs before replicated dense FFNs.
-                attn_cp_size = cfg.tp_size // cfg.dp_size
+                # The DSA / MLA CP gather and reduce-scatter
+                # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
+                attn_cp_size = cfg.tp_size // attn_dp_size
                 overrides["attn_cp_size"] = attn_cp_size
                 logger.warning(
                     "Enabled DSA context parallel: "
-                    f"strategy={cfg.cp_strategy}, dp_size={cfg.dp_size}, "
+                    f"strategy={cfg.cp_strategy}, attn_dp_size={attn_dp_size}, "
                     f"moe_dense_tp_size={overrides['moe_dense_tp_size']}, "
                     f"ep_size={overrides.get('ep_size', cfg.ep_size)}, tp_size={cfg.tp_size}, "
                     f"attn_cp_size={attn_cp_size}, "
@@ -165,7 +166,15 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "MLA prefill context parallel is still experimental. "
                 "Verified on Hopper with the fa3 backend."
             )
-            overrides["enable_dp_attention"] = True
+            # MLA CP runs data-parallel groups as attention DP.
+            assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
+                f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
+                "data-parallel replicas combined with attention data parallelism "
+                "are not supported."
+            )
+            attn_dp_size = cfg.attn_dp_size * cfg.dp_size
+            overrides["attn_dp_size"] = attn_dp_size
+            overrides["dp_size"] = 1
             # TODO(kpham-sgl) Supports moe_dense_tp_size != 1.
             overrides["moe_dense_tp_size"] = 1
             overrides["moe_a2a_backend"] = "deepep"
@@ -174,13 +183,13 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
             )
             # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
-            # DSACPLayerCommunicator does not all-reduce attention-TP
-            # partial o_proj outputs before replicated dense FFNs.
-            attn_cp_size = cfg.tp_size // cfg.dp_size
+            # The DSA / MLA CP gather and reduce-scatter
+            # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
+            attn_cp_size = cfg.tp_size // attn_dp_size
             overrides["attn_cp_size"] = attn_cp_size
             logger.warning(
                 f"Enable Context Parallel opt for MLA, "
-                f"Setting dp_size == {cfg.dp_size} and "
+                f"Setting attn_dp_size == {attn_dp_size} and "
                 f"attn_cp_size == {attn_cp_size}, "
                 f"moe_dense_tp_size == {overrides['moe_dense_tp_size']}, "
                 f"ep_size == {overrides['ep_size']}, "

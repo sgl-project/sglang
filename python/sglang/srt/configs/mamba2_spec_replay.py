@@ -70,11 +70,11 @@ class Mamba2ReplaySizing:
             raise ValueError(
                 "Mamba2 replay requires head_dim64/state_dim128 and BF16 inputs/FP16 state"
             )
-        # FlashInfer 0.6.18: x is single-buffered, B/dt/cumAdt double-buffered.
-        # All records and two int32 metadata values are PHYSICAL-SLOT indexed.
+        # FlashInfer 0.7: max_window >= verify width and ring = window + width.
+        # Eager mode uses the smallest legal ring (2 * width), with p=start=0.
+        # x/B/processed dt and two int32 values are PHYSICAL-SLOT indexed.
         record = (
-            width
-            * ((heads * dim + 2 * groups * dstate) * activation_bytes + 4 * heads * 4)
+            2 * width * ((heads * dim + groups * dstate) * activation_bytes + heads * 4)
             + 2 * 4
         )
         conv_steps = (
@@ -86,7 +86,7 @@ class Mamba2ReplaySizing:
             persistent * layers,
             record * layers,
             conv_dim * conv_steps * params.dtype.conv.itemsize * layers,
-            8 * layers,  # graph-stable int64 SR seed per layer
+            (8 + heads * 4 + 11 * 8) * layers,  # seeds, A vectors, pointer tables
         )
 
     def bytes_for(self, slots, request_cap, slots_per_request):
