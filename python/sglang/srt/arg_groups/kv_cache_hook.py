@@ -6,6 +6,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import torch
+
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
@@ -131,6 +133,38 @@ def _handle_ultraquant_compatibility(cfg: Any, server_args: Any) -> None:
     if uses_ultraquant_kv and not get_platform().is_hip:
         raise ValueError(
             "--kv-cache-dtype=ultraquant_4bit is currently validated only on ROCm."
+        )
+    if not uses_ultraquant_kv:
+        return
+
+    # These paths copy KV outside the attention backend or split it across
+    # pools, and have not been validated with the UltraQuant pool layout.
+    unsupported = {
+        "--enable-unified-memory": cfg.enable_unified_memory,
+        "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
+        "--enable-lmcache": cfg.enable_lmcache,
+        "--disaggregation-mode": cfg.disaggregation_mode != "null",
+        "--speculative-algorithm": cfg.speculative_algorithm is not None,
+        "--pp-size": cfg.pp_size > 1,
+        "--dcp-size": cfg.dcp_size > 1,
+    }
+    enabled = [flag for flag, is_set in unsupported.items() if is_set]
+    if enabled:
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit does not support "
+            f"{', '.join(enabled)} yet."
+        )
+
+    if use_mla_backend(server_args):
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit does not support MLA models; the "
+            "recipe stores separate rotated K and unrotated V."
+        )
+    dtype = model_config_of(server_args).dtype
+    if dtype != torch.bfloat16:
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit supports bfloat16 models only; "
+            f"got {dtype}."
         )
 
 

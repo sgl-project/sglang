@@ -2540,9 +2540,13 @@ class MHATokenToKVPool(KVCache):
                 self.k_scale_buffer[local_layer_id],
                 layer_id,
             )
-        if self.store_dtype != self.dtype:
-            return self.k_buffer[local_layer_id].view(self.dtype)
-        return self.k_buffer[local_layer_id]
+        return self._storage_view(self.k_buffer[local_layer_id])
+
+    def _storage_view(self, buffer: torch.Tensor) -> torch.Tensor:
+        # Layers a quant method keeps in full precision are not reinterpreted.
+        if self.store_dtype != self.dtype and buffer.dtype == self.store_dtype:
+            return buffer.view(self.dtype)
+        return buffer
 
     def get_key_buffer(self, layer_id: int):
         # note: get_key_buffer is hooked with synchronization for layer-wise KV cache loading
@@ -2564,9 +2568,7 @@ class MHATokenToKVPool(KVCache):
                 self.v_scale_buffer[local_layer_id],
                 layer_id,
             )
-        if self.store_dtype != self.dtype:
-            return self.v_buffer[local_layer_id].view(self.dtype)
-        return self.v_buffer[local_layer_id]
+        return self._storage_view(self.v_buffer[local_layer_id])
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -4247,9 +4249,6 @@ class HybridLinearKVPool(KVCache):
             )
 
     def get_v_head_dim(self):
-        # Packed FP4 value buffers are narrower than the head dim they hold.
-        if isinstance(self.full_kv_pool, MHATokenToKVPool):
-            return self.full_kv_pool.get_v_head_dim()
         # Use start_layer to handle pipeline parallelism where layer 0
         # may not be present in this stage's buffer.
         return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[

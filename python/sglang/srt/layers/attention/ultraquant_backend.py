@@ -65,12 +65,9 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         super().__init__(
             model_runner, skip_prefill=skip_prefill, kv_indptr_buf=kv_indptr_buf
         )
-
-        if self.use_mla:
-            raise RuntimeError(
-                "The ultraquant attention backend does not support MLA models; "
-                "the recipe stores separate rotated K and unrotated V."
-            )
+        # The pool stores packed value codes, so size the split-KV workspace
+        # from the model's logical value head dim.
+        self.v_head_dim = model_runner.model_config.v_head_dim
 
         from sglang.kernels.ops.attention.decode_attention import (
             _decode_softmax_reducev_fwd,
@@ -131,6 +128,10 @@ class UltraQuantAttnBackend(TritonAttnBackend):
             self.min_kv_splits = self.max_kv_splits
 
         self._verify_pool_recipe()
+        # These layers hold plain K/V, so the stock Triton path serves them.
+        self.full_precision_layers = (
+            self._ultraquant_pool().quant_method.full_precision_layers
+        )
 
     def _verify_pool_recipe(self) -> None:
         """Fail fast: any other pool layout would silently give wrong numbers."""
@@ -301,9 +302,9 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         aux_tensors=None,
     ):
         self._reject_unsupported(layer, score_mod, aux_tensors, "decode")
-        if self.dcp_size > 1:
-            raise NotImplementedError(
-                "The ultraquant backend does not support decode context parallelism."
+        if layer.layer_id in self.full_precision_layers:
+            return super().forward_decode(
+                q, k, v, layer, forward_batch, save_kv_cache, sinks
             )
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -413,6 +414,10 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         **kwargs,
     ):
         self._reject_unsupported(layer, score_mod, aux_tensors, "extend")
+        if layer.layer_id in self.full_precision_layers:
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, sinks
+            )
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
         o = torch.empty_like(q)

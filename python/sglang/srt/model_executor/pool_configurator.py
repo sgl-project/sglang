@@ -443,6 +443,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 quant_method.configure_attention_backends_from_server_args(
                     kvc.server_args
                 )
+                quant_method.configure_model(model_config)
                 cell_size = quant_method.compute_cell_size(
                     n,
                     model_config.head_dim,

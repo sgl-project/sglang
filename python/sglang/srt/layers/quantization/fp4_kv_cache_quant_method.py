@@ -358,6 +358,10 @@ class KVCacheQuantMethodBase(ABC):
         """Largest pool, in tokens, the recipe's kernels can address (None: no limit)."""
         return None
 
+    def configure_model(self, model_config) -> None:
+        """Per-model setup, called before buffers are sized (no-op by default)."""
+        pass
+
     def load_scales_from_model(self, model_runner) -> None:
         """Load per-layer global scales from model weights (no-op by default)."""
         pass
@@ -940,6 +944,9 @@ class UltraQuantKVCacheMethod(KVCacheQuantMethodBase):
     so queries must be rotated to match, which the UltraQuant attention backend
     does. The attention kernels read the packed codes directly, so no dequant
     workspace is allocated. Codes and scales live in separate buffers.
+
+    Layers in ``full_precision_layers`` keep plain K/V in the model dtype, with
+    empty scale buffers, and are served by the stock Triton attention path.
     """
 
     name = "ultraquant_4bit"
@@ -951,7 +958,29 @@ class UltraQuantKVCacheMethod(KVCacheQuantMethodBase):
         device: Optional[str] = None,
         page_size: Optional[int] = None,
     ):
-        pass
+        self.full_precision_layers: frozenset[int] = frozenset()
+        self.full_precision_dtype = torch.bfloat16
+
+    @staticmethod
+    def boundary_layers(num_layers: int, is_hybrid: bool, n: int = 2) -> frozenset[int]:
+        """First and last ``n`` layers of a dense model.
+
+        Hybrid models have few full-attention layers, so all of them are
+        quantized.
+        """
+        if is_hybrid:
+            return frozenset()
+        n = min(n, num_layers // 2)
+        return frozenset(range(n)) | frozenset(range(num_layers - n, num_layers))
+
+    def configure_model(self, model_config) -> None:
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        self.full_precision_layers = self.boundary_layers(
+            model_config.num_attention_layers,
+            is_hybrid=mambaish_config(model_config) is not None,
+        )
+        self.full_precision_dtype = model_config.dtype
 
     def needs_native_fp4_scales(self) -> bool:
         # The stored scale layout is the one the kernels read, so there is no
@@ -964,18 +993,26 @@ class UltraQuantKVCacheMethod(KVCacheQuantMethodBase):
         store_dtype = self.kv_storage_dtype()
         code_shape = (size, head_num, ultraquant_code_bytes(head_dim))
         scale_shape = (size, head_num, ultraquant_n_groups(head_dim))
+        plain_shape = (size, head_num, head_dim)
+        no_scale_shape = (size, head_num, 0)
 
-        def allocate(shape):
+        def allocate(shape, full_precision_shape, full_precision_dtype):
             return [
-                torch.zeros(shape, dtype=store_dtype, device=device)
-                for _ in range(layer_num)
+                (
+                    torch.zeros(
+                        full_precision_shape, dtype=full_precision_dtype, device=device
+                    )
+                    if layer in self.full_precision_layers
+                    else torch.zeros(shape, dtype=store_dtype, device=device)
+                )
+                for layer in range(layer_num)
             ]
 
         return {
-            "k_buffer": allocate(code_shape),
-            "v_buffer": allocate(code_shape),
-            "k_scale_buffer": allocate(scale_shape),
-            "v_scale_buffer": allocate(scale_shape),
+            "k_buffer": allocate(code_shape, plain_shape, self.full_precision_dtype),
+            "v_buffer": allocate(code_shape, plain_shape, self.full_precision_dtype),
+            "k_scale_buffer": allocate(scale_shape, no_scale_shape, torch.uint8),
+            "v_scale_buffer": allocate(scale_shape, no_scale_shape, torch.uint8),
             "store_dtype": store_dtype,
         }
 
@@ -993,6 +1030,11 @@ class UltraQuantKVCacheMethod(KVCacheQuantMethodBase):
         native_k_scale_buffer=None,
         native_v_scale_buffer=None,
     ) -> None:
+        if k_buffer.dtype == self.full_precision_dtype:
+            k_buffer[loc] = cache_k.to(k_buffer.dtype)
+            v_buffer[loc] = cache_v.to(v_buffer.dtype)
+            return
+
         from sglang.kernels.ops.kvcache.ultraquant import ultraquant_store
 
         # One kernel does the rotation, the quantization, and the packing, so
@@ -1040,7 +1082,16 @@ class UltraQuantKVCacheMethod(KVCacheQuantMethodBase):
         per_token_per_side = head_num * (
             ultraquant_code_bytes(head_dim) + ultraquant_n_groups(head_dim)
         )
-        return per_token_per_side * num_layers * 2
+        full_precision_per_token_per_side = (
+            head_num * head_dim * self.full_precision_dtype.itemsize
+        )
+        num_full_precision = sum(
+            layer in self.full_precision_layers for layer in range(num_layers)
+        )
+        return 2 * (
+            per_token_per_side * (num_layers - num_full_precision)
+            + full_precision_per_token_per_side * num_full_precision
+        )
 
     @classmethod
     def max_pool_tokens(

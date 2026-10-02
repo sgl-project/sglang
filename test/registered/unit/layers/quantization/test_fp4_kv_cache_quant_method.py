@@ -563,6 +563,102 @@ class TestUltraQuantKVCacheMethod(CustomTestCase):
                 self.assertLessEqual((cap + page_size) * row_bytes, 0xFFFFFFFF)
                 self.assertGreater((cap + page_size + 1) * row_bytes, 0xFFFFFFFF)
 
+    def test_boundary_layers(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            UltraQuantKVCacheMethod,
+        )
+
+        boundary = UltraQuantKVCacheMethod.boundary_layers
+        self.assertEqual(boundary(36, is_hybrid=False), {0, 1, 34, 35})
+        self.assertEqual(boundary(3, is_hybrid=False), {0, 2})
+        self.assertEqual(boundary(1, is_hybrid=False), set())
+        self.assertEqual(boundary(36, is_hybrid=True), set())
+
+    def test_configure_model(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            UltraQuantKVCacheMethod,
+        )
+
+        model_config = SimpleNamespace(num_attention_layers=8, dtype=torch.float16)
+        for hybrid_config, expected in ((None, {0, 1, 6, 7}), (object(), set())):
+            with (
+                self.subTest(is_hybrid=hybrid_config is not None),
+                patch(
+                    "sglang.srt.configs.hybrid_arch.mambaish_config",
+                    return_value=hybrid_config,
+                ),
+            ):
+                m = UltraQuantKVCacheMethod()
+                m.configure_model(model_config)
+                self.assertEqual(m.full_precision_layers, expected)
+                self.assertEqual(m.full_precision_dtype, torch.float16)
+
+    def _make_method_with_boundary(self, num_layers):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            UltraQuantKVCacheMethod,
+        )
+
+        m = UltraQuantKVCacheMethod()
+        m.full_precision_layers = m.boundary_layers(num_layers, is_hybrid=False)
+        return m
+
+    def test_full_precision_layer_buffers_match_cell_size(self):
+        from sglang.srt.layers.quantization.ultraquant_tensor import (
+            code_bytes,
+            n_groups,
+        )
+
+        size, heads, dim, layers = 16, 2, 128, 6
+        m = self._make_method_with_boundary(layers)
+        bufs = m.create_buffers(size, heads, dim, layers, "cpu")
+
+        for layer in range(layers):
+            with self.subTest(layer=layer):
+                k, k_scale = bufs["k_buffer"][layer], bufs["k_scale_buffer"][layer]
+                if layer in (0, 1, 4, 5):
+                    self.assertEqual(k.dtype, torch.bfloat16)
+                    self.assertEqual(k.shape, (size, heads, dim))
+                    self.assertEqual(k_scale.numel(), 0)
+                else:
+                    self.assertEqual(k.dtype, bufs["store_dtype"])
+                    self.assertEqual(k.shape, (size, heads, code_bytes(dim)))
+                    self.assertEqual(k_scale.shape, (size, heads, n_groups(dim)))
+
+        allocated = sum(
+            t.numel() * t.element_size()
+            for name in ("k_buffer", "v_buffer", "k_scale_buffer", "v_scale_buffer")
+            for t in bufs[name]
+        )
+        self.assertEqual(
+            m.compute_cell_size(heads, dim, layers, kv_size=1) * size, allocated
+        )
+
+    def test_full_precision_layer_store(self):
+        size, heads, dim = 8, 2, 64
+        m = self._make_method_with_boundary(4)
+        bufs = m.create_buffers(size, heads, dim, 4, "cpu")
+        k_buffer, v_buffer = bufs["k_buffer"][0], bufs["v_buffer"][0]
+        loc = torch.tensor([5, 2])
+        cache_k = torch.randn(2, heads, dim, dtype=torch.bfloat16)
+        cache_v = torch.randn(2, heads, dim, dtype=torch.bfloat16)
+
+        m.quantize_and_store(
+            k_buffer,
+            v_buffer,
+            bufs["k_scale_buffer"][0],
+            bufs["v_scale_buffer"][0],
+            loc,
+            cache_k,
+            cache_v,
+        )
+
+        torch.testing.assert_close(k_buffer[loc], cache_k, rtol=0, atol=0)
+        torch.testing.assert_close(v_buffer[loc], cache_v, rtol=0, atol=0)
+        untouched = torch.ones(size, dtype=torch.bool)
+        untouched[loc] = False
+        self.assertEqual(k_buffer[untouched].abs().sum().item(), 0)
+        self.assertEqual(v_buffer[untouched].abs().sum().item(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
