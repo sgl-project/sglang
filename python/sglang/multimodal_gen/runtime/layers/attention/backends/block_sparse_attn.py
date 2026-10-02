@@ -1,17 +1,15 @@
 from dataclasses import dataclass
 from typing import Any
 
-import attentions  # noqa: F401
+import sgl_kernel_npu  # noqa: F401
 import torch
+import torch_npu
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (
-    LaserAttentionBackend,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -143,7 +141,24 @@ class BlockSparseAttentionImpl(AttentionImpl):
         self.stride = 8
         self.default_tokens = 214748647
 
-        self.laser_attn_impl = LaserAttentionBackend.get_impl_cls()(
+        self._is_a5 = torch_npu.npu.get_soc_version() == 260
+        if self._is_a5:
+            if causal:
+                raise ValueError(
+                    "CANN Block Sparse Attention on A5 does not support causal masks."
+                )
+            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+                AscendFABackend,
+            )
+
+            dense_backend = AscendFABackend
+        else:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (
+                LaserAttentionBackend,
+            )
+
+            dense_backend = LaserAttentionBackend
+        self.dense_attn_impl = dense_backend.get_impl_cls()(
             num_heads,
             head_size,
             causal,
@@ -159,7 +174,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         sparsity: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.attentions.sparse_block_estimate(
+        return torch.ops.npu.sparse_block_estimate(
             query=query,
             key=key,
             actual_seq_lengths=None,
@@ -185,7 +200,32 @@ class BlockSparseAttentionImpl(AttentionImpl):
         smask: torch.Tensor,
         sct: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.ops.attentions.ada_block_sparse_attention(
+        if self._is_a5:
+            # The estimator aligns the KV mask axis to 32 blocks; CANN expects
+            # exactly ceil(Skv / block_size) columns and no count table.
+            kv_blocks = (key.shape[2] + self.block_size - 1) // self.block_size
+            head_dim = query.shape[-1]
+            padded_dim = 64 if head_dim <= 64 else 128
+            if head_dim != padded_dim:
+                query, key, value = (
+                    torch.nn.functional.pad(t, (0, padded_dim - head_dim))
+                    for t in (query, key, value)
+                )
+            output, _ = torch_npu.npu_block_sparse_attention(
+                query,
+                key,
+                value,
+                smask[..., :kv_blocks].contiguous(),
+                [self.block_size, self.block_size],
+                q_input_layout="BNSD",
+                kv_input_layout="BNSD",
+                num_key_value_heads=key.shape[1],
+                scale_value=self.softmax_scale,
+                inner_precise=4,
+                softmax_lse_flag=0,
+            )
+            return output[..., :head_dim]
+        return torch.ops.npu.ada_block_sparse_attention(
             query=query,
             key=key,
             value=value,
@@ -259,7 +299,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         if attn_metadata.current_timestep < attn_metadata.skip_first_steps:
-            output = self.laser_attn_impl.forward(
+            output = self.dense_attn_impl.forward(
                 query,
                 key,
                 value,

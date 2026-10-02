@@ -150,8 +150,7 @@ class NPUPlatformBase(Platform):
                 logger.error(f"Failed to import Laser Attention backend: {e}")
                 raise ImportError(
                     "Laser Attention backend is not installed. "
-                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
-                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
+                    "It requires `sgl_kernel_npu` from an A2/A3 kernel build."
                 ) from e
 
         elif selected_backend == AttentionBackendEnum.BLOCK_SPARSE_ATTN:
@@ -167,8 +166,8 @@ class NPUPlatformBase(Platform):
                 logger.error(f"Failed to import Block Sparse Attention backend: {e}")
                 raise ImportError(
                     "Block Sparse Attention backend is not installed. "
-                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
-                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
+                    "It requires sgl_kernel_npu for sparse_block_estimate and A2/A3 Ada BSA; "
+                    "on A5 it also requires torch_npu.npu_block_sparse_attention."
                 ) from e
 
         elif selected_backend == AttentionBackendEnum.RAIN_FUSION_ATTN:
@@ -184,8 +183,8 @@ class NPUPlatformBase(Platform):
                 logger.error(f"Failed to import Rain Fusion Attention backend: {e}")
                 raise ImportError(
                     "Rain Fusion Attention backend is not installed. "
-                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
-                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
+                    "It requires torch_npu with npu_block_sparse_attention support; "
+                    "on A2/A3, the dense path also requires sgl_kernel_npu."
                 ) from e
 
         logger.info("Using Torch SDPA backend.")
