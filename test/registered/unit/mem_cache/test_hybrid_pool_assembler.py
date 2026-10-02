@@ -20,12 +20,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _DsaStrategy,
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
+    _log_mamba_host_coverage,
+    _mamba_host_bytes_per_slot,
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
-
-    _log_mamba_host_coverage,
-    _mamba_host_bytes_per_slot,
     _resolve_hicache_mamba_split,
     _split_hicache_size,
     _SwaStrategy,
@@ -203,6 +202,7 @@ class TestHybridStageLayerMappings(CustomTestCase):
                     )
                     self.assertEqual(kvcache.layers_mapping, layers_mapping)
                     self.assertEqual(req_pool.mamba_map, global_maps.get("mamba", {}))
+
 
 class _DevicePool(_Pool):
     def __init__(self, kv_bytes, size):
