@@ -151,7 +151,7 @@ export const DeepSeekV3Deployment = () => {
     cmd += `  --model-path ${modelPath}`;
 
     if (strategyArray.includes('tp')) cmd += isXeon ? ' \\\n  --tp 6' : ' \\\n  --tp 8';
-    if (strategyArray.includes('dp')) cmd += ' \\\n  --dp 8 \\\n  --enable-dp-attention';
+    if (strategyArray.includes('dp')) cmd += ' \\\n  --attn-dp-size 8';
     if (strategyArray.includes('ep')) cmd += ' \\\n  --ep 8';
     if (strategyArray.includes('mtp')) {
       cmd += ' \\\n  --speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4';

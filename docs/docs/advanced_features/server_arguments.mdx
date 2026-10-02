@@ -534,13 +534,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-page-major-kv-layout`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the page-major KV layout: lay out the Mamba state and full/SWA KV caches in a page-granularity envelope (page is the outermost axis, layer-major within a page) instead of the default per-layer (layer-major) layout. Requires the Triton attention / linear-attn / Mamba backends (`--attention-backend triton`, and for hybrid models `--linear-attn-backend triton --mamba-backend triton`).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Store the Mamba state and full/SWA KV caches as one entry per token slot, holding every layer's state, in a single page-granular buffer instead of one buffer per layer. Implied by `--enable-unified-memory`, and currently supported only with it.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-unified-memory`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For hybrid Mamba/GDN and hybrid SWA models, replace the statically-partitioned pools (full-attention KV + SWA/Mamba conv/SSM state) with a single byte buffer split dynamically between the sub-pools, so KV-vs-state capacity flexes with the workload instead of being fixed at startup. Implies `--enable-page-major-kv-layout`. Requires the Triton attention / linear-attn / Mamba backends; monolithic (decode) cuda-graph capture only; not yet compatible with PD disaggregation or speculative decoding.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For hybrid Mamba/GDN and hybrid SWA models, replace the statically-partitioned pools (full-attention KV + SWA/Mamba conv/SSM state) with a single byte buffer split dynamically between the sub-pools, so KV-vs-state capacity flexes with the workload instead of being fixed at startup. Implies `--enable-page-major-kv-layout`. Requires stride-aware attention, linear-attention and Mamba backends; the allowed backends and the supported PD-disaggregation and speculative-decoding configurations are validated at startup.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
@@ -1220,7 +1220,13 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
   <tbody>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--data-parallel-size`<br/>`--dp-size`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The data parallelism size.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The number of data-parallel replicas of the model.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--attention-data-parallel-size`<br/>`--attn-dp-size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The attention data parallelism size: the number of data-parallel attention groups inside the TP group, one scheduler each, while the FFN stays tensor parallel.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
@@ -2570,8 +2576,8 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-dp-attention`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>Deprecated.</strong> Use <code>--attn-dp-size &lt;dp-size&gt;</code> instead of <code>--dp-size &lt;dp-size&gt; --enable-dp-attention</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>False</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
