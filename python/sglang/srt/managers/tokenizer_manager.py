@@ -106,7 +106,10 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.request_preprocessor import RequestPreprocessor
+from sglang.srt.managers.preprocess_executor import (
+    PreprocessExecutor,
+    resolve_tokenizer,
+)
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
@@ -430,6 +433,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     _server_stop_hook: Optional[Callable[[], None]] = None
     _engine_state_changed_callback: Optional[Callable[[], None]] = None
 
+    @property
+    def tokenizer(self):
+        # Inside a preprocessing job this is the worker's own clone, so no
+        # offloaded path can reach the instance the event loop is using.
+        return resolve_tokenizer(self._tokenizer)
+
+    @tokenizer.setter
+    def tokenizer(self, tokenizer):
+        self._tokenizer = tokenizer
+
     def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
         self._server_stop_hook = hook
 
@@ -517,7 +530,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.init_tokenizer_and_processor()
 
         # Init request preprocessing worker
-        self.init_request_preprocessor()
+        self.init_preprocess_executor()
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -549,8 +562,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.server_args, self.mm_processor
         )
 
-    def init_request_preprocessor(self):
-        self.request_preprocessor = RequestPreprocessor()
+    def init_preprocess_executor(self):
+        self.preprocess_executor = PreprocessExecutor(
+            get_shared_tokenizer=lambda: self._tokenizer
+        )
 
     def init_model_config(self):
         server_args = self.server_args
@@ -616,8 +631,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             get_serving().enable_dynamic_batch_tokenizer
             and not get_serving().skip_tokenizer_init
         ):
+            # A clone: the batcher encodes on its own thread.
             self.async_dynamic_batch_tokenizer = AsyncDynamicbatchTokenizer(
-                self.tokenizer,
+                copy.deepcopy(self.tokenizer),
                 max_batch_size=get_serving().dynamic_batch_tokenizer_batch_size,
                 batch_wait_timeout_s=get_serving().dynamic_batch_tokenizer_batch_timeout,
             )
@@ -1043,7 +1059,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     encoded.get("token_type_ids") if is_cross_encoder else None,
                 )
 
-            input_ids, token_type_ids = await self.request_preprocessor.run(
+            input_ids, token_type_ids = await self.preprocess_executor.run(
                 tokenize,
                 inline_if_idle=input_format == InputFormat.SINGLE_STRING
                 and len(texts) <= _INLINE_TOKENIZE_MAX_CHARS,

@@ -744,13 +744,9 @@ class AnthropicServing:
 
         try:
             # Convert to internal request
-            preprocessor = (
-                self.openai_serving_chat.tokenizer_manager.request_preprocessor
-            )
-            adapted_request, processed_request = await preprocessor.run(
-                self.openai_serving_chat._convert_to_internal_request,
-                chat_request,
-                raw_request,
+            serving_chat = self.openai_serving_chat
+            adapted_request, processed_request = await serving_chat._preprocess(
+                serving_chat._convert_to_internal_request, chat_request, raw_request
             )
             adapted_request.received_time = received_time
 
@@ -797,13 +793,9 @@ class AnthropicServing:
             )
 
         try:
-            preprocessor = (
-                self.openai_serving_chat.tokenizer_manager.request_preprocessor
-            )
-            adapted_request, processed_request = await preprocessor.run(
-                self.openai_serving_chat._convert_to_internal_request,
-                chat_request,
-                raw_request,
+            serving_chat = self.openai_serving_chat
+            adapted_request, processed_request = await serving_chat._preprocess(
+                serving_chat._convert_to_internal_request, chat_request, raw_request
             )
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
@@ -1450,10 +1442,7 @@ class AnthropicServing:
             )
 
         try:
-            preprocessor = (
-                self.openai_serving_chat.tokenizer_manager.request_preprocessor
-            )
-            input_tokens = await preprocessor.run(
+            input_tokens = await self.openai_serving_chat._preprocess(
                 self._count_prompt_tokens, chat_request
             )
             return JSONResponse(

@@ -12,9 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase  # noqa: E402
-from sglang.srt.managers.request_preprocessor import (  # noqa: E402
-    RequestPreprocessor,
-)
+from sglang.srt.managers.preprocess_executor import PreprocessExecutor  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -24,27 +22,42 @@ SHORT_PROMPT = "hi"
 
 
 class _GatedTokenizer:
-    """Blocks on long prompts until released; records finish order and overlap."""
+    """Blocks on long prompts until released; records finish order across clones
+    and which threads used each instance."""
 
     is_fast = True
 
-    def __init__(self):
-        self.long_started = threading.Event()
-        self.release_long = threading.Event()
-        self.finished = []
-        self.num_active = 0
-        self.overlapped = False
+    def __init__(self, shared_state=None):
+        state = shared_state or SimpleNamespace(
+            long_started=threading.Event(),
+            release_long=threading.Event(),
+            finished=[],
+        )
+        self.state = state
+        self.long_started = state.long_started
+        self.release_long = state.release_long
+        self.finished = state.finished
+        self.chat_template = None
+        self.threads = set()
+
+    def __deepcopy__(self, memo):
+        clone = _GatedTokenizer(self.state)
+        clone.chat_template = self.chat_template
+        return clone
 
     def __call__(self, texts, **kwargs):
-        self.num_active += 1
-        self.overlapped |= self.num_active > 1
+        self.threads.add(threading.current_thread().name)
         released = True
         if texts[0] == LONG_PROMPT:
             self.long_started.set()
             released = self.release_long.wait(timeout=2)
-        self.num_active -= 1
         self.finished.append(texts[0])
         return {"input_ids": [[int(released)]]}
+
+
+class _UncloneableTokenizer(_GatedTokenizer):
+    def __deepcopy__(self, memo):
+        raise TypeError("cannot clone")
 
 
 class _Handler(OpenAIServingBase):
@@ -58,16 +71,22 @@ class _Handler(OpenAIServingBase):
         return processed
 
 
-class TestRequestPreprocessor(CustomTestCase):
+def _make_manager(tokenizer):
+    manager = TokenizerManager.__new__(TokenizerManager)
+    manager.tokenizer = tokenizer
+    manager.async_dynamic_batch_tokenizer = None
+    manager.model_config = SimpleNamespace(is_embedding_gemma=False)
+    manager.preprocess_executor = PreprocessExecutor(
+        get_shared_tokenizer=lambda: manager._tokenizer
+    )
+    return manager
+
+
+class TestPreprocessExecutor(CustomTestCase):
     def setUp(self):
         self.tokenizer = _GatedTokenizer()
         self.addCleanup(self.tokenizer.release_long.set)
-        manager = TokenizerManager.__new__(TokenizerManager)
-        manager.tokenizer = self.tokenizer
-        manager.async_dynamic_batch_tokenizer = None
-        manager.model_config = SimpleNamespace(is_embedding_gemma=False)
-        manager.request_preprocessor = RequestPreprocessor()
-        self.manager = manager
+        self.manager = _make_manager(self.tokenizer)
 
     def test_long_prompt_tokenization_keeps_event_loop_responsive(self):
         """Tokenizing a long prompt must not stall other coroutines on the loop."""
@@ -91,7 +110,7 @@ class TestRequestPreprocessor(CustomTestCase):
             SimpleNamespace(
                 server_args=None,
                 request_logger=SimpleNamespace(log_requests=False),
-                request_preprocessor=self.manager.request_preprocessor,
+                preprocess_executor=self.manager.preprocess_executor,
             )
         )
 
@@ -129,10 +148,10 @@ class TestRequestPreprocessor(CustomTestCase):
         asyncio.run(run())
         self.assertEqual(released, [LONG_PROMPT, SHORT_PROMPT])
 
-    def test_cancelled_request_keeps_tokenizer_serialized(self):
-        """Cancelling a request cannot stop its running tokenization; later
-        requests must still wait for it instead of using the tokenizer
-        concurrently from the event loop."""
+    def test_cancelled_request_keeps_requests_ordered(self):
+        """Cancelling a request cannot stop its running tokenization; a later
+        short request must still wait for it instead of tokenizing inline and
+        reaching the scheduler first."""
 
         async def run():
             long_task = asyncio.create_task(self.manager._tokenize_texts(LONG_PROMPT))
@@ -147,8 +166,58 @@ class TestRequestPreprocessor(CustomTestCase):
             return await short_task
 
         self.assertEqual(asyncio.run(run()), ([1], None))
-        self.assertFalse(self.tokenizer.overlapped)
         self.assertEqual(self.tokenizer.finished, [LONG_PROMPT, SHORT_PROMPT])
+
+    def test_jobs_never_use_the_shared_tokenizer(self):
+        """The event loop keeps calling the shared tokenizer (multimodal processor
+        calls with padding=True) while a job runs. A fast tokenizer raises
+        "Already borrowed" when two threads use one instance, so jobs must use
+        the worker's clone instead."""
+
+        async def run():
+            long_task = asyncio.create_task(self.manager._tokenize_texts(LONG_PROMPT))
+            started = await asyncio.to_thread(self.tokenizer.long_started.wait, 2)
+            self.assertTrue(started)
+            self.manager.tokenizer([SHORT_PROMPT], padding=True)
+            self.tokenizer.release_long.set()
+            await long_task
+
+        asyncio.run(run())
+        self.assertEqual(self.tokenizer.threads, {threading.main_thread().name})
+        clone = self.manager.preprocess_executor._tokenizer_binding[1]
+        self.assertIsNot(clone, self.tokenizer)
+        self.assertEqual(len(clone.threads), 1)
+        self.assertTrue(next(iter(clone.threads)).startswith("sglang-preprocess"))
+
+    def test_clone_sees_tokenizer_edits_made_before_first_job(self):
+        """Startup sets the chat template after TokenizerManager init, so the
+        worker must clone the tokenizer on first use, not at construction."""
+        self.tokenizer.chat_template = "{{ messages }}"
+
+        async def run():
+            return await self.manager.preprocess_executor.run(
+                lambda: self.manager.tokenizer.chat_template
+            )
+
+        self.assertEqual(asyncio.run(run()), "{{ messages }}")
+
+    def test_uncloneable_tokenizer_preprocesses_on_event_loop(self):
+        """Without a clone, the worker would share the tokenizer with the loop;
+        jobs run inline instead."""
+        tokenizer = _UncloneableTokenizer()
+        manager = _make_manager(tokenizer)
+
+        async def run():
+            return await manager.preprocess_executor.run(
+                lambda: (threading.current_thread(), manager.tokenizer)
+            )
+
+        with self.assertLogs(
+            "sglang.srt.managers.preprocess_executor", level="WARNING"
+        ):
+            thread, job_tokenizer = asyncio.run(run())
+        self.assertIs(thread, threading.main_thread())
+        self.assertIs(job_tokenizer, tokenizer)
 
 
 if __name__ == "__main__":

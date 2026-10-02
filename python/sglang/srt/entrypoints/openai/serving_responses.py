@@ -394,11 +394,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             processed_messages: Optional[MessageProcessingResult] = None
 
             if self.use_harmony:
-                (
-                    messages,
-                    request_prompts,
-                    engine_prompts,
-                ) = await self.tokenizer_manager.request_preprocessor.run(
+                messages, request_prompts, engine_prompts = await self._preprocess(
                     self._make_request_with_harmony, request, prev_response
                 )
                 require_reasoning = self._is_thinking_enabled_for_request(request)
@@ -708,7 +704,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             raise _MediaInputValidationError(media_error)
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-        processed_messages = await self.tokenizer_manager.request_preprocessor.run(
+        processed_messages = await self._preprocess(
             self._process_messages, chat_request, is_multimodal
         )
         # ``_process_messages`` merges server defaults into the temporary Chat
