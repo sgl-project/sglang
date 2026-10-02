@@ -47,6 +47,7 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
             accept_lens=torch.tensor([2, 4], dtype=torch.int64),
             new_seq_lens=torch.tensor([12, 24], dtype=torch.int64),
             next_draft_input=SimpleNamespace(),
+            prepared_draft_extend_inputs=None,
         )
         forward_batch = SimpleNamespace(sampling_info=sampling_info)
         sample_result = (
