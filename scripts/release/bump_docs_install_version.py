@@ -29,7 +29,11 @@ CLONE_RE = re.compile(
 # Matches a version-pinned docker image such as `lmsysorg/sglang:v0.5.12`
 # (leaving any suffix like `-cu130`/`-runtime` untouched), capturing the
 # version in group 2. Mutable tags (`latest`, `dev`, ...) are not matched.
-DOCKER_RE = re.compile(r"(lmsysorg/sglang:)v(\d+\.\d+\.\d+(?:rc\d+|\.post\d+)?)\b")
+# CUDA 12 tags (`-cu12*`) are historical, since CUDA 12 images are no longer
+# published, so they are never bumped.
+DOCKER_RE = re.compile(
+    r"(lmsysorg/sglang:)v(\d+\.\d+\.\d+(?:rc\d+|\.post\d+)?)\b(?![\w.]*-cu12)"
+)
 
 # All version references the bump keeps in sync, each with the version in group 2.
 VERSION_PATTERNS = [CLONE_RE, DOCKER_RE]
