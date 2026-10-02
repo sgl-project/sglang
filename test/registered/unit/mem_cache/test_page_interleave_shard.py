@@ -775,11 +775,12 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
 
 
 class _GraftReq:
-    """Minimal Req stand-in for cache_unfinished_req / insert_req."""
+    """Minimal Req stand-in for insert_req."""
 
     def __init__(self, fill_ids, req_pool_idx=0):
         self.fill_ids = list(fill_ids)
         self.origin_input_ids = array("q", fill_ids)
+        self.full_untruncated_fill_ids = self.origin_input_ids
         self.output_ids = array("q", [])
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.extra_key = None
@@ -796,6 +797,9 @@ class _GraftReq:
 
     def get_fill_ids(self):
         return array("q", self.fill_ids)
+
+    def finished(self):
+        return self.finished_reason is not None
 
 
 @parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
@@ -904,13 +908,13 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
         res = _insert(tree, list(range(12)), rotation_base=3)
         self.assertTrue(res.rotation_tail_declined)
 
-    def test_cache_unfinished_decline_keeps_request_on_own_pages(self):
+    def test_insert_decline_keeps_request_on_own_pages(self):
         tree, freed = self._tree_with_spy()
         self._seed_chain(tree, list(range(8)), base=1)
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 3
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_unfinished_req(req)
+        tree.insert_req(req, up_to=len(req.fill_ids))
         # No dedup free, no rebind: the request keeps its own locs whole.
         self.assertEqual([t.tolist() for t in freed], [])
         self.assertTrue(torch.equal(req.prefix_indices, own_locs))
@@ -941,6 +945,7 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 1
         own_locs = self._own_row(tree, req, 12)
+        req.last_node = tree.root_node_handle()
         finish_req(tree, req, 12)
         self.assertEqual(_match_len(tree, req.fill_ids), 12)
         released = torch.cat(freed) if freed else torch.empty(0, dtype=torch.int64)

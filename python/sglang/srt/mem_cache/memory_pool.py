@@ -28,6 +28,7 @@ import dataclasses
 import logging
 import math
 import os
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
@@ -962,6 +963,7 @@ class MambaPool:
         # attn_tp_size (GDN: [key_dim, key_dim, value_dim]); None otherwise.
         self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
         self.conv_slice_axis = getattr(cache_params.shape, "conv_slice_axis", 0)
+        self._warmup_fused_copy_slot_kernel()
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -995,6 +997,21 @@ class MambaPool:
 
     def _should_fuse_slot_ops(self) -> bool:
         return self._conv_fuse_ok and not envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.get()
+
+    def _warmup_fused_copy_slot_kernel(self) -> None:
+        """Warm the cache-hit-only fused COW kernel during pool initialization."""
+        if not self._should_fuse_slot_ops() or self.mamba_cache.conv[0].shape[1] < 2:
+            return
+        from sglang.srt.mem_cache.mamba_slot_fused import (
+            warmup_fused_copy_conv_slots,
+        )
+
+        started = time.perf_counter()
+        warmup_fused_copy_conv_slots(self._conv_slot_desc)
+        logger.info(
+            "Warmed fused Mamba slot copy kernel in %.3f ms",
+            (time.perf_counter() - started) * 1000,
+        )
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
@@ -1034,7 +1051,7 @@ class MambaPool:
         ReplaySSM invariant: the SOURCE must be a fully-flushed checkpoint
         (``write_pos[src] == 0``). Only ``temporal`` is copied, not the ring, so
         an un-flushed source would drop its last ``write_pos`` updates. Callers
-        comply: COW copies radix checkpoints; ``cache_unfinished_req`` copies an
+        comply: COW copies radix checkpoints; a checkpoint ``insert_req`` copies an
         active slot only during prefill (ring empty); ``insert_req``
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
