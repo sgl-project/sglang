@@ -850,7 +850,8 @@ PD 的 TransferEngine KV 交接不是 Store 样本提交，两个完成事件分
 
 `pd_capture.py` 实现 D 统一导出路径。当前接入 Mooncake backend、DP=1，
 普通 AR 支持 TP 分片与 PP；静态 target-KV DSpark 推测采集也已接通同步 PP P/D。
-真实模型已覆盖 TP1 的 P2/D2 与 P2/D1；TP2/PP2 组合及跨节点 PP 仍需验证。
+真实模型已覆盖 TP1 的 P2/D2 与 P2/D1，以及两端匹配的 TP2/PP2 AR 和静态
+target-KV DSpark eager/graph；跨节点 PP 仍需验证。
 hidden-input/confidence-scheduled PP 仍未支持。TP=PP=1 的普通 AR 和
 target-KV DSpark 已通过跨节点 P/D RDMA 的 eager/graph 验证；跨节点 Store RDMA
 的独立验收范围见第 8.2 节。
@@ -865,6 +866,9 @@ P=PP1、D=PP2 等展开拓扑仍不受底层传输支持。
 cohort 失败和资源回收流程。PP CUDA graph 的 activation 按 token 数分配与
 截取，并在执行前刷新提前规划时尚未收到的数据。两张 H100 上的 Qwen3-0.6B
 TP1/PP2 eager/graph 已验证输出、KV、raw top-128、mask、取消和自然显存压力。
+四张 H100 上的 TP2/PP2 也通过相同流程；各 TP/PP rank 分别核对源 KV 与
+draft 投影，完整样本在服务进程树退出后仍能从 Store 读取。
+组合拓扑的范围与复现见 [TP/PP runbook](experiments/COMBINED_TP_PP.md)。
 异步 microbatch、host-tier cache 或训练质量仍需单独验证。
 合设实现和复现范围见 [PP serving runbook](experiments/PIPELINE_SERVING.md)。
 
@@ -877,7 +881,9 @@ target KV 投影 draft context，不执行 target prefill。完整实现与边�
 [PP P/D runbook](experiments/PIPELINE_PD.md)。
 
 P/D 的自然容量压力验收使用 512-token KV pool，同时生成四条 208-token 路径。
-PP1 覆盖同步/overlap 与 eager/graph 四种组合，PP2 覆盖同步 eager/graph。
+PP1 覆盖同步/overlap 与 eager/graph 四种组合，TP1/PP2 和 TP2/PP2
+覆盖同步 eager/graph。撤回计数按每个 TP/PP rank 独立核对，避免把同一请求
+在多个 TP rank 的指标相加后重复计数。
 撤回前独立保存目标模型全部 28 层的本地 K/V，CPU 备份恢复到新槽位后逐元素比较；
 各阶段还必须清空旧 draft context 并重新投影。被撤回请求的原始 capture ID
 必须在 Catalog 进入 FAILED，恢复生成不能重新采集这份不完整样本。

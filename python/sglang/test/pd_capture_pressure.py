@@ -32,20 +32,26 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
             self.assertLess(time.monotonic(), deadline, state)
             time.sleep(0.03)
 
-    def retraction_metrics(self, pp_size):
+    def retraction_metrics(self, tp_size, pp_size):
         response = requests.get(self.decode_url + "/metrics", timeout=10)
         response.raise_for_status()
-        values = {rank: 0 for rank in range(pp_size)}
+        values = {(tp, pp): 0 for tp in range(tp_size) for pp in range(pp_size)}
         for family in text_string_to_metric_families(response.text):
             for sample in family.samples:
                 if sample.name == "sglang:num_retracted_requests_total":
-                    values[int(sample.labels.get("pp_rank", 0))] += sample.value
+                    rank = (
+                        int(sample.labels.get("tp_rank", 0)),
+                        int(sample.labels.get("pp_rank", 0)),
+                    )
+                    values[rank] += sample.value
         return values
 
     @patch.dict(os.environ, {"SGLANG_TEST_RETRACT": "0"})
-    def exercise_pressure(self, *, replay, enable_overlap=False, pp_size=1):
+    def exercise_pressure(self, *, replay, enable_overlap=False, tp_size=1, pp_size=1):
         draft = self.get_draft("target_kv")
-        suffix = f"{pp_size}-{replay}-{enable_overlap}"
+        suffix = f"{tp_size}-{pp_size}-{replay}-{enable_overlap}"
+        ranks = {(tp, pp) for tp in range(tp_size) for pp in range(pp_size)}
+        distributed = tp_size * pp_size > 1
         root = self.root / f"pressure-{suffix}"
         root.mkdir()
         self.bootstrap_port, self.bootstrap_room = self.new_bootstrap_port(), 8000
@@ -60,7 +66,7 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
             "prefill",
             root,
             replay=False,
-            tp_size=1,
+            tp_size=tp_size,
             pp_size=pp_size,
             draft=draft,
             extra_args=extra,
@@ -69,15 +75,15 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
             "decode",
             root,
             replay=replay,
-            tp_size=1,
+            tp_size=tp_size,
             pp_size=pp_size,
             draft=draft,
             enable_overlap=enable_overlap,
             extra_args=extra,
         )
         # Single-rank leases are prepared asynchronously; cohort admission is lazy.
-        before = self.wait_capture_idle(min_available=4 if pp_size == 1 else 0)
-        metric_before = self.retraction_metrics(pp_size)
+        before = self.wait_capture_idle(min_available=0 if distributed else 4)
+        metric_before = self.retraction_metrics(tp_size, pp_size)
         first = len(self.catalog.publications)
         ids = [f"pressure-batch-{suffix}-{index}" for index in range(4)]
         prompts = [[17 + index, 900 + index] * 8 for index in range(4)]
@@ -97,8 +103,8 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
         self.assertTrue(retired, "workload did not trigger natural P/D retraction")
         self.assertTrue(successful, "no captured request survived pressure")
         after = self.wait_capture_idle(min_available=1)
-        metric_after = self.retraction_metrics(pp_size)
-        for rank in range(pp_size):
+        metric_after = self.retraction_metrics(tp_size, pp_size)
+        for rank in ranks:
             self.assertEqual(metric_after[rank] - metric_before[rank], retractions)
         self.assertEqual(
             after["counters"]["admitted"] - before["counters"].get("admitted", 0),
@@ -111,7 +117,7 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
             if name.startswith("failed_")
         }
         allowed = {"failed_request_aborted_or_retracted"}
-        if pp_size > 1:
+        if distributed:
             # A peer's retraction can invalidate this rank before local release.
             allowed.add("failed_peer_capture_failed")
         self.assertLessEqual(failures.keys(), allowed)
@@ -145,9 +151,13 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
             and item["retraction_ct"] > 0
             and item["previous_end"] is None
         ]
-        for rank in range(pp_size):
+        for tp, pp in ranks:
             self.assertEqual(
-                {item["rid"] for item in rebuilt if item.get("pp_rank", 0) == rank},
+                {
+                    item["rid"]
+                    for item in rebuilt
+                    if item["tp_rank"] == tp and item["pp_rank"] == pp
+                },
                 retired,
             )
         for item in rebuilt:
@@ -159,8 +169,12 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
             for path in sorted((root / "decode").glob("pressure-restore-*.jsonl"))
             for line in path.read_text().splitlines()
         ]
-        for rank in range(pp_size):
-            local = [item for item in restored if item["pp_rank"] == rank]
+        for tp, pp in ranks:
+            local = [
+                item
+                for item in restored
+                if item["tp_rank"] == tp and item["pp_rank"] == pp
+            ]
             self.assertEqual({item["rid"] for item in local}, retired)
             self.assertEqual(len(local), retractions)
             self.assertTrue(all(item["restored_tokens"] >= 16 for item in local))
@@ -180,7 +194,7 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
                 self.assertEqual(record["state"], "FAILED")
                 self.assertEqual(
                     record["reason"],
-                    "cohort_failed" if pp_size > 1 else "request_aborted_or_retracted",
+                    "cohort_failed" if distributed else "request_aborted_or_retracted",
                 )
                 self.assertNotIn(capture_id, self.catalog.publications)
                 failed_captures[rid] = capture_id
@@ -198,6 +212,10 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
         self.assertEqual(any(frame["cuda_graph"] for frame in references), replay)
         for publication in publications:
             manifest, tensors = read_snapshot(self.reader, publication)
+            self.assertEqual(
+                (manifest.topology.tp_size, manifest.topology.pp_size),
+                (tp_size, pp_size),
+            )
             self.assertEqual(
                 tensors["token_ids"].tolist(), traces.pop(manifest.provenance.trace_id)
             )
@@ -218,6 +236,7 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
             json.dumps(
                 {
                     "pd_memory_pressure": {
+                        "tp_size": tp_size,
                         "pp_size": pp_size,
                         "replay": replay,
                         "enable_overlap": enable_overlap,

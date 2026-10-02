@@ -43,10 +43,10 @@ it does not redefine the goal as the modules already implemented.
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes synchronous/overlap and eager/graph combinations; retired captures fail once, released slots are reused, fresh admission and exact post-exit Store reads pass; distributed pressure and SLOs remain open |
-| DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes colocated and P/D PP1 synchronous/overlap and eager/graph combinations, plus synchronous PP2 eager/graph; P/D checks exact all-layer CPU restore and failed Catalog leases |
-| PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2, synchronous P2/D2 and P2/D1, and cross-node TP1 RDMA pass eager/graph source parity and failure exclusion; combined topologies and wider distributed RDMA remain open |
-| Pipeline draft serving | Synchronous static target-KV PP loop, per-stage graph activations, P/D queue agreement and cohort capture | Qwen3 TP1/PP2 eager/graph colocated and P/D serving pass exact Mooncake readback and memory retraction; asynchronous PP and broader topologies remain open |
-| Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark, colocated and P/D static target-KV PP2 DSpark, TP/PP AR PD, TP1/TP2 target-KV DSpark PD, single-rank cross-node RDMA and single-GPU AR prefill graphs have runtime evidence below; combined topologies and workload SLO gates remain open |
+| DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes colocated and P/D PP1 synchronous/overlap and eager/graph combinations, plus synchronous TP1/PP2 and TP2/PP2 eager/graph; P/D checks exact all-layer CPU restore and failed Catalog leases |
+| PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2, synchronous P2/D2 and P2/D1, matching TP2/PP2, and cross-node TP1 RDMA pass eager/graph source parity and failure exclusion; wider distributed RDMA remains open |
+| Pipeline draft serving | Synchronous static target-KV PP loop, per-stage graph activations, P/D queue agreement and cohort capture | Qwen3 TP1/PP2 and TP2/PP2 eager/graph colocated and P/D serving pass exact Mooncake readback and memory retraction; asynchronous PP and broader topologies remain open |
+| Deployment coverage | Partial | TP2/PP1, TP1/PP2 and matching TP2/PP2 AR P/D, TP confidence-scheduled DSpark, colocated and P/D static target-KV PP2 DSpark at TP1/TP2, asymmetric TP/PP AR PD, single-rank cross-node RDMA and single-GPU AR prefill graphs have runtime evidence below; additional models/topologies and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
 `/gpfs/users/fuxuanwei-1/dspark-maas-lab/state`):
@@ -3191,16 +3191,71 @@ production Catalog retention and performance SLOs remain separate work. See
 [the runbook](experiments/PD_MEMORY_PRESSURE.md) and
 [the retained evidence](experiments/pd-memory-pressure.json).
 
+## Combined TP2/PP2 Runtime Capture
+
+Real Qwen3-0.6B now passes matching TP2/PP2 AR and static target-KV DSpark
+P/D, colocated DSpark, and natural memory-pressure checks in eager and decode
+graph execution. Each serving instance has four workers; independent P/D
+instances share the four devices for correctness validation. Target-KV injection
+gathers heads within the owning TP group before broadcasting the complete layer
+through PP. Capture retains owner-local writes and cohort publication.
+
+Three new four-GPU test files reuse the existing serving fixtures. Pressure
+metrics are now checked separately for every `(tp_rank, pp_rank)`, avoiding
+double-counting one logical retraction across TP workers. Every rank must rebuild
+each retired draft context. P/D additionally compares all local target-layer K/V
+against independent pre-offload copies and checks the original failed Catalog
+lease. Colocated source/projection observations and manifests must report the
+actual topology. Debug retraction is explicitly disabled. These are test/helper
+changes; production sources remain at
+`c8a9e67e18a5c8c6cbe45e80a5cf208aa88f7305`.
+
+| Complete runtime suite | Tests | Seconds | Strict post-exit snapshots |
+| --- | ---: | ---: | ---: |
+| TP2/PP2 AR and DSpark P/D | 6 | 642.042 | 34 |
+| TP2/PP2 DSpark P/D pressure | 2 | 241.360 | 6 |
+| TP2/PP2 colocated DSpark | 2 | 271.365 | 20 |
+| PP1 P/D pressure regression | 4 | 337.398 | 12 |
+| Single-GPU complete runtime regression | 2 | 639.843 | Not counted |
+| PP2 P/D pressure regression | 2 | 222.319 | 6 |
+| PP2 colocated DSpark regression | 2 | 172.748 | 20 |
+| Total | 20 | | 98 |
+
+The three combined suites contribute 10 tests and 60 snapshots. P/D fault cases
+exclude 18 missing/stale/aborted captures; combined P/D pressure checks 16 exact
+rank-local restores across four retired captures. Snapshot checks include
+selected KV, token IDs, response masks, raw top-128 logits/IDs, full-vocabulary
+LSE, positions and terminal validity. Counts exclude synthetic-draft seed
+snapshots. The monolithic single-GPU runtime regression passes, but its process
+cleanup does not establish the strengthened fixture's full-tree exit invariant;
+its READY log entries are not included in the 98 strict reads.
+
+Relevant helper/test hashes match the final sources in each frozen runtime
+directory. Ruff, Black and `git diff --check` pass. Temporary four-H100 job
+`job-187ee89b1506-20261002123141` was deleted after confirming no live model,
+Store or GPU compute processes; its pod is absent. The resident H100 has no
+active/queued experiment and runs its 60% idle workload. Original staged changes
+remain untouched. See [the runbook](experiments/COMBINED_TP_PP.md) and
+[retained evidence](experiments/combined-tp-pp.json).
+
+This milestone uses a synthetic draft, Mooncake TCP and the HTTP Catalog test
+double. Qwen3's eight target KV heads are sharded, not replicated, at TP2.
+Trained/exported checkpoints, replicated target heads, additional models,
+asymmetric combined P/D, distributed prefill graphs, asynchronous PP, cross-node
+combined RDMA, production retention and performance SLOs remain open.
+
 ## Next Implementation
 
 1. Extend passing single-GPU AR prefill graph coverage to distributed/speculative
    and mixed-batch execution. Extend distributed pressure beyond passing
-   colocated and P/D synchronous PP2 DSpark to AR and combined topologies. Broaden real-request coverage to speculative cache eviction, target weight replacement and
+   colocated and P/D synchronous TP1/PP2 and TP2/PP2 DSpark to AR and asymmetric
+   combined topologies. Broaden real-request coverage to speculative cache
+   eviction, target weight replacement and
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
-3. Extend P9's real TP2/PP1 and TP1/PP2 Qwen3 capture validation to combined
-   TP2/PP2, replicated heads, distributed cancellation/backpressure and additional
+3. Extend P9's real TP2/PP1, TP1/PP2 and TP2/PP2 Qwen3 capture validation to
+   replicated heads, saturated distributed backpressure and additional
    model identities. Extend passing colocated and P/D static PP speculative
    collection to broader topologies, extend real
    speculative PD topology coverage and cross-node distributed RDMA. Both the
@@ -3212,7 +3267,7 @@ production Catalog retention and performance SLOs remain separate work. See
    Ordinary AR uses the distributed serving
    path, and static and confidence-scheduled DSpark capture support TP. The
    target-KV PD path reconstructs draft context from D's received target prefix,
-   with TP1/TP2 and TP1 P2/D2/P2/D1 real-request validation. The
+   with TP1/TP2, TP1 P2/D2/P2/D1 and matching TP2/PP2 real-request validation. The
    target-KV v1 draft remains static by checkpoint contract; the remaining
    capability gates do not constitute implementation of those paths.
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to

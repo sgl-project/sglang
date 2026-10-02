@@ -413,8 +413,10 @@ KV, raw top-128 values/IDs, logsumexp, masks and positions after Mooncake readba
 including readback after serving exits. The synthetic draft checks mechanics,
 not training quality. This loop keeps one batch outstanding; asynchronous PP
 microbatch depth does not introduce concurrency here. The P/D variant is described
-below. Combined real-model TP2/PP2, host-tier cache integration, other model families and
-performance SLO validation remain open. See
+below. The same workflow also passes at TP2/PP2 with per-rank source/projection
+checks and post-exit Store reads; see [the combined runbook](experiments/COMBINED_TP_PP.md).
+Host-tier cache integration, other model families and performance SLO validation
+remain open. See
 [the serving runbook](experiments/PIPELINE_SERVING.md).
 
 ### Disaggregated Context
@@ -443,12 +445,14 @@ Every P stage validates it against its capture context. D then consumes that
 teacher together with received target KV and uses the existing cohort writer.
 P may run AR or load a target-KV draft. Real-model coverage includes TP1 P2/D2
 with a draft on D alone or both sides, and P2/D1 with drafts on both sides, in
-eager/graph execution. See [the P/D runbook](experiments/PIPELINE_PD.md).
+eager/graph execution. Matching TP2/PP2 also passes with P running AR or a
+target-KV draft. See [the P/D runbook](experiments/PIPELINE_PD.md) and
+[the combined runbook](experiments/COMBINED_TP_PP.md).
 
 Under decode KV pool exhaustion, the ordinary request CPU backup/restore path
 preserves target KV while retraction invalidates the draft projection and capture
-lease. Real PP1 synchronous/overlap and PP2 synchronous pressure tests check
-every target layer before/after restore, projection rebuild, failed lease
+lease. Real PP1 synchronous/overlap and TP1/PP2 and TP2/PP2 synchronous pressure
+tests check every target layer before/after restore, projection rebuild, failed lease
 exclusion, fresh capture admission and post-exit Store reads. This is distinct
 from enabling the optional P/D KV offload manager or HiCache. See
 [the pressure runbook](experiments/PD_MEMORY_PRESSURE.md).

@@ -119,6 +119,8 @@ cache and snapshot correctness, not model quality or serving performance.
 
 This is normal decode-pool exhaustion and request CPU backup/restore. It is
 separate from the optional P/D KV offload manager, HiCache host-tier eviction,
-CUDA allocator errors, rank failure and device loss. Combined TP/PP pressure,
-asymmetric P/D pressure, cross-node RDMA pressure, production Catalog retention,
+CUDA allocator errors, rank failure and device loss. Combined TP2/PP2 pressure
+now passes eager/graph with per-rank restore checks in
+[the combined suite](COMBINED_TP_PP.md). Asymmetric P/D pressure,
+cross-node RDMA pressure, production Catalog retention,
 trained checkpoints and latency/throughput SLOs still need their own evidence.

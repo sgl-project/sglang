@@ -118,10 +118,12 @@ support expanding P=PP1 to D=PP2. Hidden-input and confidence-scheduled PP draft
 remain unsupported.
 
 These fixtures do not establish trained-draft quality, production Catalog
-retention, real combined TP2/PP2, cross-node pipeline RDMA, asynchronous PP
+retention, cross-node pipeline RDMA, asynchronous PP
 microbatch throughput, distributed prefill graphs or performance SLOs. Runtime
 retraction under P/D memory pressure is now exercised separately with exact
 all-layer CPU restore and failed-capture checks in
 [the pressure suite](PD_MEMORY_PRESSURE.md).
+Matching TP2/PP2 AR and static target-KV DSpark now pass eager/graph serving and
+natural-pressure checks in [the combined suite](COMBINED_TP_PP.md).
 Failed internal model collectives or crashed processes still require
 process-group failure handling and restart.

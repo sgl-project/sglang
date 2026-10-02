@@ -12,8 +12,11 @@ from sglang.test.dspark_capture_observer import check_capture_snapshot
 
 
 def exercise_dspark_capture_pressure(
-    test, *, url, directory, cuda_graph, enable_overlap, pp_size=1
+    test, *, url, directory, cuda_graph, enable_overlap, tp_size=1, pp_size=1
 ):
+    ranks = {(tp, pp) for tp in range(tp_size) for pp in range(pp_size)}
+    distributed = tp_size * pp_size > 1
+
     def state():
         response = requests.get(url + "/server_info", timeout=10)
         response.raise_for_status()
@@ -31,16 +34,19 @@ def exercise_dspark_capture_pressure(
     def retraction_metric():
         response = requests.get(url + "/metrics", timeout=10)
         response.raise_for_status()
-        values = {rank: 0 for rank in range(pp_size)}
+        values = {rank: 0 for rank in ranks}
         for family in text_string_to_metric_families(response.text):
             for sample in family.samples:
                 if sample.name == "sglang:num_retracted_requests_total":
-                    rank = int(sample.labels.get("pp_rank", 0))
+                    rank = (
+                        int(sample.labels.get("tp_rank", 0)),
+                        int(sample.labels.get("pp_rank", 0)),
+                    )
                     values[rank] += sample.value
         return values
 
     def completed_count(current):
-        if pp_size > 1:
+        if distributed:
             return current["cohort_writer"]["counters"].get("stored", 0)
         return current["counters"].get("ready", 0)
 
@@ -82,17 +88,21 @@ def exercise_dspark_capture_pressure(
     test.assertTrue(successful, "no captured request survived memory pressure")
     after = wait_available(4)
     metric_after = retraction_metric()
-    for rank in range(pp_size):
+    for rank in ranks:
         test.assertEqual(metric_after[rank] - metric_before[rank], num_retractions)
-    for counter, expected in (
-        ("admitted", 4),
-        ("failed_request_aborted_or_retracted", len(retired)),
-    ):
-        test.assertEqual(
-            after["counters"].get(counter, 0) - before["counters"].get(counter, 0),
-            expected,
-            after,
-        )
+    test.assertEqual(
+        after["counters"]["admitted"] - before["counters"].get("admitted", 0), 4, after
+    )
+    failures = {
+        name: count - before["counters"].get(name, 0)
+        for name, count in after["counters"].items()
+        if name.startswith("failed_") and count > before["counters"].get(name, 0)
+    }
+    allowed = {"failed_request_aborted_or_retracted"}
+    if distributed:
+        allowed.add("failed_peer_capture_failed")
+    test.assertLessEqual(failures.keys(), allowed)
+    test.assertEqual(sum(failures.values()), len(retired), failures)
     test.assertEqual(completed_count(after) - completed_count(before), len(successful))
     test.assertEqual(after["host_pool"]["quarantined"], 0)
     test.catalog.wait_publications(first_publication + len(successful), timeout=30)
@@ -138,9 +148,13 @@ def exercise_dspark_capture_pressure(
         and item["previous_end"] is None
     ]
     test.assertEqual({item["rid"] for item in rebuilt}, retired)
-    for rank in range(pp_size):
+    for tp, pp in ranks:
         test.assertEqual(
-            {item["rid"] for item in rebuilt if item.get("pp_rank", 0) == rank},
+            {
+                item["rid"]
+                for item in rebuilt
+                if item.get("tp_rank", 0) == tp and item.get("pp_rank", 0) == pp
+            },
             retired,
         )
     for item in rebuilt:
@@ -167,6 +181,8 @@ def exercise_dspark_capture_pressure(
         json.dumps(
             {
                 "dspark_memory_pressure": {
+                    "tp_size": tp_size,
+                    "pp_size": pp_size,
                     "cuda_graph": cuda_graph,
                     "enable_overlap": enable_overlap,
                     "kv_pool_tokens": 512,

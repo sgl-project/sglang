@@ -22,6 +22,8 @@ register_cuda_ci(est_time=600, stage="base-b", runner_config="2-gpu")
 
 @unittest.skipUnless(torch.cuda.device_count() >= 2, "two CUDA devices required")
 class TestDSparkPipelineCapture(PDCaptureRuntimeBase):
+    tp_size = 1
+
     def launch_colocated(self, root, *, replay, draft=None):
         root.mkdir()
         config = {
@@ -58,8 +60,14 @@ class TestDSparkPipelineCapture(PDCaptureRuntimeBase):
                 self.model,
                 url,
                 timeout=240,
-                env={**os.environ, "SGLANG_RAGGED_VERIFY_MODE": "static"},
+                env={
+                    **os.environ,
+                    "SGLANG_RAGGED_VERIFY_MODE": "static",
+                    "SGLANG_TEST_RETRACT": "0",
+                },
                 other_args=[
+                    "--tp-size",
+                    str(self.tp_size),
                     "--pp-size",
                     "2",
                     "--pp-max-micro-batch-size",
@@ -139,7 +147,7 @@ class TestDSparkPipelineCapture(PDCaptureRuntimeBase):
         return response.json()
 
     def exercise_pipeline(self, replay):
-        root = self.root / f"pp-{replay}"
+        root = self.root / f"tp{self.tp_size}-pp2-{replay}"
         root.mkdir()
         first = len(self.catalog.publications)
         server, url = self.launch_colocated(root / "ar", replay=False)
@@ -224,11 +232,18 @@ class TestDSparkPipelineCapture(PDCaptureRuntimeBase):
             references = [
                 torch.load(path, weights_only=True) for path in draft.rglob("*.pt")
             ]
-            self.assertEqual({row["pp_rank"] for row in references}, {0, 1})
+            ranks = {(tp, pp) for tp in range(self.tp_size) for pp in range(2)}
+            self.assertEqual(
+                {(row["tp_rank"], row["pp_rank"]) for row in references}, ranks
+            )
             self.assertTrue(any(row["batch_size"] == 2 for row in references))
             self.assertEqual(any(row["cuda_graph"] for row in references), replay)
             samples = [read_snapshot(self.reader, item) for item in publications]
             for manifest, tensors in samples:
+                self.assertEqual(
+                    (manifest.topology.tp_size, manifest.topology.pp_size),
+                    (self.tp_size, 2),
+                )
                 check_capture_snapshot(self, manifest, tensors, references)
             self.assertCountEqual(
                 [
@@ -243,8 +258,12 @@ class TestDSparkPipelineCapture(PDCaptureRuntimeBase):
                 for line in path.read_text().splitlines()
             ]
             self.assertEqual(
-                {row["pp_rank"] for row in observations if row["kind"] == "projection"},
-                {0, 1},
+                {
+                    (row["tp_rank"], row["pp_rank"])
+                    for row in observations
+                    if row["kind"] == "projection"
+                },
+                ranks,
             )
             commits = [row for row in observations if row["kind"] == "verify"]
             self.assertTrue(any(row["num_reject"] > 0 for row in commits))
@@ -265,11 +284,13 @@ class TestDSparkPipelineCapture(PDCaptureRuntimeBase):
                 directory=draft,
                 cuda_graph=replay,
                 enable_overlap=False,
+                tp_size=self.tp_size,
                 pp_size=2,
             )
             print(
                 json.dumps(
                     {
+                        "tp_size": self.tp_size,
                         "pp_size": 2,
                         "cuda_graph": replay,
                         "checked_snapshots": len(publications),

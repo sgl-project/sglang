@@ -93,7 +93,7 @@ completion; the PP1 runtime's `ready` counter does not track cohort publication.
 This proves Qwen3-0.6B TP1/PP2 mechanics with a synthetic draft, two H100s, NCCL
 between model stages, Mooncake TCP storage and a Catalog test double. It does not
 prove trained-checkpoint quality, SpecForge production retention/consumption,
-combined real-model TP2/PP2, host-tier cache integration,
+host-tier cache integration,
 cross-node pipeline RDMA, additional model families or latency/throughput SLOs.
 Only one speculative batch is outstanding; this is not asynchronous pipeline
 microbatch scheduling. Failed internal model collectives or crashed ranks still
@@ -101,6 +101,8 @@ require process-group timeout/restart.
 
 The colocated fixture does not exercise P/D. Separate P2/D2 and P2/D1 tests cover
 static target-KV speculation with the existing Mooncake transport.
+Combined TP2/PP2 colocated and matching P/D serving now have separate real-model
+eager/graph and natural-pressure coverage in [the combined suite](COMBINED_TP_PP.md).
 
 Exact results, source hashes and retained log locations are recorded in
 `pipeline-dspark-serving.json`.
