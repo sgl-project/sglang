@@ -1531,7 +1531,7 @@ class DeepseekV4AttnBackend(
             token_indices=token_indices,
             contiguous_start=contiguous_start,
         )
-        tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
+        tail_lens = self._move_to_device(tail_lens_cpu)
         cp_tail = (
             self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
             if is_cp_active(forward_batch)
@@ -1561,7 +1561,9 @@ class DeepseekV4AttnBackend(
         )
         metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         metadata.low_ratio_req_indices = torch.repeat_interleave(
-            forward_batch.req_pool_indices.to(torch.int64), tail_lens.to(torch.int64)
+            forward_batch.req_pool_indices.to(torch.int64),
+            tail_lens.to(torch.int64),
+            output_size=sum(tail_lens_cpu),
         )
         positions = _tail_rows(
             forward_batch.positions,

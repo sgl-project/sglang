@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
+from sglang.srt.utils import is_pin_memory_available
 
 from .scoring import (
     DeepGEMMDecodeData,
@@ -413,7 +414,11 @@ def publish_prefill_table(
         )
     request_ids = torch.repeat_interleave(
         torch.arange(len(data.rows_per_request), dtype=torch.int32, device=device),
-        torch.tensor(data.rows_per_request, dtype=torch.int64, device=device),
+        torch.tensor(
+            data.rows_per_request,
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(device),
+        ).to(device, non_blocking=True),
         output_size=rows,
     )
     return _build_prefill_table(
