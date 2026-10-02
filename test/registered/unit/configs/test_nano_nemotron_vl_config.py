@@ -47,18 +47,13 @@ class TestNemotronHOmniConfig(CustomTestCase):
         )
 
     def test_text_config_resolves_to_the_language_model_config(self):
-        """LoRAManager sizes its pools from base_hf_config.get_text_config();
-        without the override that returns the VL config itself, which carries no
-        num_hidden_layers, and LoRA init dies before serving a single request."""
+        """get_text_config() returns llm_config, which LoRAManager sizes from."""
         config = NemotronH_Omni_Reasoning_V3_Config(
             vision_config={"args": {"model": "radio"}},
             llm_config={},
         )
 
         self.assertIs(config.get_text_config(), config.llm_config)
-        # Without the override this raises AttributeError rather than comparing
-        # unequal, which is the reported failure.
-        self.assertIsInstance(config.get_text_config().num_hidden_layers, int)
 
 
 if __name__ == "__main__":

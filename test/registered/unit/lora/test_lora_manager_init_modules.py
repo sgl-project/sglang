@@ -100,12 +100,7 @@ class TestTiedLMHeadLoRA(CustomTestCase):
 
 
 class TestShouldApplyLoRAGate(CustomTestCase):
-    """Regression for #21864, which deleted the should_apply_lora call site.
-
-    Without the gate a VL model's vision projections are wrapped and bound to
-    the language model's buffers, and the first request naming an adapter
-    aborts the scheduler on a LoRA buffer/weight shape mismatch.
-    """
+    """init_lora_modules wraps only modules that should_apply_lora admits."""
 
     @staticmethod
     def _manager(modules, target_modules):
@@ -148,10 +143,7 @@ class TestShouldApplyLoRAGate(CustomTestCase):
         self.assertEqual(manager.embed_tokens_module, LANGUAGE_EMBED_TOKENS)
 
     def test_routed_bank_outside_the_gated_prefix_still_raises(self):
-        """Unsupported routed-expert targets must fail loudly rather than be
-        skipped; the gate would otherwise drop the bank before the FusedMoE
-        branch rejects it, and the adapter's weights are then dropped silently
-        because lora_strict_loading defaults to off."""
+        """Routed-bank targets raise instead of being skipped by the gate."""
         bank = FusedMoE.__new__(FusedMoE)
         manager = self._manager(
             modules=[(META_MLP_BANK, bank)],
