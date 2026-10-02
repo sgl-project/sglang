@@ -254,7 +254,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("modelA".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 
@@ -336,10 +336,12 @@ mod tests {
             observability: Default::default(),
             model: ModelConfig {
                 id: id.into(),
-                tokenizer_path: "/tmp/x".into(),
+                tokenizer_path: Some("/tmp/x".into()),
                 disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
                 policy,
                 decode_policy: Default::default(),
+                dp_aware: false,
                 bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,
@@ -348,12 +350,51 @@ mod tests {
                 fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],
             }),
             proxy: ProxyConfig::default(),
             router_inflight_load: InflightLoadConfig::default(),
+        }
+    }
+
+    #[test]
+    fn only_prefix_reading_policies_need_request_tokens() {
+        fn fuse(model: &mut ModelConfig, kinds: &[ScoreTermKind]) {
+            model.policy = PolicyKind::FusedScore;
+            model.fused = Some(
+                (kinds.iter())
+                    .map(|&kind| crate::config::FusedTerm { kind, weight: None })
+                    .collect(),
+            );
+        }
+        type Mutate = fn(&mut ModelConfig);
+        let cases: [(Mutate, bool); 8] = [
+            (|_| {}, false),
+            (|m| m.policy = PolicyKind::PowerOfTwo, false),
+            (|m| m.policy = PolicyKind::SessionAware, false),
+            (|m| m.policy = PolicyKind::CacheAware, true),
+            (|m| fuse(m, &crate::config::DEFAULT_FUSE), true),
+            (|m| fuse(m, &[ScoreTermKind::LoadBased]), false),
+            (|m| fuse(m, &[ScoreTermKind::PrefixCache]), true),
+            (
+                |m| {
+                    m.eligibility = Some(EligibilityConfig {
+                        filters: vec![FilterKind::PrefixCache],
+                        min_prefix_share: Some(0.6),
+                        ..Default::default()
+                    })
+                },
+                true,
+            ),
+        ];
+        for (i, (mutate, needs)) in cases.into_iter().enumerate() {
+            let mut cfg = cfg_with_model("modelA", PolicyKind::RoundRobin);
+            mutate(&mut cfg.model);
+            let registry = build_registry_with_defaults(&cfg).unwrap();
+            assert_eq!(registry.needs_request_tokens(), needs, "case {i}");
         }
     }
 

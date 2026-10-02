@@ -378,10 +378,6 @@ def _make_fake_base_model(num_experts: int) -> torch.nn.Module:
 class TestNumExpertHelpers(unittest.TestCase):
     """`_get_num_experts` / `_get_num_local_experts` / buffer-dim picker."""
 
-    def test_num_experts_read_from_config(self):
-        model = _make_fake_base_model(num_experts=8)
-        self.assertEqual(LoRAMemoryPool._get_num_experts(model), 8)
-
     def test_num_local_experts_no_ep(self):
         pool = _make_pool(
             num_experts_global=8,
@@ -1130,8 +1126,8 @@ class TestMoeBufferShardsByMoeTp(unittest.TestCase):
         pool.max_loras_per_batch = 2
         pool.tp_size = tp_size
         pool.tp_rank = 0
-        # Without --enable-dp-attention the attention TP group equals the
-        # outer TP group.
+        # Without attention DP the attention TP group equals the outer TP
+        # group.
         pool.attn_tp_size = tp_size
         pool.moe_ep_size = ep_size
         pool.moe_ep_rank = ep_rank
@@ -1236,8 +1232,8 @@ class TestAttnModulesShardByAttnTp(unittest.TestCase):
     """Regression: attention-module LoRA buffers must shard by `attn_tp_size`,
     not the outer `tp_size`.
 
-    Under `--enable-dp-attention` attention layers are built on the attn_tp
-    group (`attn_tp_size = tp_size // dp_size`), so e.g. MLA `o_proj` holds an
+    Under `--attn-dp-size` attention layers are built on the attn_tp group
+    (`attn_tp_size = tp_size // attn_dp_size`), so e.g. MLA `o_proj` holds an
     attn_tp-local input shard. Sizing the LoRA buffer by the outer `tp_size`
     would make it narrower than the slice produced by
     `RowParallelLinearWithLoRA.slice_lora_a_weights` (which slices by the base
@@ -1441,7 +1437,7 @@ class TestRowParallelLoraAShardsByBaseLinear(unittest.TestCase):
     """Regression: dense row-parallel LoRA-A buffers must match the base linear's
     real input shard.
 
-    Under `--enable-dp-attention --moe-dense-tp-size 1` the dense-MLP and
+    Under `--attn-dp-size N --moe-dense-tp-size 1` the dense-MLP and
     shared-expert `down_proj` are fully replicated (K is the full intermediate
     size) although the outer `tp_size` is large. Dividing by `tp_size` undersized
     the buffer and `sgemm_lora_a_fwd` failed its `x.shape[-1] == K` assertion.

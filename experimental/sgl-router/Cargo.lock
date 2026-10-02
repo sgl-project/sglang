@@ -3291,6 +3291,7 @@ dependencies = [
  "dirs 5.0.1",
  "dynamo-renderer",
  "dynamo-tokenizers",
+ "flate2",
  "futures",
  "hf-hub",
  "http-body",

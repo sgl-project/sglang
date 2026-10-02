@@ -206,8 +206,25 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
+            "/generate",
+            post(crate::server::routes::chat::generate)
+                .put(crate::server::routes::chat::generate)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/embeddings",
+            post(crate::server::routes::chat::embeddings)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
+        )
+        .route(
+            crate::state::kv_events::bootstrap::SNAPSHOT_PATH,
+            get(crate::server::routes::cache::kv_snapshot),
         );
     // A route that panics on purpose, so the panic-handling layers below are
     // exercised as `build_router` actually composes them. Without it the layers
