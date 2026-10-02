@@ -232,7 +232,9 @@ class CanonicalStrategy:
         channel_header = text[channel_start:channel_end]
 
         channel_type = self._extract_channel_type(channel_header)
-        if channel_type != "analysis":
+        if channel_type != "analysis" or re.search(
+            r"\bto\s*=", channel_header, re.IGNORECASE
+        ):
             return None  # Only stream analysis content - tool calls wait for completion
 
         # Extract partial content after <|message|>
