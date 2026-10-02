@@ -367,6 +367,112 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     assert calls[0]["q_stride"] == 4
 
 
+def _translate_through_a_moving_page_map(backend):
+    """Give the backend a translating pool whose virtual->physical page map the
+    test rewrites before every replay, so a page-table column the refill missed
+    still holds an earlier replay's page."""
+    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+    from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+
+    rows, width = backend.req_to_token.shape
+    # Row r holds virtual pages r * width / PAGE_SIZE + 1, ...; page 0 is the sink.
+    backend.req_to_token.copy_(
+        torch.arange(rows * width, dtype=torch.int32).view(rows, width) + PAGE_SIZE
+    )
+    v2p = torch.zeros(rows * width // PAGE_SIZE + 1, dtype=torch.int64)
+    translator = KVIndexTranslator.__new__(KVIndexTranslator)
+    translator.req_to_token = backend.req_to_token
+    translator.page_size = PAGE_SIZE
+    translator.device = "cpu"
+    translator.is_translating = True
+    translator.defer_read_translate = False
+    translator._capture_page_size = PAGE_SIZE
+    translator._full_v2p_table = v2p
+    translator._spaces = {
+        IdSpaceKind.FULL: IdSpace(
+            key=(IdSpaceKind.FULL, "test"), write=lambda ids: ids, read_v2p=v2p
+        )
+    }
+    translator._rows = torch.arange(rows, dtype=torch.int64)
+    backend.kv_index_translator = translator
+    return v2p
+
+
+def _move_every_page(v2p, replay):
+    v2p[1:] = torch.arange(1, v2p.numel()) + 1000 * replay
+
+
+def _assert_reads_only_current_pages(backend, v2p, bs=2):
+    metadata = backend.forward_metadata
+    for row, length in enumerate(metadata.cache_seqlens_int32[:bs].tolist()):
+        pages = -(-length // PAGE_SIZE)
+        first_tokens = backend.req_to_token[row, : pages * PAGE_SIZE : PAGE_SIZE]
+        expected = v2p[first_tokens.long() // PAGE_SIZE].to(torch.int32)
+        stale = (metadata.page_table[row, :pages] != expected).nonzero().flatten()
+        assert stale.numel() == 0, (
+            f"row {row} reads {length} tokens ({pages} pages), but page-table "
+            f"columns {stale.tolist()} hold another replay's pages"
+        )
+
+
+def _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req):
+    seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    bs = seq_lens.numel()
+    return SimpleNamespace(
+        batch_size=bs,
+        req_pool_indices=torch.arange(bs, dtype=torch.int64),
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.clone(),
+        forward_mode=forward_mode,
+        spec_info=spec_info,
+        positions=torch.arange(bs * tokens_per_req, dtype=torch.int64),
+        # The window it writes; the reads under test do not depend on its ids.
+        out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
+    )
+
+
+def _replay_and_check_every_read(monkeypatch, backend, batch, bind_plan):
+    # The recorded kernel writes cache_seqlens = seq_lens + offset only when the
+    # graph runs, which is after replay-prep has refilled the page table.
+    def recorded_kernel(**kwargs):
+        bs = kwargs["bs"]
+        kwargs["cache_seqlens"][:bs].copy_(
+            kwargs["seq_lens"][:bs] + kwargs["seqlen_offset"]
+        )
+
+    monkeypatch.setattr(
+        trtllm_mha_backend, "update_trtllm_mha_graph_metadata", recorded_kernel
+    )
+    v2p = _translate_through_a_moving_page_map(backend)
+    capture = batch([1, 1])
+    bind_plan(backend.kv_index_translator, capture)
+    backend.init_forward_metadata_out_graph(capture, in_capture=True)
+    backend.init_forward_metadata_in_graph(capture)
+    # Rows grow across page boundaries and trade lengths between replays.
+    for n, seq_lens in enumerate(([5, 9], [300, 3], [129, 700]), start=1):
+        _move_every_page(v2p, n)
+        replay = batch(seq_lens)
+        bind_plan(backend.kv_index_translator, replay)
+        backend.init_forward_metadata_out_graph(replay)
+        backend.init_forward_metadata_in_graph(replay)
+        _assert_reads_only_current_pages(backend, v2p)
+
+
+def test_unified_decode_replay_reads_only_this_replays_pages(monkeypatch):
+    """A decode replay's page table is the plan of its own batch: the replay
+    reads no page an earlier replay refilled."""
+
+    def batch(seq_lens):
+        return _graph_batch(seq_lens, ForwardMode.DECODE, None, 1)
+
+    _replay_and_check_every_read(
+        monkeypatch,
+        _make_backend_for_hook_test(),
+        batch,
+        lambda translator, fb: translator.bind_own_plan(fb),
+    )
+
+
 def test_hybrid_wrappers_forward_in_graph_hook():
     # The hybrid backend reads the mode from the published configuration.
     from sglang.srt.runtime_context import get_context
