@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Request validation, optional tokenization, and outgoing body preparation for
-//! chat completions, the native `/generate` endpoint, and embeddings.
+//! chat completions, the native `/generate` endpoint, embeddings and rerank.
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
@@ -22,6 +22,7 @@ const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 const CHAT_PATH: &str = "/v1/chat/completions";
 const GENERATE_PATH: &str = "/generate";
 const EMBEDDINGS_PATH: &str = "/v1/embeddings";
+const RERANK_PATH: &str = "/v1/rerank";
 
 /// Validated routing inputs and the original body, ready for worker selection.
 ///
@@ -44,7 +45,7 @@ pub(super) struct PreparedRequest {
     pub(super) expected_peak_sequence_tokens: Option<u64>,
     caller_set_rid: bool,
     pub(super) fans_out: bool,
-    /// `None` for `/generate` and embeddings, whose tokens replace text during preparation.
+    /// `None` for `/generate`, embeddings and rerank, which prepare their own body.
     forwarding_scope: Option<ForwardingScope>,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
@@ -231,9 +232,49 @@ impl PreparedRequest {
         })
     }
 
-    /// Whether the engine endpoint honors a routed DP rank; `/v1/embeddings` takes none.
+    /// SGLang's `V1RerankReqInput`, forwarded as sent: the engine renders and
+    /// tokenizes each query-document pair as its own prompt.
+    pub(super) fn rerank(model: ModelId, body: Bytes) -> Result<Self, ApiError> {
+        let value = Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
+        // Multimodal content counts only its text parts, as for embeddings.
+        let text_len = |content: &Value| match content {
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .map(str::len)
+                .sum(),
+            content => content.as_str().map_or(0, str::len),
+        };
+        let query = text_len(&value["query"]);
+        let lengths: Vec<usize> = value["documents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|document| estimate_prefill_tokens(query + text_len(document)))
+            .collect();
+        let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
+        Ok(Self {
+            path: RERANK_PATH,
+            model,
+            streaming: false,
+            output_tokens: Some(0),
+            input_token_count: lengths.iter().sum::<usize>().max(1),
+            sequence_token_count: sequence_tokens,
+            expected_peak_sequence_tokens: Some(sequence_tokens as u64),
+            body,
+            tokens: None,
+            caller_set_rid: false,
+            // Each document is its own engine request, and the engine reads no `rid`.
+            fans_out: true,
+            forwarding_scope: None,
+            parsed_body: None,
+            sampling_defaults: Vec::new(),
+        })
+    }
+
+    /// Whether the engine endpoint honors a routed DP rank; embeddings and rerank take none.
     pub(super) fn accepts_dp_rank(&self) -> bool {
-        self.path != EMBEDDINGS_PATH
+        !matches!(self.path, EMBEDDINGS_PATH | RERANK_PATH)
     }
 
     pub(super) fn engine_rid(&self) -> Option<String> {
@@ -1186,6 +1227,16 @@ mod tests {
         let (r, input) = prepare_embeddings(&ctx, json!("hi"));
         let ids = ctx.tokenizers.encode_prompt("stub-model", "hi");
         assert_eq!((input, r.tokens.map(|t| t.ids)), (json!("hi"), ids));
+    }
+
+    #[test]
+    fn rerank_estimates_each_query_document_pair() {
+        let image = json!({"type": "image_url", "image_url": {"url": "x".repeat(4096)}});
+        let documents = json!(["abcd", [{"type": "text", "text": "abcdefgh"}, image]]);
+        let body = json!({"query": "abcd", "documents": documents}).to_string();
+        let r = PreparedRequest::rerank(ModelId("stub-model".into()), body.into()).unwrap();
+        // (4 + 4) / 4 and (4 + 8) / 4 estimated tokens.
+        assert_eq!((r.input_token_count, r.sequence_token_count), (5, 3));
     }
 
     #[test]

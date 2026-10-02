@@ -86,16 +86,36 @@ pub async fn embeddings(
     let start = Instant::now();
     let (model, value) = parse_embedding_request(&body)?;
     let routing = ModelRouting::lookup(&ctx, &model)?;
-    // Prefill and decode engines serve generation; embeddings need plain workers.
-    let registered = ctx.registry.workers_for(&model);
-    if registered.iter().any(|w| w.mode() != WorkerMode::Plain) {
-        return Err(ApiError::BadRequest(
-            "embeddings are not served by prefill-decode workers".into(),
-        ));
-    }
+    require_plain_workers(&ctx, &model, "/v1/embeddings")?;
     let request = PreparedRequest::embeddings(&ctx, model, body, value)?;
     let workers = routing.select_workers(&ctx, &request, &headers).await?;
     forward_request(&ctx, request, workers, headers, start).await
+}
+
+/// SGLang's `/v1/rerank`, forwarded as sent to the model this router serves.
+pub async fn rerank(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let start = Instant::now();
+    let model = ModelId(ctx.config.model.id.clone());
+    let routing = ModelRouting::lookup(&ctx, &model)?;
+    require_plain_workers(&ctx, &model, "/v1/rerank")?;
+    let request = PreparedRequest::rerank(model, body)?;
+    let workers = routing.select_workers(&ctx, &request, &headers).await?;
+    forward_request(&ctx, request, workers, headers, start).await
+}
+
+/// Prefill and decode engines serve generation only.
+fn require_plain_workers(ctx: &AppContext, model: &ModelId, path: &str) -> Result<(), ApiError> {
+    let registered = ctx.registry.workers_for(model);
+    if registered.iter().any(|w| w.mode() != WorkerMode::Plain) {
+        return Err(ApiError::BadRequest(format!(
+            "{path} is not served by prefill-decode workers"
+        )));
+    }
+    Ok(())
 }
 
 /// A model's routing state, resolved before the request is prepared.
