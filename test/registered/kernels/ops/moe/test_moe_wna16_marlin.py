@@ -804,6 +804,7 @@ def test_mxfp4_tp8_load_before_padding(tp_rank):
     assert layer.w13_weight.shape == (e, 2 * intermediate, h // 2)
     loader = SimpleNamespace(
         moe_tp_size=tp,
+        moe_tp_rank=tp_rank,
         use_padded_loading=False,
         use_presharded_weights=False,
         use_triton_kernels=False,
@@ -829,7 +830,7 @@ def test_mxfp4_tp8_load_before_padding(tp_rank):
         ]:
             parameter = getattr(layer, f"{prefix}_{suffix}")
             for expert in range(e):
-                load(loader, parameter[expert], axis, shard, data[expert], tp_rank)
+                load(loader, parameter[expert], axis, shard, data[expert])
             width = data.shape[axis + 1] // tp
             selected = data.narrow(axis + 1, tp_rank * width, width)
             actual = (
