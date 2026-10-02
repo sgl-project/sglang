@@ -195,7 +195,7 @@ install_apt_packages() {
 
 install_gdrcopy() {
     # DeepEP tests only run on 4+ GPU hosts. Keep GDRCopy in the shared CUDA
-    # bootstrap while avoiding a DKMS/package build on the 1- and 2-GPU jobs.
+    # bootstrap while avoiding the libgdrapi package build on the 1- and 2-GPU jobs.
     local gpu_count=0
     if command -v nvidia-smi >/dev/null 2>&1; then
         gpu_count=$(
@@ -220,6 +220,22 @@ install_gdrcopy() {
     # Userspace libgdrapi only: the gdrdrv kernel module comes from the host,
     # and the gdrcopy test tools are unused.
     local -a gdrcopy_packages=(devscripts debhelper fakeroot)
+
+    # The former nvidia-dkms-580 install can be left unpacked but unconfigured
+    # when its nvidia-firmware-580 dependency collides with the host firmware
+    # the NVIDIA container runtime mounts in, and apt then refuses every later
+    # install. Drop those packages and finish configuring the rest.
+    local -a stale_nvidia_packages
+    mapfile -t stale_nvidia_packages < <(
+        dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' \
+            'nvidia-dkms-*' 'nvidia-kernel-common-*' 'nvidia-kernel-source-*' 2>/dev/null |
+            awk '$1 ~ /^i/ && $1 != "ii" {print $2}'
+    )
+    if [ "${#stale_nvidia_packages[@]}" -gt 0 ]; then
+        echo "Removing half-installed packages: ${stale_nvidia_packages[*]}"
+        dpkg --remove --force-depends "${stale_nvidia_packages[@]}"
+        dpkg --configure -a
+    fi
 
     apt-get update || true
     apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
