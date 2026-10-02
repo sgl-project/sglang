@@ -525,10 +525,12 @@ class TestNixlTransferStatus(CustomTestCase):
 
         self.assertFalse(status.is_done())
 
-        status.received_state_per_pp.add(0)
-        self.assertFalse(status.is_done())
+        status.expected_state_per_pp.update({0: 2, 1: 1})
+        status.received_state_per_pp[0].add(1)
+        status.received_state_per_pp[1].add(0)
+        self.assertFalse(status.is_done())  # PP rank 0's component 0 in flight.
 
-        status.received_state_per_pp.add(1)
+        status.received_state_per_pp[0].add(0)
         self.assertTrue(status.is_done())
 
 
@@ -923,12 +925,16 @@ class TestNixlNotifications(CustomTestCase):
         self.assertEqual(status.expected_kvs_per_pp[3], 0)
         self.assertEqual(status.num_pp_ranks_expected, 4)
 
-    def test_state_notification_marks_pp_rank(self):
-        mgr = self._make_manager(["7_state_2"])
+    def test_state_notifications_count_components_in_any_order(self):
+        # Every component notif carries the count; a count-less (older) peer
+        # counts as done on its first component.
+        mgr = self._make_manager(["7_state_2_1_2", "7_state_2_0_2", "7_state_3_0"])
 
         mgr.update_transfer_status()
 
-        self.assertEqual(mgr.transfer_statuses[7].received_state_per_pp, {2})
+        status = mgr.transfer_statuses[7]
+        self.assertEqual(status.received_state_per_pp, {2: {0, 1}, 3: {0}})
+        self.assertEqual(status.expected_state_per_pp, {2: 2, 3: 1})
 
     def test_aux_nokv_allows_full_hit_completion(self):
         mgr = self._make_manager(["8_aux_nokv_0"], required={8: 1})

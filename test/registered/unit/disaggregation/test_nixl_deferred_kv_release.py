@@ -287,7 +287,7 @@ class TestNixlWorkerSettledFailureReleasesAck(CustomTestCase):
         mgr.check_status = lambda r: mgr.request_status[r]
         mgr.update_status = lambda r, s: mgr.request_status.__setitem__(r, s)
         mgr.record_failure = MagicMock()
-        mgr._await_handles = lambda handles, failure_seen=False: (True, True)
+        mgr._await_handles = lambda handles, failure_seen=False, **_: (True, True)
         mgr.transfer_infos[7] = {"sess0": _SettledFailureReq()}
         # The decode learns of the failure and its ABORT lands while the chunk
         # is still counted -- the interleaving that held the ack forever.

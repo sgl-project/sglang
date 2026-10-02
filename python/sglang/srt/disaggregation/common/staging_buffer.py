@@ -129,6 +129,8 @@ class StagingBuffer:
         device: str,
         gpu_id: int,
         custom_mem_pool=None,
+        *,
+        pin_memory: bool = False,
     ):
         self.size_bytes = size_bytes
         self.device = device
@@ -136,7 +138,13 @@ class StagingBuffer:
         self._gather_stream: Optional[torch.cuda.Stream] = None
 
         torch.cuda.set_device(gpu_id)
-        if custom_mem_pool is not None:
+        if pin_memory:
+            if device != "cpu" or custom_mem_pool is not None or size_bytes <= 0:
+                raise ValueError("Pinned staging requires positive-size CPU storage")
+            # Page-locked so D2H/H2D copies are async DMA and NIXL registers it.
+            self.buffer = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
+            alloc_method = "pinned host"
+        elif custom_mem_pool is not None:
             with torch.cuda.use_mem_pool(custom_mem_pool):
                 self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
             alloc_method = "custom_mem_pool (cuMemCreate)"
@@ -189,8 +197,12 @@ class StagingAllocator:
         device: str,
         gpu_id: int,
         custom_mem_pool=None,
+        *,
+        pin_memory: bool = False,
     ):
-        self.buffer = StagingBuffer(total_size_bytes, device, gpu_id, custom_mem_pool)
+        self.buffer = StagingBuffer(
+            total_size_bytes, device, gpu_id, custom_mem_pool, pin_memory=pin_memory
+        )
         self.total_size = total_size_bytes
         self.base_ptr = self.buffer.data_ptr
         self.head = 0

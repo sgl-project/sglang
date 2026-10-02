@@ -192,6 +192,23 @@ class BaseKVSender(ABC):
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
 
+    def is_source_pending(self) -> bool:
+        """Whether asynchronous staging still owns this request's KV/aux storage."""
+        return False
+
+    def stages_source_async(self) -> bool:
+        """Config-level is_source_pending(): the same on every rank."""
+        return False
+
+    def is_aux_in_flight(self) -> bool:
+        """Whether a posted aux WRITE may still read this request's metadata slot."""
+        return False
+
+    def holds_failed_source(self) -> bool:
+        """For a request whose (reduced) poll is Failed: stop new WRITEs for its
+        room on this rank, then report whether one may still read its source."""
+        return False
+
     @abstractmethod
     def get_transfer_metric(self) -> KVTransferMetric:
         """Return backend-specific transfer metrics for this sender."""

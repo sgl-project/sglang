@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_min_attn_cp_tp_group,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -147,6 +148,11 @@ def maybe_release_metadata_buffer(
         allocator: The ReqToMetadataIdxAllocator instance to free the index
     """
     if req.metadata_buffer_index >= 0:
+        if req.disagg_kv_sender is not None and (
+            req.disagg_kv_sender.is_source_pending()
+            or req.disagg_kv_sender.is_aux_in_flight()
+        ):
+            req.disagg_kv_sender.failure_exception()
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
 
@@ -1007,6 +1013,31 @@ class SchedulerDisaggregationPrefillMixin:
         )
         self.maybe_send_health_check_signal()
 
+    def hold_failed_prefill_transfers(
+        self: Scheduler, reqs: List[Req], polls: List[int]
+    ) -> List[bool]:
+        """Which Failed requests to hold: a WRITE on some attn TP/CP rank may
+        still read their KV pages or metadata slot.
+
+        polls are post-reduce, so every rank runs the same collective. Each
+        sender fences its room first, so after this a request's hold can only
+        clear, never start: a release decided now stays safe.
+        """
+        if KVPoll.Failed not in polls:
+            return [False] * len(polls)
+        released = all_reduce_min_attn_cp_tp_group(
+            [
+                int(
+                    poll != KVPoll.Failed
+                    or not req.disagg_kv_sender.holds_failed_source()
+                )
+                for req, poll in zip(reqs, polls)
+            ],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        return [not r for r in released]
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -1026,9 +1057,20 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
+        # PP: rids_to_check is the stages' release consensus, which already
+        # excluded held requests (_pp_pd_get_prefill_transferred_ids); holding
+        # here again could keep a rid on one stage that every other released.
+        held = (
+            self.hold_failed_prefill_transfers(
+                self.disagg_prefill_inflight_queue, polls
+            )
+            if rids_to_check is None
+            else [False] * len(polls)
+        )
+
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        for req, poll, hold in zip(self.disagg_prefill_inflight_queue, polls, held):
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1072,6 +1114,8 @@ class SchedulerDisaggregationPrefillMixin:
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
+            elif poll == KVPoll.Failed and hold:
+                undone_reqs.append(req)
             elif poll == KVPoll.Failed:
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
@@ -1517,6 +1561,15 @@ class SchedulerDisaggregationPrefillMixin:
             )
         else:
             segments = [(start_idx, end_idx)]
+
+        if envs.SGLANG_NIXL_HOST_STAGING_MB.get():
+            event = torch.cuda.Event()
+            event.record(
+                self.forward_stream
+                if self.enable_overlap
+                else torch.cuda.current_stream()
+            )
+            req.disagg_kv_sender._host_ready_event = event
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
