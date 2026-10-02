@@ -1,7 +1,7 @@
 """CPU-only unit tests for the mamba pool ratio vs the prefill->decode peak.
 
 Pins the sizing invariant behind MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO:
-at the first cache_unfinished_req, a request still holds its admission-locked
+at the first insert_req, a request still holds its admission-locked
 matched-prefix mamba (protected) plus its own COW slot, and then allocates a
 donated slot. With N distinct-prefix requests that peak is N own + N locked +
 1 donated. An effective ratio of 2 (pool = 2N) leaves no evictable victim and

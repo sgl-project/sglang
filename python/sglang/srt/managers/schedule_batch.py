@@ -933,6 +933,9 @@ class ReqKvInfo:
 
     # The request's own KV is [cache_protected_len, kv_allocated_len).
     cache_protected_len: int = 0  # Tree cache owns [0, here) (matched or inserted)
+    # This request already inserted [0, here) into the tree; later inserts count
+    # a hit only on the nodes past it, so a request counts each node once.
+    cache_inserted_len: int = 0
     kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
 
@@ -1217,7 +1220,7 @@ class Req(ReqDllmMixin):
         # Refreshed at every sharded alloc — read through last_node, or drawn
         # least-full for a new chain — and consumed by the radix insert to
         # stamp new tree nodes. Allocation itself must NOT read it back when
-        # a tree node is available (the cache_unfinished_req dedup rebind
+        # a tree node is available (the insert_req dedup rebind
         # would make it stale); the only allocation-time reader is the
         # ChunkCache fallback, which has no tree nodes and no rebind.
         self.kv_rotation_base: Optional[int] = None
@@ -1978,6 +1981,7 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.kv.cache_protected_len = 0
+        self.kv.cache_inserted_len = 0
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
@@ -3257,7 +3261,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req, seq_len in zip(self.reqs, seq_lens, strict=True):
             req._refresh_fill_ids()
             # end runs one past full_untruncated_fill_ids while output_ids
-            # trails; safe only while decoding_reqs suppresses cache_unfinished_req.
+            # trails; safe only while decoding_reqs suppresses the checkpoint insert.
             req.set_extend_range(seq_len - 1, seq_len)
 
         self.prefix_lens = [seq_len - 1 for seq_len in seq_lens]
