@@ -4484,8 +4484,6 @@ class Scheduler(
                                         return_hidden_states=batch.return_hidden_states,
                                     )
                                     if self.enable_async_d2h_copy:
-                                        # Using the async D2H copy worker when NVIDIA
-                                        # Confidential Computing (CC) is enabled.
                                         batch_result.copy_done = (
                                             self.async_d2h_worker.submit(copy_fn)
                                         )
@@ -4780,8 +4778,6 @@ class Scheduler(
                 return_hidden_states=cur_batch.return_hidden_states,
             )
             if self.enable_async_d2h_copy:
-                # Using the async D2H copy worker when NVIDIA
-                # Confidential Computing (CC) is enabled.
                 batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
             else:
                 copy_fn()
