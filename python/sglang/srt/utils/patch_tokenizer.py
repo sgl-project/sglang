@@ -1,4 +1,5 @@
 import inspect
+import json
 import logging
 
 from sglang.srt.environ import envs
@@ -20,7 +21,38 @@ def patch_tokenizer(tokenizer):
         logger.info(f"Applying _pad(padding_side=...) compat shim for {type(tokenizer)}")
         return _PadPaddingSideShim.patch(tokenizer)
 
+    fixes = _find_added_token_id_mismatches(tokenizer)
+    if fixes:
+        logger.info(
+            f"Remapping {len(fixes)} added-token id(s) for {type(tokenizer).__name__} "
+            f"back to their tokenizer_config.json-declared ids: {fixes}"
+        )
+        return _AddedTokenIdShim.patch(tokenizer, fixes)
+
     return tokenizer
+
+
+def _find_added_token_id_mismatches(tokenizer) -> dict:
+    init_kwargs = getattr(tokenizer, "init_kwargs", None) or {}
+    authoritative = init_kwargs.get("added_tokens_decoder")
+    if not authoritative:
+        return {}
+    live = getattr(tokenizer, "added_tokens_decoder", None)
+    if not live:
+        return {}
+    live_by_content = {t.content: i for i, t in live.items()}
+
+    fixes = {}
+    for id_or_str, added_tok in authoritative.items():
+        try:
+            correct_id = int(id_or_str)
+        except (TypeError, ValueError):
+            continue
+        content = added_tok.content
+        live_id = live_by_content.get(content)
+        if live_id is not None and live_id != correct_id:
+            fixes[content] = correct_id
+    return fixes
 
 
 def _needs_pad_padding_side_shim(tokenizer) -> bool:
@@ -79,6 +111,49 @@ class _PadPaddingSideShim:
         tokenizer_cls._pad = patched_pad
         setattr(tokenizer_cls, cls._PATCHED_FLAG, True)
 
+        return tokenizer
+
+
+class _AddedTokenIdShim:
+    _PATCHED_FLAG = "_sglang_added_token_id_patched"
+
+    @classmethod
+    def patch(cls, tokenizer, fixes: dict):
+        if getattr(tokenizer, cls._PATCHED_FLAG, False):
+            return tokenizer
+
+        backend = getattr(tokenizer, "_tokenizer", None)
+        if backend is None or not hasattr(backend, "to_str"):
+            return tokenizer
+
+        try:
+            from tokenizers import Tokenizer as _RustTokenizer
+
+            state = json.loads(backend.to_str())
+            model_vocab = state.get("model", {}).get("vocab")
+            if not isinstance(model_vocab, dict):
+                return tokenizer
+
+            id_to_content = {v: k for k, v in model_vocab.items()}
+            for content, correct_id in fixes.items():
+                stale_content = id_to_content.get(correct_id)
+                if stale_content is not None and stale_content != content:
+                    del model_vocab[stale_content]
+                model_vocab[content] = correct_id
+
+            for entry in state.get("added_tokens", []):
+                if entry.get("content") in fixes:
+                    entry["id"] = fixes[entry["content"]]
+
+            tokenizer._tokenizer = _RustTokenizer.from_str(json.dumps(state))
+        except Exception:
+            logger.warning(
+                f"Failed to remap added-token ids for {type(tokenizer)}",
+                exc_info=True,
+            )
+            return tokenizer
+
+        setattr(tokenizer, cls._PATCHED_FLAG, True)
         return tokenizer
 
 
