@@ -460,6 +460,7 @@ class DeepseekSparseAttnBackend(
                 16 // self.num_q_heads if self.num_q_heads < 16 else 1
             )
             self.num_head_padded = self.num_q_heads * self.head_repeat_factor
+            self.aiter_dsa_max_split_per_batch = 64
             self.aiter_dsa_metadata_capacity = 0
             self.aiter_dsa_metadata_max_seqlen_q = 0
             self.aiter_dsa_metadata_q_dtype = None
@@ -719,7 +720,7 @@ class DeepseekSparseAttnBackend(
             kv_last_page_lens,
             self.num_head_padded,
             1,
-            True,
+            False,
             self.aiter_dsa_work_metadata,
             self.aiter_dsa_work_info_set,
             self.aiter_dsa_work_indptr,
@@ -732,6 +733,7 @@ class DeepseekSparseAttnBackend(
             uni_seqlen_qo=max_seqlen_q,
             fast_mode=True,
             topk=-1,
+            max_split_per_batch=self.aiter_dsa_max_split_per_batch,
             intra_batch_mode=False,
             dtype_q=q_dtype,
             dtype_kv=kv_dtype,
