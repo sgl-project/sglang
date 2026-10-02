@@ -64,8 +64,10 @@ class PPUSRTPlatform(PPUDeviceMixin, SRTPlatform):
         return _ZW810E_NAME in self.get_device_name()
 
 
-# Load PPU FA3 ops hook when running on PPU hardware.
-# The module-level @plugin_hook decorator registers an AROUND hook on
-# FlashAttentionBackend.__init__ so PPU-specific FA3 ops are used transparently.
+# Load PPU attention hooks when running on PPU hardware.
+# Each module registers @plugin_hook decorators that inject PPU-native ops
+# into the respective attention backends transparently.
 if is_ppu_available():
+    import sglang.srt.hardware_backend.ppu.attention.ppu_dsa_hooks  # noqa: F401
     import sglang.srt.hardware_backend.ppu.attention.ppu_fa3_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.ppu.attention.ppu_flashmla_hooks  # noqa: F401
