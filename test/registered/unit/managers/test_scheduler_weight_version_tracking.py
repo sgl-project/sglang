@@ -1,10 +1,13 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
+
+import msgspec
 
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
+    UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
@@ -359,6 +362,183 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertIn("begin_weight_update", output.message)
         target.weight_updater.receive_weights_from_distributed.assert_not_called()
+
+
+class TestNcclM2NWeightUpdateSession(_WeightUpdaterManagerTestBase):
+    def _m2n_request(self, **fields):
+        return UpdateWeightsFromDistributedReqInput(
+            **{
+                "names": [],
+                "dtypes": [],
+                "shapes": [],
+                "group_name": "pp0",
+                "load_format": "nccl_m2n",
+                "selector": "target",
+                "flush_cache": False,
+                **fields,
+            }
+        )
+
+    def test_ipc_waves_and_residual_finalize_once(self):
+        for concurrent in (False, True):
+            with self.subTest(concurrent=concurrent):
+                target = _runner()
+                manager = self._manager(target)
+                for groups in (["pp0", "pp1"], ["pp2"]):
+                    req = self._m2n_request(
+                        group_name=groups[0],
+                        m2n_group_names=groups if concurrent else None,
+                    )
+                    decoded = msgspec.msgpack.decode(
+                        msgspec.msgpack.encode(req), type=type(req)
+                    )
+                    self.assertEqual(decoded.m2n_group_names, req.m2n_group_names)
+                    # Old positional IPC requests still decode with the appended default.
+                    legacy = msgspec.msgpack.decode(msgspec.msgpack.encode(req))[:-1]
+                    self.assertIsNone(
+                        msgspec.msgpack.decode(
+                            msgspec.msgpack.encode(legacy), type=type(req)
+                        ).m2n_group_names
+                    )
+                    self.assertTrue(
+                        manager.update_weights_from_distributed(decoded).success
+                    )
+                    target.weight_updater.end_weight_update.assert_not_called()
+                if concurrent:
+                    self.assertEqual(
+                        target.weight_updater.receive_weights_from_m2n_groups.call_args_list,
+                        [call(["pp0", "pp1"]), call(["pp2"])],
+                    )
+                else:
+                    self.assertEqual(
+                        target.weight_updater.receive_weights_from_m2n.call_args_list,
+                        [call("pp0"), call("pp2")],
+                    )
+                manager._session = msgspec.structs.replace(
+                    manager._session, sync_base=False
+                )
+                self.assertFalse(
+                    manager.update_weights_from_distributed(decoded).success
+                )
+                manager._session = msgspec.structs.replace(
+                    manager._session, sync_base=True
+                )
+                self.assertTrue(
+                    manager.update_weights_from_distributed(_request()).success
+                )
+                target.weight_updater.load_weights_from_distributed.assert_called_once()
+                self.assertTrue(
+                    manager.end_weight_update(EndWeightUpdateReqInput()).success
+                )
+                target.weight_updater.end_weight_update.assert_called_once_with(
+                    run_post_load=True
+                )
+
+    def test_open_session_rejects_reentry_without_changing_state(self):
+        for m2n in (False, True):
+            for selector, sync_base in (
+                ("target", True),
+                ("all", True),
+                ("target", False),
+            ):
+                with self.subTest(m2n=m2n, selector=selector, sync_base=sync_base):
+                    target, draft = _runner(), _runner()
+                    target.weight_updater._m2n_receivers = (
+                        {"pp0": Mock()} if m2n else {}
+                    )
+                    manager = self._manager(target, draft, session=False)
+                    with patch("torch.distributed.barrier") as barrier:
+                        self.assertTrue(
+                            manager.begin_weight_update(
+                                BeginWeightUpdateReqInput(selector="target")
+                            ).success
+                        )
+                        manager._session = msgspec.structs.replace(
+                            manager._session,
+                            loaded_weights=True,
+                            requires_post_load=True,
+                            pending_version="pending",
+                        )
+                        original_session = manager._session
+                        barrier.reset_mock()
+                        output = manager.begin_weight_update(
+                            BeginWeightUpdateReqInput(
+                                selector=selector, sync_base=sync_base
+                            )
+                        )
+                        self.assertFalse(output.success)
+                        self.assertIn("already open", output.message)
+                        self.assertIs(manager._session, original_session)
+                        barrier.assert_not_called()
+                    target.weight_updater.begin_weight_update.assert_called_once()
+                    draft.weight_updater.begin_weight_update.assert_not_called()
+
+    def test_failed_m2n_update_does_not_reopen_session(self):
+        target = _runner()
+        target.weight_updater._m2n_receivers = {"pp0": Mock()}
+        manager = self._manager(target, session=False)
+        self.assertTrue(
+            manager.begin_weight_update(
+                BeginWeightUpdateReqInput(selector="target")
+            ).success
+        )
+        original_session = manager._session
+        target.weight_updater.receive_weights_from_m2n.side_effect = RuntimeError(
+            "transfer failed"
+        )
+        output = manager.update_weights_from_distributed(
+            self._m2n_request(weight_version="failed")
+        )
+        self.assertFalse(output.success)
+        self.assertIn("restart the affected rollout engines", output.message)
+        self.assertIs(manager._session, original_session)
+        self.assertEqual(self.recorded, [])
+        target.weight_updater.end_weight_update.assert_not_called()
+        output = manager.begin_weight_update(
+            BeginWeightUpdateReqInput(selector="target")
+        )
+        self.assertFalse(output.success)
+        self.assertIn("already open", output.message)
+
+    def test_m2n_version_is_published_only_when_session_commits(self):
+        for abort in (False, True):
+            with self.subTest(abort=abort):
+                self.recorded.clear()
+                manager = self._manager(_runner())
+                self.assertTrue(
+                    manager.update_weights_from_distributed(
+                        self._m2n_request(weight_version="m2n-v2")
+                    ).success
+                )
+                self.assertEqual(manager._session.pending_version, "m2n-v2")
+                self.assertEqual(self.recorded, [])
+                self.assertTrue(
+                    manager.end_weight_update(
+                        EndWeightUpdateReqInput(abort=abort)
+                    ).success
+                )
+                self.assertEqual(self.recorded, [] if abort else ["m2n-v2"])
+                self.assertIsNone(manager._session)
+
+    def test_m2n_post_load_requirement_does_not_leak_into_next_session(self):
+        target = _runner()
+        manager = self._manager(target)
+        self.assertTrue(
+            manager.update_weights_from_distributed(self._m2n_request()).success
+        )
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
+        self.assertTrue(
+            manager.begin_weight_update(BeginWeightUpdateReqInput()).success
+        )
+        self.assertTrue(manager.update_weights_from_distributed(_request()).success)
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
+        self.assertEqual(
+            target.weight_updater.end_weight_update.call_args_list,
+            [
+                call(run_post_load=True),
+                call(run_post_load=False),
+            ],
+        )
 
 
 if __name__ == "__main__":

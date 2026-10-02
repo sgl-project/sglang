@@ -757,5 +757,86 @@ def test_fp8_rejects_incompatible_formats_without_replacing_storage(
         assert parameter.stride() == buffers[name].stride()
 
 
+@pytest.mark.parametrize("failure", ["native", "process_group"])
+def test_m2n_teardown_preserves_resources_on_failure(failure):
+    from sglang.srt.model_executor.model_runner_components.weight_updater import (
+        WeightUpdater,
+    )
+
+    events = []
+    receivers = {name: Mock() for name in ("pp0", "pp1")}
+    groups = {"pp0": "pg0", "pp1": "pg1", "residual": "residual"}
+    runner = SimpleNamespace(
+        _m2n_receivers=receivers.copy(), _model_update_group=groups.copy()
+    )
+    for name, receiver in receivers.items():
+        receiver.stream.synchronize.side_effect = lambda name=name: events.append(
+            ("sync", name)
+        )
+        receiver.destroy.side_effect = lambda name=name: events.append(("native", name))
+    if failure == "native":
+        receivers["pp1"].destroy.side_effect = RuntimeError("native failed")
+
+    def destroy(pg):
+        events.append(("pg", pg))
+        if failure == "process_group" and pg == "pg1" and events.count(("pg", pg)) == 1:
+            raise RuntimeError("process group failed")
+
+    with patch("torch.distributed.destroy_process_group", side_effect=destroy):
+        assert not WeightUpdater.destroy_weights_update_group(runner, "pp0")[0]
+        assert events[:3] == [("sync", "pp0"), ("sync", "pp1"), ("native", "pp0")]
+        if failure == "native":
+            assert not any(kind == "pg" for kind, _ in events)
+            assert runner._m2n_receivers == receivers
+            receivers["pp1"].destroy.side_effect = lambda: events.append(
+                ("native", "pp1")
+            )
+        else:
+            assert events[3:5] == [("native", "pp1"), ("pg", "pg0")]
+            assert list(runner._m2n_receivers) == ["pp1"]
+        assert WeightUpdater.destroy_weights_update_group(runner, "pp1")[0]
+        assert WeightUpdater.destroy_weights_update_group(runner, "pp0")[0]
+    assert runner._m2n_receivers == {}
+    assert runner._model_update_group == {"residual": "residual"}
+
+
+@pytest.mark.parametrize("cache", ["ipc", "compensated_mhc", "model_owned"])
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_m2n_receive_respects_upstream_weight_cache_guards(cache, concurrent):
+    from sglang.srt.model_executor.model_runner_components import weight_updater as wu
+
+    receiver = Mock()
+    model = torch.nn.Module()
+    model.child = torch.nn.Module()
+    if cache == "compensated_mhc":
+        model.child._hc_attn_tf32_parts = object()
+    elif cache == "model_owned":
+        model.child._derived_weight_cache_error = "model-owned derived cache"
+    updater = object.__new__(wu.WeightUpdater)
+    object.__setattr__(updater, "_m2n_receivers", {"pp0": receiver})
+    object.__setattr__(updater, "get_model", lambda: model)
+    with (
+        patch.object(
+            wu,
+            "get_model",
+            return_value=SimpleNamespace(
+                weight_cache_mode="attach" if cache == "ipc" else "off"
+            ),
+        ),
+        patch(
+            "sglang.srt.weight_sync.nccl_m2n.NcclM2NReceiver.receive_many"
+        ) as receive_many,
+    ):
+        with pytest.raises(
+            RuntimeError, match="weight_cache|compensated mHC|derived cache"
+        ):
+            if concurrent:
+                updater.receive_weights_from_m2n_groups(["pp0"])
+            else:
+                updater.receive_weights_from_m2n("pp0")
+        receive_many.assert_not_called()
+    receiver.receive.assert_not_called()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
