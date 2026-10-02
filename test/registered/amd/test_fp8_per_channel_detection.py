@@ -121,22 +121,25 @@ def _process_with_fnuz_aiter_per_token(activation_scheme, input_scale_value):
 
 
 class TestFnuzAiterPerTokenInputScale(unittest.TestCase):
-    """Regression: on ROCm e4m3fnuz, Fp8LinearMethod.process_weights_after_loading
-    doubled weight_scale but not a static activation input_scale on the
-    ``_use_aiter and use_aiter_fp8_per_token`` branch. A static input_scale is
-    still consumed by apply_fp8_linear, so leaving it un-doubled quantizes
-    activations against a 2x-overrange scale -> wrong GEMM results.
+    """Regression: the aiter per-token path forces dynamic per-token activation
+    quant (use_per_token_if_dynamic), which is incompatible with a static
+    per-tensor input_scale. Fp8LinearMethod.process_weights_after_loading must
+    drop a static input_scale here so apply_fp8_linear (and the fused
+    RMSNorm+quant path) quantize activations per token; keeping it would run
+    static per-tensor quant and, on fnuz, against an un-doubled (2x-overrange)
+    scale -> wrong GEMM results. weight_scale is still fnuz-doubled.
     """
 
-    def test_static_input_scale_is_doubled(self):
-        """Static activation scale must be doubled to match the fnuz weight scale."""
+    def test_static_input_scale_is_dropped(self):
+        """A static input_scale must be dropped (None) on the per-token path."""
         layer = _process_with_fnuz_aiter_per_token(
             activation_scheme="static", input_scale_value=0.5
         )
-        # weight_scale doubling is the existing behavior that defines the target;
-        # input_scale must track it (0.5 -> 1.0). Pre-fix it stayed 0.5.
+        # Dropped so activations go through dynamic per-token quant. Pre-fix it
+        # was kept (0.5, un-doubled); an earlier fix kept it doubled (1.0).
+        self.assertIsNone(layer.input_scale)
+        # weights still need the fnuz reinterpretation (0.5 -> 1.0).
         self.assertAlmostEqual(layer.weight_scale.flatten()[0].item(), 1.0, places=6)
-        self.assertAlmostEqual(layer.input_scale.item(), 1.0, places=6)
 
     def test_dynamic_input_scale_stays_none(self):
         """Dynamic activation (input_scale is None) must not crash or be set."""

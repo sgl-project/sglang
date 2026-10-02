@@ -1088,20 +1088,16 @@ class Fp8LinearMethod(LinearMethodBase):
                     if _use_aiter and self.use_aiter_fp8_per_token:
                         # Otherwise, by default, aiter only uses per-tensor quantization
                         self.use_per_token_if_dynamic = True
+                        # This path quantizes activations dynamically per token, which
+                        # is incompatible with a static per-tensor input_scale. Drop it
+                        # so apply_fp8_linear (and the fused RMSNorm+quant path) compute
+                        # the activation scale per token instead of reusing a stale one.
+                        layer.input_scale = None
                         if _is_fp8_fnuz:
-                            # Double the static input_scale too: apply_fp8_linear still
-                            # consumes it, so it must match the fnuz reinterpretation.
-                            weight, weight_scale, input_scale = (
-                                normalize_e4m3fn_to_e4m3fnuz(
-                                    weight=weight,
-                                    weight_scale=weight_scale,
-                                    input_scale=layer.input_scale,
-                                )
+                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                                weight=weight,
+                                weight_scale=weight_scale,
                             )
-                            if input_scale is not None:
-                                layer.input_scale = Parameter(
-                                    input_scale, requires_grad=False
-                                )
                         if use_aiter_bpreshuffle_gemm(weight.shape[0]):
                             weight = shuffle_weight(weight.contiguous(), (16, 16))
                 else:
@@ -1131,13 +1127,17 @@ class Fp8LinearMethod(LinearMethodBase):
                 # Update layer with new values.
                 layer.weight = Parameter(weight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                # input_scale is None when the per-token path above dropped it.
                 if (
-                    hasattr(self.quant_config, "activation_scheme")
-                    and self.quant_config.activation_scheme == "static"
-                ) or (
-                    hasattr(self.quant_config, "linear_activation_scheme")
-                    and self.quant_config.linear_activation_scheme == "static"
-                ):
+                    (
+                        hasattr(self.quant_config, "activation_scheme")
+                        and self.quant_config.activation_scheme == "static"
+                    )
+                    or (
+                        hasattr(self.quant_config, "linear_activation_scheme")
+                        and self.quant_config.linear_activation_scheme == "static"
+                    )
+                ) and layer.input_scale is not None:
                     layer.input_scale = Parameter(
                         layer.input_scale.max(), requires_grad=False
                     )
