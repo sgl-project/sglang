@@ -122,9 +122,9 @@ const _: () = {
 pub enum ReplayOutcome {
     /// Every missing batch was recovered.
     Repaired,
-    /// The engine's history no longer reached back far enough.
+    /// History did not cover the gap, or replay failed after recovering part of it.
     Incomplete,
-    /// No answer: socket error or timeout.
+    /// Socket/decode error or timeout before any missing batch was recovered.
     Failed,
 }
 

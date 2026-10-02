@@ -608,32 +608,36 @@ async fn fill_gap(
     to: i64,
     tally: &EventTally,
 ) -> Vec<WorkerEvent> {
-    let batches = match tokio::time::timeout(REPLAY_TIMEOUT, fetch_replay(endpoint, from)).await {
-        Ok(Ok(batches)) => batches,
+    // Keep received batches outside the timed future so cancellation or a
+    // later socket/decode error cannot discard an already recovered removal.
+    let mut batches = Vec::new();
+    let completed = match tokio::time::timeout(
+        REPLAY_TIMEOUT,
+        fetch_replay(endpoint, from, to, &mut batches),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
         Ok(Err(e)) => {
             warn!(worker = ?id, from, to, error = %e, "kv-events: gap replay failed");
-            tally.record_replay(ReplayOutcome::Failed);
-            return Vec::new();
+            false
         }
         Err(_) => {
             warn!(worker = ?id, from, to, "kv-events: gap replay timed out");
-            tally.record_replay(ReplayOutcome::Failed);
-            return Vec::new();
+            false
         }
     };
-    let batches: Vec<_> = batches
-        .into_iter()
-        .filter(|(seq, _)| (from..to).contains(seq))
-        .collect();
     let outcome = if batches.len() as i64 == to - from {
         ReplayOutcome::Repaired
+    } else if !completed && batches.is_empty() {
+        ReplayOutcome::Failed
     } else {
         warn!(
             worker = ?id,
             from,
             to,
             recovered = batches.len(),
-            "kv-events: replay history no longer covers the gap",
+            "kv-events: replay did not cover the gap",
         );
         ReplayOutcome::Incomplete
     };
@@ -648,27 +652,38 @@ async fn fill_gap(
         .collect()
 }
 
-/// Ask the publisher's ROUTER for every buffered batch from `from` on.
+/// Ask the publisher's ROUTER for buffered batches from `from` on, retaining
+/// only `from..to`. The publisher replies in sequence order, so stop once the
+/// gap's end is reached without waiting for newer batches or their END_SEQ.
 /// Wire contract: `ZmqEventPublisher._service_replay` in SGLang's
 /// `disaggregation/kv_events.py`; replies are `[b"", seq, payload]` up to an
 /// `END_SEQ` frame.
-async fn fetch_replay(endpoint: &str, from: i64) -> anyhow::Result<Vec<(i64, KvEventBatch)>> {
+async fn fetch_replay(
+    endpoint: &str,
+    from: i64,
+    to: i64,
+    batches: &mut Vec<(i64, KvEventBatch)>,
+) -> anyhow::Result<()> {
     let mut dealer = DealerSocket::new();
     dealer.connect(endpoint).await?;
     let mut request = ZmqMessage::from(Bytes::new());
     request.push_back(Bytes::copy_from_slice(&from.to_be_bytes()));
     dealer.send(request).await?;
-    let mut batches = Vec::new();
     loop {
         let reply = dealer.recv().await?;
         let (Some(seq), Some(payload)) = (reply.get(1), reply.get(2)) else {
             return Err(anyhow!("replay reply has {} frames", reply.len()));
         };
         let seq = i64::from_be_bytes(seq.as_ref().try_into().context("replay seq frame")?);
-        if seq == END_SEQ_SENTINEL {
-            return Ok(batches);
+        if seq == END_SEQ_SENTINEL || seq >= to {
+            return Ok(());
         }
-        batches.push((seq, decode_event_batch(payload.as_ref())?));
+        if seq >= from {
+            batches.push((seq, decode_event_batch(payload.as_ref())?));
+        }
+        if seq == to - 1 {
+            return Ok(());
+        }
     }
 }
 
@@ -1769,6 +1784,65 @@ mod tests {
         assert_eq!(tally.replays(ReplayOutcome::Repaired), 1);
         server.await.unwrap();
         registry.shutdown().await;
+    }
+
+    /// Replay can time out or fail after useful batches have already arrived.
+    #[tokio::test]
+    async fn replay_preserves_batches_before_timeout_or_decode_error() {
+        use zeromq::RouterSocket;
+
+        for (seqs, malformed_tail, expected) in [
+            (vec![2], false, ReplayOutcome::Incomplete),
+            (vec![2], true, ReplayOutcome::Incomplete),
+            (vec![], true, ReplayOutcome::Failed),
+            (vec![2, 3], false, ReplayOutcome::Repaired),
+        ] {
+            let mut router = RouterSocket::new();
+            let endpoint = router.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
+            let sent = seqs.clone();
+            let server = tokio::spawn(async move {
+                let request = router.recv().await.unwrap();
+                let peer = request.get(0).unwrap().clone();
+                for seq in sent {
+                    let mut reply = ZmqMessage::from(peer.clone());
+                    reply.push_back(Bytes::new());
+                    reply.push_back(Bytes::copy_from_slice(&i64::to_be_bytes(seq)));
+                    reply.push_back(Bytes::from(helpers::encode_all_blocks_cleared_batch(
+                        0.0, None,
+                    )));
+                    router.send(reply).await.unwrap();
+                }
+                if malformed_tail {
+                    let mut reply = ZmqMessage::from(peer);
+                    reply.push_back(Bytes::new());
+                    reply.push_back(Bytes::copy_from_slice(&3i64.to_be_bytes()));
+                    reply.push_back(Bytes::from_static(&[0xc1])); // Invalid msgpack.
+                    router.send(reply).await.unwrap();
+                }
+                // Keep the socket open without END_SEQ. A complete gap must
+                // finish immediately; a partial one must survive the timeout.
+                std::future::pending::<()>().await;
+            });
+            let id = KvWorkerId::new("http://worker".into(), 0);
+            let tally = EventTally::new();
+            let deadline = if expected == ReplayOutcome::Repaired {
+                REPLAY_TIMEOUT / 2
+            } else {
+                REPLAY_TIMEOUT * 2
+            };
+            let result = timeout(deadline, fill_gap(&id, &endpoint, 2, 4, &tally)).await;
+            server.abort();
+            let _ = server.await;
+            let recovered: Vec<_> = result
+                .expect("replay must finish without waiting for an unrelated tail")
+                .into_iter()
+                .map(|event| helpers::expect_batch(event).1)
+                .collect();
+            assert_eq!(recovered, seqs, "malformed_tail={malformed_tail}");
+            for outcome in ReplayOutcome::ALL {
+                assert_eq!(tally.replays(outcome), u64::from(outcome == expected));
+            }
+        }
     }
 
     #[tokio::test]
