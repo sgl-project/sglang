@@ -30,25 +30,34 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _shared_allocator(*, page_size=4, total_bytes=1024):
+def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
+    # `pool_tokens` sizes both sub-pools directly, for a test whose arithmetic
+    # needs an exact token count rather than whatever a byte budget buys.
+    sized = (
+        dict(
+            full_max_total_num_tokens=pool_tokens, swa_max_total_num_tokens=pool_tokens
+        )
+        if pool_tokens is not None
+        else dict(total_bytes=total_bytes)
+    )
     return init_unified_swa_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
-        head_dim=4,
-        v_head_dim=4,
+        head_dim=8,
+        v_head_dim=8,
         swa_head_num=1,
-        swa_head_dim=4,
-        swa_v_head_dim=4,
+        swa_head_dim=8,
+        swa_v_head_dim=8,
         page_size=page_size,
         start_layer=0,
         end_layer=2,
         swa_attention_layer_ids=[1],
         full_attention_layer_ids=[0],
-        total_bytes=total_bytes,
         enable_memory_saver=False,
         need_sort=False,
         lazy_compaction=True,
+        **sized,
     ).token_to_kv_pool_allocator
 
 
@@ -148,8 +157,11 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
 class TestSharedPrefillAdmission(unittest.TestCase):
     def _new_admission(self, page_size, pool_pages, *, ignore_eos=False):
         allocator = _shared_allocator(
-            page_size=page_size, total_bytes=pool_pages * page_size * 16
+            page_size=page_size, pool_tokens=pool_pages * page_size
         )
+        # The admission arithmetic below is tuned to this pool; a resize would
+        # measure something else, so pin the geometry rather than assume it.
+        self.assertEqual(allocator.size_full, pool_pages * page_size)
         req = Req(
             rid="unaligned-prompt",
             origin_input_text=None,
@@ -191,7 +203,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
     def test_unaligned_final_chunk_makes_progress(self):
         for page_size in (4, 64):
             with self.subTest(page_size=page_size):
-                allocator, req, adder = self._new_admission(page_size, pool_pages=7)
+                allocator, req, adder = self._new_admission(page_size, pool_pages=6)
                 req.prefix_indices = allocator.alloc(page_size)
                 self.assertIsNotNone(req.prefix_indices)
                 self.assertTrue(allocator.can_reserve(page_size + 2, page_size + 2))
@@ -204,7 +216,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
         for page_size in (4, 64):
             with self.subTest(page_size=page_size):
                 allocator, req, adder = self._new_admission(
-                    page_size, pool_pages=6, ignore_eos=True
+                    page_size, pool_pages=5, ignore_eos=True
                 )
                 self.assertEqual(len(req.prefix_indices), 0)
                 self.assertTrue(allocator.can_reserve(2 * page_size + 2, 2 * page_size))

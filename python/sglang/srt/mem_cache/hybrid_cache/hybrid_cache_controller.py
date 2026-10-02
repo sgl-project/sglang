@@ -46,7 +46,6 @@ from sglang.srt.runtime_context import get_memory
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedMHATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.utils import broadcast_pyobj
 
@@ -857,18 +856,12 @@ class HybridCacheController(BaseHiCacheController):
             ):
                 raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
             entry = self.mem_pool_host.entry_map[pool_transfer.name]
-            indices = pool_transfer.device_indices
-            if pool_transfer.name == PoolName.SWA and isinstance(
-                entry.device_pool, UnifiedMHATokenToKVPool
-            ):
-                # SWA reload reserves physical slots before binding FULL ids.
-                indices = entry.device_pool._physical_to_kernel_indices(indices)
             transfers.append(
                 L2Transfer(
                     host_pool=entry.host_pool,
                     device_pool=entry.device_pool,
                     host_indices=pool_transfer.host_indices,
-                    device_indices=indices,
+                    device_indices=pool_transfer.device_indices,
                     layer_mapper=entry.layer_mapper,
                 )
             )
@@ -1700,7 +1693,7 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             if entry.device_indices_from_anchor_fn is not None:
                 # Allocate independent pools first: their allocation/eviction
-                # can compact SWA before its kernel-facing IDs are captured.
+                # can compact SWA before its physical IDs are captured.
                 anchor_transfers.append((pool, entry))
                 continue
             # device_alloc_fn / device_free_fn override entry.device_pool's

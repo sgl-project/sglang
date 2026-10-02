@@ -127,9 +127,9 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.available_size(),
         )
 
-        # HiCache indexes the full sub-pool's per-layer views with kernel-facing IDs.
+        # HiCache indexes the full sub-pool's per-layer views with physical IDs.
         kvcache.full_kv_pool.host_transfer_translate = (
-            self.full_attn_allocator.translate_kv_loc_for_kernel
+            self.full_attn_allocator.translate_kv_loc
         )
 
     # -- size: dynamic --
@@ -255,20 +255,17 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> physical TOKEN ids; `-1` passes through as
-        `-1` (padding downstream). ``out=`` supports cuda-graph buffer stability."""
+        """Full-pool virtual TOKEN ids -> physical TOKEN ids; an unmapped or
+        negative id lands on 0, the sink. ``out=`` supports cuda-graph buffer
+        stability."""
         result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
         return result
 
     @property
-    def kernel_page_multiplier(self) -> int:
-        return self.full_attn_allocator.kernel_page_multiplier
-
-    @property
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the full sub-pool. Kernels that
-        build the MLA block table straight from req_to_token gather through this,
-        then scale by `kernel_page_multiplier` to reach the per-page block."""
+        build the MLA block table straight from req_to_token gather through this;
+        an entry is the physical page."""
         return self.full_attn_allocator.virtual_to_physical
 
     @property
@@ -276,24 +273,15 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Page-level physical->virtual table of the full sub-pool."""
         return self.full_attn_allocator.physical_to_virtual
 
-    def translate_kv_loc_for_kernel(
-        self,
-        loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
-        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
-
-    def translate_write_loc_for_kernel(
+    def translate_write_loc(
         self,
         loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
-        """Widened virtual WRITE loc -> DENSE id; see the sub-allocator's copy."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(
+        """Widened virtual WRITE loc -> physical id; see the sub-allocator's copy."""
+        return self.full_attn_allocator.translate_write_loc(
             loc, out=out, out_width=out_width
         )
 
@@ -301,7 +289,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
         """Virtual TOKEN ids -> PHYSICAL token ids for the PD transfer engine.
-        PHYSICAL, not kernel-facing: the transfer registers page ENVELOPES (see
+        The transfer registers page ENVELOPES and addresses them by PHYSICAL id (see
         `UnifiedMLATokenToKVPool.get_contiguous_buf_infos`)."""
         # Defensive: `_validate_unified_memory_dcp` rejects this pairing at
         # argument validation, so reaching it means a config path got past that.

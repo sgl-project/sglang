@@ -50,6 +50,17 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def storage_model_name(
+    model_name: Optional[str], host_pool: HostKVCache
+) -> Optional[str]:
+    """The model name storage backends key pages on, tagged with the host
+    pool's page format when it has one of its own."""
+    tag = host_pool.storage_format_tag
+    if tag is None:
+        return model_name
+    return f"{model_name}-{tag}" if model_name else tag
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -730,6 +741,7 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        model_name = storage_model_name(model_name, self.storage_host_pool)
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
