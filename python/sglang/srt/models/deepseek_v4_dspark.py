@@ -110,8 +110,6 @@ class DSparkAttention(MqaAttentionBase):
             layer_id,
             quant_config,
             prefix,
-            attn_tp_rank=get_parallel().attn_tp_rank,
-            attn_tp_size=get_parallel().attn_tp_size,
             compress_ratio=0,
             fuse_wqa_wkv=False,
             wo_a_fp8=False,
