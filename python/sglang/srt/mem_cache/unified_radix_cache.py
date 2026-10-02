@@ -1129,8 +1129,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
-        # At finish the repoint is redundant but harmless: the row is freed
-        # right after, and the match has no side effects on a finished req.
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
