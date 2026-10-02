@@ -331,12 +331,9 @@ def alloc_req_slots(
     and should surface rather than be masked.
     """
     num_reqs = len(reqs)
-    if not ensure_mamba_capacity(req_to_token_pool, reqs, tree_cache):
-        raise RuntimeError(
-            "alloc_req_slots runs out of Mamba state slots. "
-            "Please set a smaller number for `--max-running-requests`. "
-            f"{num_reqs=}, "
-        )
+    # Keep combined serving's existing behavior: try cache eviction, then let
+    # the pool allocate. A failed precheck need not mean allocation will fail.
+    ensure_mamba_capacity(req_to_token_pool, reqs, tree_cache)
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(

@@ -73,9 +73,8 @@ class TestMambaCapacity(unittest.TestCase):
         self.assertEqual(pool.mamba_allocator.available_size(), 2)
         self.assertIsNone(req.kv.req_pool_idx)
         self.assertIsNone(req.kv.mamba_pool_idx)
-        with self.assertRaisesRegex(RuntimeError, "Mamba state slots"):
-            alloc_req_slots(pool, [req], cache)
-        pool.alloc.assert_not_called()
+        self.assertEqual(alloc_req_slots(pool, [req], cache), [1])
+        pool.alloc.assert_called_once_with([req])
 
     def test_uses_only_missing_slots_for_each_request(self):
         pool, held = make_pool(2)
