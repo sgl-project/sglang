@@ -3,8 +3,9 @@
 Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
 Serves a single model and routes across its workers. Exposes
-`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions`
-(buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker
+`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions` and
+SGLang's native [`/generate`](#native-generate) (buffered and SSE), plus
+`/healthz` / `/readyz` and `/metrics`. Worker
 pools come from either a static URL list or Kubernetes EndpointSlice
 discovery. Both edges speak cleartext HTTP/2 where the peer does — see
 [HTTP/2](#http2).
@@ -182,8 +183,10 @@ model, KV-event publisher, HTTP/2 support and DP size. An engine launched with
 
 ### Fleet-wide sampling contract
 
-`--override-sampling-params` fixes the sampling configuration for every client
-of this router, independently of what the engine's own defaults happen to be:
+`--override-sampling-params` fixes the sampling configuration for every
+chat-completions client of this router, independently of what the engine's own
+defaults happen to be (native [`/generate`](#native-generate) passes its
+`sampling_params` through, as the engine does):
 
 ```bash
 sgl-router \
@@ -350,6 +353,32 @@ case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
 backend and cache state. `/metrics` exposes only
 `sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
 how much tokenization work the cache reuses.
+
+## Native `/generate`
+
+`/generate` (`POST` or `PUT`) has the engine's interface: the same
+`GenerateReqInput` body and the same response, buffered or SSE. The body names no
+model, so requests go to the one this router serves. Worker selection
+(`--chat-routing`, `--policy`), PD dispatch, and abort-on-disconnect are shared
+with chat completions.
+
+With a tokenizer loaded, the router tokenizes `text` (a string or a list) with
+the special tokens SGLang adds (BOS per `add_bos_token` for Llama-, Gemma- and
+Cohere-class tokenizers, otherwise the `tokenizer.json` post-processor's), and
+forwards it as `input_ids`. The engine skips tokenizing and routing sees its exact
+tokens. Multimodal requests keep `text`, since the engine expands placeholders
+from it, and `--disable-input-ids-forwarding` keeps it for every request. So does
+a model whose `tokenizer.json` normalizer transformers replaces on load (legacy
+SentencePiece Llama files, bge-m3), as the router cannot reproduce its tokens. A
+batch goes to one worker: load counts every prompt and each of its `n` samples,
+while bucket and context limits bound the longest prompt plus its own
+`max_new_tokens`.
+
+Otherwise the body passes through, plus PD bootstrap fields and a minted `rid`
+for a single prompt that has none. `--override-sampling-params` does not apply:
+`sampling_params` pass through. Under `--dp-aware` each worker's body also
+carries the chosen `routed_dp_rank`; a PD batch or `n > 1` request leaves the
+prefill rank to the engine, which gives item `i` the bootstrap room `room + i`.
 
 ## DeepSeek V4
 

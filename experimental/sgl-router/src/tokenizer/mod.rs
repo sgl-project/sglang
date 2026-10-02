@@ -64,6 +64,8 @@ pub struct TokenizerRegistry {
     formatters: DashMap<String, Arc<ChatFormatterEntry>>,
     /// Resolved encode backend and L1 cache counters of the served model's tokenizer.
     stats: Arc<stats::TokenizerStats>,
+    /// Special tokens the engine adds around a raw prompt; `None` if unknown.
+    prompt_affixes: Option<(Vec<u32>, Vec<u32>)>,
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -88,7 +90,14 @@ impl TokenizerRegistry {
             "tokenizer loaded");
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
-        match ChatFormatter::load(&m.id, tokenizer_path) {
+        let files = adapter::ModelFiles::open(tokenizer_path);
+        me.prompt_affixes = adapter::prompt_affixes(tokenizer_path, &files)
+            .map_err(|e| {
+                tracing::warn!(model = %m.id, error = %format!("{e:#}"),
+                    "cannot reproduce the engine's tokens; /generate forwards text")
+            })
+            .ok();
+        match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
                 let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
                 me.formatters
@@ -134,6 +143,13 @@ impl TokenizerRegistry {
 
     pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
         self.inner.get(model_id).map(|r| Arc::clone(&*r))
+    }
+
+    /// Encode a raw prompt as the engine's `tokenizer(text)` does, special tokens included.
+    pub fn encode_prompt(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
+        let (prefix, suffix) = self.prompt_affixes.as_ref()?;
+        let ids = adapter::encode(&*self.get(model_id)?, text).ok()?;
+        (!ids.is_empty()).then(|| [prefix.as_slice(), &ids, suffix].concat())
     }
 
     /// Whether this model has a chat formatter (and thus the chat-aware

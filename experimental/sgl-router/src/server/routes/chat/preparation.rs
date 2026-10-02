@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Chat request validation, optional tokenization, and outgoing body preparation.
+//! Request validation, optional tokenization, and outgoing body preparation for
+//! chat completions and the native `/generate` endpoint.
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
@@ -18,24 +19,38 @@ use serde_json::{json, Number, Value};
 /// SGLang upstream's coarse bytes-per-token estimate; only relative load ordering matters.
 const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
+const CHAT_PATH: &str = "/v1/chat/completions";
+const GENERATE_PATH: &str = "/generate";
+
 /// Validated routing inputs and the original body, ready for worker selection.
-pub(super) struct PreparedChatRequest {
+///
+/// Each `/generate` prompt and `n` sample is its own engine request: input and output
+/// counts sum over them, while the sequence counts bound the longest.
+pub(super) struct PreparedRequest {
+    /// Engine endpoint the request is forwarded to.
+    pub(super) path: &'static str,
     pub(super) model: ModelId,
     pub(super) streaming: bool,
-    pub(super) max_output_tokens: Option<u64>,
+    /// Output budget, for decode KV; unknown if any prompt leaves it unset.
+    pub(super) output_tokens: Option<u64>,
     pub(super) body: Bytes,
     pub(super) tokens: Option<RequestTokens>,
     /// Token count for routing/load accounting; estimated from body size when unavailable.
     pub(super) input_token_count: usize,
+    /// The longest prompt, for bucket and context checks.
+    pub(super) sequence_token_count: usize,
+    /// The longest prompt plus its own output budget.
+    pub(super) expected_peak_sequence_tokens: Option<u64>,
     caller_set_rid: bool,
-    fans_out: bool,
-    forwarding_scope: ForwardingScope,
+    pub(super) fans_out: bool,
+    /// `None` for `/generate`, whose tokens replace `text` during preparation.
+    forwarding_scope: Option<ForwardingScope>,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
 }
 
-impl PreparedChatRequest {
-    pub(super) fn prepare(
+impl PreparedRequest {
+    pub(super) fn chat(
         ctx: &AppContext,
         model: ModelId,
         fields: RoutingFields,
@@ -64,23 +79,95 @@ impl PreparedChatRequest {
         let tokens = parsed_body
             .as_ref()
             .and_then(|parsed_body| request_tokens_for(&ctx.tokenizers, &model, parsed_body));
-        // Keep load accounting available even when tokenization is unavailable.
-        let input_token_count = tokens
-            .as_ref()
-            .map(|tokens| tokens.ids.len().max(1))
-            .unwrap_or_else(|| estimate_prefill_tokens(&body));
+        let input_tokens = input_token_count(tokens.as_ref(), &body);
+        let output_tokens = fields.requested_max_output_tokens();
         Ok(Self {
+            path: CHAT_PATH,
             model,
             streaming: fields.stream.unwrap_or(false),
-            max_output_tokens: fields.requested_max_output_tokens(),
+            output_tokens,
+            input_token_count: input_tokens,
+            sequence_token_count: input_tokens,
+            expected_peak_sequence_tokens: output_tokens
+                .map(|output| (input_tokens as u64).saturating_add(output)),
             body,
             tokens,
-            input_token_count,
             caller_set_rid: fields.caller_set_rid,
             fans_out: requests_multiple_samples(&fields, &sampling_defaults),
-            forwarding_scope,
+            forwarding_scope: Some(forwarding_scope),
             parsed_body,
             sampling_defaults,
+        })
+    }
+
+    /// The engine's `GenerateReqInput`. With a tokenizer loaded, `text` becomes
+    /// `input_ids` here, so the engine skips tokenizing and routing sees its tokens.
+    pub(super) fn generate(
+        ctx: &AppContext,
+        model: ModelId,
+        mut body: Bytes,
+    ) -> Result<Self, ApiError> {
+        let mut value =
+            Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
+        let stream =
+            Option::<bool>::deserialize(&value["stream"]).map_err(|_| invalid_request())?;
+        let text_ids = tokenize_text(ctx, &model, &value);
+        // Routing sees `text` as the engine's ids, whether or not they are forwarded.
+        let routed = text_ids.as_ref().map(|ids| json!({ "input_ids": ids }));
+        let routed = routed.as_ref().unwrap_or(&value);
+        let tokens = request_tokens_for(&ctx.tokenizers, &model, routed);
+        let batch = batch_prompt_tokens(routed);
+        if let Some(input_ids) = text_ids.filter(|_| forwards_text_ids(ctx, &value)) {
+            let fields = value.as_object_mut().expect("parsed as an object");
+            fields.remove("text");
+            fields.insert("input_ids".into(), input_ids);
+            body = serde_json::to_vec(&value)
+                .map_err(|error| ApiError::Internal(error.into()))?
+                .into();
+        }
+        let samples = parallel_samples(&value);
+        let fans_out = batch.is_some() || samples > 1;
+        let lengths = batch.unwrap_or_else(|| {
+            let embeds = input_embeds(&value).map(|rows| rows.len().max(1));
+            vec![embeds.unwrap_or_else(|| input_token_count(tokens.as_ref(), &body))]
+        });
+        let outputs: Option<Vec<u64>> = match &value["sampling_params"] {
+            Value::Array(params) if params.len() == lengths.len() => params
+                .iter()
+                .map(|params| params["max_new_tokens"].as_u64())
+                .collect(),
+            Value::Array(_) => None, // The engine rejects the mismatch.
+            params => params["max_new_tokens"]
+                .as_u64()
+                .map(|output| vec![output; lengths.len()]),
+        };
+        let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
+        Ok(Self {
+            path: GENERATE_PATH,
+            model,
+            streaming: stream.unwrap_or(false),
+            output_tokens: outputs.as_ref().map(|outputs| {
+                let output = outputs.iter().fold(0, |sum: u64, &o| sum.saturating_add(o));
+                output.saturating_mul(samples)
+            }),
+            input_token_count: lengths
+                .iter()
+                .sum::<usize>()
+                .max(1)
+                .saturating_mul(samples as usize),
+            sequence_token_count: sequence_tokens,
+            expected_peak_sequence_tokens: outputs.map(|outputs| {
+                let peaks = lengths.iter().zip(outputs);
+                let peaks = peaks.map(|(&input, output)| (input as u64).saturating_add(output));
+                peaks.max().unwrap_or(sequence_tokens as u64)
+            }),
+            body,
+            tokens,
+            caller_set_rid: !value["rid"].is_null(),
+            fans_out,
+            forwarding_scope: None,
+            parsed_body: Some(value),
+            sampling_defaults: Vec::new(),
         })
     }
 
@@ -100,15 +187,13 @@ impl PreparedChatRequest {
         engine_rid: Option<&str>,
     ) -> Result<Bytes, ApiError> {
         // Routing tokens can replace engine tokenization only for supported chat templates.
-        let forwarding = input_ids_forwarding(
-            self.forwarding_scope,
-            self.parsed_body.as_ref(),
-            self.tokens.as_ref(),
-        );
+        let forwarding = self.forwarding_scope.map(|scope| {
+            input_ids_forwarding(scope, self.parsed_body.as_ref(), self.tokens.as_ref())
+        });
         let input_ids = self
             .tokens
             .as_ref()
-            .filter(|_| forwarding == InputIdsForwarding::Forwarded)
+            .filter(|_| forwarding == Some(InputIdsForwarding::Forwarded))
             .map(|tokens| tokens.ids.as_slice());
         let body = build_outgoing_body(
             &self.body,
@@ -120,12 +205,77 @@ impl PreparedChatRequest {
         )?;
         // Book only after the outgoing body exists; a request rejected here
         // (an f64-overflow literal re-parsed for PD bootstrap) was never dispatched.
-        ctx.metrics
-            .record_input_ids_forwarding(&self.model.0, forwarding);
-        if forwarding == InputIdsForwarding::TokenizeFailed {
-            ctx.metrics.record_ingress_tokenize_error(&self.model.0);
+        if let Some(forwarding) = forwarding {
+            ctx.metrics
+                .record_input_ids_forwarding(&self.model.0, forwarding);
+            if forwarding == InputIdsForwarding::TokenizeFailed {
+                ctx.metrics.record_ingress_tokenize_error(&self.model.0);
+            }
         }
         Ok(body)
+    }
+}
+
+/// `text` as the engine's `input_ids`, of the same shape; `None` when the caller sent ids.
+fn tokenize_text(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Value> {
+    if has_caller_input_ids(value) {
+        return None;
+    }
+    let encode = |text: &Value| ctx.tokenizers.encode_prompt(&model.0, text.as_str()?);
+    match &value["text"] {
+        Value::Array(texts) => texts
+            .iter()
+            .map(encode)
+            .collect::<Option<Vec<_>>>()
+            .map(Value::from),
+        text => encode(text).map(Value::from),
+    }
+}
+
+/// Whether `text` may reach the engine as `input_ids`: not when its processor expands
+/// multimodal placeholders from the text, nor under `--disable-input-ids-forwarding`.
+fn forwards_text_ids(ctx: &AppContext, value: &Value) -> bool {
+    let engine_inputs = ["input_embeds", "image_data", "video_data", "audio_data"];
+    !ctx.config.model.disable_input_ids_forwarding
+        && engine_inputs.iter().all(|key| value[key].is_null())
+}
+
+/// `input_embeds`, which the engine reads only without `text` and `input_ids`.
+fn input_embeds(value: &Value) -> Option<&Vec<Value>> {
+    value["input_embeds"]
+        .as_array()
+        .filter(|_| value["text"].is_null() && value["input_ids"].is_null())
+}
+
+/// Per-prompt token counts of a batch: exact for nested `input_ids` or
+/// `input_embeds`, estimated for a `text` list. `None` for a single prompt.
+fn batch_prompt_tokens(value: &Value) -> Option<Vec<usize>> {
+    if let Some(texts) = value["text"].as_array() {
+        let estimate = |text: &Value| estimate_prefill_tokens(text.as_str().map_or(0, str::len));
+        return Some(texts.iter().map(estimate).collect());
+    }
+    let rows = value["input_ids"]
+        .as_array()
+        .filter(|rows| rows.first().is_some_and(Value::is_array))
+        .or_else(|| {
+            input_embeds(value).filter(|rows| rows.first().is_some_and(|r| r[0].is_array()))
+        })?;
+    Some(
+        rows.iter()
+            .map(|row| row.as_array().map_or(0, Vec::len).max(1))
+            .collect(),
+    )
+}
+
+/// Samples per prompt, at least one; beam search returns its `n` from one request.
+fn parallel_samples(value: &Value) -> u64 {
+    let params = match &value["sampling_params"] {
+        Value::Array(batch) => batch.first().unwrap_or(&Value::Null),
+        params => params,
+    };
+    match params["beam_width"].as_u64() {
+        Some(width) if width > 1 => 1,
+        _ => params["n"].as_u64().unwrap_or(1).max(1),
     }
 }
 
@@ -418,9 +568,16 @@ fn requests_multiple_samples(
     }
 }
 
-fn estimate_prefill_tokens(body: &Bytes) -> usize {
+/// Keep load accounting available even when tokenization is unavailable.
+fn input_token_count(tokens: Option<&RequestTokens>, body: &Bytes) -> usize {
+    tokens
+        .map(|tokens| tokens.ids.len().max(1))
+        .unwrap_or_else(|| estimate_prefill_tokens(body.len()))
+}
+
+fn estimate_prefill_tokens(bytes: usize) -> usize {
     // Never 0: a zero-load entry is invisible to the cache-aware imbalance fast path.
-    (body.len() / BYTES_PER_TOKEN_ESTIMATE).max(1)
+    (bytes / BYTES_PER_TOKEN_ESTIMATE).max(1)
 }
 
 /// The engine stores bootstrap rooms as signed int64 values.
@@ -440,39 +597,29 @@ pub(super) struct BootstrapFields {
     pub(super) room: u64,
 }
 
-/// Append before the closing brace so injected values win over explicit nulls.
-fn append_top_level_fields(
-    body: &Bytes,
-    sampling_defaults: &[(SamplingField, Number)],
-    rid: Option<&str>,
-) -> Option<Bytes> {
-    use std::io::Write as _;
-
+/// Append JSON-encoded `fields` before the closing brace, so they win over
+/// earlier values of the same keys.
+pub(super) fn append_fields(body: &Bytes, fields: &[(&str, String)]) -> Option<Bytes> {
     let open = body.iter().position(|&b| b == b'{')?;
     let close = body.iter().rposition(|&b| b == b'}')?;
     if close <= open {
         return None;
     }
-    let has_members = body[open + 1..close]
+    let mut wrote_any = body[open + 1..close]
         .iter()
         .any(|b| !b.is_ascii_whitespace());
-    let rid_budget = rid.map_or(0, |rid| rid.len() + ",\"rid\":\"\"".len());
-    let mut output = Vec::with_capacity(body.len() + 24 * sampling_defaults.len() + rid_budget + 1);
+    let budget: usize = fields
+        .iter()
+        .map(|(key, value)| key.len() + value.len() + 4)
+        .sum();
+    let mut output = Vec::with_capacity(body.len() + budget);
     output.extend_from_slice(&body[..close]);
-    let mut wrote_any = has_members;
-    for (field, value) in sampling_defaults {
+    for (key, value) in fields {
         if wrote_any {
             output.push(b',');
         }
-        write!(output, "\"{}\":{}", field.wire_name(), value).ok()?;
+        output.extend_from_slice(format!("\"{key}\":{value}").as_bytes());
         wrote_any = true;
-    }
-    if let Some(rid) = rid {
-        if wrote_any {
-            output.push(b',');
-        }
-        output.extend_from_slice(b"\"rid\":");
-        serde_json::to_writer(&mut output, rid).ok()?;
     }
     output.extend_from_slice(&body[close..]);
     Some(Bytes::from(output))
@@ -493,7 +640,12 @@ fn build_outgoing_body(
         return Ok(body.clone());
     }
     if !needs_parse {
-        if let Some(spliced) = append_top_level_fields(body, sampling_defaults, rid) {
+        let defaults = sampling_defaults
+            .iter()
+            .map(|(field, value)| (field.wire_name(), value.to_string()));
+        let rid = rid.map(|rid| ("rid", Value::from(rid).to_string()));
+        let fields: Vec<_> = defaults.chain(rid).collect();
+        if let Some(spliced) = append_fields(body, &fields) {
             return Ok(spliced);
         }
     }
@@ -785,6 +937,7 @@ fn invalid_request() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer::TokenizerRegistry;
     use std::sync::Arc;
 
     #[test]
@@ -799,6 +952,99 @@ mod tests {
             let room = generate_room_id_for_rank(6, 7);
             assert!(room <= i64::MAX as u64 && room % 7 == 6);
         }
+    }
+
+    /// A `/generate` request prepared with the tiny test tokenizer loaded.
+    fn prepare_generate(body: Value) -> PreparedRequest {
+        // The tiny tokenizer, with a post-processor that prepends BOS (id 256).
+        let tokenizer = std::fs::read_to_string("tests/fixtures/tiny_tokenizer.json").unwrap();
+        let mut tokenizer: Value = serde_json::from_str(&tokenizer).unwrap();
+        tokenizer["post_processor"] = json!({"type": "TemplateProcessing", "pair": [], "single": [
+            {"SpecialToken": {"id": "<|endoftext|>", "type_id": 0}},
+            {"Sequence": {"id": "A", "type_id": 0}}],
+            "special_tokens": {"<|endoftext|>": {"id": "<|endoftext|>", "ids": [256], "tokens": ["<|endoftext|>"]}}});
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, tokenizer.to_string()).unwrap();
+        let mut ctx = AppContext::stub();
+        ctx.config.model.tokenizer_path = Some(path.to_str().unwrap().into());
+        ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+        let body = Bytes::from(body.to_string());
+        PreparedRequest::generate(&ctx, ModelId("stub-model".into()), body).unwrap()
+    }
+
+    #[test]
+    fn generate_counts_batches_per_prompt() {
+        // (fans out, (input total, longest prompt, output total, longest peak))
+        for (body, fans_out, counts) in [
+            (
+                json!({"input_ids": [1, 2], "sampling_params": {"max_new_tokens": 8}}),
+                false,
+                (2, 2, Some(8), Some(10)),
+            ),
+            (
+                json!({"input_ids": [[1], [2, 3, 4]], "sampling_params": [{"max_new_tokens": 9}, {"max_new_tokens": 1}]}),
+                true,
+                (4, 3, Some(10), Some(10)),
+            ),
+            (
+                json!({"input_embeds": [[[0.5]], [[0.5], [0.5], [0.5]]], "sampling_params": {"max_new_tokens": 2}}),
+                true,
+                (4, 3, Some(4), Some(5)),
+            ),
+            // The engine default bounds the second prompt, unseen by the router.
+            (
+                json!({"input_ids": [[1], [2]], "sampling_params": [{"max_new_tokens": 8}, {}]}),
+                true,
+                (2, 1, None, None),
+            ),
+            // Each sample is its own engine request, with its own KV.
+            (
+                json!({"input_ids": [1], "sampling_params": {"n": 2, "max_new_tokens": 8}}),
+                true,
+                (2, 1, Some(16), Some(9)),
+            ),
+            (
+                json!({"input_ids": [1], "sampling_params": {"n": 2, "beam_width": 2}}),
+                false,
+                (1, 1, None, None),
+            ),
+            // The engine ignores embeddings next to token IDs.
+            (
+                json!({"input_ids": [1], "input_embeds": [[[0.5]], [[0.5]]]}),
+                false,
+                (1, 1, None, None),
+            ),
+        ] {
+            let r = prepare_generate(body);
+            let actual = (
+                r.input_token_count,
+                r.sequence_token_count,
+                r.output_tokens,
+                r.expected_peak_sequence_tokens,
+            );
+            assert_eq!((r.fans_out, actual), (fans_out, counts));
+        }
+    }
+
+    #[test]
+    fn generate_forwards_text_as_input_ids() {
+        let body =
+            |request: &PreparedRequest| serde_json::from_slice::<Value>(&request.body).unwrap();
+        let single = prepare_generate(json!({"text": "hi", "stream": true}));
+        let ids = single.tokens.as_ref().unwrap().ids.clone();
+        assert_eq!(ids[0], 256);
+        assert_eq!(body(&single), json!({"stream": true, "input_ids": ids}));
+        let batch = prepare_generate(json!({"text": ["hi", "hi"]}));
+        assert_eq!(body(&batch)["input_ids"], json!([ids, ids]));
+        assert_eq!(batch.input_token_count, 2 * ids.len());
+        // The processor expands multimodal placeholders from the text itself.
+        let image = prepare_generate(json!({"text": "hi", "image_data": "a.png"}));
+        assert_eq!(body(&image)["text"], "hi");
+        // Text left to the engine still routes on its tokens, in a batch as for one prompt.
+        assert_eq!(image.tokens.unwrap().ids, ids);
+        let images = prepare_generate(json!({"text": ["hi", "hi"], "image_data": ["a", "b"]}));
+        assert_eq!(images.input_token_count, 2 * ids.len());
     }
 
     #[test]
