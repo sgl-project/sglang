@@ -113,7 +113,7 @@ def test_constructor_selects_serial_shared_experts(
     initialized_moe, backend, runner, serial
 ):
     with initialized_moe(backend, runner) as model:
-        assert model._nccl_ep_serial_shared_experts is serial
+        assert model._nccl_ep_shared_experts_on_current_stream is serial
         assert model.num_fused_shared_experts == 0
         assert model.shared_experts.down_proj.reduce_results is False
 
@@ -134,7 +134,7 @@ def test_constructor_preserves_other_backends_outside_sbo_overlap(
     initialized_moe, backend, runner
 ):
     with initialized_moe(backend, runner, overlap=True) as model:
-        assert not model._nccl_ep_serial_shared_experts
+        assert not model._nccl_ep_shared_experts_on_current_stream
 
 
 @pytest.mark.parametrize(
@@ -255,7 +255,7 @@ def test_model_keeps_shared_mlp_serial_and_scales_only_routed_output(
     model = DeepseekV2MoE.__new__(DeepseekV2MoE)
     torch.nn.Module.__init__(model)
     model.shared_experts = mlp
-    model._nccl_ep_serial_shared_experts = True
+    model._nccl_ep_shared_experts_on_current_stream = True
     model.alt_stream = torch.cuda.Stream()
     model._fuse_shared_experts_inside_sbo = False
     model.is_nextn = True
@@ -331,7 +331,7 @@ def test_shared_and_routed_compute_through_dispatcher_and_graph():
         model = DeepseekV2MoE.__new__(DeepseekV2MoE)
         torch.nn.Module.__init__(model)
         model.shared_experts = make_shared_mlp()
-        model._nccl_ep_serial_shared_experts = True
+        model._nccl_ep_shared_experts_on_current_stream = True
         model.alt_stream = torch.cuda.Stream()
         model._fuse_shared_experts_inside_sbo = False
         model.is_nextn = True

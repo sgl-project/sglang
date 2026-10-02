@@ -4,10 +4,13 @@ import torch
 import torch.nn.functional as F
 
 
-def configure_compute(*, graph_enabled=False):
+def configure_compute(*, graph_enabled=False, dispatch_algorithm=None):
     from sglang.srt.runtime_context import get_context
 
     get_context().override_server_args(
+        device="cuda",
+        moe_dense_tp_size=1,
+        ep_dispatch_algorithm=dispatch_algorithm,
         enable_fused_moe_sum_all_reduce=False,
         enable_deterministic_inference=False,
         disable_shared_experts_fusion=True,

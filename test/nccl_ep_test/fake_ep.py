@@ -238,7 +238,7 @@ def dispatcher_environment(*, capacity=32):
         module._nccl_ep_runtime = None
 
         def dispatcher(*, layer_id):
-            return module.NcclEpDispatcher(
+            result = module.NcclEpDispatcher(
                 MoeRunnerConfig(
                     num_experts=2,
                     num_local_experts=2,
@@ -250,13 +250,20 @@ def dispatcher_environment(*, capacity=32):
                 coordinator,
             )
 
+            return result
+
         library.dispatcher = dispatcher
         library.coordinator = coordinator
         try:
             yield library
         finally:
+            from sglang.srt.layers.moe.token_dispatcher.nccl_ep_stream import (
+                destroy_nccl_ep_streams,
+            )
+
             torch.cuda.synchronize()
             module.NcclEpBuffer.destroy()
+            destroy_nccl_ep_streams()
             get_resources().buffers.pop("nccl_ep_state", None)
             # Restore the import cache while the module remains importable.
             module._nccl_ep_runtime = previous_runtime

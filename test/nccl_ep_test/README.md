@@ -98,3 +98,29 @@ first-use JIT are excluded from the timed samples. Profiling adds overhead and
 must not be used to derive the unprofiled speedup.
 
 See [the recorded validation](validation.md) for the tested snapshot and results.
+
+## Overlap stream regression
+
+Enable `--enable-single-batch-overlap` with NCCL EP LL to use an
+independent communication stream automatically. Overlap requires single-node
+CUDA, DeepSeek V2/V3 block-128 FP8 experts and the Triton MoE runner. TBO and
+EPLB migration are unsupported. Without SBO, NCCL EP retains serial execution
+on the current stream.
+
+Communication uses a separate CUDA stream while shared-expert computation
+stays on the current stream. Streams are initialized during warmup and reused
+during capture and replay. Graph replays and buckets remain serial.
+
+The tests cover producer/consumer ordering, captured tensor lifetimes,
+dynamic routing and the SBO model path:
+
+```bash
+PYTHONPATH=python:test python -m pytest -q \
+  test/registered/unit/layers/moe/test_nccl_ep_streams.py \
+  test/registered/unit/layers/moe/test_nccl_ep_overlap_config.py
+```
+
+These tests use real CUDA streams and Graphs with external EP replaced.
+They detect completion incorrectly waiting for independent compute, but do
+not measure native communication overlap or model speedup. The opt-in
+batch-invariant router and full-model logit diagnostics are separate changes.

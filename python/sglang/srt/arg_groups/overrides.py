@@ -1530,6 +1530,8 @@ def _nccl_ep_capability_fallback(view: Any) -> dict:
         return {}
     if view.enable_nccl_ep_cuda_graph:
         raise ValueError(f"NCCL EP CUDA Graph is unavailable: {reason}")
+    if view.enable_single_batch_overlap or view.enable_two_batch_overlap:
+        raise ValueError(f"NCCL EP overlap is unavailable: {reason}")
     import importlib.util
 
     fallback = (

@@ -244,6 +244,35 @@ def handle_a2a_moe(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    nccl_ep_overlap = (
+        cfg.moe_a2a_backend == "nccl_ep" and cfg.enable_single_batch_overlap
+    )
+    if nccl_ep_overlap:
+        if (
+            cfg.device != "cuda"
+            or cfg.moe_runner_backend != "triton"
+            or cfg.enable_two_batch_overlap
+            or cfg.nnodes != 1
+            or cfg.enable_pdmux
+            or cfg.enable_torch_compile
+            or cfg.enable_memory_saver
+            or cfg.speculative_algorithm is not None
+            or cfg.enable_eplb
+        ):
+            raise ValueError(
+                "NCCL EP overlap requires single-node CUDA NCCL EP Triton "
+                "SBO without TBO, PDMux, compile, memory saver, speculation or EPLB"
+            )
+        model = model_config_of(server_args)
+        quant = getattr(model.hf_config, "quantization_config", {}) or {}
+        if (
+            model.hf_config.architectures[0]
+            not in ("DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM")
+            or (cfg.quantization or quant.get("quant_method")) != "fp8"
+            or quant.get("weight_block_size") != [128, 128]
+        ):
+            raise ValueError("NCCL EP overlap requires DeepSeek V2/V3 FP8")
+
     # Resolve nccl_ep availability first: a fallback to 'deepep' must flow
     # through the deepep-specific handling in the passes below.
     run_post_process_pass(server_args, _nccl_ep_capability_fallback)
@@ -697,8 +726,10 @@ def handle_nccl_ep_token_budget(server_args: Any):
         raise ValueError("NCCL EP CUDA Graph requires the resolved NCCL EP backend")
     if cfg.moe_a2a_backend != "nccl_ep":
         return
-    if cfg.enable_single_batch_overlap or cfg.enable_two_batch_overlap:
-        raise ValueError("NCCL EP LL does not support single/two batch overlap")
+    if cfg.enable_two_batch_overlap:
+        raise ValueError("NCCL EP LL does not support two batch overlap")
+    if cfg.enable_eplb:
+        raise ValueError("NCCL EP LL does not support EPLB")
     if cfg.moe_runner_backend == "triton":
         if cfg.nccl_ep_layout != "expert_major":
             raise ValueError("NCCL EP Triton requires expert_major layout")

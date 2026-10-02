@@ -47,6 +47,7 @@ def test_destroy_closes_persistent_handles_before_group(monkeypatch):
     state = SimpleNamespace(
         group=SimpleNamespace(destroy=lambda: events.append("group")),
         dispatchers={dispatcher},
+        borrower=None,
     )
     dispatcher.buffer = state
     monkeypatch.setattr(NcclEpBuffer, "_state", classmethod(lambda cls: state))
@@ -63,7 +64,7 @@ def test_destroy_does_not_release_group_with_active_transaction(monkeypatch):
     dispatcher = NcclEpDispatcher.__new__(NcclEpDispatcher)
     dispatcher._stage = _Stage.AFTER_DISPATCH_A
     group = Mock()
-    state = SimpleNamespace(group=group, dispatchers={dispatcher})
+    state = SimpleNamespace(group=group, dispatchers={dispatcher}, borrower=None)
     monkeypatch.setattr(NcclEpBuffer, "_state", classmethod(lambda cls: state))
     with pytest.raises(RuntimeError, match="active transaction"):
         NcclEpBuffer.destroy()
