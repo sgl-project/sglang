@@ -44,6 +44,7 @@ from sglang.srt.multimodal.media_artifacts.base import (
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
+    feature_transport_uses_gpu,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
@@ -308,7 +309,9 @@ async def preprocess_video(
         [resized_height, resized_width],
         interpolation=InterpolationMode.BILINEAR,
     )
-    if not is_cpu():
+    # pin_memory() initializes a CUDA context in this worker; CPU feature
+    # transport keeps the worker off the base GPU, so pin only for GPU transports.
+    if not is_cpu() and feature_transport_uses_gpu():
         video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
