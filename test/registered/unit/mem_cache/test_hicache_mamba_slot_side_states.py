@@ -49,9 +49,7 @@ class _RegisteredSideState:
 
 def _make_pools(with_side_state: bool):
     conv = [
-        torch.zeros(
-            (NUM_LAYERS, NUM_DEVICE_SLOTS) + CONV_SHAPE, dtype=torch.bfloat16
-        )
+        torch.zeros((NUM_LAYERS, NUM_DEVICE_SLOTS) + CONV_SHAPE, dtype=torch.bfloat16)
     ]
     temporal = torch.zeros(
         (NUM_LAYERS, NUM_DEVICE_SLOTS) + TEMPORAL_SHAPE, dtype=torch.bfloat16
@@ -106,9 +104,7 @@ def _make_pools(with_side_state: bool):
         (NUM_HOST_SLOTS, NUM_LAYERS, 1) + TEMPORAL_SHAPE, dtype=temporal.dtype
     )
     host.conv_buffer = [
-        torch.zeros(
-            (NUM_HOST_SLOTS, NUM_LAYERS, 1) + CONV_SHAPE, dtype=conv[0].dtype
-        )
+        torch.zeros((NUM_HOST_SLOTS, NUM_LAYERS, 1) + CONV_SHAPE, dtype=conv[0].dtype)
     ]
     host._init_write_back_staging_buffers()
     # The kernel path takes raw device pointers; the stubbed copies never
@@ -122,9 +118,13 @@ def _make_pools(with_side_state: bool):
 def _stub_conv_and_temporal_copies():
     """The conv/temporal legs are CUDA kernels; this test is about the side state."""
     return (
-        mock.patch.object(MambaPoolHost, "_copy_tensor_pf_lf", staticmethod(lambda **kw: None)),
         mock.patch.object(
-            MambaPoolHost, "_copy_tensor_all_layers_lf_pf", staticmethod(lambda **kw: None)
+            MambaPoolHost, "_copy_tensor_pf_lf", staticmethod(lambda **kw: None)
+        ),
+        mock.patch.object(
+            MambaPoolHost,
+            "_copy_tensor_all_layers_lf_pf",
+            staticmethod(lambda **kw: None),
         ),
     )
 
