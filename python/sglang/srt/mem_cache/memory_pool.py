@@ -5539,6 +5539,10 @@ class MiniMaxSparseKVPool(KVCache):
             envs.SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE.get()
         )
 
+        # The attention backend enables SHUFFLE only after selecting compatible
+        # indexer and attention consumers, before the first cache write.
+        self.use_aiter_sparse_pa = False
+
         local_dense_layer_ids = [
             lid for lid in dense_layer_ids if start_layer <= lid < end_layer
         ]
@@ -5773,9 +5777,23 @@ class MiniMaxSparseKVPool(KVCache):
     ) -> None:
         """Write main K/V at `loc`. Works for any layer (dense or sparse).
 
-        Scale semantics follow MHATokenToKVPool: None means unit scale;
-        a non-None scale is applied with an in-place div_ before the fp8 cast.
+        None means unit scale. NHD stores follow MHATokenToKVPool; SHUFFLE
+        stores apply the corresponding device scales inside the cache kernel.
         """
+        if self.use_aiter_sparse_pa and layer.layer_id in self.sparse_layer_id_mapping:
+            from sglang.srt.layers.attention.minimax_sparse_ops.aiter_sparse_pa import (
+                store_sparse_kv,
+            )
+
+            store_sparse_kv(
+                cache_k,
+                cache_v,
+                *self.main_pool.get_kv_buffer(layer.layer_id),
+                loc,
+                layer.k_scale if k_scale is not None else None,
+                layer.v_scale if v_scale is not None else None,
+            )
+            return
         self._pool_for(layer.layer_id).set_kv_buffer(
             layer,
             loc,
@@ -5842,6 +5860,7 @@ class MiniMaxSparseKVPool(KVCache):
         main = self.main_pool
         return (
             self.use_minimax_fused_kv_index_store
+            and not self.use_aiter_sparse_pa
             and _is_cuda
             # No dtype conversion / fp8 scaling on either side (the fused kernel
             # is a raw byte copy, it does not quantize).

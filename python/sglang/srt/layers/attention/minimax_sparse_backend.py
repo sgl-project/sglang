@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.moe.utils import is_tbo_enabled
-from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -125,9 +125,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.max_context_len = int(runner.model_config.context_len)
         # Per-forward cache for the native decode block table (rebuilt each forward).
         self._native_decode_bt: dict = {}
-        self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(
-            resolving_view(runner.server_args)
-        )
+        cfg = resolving_view(runner.server_args)
+        self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(cfg)
         if self.fp8_attn_gemm:
             assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
                 "fp8 attn-GEMM mode requires an fp8_e4m3fn main KV pool, got "
@@ -339,6 +338,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._topk_cache: dict = {}
         self._topk_cache_owner: Optional[ForwardBatch] = None
 
+        self._init_aiter_indexer(
+            num_index_heads=max(
+                sparse_cfg["sparse_num_index_heads"] // get_parallel().attn_tp_size,
+                1,
+            ),
+            max_query_len=(
+                self.speculative_num_draft_tokens
+                if spec.speculative_algorithm is not None
+                else 1
+            ),
+        )
+        self._init_aiter_sparse_pa(
+            enable_hierarchical_cache=cfg.enable_hierarchical_cache,
+            disaggregation_mode=cfg.disaggregation_mode,
+        )
+
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
@@ -358,6 +373,82 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 "JIT-compile fmha_sm100 fp8 kernel variants (cold cache can "
                 "take minutes; compiles serialize across TP ranks)."
             )
+
+    def _init_aiter_indexer(self, num_index_heads: int, max_query_len: int = 1):
+        self.aiter_indexer = None
+        self.aiter_prefill_indexer = False
+        # Default to AITER only when its static kernel and cache contracts hold.
+        if not (
+            is_hip()
+            and is_gfx95_supported()
+            and envs.SGLANG_M3_USE_AITER_INDEXER.get()
+            and self.hisparse_coordinator is None
+            and not self.use_dense_sparse_decode
+            and self.score_type == "max"
+            and set(self.sparse_layer_ids).issubset(self.disable_value_layer_ids)
+            and self.block_size_k == self.page_size == 128
+            and self.idx_head_dim == 128
+            and self.topk_blocks == 16
+            and num_index_heads == self.kv_pool.main_pool.head_num
+            and num_index_heads * max_query_len <= 16
+            and 0 < self.max_context_len <= 8192 * self.page_size
+        ):
+            return
+        index_cache = self.kv_pool.get_index_k_buffer(self.sparse_layer_ids[0])
+        if (
+            index_cache.dtype != torch.float8_e4m3fn
+            or not index_cache.is_contiguous()
+            or tuple(index_cache.shape[1:]) != (1, 128)
+        ):
+            return
+
+        from sglang.srt.layers.attention.minimax_sparse_ops.aiter_indexer import (
+            AiterMiniMaxIndexer,
+        )
+
+        self.aiter_indexer = AiterMiniMaxIndexer(
+            max_context_len=self.max_context_len,
+            page_size=self.page_size,
+            num_index_heads=num_index_heads,
+            num_kv_heads=self.kv_pool.main_pool.head_num,
+            head_dim=self.idx_head_dim,
+            topk=self.topk_blocks,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+            index_cache=index_cache,
+        )
+        self.aiter_prefill_indexer = envs.SGLANG_M3_USE_AITER_PREFILL_INDEXER.get()
+        logger.info("MiniMax-M3 AITER FP8 indexer enabled for decode and linear verify")
+
+    def _init_aiter_sparse_pa(
+        self,
+        *,
+        enable_hierarchical_cache: bool = False,
+        disaggregation_mode: str = "null",
+    ):
+        self.aiter_sparse_pa = None
+        self._aiter_decode_selection = None
+        main_pool = self.kv_pool.main_pool
+        if (
+            envs.SGLANG_M3_USE_AITER_SPARSE_PA.get()
+            and self.aiter_prefill_indexer
+            # The host and disaggregation transfer paths use NHD token rows.
+            and not enable_hierarchical_cache
+            and disaggregation_mode == "null"
+            and not self.fp8_attn_gemm
+            and type(main_pool) is MHATokenToKVPool
+            and main_pool.kv_cache_layout == "nhd"
+            and main_pool.dtype == torch.float8_e4m3fn
+            and main_pool.head_dim == main_pool.v_head_dim == 128
+        ):
+            from sglang.srt.layers.attention.minimax_sparse_ops.aiter_sparse_pa import (
+                AiterMiniMaxSparsePA,
+            )
+
+            self.aiter_sparse_pa = AiterMiniMaxSparsePA(self.kv_pool.device)
+            logger.info("MiniMax-M3 AITER sparse PA enabled with page16 SHUFFLE KV")
+        # Resolve the writer and consumer together before any KV is stored.
+        self.kv_pool.use_aiter_sparse_pa = self.aiter_sparse_pa is not None
 
     def _hisparse_swap_in_blocks(
         self,
@@ -411,6 +502,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
+        self._aiter_decode_selection = None
         # New forward -> drop the per-forward index-cache top-k (prefill only).
         if self.index_cache_enabled:
             self._topk_cache = {}
@@ -560,6 +652,33 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        if self.aiter_indexer is not None and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            query_len = (
+                self.speculative_num_draft_tokens
+                if forward_batch.forward_mode.is_target_verify()
+                else 1
+            )
+            seq_lens = forward_batch.seq_lens
+            if forward_batch.forward_mode.is_target_verify():
+                seq_lens = seq_lens + query_len
+            self.aiter_indexer.prepare(
+                self.req_to_token, forward_batch.req_pool_indices, seq_lens, query_len
+            )
+        elif self.aiter_prefill_indexer and forward_batch.forward_mode.is_extend():
+            q_lens = forward_batch.extend_seq_lens.to(torch.int32)
+            cu_q = torch.cat([q_lens.new_zeros(1), q_lens.cumsum(0).to(torch.int32)])
+            self.aiter_indexer.prepare_prefill(
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                cu_q,
+                total_q=sum(forward_batch.extend_seq_lens_cpu),
+                max_query_len=self._max_seqlen_q,
+                max_seq_len=self._max_seqlen_k,
+            )
         if not self.is_npu:
             if self.is_hip and forward_batch.forward_mode.is_target_verify():
                 self._init_rocm_linear_verify_metadata(forward_batch)
@@ -1600,6 +1719,39 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     cached_topk_idx = self._topk_cache.get(group)
                     # Miss (e.g. source layer chunked differently) -> recompute safely.
 
+            if self.aiter_sparse_pa is not None:
+                # This consumer reuses the full selection, including its page
+                # table, through the same per-batch cache as the NHD path.
+                selection = cached_topk_idx
+                if selection is None:
+                    selection = self.aiter_indexer.select(idx_q, idx_k_cache)
+                    if use_index_cache:
+                        self._topk_cache[group] = selection
+                o = self.aiter_sparse_pa.forward(
+                    q,
+                    k_cache,
+                    v_cache,
+                    selection,
+                    softmax_scale=layer.scaling,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
+                )
+                if actual_num_tokens < original_num_tokens:
+                    o = torch.cat(
+                        [
+                            o,
+                            o.new_zeros(
+                                original_num_tokens - actual_num_tokens,
+                                *o.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
+                return None, o.reshape(original_num_tokens, -1)
+
+            if self.aiter_prefill_indexer and cached_topk_idx is None:
+                cached_topk_idx = self.aiter_indexer.forward(idx_q, idx_k_cache)
+
             result = minimax_sparse_prefill(
                 q,
                 k_cache,
@@ -1772,6 +1924,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
         else:
             # fp8 attn-GEMM: quantize q/idx_q after the KV store (reads bf16 k/v).
+            if self.aiter_sparse_pa is not None:
+                source = self._topk_is_source.get(layer.layer_id, True)
+                selection = (
+                    self._aiter_decode_selection
+                    if self.index_cache_enabled and not source
+                    else None
+                )
+                if selection is None:
+                    selection = self.aiter_indexer.select(idx_q, idx_k_cache)
+                    self._aiter_decode_selection = selection
+                o = self.aiter_sparse_pa.forward(
+                    q,
+                    k_cache,
+                    v_cache,
+                    selection,
+                    softmax_scale=layer.scaling,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
+                )
+                return None, o.reshape(q.shape[0], -1)
             if self.fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
@@ -1801,6 +1973,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         topk_idx=topk_idx,
                         layer_id=layer.layer_id,
                     )
+
+            if self.aiter_indexer is not None and _cached_topk is None:
+                _cached_topk = self.aiter_indexer.forward(idx_q, idx_k_cache)
 
             idx_o, o = minimax_sparse_decode(
                 q,
