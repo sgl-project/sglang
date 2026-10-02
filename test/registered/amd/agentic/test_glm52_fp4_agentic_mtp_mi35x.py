@@ -20,14 +20,19 @@ What this port keeps and what it changes:
   and the decode CUDA-graph batch list from that point's concurrency, whereas
   here one server serves the whole sweep and both are sized from the largest
   concurrency in it.
-- The workload is synthesized rather than replayed from the SemiAnalysis
-  ``cc-traces-weka`` corpus, which is gated and reachable only through AIPerf's
-  loader. ``sglang.test.agentic_bench_utils`` builds a corpus with the same
-  structure instead -- a shared agent scaffold, a per-session repository
-  context, and per-turn tool output, sized so a session opens at ~39K tokens
-  and reaches ~68K by its eighth turn -- and ``SGLANG_AGENTIC_TRACE_PATH``
-  replays a real one when a runner has it. Absolute numbers therefore are not
-  comparable against AgentX's published results; run-over-run numbers here are.
+- The workload is a real multi-turn corpus where the runner has one and a
+  synthesized one otherwise. The SemiAnalysis ``cc-traces-weka`` corpus the
+  recipe names is gated and reachable only through AIPerf's loader, but the
+  MI35x runners carry staged traces under ``/sgl-data/agentic-traces`` (64
+  conversations over 584 turns, averaging 86K prompt tokens per turn and
+  peaking at 231K), and the nightly points ``SGLANG_AGENTIC_TRACE_PATH`` at
+  one. Without that variable ``sglang.test.agentic_bench_utils`` builds a
+  corpus with the same shape -- a shared agent scaffold, a per-session
+  repository context, and per-turn tool output, sized so a session opens at
+  ~39K tokens and reaches ~68K by its eighth turn -- which is lighter, so the
+  two are not comparable with each other. Neither is comparable against
+  AgentX's published numbers, which measure a fixed duration rather than fixed
+  work; run-over-run numbers here are.
 - The recipe pins ``SGLANG_SIMULATE_ACC_LEN=3.61``, which makes the server
   report a fixed acceptance length instead of running draft verification. That
   suits AgentX's projections and defeats a regression check, so this test runs
