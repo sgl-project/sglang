@@ -401,7 +401,9 @@ impl KvEventIndex {
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<PumpControl>(16);
-        let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx.clone()));
+        let tally = Arc::new(EventTally::new());
+        let subscribers =
+            Arc::new(KvEventSubscriberRegistry::new(tx.clone()).with_tally(Arc::clone(&tally)));
         let load_subscribers = Arc::new(KvEventSubscriberRegistry::with_kind(tx, SubKind::Load));
         let engine_reported_load = EngineReportedLoadTable::new();
         let cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -409,7 +411,6 @@ impl KvEventIndex {
         let pump_cancel = CancellationToken::new();
         let peers = Arc::new(PeerRegistry::new());
         let (bootstrap_tx, bootstrap_rx) = mpsc::channel(BOOTSTRAP_QUEUE_DEPTH);
-        let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
                 tally: Arc::clone(&tally),
