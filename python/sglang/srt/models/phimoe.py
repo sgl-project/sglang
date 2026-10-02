@@ -188,7 +188,6 @@ class PhiMoE(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.tp_size = get_parallel().tp_size
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(

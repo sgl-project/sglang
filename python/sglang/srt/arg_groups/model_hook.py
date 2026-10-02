@@ -37,7 +37,11 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import derive_attention_widths, get_platform
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    derive_attn_tp_size,
+    get_platform,
+)
 from sglang.srt.utils.common import (
     get_quantization_config,
     is_mps,
@@ -164,6 +168,13 @@ def handle_model_specific_adjustments(server_args: Any):
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
+    if get_platform().is_npu and cfg.dcp_size > 1 and not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            "NPU decode context parallelism is currently implemented only for "
+            "DeepSeek DSA models; got "
+            f"{model_arch}. Set --decode-context-parallel-size=1 or use a DSA model."
+        )
+
     if model_arch == "InternS2MobiusForConditionalGeneration":
         unsupported = []
         if cfg.pp_size != 1:
@@ -283,15 +294,14 @@ def handle_model_specific_adjustments(server_args: Any):
                     )
                 else:
                     # Pure TP and partial DP Attention mode is active for DSA, logging a warning
-                    if cfg.dp_size < cfg.tp_size:
-                        _, attn_tp_size = derive_attention_widths(
-                            tp_size=cfg.tp_size,
-                            attn_cp_size=cfg.attn_cp_size,
-                            dp_size=cfg.dp_size,
-                            enable_dp_attention=cfg.enable_dp_attention,
-                        )
+                    attn_tp_size = derive_attn_tp_size(
+                        tp_size=cfg.tp_size,
+                        attn_cp_size=cfg.attn_cp_size,
+                        attn_dp_size=cfg.attn_dp_size,
+                    )
+                    if attn_tp_size > 1:
                         logger.warning(
-                            f"DSA with TP mode is active, dp_size={cfg.dp_size}, tp_size={cfg.tp_size}, "
+                            f"DSA with TP mode is active, attn_dp_size={cfg.attn_dp_size}, tp_size={cfg.tp_size}, "
                             f"attn_tp_size={attn_tp_size}, attention weights will be sharded across {attn_tp_size} ranks."
                         )
 
@@ -403,7 +413,7 @@ def handle_model_specific_adjustments(server_args: Any):
             if is_deepseek_dsa(hf_config) and not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
                 # Prefer HIP top-k by default while honoring an explicit selection.
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-            if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
+            if not attn_dp_enabled_of(resolved_view(server_args)) and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
 
@@ -507,7 +517,7 @@ def handle_model_specific_adjustments(server_args: Any):
         quant_method = get_quantization_config(hf_config)
         is_mxfp4_quant_format = quant_method == "mxfp4"
         if (
-            not resolved_view(server_args).enable_dp_attention
+            not attn_dp_enabled_of(resolved_view(server_args))
             and cfg.nnodes == 1
             and get_platform().is_hip
         ):
@@ -536,8 +546,11 @@ def handle_model_specific_adjustments(server_args: Any):
         if model_arch == "MiMoV2ForCausalLM" and not cfg.encoder_only:
             expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(hf_config)
             view = resolved_view(server_args)
-            attn_dp_size = cfg.dp_size if view.enable_dp_attention else 1
-            effective_attn_tp_size = cfg.tp_size // attn_dp_size // view.attn_cp_size
+            effective_attn_tp_size = derive_attn_tp_size(
+                tp_size=cfg.tp_size,
+                attn_cp_size=view.attn_cp_size,
+                attn_dp_size=cfg.attn_dp_size,
+            )
             if (
                 expected_attn_tp_size is not None
                 and expected_attn_tp_size % effective_attn_tp_size != 0
@@ -548,10 +561,9 @@ def handle_model_specific_adjustments(server_args: Any):
                     "qkv_proj weights are "
                     f"TP={expected_attn_tp_size}-interleaved; got "
                     f"{effective_attn_tp_size} "
-                    f"(tp_size={cfg.tp_size}, dp_size={cfg.dp_size}, "
-                    f"enable_dp_attention={view.enable_dp_attention}, "
+                    f"(tp_size={cfg.tp_size}, attn_dp_size={cfg.attn_dp_size}, "
                     f"attn_cp_size={view.attn_cp_size}). "
-                    "Set --tp, --dp, --enable-dp-attention, and "
+                    "Set --tp, --attn-dp-size, and "
                     "--attention-context-parallel-size so the effective "
                     f"attention TP size is {expected_attn_tp_size}."
                 )

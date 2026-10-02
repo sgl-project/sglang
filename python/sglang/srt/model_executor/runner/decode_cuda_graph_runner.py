@@ -198,6 +198,7 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
+        origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         max_seq_len_override=forward_batch.max_seq_len_override,
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
@@ -259,15 +260,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.require_mlp_tp_gather or self.require_attn_tp_gather
         )
         self.require_mlp_sync = (
-            get_parallel().enable_dp_attention or self.require_gathered_buffer
+            get_parallel().attn_dp_enabled or self.require_gathered_buffer
         )
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
         # True if the DSA or MLA prefill-CP flavor is active. These flavors
         # feed a zigzag-split rank-local layout into the runner; MHA-arch
         # prefill CP (Qwen3/Qwen2 MoE via PR #18233) keeps an
@@ -415,7 +414,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.model_config.vocab_size, rows=logits_buffer_rows
             ),
             dtype=self.model_runner.model_config.dtype,
-            dp_size=self.dp_size,
+            num_dp_ranks=self.num_dp_ranks,
             pp_size=self.pp_size,
             is_encoder_decoder=self.is_encoder_decoder,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
@@ -459,7 +458,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             enable_prefill_cp=self.enable_prefill_cp,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
-            dp_size=self.dp_size,
+            num_dp_ranks=self.num_dp_ranks,
             source=self.buffers,
         )
 
@@ -527,8 +526,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             declared is SharedReadEnds.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
         ):
-            # TODO: this lands EARLIER than declared; POST_REPLAY is the sound one.
-            return SharedReadEnds.PRE_REPLAY
+            # no in-graph marker (e.g. HIP): only a post-replay event covers its reads
+            return SharedReadEnds.POST_REPLAY
         return declared
 
     def _publish_read_done(self, in_graph: bool):
@@ -585,7 +584,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _global_num_tokens_for_graph(self, num_tokens: int) -> Optional[list[int]]:
         if self.require_mlp_tp_gather:
-            return [num_tokens] * self.dp_size
+            return [num_tokens] * self.num_dp_ranks
         if self.require_attn_tp_gather:
             return [num_tokens]
         return None
@@ -1136,7 +1135,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         self.model_runner.model,
                         bs in self.compile_bs,
                         num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
+                        tp_group=get_parallel().tp_group,
                     ) as forward:
                         self.capture_one_shape(
                             bs,
@@ -1428,7 +1427,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         if (
             self.model_runner.lora_manager is not None
-            and self.model_runner.lora_manager.enable_dp_attention
+            and self.model_runner.lora_manager.attn_dp_enabled
         ):
             self.model_runner.lora_manager.prepare_lora_batch(
                 cast(ForwardBatch, fb_view)

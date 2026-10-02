@@ -191,8 +191,7 @@ class DynamicChunkSizer:
 
             if is_dp_attention_enabled():
                 # Profiling runs one request on this rank; other DP ranks report 0.
-                dp_size = get_parallel().attn_dp_size
-                global_num_tokens = [0] * dp_size
+                global_num_tokens = [0] * get_parallel().attn_dp_size
                 dp_rank = get_parallel().attn_dp_rank
                 global_num_tokens[dp_rank] = current_seq_len
                 batch.global_num_tokens = global_num_tokens
