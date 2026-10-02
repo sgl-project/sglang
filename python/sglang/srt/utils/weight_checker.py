@@ -85,7 +85,10 @@ def _nvfp4_quantized_weights(module, prefix):
     trtllm = method.enable_flashinfer_trtllm_moe
     layout = "trtllm" if trtllm else "cutedsl"
     # named_parameters removes aliases; plans must use names present in snapshots.
-    names = {id(param): prefix + name for name, param in module.named_parameters(recurse=False)}
+    names = {
+        id(param): prefix + name
+        for name, param in module.named_parameters(recurse=False)
+    }
 
     def name(attr):
         return names[id(getattr(module, attr))]
@@ -100,10 +103,14 @@ def _nvfp4_quantized_weights(module, prefix):
         spec = Nvfp4Weight(weight, scale, global_scale, layout, gated)
         result[weight] = spec
         if source_scale != scale:
-            result[source_scale] = spec._replace(scale_name=source_scale, layout="cutedsl_linear")
+            result[source_scale] = spec._replace(
+                scale_name=source_scale, layout="cutedsl_linear"
+            )
         if not trtllm:
             mma_scale = name(f"{op}_blockscale_mma")
-            result[mma_scale] = spec._replace(scale_name=mma_scale, layout="cutedsl_mma")
+            result[mma_scale] = spec._replace(
+                scale_name=mma_scale, layout="cutedsl_mma"
+            )
 
         # Check execution alphas with their weights: a global-scale change may
         # be compensated by qweight/blockscale without changing the effective GEMM.
@@ -122,10 +129,14 @@ def _nvfp4_quantized_weights(module, prefix):
                     # These derived Parameters exist only when the activation config requests them.
                     if hasattr(module, alpha) and not situ:
                         result[name(alpha)] = spec._replace(
-                            global_scale_name=name(alpha), half=0 if gated else None, reciprocal=True
+                            global_scale_name=name(alpha),
+                            half=0 if gated else None,
+                            reciprocal=True,
                         )
         else:
-            result[name("g2_alphas")] = spec._replace(global_scale_name=name("g2_alphas"))
+            result[name("g2_alphas")] = spec._replace(
+                global_scale_name=name("g2_alphas")
+            )
     return result
 
 
@@ -440,7 +451,9 @@ def _build_check_entries(
     quantized_set = quantized_set or {}
     scale_names = {qw.scale_name for qw in quantized_set.values()}
     scale_names.update(
-        qw.global_scale_name for qw in quantized_set.values() if isinstance(qw, Nvfp4Weight)
+        qw.global_scale_name
+        for qw in quantized_set.values()
+        if isinstance(qw, Nvfp4Weight)
     )
 
     for name, tensor in raw.items():
@@ -451,7 +464,8 @@ def _build_check_entries(
             if isinstance(qw, Nvfp4Weight):
                 yield CheckEntry(
                     name,
-                    name not in skip_compare_names and qw.weight_name not in skip_compare_names,
+                    name not in skip_compare_names
+                    and qw.weight_name not in skip_compare_names,
                     qw.comparable(raw),
                 )
                 continue

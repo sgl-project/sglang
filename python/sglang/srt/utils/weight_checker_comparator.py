@@ -188,8 +188,12 @@ class Nvfp4MoEComparable(ComparableWeight):
         else:
             assert self.layout in ("trtllm", "cutedsl")
         padded_n, padded_k = -(-n // 128) * 128, -(-(k_bytes // 8) // 4) * 4
-        s = s.view(torch.float8_e4m3fn).reshape(e, padded_n // 128, padded_k // 4, 32, 4, 4)
-        return s.permute(0, 1, 4, 3, 2, 5).reshape(e, padded_n, padded_k)[:, :n, : k_bytes // 8]
+        s = s.view(torch.float8_e4m3fn).reshape(
+            e, padded_n // 128, padded_k // 4, 32, 4, 4
+        )
+        return s.permute(0, 1, 4, 3, 2, 5).reshape(e, padded_n, padded_k)[
+            :, :n, : k_bytes // 8
+        ]
 
     def _iter_decoded(self):
         e, n, k_bytes = self.w_q.shape
@@ -204,13 +208,24 @@ class Nvfp4MoEComparable(ComparableWeight):
                 end = min(start + step, n)
                 q = self.w_q[expert, start:end].cuda()
                 row = rows[start:end]
-                s = scales.view(torch.uint8)[expert, scale_rows[start:end]].view(torch.float8_e4m3fn).cuda().float()
+                s = (
+                    scales.view(torch.uint8)[expert, scale_rows[start:end]]
+                    .view(torch.float8_e4m3fn)
+                    .cuda()
+                    .float()
+                )
                 g = global_scale[expert].cuda().float()
-                halves = (row // (n // 2)).cuda() if self.gated else torch.zeros_like(row).cuda()
+                halves = (
+                    (row // (n // 2)).cuda()
+                    if self.gated
+                    else torch.zeros_like(row).cuda()
+                )
                 if g.numel() == 2:
                     g = g[halves, None]
                 s = s * g
-                codes = torch.stack((q & 15, q >> 4), dim=-1).reshape(end - start, -1, 16)
+                codes = torch.stack((q & 15, q >> 4), dim=-1).reshape(
+                    end - start, -1, 16
+                )
                 magnitude = (codes & 7).long()
                 sign = 1.0 - 2.0 * (codes >> 3).float()
                 values = torch.tensor(_E2M1_VALUES, device=q.device)[magnitude] * sign
@@ -218,7 +233,10 @@ class Nvfp4MoEComparable(ComparableWeight):
                 dequantized = (values * s.unsqueeze(-1)).reshape(end - start, -1)
                 ulp = (spacing * s.abs().unsqueeze(-1)).reshape(end - start, -1)
                 if self.half is not None:
-                    dequantized, ulp = dequantized[halves == self.half], ulp[halves == self.half]
+                    dequantized, ulp = (
+                        dequantized[halves == self.half],
+                        ulp[halves == self.half],
+                    )
                 yield dequantized, ulp
 
     def iter_chunks(self):
@@ -416,7 +434,10 @@ def select_comparable_weight(quant_method) -> Optional[type]:
     ):
         return Fp8BlockComparable
     if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
-        if quant_method.enable_flashinfer_trtllm_moe or quant_method._is_cutedsl_v2_standard:
+        if (
+            quant_method.enable_flashinfer_trtllm_moe
+            or quant_method._is_cutedsl_v2_standard
+        ):
             return Nvfp4MoEComparable
         raise NotImplementedError(
             f"weight checker has no ComparableWeight for {type(quant_method).__name__}"

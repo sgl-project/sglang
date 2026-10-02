@@ -29,13 +29,22 @@ _VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 def _checkpoint():
     generator = torch.Generator().manual_seed(42)
     result = {}
-    for op, n, k in (("w13", 2 * _INTERMEDIATE, _HIDDEN), ("w2", _HIDDEN, _INTERMEDIATE)):
-        codes = torch.randint(0, 16, (_EXPERTS, n, k), generator=generator, dtype=torch.uint8)
+    for op, n, k in (
+        ("w13", 2 * _INTERMEDIATE, _HIDDEN),
+        ("w2", _HIDDEN, _INTERMEDIATE),
+    ):
+        codes = torch.randint(
+            0, 16, (_EXPERTS, n, k), generator=generator, dtype=torch.uint8
+        )
         result[f"{op}_weight"] = (codes[..., ::2] | (codes[..., 1::2] << 4)).cuda()
         result[f"{op}_weight_scale"] = (
-            torch.randint(1, 8, (_EXPERTS, n, k // 16), generator=generator).cuda().to(torch.float8_e4m3fn)
+            torch.randint(1, 8, (_EXPERTS, n, k // 16), generator=generator)
+            .cuda()
+            .to(torch.float8_e4m3fn)
         )
-    result["w13_weight_scale_2"] = torch.tensor([[0.25, 0.5], [1.0, 2.0]], device="cuda")
+    result["w13_weight_scale_2"] = torch.tensor(
+        [[0.25, 0.5], [1.0, 2.0]], device="cuda"
+    )
     result["w2_weight_scale_2"] = torch.tensor([0.5, 0.25], device="cuda")
     return result
 
@@ -56,10 +65,20 @@ def _layer(checkpoint, backend):
         put(name, value.clone())
     if backend == "trtllm":
         q13, s13, q2, s2 = prepare_static_weights_for_trtllm_fp4_moe(
-            layer.w13_weight, layer.w2_weight, layer.w13_weight_scale, layer.w2_weight_scale,
-            _HIDDEN, _INTERMEDIATE, _EXPERTS,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            _HIDDEN,
+            _INTERMEDIATE,
+            _EXPERTS,
         )
-        for name, value in (("w13_weight", q13), ("w13_weight_scale", s13), ("w2_weight", q2), ("w2_weight_scale", s2)):
+        for name, value in (
+            ("w13_weight", q13),
+            ("w13_weight_scale", s13),
+            ("w2_weight", q2),
+            ("w2_weight_scale", s2),
+        ):
             put(name, value)
     else:
         for suffix in ("weight", "weight_scale"):
@@ -67,13 +86,23 @@ def _layer(checkpoint, backend):
             gate, up = tensor.chunk(2, dim=1)
             put(f"w13_{suffix}", interleave_w13_halves(torch.cat((up, gate), dim=1)))
         for op in ("w13", "w2"):
-            put(f"{op}_weight_scale", swizzle_blockscale(getattr(layer, f"{op}_weight_scale")))
-            setattr(layer, f"{op}_blockscale_swizzled", getattr(layer, f"{op}_weight_scale"))
+            put(
+                f"{op}_weight_scale",
+                swizzle_blockscale(getattr(layer, f"{op}_weight_scale")),
+            )
+            setattr(
+                layer, f"{op}_blockscale_swizzled", getattr(layer, f"{op}_weight_scale")
+            )
             q = getattr(layer, f"{op}_weight")
-            put(f"{op}_blockscale_mma", convert_sf_to_mma_layout(
-                getattr(layer, f"{op}_weight_scale").view(torch.uint8).reshape(-1),
-                m=q.shape[1], k=q.shape[2] * 2, num_groups=_EXPERTS,
-            ))
+            put(
+                f"{op}_blockscale_mma",
+                convert_sf_to_mma_layout(
+                    getattr(layer, f"{op}_weight_scale").view(torch.uint8).reshape(-1),
+                    m=q.shape[1],
+                    k=q.shape[2] * 2,
+                    num_groups=_EXPERTS,
+                ),
+            )
     put("g1_alphas", layer.w13_weight_scale_2[:, 0].clone())
     put("g1_alphas_up", layer.w13_weight_scale_2[:, 1].clone())
     put("g2_alphas", layer.w2_weight_scale_2.clone())
@@ -83,9 +112,17 @@ def _layer(checkpoint, backend):
 
 
 def _entries(layer, *, snapshot=False):
-    with patch.object(ModelOptNvFp4FusedMoEMethod, "_is_cutedsl_v2_standard", new_callable=PropertyMock, return_value=True):
+    with patch.object(
+        ModelOptNvFp4FusedMoEMethod,
+        "_is_cutedsl_v2_standard",
+        new_callable=PropertyMock,
+        return_value=True,
+    ):
         plan = _build_quantized_set(layer)
-    raw = {name: p.detach().cpu().contiguous() if snapshot else p for name, p in layer.named_parameters()}
+    raw = {
+        name: p.detach().cpu().contiguous() if snapshot else p
+        for name, p in layer.named_parameters()
+    }
     return list(_build_check_entries(raw, set(), plan))
 
 
@@ -94,32 +131,59 @@ class TestNvfp4WeightChecker(CustomTestCase):
         checkpoint = _checkpoint()
         for backend in ("trtllm", "cutedsl"):
             with self.subTest(backend=backend):
-                entries = {name: comparable for name, _, comparable in _entries(_layer(checkpoint, backend), snapshot=True)}
+                entries = {
+                    name: comparable
+                    for name, _, comparable in _entries(
+                        _layer(checkpoint, backend), snapshot=True
+                    )
+                }
                 for op in ("w13", "w2"):
                     q = checkpoint[f"{op}_weight"]
-                    codes = torch.stack((q & 15, q >> 4), dim=-1).reshape(_EXPERTS, q.shape[1], -1)
-                    values = torch.tensor(_VALUES, device="cuda")[(codes & 7).long()] * (1 - 2 * (codes >> 3).float())
-                    s = checkpoint[f"{op}_weight_scale"].float().repeat_interleave(16, dim=-1)
+                    codes = torch.stack((q & 15, q >> 4), dim=-1).reshape(
+                        _EXPERTS, q.shape[1], -1
+                    )
+                    values = torch.tensor(_VALUES, device="cuda")[
+                        (codes & 7).long()
+                    ] * (1 - 2 * (codes >> 3).float())
+                    s = (
+                        checkpoint[f"{op}_weight_scale"]
+                        .float()
+                        .repeat_interleave(16, dim=-1)
+                    )
                     g = checkpoint[f"{op}_weight_scale_2"].reshape(_EXPERTS, -1)
-                    g = g.repeat_interleave(q.shape[1] // g.shape[1], dim=1).unsqueeze(-1)
+                    g = g.repeat_interleave(q.shape[1] // g.shape[1], dim=1).unsqueeze(
+                        -1
+                    )
                     expected = (values * s * g).to(torch.bfloat16)
                     if backend == "trtllm":
                         from flashinfer.fused_moe.core import (
                             _maybe_get_cached_w3_w1_permute_indices,
                             get_w2_permute_indices_with_cache,
                         )
-                        permute = _maybe_get_cached_w3_w1_permute_indices if op == "w13" else get_w2_permute_indices_with_cache
+
+                        permute = (
+                            _maybe_get_cached_w3_w1_permute_indices
+                            if op == "w13"
+                            else get_w2_permute_indices_with_cache
+                        )
                         expected = expected[:, permute({}, q[0], 128)]
                     elif op == "w13":
                         gate, up = expected.chunk(2, dim=1)
                         expected = interleave_w13_halves(torch.cat((up, gate), dim=1))
-                    torch.testing.assert_close(entries[f"{op}_weight"].dequantize(), expected.flatten(0, 1), rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        entries[f"{op}_weight"].dequantize(),
+                        expected.flatten(0, 1),
+                        rtol=0,
+                        atol=0,
+                    )
 
     def test_equivalent_global_and_block_scales_compare_and_hash_equal(self):
         checkpoint = _checkpoint()
         other = {name: tensor.clone() for name, tensor in checkpoint.items()}
         for op in ("w13", "w2"):
-            other[f"{op}_weight_scale"] = (other[f"{op}_weight_scale"].float() / 2).to(torch.float8_e4m3fn)
+            other[f"{op}_weight_scale"] = (other[f"{op}_weight_scale"].float() / 2).to(
+                torch.float8_e4m3fn
+            )
             other[f"{op}_weight_scale_2"] *= 2
         for backend in ("trtllm", "cutedsl"):
             with self.subTest(backend=backend):
@@ -127,15 +191,33 @@ class TestNvfp4WeightChecker(CustomTestCase):
                 actual = _entries(_layer(other, backend))
                 _check_tensors(expected, actual)
                 self.assertEqual(
-                    {n: _hash_tensor(c.dequantize()) for n, flag, c in expected if flag},
+                    {
+                        n: _hash_tensor(c.dequantize())
+                        for n, flag, c in expected
+                        if flag
+                    },
                     {n: _hash_tensor(c.dequantize()) for n, flag, c in actual if flag},
                 )
 
     def test_corruption_is_detected_in_weights_scales_and_execution_alphas(self):
         checkpoint = _checkpoint()
         for backend in ("trtllm", "cutedsl"):
-            fields = ["w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale", "w13_weight_scale_2", "w2_weight_scale_2", "g1_alphas", "g1_alphas_up", "g2_alphas"]
-            fields += ["g1_scale_c"] if backend == "trtllm" else ["w13_blockscale_mma", "w2_blockscale_mma"]
+            fields = [
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+                "w13_weight_scale_2",
+                "w2_weight_scale_2",
+                "g1_alphas",
+                "g1_alphas_up",
+                "g2_alphas",
+            ]
+            fields += (
+                ["g1_scale_c"]
+                if backend == "trtllm"
+                else ["w13_blockscale_mma", "w2_blockscale_mma"]
+            )
             expected = _entries(_layer(checkpoint, backend), snapshot=True)
             for field in fields:
                 with self.subTest(backend=backend, field=field):
@@ -147,8 +229,12 @@ class TestNvfp4WeightChecker(CustomTestCase):
                         tensor.view(torch.uint8).fill_(127)
                     else:
                         tensor.mul_(16)
-                    with self.assertRaisesRegex(Exception, "check tensor equality failed"):
-                        _check_tensors(expected, _entries(layer), allow_quant_error=True)
+                    with self.assertRaisesRegex(
+                        Exception, "check tensor equality failed"
+                    ):
+                        _check_tensors(
+                            expected, _entries(layer), allow_quant_error=True
+                        )
 
     def test_chunking_and_snapshot_strides_do_not_change_results(self):
         checkpoint = _checkpoint()
@@ -156,7 +242,10 @@ class TestNvfp4WeightChecker(CustomTestCase):
             with self.subTest(backend=backend):
                 layer = _layer(checkpoint, backend)
                 expected, actual = _entries(layer, snapshot=True), _entries(layer)
-                with patch("sglang.srt.utils.weight_checker_comparator.CHUNK_NUMEL", 256 * 4 * 7):
+                with patch(
+                    "sglang.srt.utils.weight_checker_comparator.CHUNK_NUMEL",
+                    256 * 4 * 7,
+                ):
                     for (_, _, lhs), (_, _, rhs) in zip(expected, actual, strict=True):
                         result = compare_weights(lhs, rhs)
                         self.assertTrue(result.equal, result)
