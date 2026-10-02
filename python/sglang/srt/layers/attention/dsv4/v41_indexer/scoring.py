@@ -10,6 +10,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    finish_flat_indexer_topk,
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
@@ -66,6 +67,19 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
         )
 
     def write_selection(self, selected: torch.Tensor, out: Selection) -> None:
+        if (
+            selected.is_cuda
+            and get_platform().is_sm100
+            and selected.dtype == torch.int32
+        ):
+            finish_flat_indexer_topk(
+                selected,
+                self.k_slots,
+                self.request_starts,
+                out.page_indices,
+                out.raw_indices,
+            )
+            return
         num_tokens, topk = selected.shape
         unselected = torch.iinfo(torch.int32).max
         selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values

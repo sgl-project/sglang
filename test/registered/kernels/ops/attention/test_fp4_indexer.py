@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -744,6 +745,122 @@ def test_hopper_indexer_backends_replay(ratio):
             assert (out.page_indices[batch] == -1).all().item()
             if out.raw_indices is not None:
                 assert (out.raw_indices[batch] == -1).all().item()
+
+
+@pytest.mark.parametrize("rows", [0, 1, 32, 129])
+@pytest.mark.parametrize("topk", [0, 1, 65, 512])
+@pytest.mark.parametrize("write_raw", [False, True])
+def test_flat_indexer_selection_replay(rows, topk, write_raw):
+    from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+
+    torch.manual_seed(81 + rows + topk)
+    indices = torch.randint(
+        0, 2048, (rows, topk + 8), device="cuda", dtype=torch.int32
+    )[:, :topk]
+    slots = torch.randperm(2048, device="cuda").to(torch.int64)
+    starts = torch.randint(0, 128, (rows,), device="cuda", dtype=torch.int32)
+    pages = torch.full((rows + 1, topk + 8), 12345, device="cuda", dtype=torch.int32)
+    raw = torch.full_like(pages, 12345) if write_raw else None
+
+    data = SimpleNamespace(k_slots=slots, request_starts=starts)
+    selection = SimpleNamespace(page_indices=pages, raw_indices=raw)
+
+    def run():
+        # Use real platform dispatch on Blackwell; also check integer
+        # finalization on other CUDA GPUs through the SM100 runtime entry.
+        platform = scoring.get_platform()
+        context = (
+            nullcontext()
+            if platform.is_sm100
+            else patch.object(
+                scoring, "get_platform", return_value=SimpleNamespace(is_sm100=True)
+            )
+        )
+        with context:
+            scoring.DeepGEMMPrefillData.write_selection(data, indices, selection)
+
+    for _ in range(3):
+        run()
+    graph = None
+    if rows and topk:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+    for step in range(3):
+        indices.copy_(
+            torch.randint(0, 2048, indices.shape, device="cuda", dtype=torch.int32)
+        )
+        indices[:, step::7] = -1 - step
+        indices[:, 2::11] = torch.iinfo(torch.int32).max
+        if step == 1:
+            indices.fill_(-1)
+        slots.copy_(slots.roll(17))
+        starts.add_(1)
+        pages.fill_(12345)
+        if raw is not None:
+            raw.fill_(12345)
+        if graph is not None:
+            graph.replay()
+        else:
+            run()
+        sentinel = torch.iinfo(torch.int32).max
+        selected = indices.masked_fill(indices < 0, sentinel).sort(-1).values
+        chosen = selected != sentinel
+        expected_pages = torch.full_like(pages, 12345)
+        expected_pages[:rows, :topk] = torch.where(
+            chosen, slots[selected.clamp_max(slots.numel() - 1)], -1
+        ).int()
+        torch.testing.assert_close(pages, expected_pages, rtol=0, atol=0)
+        if raw is not None:
+            expected_raw = torch.full_like(raw, 12345)
+            expected_raw[:rows, :topk] = torch.where(
+                chosen, selected - starts[:, None], -1
+            )
+            torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("write_raw", [False, True])
+def test_flat_indexer_slot_count_does_not_recompile(write_raw):
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        _finish_flat_indexer_topk_kernel,
+    )
+
+    rows, topk = 32, 512
+    torch.manual_seed(95)
+    indices = torch.randint(0, 8192, (rows, topk), device="cuda", dtype=torch.int32)
+    indices[:, 0] = -3
+    indices[:, 1] = torch.iinfo(torch.int32).max
+    starts = torch.arange(rows, device="cuda", dtype=torch.int32)
+    pages = torch.empty_like(indices)
+    raw = torch.empty_like(indices) if write_raw else None
+    hashes = set()
+    for num_slots in (1, 17, 64, 65, 129, 2048, 8192):
+        slots = torch.arange(num_slots, device="cuda", dtype=torch.int64) * 3 + 7
+        compiled = _finish_flat_indexer_topk_kernel[(rows,)](
+            indices,
+            slots,
+            starts,
+            pages,
+            raw,
+            topk,
+            num_slots,
+            indices.stride(0),
+            pages.stride(0),
+            raw.stride(0) if raw is not None else 0,
+            write_raw,
+            topk,
+            num_warps=4,
+        )
+        hashes.add(compiled.hash)
+        sentinel = torch.iinfo(torch.int32).max
+        selected = indices.masked_fill(indices < 0, sentinel).sort(-1).values
+        chosen = selected != sentinel
+        expected = torch.where(chosen, slots[selected.clamp_max(num_slots - 1)], -1)
+        torch.testing.assert_close(pages, expected.int(), rtol=0, atol=0)
+        if raw is not None:
+            expected_raw = torch.where(chosen, selected - starts[:, None], -1)
+            torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
+    assert len(hashes) == 1, "Changing the visible slot count must reuse the kernel"
 
 
 if __name__ == "__main__":
