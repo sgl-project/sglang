@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_mps, is_no_spec_infer_or_topk_one
+from sglang.srt.utils.common import is_mps, is_no_spec_infer_or_topk_one, is_ppu
 
 logger = logging.getLogger(__name__)
 
@@ -272,9 +272,9 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
     if not use_mla_backend:
         # MHA architecture
 
-        if get_platform().is_hopper_with_cuda_12_3 and is_no_spec_infer_or_topk_one(
-            resolved_view(server_args)
-        ):
+        if (
+            is_ppu() or get_platform().is_hopper_with_cuda_12_3
+        ) and is_no_spec_infer_or_topk_one(resolved_view(server_args)):
             # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
             # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
             # ref: https://github.com/sgl-project/sglang/issues/17411

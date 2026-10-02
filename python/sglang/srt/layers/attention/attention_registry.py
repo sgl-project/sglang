@@ -23,11 +23,12 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_ppu
 
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +230,10 @@ def create_flashattention_v3_backend(runner):
 
     major, minor = get_device_capability()
     if not _is_musa:
-        assert (major == 8 and not runner.use_mla_backend) or major == 9, (
+        # PPU reports SM8x but routes MLA prefill through fa3 (its FA3 library
+        # handles the MLA head dims), so it is exempt from the SM80-excludes-MLA
+        # restriction that applies to NVIDIA Ampere.
+        assert (major == 8 and (_is_ppu or not runner.use_mla_backend)) or major == 9, (
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
         )

@@ -34,6 +34,12 @@ def maybe_disable_chunked_prefix_cache(
     # model's (often non-MLA) config must not flip the shared setting.
     if is_draft_worker:
         return
+    # <NOTE>
+    # PPU FA3 does not support MLA. For MLA models on PPU, the attention backend
+    # is split: [--prefill-attention-backend fa3 --decode-attention-backend flashmla].
+    # Therefore we must check prefill_attention_backend (not attention_backend) when
+    # determining chunked-prefix-cache support on PPU.
+    # </NOTE>
     # Chunked prefix cache is a prefill feature: the prefill half decides.
     prefill_backend, _ = attention_backends()
     if (

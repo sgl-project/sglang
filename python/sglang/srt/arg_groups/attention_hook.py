@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _attention_backend_default,
+    _attention_backend_dual_chunk,
     _attention_backend_fa3_fp8_fallback,
     _attention_backend_platform_fallbacks,
     _cutedsl_prefill_backend_fill,
@@ -19,6 +20,9 @@ from sglang.srt.arg_groups.overrides import (
     _intel_xpu_page_constraint,
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
+    _ppu_fa3_chunked_prefix_cache_threshold,
+    _ppu_fa3_flashmla_qv_fallback,
+    _ppu_flashmla_fp8_kv_cache_fallback,
     attention_backends_of,
     declare_resolution,
     mamba_extra_buffer_of,
@@ -49,6 +53,12 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     # Split-backend override + default fill.
     run_post_process_pass(server_args, _attention_backend_default)
+
+    # PPU: fa3+flashmla combo crashes with "q_v not support" under certain
+    # configs; fall back to a unified flashmla backend. Also, flashmla does
+    # not support fp8_e4m3 KV cache on PPU; disable FP8 KV cache.
+    run_post_process_pass(server_args, _ppu_fa3_flashmla_qv_fallback)
+    run_post_process_pass(server_args, _ppu_flashmla_fp8_kv_cache_fallback)
 
     # Torch native and flex attention backends
     attention_backend = resolved_view(server_args).attention_backend
@@ -204,6 +214,26 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     # XPU platforms backends
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
+
+    # Dual chunk flash attention backend
+    run_post_process_pass(server_args, _attention_backend_dual_chunk)
+    if resolved_view(server_args).attention_backend == "dual_chunk_flash_attn":
+        logger.warning(
+            "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
+        )
+        declare_resolution(
+            server_args,
+            "_handle_attention_backend_compatibility",
+            enable_mixed_chunk=False,
+        )
+        declare_resolution(
+            server_args,
+            "_handle_attention_backend_compatibility",
+            disable_radix_cache=True,
+        )
+
+    # PPU FA3 cannot consume a chunked prefix cache: force the threshold to 0.
+    run_post_process_pass(server_args, _ppu_fa3_chunked_prefix_cache_threshold)
 
 
 def handle_linear_attn_backend(server_args: Any):

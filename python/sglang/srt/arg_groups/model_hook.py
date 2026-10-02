@@ -41,6 +41,7 @@ from sglang.srt.runtime_context import derive_attention_widths, get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
     is_mps,
+    is_ppu,
     parse_connector_type,
 )
 
@@ -381,6 +382,20 @@ def handle_model_specific_adjustments(server_args: Any):
             # the override registry (arg_groups/overrides.py:
             # _deepseek_family_overrides).
             if cfg.enable_prefill_cp and use_mla_backend(server_args):
+                declare_resolution(
+                    server_args,
+                    "_handle_model_specific_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.PREFILL,
+                        backend=Backend.DISABLED,
+                    ),
+                )
+
+            # A captured prefill graph pins MLA to the absorbed path, which
+            # hands the backend a non-None q_v; the PPU FA3 interface rejects
+            # that argument, so MLA prefill must stay eager on PPU.
+            if is_ppu() and use_mla_backend(server_args):
                 declare_resolution(
                     server_args,
                     "_handle_model_specific_adjustments",
