@@ -467,7 +467,10 @@ def can_use_residual_gate_add_cuda(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
     return (
-        residual.dtype in _SUPPORTED_DTYPES
+        # ROCm tensors also report is_cuda, but these kernels contain PTX
+        # rounding instructions and cannot be compiled for AMD GPUs.
+        torch.version.hip is None
+        and residual.dtype in _SUPPORTED_DTYPES
         and residual.dtype == update.dtype
         and residual.dtype == gate.dtype
         and residual.is_cuda
