@@ -180,6 +180,7 @@ class GSM8KMixin:
     # the sampling path.
     gsm8k_temperature: Optional[float] = None
     gsm8k_top_p: Optional[float] = None
+    gsm8k_data_path: Optional[str] = None  # local path to GSM8K jsonl
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
@@ -215,6 +216,7 @@ class GSM8KMixin:
                 num_shots=self.gsm8k_num_shots,
                 temperature=self.gsm8k_temperature,
                 top_p=self.gsm8k_top_p,
+                gsm8k_data_path=self.gsm8k_data_path,
             )
 
 
