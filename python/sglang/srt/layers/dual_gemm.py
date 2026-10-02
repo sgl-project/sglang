@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_forward
 from sglang.srt.utils import is_cuda
 
@@ -38,7 +39,7 @@ class DualGemm:
         self.mode = self._select_mode(hidden_size)
 
     def _select_mode(self, hidden_size: int) -> Optional[DualGemmQuantMode]:
-        if not is_cuda():
+        if envs.SGLANG_DISABLE_FUSIONS.get() or not is_cuda():
             return None
 
         from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (

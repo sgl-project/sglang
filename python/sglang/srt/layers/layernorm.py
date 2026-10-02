@@ -92,7 +92,7 @@ if _is_cuda or _is_xpu or _is_musa:
             )
             from flashinfer.norm import rmsnorm_quant as _flashinfer_rmsnorm_quant
 
-            _flashinfer_rmsnorm_quant_available = True
+            _flashinfer_rmsnorm_quant_available = not envs.SGLANG_DISABLE_FUSIONS.get()
         except (ImportError, AttributeError):
             _flashinfer_rmsnorm_quant_available = False
     else:
