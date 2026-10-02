@@ -10,6 +10,7 @@ and never give it a `moe_runner_config` (issue #36264).
 import sys
 import types
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch

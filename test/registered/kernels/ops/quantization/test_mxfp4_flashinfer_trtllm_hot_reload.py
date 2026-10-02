@@ -19,7 +19,8 @@ if not torch.cuda.is_available():
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     Mxfp4FlashinferTrtllmMoEMethod,
 )
-from sglang.srt.model_loader.loader import postprocess_weight, restore_weight
+from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,7 +42,7 @@ KERNEL_TENSORS = (
 )
 NUM_EXPERTS = 2
 HIDDEN_SIZE = 128
-INTERMEDIATE_SIZE = 64
+INTERMEDIATE_SIZE = 128
 
 
 class _NoOpFp8:
@@ -88,29 +89,41 @@ def _build_layer(
 
 def _load_weights(layer: Module, seed: int) -> None:
     generator = torch.Generator(device="cuda").manual_seed(seed)
+    intermediate_size = layer.quant_method._intermediate_size_unpadded
     for name in LOAD_PARAMS:
         param = getattr(layer, name)
+        shape = list(param.shape)
+        if name.startswith("w13"):
+            shape[1] = 2 * intermediate_size
+        else:
+            shape[2] = intermediate_size // (32 if "scale" in name else 2)
         if "scale" in name:
             encoded = torch.randint(
                 100,
                 140,
-                param.shape,
+                shape,
                 generator=generator,
                 device="cuda",
                 dtype=torch.uint8,
             )
-            param.data.copy_(encoded.view(torch.float8_e8m0fnu))
+            loaded = encoded.view(torch.float8_e8m0fnu)
         else:
-            param.data.copy_(
-                torch.randint(
-                    -128,
-                    127,
-                    param.shape,
-                    generator=generator,
-                    device="cuda",
-                    dtype=torch.int8,
-                )
+            loaded = torch.randint(
+                -128,
+                127,
+                shape,
+                generator=generator,
+                device="cuda",
+                dtype=torch.int8,
             )
+        if name.startswith("w13"):
+            half = param.shape[1] // 2
+            param.data[:, :intermediate_size].copy_(loaded[:, :intermediate_size])
+            param.data[:, half : half + intermediate_size].copy_(
+                loaded[:, intermediate_size:]
+            )
+        else:
+            param.data[:, :, : loaded.shape[2]].copy_(loaded)
 
 
 def _layout(layer: Module) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
@@ -124,13 +137,16 @@ def _kernel_tensors(layer: Module) -> dict[str, torch.Tensor]:
     return {name: getattr(layer, name) for name in KERNEL_TENSORS}
 
 
-def test_hot_reload_matches_fresh_load_and_preserves_kernel_addresses():
-    layer = _build_layer()
-    load_layout = _layout(layer)
+@pytest.mark.parametrize("intermediate_size", [64, 128])
+def test_hot_reload_matches_fresh_load_and_preserves_kernel_addresses(
+    intermediate_size,
+):
+    layer = _build_layer(intermediate_size=intermediate_size)
     load_params = {name: getattr(layer, name) for name in LOAD_PARAMS}
 
     _load_weights(layer, seed=0)
-    postprocess_weight(layer, torch.device("cuda"))
+    DefaultModelLoader.postprocess_weights(layer, torch.device("cuda"))
+    load_layout = _layout(layer)
     initial = {
         name: tensor.detach().clone() for name, tensor in _kernel_tensors(layer).items()
     }
@@ -138,9 +154,9 @@ def test_hot_reload_matches_fresh_load_and_preserves_kernel_addresses():
         name: tensor.data_ptr() for name, tensor in _kernel_tensors(layer).items()
     }
 
-    reference = _build_layer()
+    reference = _build_layer(intermediate_size=intermediate_size)
     _load_weights(reference, seed=1)
-    postprocess_weight(reference, torch.device("cuda"))
+    DefaultModelLoader.postprocess_weights(reference, torch.device("cuda"))
     expected = {
         name: tensor.detach().clone()
         for name, tensor in _kernel_tensors(reference).items()
@@ -148,14 +164,14 @@ def test_hot_reload_matches_fresh_load_and_preserves_kernel_addresses():
 
     # The loader hooks bracket every update session; neither may disturb the
     # checkpoint-layout parameters ``load_weights`` writes into.
-    restore_weight(layer, torch.device("cuda"))
+    DefaultModelLoader.restore_weights_before_loading(layer, torch.device("cuda"))
     assert _layout(layer) == load_layout
     for name in LOAD_PARAMS:
         assert getattr(layer, name) is load_params[name]
         assert hasattr(getattr(layer, name), "weight_loader")
 
     _load_weights(layer, seed=1)
-    postprocess_weight(layer, torch.device("cuda"))
+    DefaultModelLoader.postprocess_weights(layer, torch.device("cuda"))
 
     for name in LOAD_PARAMS:
         assert getattr(layer, name) is load_params[name]
@@ -206,9 +222,7 @@ class TestMxfp4KernelForward(CustomTestCase):
         outputs = []
         # A local kernel call needs no distributed symmetric-memory allocator.
         with (
-            patch.object(
-                mxfp4_flashinfer_trtllm_moe, "get_tp_group", return_value=None
-            ),
+            get_parallel().override(tp_group=None),
             patch.object(
                 mxfp4_flashinfer_trtllm_moe,
                 "is_allocation_symmetric",
@@ -217,12 +231,14 @@ class TestMxfp4KernelForward(CustomTestCase):
         ):
             for packed_byte in (-86, 34):
                 if outputs:
-                    restore_weight(layer, torch.device("cuda"))
+                    DefaultModelLoader.restore_weights_before_loading(
+                        layer, torch.device("cuda")
+                    )
                 for name in LOAD_PARAMS:
                     getattr(layer, name).fill_(
                         1 / 32 if "scale" in name else packed_byte
                     )
-                postprocess_weight(layer, torch.device("cuda"))
+                DefaultModelLoader.postprocess_weights(layer, torch.device("cuda"))
                 output = layer.quant_method.apply(layer, dispatch).hidden_states
                 torch.cuda.synchronize()
                 self.assertEqual(output.shape, hidden_states.shape)

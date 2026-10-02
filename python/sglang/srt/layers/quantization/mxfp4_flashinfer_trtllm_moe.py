@@ -51,10 +51,20 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 )
 
 
-def _pad_intermediate_size(layer: Module) -> None:
-    intermediate_size = layer.w13_weight.shape[1] // 2
+def _pad_intermediate_size(layer: Module, intermediate_size: int) -> None:
     padded_size = (intermediate_size + 127) // 128 * 128
     if padded_size == intermediate_size:
+        return
+
+    if layer.w13_weight.shape[1] == 2 * padded_size:
+        # Partial checkpoint loads leave the padding untouched. After a kernel
+        # row permutation those slots can contain data, so clear them on reload.
+        for name, fill_value in (("w13_weight", 0), ("w13_weight_scale_inv", 1)):
+            param = getattr(layer, name).data
+            param[:, intermediate_size:padded_size].fill_(fill_value)
+            param[:, padded_size + intermediate_size :].fill_(fill_value)
+        layer.w2_weight.data[:, :, intermediate_size // 2 :].zero_()
+        layer.w2_weight_scale_inv.data[:, :, intermediate_size // 32 :].fill_(1)
         return
 
     # Gate and up occupy separate halves; each needs its own zero tail.
@@ -102,9 +112,9 @@ def _pad_intermediate_size(layer: Module) -> None:
 
 
 def routed_hidden_size(layer: Module) -> int:
-    """Hidden size the routed GEMM1 expects (uint8 weights hold two fp4/row)."""
+    """Hidden size the routed GEMM1 expects (packed bytes hold two FP4 values)."""
     w13 = layer.w13_weight
-    return w13.shape[2] * 2 if w13.dtype == torch.uint8 else w13.shape[2]
+    return w13.shape[2] * 2 if w13.dtype in (torch.int8, torch.uint8) else w13.shape[2]
 
 
 class Mxfp8RoutedInputPreQuant(NamedTuple):
@@ -170,6 +180,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         fp4_block_k = 32
+        self._intermediate_size_unpadded = intermediate_size_per_partition
 
         w13_weight = Parameter(
             torch.empty(
@@ -240,7 +251,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        _pad_intermediate_size(layer)
+        _pad_intermediate_size(layer, self._intermediate_size_unpadded)
         log_info_on_rank0(
             logger,
             f"Shuffling FP4 expert weights for TRT-LLM MxFP4 kernel "
