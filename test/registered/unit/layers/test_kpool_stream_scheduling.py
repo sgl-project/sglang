@@ -330,6 +330,7 @@ def _plan_chunks(*, num_rows, num_cols, budget_bytes, capture_mode=False):
         patch.object(indexer_module, "is_hip", return_value=False),
         patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
         patch.object(indexer_module.capture_mode, "is_capture_mode", capture_mode),
+        patch.dict(indexer_module._MQA_LOGITS_BUDGET_BYTES, clear=True),
     ):
         chunks = indexer_module._mqa_logits_row_chunks(
             num_rows=num_rows, num_cols=num_cols, device=torch.device("cuda", 0)
@@ -342,6 +343,36 @@ class TestKPoolMqaLogitsRowChunks(CustomTestCase):
         chunks, budget = _plan_chunks(num_rows=64, num_cols=1024, budget_bytes=1 << 20)
         self.assertEqual(chunks, (slice(0, 64),))
         budget.assert_not_called()
+
+    def test_budget_is_measured_once_per_device(self):
+        # mem_get_info syncs the host; every sparse layer of a prefill asks.
+        with (
+            patch.object(
+                indexer_module, "mqa_logits_budget_bytes", return_value=6 << 30
+            ) as budget,
+            patch.object(indexer_module, "is_hip", return_value=False),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(indexer_module.capture_mode, "is_capture_mode", False),
+            patch.dict(indexer_module._MQA_LOGITS_BUDGET_BYTES, clear=True),
+        ):
+            plans = [
+                indexer_module._mqa_logits_row_chunks(
+                    num_rows=_LARGE_ROWS,
+                    num_cols=_LARGE_COLS,
+                    device=torch.device("cuda", 0),
+                )
+                for _ in range(3)
+            ]
+            indexer_module._mqa_logits_row_chunks(
+                num_rows=_LARGE_ROWS,
+                num_cols=_LARGE_COLS,
+                device=torch.device("cuda", 1),
+            )
+        self.assertEqual(plans[0], plans[1])
+        self.assertEqual(plans[0], plans[2])
+        self.assertEqual(
+            [call.kwargs["device_index"] for call in budget.call_args_list], [0, 1]
+        )
 
     def test_chunks_cover_every_row_once_and_fit_the_budget(self):
         budget_bytes = 6 << 30
