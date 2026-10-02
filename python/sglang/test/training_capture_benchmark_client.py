@@ -14,13 +14,16 @@ import numpy as np
 
 
 class RequestRecorder:
-    def __init__(self, request):
+    def __init__(self, request, diagnostics=None):
         self.request = request
+        self.diagnostics = diagnostics
         self.prefix = uuid.uuid4().hex
         self.indices = itertools.count()
         self.records = []
 
     async def __call__(self, request_func_input, pbar=None):
+        if self.diagnostics is not None:
+            self.diagnostics.watch_loop()
         index = next(self.indices)
         rid = f"capture-benchmark-{self.prefix}-{index}"
         request = replace(
@@ -111,13 +114,21 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__, add_help=False)
     parser.add_argument("--capture-request-records", type=Path, required=True)
+    parser.add_argument("--capture-latency-diagnostics", action="store_true")
     parser.add_argument("--backend", choices=["sglang"], required=True)
     args, remaining = parser.parse_known_args()
     original = serving.ASYNC_REQUEST_FUNCS["sglang"]
-    recorder = RequestRecorder(original)
+    diagnostics = None
+    if args.capture_latency_diagnostics:
+        from sglang.test.training_capture_diagnostics import ClientDiagnostics
+
+        diagnostics = ClientDiagnostics()
+    recorder = RequestRecorder(original, diagnostics)
     report = {"schema_version": 1, "status": "running"}
     argv = sys.argv
     with args.capture_request_records.open("x") as stream:
+        if diagnostics is not None:
+            diagnostics.start()
         try:
             serving.ASYNC_REQUEST_FUNCS["sglang"] = recorder
             sys.argv = [argv[0], "--backend", "sglang", *remaining]
@@ -129,6 +140,8 @@ def main():
         finally:
             serving.ASYNC_REQUEST_FUNCS["sglang"] = original
             sys.argv = argv
+            if diagnostics is not None:
+                report["diagnostics"] = diagnostics.close()
             report["requests"] = sorted(
                 recorder.records, key=lambda row: row["request_index"]
             )

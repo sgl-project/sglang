@@ -1,0 +1,2465 @@
+{
+  "schema_version": 1,
+  "baseline_revision": "b091ab1be267f9b9bd30e143d5cacfccf034540d",
+  "branch": "codex/dspark-maas-capture",
+  "runtime_lock": {
+    "path": "mooncake-study/experiments/h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84"
+  },
+  "change": "Opt-in clock anchors and client GC/event-loop observations, separate/drained server logs, test-only structured tokenizer GC, offline request/pause correlation and tail extrema.",
+  "checks": {
+    "black_python_files": 5,
+    "full_ruff_python_files": 5,
+    "diff_check": "passed",
+    "final_unit_methods": 24,
+    "final_unit_seconds": 0.097,
+    "final_unit_job": "01790975296699001641-5273d8579097"
+  },
+  "validation": {
+    "timed_requests": 10944,
+    "output_tokens": 350208,
+    "post_exit_snapshots": 390,
+    "payload_bytes": 243172800,
+    "serving_phases": 15,
+    "diagnostic_phases": 12,
+    "verified_prometheus_scrapes": 5,
+    "final_tokenizer_run_requests": 3072,
+    "final_tokenizer_run_snapshots": 92,
+    "tokenizer_gc_spans_fully_within_ttft": 24,
+    "wall_monotonic_gc_duration_disagreement_under_seconds": 0.000002,
+    "max_observed_clock_offset_change_bound_seconds": 0.0000036954879760742188,
+    "all_seven_jobs_terminal_success": true
+  },
+  "findings": [
+    "V2 has eight >500ms TTFT requests in every 1024-request phase. Maximum TTFT is 578.894-603.620ms, while p99 is 58.031-88.592ms. The affected fraction is below 1%; aggregate p99 did not expose the stall.",
+    "V3 observes tokenizer generation-two GC spans of 500.057, 487.729 and 492.640ms. Each span is fully inside TTFT for requests 168-175 in its phase, including both capture-off phases and the 10% phase.",
+    "The test-only tokenizer entrypoint changes import/allocation history: its affected indices differ from v2. No GC collection policy is changed and no controlled policy intervention is measured.",
+    "An intermediate v1 off phase observes 103.524ms client event-loop lag overlapping requests 88-95 without a simultaneous >=20ms client GC event. Timer lag identifies a late callback, not the delaying operation.",
+    "The original uninstrumented metadata-comparison spike cannot be retroactively assigned to these observed events."
+  ],
+  "limitations": [
+    "Single resident H100, Qwen3-0.6B BF16, synthetic token IDs, local TCP Store, HTTP test Catalog and GPFS publication journal.",
+    "Diagnostics allocate event records, schedule timers, log GC and alter import history; timings are not a clean comparison to earlier uninstrumented sources.",
+    "Two clock anchors bound observed endpoint offset change, not every possible intervening wall-clock jump. Server mapping is omitted if the observed bound exceeds 5ms.",
+    "GC and event-loop intervals may overlap; their request overlaps are temporal associations and cannot be summed as causal latency.",
+    "Non-GC tokenizer work, detokenizer pauses and OS scheduling are not directly observed. The visible cgroup has no observed quota throttle; parent/host effects are not ruled out.",
+    "V1 shares server log sinks and lacks explicit log-drain waiting, so it is intermediate evidence. V2 adds complete separate logs; v3 adds tokenizer instrumentation. The disabled smoke uses v2.",
+    "Production GC policy, capture defaults and native streaming behavior remain unchanged. Production SLO, Catalog retention, SpecForge integration and trained draft quality are not proven."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+    "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+    "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+    "python/sglang/srt/training_capture/cohort.py": "6bd093ee9a219970b08023d279852b07caaacf288f2f617236b6b2e1c7d5af56",
+    "python/sglang/srt/training_capture/cohort_coordinator.py": "b1f4d340cab3b2400e7415c17773b27510524f8d3df55c6ec8af89455e3504f1",
+    "python/sglang/srt/training_capture/cohort_exchange.py": "b37abb0499a23fa8650521fe28c04a7219b887f5d2920e6f8070d4bfacae2ed3",
+    "python/sglang/srt/training_capture/cohort_service.py": "60f8578cf250b4f3dbf97b15d67a2c78a67eb6b836a5bcda85dfdaf90ecf9324",
+    "python/sglang/srt/training_capture/cohort_startup.py": "dfacd1a45203de5f3c08ccf73b06933f7aa4183bd670979981cfe2cb960208ed",
+    "python/sglang/srt/training_capture/cohort_writer.py": "8f47827eb4e8ca2d3e4f68a91a21d56e13e84530952d5f3ea71843b7f3647d69",
+    "python/sglang/srt/training_capture/config.py": "9cf427b9f673c376f728aa4bec45b0b4a31bffb360ce88731b32b8fccc34530d",
+    "python/sglang/srt/training_capture/context.py": "548ba9ac33f40cd2589ccf67c76b66ec2d307df7e8323ec788ed515c1a812de7",
+    "python/sglang/srt/training_capture/coordinator.py": "9e5ad5eac75c1a5337bde61fec32036627e14182458fedf81e22dc81cdb2fb33",
+    "python/sglang/srt/training_capture/host_pool.py": "591086d65bd855dfb671588c4c7e1b0af7270237ef738e0967db32f5e5816bfc",
+    "python/sglang/srt/training_capture/identity.py": "47f91ad994b716d27454eace428d9d0a5ce7468c5708e4dd3d3e385119c8ac24",
+    "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+    "python/sglang/srt/training_capture/kv_exporter.py": "2cecaf4db75bd9b2b0adf664f12fd6c56cfaba74be01b1c755b40cfd62299c8f",
+    "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+    "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+    "python/sglang/srt/training_capture/metrics.py": "422f9522d27718ed015c354c9b1ad7bb6c9b49f366a4e8b02de083f7e424ac1f",
+    "python/sglang/srt/training_capture/mooncake_store.py": "94525a4eb4088ab847c9dffd66d8a3c509b44d30244da76cba7647cd0944e139",
+    "python/sglang/srt/training_capture/pd_capture.py": "a2e239ca22f3318a85d5bd27c872047975843a84676fc70ca85a693256e9f36f",
+    "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+    "python/sglang/srt/training_capture/protocol.py": "e57f130767eb7ca4aef6dc63a7cfdbaa37cc1d02326a068bc973d818a7bb9d62",
+    "python/sglang/srt/training_capture/request_router.py": "b97ca76fd4621398c617414098c539850e331e0ee42d88e91eb7e0cb41f09824",
+    "python/sglang/srt/training_capture/resources.py": "4f615e4b1b79b94637ba664e05e93bdbb827f865a176d06abbf23e8bcd02cd8d",
+    "python/sglang/srt/training_capture/snapshot.py": "82e7dce85b0ecac6538aac26a21d22286e35c19e59a01b0ca2735e4da0dec3b3",
+    "python/sglang/srt/training_capture/snapshot_writer.py": "ec60267c9e9057c3b8fcc3c5b66bcd9987dff65279514f4007637c861dd3a1f5",
+    "python/sglang/srt/training_capture/startup.py": "00d81ee4757ef83347248e419065a81dd8f812837f5589a91fd9b7511e895371",
+    "python/sglang/srt/training_capture/teacher.py": "6a267208c1ca42d209920e7cfcbd9b3441ce6894060b0988ada23375870d82ab",
+    "python/sglang/srt/training_capture/teacher_staging.py": "9afe4b9bb7bdf16e43156377b47d034f9707ed1c09b62dbfdac3795bb7032fd0",
+    "python/sglang/srt/training_capture/timings.py": "9bea8c331ae56ed343f85d79451dfe22b512beef7f339167f00cc8e3da8c9278",
+    "python/sglang/srt/training_capture/topology.py": "b35eef08cd7ac804817c5b22c232e9c1e6dd76fc292220acc928eb58af5f1a35",
+    "python/sglang/benchmark/serving.py": "0f2e715e717ab89b0b398276644b8995915125bd7f2864a047f49bf5291c0ba4",
+    "python/sglang/test/training_capture_diagnostics.py": "ee708bba0deae99d21af8f854e7121a82183b54ff2f4e4554a3a6f3736feb18d",
+    "python/sglang/test/training_capture_benchmark_client.py": "aded7880869274fd4a58cc9646cb0a02eae470debfacffc1b45f9bf04a8a204e",
+    "mooncake-study/experiments/benchmark_training_capture.py": "1abf5d09f49434566b4c6f83cb89d1b180b5d0668bfbb6a129e30e6c13cb9912",
+    "test/registered/unit/training_capture/test_latency_diagnostics.py": "b0f7e4528ecb2dd5f47e1d7423052161ad76b9430aa3e87dd7f4262e8c088c4b",
+    "python/sglang/test/training_capture_pause_server.py": "c9e03394752ddad4ebbf45fedf53608f16ad781636c801669eda59a5f3e1ecd0"
+  },
+  "tested_source_sha256": {
+    "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+    "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+    "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+    "python/sglang/srt/training_capture/cohort.py": "6bd093ee9a219970b08023d279852b07caaacf288f2f617236b6b2e1c7d5af56",
+    "python/sglang/srt/training_capture/cohort_coordinator.py": "b1f4d340cab3b2400e7415c17773b27510524f8d3df55c6ec8af89455e3504f1",
+    "python/sglang/srt/training_capture/cohort_exchange.py": "b37abb0499a23fa8650521fe28c04a7219b887f5d2920e6f8070d4bfacae2ed3",
+    "python/sglang/srt/training_capture/cohort_service.py": "60f8578cf250b4f3dbf97b15d67a2c78a67eb6b836a5bcda85dfdaf90ecf9324",
+    "python/sglang/srt/training_capture/cohort_startup.py": "dfacd1a45203de5f3c08ccf73b06933f7aa4183bd670979981cfe2cb960208ed",
+    "python/sglang/srt/training_capture/cohort_writer.py": "8f47827eb4e8ca2d3e4f68a91a21d56e13e84530952d5f3ea71843b7f3647d69",
+    "python/sglang/srt/training_capture/config.py": "9cf427b9f673c376f728aa4bec45b0b4a31bffb360ce88731b32b8fccc34530d",
+    "python/sglang/srt/training_capture/context.py": "548ba9ac33f40cd2589ccf67c76b66ec2d307df7e8323ec788ed515c1a812de7",
+    "python/sglang/srt/training_capture/coordinator.py": "9e5ad5eac75c1a5337bde61fec32036627e14182458fedf81e22dc81cdb2fb33",
+    "python/sglang/srt/training_capture/host_pool.py": "591086d65bd855dfb671588c4c7e1b0af7270237ef738e0967db32f5e5816bfc",
+    "python/sglang/srt/training_capture/identity.py": "47f91ad994b716d27454eace428d9d0a5ce7468c5708e4dd3d3e385119c8ac24",
+    "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+    "python/sglang/srt/training_capture/kv_exporter.py": "2cecaf4db75bd9b2b0adf664f12fd6c56cfaba74be01b1c755b40cfd62299c8f",
+    "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+    "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+    "python/sglang/srt/training_capture/metrics.py": "422f9522d27718ed015c354c9b1ad7bb6c9b49f366a4e8b02de083f7e424ac1f",
+    "python/sglang/srt/training_capture/mooncake_store.py": "94525a4eb4088ab847c9dffd66d8a3c509b44d30244da76cba7647cd0944e139",
+    "python/sglang/srt/training_capture/pd_capture.py": "a2e239ca22f3318a85d5bd27c872047975843a84676fc70ca85a693256e9f36f",
+    "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+    "python/sglang/srt/training_capture/protocol.py": "e57f130767eb7ca4aef6dc63a7cfdbaa37cc1d02326a068bc973d818a7bb9d62",
+    "python/sglang/srt/training_capture/request_router.py": "b97ca76fd4621398c617414098c539850e331e0ee42d88e91eb7e0cb41f09824",
+    "python/sglang/srt/training_capture/resources.py": "4f615e4b1b79b94637ba664e05e93bdbb827f865a176d06abbf23e8bcd02cd8d",
+    "python/sglang/srt/training_capture/snapshot.py": "82e7dce85b0ecac6538aac26a21d22286e35c19e59a01b0ca2735e4da0dec3b3",
+    "python/sglang/srt/training_capture/snapshot_writer.py": "ec60267c9e9057c3b8fcc3c5b66bcd9987dff65279514f4007637c861dd3a1f5",
+    "python/sglang/srt/training_capture/startup.py": "00d81ee4757ef83347248e419065a81dd8f812837f5589a91fd9b7511e895371",
+    "python/sglang/srt/training_capture/teacher.py": "6a267208c1ca42d209920e7cfcbd9b3441ce6894060b0988ada23375870d82ab",
+    "python/sglang/srt/training_capture/teacher_staging.py": "9afe4b9bb7bdf16e43156377b47d034f9707ed1c09b62dbfdac3795bb7032fd0",
+    "python/sglang/srt/training_capture/timings.py": "9bea8c331ae56ed343f85d79451dfe22b512beef7f339167f00cc8e3da8c9278",
+    "python/sglang/srt/training_capture/topology.py": "b35eef08cd7ac804817c5b22c232e9c1e6dd76fc292220acc928eb58af5f1a35",
+    "python/sglang/benchmark/serving.py": "0f2e715e717ab89b0b398276644b8995915125bd7f2864a047f49bf5291c0ba4",
+    "python/sglang/test/training_capture_diagnostics.py": "ee708bba0deae99d21af8f854e7121a82183b54ff2f4e4554a3a6f3736feb18d",
+    "python/sglang/test/training_capture_benchmark_client.py": "aded7880869274fd4a58cc9646cb0a02eae470debfacffc1b45f9bf04a8a204e",
+    "mooncake-study/experiments/benchmark_training_capture.py": "1abf5d09f49434566b4c6f83cb89d1b180b5d0668bfbb6a129e30e6c13cb9912",
+    "test/registered/unit/training_capture/test_latency_diagnostics.py": "b0f7e4528ecb2dd5f47e1d7423052161ad76b9430aa3e87dd7f4262e8c088c4b",
+    "python/sglang/test/training_capture_pause_server.py": "c9e03394752ddad4ebbf45fedf53608f16ad781636c801669eda59a5f3e1ecd0"
+  },
+  "unchanged_production_and_native_client_files": 33,
+  "reports": [
+    {
+      "variant": "latency-diagnostics-v1",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v1/report.json",
+        "sha256": "820e096966f96f3b64b9e99a03a56bc6a0f19d2754ee90f40feb2f9b9f191551"
+      },
+      "source_revision": "b091ab1be-plus-latency-diagnostics-v1",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "b091ab1be-plus-latency-diagnostics-v1",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v1",
+        "num_prompts": 512,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600,
+        "request_details": true,
+        "latency_diagnostics": true
+      },
+      "versions": {
+        "torch": "2.13.0",
+        "transformers": "5.12.1",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      },
+      "rounds": [
+        {
+          "repetition": 0,
+          "comparison": {
+            "baseline_bracket_mean": {
+              "median_ttft_ms": 38.98685332387686,
+              "p95_ttft_ms": 40.74006211012602,
+              "p99_ttft_ms": 134.34720566496253,
+              "median_tpot_ms": 1.4752233400940895,
+              "p95_tpot_ms": 1.5757059107624716,
+              "p99_tpot_ms": 1.6033837932252115,
+              "output_throughput": 2922.0211468901744
+            },
+            "baseline_after_over_before": {
+              "median_ttft_ms": 1.022927042718588,
+              "p95_ttft_ms": 1.0656438902182426,
+              "p99_ttft_ms": 1.2192836905315148,
+              "median_tpot_ms": 0.998160916228727,
+              "p95_tpot_ms": 0.9992301417322303,
+              "p99_tpot_ms": 1.024573297275997,
+              "output_throughput": 0.9894808976988332
+            },
+            "capture_over_baseline": [
+              {
+                "sample_ratio": 0.1,
+                "ratios": {
+                  "median_ttft_ms": 1.0962269075050854,
+                  "p95_ttft_ms": 1.2257909729541365,
+                  "p99_ttft_ms": 0.42746446481860084,
+                  "median_tpot_ms": 1.306639081290655,
+                  "p95_tpot_ms": 2.054264908282277,
+                  "p99_tpot_ms": 2.150372790054854,
+                  "output_throughput": 0.8426375726165841
+                }
+              }
+            ]
+          },
+          "phases": [
+            {
+              "sample_ratio": null,
+              "requests": 512,
+              "output_tokens": 16384,
+              "requests_per_second": 91.7959664211271,
+              "p99_ttft_ms": 121.07258412986994,
+              "max_ttft_ms": 121.89310416579247,
+              "ttft_over_500ms_requests": 0,
+              "p99_tpot_ms": 1.583922691643238,
+              "readback": {},
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v1/round-0-phase-0-off/requests.json",
+                "sha256": "3f08fbcf511acfa4aa13c25e0b62ebbc04490f00105dc4b9666d0194a170156c"
+              },
+              "capture_counters": {},
+              "metrics": null,
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.000003295019268989563,
+                "client_event_count": 445,
+                "scheduler_gc_events": 24,
+                "tokenizer_gc": null,
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33405377.577509005,
+                    "end": 33405377.896505564,
+                    "generation": 2,
+                    "thread_id": 140225704137472,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 318.9965598285198,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33405385.116182927,
+                    "end": 33405385.193880606,
+                    "thread_id": 140225704137472,
+                    "event_id": 1,
+                    "duration_ms": 77.69767940044403,
+                    "overlapping_requests": []
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 1,
+                    "published": false,
+                    "start_unix_seconds": 1790974322.1194012,
+                    "ttft_ms": 121.89310416579247,
+                    "tpot_ms": 1.4918141307369355,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 2,
+                    "published": false,
+                    "start_unix_seconds": 1790974322.1196837,
+                    "ttft_ms": 121.62633240222931,
+                    "tpot_ms": 1.4931908057581993,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 3,
+                    "published": false,
+                    "start_unix_seconds": 1790974322.119854,
+                    "ttft_ms": 121.51267006993294,
+                    "tpot_ms": 1.4963950360974958,
+                    "overlaps": []
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 288,
+                    "published": false,
+                    "start_unix_seconds": 1790974325.274794,
+                    "ttft_ms": 36.376893520355225,
+                    "tpot_ms": 1.6601980934219975,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 0,
+                    "published": false,
+                    "start_unix_seconds": 1790974322.11882,
+                    "ttft_ms": 118.42184886336327,
+                    "tpot_ms": 1.6097957568783914,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 88,
+                    "published": false,
+                    "start_unix_seconds": 1790974323.139964,
+                    "ttft_ms": 36.081258207559586,
+                    "tpot_ms": 1.59207635348843,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "combined": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v1/round-0-phase-0-off/server.log",
+                    "sha256": "1d4ee2cfe5218d16df3da339aaf2ccbd45914192aad25d82d7f56ba50385a394"
+                  }
+                }
+              }
+            },
+            {
+              "sample_ratio": 0.1,
+              "requests": 512,
+              "output_tokens": 16384,
+              "requests_per_second": 76.94390019843324,
+              "p99_ttft_ms": 57.42865636944771,
+              "max_ttft_ms": 58.34975093603134,
+              "ttft_over_500ms_requests": 0,
+              "p99_tpot_ms": 3.447872880966433,
+              "readback": {
+                "validated_samples": 50,
+                "manifest_bytes": 430500,
+                "payload_bytes": 31176000,
+                "aux_payload_bytes": 1684800,
+                "payload_objects": 700,
+                "kv_payload_bytes": 29491200
+              },
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v1/round-0-phase-1-0.1/requests.json",
+                "sha256": "4cd9bfe4d39d2a4015f6fa5f0bde72fa13bf2ba54d716f75da72a5b309e35a08"
+              },
+              "capture_counters": {
+                "considered": 512,
+                "sampled_out": 462,
+                "admitted": 50,
+                "overlap_forwards": 1355,
+                "eager_forwards": 43,
+                "cuda_graph_forwards": 1312,
+                "sealed": 50,
+                "writer_started": 50,
+                "copies_completed": 50,
+                "snapshot_built": 50,
+                "ready": 50
+              },
+              "metrics": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v1/round-0-phase-1-0.1/metrics.prom",
+                "sha256": "4f9a40c7a8cca4fa9db5c0e364218022f51f1a2d9df6a54ab83f367e1fb202f5"
+              },
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.0000030137598514556885,
+                "client_event_count": 445,
+                "scheduler_gc_events": 23,
+                "tokenizer_gc": null,
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33405441.729613844,
+                    "end": 33405442.04357002,
+                    "generation": 2,
+                    "thread_id": 139866045371136,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 313.9561749994755,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33405450.339169897,
+                    "end": 33405450.41857164,
+                    "thread_id": 139866045371136,
+                    "event_id": 1,
+                    "duration_ms": 79.40174266695976,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "scheduler_gc",
+                    "start_unix_seconds": 1790974376.377971,
+                    "end_unix_seconds": 1790974376.4132822,
+                    "generation": 0,
+                    "start": 33405433.804904222,
+                    "end": 33405433.840215445,
+                    "event_id": 2,
+                    "duration_ms": 35.311222076416016,
+                    "overlapping_requests": []
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 1,
+                    "published": false,
+                    "start_unix_seconds": 1790974386.2683861,
+                    "ttft_ms": 58.34975093603134,
+                    "tpot_ms": 1.934891386378196,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 2,
+                    "published": true,
+                    "start_unix_seconds": 1790974386.2686615,
+                    "ttft_ms": 58.084722608327866,
+                    "tpot_ms": 1.9361585859329469,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 3,
+                    "published": false,
+                    "start_unix_seconds": 1790974386.2688363,
+                    "ttft_ms": 57.833097875118256,
+                    "tpot_ms": 1.9289574796153652,
+                    "overlaps": []
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 120,
+                    "published": false,
+                    "start_unix_seconds": 1790974387.825605,
+                    "ttft_ms": 49.21125993132591,
+                    "tpot_ms": 3.6063923710776913,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 127,
+                    "published": false,
+                    "start_unix_seconds": 1790974387.8267162,
+                    "ttft_ms": 53.12126874923706,
+                    "tpot_ms": 3.452789278761033,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 125,
+                    "published": false,
+                    "start_unix_seconds": 1790974387.8264823,
+                    "ttft_ms": 53.344450891017914,
+                    "tpot_ms": 3.451619537607316,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "combined": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v1/round-0-phase-1-0.1/server.log",
+                    "sha256": "dc12ff3980237b50747cdd40478f5ec6221faf0ae8886a7c0d3eea8a7caa9372"
+                  }
+                }
+              }
+            },
+            {
+              "sample_ratio": null,
+              "requests": 512,
+              "output_tokens": 16384,
+              "requests_per_second": 90.83035525950879,
+              "p99_ttft_ms": 147.62182720005512,
+              "max_ttft_ms": 148.72513338923454,
+              "ttft_over_500ms_requests": 0,
+              "p99_tpot_ms": 1.622844894807185,
+              "readback": {},
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v1/round-0-phase-2-off/requests.json",
+                "sha256": "91fef99297e6d3a502b5c9513c81f003908aedd62bd3f1424b749f606194d8b7"
+              },
+              "capture_counters": {},
+              "metrics": null,
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.0000029690563678741455,
+                "client_event_count": 447,
+                "scheduler_gc_events": 24,
+                "tokenizer_gc": null,
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33405507.81207712,
+                    "end": 33405508.13783722,
+                    "generation": 2,
+                    "thread_id": 140269786948352,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 325.7601000368595,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33405510.900470845,
+                    "end": 33405511.00399439,
+                    "thread_id": 140269786948352,
+                    "event_id": 1,
+                    "duration_ms": 103.52354496717453,
+                    "overlapping_requests": [
+                      88,
+                      89,
+                      90,
+                      91,
+                      92,
+                      93,
+                      94,
+                      95
+                    ]
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33405515.519514948,
+                    "end": 33405515.595551696,
+                    "thread_id": 140269786948352,
+                    "event_id": 2,
+                    "duration_ms": 76.03674754500389,
+                    "overlapping_requests": []
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 92,
+                    "published": false,
+                    "start_unix_seconds": 1790974453.4302735,
+                    "ttft_ms": 148.72513338923454,
+                    "tpot_ms": 0.007847984952311362,
+                    "overlaps": [
+                      {
+                        "event_id": 1,
+                        "ttft_overlap_ms": 103.52354496717453,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  },
+                  {
+                    "request_index": 90,
+                    "published": false,
+                    "start_unix_seconds": 1790974453.430028,
+                    "ttft_ms": 148.67959544062614,
+                    "tpot_ms": 0.007943280281559113,
+                    "overlaps": [
+                      {
+                        "event_id": 1,
+                        "ttft_overlap_ms": 103.52354496717453,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  },
+                  {
+                    "request_index": 95,
+                    "published": false,
+                    "start_unix_seconds": 1790974453.430615,
+                    "ttft_ms": 148.67032691836357,
+                    "tpot_ms": 0.008136755035769555,
+                    "overlaps": [
+                      {
+                        "event_id": 1,
+                        "ttft_overlap_ms": 103.52354496717453,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 0,
+                    "published": false,
+                    "start_unix_seconds": 1790974452.4595366,
+                    "ttft_ms": 55.61549589037895,
+                    "tpot_ms": 1.641051423165106,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 8,
+                    "published": false,
+                    "start_unix_seconds": 1790974452.5664654,
+                    "ttft_ms": 37.19305992126465,
+                    "tpot_ms": 1.628946392766891,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 368,
+                    "published": false,
+                    "start_unix_seconds": 1790974456.5294423,
+                    "ttft_ms": 36.973245441913605,
+                    "tpot_ms": 1.6247632522736826,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "combined": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v1/round-0-phase-2-off/server.log",
+                    "sha256": "9324aa92150824202cd82948c2484eacdf61cfe021d7a57ccf580bc5e0b59719"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "latency-diagnostics-v2",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/report.json",
+        "sha256": "92d189931cef04a88c49a1ab5e33a484efcc7e985844c60b83fa9118e2749494"
+      },
+      "source_revision": "b091ab1be-plus-latency-diagnostics-v2",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "b091ab1be-plus-latency-diagnostics-v2",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2",
+        "num_prompts": 1024,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 2,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600,
+        "request_details": true,
+        "latency_diagnostics": true
+      },
+      "versions": {
+        "torch": "2.13.0",
+        "transformers": "5.12.1",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      },
+      "rounds": [
+        {
+          "repetition": 0,
+          "comparison": {
+            "baseline_bracket_mean": {
+              "median_ttft_ms": 38.4178189560771,
+              "p95_ttft_ms": 40.812105033546686,
+              "p99_ttft_ms": 75.37701759487389,
+              "median_tpot_ms": 1.474512740969658,
+              "p95_tpot_ms": 1.5741395103114266,
+              "p99_tpot_ms": 1.6009583834919237,
+              "output_throughput": 2832.028327566445
+            },
+            "baseline_after_over_before": {
+              "median_ttft_ms": 0.9837612289476618,
+              "p95_ttft_ms": 1.0208113856472145,
+              "p99_ttft_ms": 0.7016648209659281,
+              "median_tpot_ms": 0.9994853061295992,
+              "p95_tpot_ms": 0.9995908793460468,
+              "p99_tpot_ms": 1.0152466108319196,
+              "output_throughput": 1.0090134610085033
+            },
+            "capture_over_baseline": [
+              {
+                "sample_ratio": 0.1,
+                "ratios": {
+                  "median_ttft_ms": 1.0992695684417806,
+                  "p95_ttft_ms": 1.3036614371748605,
+                  "p99_ttft_ms": 0.780038162745216,
+                  "median_tpot_ms": 1.3185769879952225,
+                  "p95_tpot_ms": 2.071421270683153,
+                  "p99_tpot_ms": 2.1274525384779954,
+                  "output_throughput": 0.8466304344161326
+                }
+              }
+            ]
+          },
+          "phases": [
+            {
+              "sample_ratio": null,
+              "requests": 1024,
+              "output_tokens": 32768,
+              "requests_per_second": 88.10382504059969,
+              "p99_ttft_ms": 88.59208542853592,
+              "max_ttft_ms": 588.7236818671227,
+              "ttft_over_500ms_requests": 8,
+              "p99_tpot_ms": 1.58884612422797,
+              "readback": {},
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-0-phase-0-off/requests.json",
+                "sha256": "3d888e6c7fc7d5bb76bfb24b1e03ca6ba556efb372ddbfe4ad53adb89bda81a8"
+              },
+              "capture_counters": {},
+              "metrics": null,
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.0000029336661100387573,
+                "client_event_count": 456,
+                "scheduler_gc_events": 24,
+                "tokenizer_gc": null,
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33405595.055804167,
+                    "end": 33405595.366853952,
+                    "generation": 2,
+                    "thread_id": 140531213341440,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 311.04978546500206,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33405608.621091403,
+                    "end": 33405608.75977883,
+                    "thread_id": 140531213341440,
+                    "event_id": 1,
+                    "duration_ms": 138.68742808699608,
+                    "overlapping_requests": []
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 626,
+                    "published": false,
+                    "start_unix_seconds": 1790974546.3328242,
+                    "ttft_ms": 588.7236818671227,
+                    "tpot_ms": 1.4817340960425716,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 627,
+                    "published": false,
+                    "start_unix_seconds": 1790974546.3329816,
+                    "ttft_ms": 588.4748883545399,
+                    "tpot_ms": 1.4679882555238661,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 628,
+                    "published": false,
+                    "start_unix_seconds": 1790974546.333143,
+                    "ttft_ms": 588.3723646402359,
+                    "tpot_ms": 1.478267172651906,
+                    "overlaps": []
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 0,
+                    "published": false,
+                    "start_unix_seconds": 1790974539.5817342,
+                    "ttft_ms": 84.74617451429367,
+                    "tpot_ms": 1.6478679833873626,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 520,
+                    "published": false,
+                    "start_unix_seconds": 1790974545.2088156,
+                    "ttft_ms": 38.27911987900734,
+                    "tpot_ms": 1.637494852465968,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 296,
+                    "published": false,
+                    "start_unix_seconds": 1790974542.806011,
+                    "ttft_ms": 36.31593659520149,
+                    "tpot_ms": 1.6346733656621748,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "stdout": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-0-phase-0-off/server.stdout.log",
+                    "sha256": "4b03a62639972303e8cbdfec718956e38444a32fa4ab098e36e3be6dd5277eb9"
+                  },
+                  "stderr": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-0-phase-0-off/server.stderr.log",
+                    "sha256": "39a32cf083de656b11ccfe55b50e4753cc5851d91c4d9a4b6fad62897d4075b0"
+                  }
+                }
+              }
+            },
+            {
+              "sample_ratio": 0.1,
+              "requests": 1024,
+              "output_tokens": 32768,
+              "requests_per_second": 74.92754291394915,
+              "p99_ttft_ms": 58.79695031791925,
+              "max_ttft_ms": 583.5915207862854,
+              "ttft_over_500ms_requests": 8,
+              "p99_tpot_ms": 3.4059629769575213,
+              "readback": {
+                "validated_samples": 92,
+                "manifest_bytes": 792120,
+                "payload_bytes": 57363840,
+                "aux_payload_bytes": 3100032,
+                "payload_objects": 1288,
+                "kv_payload_bytes": 54263808
+              },
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-0-phase-1-0.1/requests.json",
+                "sha256": "3ae2bf1e4db9034f9a6eef0984ad37a66be97df42304ece4ee20bfb116d91f89"
+              },
+              "capture_counters": {
+                "considered": 1024,
+                "sampled_out": 932,
+                "admitted": 92,
+                "overlap_forwards": 2416,
+                "eager_forwards": 80,
+                "cuda_graph_forwards": 2336,
+                "sealed": 92,
+                "writer_started": 92,
+                "copies_completed": 92,
+                "snapshot_built": 92,
+                "ready": 92
+              },
+              "metrics": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-0-phase-1-0.1/metrics.prom",
+                "sha256": "63d31a83cd797b18b092e42c05c8c277524ecd3b8fd51b4ed9f4b704df18fa61"
+              },
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.000003032386302947998,
+                "client_event_count": 456,
+                "scheduler_gc_events": 23,
+                "tokenizer_gc": null,
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33405665.34172549,
+                    "end": 33405665.67649339,
+                    "generation": 2,
+                    "thread_id": 139732814869248,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 334.7679004073143,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33405680.989123594,
+                    "end": 33405681.114243407,
+                    "thread_id": 139732814869248,
+                    "event_id": 1,
+                    "duration_ms": 125.11981278657913,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "scheduler_gc",
+                    "start_unix_seconds": 1790974599.8842776,
+                    "end_unix_seconds": 1790974599.9291916,
+                    "generation": 0,
+                    "start": 33405657.31121111,
+                    "end": 33405657.356125116,
+                    "event_id": 2,
+                    "duration_ms": 44.91400718688965,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "scheduler_gc",
+                    "start_unix_seconds": 1790974606.9335089,
+                    "end_unix_seconds": 1790974607.2789721,
+                    "generation": 0,
+                    "start": 33405664.3604424,
+                    "end": 33405664.705905676,
+                    "event_id": 3,
+                    "duration_ms": 345.4632759094238,
+                    "overlapping_requests": []
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 633,
+                    "published": false,
+                    "start_unix_seconds": 1790974618.0108862,
+                    "ttft_ms": 583.5915207862854,
+                    "tpot_ms": 1.5459393541659079,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 634,
+                    "published": false,
+                    "start_unix_seconds": 1790974618.0110505,
+                    "ttft_ms": 583.375621587038,
+                    "tpot_ms": 1.5443970839823447,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 635,
+                    "published": false,
+                    "start_unix_seconds": 1790974618.01119,
+                    "ttft_ms": 583.2997709512711,
+                    "tpot_ms": 1.547171103377496,
+                    "overlaps": []
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 641,
+                    "published": true,
+                    "start_unix_seconds": 1790974618.6427581,
+                    "ttft_ms": 38.280390202999115,
+                    "tpot_ms": 3.557529660963243,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 705,
+                    "published": true,
+                    "start_unix_seconds": 1790974619.4659388,
+                    "ttft_ms": 38.17888721823692,
+                    "tpot_ms": 3.5567370153242543,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 841,
+                    "published": true,
+                    "start_unix_seconds": 1790974621.1173708,
+                    "ttft_ms": 38.49562257528305,
+                    "tpot_ms": 3.5532924436753794,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "stdout": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-0-phase-1-0.1/server.stdout.log",
+                    "sha256": "863c0ea5040373715e12cc362d700da2a95128fb0e4b4f5f3152a320f0193802"
+                  },
+                  "stderr": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-0-phase-1-0.1/server.stderr.log",
+                    "sha256": "dfaa6273c3789fe38d80951d0752e31867d3795f585815e643d96eb366fba1ee"
+                  }
+                }
+              }
+            },
+            {
+              "sample_ratio": null,
+              "requests": 1024,
+              "output_tokens": 32768,
+              "requests_per_second": 88.89794543230313,
+              "p99_ttft_ms": 62.161949761211865,
+              "max_ttft_ms": 592.3972651362419,
+              "ttft_over_500ms_requests": 8,
+              "p99_tpot_ms": 1.6130706427558774,
+              "readback": {},
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-0-phase-2-off/requests.json",
+                "sha256": "2ec98eab2a0bf9c13e338edb950fad84e32911929a37e5f738faefc0111a42ba"
+              },
+              "capture_counters": {},
+              "metrics": null,
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.0000029373914003372192,
+                "client_event_count": 456,
+                "scheduler_gc_events": 24,
+                "tokenizer_gc": null,
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33405737.349212985,
+                    "end": 33405737.677544978,
+                    "generation": 2,
+                    "thread_id": 140588623143680,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 328.33199203014374,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33405750.830463827,
+                    "end": 33405750.9634691,
+                    "thread_id": 140588623143680,
+                    "event_id": 1,
+                    "duration_ms": 133.0052725970745,
+                    "overlapping_requests": []
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 626,
+                    "published": false,
+                    "start_unix_seconds": 1790974688.564572,
+                    "ttft_ms": 592.3972651362419,
+                    "tpot_ms": 1.4755532385841492,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 627,
+                    "published": false,
+                    "start_unix_seconds": 1790974688.5647092,
+                    "ttft_ms": 592.3556722700596,
+                    "tpot_ms": 1.4807596322028869,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 628,
+                    "published": false,
+                    "start_unix_seconds": 1790974688.564836,
+                    "ttft_ms": 592.2165773808956,
+                    "tpot_ms": 1.4795382176676104,
+                    "overlaps": []
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 777,
+                    "published": false,
+                    "start_unix_seconds": 1790974690.7342255,
+                    "ttft_ms": 36.06799989938736,
+                    "tpot_ms": 1.8565765311641078,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 783,
+                    "published": false,
+                    "start_unix_seconds": 1790974690.7352545,
+                    "ttft_ms": 38.090527057647705,
+                    "tpot_ms": 1.7629911101633502,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 784,
+                    "published": false,
+                    "start_unix_seconds": 1790974690.7353764,
+                    "ttft_ms": 37.959229201078415,
+                    "tpot_ms": 1.761787841396947,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "stdout": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-0-phase-2-off/server.stdout.log",
+                    "sha256": "e8504ac797250c7b0557f5b18f1fedf84c5a91583a72c0a716b1726de5377ef8"
+                  },
+                  "stderr": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-0-phase-2-off/server.stderr.log",
+                    "sha256": "cd8080c39d8f00bf34c72068b5d16fe152bc224369dfbcc6096671d997a73f3c"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "repetition": 1,
+          "comparison": {
+            "baseline_bracket_mean": {
+              "median_ttft_ms": 38.283021189272404,
+              "p95_ttft_ms": 39.4287558272481,
+              "p99_ttft_ms": 58.934029936790466,
+              "median_tpot_ms": 1.4736271733718533,
+              "p95_tpot_ms": 1.5734103478250965,
+              "p99_tpot_ms": 1.6304801061989793,
+              "output_throughput": 2843.929710167681
+            },
+            "baseline_after_over_before": {
+              "median_ttft_ms": 0.9998958359230423,
+              "p95_ttft_ms": 0.9986630637738041,
+              "p99_ttft_ms": 0.969826273689278,
+              "median_tpot_ms": 1.0026038138971816,
+              "p95_tpot_ms": 1.0040745991100326,
+              "p99_tpot_ms": 1.0341534306481963,
+              "output_throughput": 1.0001031603757553
+            },
+            "capture_over_baseline": [
+              {
+                "sample_ratio": 0.1,
+                "ratios": {
+                  "median_ttft_ms": 1.1080656411882222,
+                  "p95_ttft_ms": 1.317323688353505,
+                  "p99_ttft_ms": 1.0985470389121526,
+                  "median_tpot_ms": 1.3084364241905933,
+                  "p95_tpot_ms": 2.066024526742658,
+                  "p99_tpot_ms": 2.0832451990346783,
+                  "output_throughput": 0.8436963100764343
+                }
+              }
+            ]
+          },
+          "phases": [
+            {
+              "sample_ratio": null,
+              "requests": 1024,
+              "output_tokens": 32768,
+              "requests_per_second": 88.86821960327656,
+              "p99_ttft_ms": 59.83677923679352,
+              "max_ttft_ms": 603.6200895905495,
+              "ttft_over_500ms_requests": 8,
+              "p99_tpot_ms": 1.6031043495862711,
+              "readback": {},
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-1-phase-0-off/requests.json",
+                "sha256": "db13600e36d4fbf15f7f4bbad30554cdb7bec03354adbfa52a68e86e5f9b5262"
+              },
+              "capture_counters": {},
+              "metrics": null,
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.0000036954879760742188,
+                "client_event_count": 456,
+                "scheduler_gc_events": 24,
+                "tokenizer_gc": null,
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33405807.32101569,
+                    "end": 33405807.640139848,
+                    "generation": 2,
+                    "thread_id": 140702867411712,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 319.12415847182274,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33405820.827147547,
+                    "end": 33405820.954701304,
+                    "thread_id": 140702867411712,
+                    "event_id": 1,
+                    "duration_ms": 127.55375728011131,
+                    "overlapping_requests": []
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 626,
+                    "published": false,
+                    "start_unix_seconds": 1790974758.5500338,
+                    "ttft_ms": 603.6200895905495,
+                    "tpot_ms": 1.4759728745106728,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 627,
+                    "published": false,
+                    "start_unix_seconds": 1790974758.5501735,
+                    "ttft_ms": 603.4929379820824,
+                    "tpot_ms": 1.4771768643010048,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 628,
+                    "published": false,
+                    "start_unix_seconds": 1790974758.5502949,
+                    "ttft_ms": 603.3262237906456,
+                    "tpot_ms": 1.475406390043997,
+                    "overlaps": []
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 769,
+                    "published": false,
+                    "start_unix_seconds": 1790974760.6507967,
+                    "ttft_ms": 35.876549780368805,
+                    "tpot_ms": 1.855126311702113,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 773,
+                    "published": false,
+                    "start_unix_seconds": 1790974760.6515326,
+                    "ttft_ms": 38.18681463599205,
+                    "tpot_ms": 1.7617694552867644,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 776,
+                    "published": false,
+                    "start_unix_seconds": 1790974760.6518672,
+                    "ttft_ms": 37.8422811627388,
+                    "tpot_ms": 1.7604690886312915,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "stdout": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-1-phase-0-off/server.stdout.log",
+                    "sha256": "ecaeee5f02aa9560ebd1bea89135f46d1ef575f33c422b74cebcac86cb70dc7b"
+                  },
+                  "stderr": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-1-phase-0-off/server.stderr.log",
+                    "sha256": "9fafe667edf9b2c38827cdfca602555f4d50cc5060869ea57f9a3c781479b455"
+                  }
+                }
+              }
+            },
+            {
+              "sample_ratio": 0.1,
+              "requests": 1024,
+              "output_tokens": 32768,
+              "requests_per_second": 74.981656330788,
+              "p99_ttft_ms": 64.74180407822132,
+              "max_ttft_ms": 587.0468765497208,
+              "ttft_over_500ms_requests": 8,
+              "p99_tpot_ms": 3.3966898533605763,
+              "readback": {
+                "validated_samples": 92,
+                "manifest_bytes": 792120,
+                "payload_bytes": 57363840,
+                "aux_payload_bytes": 3100032,
+                "payload_objects": 1288,
+                "kv_payload_bytes": 54263808
+              },
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-1-phase-1-0.1/requests.json",
+                "sha256": "84e0576bb85d7be0b606d30d922d4db6b362e70a05f16769e27cc4f8981fb1e2"
+              },
+              "capture_counters": {
+                "considered": 1024,
+                "sampled_out": 932,
+                "admitted": 92,
+                "overlap_forwards": 2416,
+                "eager_forwards": 80,
+                "cuda_graph_forwards": 2336,
+                "sealed": 92,
+                "writer_started": 92,
+                "copies_completed": 92,
+                "snapshot_built": 92,
+                "ready": 92
+              },
+              "metrics": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-1-phase-1-0.1/metrics.prom",
+                "sha256": "8a6de8968272fa4685d09fcbdc0a362f4b14de87ab32c7a372a21c7beba15cee"
+              },
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.0000025313347578048706,
+                "client_event_count": 456,
+                "scheduler_gc_events": 23,
+                "tokenizer_gc": null,
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33405877.388886515,
+                    "end": 33405877.70652948,
+                    "generation": 2,
+                    "thread_id": 139770123563776,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 317.6429644227028,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33405893.01387727,
+                    "end": 33405893.148936406,
+                    "thread_id": 139770123563776,
+                    "event_id": 1,
+                    "duration_ms": 135.05913689732552,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "scheduler_gc",
+                    "start_unix_seconds": 1790974811.8416893,
+                    "end_unix_seconds": 1790974811.8737206,
+                    "generation": 0,
+                    "start": 33405869.268622875,
+                    "end": 33405869.300654173,
+                    "event_id": 2,
+                    "duration_ms": 32.03129768371582,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "scheduler_gc",
+                    "start_unix_seconds": 1790974818.326165,
+                    "end_unix_seconds": 1790974818.3810937,
+                    "generation": 0,
+                    "start": 33405875.753098488,
+                    "end": 33405875.808027267,
+                    "event_id": 3,
+                    "duration_ms": 54.92877960205078,
+                    "overlapping_requests": []
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 633,
+                    "published": false,
+                    "start_unix_seconds": 1790974830.0494614,
+                    "ttft_ms": 587.0468765497208,
+                    "tpot_ms": 1.5331786726751635,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 634,
+                    "published": false,
+                    "start_unix_seconds": 1790974830.0496302,
+                    "ttft_ms": 586.9332551956177,
+                    "tpot_ms": 1.5369193448174385,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 635,
+                    "published": false,
+                    "start_unix_seconds": 1790974830.0497646,
+                    "ttft_ms": 586.8347398936749,
+                    "tpot_ms": 1.5405486187627238,
+                    "overlaps": []
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 705,
+                    "published": true,
+                    "start_unix_seconds": 1790974831.5133429,
+                    "ttft_ms": 38.12789544463158,
+                    "tpot_ms": 3.5633019381953823,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 841,
+                    "published": true,
+                    "start_unix_seconds": 1790974833.1524773,
+                    "ttft_ms": 37.93665021657944,
+                    "tpot_ms": 3.5518957001547657,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 641,
+                    "published": true,
+                    "start_unix_seconds": 1790974830.684609,
+                    "ttft_ms": 39.003994315862656,
+                    "tpot_ms": 3.54079962257416,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "stdout": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-1-phase-1-0.1/server.stdout.log",
+                    "sha256": "670e02051c3ce5db89672a7baa80f4f8faba8f4c7da0e6e36117cc4a7c0063fc"
+                  },
+                  "stderr": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-1-phase-1-0.1/server.stderr.log",
+                    "sha256": "4213336a8dd05fef5cc22e8c6ec4a81546bcdec8abc164ad0ec73fba5aec8200"
+                  }
+                }
+              }
+            },
+            {
+              "sample_ratio": null,
+              "requests": 1024,
+              "output_tokens": 32768,
+              "requests_per_second": 88.87738728220353,
+              "p99_ttft_ms": 58.031280636787415,
+              "max_ttft_ms": 578.8942351937294,
+              "ttft_over_500ms_requests": 8,
+              "p99_tpot_ms": 1.6578558628116877,
+              "readback": {},
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-1-phase-2-off/requests.json",
+                "sha256": "2a62e71853e325899fd2703d3548a064367b2a53efbb9c69948c46dab73cab38"
+              },
+              "capture_counters": {},
+              "metrics": null,
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.000003116205334663391,
+                "client_event_count": 456,
+                "scheduler_gc_events": 24,
+                "tokenizer_gc": null,
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33405949.889459938,
+                    "end": 33405950.214968808,
+                    "generation": 2,
+                    "thread_id": 140713909580544,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 325.50887018442154,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33405963.376418456,
+                    "end": 33405963.499995466,
+                    "thread_id": 140713909580544,
+                    "event_id": 1,
+                    "duration_ms": 123.57700988650322,
+                    "overlapping_requests": []
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 626,
+                    "published": false,
+                    "start_unix_seconds": 1790974901.1160734,
+                    "ttft_ms": 578.8942351937294,
+                    "tpot_ms": 1.5033702215840739,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 627,
+                    "published": false,
+                    "start_unix_seconds": 1790974901.1162088,
+                    "ttft_ms": 578.7466317415237,
+                    "tpot_ms": 1.5021214081395058,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 628,
+                    "published": false,
+                    "start_unix_seconds": 1790974901.11633,
+                    "ttft_ms": 578.5556398332119,
+                    "tpot_ms": 1.4993300841700645,
+                    "overlaps": []
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 592,
+                    "published": false,
+                    "start_unix_seconds": 1790974900.76208,
+                    "ttft_ms": 36.55748441815376,
+                    "tpot_ms": 1.96128434711887,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 598,
+                    "published": false,
+                    "start_unix_seconds": 1790974900.7630384,
+                    "ttft_ms": 42.92731359601021,
+                    "tpot_ms": 1.7061776691867458,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 961,
+                    "published": false,
+                    "start_unix_seconds": 1790974905.241974,
+                    "ttft_ms": 38.118213415145874,
+                    "tpot_ms": 1.6962596245350376,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "stdout": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-1-phase-2-off/server.stdout.log",
+                    "sha256": "dff38e2fb56d929185a0cc887c535f5c6505ad1a71afb574f7e244b32f3c0938"
+                  },
+                  "stderr": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2/round-1-phase-2-off/server.stderr.log",
+                    "sha256": "f88ec9ea03203ba1cab772d9bba42cefb3dd7b47c8ec312869a9383ceb8bf5f0"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "latency-diagnostics-disabled-v2",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-disabled-v2/report.json",
+        "sha256": "8cc2687a774056270576b51d3d010ef495f5eb0213a5f66b83f88a1dceb89503"
+      },
+      "source_revision": "b091ab1be-plus-latency-diagnostics-v2",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "b091ab1be-plus-latency-diagnostics-v2",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-disabled-v2",
+        "num_prompts": 64,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600,
+        "request_details": true,
+        "latency_diagnostics": false
+      },
+      "versions": {
+        "torch": "2.13.0",
+        "transformers": "5.12.1",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      },
+      "rounds": [
+        {
+          "repetition": 0,
+          "comparison": {
+            "baseline_bracket_mean": {
+              "median_ttft_ms": 38.197143003344536,
+              "p95_ttft_ms": 76.43301989883184,
+              "p99_ttft_ms": 76.86394661664963,
+              "median_tpot_ms": 1.4808679360055155,
+              "p95_tpot_ms": 1.6084219839784408,
+              "p99_tpot_ms": 1.6382714445071835,
+              "output_throughput": 2804.599315757433
+            },
+            "baseline_after_over_before": {
+              "median_ttft_ms": 0.9814621056853031,
+              "p95_ttft_ms": 0.5676533666744428,
+              "p99_ttft_ms": 0.5686660956026519,
+              "median_tpot_ms": 0.9932507829200994,
+              "p95_tpot_ms": 0.9547749730722435,
+              "p99_tpot_ms": 0.9461066902659605,
+              "output_throughput": 1.0767026597187688
+            },
+            "capture_over_baseline": [
+              {
+                "sample_ratio": 1,
+                "ratios": {
+                  "median_ttft_ms": 1.652696904730034,
+                  "p95_ttft_ms": 0.8639697244659613,
+                  "p99_ttft_ms": 0.8627157371760428,
+                  "median_tpot_ms": 2.9714347097555973,
+                  "p95_tpot_ms": 4.660425562299397,
+                  "p99_tpot_ms": 4.638448510434125,
+                  "output_throughput": 0.43608622457357843
+                }
+              }
+            ]
+          },
+          "phases": [
+            {
+              "sample_ratio": null,
+              "requests": 64,
+              "output_tokens": 2048,
+              "requests_per_second": 84.40662239946154,
+              "p99_ttft_ms": 97.99911763519049,
+              "max_ttft_ms": 98.1677658855915,
+              "ttft_over_500ms_requests": 0,
+              "p99_tpot_ms": 1.6836399080291868,
+              "readback": {},
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-disabled-v2/round-0-phase-0-off/requests.json",
+                "sha256": "28d491d2de80c73ce225054a554bdd49dfafbaa5d26463f320059fb4387013be"
+              },
+              "capture_counters": {},
+              "metrics": null,
+              "diagnostics": null
+            },
+            {
+              "sample_ratio": 1,
+              "requests": 64,
+              "output_tokens": 2048,
+              "requests_per_second": 38.220222720321885,
+              "p99_ttft_ms": 66.31173636764288,
+              "max_ttft_ms": 66.44994020462036,
+              "ttft_over_500ms_requests": 0,
+              "p99_tpot_ms": 7.599037741461108,
+              "readback": {
+                "validated_samples": 64,
+                "manifest_bytes": 551040,
+                "payload_bytes": 39905280,
+                "aux_payload_bytes": 2156544,
+                "payload_objects": 896,
+                "kv_payload_bytes": 37748736
+              },
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-disabled-v2/round-0-phase-1-1.0/requests.json",
+                "sha256": "a658baf6365645112eaaf36a92fb59200ca6370705ff7064f842a12c93d26e1a"
+              },
+              "capture_counters": {
+                "considered": 64,
+                "excluded_health_check": 0,
+                "admitted": 64,
+                "overlap_forwards": 272,
+                "eager_forwards": 16,
+                "cuda_graph_forwards": 256,
+                "sealed": 64,
+                "writer_started": 64,
+                "copies_completed": 64,
+                "snapshot_built": 64,
+                "ready": 64
+              },
+              "metrics": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-disabled-v2/round-0-phase-1-1.0/metrics.prom",
+                "sha256": "4764c4a8a8a9f0eaaee851174cfaf48632044dae31c44d92adf5c3abbfe535f6"
+              },
+              "diagnostics": null
+            },
+            {
+              "sample_ratio": null,
+              "requests": 64,
+              "output_tokens": 2048,
+              "requests_per_second": 90.88083483537804,
+              "p99_ttft_ms": 55.72877559810877,
+              "max_ttft_ms": 55.88652938604355,
+              "ttft_over_500ms_requests": 0,
+              "p99_tpot_ms": 1.59290298098518,
+              "readback": {},
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-disabled-v2/round-0-phase-2-off/requests.json",
+                "sha256": "aa9a4ff4a9d45229ffa0ec661f60b148d76e1429d1d98f341043077bf1cf182f"
+              },
+              "capture_counters": {},
+              "metrics": null,
+              "diagnostics": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "latency-diagnostics-v3",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/report.json",
+        "sha256": "2f56507e364371c4f7952ab5b4a1d548df8525b5034a51d6545aed795dc346b3"
+      },
+      "source_revision": "b091ab1be-plus-latency-diagnostics-v3",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "b091ab1be-plus-latency-diagnostics-v3",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3",
+        "num_prompts": 1024,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600,
+        "request_details": true,
+        "latency_diagnostics": true
+      },
+      "versions": {
+        "torch": "2.13.0",
+        "transformers": "5.12.1",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      },
+      "rounds": [
+        {
+          "repetition": 0,
+          "comparison": {
+            "baseline_bracket_mean": {
+              "median_ttft_ms": 38.663703948259354,
+              "p95_ttft_ms": 39.68109944835305,
+              "p99_ttft_ms": 88.47461005672812,
+              "median_tpot_ms": 1.4728782998938714,
+              "p95_tpot_ms": 1.5736468556907868,
+              "p99_tpot_ms": 1.6116049603348777,
+              "output_throughput": 2834.438860518814
+            },
+            "baseline_after_over_before": {
+              "median_ttft_ms": 0.9947634789292996,
+              "p95_ttft_ms": 0.9978185520515981,
+              "p99_ttft_ms": 0.5436037325094458,
+              "median_tpot_ms": 0.9998603294015215,
+              "p95_tpot_ms": 1.000197788174814,
+              "p99_tpot_ms": 1.0406908098258845,
+              "output_throughput": 1.0093150430646465
+            },
+            "capture_over_baseline": [
+              {
+                "sample_ratio": 0.1,
+                "ratios": {
+                  "median_ttft_ms": 1.096351916216169,
+                  "p95_ttft_ms": 1.332018167675435,
+                  "p99_ttft_ms": 0.6939618251228903,
+                  "median_tpot_ms": 1.3166305574188442,
+                  "p95_tpot_ms": 2.143789204618541,
+                  "p99_tpot_ms": 2.1922594396576462,
+                  "output_throughput": 0.8472917083528787
+                }
+              }
+            ]
+          },
+          "phases": [
+            {
+              "sample_ratio": null,
+              "requests": 1024,
+              "output_tokens": 32768,
+              "requests_per_second": 88.16558129790815,
+              "p99_ttft_ms": 114.63383793830872,
+              "max_ttft_ms": 545.0428202748299,
+              "ttft_over_500ms_requests": 8,
+              "p99_tpot_ms": 1.5794700035645115,
+              "readback": {},
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/round-0-phase-0-off/requests.json",
+                "sha256": "3f7f6b0e8da9618d08df8e0b8315cb1bcbfe43d9c81fedc2ee4e1434ad7d07d7"
+              },
+              "capture_counters": {},
+              "metrics": null,
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.000003082677721977234,
+                "client_event_count": 456,
+                "scheduler_gc_events": 18,
+                "tokenizer_gc": {
+                  "observers": [
+                    {
+                      "pid": 30476,
+                      "threshold_seconds": 0.02
+                    }
+                  ],
+                  "events": [
+                    {
+                      "kind": "tokenizer_gc",
+                      "pid": 30476,
+                      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+                      "generation": 2,
+                      "start_unix_seconds": 1790975420.134313,
+                      "end_unix_seconds": 1790975420.6343706,
+                      "duration_seconds": 0.5000565573573112,
+                      "collected": 30
+                    }
+                  ]
+                },
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33406473.72105217,
+                    "end": 33406474.03971172,
+                    "generation": 2,
+                    "thread_id": 140382860387072,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 318.65955144166946,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33406487.289377872,
+                    "end": 33406487.41853824,
+                    "thread_id": 140382860387072,
+                    "event_id": 1,
+                    "duration_ms": 129.16036695241928,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "tokenizer_gc",
+                    "pid": 30476,
+                    "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+                    "generation": 2,
+                    "start_unix_seconds": 1790975420.134313,
+                    "end_unix_seconds": 1790975420.6343706,
+                    "duration_seconds": 0.5000565573573112,
+                    "collected": 30,
+                    "start": 33406477.561246634,
+                    "end": 33406478.061304092,
+                    "event_id": 2,
+                    "duration_ms": 500.0574588775635,
+                    "overlapping_requests": [
+                      168,
+                      169,
+                      170,
+                      171,
+                      172,
+                      173,
+                      174,
+                      175
+                    ]
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 170,
+                    "published": false,
+                    "start_unix_seconds": 1790975420.131422,
+                    "ttft_ms": 545.0428202748299,
+                    "tpot_ms": 1.4746197529377476,
+                    "overlaps": [
+                      {
+                        "event_id": 2,
+                        "ttft_overlap_ms": 500.0574588775635,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  },
+                  {
+                    "request_index": 171,
+                    "published": false,
+                    "start_unix_seconds": 1790975420.1315546,
+                    "ttft_ms": 544.8031313717365,
+                    "tpot_ms": 1.4625523359544816,
+                    "overlaps": [
+                      {
+                        "event_id": 2,
+                        "ttft_overlap_ms": 500.0574588775635,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  },
+                  {
+                    "request_index": 172,
+                    "published": false,
+                    "start_unix_seconds": 1790975420.1316776,
+                    "ttft_ms": 544.7993613779545,
+                    "tpot_ms": 1.4758391245718925,
+                    "overlaps": [
+                      {
+                        "event_id": 2,
+                        "ttft_overlap_ms": 500.0574588775635,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 305,
+                    "published": false,
+                    "start_unix_seconds": 1790975422.0963333,
+                    "ttft_ms": 36.53307631611824,
+                    "tpot_ms": 1.6300597738835119,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 0,
+                    "published": false,
+                    "start_unix_seconds": 1790975418.254186,
+                    "ttft_ms": 111.30884289741516,
+                    "tpot_ms": 1.6298827625090075,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 673,
+                    "published": false,
+                    "start_unix_seconds": 1790975426.0347373,
+                    "ttft_ms": 36.33646294474602,
+                    "tpot_ms": 1.6292458580386253,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "stdout": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/round-0-phase-0-off/server.stdout.log",
+                    "sha256": "21922b9480a32b83306f08e06338a727f707b6e8dd1eeb546116e5822cbbe058"
+                  },
+                  "stderr": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/round-0-phase-0-off/server.stderr.log",
+                    "sha256": "d2e31d7ad9b13317c2cc4624d72399fd8911bce9749b4b85939f5e64b917215e"
+                  }
+                }
+              }
+            },
+            {
+              "sample_ratio": 0.1,
+              "requests": 1024,
+              "output_tokens": 32768,
+              "requests_per_second": 75.04989201096166,
+              "p99_ttft_ms": 61.39800187200307,
+              "max_ttft_ms": 534.2563427984715,
+              "ttft_over_500ms_requests": 7,
+              "p99_tpot_ms": 3.533056187293222,
+              "readback": {
+                "validated_samples": 92,
+                "manifest_bytes": 792120,
+                "payload_bytes": 57363840,
+                "aux_payload_bytes": 3100032,
+                "payload_objects": 1288,
+                "kv_payload_bytes": 54263808
+              },
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/round-0-phase-1-0.1/requests.json",
+                "sha256": "57469aa5cf72bd39332ded700fcadf5f9f646666e71082bb7a20a4e2a3318a77"
+              },
+              "capture_counters": {
+                "considered": 1024,
+                "sampled_out": 932,
+                "admitted": 92,
+                "overlap_forwards": 2382,
+                "eager_forwards": 78,
+                "cuda_graph_forwards": 2304,
+                "sealed": 92,
+                "writer_started": 92,
+                "copies_completed": 92,
+                "snapshot_built": 92,
+                "ready": 92
+              },
+              "metrics": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/round-0-phase-1-0.1/metrics.prom",
+                "sha256": "69cf2af25243352c0074369ab2f48bcb84046461007e2af64449f2c7087eaa56"
+              },
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.000002726912498474121,
+                "client_event_count": 456,
+                "scheduler_gc_events": 19,
+                "tokenizer_gc": {
+                  "observers": [
+                    {
+                      "pid": 31081,
+                      "threshold_seconds": 0.02
+                    }
+                  ],
+                  "events": [
+                    {
+                      "kind": "tokenizer_gc",
+                      "pid": 31081,
+                      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+                      "generation": 2,
+                      "start_unix_seconds": 1790975490.6651187,
+                      "end_unix_seconds": 1790975491.1528473,
+                      "duration_seconds": 0.4877277575433254,
+                      "collected": 30
+                    }
+                  ]
+                },
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33406543.86908688,
+                    "end": 33406544.196517233,
+                    "generation": 2,
+                    "thread_id": 139729718297344,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 327.4303525686264,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33406559.478338163,
+                    "end": 33406559.611702207,
+                    "thread_id": 139729718297344,
+                    "event_id": 1,
+                    "duration_ms": 133.36404412984848,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "scheduler_gc",
+                    "start_unix_seconds": 1790975473.6213608,
+                    "end_unix_seconds": 1790975473.642903,
+                    "generation": 0,
+                    "start": 33406531.048294306,
+                    "end": 33406531.069836617,
+                    "event_id": 2,
+                    "duration_ms": 21.54231071472168,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "scheduler_gc",
+                    "start_unix_seconds": 1790975481.8296077,
+                    "end_unix_seconds": 1790975481.8811548,
+                    "generation": 0,
+                    "start": 33406539.256541252,
+                    "end": 33406539.308088303,
+                    "event_id": 3,
+                    "duration_ms": 51.54705047607422,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "tokenizer_gc",
+                    "pid": 31081,
+                    "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+                    "generation": 2,
+                    "start_unix_seconds": 1790975490.6651187,
+                    "end_unix_seconds": 1790975491.1528473,
+                    "duration_seconds": 0.4877277575433254,
+                    "collected": 30,
+                    "start": 33406548.09205222,
+                    "end": 33406548.579780817,
+                    "event_id": 4,
+                    "duration_ms": 487.7285957336426,
+                    "overlapping_requests": [
+                      168,
+                      169,
+                      170,
+                      171,
+                      172,
+                      173,
+                      174,
+                      175
+                    ]
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 170,
+                    "published": false,
+                    "start_unix_seconds": 1790975490.6622403,
+                    "ttft_ms": 534.2563427984715,
+                    "tpot_ms": 1.9796596419426702,
+                    "overlaps": [
+                      {
+                        "event_id": 4,
+                        "ttft_overlap_ms": 487.7285957336426,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  },
+                  {
+                    "request_index": 171,
+                    "published": false,
+                    "start_unix_seconds": 1790975490.6623795,
+                    "ttft_ms": 534.029345959425,
+                    "tpot_ms": 1.9722791208374886,
+                    "overlaps": [
+                      {
+                        "event_id": 4,
+                        "ttft_overlap_ms": 487.7285957336426,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  },
+                  {
+                    "request_index": 172,
+                    "published": false,
+                    "start_unix_seconds": 1790975490.6625056,
+                    "ttft_ms": 533.9682921767235,
+                    "tpot_ms": 1.9739655958067985,
+                    "overlaps": [
+                      {
+                        "event_id": 4,
+                        "ttft_overlap_ms": 487.7285957336426,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 112,
+                    "published": false,
+                    "start_unix_seconds": 1790975489.8499794,
+                    "ttft_ms": 37.889376282691956,
+                    "tpot_ms": 3.6754403864183733,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 1001,
+                    "published": false,
+                    "start_unix_seconds": 1790975501.6708653,
+                    "ttft_ms": 38.12433034181595,
+                    "tpot_ms": 3.6543662990293195,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 641,
+                    "published": true,
+                    "start_unix_seconds": 1790975497.140513,
+                    "ttft_ms": 38.68237882852554,
+                    "tpot_ms": 3.5716878069985296,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "stdout": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/round-0-phase-1-0.1/server.stdout.log",
+                    "sha256": "d5611bd45647310eaca1c46a670fd7fd402574c2411a8f458063c2a94b6199e7"
+                  },
+                  "stderr": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/round-0-phase-1-0.1/server.stderr.log",
+                    "sha256": "987452e67faf2fda361c48ac9a0c2f200a238c5a8f30ab52bc73ecedfaa9e9d0"
+                  }
+                }
+              }
+            },
+            {
+              "sample_ratio": null,
+              "requests": 1024,
+              "output_tokens": 32768,
+              "requests_per_second": 88.98684748451775,
+              "p99_ttft_ms": 62.31538217514753,
+              "max_ttft_ms": 537.3932980000973,
+              "ttft_over_500ms_requests": 8,
+              "p99_tpot_ms": 1.643739917105244,
+              "readback": {},
+              "request_records": {
+                "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/round-0-phase-2-off/requests.json",
+                "sha256": "0e4aa496ce35d173a3a8c44614342b52b13427ed18e778f05871c5b0dea169f6"
+              },
+              "capture_counters": {},
+              "metrics": null,
+              "diagnostics": {
+                "clock_mapping_stable": true,
+                "clock_offset_change_bound_seconds": 0.0000029336661100387573,
+                "client_event_count": 456,
+                "scheduler_gc_events": 18,
+                "tokenizer_gc": {
+                  "observers": [
+                    {
+                      "pid": 32558,
+                      "threshold_seconds": 0.02
+                    }
+                  ],
+                  "events": [
+                    {
+                      "kind": "tokenizer_gc",
+                      "pid": 32558,
+                      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+                      "generation": 2,
+                      "start_unix_seconds": 1790975562.4272466,
+                      "end_unix_seconds": 1790975562.9198864,
+                      "duration_seconds": 0.49263935908675194,
+                      "collected": 30
+                    }
+                  ]
+                },
+                "scheduler_unmatched_starts": 0,
+                "scheduler_unmatched_ends": 0,
+                "long_events": [
+                  {
+                    "kind": "client_gc",
+                    "start": 33406616.039464906,
+                    "end": 33406616.373573504,
+                    "generation": 2,
+                    "thread_id": 139696037667584,
+                    "collected": 90,
+                    "event_id": 0,
+                    "duration_ms": 334.1085985302925,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "client_loop_lag",
+                    "start": 33406629.52758442,
+                    "end": 33406629.65542858,
+                    "thread_id": 139696037667584,
+                    "event_id": 1,
+                    "duration_ms": 127.84416228532791,
+                    "overlapping_requests": []
+                  },
+                  {
+                    "kind": "tokenizer_gc",
+                    "pid": 32558,
+                    "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+                    "generation": 2,
+                    "start_unix_seconds": 1790975562.4272466,
+                    "end_unix_seconds": 1790975562.9198864,
+                    "duration_seconds": 0.49263935908675194,
+                    "collected": 30,
+                    "start": 33406619.854180098,
+                    "end": 33406620.346819878,
+                    "event_id": 2,
+                    "duration_ms": 492.63978004455566,
+                    "overlapping_requests": [
+                      168,
+                      169,
+                      170,
+                      171,
+                      172,
+                      173,
+                      174,
+                      175
+                    ]
+                  }
+                ],
+                "worst_ttft": [
+                  {
+                    "request_index": 170,
+                    "published": false,
+                    "start_unix_seconds": 1790975562.4243612,
+                    "ttft_ms": 537.3932980000973,
+                    "tpot_ms": 1.4702026401796648,
+                    "overlaps": [
+                      {
+                        "event_id": 2,
+                        "ttft_overlap_ms": 492.63978004455566,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  },
+                  {
+                    "request_index": 171,
+                    "published": false,
+                    "start_unix_seconds": 1790975562.4244967,
+                    "ttft_ms": 537.3322479426861,
+                    "tpot_ms": 1.474227515920516,
+                    "overlaps": [
+                      {
+                        "event_id": 2,
+                        "ttft_overlap_ms": 492.63978004455566,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  },
+                  {
+                    "request_index": 172,
+                    "published": false,
+                    "start_unix_seconds": 1790975562.4246194,
+                    "ttft_ms": 537.1991544961929,
+                    "tpot_ms": 1.473067388419182,
+                    "overlaps": [
+                      {
+                        "event_id": 2,
+                        "ttft_overlap_ms": 492.63978004455566,
+                        "after_first_token_overlap_ms": 0
+                      }
+                    ]
+                  }
+                ],
+                "worst_tpot": [
+                  {
+                    "request_index": 104,
+                    "published": false,
+                    "start_unix_seconds": 1790975561.7336128,
+                    "ttft_ms": 35.75173765420914,
+                    "tpot_ms": 1.8226028450073735,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 108,
+                    "published": false,
+                    "start_unix_seconds": 1790975561.7351565,
+                    "ttft_ms": 37.34782338142395,
+                    "tpot_ms": 1.739268942225364,
+                    "overlaps": []
+                  },
+                  {
+                    "request_index": 110,
+                    "published": false,
+                    "start_unix_seconds": 1790975561.7354712,
+                    "ttft_ms": 37.02329844236374,
+                    "tpot_ms": 1.7380168841731163,
+                    "overlaps": []
+                  }
+                ],
+                "server_logs": {
+                  "stdout": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/round-0-phase-2-off/server.stdout.log",
+                    "sha256": "65feed934397c796a50009a6e03cf6f09b14c64a0fc10454cf5e52fe143848a9"
+                  },
+                  "stderr": {
+                    "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/round-0-phase-2-off/server.stderr.log",
+                    "sha256": "8ef8ab88c38c71a3abef4bd052da1c9547952df97804f1eccba6d30f08fbe2b8"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "jobs": [
+    {
+      "role": "unit",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v1 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v1/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v1/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v1/test/registered/unit -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m unittest test_latency_diagnostics test_benchmark_latency test_bench_sglang_streaming -v",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v1",
+      "id": "01790974208681827075-553dde07dc5d",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790974208681827075-553dde07dc5d.json",
+        "sha256": "2ea0196b10d60257ee82bfbe5abfe73648f786e2ee481be5afc57c0b89f856c7"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790974221.381139,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790974208681827075-553dde07dc5d.log",
+        "sha256": "e5d917778d378be27c92276e3d08d1c41752ff1e5237fc3e049cd05a28064f94"
+      },
+      "test_methods": 20,
+      "test_seconds": 0.026
+    },
+    {
+      "role": "serving_diagnostics_512",
+      "id": "01790974258272274142-4e37de495510",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v1 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v1/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v1/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v1/test/registered/unit -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/benchmark_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision b091ab1be-plus-latency-diagnostics-v1 --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v1 --num-prompts 512 --input-len 16 --output-len 32 --concurrency 8 --capture-slots 16 --ratios 0.1 --repeats 1 --request-details --latency-diagnostics",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v1",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790974258272274142-4e37de495510.json",
+        "sha256": "f102eebe50d8d429a4ad167fd93366205c851d349d9b41c14661cef7435898d0"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790974464.435049,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790974258272274142-4e37de495510.log",
+        "sha256": "f842146e44129def0f8e218850af04f4a61a6da83ac91a09ff6dc2e5ad2777f6"
+      }
+    },
+    {
+      "role": "final_unit",
+      "id": "01790974450852803497-0cb23999ed9c",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2/test/registered/unit -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m unittest test_latency_diagnostics test_benchmark_latency test_bench_sglang_streaming -v",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790974450852803497-0cb23999ed9c.json",
+        "sha256": "1773bfcc4cc60a3e220f45bc4f60863e12030f973df24e729d45291fb3104a28"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790974476.4725733,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790974450852803497-0cb23999ed9c.log",
+        "sha256": "370c33f6d6604f1e754ad60ba88166e9996d48abd27fbd3cd0b81b4755cc43b3"
+      },
+      "test_methods": 21,
+      "test_seconds": 0.088
+    },
+    {
+      "role": "serving_diagnostics_1024",
+      "id": "01790974451200618330-e22e1f56f680",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2/test/registered/unit -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/benchmark_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision b091ab1be-plus-latency-diagnostics-v2 --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v2 --num-prompts 1024 --input-len 16 --output-len 32 --concurrency 8 --capture-slots 16 --ratios 0.1 --repeats 2 --request-details --latency-diagnostics",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790974451200618330-e22e1f56f680.json",
+        "sha256": "1e87bb9e05e6e8b49c735f0ee8d2928112725e7ba11cd21c41aeb28d38c9ecf9"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790974912.4075594,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790974451200618330-e22e1f56f680.log",
+        "sha256": "9fb2cb0ed05432fd72764cba89399a55e3f1d560ddaba5eab0b5058759f1e54e"
+      }
+    },
+    {
+      "role": "diagnostics_disabled_smoke",
+      "id": "01790974612519411457-2ec6dac40ab3",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2/test/registered/unit -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/benchmark_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision b091ab1be-plus-latency-diagnostics-v2 --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-disabled-v2 --num-prompts 64 --input-len 16 --output-len 32 --concurrency 8 --capture-slots 16 --ratios 1 --repeats 1 --request-details",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790974612519411457-2ec6dac40ab3.json",
+        "sha256": "1d6f41ba604e88afc1ff34fa724aa144fac3958450850bf9121fbd2258b4cb5d"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790975101.7901537,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790974612519411457-2ec6dac40ab3.log",
+        "sha256": "20e18137e99a20cbc7c39ba44c9c224874ce5453dca06f9057adae47f2e59303"
+      }
+    },
+    {
+      "role": "tokenizer_final_unit",
+      "id": "01790975296699001641-5273d8579097",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3/test/registered/unit -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m unittest test_latency_diagnostics test_benchmark_latency test_bench_sglang_streaming -v",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790975296699001641-5273d8579097.json",
+        "sha256": "2f1f093fa9a48c2c0d696698504239e5d07d1ae1555a7504b4eca761ebaa18f4"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790975309.7396452,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790975296699001641-5273d8579097.log",
+        "sha256": "75f5fcbe4dec9f31160462d82dd8dcbac49e7453c4d8bb0c5944e96be5ce2ff3"
+      },
+      "test_methods": 24,
+      "test_seconds": 0.097
+    },
+    {
+      "role": "tokenizer_diagnostics_1024",
+      "id": "01790975354652122165-c0cef48b21a8",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3/test/registered/unit/training_capture:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3/test/registered/unit -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/benchmark_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision b091ab1be-plus-latency-diagnostics-v3 --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3 --num-prompts 1024 --input-len 16 --output-len 32 --concurrency 8 --capture-slots 16 --ratios 0.1 --repeats 1 --request-details --latency-diagnostics",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790975354652122165-c0cef48b21a8.json",
+        "sha256": "dae43c3e7b9a4ad8af65bd39d77e0d5f927b29d173fb2a9b85c8ba95e5ac14ab"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790975579.157446,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790975354652122165-c0cef48b21a8.log",
+        "sha256": "f79228c5501f2c5cbd2b7b8b219b3e87255bef10ff13ee6ef04ac353e23390bd"
+      }
+    }
+  ],
+  "source_verification": {
+    "final_frozen_source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3",
+    "all_38_final_source_hashes_match_frozen": true,
+    "unchanged_production_and_native_client_files": 33,
+    "outer_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "offline_replays": [
+    {
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2",
+      "command": "kubectl exec -i -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v2/python /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python - <<'PY'\nimport ast\nimport hashlib\nimport json\nfrom pathlib import Path\n\nfrom sglang.test.training_capture_benchmark_client import summarize_requests\nfrom sglang.test.training_capture_diagnostics import correlate_pauses, scheduler_gc_events\n\nlab = Path(\"/gpfs/users/fuxuanwei-1/dspark-maas-lab\")\ncounts = {\"phases\": 0, \"requests\": 0, \"snapshots\": 0, \"diagnostic_phases\": 0}\nreports = []\nfor name in (\"latency-diagnostics-v1\", \"latency-diagnostics-v2\", \"latency-diagnostics-disabled-v2\"):\n    report_path = lab / \"experiments\" / name / \"report.json\"\n    report = json.loads(report_path.read_text())\n    assert report[\"status\"] == \"completed\"\n    phase_count = 0\n    for run in report[\"rounds\"]:\n        for phase in run[\"phases\"]:\n            details = phase[\"request_details\"]\n            raw = Path(details[\"path\"]).read_bytes()\n            assert hashlib.sha256(raw).hexdigest() == details[\"sha256\"]\n            saved = json.loads(raw)\n            assert saved[\"status\"] == \"completed\"\n            ids = set(details[\"published_trace_ids\"])\n            assert len(ids) == len(details[\"published_trace_ids\"]) == phase[\"readback\"].get(\"validated_samples\", 0)\n            replay = summarize_requests(saved[\"requests\"], ids, count=report[\"config\"][\"num_prompts\"], output_len=32)\n            assert replay == {key: details[key] for key in replay}\n            if report[\"config\"][\"latency_diagnostics\"]:\n                diag = phase[\"latency_diagnostics\"]\n                if \"server_logs\" in diag:\n                    for artifact in diag[\"server_logs\"].values():\n                        assert hashlib.sha256(Path(artifact[\"path\"]).read_bytes()).hexdigest() == artifact[\"sha256\"]\n                    log_path = diag[\"server_logs\"][\"stderr\"][\"path\"]\n                else:\n                    log_path = diag[\"server_log\"]\n                    assert hashlib.sha256(Path(log_path).read_bytes()).hexdigest() == diag[\"server_log_sha256\"]\n                gc_events = scheduler_gc_events(Path(log_path).read_text())\n                assert gc_events == diag[\"scheduler_gc\"]\n                assert gc_events[\"unmatched_starts\"] == gc_events[\"unmatched_ends\"] == 0\n                replay = correlate_pauses(saved[\"requests\"], saved[\"diagnostics\"], gc_events, ids)\n                assert replay == {key: diag[key] for key in replay}\n                assert saved[\"diagnostics\"][\"dropped_events\"] == saved[\"diagnostics\"][\"incomplete_gc\"] == 0\n                counts[\"diagnostic_phases\"] += 1\n            else:\n                assert \"diagnostics\" not in saved and \"latency_diagnostics\" not in phase\n            counts[\"requests\"] += len(saved[\"requests\"])\n            counts[\"snapshots\"] += len(ids)\n            counts[\"phases\"] += 1\n            phase_count += 1\n    reports.append({\"path\": str(report_path), \"sha256\": hashlib.sha256(report_path.read_bytes()).hexdigest(), \"phases\": phase_count})\nprint(json.dumps({\"status\": \"passed\", \"counts\": counts, \"reports\": reports, \"request_summaries_reproduced\": True, \"pause_correlations_reproduced\": True, \"artifact_hashes_verified\": True, \"inference_requests\": 0}))\n\nPY",
+      "result": {
+        "status": "passed",
+        "counts": {
+          "phases": 12,
+          "requests": 7872,
+          "snapshots": 298,
+          "diagnostic_phases": 9
+        },
+        "request_summaries_reproduced": true,
+        "pause_correlations_reproduced": true,
+        "artifact_hashes_verified": true,
+        "inference_requests": 0
+      }
+    },
+    {
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3",
+      "command": "kubectl exec -i -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-latency-diagnostics-v3/python /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python - <<'PY'\nimport ast\nimport hashlib\nimport json\nfrom pathlib import Path\n\nfrom sglang.test.training_capture_benchmark_client import summarize_requests\nfrom sglang.test.training_capture_diagnostics import correlate_pauses, scheduler_gc_events, tokenizer_gc_events\n\nlab = Path(\"/gpfs/users/fuxuanwei-1/dspark-maas-lab\")\ncounts = {\"phases\": 0, \"requests\": 0, \"snapshots\": 0, \"diagnostic_phases\": 0}\nreports = []\nfor name in (\"latency-diagnostics-v3\",):\n    report_path = lab / \"experiments\" / name / \"report.json\"\n    report = json.loads(report_path.read_text())\n    assert report[\"status\"] == \"completed\"\n    phase_count = 0\n    for run in report[\"rounds\"]:\n        for phase in run[\"phases\"]:\n            details = phase[\"request_details\"]\n            raw = Path(details[\"path\"]).read_bytes()\n            assert hashlib.sha256(raw).hexdigest() == details[\"sha256\"]\n            saved = json.loads(raw)\n            assert saved[\"status\"] == \"completed\"\n            ids = set(details[\"published_trace_ids\"])\n            assert len(ids) == len(details[\"published_trace_ids\"]) == phase[\"readback\"].get(\"validated_samples\", 0)\n            replay = summarize_requests(saved[\"requests\"], ids, count=report[\"config\"][\"num_prompts\"], output_len=32)\n            assert replay == {key: details[key] for key in replay}\n            if report[\"config\"][\"latency_diagnostics\"]:\n                diag = phase[\"latency_diagnostics\"]\n                if \"server_logs\" in diag:\n                    for artifact in diag[\"server_logs\"].values():\n                        assert hashlib.sha256(Path(artifact[\"path\"]).read_bytes()).hexdigest() == artifact[\"sha256\"]\n                    log_path = diag[\"server_logs\"][\"stderr\"][\"path\"]\n                else:\n                    log_path = diag[\"server_log\"]\n                    assert hashlib.sha256(Path(log_path).read_bytes()).hexdigest() == diag[\"server_log_sha256\"]\n                gc_events = scheduler_gc_events(Path(log_path).read_text())\n                assert gc_events == diag[\"scheduler_gc\"]\n                assert gc_events[\"unmatched_starts\"] == gc_events[\"unmatched_ends\"] == 0\n                tokenizer_events = tokenizer_gc_events(Path(log_path).read_text())\n                assert tokenizer_events == diag[\"tokenizer_gc\"]\n                replay = correlate_pauses(saved[\"requests\"], saved[\"diagnostics\"], {\"events\": gc_events[\"events\"] + tokenizer_events[\"events\"]}, ids)\n                assert replay == {key: diag[key] for key in replay}\n                assert saved[\"diagnostics\"][\"dropped_events\"] == saved[\"diagnostics\"][\"incomplete_gc\"] == 0\n                counts[\"diagnostic_phases\"] += 1\n            else:\n                assert \"diagnostics\" not in saved and \"latency_diagnostics\" not in phase\n            counts[\"requests\"] += len(saved[\"requests\"])\n            counts[\"snapshots\"] += len(ids)\n            counts[\"phases\"] += 1\n            phase_count += 1\n    reports.append({\"path\": str(report_path), \"sha256\": hashlib.sha256(report_path.read_bytes()).hexdigest(), \"phases\": phase_count})\nprint(json.dumps({\"status\": \"passed\", \"counts\": counts, \"reports\": reports, \"request_summaries_reproduced\": True, \"pause_correlations_reproduced\": True, \"artifact_hashes_verified\": True, \"inference_requests\": 0}))\n\nPY",
+      "result": {
+        "status": "passed",
+        "counts": {
+          "phases": 3,
+          "requests": 3072,
+          "snapshots": 92,
+          "diagnostic_phases": 3
+        },
+        "reports": [
+          {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/latency-diagnostics-v3/report.json",
+            "sha256": "2f56507e364371c4f7952ab5b4a1d548df8525b5034a51d6545aed795dc346b3",
+            "phases": 3
+          }
+        ],
+        "request_summaries_reproduced": true,
+        "pause_correlations_reproduced": true,
+        "artifact_hashes_verified": true,
+        "inference_requests": 0
+      }
+    }
+  ],
+  "cpu_quota_observation": {
+    "pod_cpu_limit": null,
+    "visible_cgroup_cpu_max": "max 100000",
+    "nr_periods": 0,
+    "nr_throttled": 0,
+    "throttled_usec": 0,
+    "scope": "Read during v2 diagnostics; not evidence that host scheduling cannot stall."
+  },
+  "resident": {
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+    "worker_pid": 1,
+    "idle_pid": 33037,
+    "gpu_uuid": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "queue": 0,
+    "process_check": "ps confirms worker and idle load after all terminal results; nvidia-smi confirms the same H100.",
+    "additional_allocations": 0
+  }
+}

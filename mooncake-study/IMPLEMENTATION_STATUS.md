@@ -4005,6 +4005,34 @@ limitations are retained in the [runbook](experiments/CONTEXT_METADATA.md) and
 [evidence index](experiments/context-metadata.json). Production performance
 acceptance remains open.
 
+## Request And Pause Clock Correlation
+
+The capture benchmark's opt-in `--latency-diagnostics` binds native request
+times to bounded client GC/event-loop observations and timestamped scheduler
+and tokenizer GC. The test-only tokenizer entrypoint retains GC policy. Logs
+are captured per stream, drained after producer exit and hashed before parsing.
+Clock steps reject server mapping, incomplete client records reject correlation,
+and maximum TTFT / counts above 500ms expose tails hidden below the p99 fraction.
+
+Two 1,024-request diagnostic rounds find eight >500ms requests per phase even
+with p99 TTFT below 89ms. The final tokenizer-aware run directly observes one
+generation-two collection of **488-500ms** per phase, overlapping all eight
+requests in the affected batch, with capture both on and off. Maximum TTFT is
+**534-545ms**; the clock alignment bounds are about three microseconds. A
+separate intermediate run also observes a 104ms client-loop delay with capture
+off. These are distinct observations, not additive latency costs. The original
+uninstrumented metadata-run spike still cannot be retroactively attributed.
+
+All **24 final unit methods** pass. Four serving experiments finish **10,944
+requests** and **390 post-exit snapshot validations**, including intermediate
+and diagnostic-disabled runs. Offline replay reproduces all 15 phase summaries
+and 12 diagnostic correlations from hashed artifacts, without inference.
+Production capture/native streaming sources are unchanged. All seven jobs are
+terminal and the resident H100 resumes idle load. The [runbook](experiments/LATENCY_DIAGNOSTICS.md)
+and [evidence](experiments/latency-diagnostics.json) retain source versions,
+measurement limits and the tokenizer observation's effect on allocation history.
+No GC policy or production performance acceptance is changed.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
@@ -4044,10 +4072,13 @@ acceptance remains open.
    and control/durability costs. The new token-based timing and publication join
    reproduce off-phase TTFT/TPOT stalls and mixed-publication slow batches; locate
    their server operations without dropping publication checks. The deferred
-   position metadata comparison reduces repeated CPU work but leaves a
-   non-reproduced serving regression; bind request monotonic times to wall-clock
-   events and observe client/tokenizer pauses as well as scheduler GC before
-   assigning causality. Existing D2H
+   position metadata comparison reduces repeated CPU work but leaves an
+   unattributed historical regression. The new clock-bound diagnostic reproduces
+   half-second tokenizer generation-two GC pauses with capture on and off,
+   and exposes them below the p99 fraction. Evaluate existing warmup/GC controls
+   with a controlled intervention and memory/lifecycle checks before changing
+   serving policy; continue investigating the separate client-loop pauses.
+   Existing D2H
    staging comparisons do not justify changing the defaults. Per-model numerical/runtime validation and
    runtime identity coverage also need expansion beyond the tested combination.
 5. Integrate with the SpecForge-owned production Catalog and consumer when

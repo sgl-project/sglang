@@ -18,6 +18,7 @@ import time
 from collections import Counter
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import requests
 import torch
@@ -29,6 +30,7 @@ from sglang.srt.training_capture.protocol import (
     validate_tensors,
 )
 from sglang.srt.utils import kill_process_tree
+from sglang.test import test_utils
 from sglang.test.test_utils import popen_launch_server
 from sglang.test.training_capture_catalog import TestCaptureCatalog
 
@@ -45,10 +47,38 @@ def free_port():
         return sock.getsockname()[1]
 
 
+@contextmanager
+def diagnostic_server(enabled):
+    if not enabled:
+        yield
+        return
+    launch = test_utils._launch_server_process
+
+    def annotated(command, *launch_args):
+        return launch(
+            [sys.executable, "-m", "sglang.test.training_capture_pause_server"]
+            + command[2:],
+            *launch_args,
+        )
+
+    with patch.object(test_utils, "_launch_server_process", annotated):
+        yield
+
+
 def stop_process(process):
     if process.poll() is None:
         kill_process_tree(process.pid)
     process.wait(timeout=20)
+    # The launch helper tees each pipe on a separate thread. EOF must reach
+    # both readers before their sinks are closed, hashed or parsed.
+    deadline = time.monotonic() + 20
+    while any(
+        stream is not None and not stream.closed
+        for stream in (process.stdout, process.stderr)
+    ):
+        if time.monotonic() > deadline:
+            raise RuntimeError("server log readers did not finish after process exit")
+        time.sleep(0.01)
 
 
 def store_setup(address, segment_bytes=0):
@@ -243,6 +273,8 @@ def benchmark_command(args, url, path):
     if getattr(args, "request_details", False):
         command[2] = "sglang.test.training_capture_benchmark_client"
         command += ["--capture-request-records", str(path.parent / "requests.json")]
+    if getattr(args, "latency_diagnostics", False):
+        command += ["--capture-latency-diagnostics"]
     return command
 
 
@@ -384,11 +416,23 @@ def run_phase(args, directory, ratio):
         ]
         if ratio is not None:
             server_args += ["--training-capture-config", str(config_path)]
+        if args.latency_diagnostics:
+            server_args += ["--gc-warning-threshold-secs", "0.02"]
         process = None
+        server_logs = []
         try:
-            process = popen_launch_server(
-                args.model_path, url, timeout=300, other_args=server_args
-            )
+            if args.latency_diagnostics:
+                for name in ("stdout", "stderr"):
+                    server_logs.append((directory / f"server.{name}.log").open("x"))
+            with diagnostic_server(args.latency_diagnostics):
+                process = popen_launch_server(
+                    args.model_path,
+                    url,
+                    timeout=300,
+                    other_args=server_args,
+                    env={"SGLANG_LOG_GC": "1"} if args.latency_diagnostics else None,
+                    return_stdout_stderr=tuple(server_logs) if server_logs else None,
+                )
             warmup(url, args)
             with catalog.condition:
                 warmup_publications = set(catalog.publications)
@@ -407,8 +451,12 @@ def run_phase(args, directory, ratio):
             )
             write_json(directory / "measurement.json", result)
         finally:
-            if process is not None:
-                stop_process(process)
+            try:
+                if process is not None:
+                    stop_process(process)
+            finally:
+                for log in server_logs:
+                    log.close()
         trace_ids = set()
         result["readback"] = validate_publications(
             reader,
@@ -450,6 +498,34 @@ def run_phase(args, directory, ratio):
                 "sha256": hashlib.sha256(details_path.read_bytes()).hexdigest(),
                 **summary,
             }
+            if args.latency_diagnostics:
+                from sglang.test.training_capture_diagnostics import (
+                    correlate_pauses,
+                    scheduler_gc_events,
+                    tokenizer_gc_events,
+                )
+
+                log_path = directory / "server.stderr.log"
+                gc_events = scheduler_gc_events(log_path.read_text())
+                tokenizer_events = tokenizer_gc_events(log_path.read_text())
+                result["latency_diagnostics"] = {
+                    "server_logs": {
+                        name: {
+                            "path": str(path),
+                            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                        }
+                        for name in ("stdout", "stderr")
+                        for path in (directory / f"server.{name}.log",)
+                    },
+                    "scheduler_gc": gc_events,
+                    "tokenizer_gc": tokenizer_events,
+                    **correlate_pauses(
+                        details["requests"],
+                        details["diagnostics"],
+                        {"events": gc_events["events"] + tokenizer_events["events"]},
+                        trace_ids,
+                    ),
+                }
         admitted = result["capture_counter_delta"].get("admitted", 0)
         ready = result["capture_counter_delta"].get("ready", 0)
         if len(publications) != ready or catalog_errors:
@@ -526,7 +602,10 @@ def main():
     parser.add_argument("--segment-mib", type=int, default=2048)
     parser.add_argument("--phase-timeout", type=int, default=600)
     parser.add_argument("--request-details", action="store_true")
+    parser.add_argument("--latency-diagnostics", action="store_true")
     args = parser.parse_args()
+    if args.latency_diagnostics and not args.request_details:
+        parser.error("--latency-diagnostics requires --request-details")
     if not Path(args.model_path).is_dir():
         parser.error("Use a local model directory")
     if (
@@ -574,6 +653,8 @@ def main():
                 for path in (
                     "python/sglang/benchmark/serving.py",
                     "python/sglang/test/training_capture_benchmark_client.py",
+                    "python/sglang/test/training_capture_diagnostics.py",
+                    "python/sglang/test/training_capture_pause_server.py",
                 )
             }
             if args.request_details
@@ -598,6 +679,7 @@ def main():
             "prefill_cuda_graphs": False,
             "client": "existing sglang.benchmark.serving, streaming native /generate",
             "request_details": args.request_details,
+            "latency_diagnostics": args.latency_diagnostics,
             "workload": "seeded fixed-length random-ids, closed-loop concurrency, not production traffic",
             "timing": "Client timing excludes warmup, server launch, readback and post-response writer drain",
             "payload_bytes": "Validated manifest tensor sizes; not D2H or wire byte counters",
