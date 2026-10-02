@@ -1233,6 +1233,47 @@ class ServingChatTestCase(CustomTestCase):
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], expected_tools)
 
+    def _named_tool_choice_request(self):
+        def tool(name):
+            return {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"Run {name}.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+
+        return ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Summarize what you found."}],
+            tools=[tool("search_logs"), tool("query_metrics"), tool("submit")],
+            tool_choice={"type": "function", "function": {"name": "submit"}},
+        )
+
+    def test_named_tool_choice_renders_only_the_named_tool_by_default(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        req = self._named_tool_choice_request()
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(kwargs["tools"], [req.tools[2].model_dump()])
+
+    def test_named_tool_choice_can_keep_every_tool_in_the_prompt(self):
+        """An agent that names a tool on one turn must not lose its prefix cache:
+        the template gets the same tool list as on a turn with automatic choice."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        req = self._named_tool_choice_request()
+
+        with envs.SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS.override(True):
+            self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(kwargs["tools"], [tool.model_dump() for tool in req.tools])
+
     def test_glm47_without_tools_has_no_tool_call_constraint(self):
         """A plain GLM47 chat must not get the full-assistant EBNF: its
         terminal state finishes the request even under ignore_eos."""
