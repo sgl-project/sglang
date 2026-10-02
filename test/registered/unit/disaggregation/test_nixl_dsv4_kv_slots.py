@@ -67,13 +67,17 @@ def geometry(bufs):
 
 
 class FakeAgent:
-    """Prepared dlists are their row arrays; transfers record their rows."""
+    """Prepared dlists expand strided runs to per-block rows, as NIXL does.
+
+    Transfer indices address the expanded descriptors, so the prepared handle
+    must be the expanded array.
+    """
 
     def __init__(self):
         self.posted = []
 
-    def prep_xfer_dlist(self, peer_name, rows, mem_kind):
-        return np.asarray(rows)
+    def prep_xfer_dlist(self, peer_name, descs, mem_kind):
+        return NixlKVManager._expand_stride_descs(np.asarray(descs))
 
     def make_prepped_xfer(self, op, src, src_indices, dst, dst_indices, notif):
         self.posted.append((src[src_indices], dst[dst_indices]))
