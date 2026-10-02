@@ -5,7 +5,11 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+    SamplingMaskStatus,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -55,7 +59,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
     def test_selected_and_support_modes_share_one_batch(self):
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SimpleNamespace(
+            sampling_mask_output=SamplingMaskOutput(
                 token_ids=torch.tensor([[7, 8], [9, 10]], dtype=torch.int32),
                 lengths=torch.tensor([2, 2]),
                 selected_logprobs=torch.tensor([-0.5, -0.25]),
@@ -88,7 +92,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
     def test_selected_mode_does_not_require_support_tensor(self):
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SimpleNamespace(
+            sampling_mask_output=SamplingMaskOutput(
                 token_ids=torch.tensor([[7, 8]], dtype=torch.int32),
                 lengths=torch.tensor([2]),
                 selected_logprobs=torch.tensor([-0.5]),
@@ -114,7 +118,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         packed_ids.cpu.return_value = torch.tensor([[7, 8, 0], [9, 0, 0]])
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SimpleNamespace(
+            sampling_mask_output=SamplingMaskOutput(
                 token_ids=packed_ids,
                 lengths=torch.tensor([2, 1]),
                 selected_logprobs=torch.tensor([-0.5, -0.25]),
@@ -254,7 +258,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 with (
                     patch(
                         "sglang.srt.managers.scheduler_components."
-                        "batch_result_processor.maybe_cache_unfinished_req"
+                        "batch_result_processor.checkpoint_kv_cache"
                     ),
                     patch(
                         "sglang.srt.managers.scheduler_components."

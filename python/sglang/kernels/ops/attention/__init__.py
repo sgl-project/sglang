@@ -318,7 +318,7 @@ register_kernel(
         op="attention.deep_select_topk",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.deep_select:topk",
-        # Mirrors deep_select._SUPPORTED_CAPABILITIES: exactly SM90, SM100, SM103.
+        # Exactly SM90, SM100 and SM103, the architectures DeepSelect is tuned for.
         capabilities=frozenset(
             CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
             for sm in ((9, 0), (10, 0), (10, 3))

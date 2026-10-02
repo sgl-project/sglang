@@ -248,24 +248,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
         return True
 
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        self._publish_external_loaded_prefix(req, token_ids_len=len(req.get_fill_ids()))
-        super().cache_unfinished_req(req, chunked=chunked, **kwargs)
-        self._retire_loaded_flow(req.rid)
-        self._submit_store(req, req.get_fill_ids())
-
     def on_release(self, req: Req, *, inserted: bool) -> None:
         super().on_release(req, inserted=inserted)
         if not inserted:
             self.release_aborted_request(req.cache_request_handle)
 
-    def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs) -> None:
-        self._publish_external_loaded_prefix(req, token_ids_len=owned_kv_len)
-        super().cache_finished_req(req, owned_kv_len=owned_kv_len, **kwargs)
+    def insert_req(self, req: Req, *, up_to: int, **kwargs) -> None:
+        self._publish_external_loaded_prefix(req, token_ids_len=up_to)
+        super().insert_req(req, up_to=up_to, **kwargs)
         self._retire_loaded_flow(req.rid)
-        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
-        self._submit_store(req, token_ids)
-        self._request_session_finish(req.rid)
+        self._submit_store(req, req.full_untruncated_fill_ids[:up_to])
+        if req.finished():
+            self._request_session_finish(req.rid)
 
     def check_hicache_events(self) -> None:
         """Poll LMCache retrieve/store futures at the scheduler safe point."""
@@ -769,7 +763,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 external_tokens - self.lmcache_connector.aligned_swa_window_size(),
                 0,
             )
-            req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, swa_missing_end)
+            req.kv.set_evicted_seqlen(
+                ComponentType.SWA,
+                max(req.kv.get_evicted_seqlen(ComponentType.SWA), swa_missing_end),
+            )
 
     def _publish_external_loaded_prefix(self, req: Req, *, token_ids_len: int) -> None:
         """Publish retrieved KV and immutable Mamba state into the device tree."""
@@ -807,8 +804,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 value=kv_indices[:total_hit].to(dtype=torch.int64, copy=True),
                 mamba_value=checkpoint,
                 prev_prefix_len=prev_prefix_len,
-                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
-                chunked=True,
+                component_evicted_seqlens=req.kv.component_evicted_seqlens.copy(),
+                inserted_len=len(key),
                 priority=req.priority or 0,
             )
         )

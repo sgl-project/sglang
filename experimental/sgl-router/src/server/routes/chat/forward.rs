@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Plain and PD chat forwarding, including load tracking and streaming metrics.
+//! Plain and PD forwarding, including load tracking and streaming metrics.
 
-use super::preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
+use super::nonempty_header;
+use super::preparation::{
+    append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
+};
 use crate::discovery::WorkerMode;
-use crate::proxy::sse::{StreamEnd, StreamEndReason};
+use crate::policies::dp_rank::select_dp_rank;
+use crate::proxy::sse::{self, StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -13,19 +17,21 @@ use crate::server::metrics::{
     StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
-use crate::workers::{LoadGuard, Worker};
+use crate::workers::{DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use bytes::Bytes;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-const CHAT_PATH: &str = "/v1/chat/completions";
 // Expose the selected decode worker to both PD workers and the client.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
-type LoadGuards = (LoadGuard, RouterInflightLoadGuard);
+// SGLang's DP controller dispatches to this rank; it outranks `routed_dp_rank` in the body.
+const X_DATA_PARALLEL_RANK: HeaderName = HeaderName::from_static("x-data-parallel-rank");
+type LoadGuards = (LoadGuard, RouterInflightLoadGuard, Option<DpRankGuard>);
 
 /// A plain worker, or a prefill worker paired with a decode worker for PD.
 pub(super) struct SelectedWorkers {
@@ -34,9 +40,10 @@ pub(super) struct SelectedWorkers {
     pub(super) track_dispatch_timestamps: bool,
 }
 
-pub(super) async fn forward_chat_request(
+/// PD sends to both workers and returns the decode response.
+pub(super) async fn forward_request(
     ctx: &AppContext,
-    request: PreparedChatRequest,
+    request: PreparedRequest,
     workers: SelectedWorkers,
     mut headers: HeaderMap,
     request_started_at: Instant,
@@ -52,6 +59,19 @@ pub(super) async fn forward_chat_request(
     if let Some(hint) = &decode_url_header {
         headers.insert(X_SGL_DECODE_URL, hint.clone());
     }
+    // Only the router chooses DP ranks; a client-supplied rank is never forwarded.
+    headers.remove(X_DATA_PARALLEL_RANK);
+    let dp_aware = ctx.config.model.dp_aware && request.accepts_dp_rank();
+    // The engine gives fan-out item i the room `room + i`, so in PD decode looks
+    // for each item on a different prefill rank; one pinned rank would break that.
+    let unpin_prefill = dp_aware && decode.is_some() && request.fans_out;
+    let prefill_rank = (dp_aware && !unpin_prefill)
+        .then(|| prompt_dp_rank(ctx, &request, &headers, &prefill))
+        .flatten();
+    let decode_rank = decode
+        .as_deref()
+        .filter(|_| dp_aware)
+        .and_then(|decode| select_dp_rank(decode, None, &[]));
 
     // Track worker occupancy and the prompt's contribution to active load.
     let worker_load_guard = if track_dispatch_timestamps {
@@ -77,60 +97,98 @@ pub(super) async fn forward_chat_request(
         let bootstrap = BootstrapFields {
             host: prefill.bootstrap_host().to_string(),
             port: prefill.bootstrap_port(),
-            room: generate_room_id(),
+            room: match prefill_rank {
+                Some(rank) => generate_room_id_for_rank(rank, prefill.dp_ranks()),
+                None => generate_room_id(),
+            },
         };
         (decode, bootstrap)
     });
-    let engine_rid = request.engine_rid(pd.is_some());
+    let path = request.path;
+    let engine_rid = request.engine_rid();
     let body = request.into_outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
-    let prefill_load_guards = (worker_load_guard, active_request_guard);
+    let (prefill_headers, prefill_body) =
+        with_dp_rank(dp_aware, headers.clone(), &body, prefill_rank);
+    let prefill_load_guards = (
+        worker_load_guard,
+        active_request_guard,
+        prefill_rank.map(|rank| prefill.dp_rank_guard(rank)),
+    );
 
     // In PD mode, prefill runs independently and decode supplies the client response.
-    let (response_worker, response_load_guards) = if let Some((decode, bootstrap)) = pd {
-        spawn_prefill_request(
-            ctx,
-            prefill,
-            headers.clone(),
-            body.clone(),
-            prefill_load_guards,
-            bootstrap.room,
-        );
-        let decode_load_guards = (
-            decode.load_guard(),
-            ctx.router_inflight_load
-                .register(decode.id.clone(), decode.url.clone(), 0, 1),
-        );
-        (decode, decode_load_guards)
-    } else {
-        (prefill, prefill_load_guards)
-    };
+    let stream_abort = CancellationToken::new();
+    let (response_worker, response_headers, response_body, response_load_guards, prefill_task) =
+        if let Some((decode, bootstrap)) = pd {
+            let task = spawn_prefill_request(
+                ctx,
+                &metrics,
+                Arc::clone(&prefill),
+                path,
+                prefill_headers,
+                prefill_body,
+                prefill_load_guards,
+                bootstrap.room,
+                stream_abort.clone(),
+            );
+            let decode_load_guards = (
+                decode.load_guard(),
+                ctx.router_inflight_load
+                    .register(decode.id.clone(), decode.url.clone(), 0, 1),
+                decode_rank.map(|rank| decode.dp_rank_guard(rank)),
+            );
+            let (decode_headers, decode_body) = with_dp_rank(dp_aware, headers, &body, decode_rank);
+            (
+                decode,
+                decode_headers,
+                decode_body,
+                decode_load_guards,
+                Some((task, prefill)),
+            )
+        } else {
+            (
+                prefill,
+                prefill_headers,
+                prefill_body,
+                prefill_load_guards,
+                None,
+            )
+        };
 
     // In PD mode, prefill can finish before decode. Watch the registration
     // held by the response so expiration remains live for its full lifetime.
     let expiration_token = response_load_guards.1.cancel_token().clone();
-    let response_future = forward_to_response_worker(
+    let response = forward_to_response_worker(
         ctx,
         &response_worker,
-        &headers,
-        body,
+        path,
+        &response_headers,
+        response_body,
         engine_rid.as_deref(),
         response_load_guards,
         &metrics,
         expiration_token.clone(),
+        stream_abort,
     );
-    // A ready response wins if request expiration fires in the same poll.
-    let result = tokio::select! {
-        biased;
-        result = response_future => result,
-        _ = expiration_token.cancelled() => Err(ApiError::StaleRequestExpired {
-            model: metrics.model.clone(),
-        }),
+    let dispatch = async {
+        match prefill_task {
+            Some((task, prefill)) => forward_pd(task, prefill, response).await,
+            None => (response.await, None),
+        }
     };
-    let log_context = metrics.record_dispatch_result(&result, engine_rid);
+    // A ready response wins if request expiration fires in the same poll.
+    let (result, blamed_prefill) = tokio::select! {
+        biased;
+        dispatch = dispatch => dispatch,
+        _ = expiration_token.cancelled() => {
+            let model = metrics.model.clone();
+            (Err(ApiError::StaleRequestExpired { model }), None)
+        }
+    };
+    let log_context = metrics.record_dispatch_result(&result, engine_rid, blamed_prefill.as_ref());
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
         Ok(mut response) => {
@@ -145,6 +203,57 @@ pub(super) async fn forward_chat_request(
     Ok(response)
 }
 
+/// Rank for the worker that computes the prompt; decode gets its KV from
+/// prefill, so it is placed by load alone.
+fn prompt_dp_rank(
+    ctx: &AppContext,
+    request: &PreparedRequest,
+    headers: &HeaderMap,
+    worker: &Worker,
+) -> Option<u32> {
+    if worker.dp_ranks() <= 1 {
+        return None;
+    }
+    let model = &ctx.config.model;
+    let sticky = model.sticky.as_ref().map(|c| c.header_name.as_str());
+    let session = model
+        .affinity
+        .as_ref()
+        .map(|c| c.session_id_header.as_str());
+    let key = [sticky, session]
+        .into_iter()
+        .flatten()
+        .find_map(|name| nonempty_header(headers, name));
+    let prefix_depths = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
+        (None, Some(provider), Some(tokens)) => provider.rank_depths(&tokens.ids, &worker.url),
+        _ => Vec::new(),
+    };
+    select_dp_rank(worker, key, &prefix_depths)
+}
+
+/// Under `--dp-aware` the router owns the rank: the header pins it for chat, and
+/// the body, which `/generate` reads instead, carries it or null to unpin.
+fn with_dp_rank(
+    dp_aware: bool,
+    mut headers: HeaderMap,
+    body: &Bytes,
+    rank: Option<u32>,
+) -> (HeaderMap, Bytes) {
+    if !dp_aware {
+        return (headers, body.clone());
+    }
+    if let Some(rank) = rank {
+        headers.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(rank));
+    }
+    let rank = rank.map_or_else(|| "null".to_owned(), |rank| rank.to_string());
+    let fields = [
+        ("routed_dp_rank", rank),
+        ("data_parallel_rank", "null".into()),
+    ];
+    let body = append_fields(body, &fields).unwrap_or_else(|| body.clone());
+    (headers, body)
+}
+
 fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(decode_url)
         .map_err(|error| {
@@ -157,54 +266,144 @@ fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {
         .ok()
 }
 
+/// A prefill's client-visible failure; `None` means it succeeded.
+type PrefillFailure = Option<Result<Response<Body>, ApiError>>;
+
+/// Runs prefill to completion even if the client disconnects. A failure also
+/// aborts decode's stream until its first token, which proves KV transfer completed.
+#[allow(clippy::too_many_arguments)]
 fn spawn_prefill_request(
     ctx: &AppContext,
+    metrics: &DispatchMetrics,
     prefill_worker: Arc<Worker>,
+    path: &'static str,
     headers: HeaderMap,
     body: Bytes,
     load_guards: LoadGuards,
     bootstrap_room: u64,
-) {
+    stream_abort: CancellationToken,
+) -> tokio::task::JoinHandle<PrefillFailure> {
     let proxy = Arc::clone(&ctx.proxy);
-    // Let prefill finish KV transfer after client cancellation; router shutdown still cancels it.
+    let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
     tokio::spawn(async move {
         let _load_guards = load_guards;
-        match proxy
+        let result = proxy
             .forward_json_to(
                 &prefill_worker.url,
                 prefill_worker.protocol(),
                 &prefill_worker.breaker,
-                CHAT_PATH,
+                path,
                 &headers,
                 body,
                 None,
             )
-            .await
-        {
-            Ok(_) => tracing::debug!(
-                prefill_url = %prefill_worker.url, bootstrap_room, "prefill side completed",
+            .await;
+        let failure = prefill_failure(result).await;
+        let prefill_url = &prefill_worker.url;
+        let outcome = failure
+            .as_ref()
+            .map_or(RequestOutcome::Success, dispatch_outcome);
+        registry.record_worker_request(prefill_url, &model, WorkerModeLabel::Prefill, outcome);
+        match &failure {
+            None => tracing::debug!(%prefill_url, bootstrap_room, "prefill side completed"),
+            Some(Ok(response)) => tracing::debug!(
+                %prefill_url, bootstrap_room, status = %response.status(),
+                "prefill rejected the request",
             ),
-            // Prefill failures surface to the client through decode's bootstrap timeout.
-            Err(error) => tracing::warn!(
-                prefill_url = %prefill_worker.url,
-                bootstrap_room,
-                %error,
-                "prefill request failed; decode will time out on bootstrap_room",
-            ),
+            Some(Err(error)) => {
+                tracing::warn!(%prefill_url, bootstrap_room, %error, "prefill failed")
+            }
         }
-    });
+        if failure.is_some() {
+            stream_abort.cancel();
+        }
+        failure
+    })
+}
+
+/// Client errors and backpressure pass through; only a prefill fault becomes
+/// `prefill_failed`.
+async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
+    let status = match result {
+        // A streaming prefill reports a late failure as a 200 carrying an SSE error event.
+        Ok(response) if response.status().is_success() => {
+            let status = response.status();
+            match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+                Ok(body) if !sse::has_error_event(&body) => return None,
+                _ => status,
+            }
+        }
+        Ok(response)
+            if matches!(
+                outcome_from_status(response.status().as_u16()),
+                RequestOutcome::Error
+            ) =>
+        {
+            response.status()
+        }
+        result => return Some(result),
+    };
+    Some(Err(ApiError::PrefillFailed {
+        status: Some(status),
+    }))
+}
+
+/// Prefill's failure ended the request, so the client-visible outcome belongs to
+/// `prefill` rather than to the decode worker the dispatch had selected.
+struct Blame {
+    prefill: Arc<Worker>,
+    /// Whether decode had already reached the wire when it was dropped. False
+    /// only if prefill failed before decode's future was ever polled, which is
+    /// a pre-dispatch drop and must stay uncounted.
+    decode_dispatched: bool,
+}
+
+/// Returns decode's response as soon as decode answers, unless prefill fails
+/// first; then prefill's failure is returned along with the blamed prefill.
+async fn forward_pd(
+    task: tokio::task::JoinHandle<PrefillFailure>,
+    prefill: Arc<Worker>,
+    decode: impl std::future::Future<Output = Result<Response<Body>, ApiError>>,
+) -> (Result<Response<Body>, ApiError>, Option<Blame>) {
+    // Set on decode's first poll, which is where `forward_to_response_worker`
+    // begins and the request reaches the worker. Read from the same task, so
+    // `Relaxed` needs no ordering beyond what the select already gives.
+    let dispatched = AtomicBool::new(false);
+    let decode = async {
+        dispatched.store(true, Ordering::Relaxed);
+        decode.await
+    };
+    let mut decode = std::pin::pin!(decode);
+    let blame = |prefill| {
+        Some(Blame {
+            prefill,
+            decode_dispatched: dispatched.load(Ordering::Relaxed),
+        })
+    };
+    tokio::select! {
+        biased;
+        failure = task => match failure {
+            Ok(None) => (decode.await, None),
+            Ok(Some(failure)) => (failure, blame(prefill)),
+            Err(_) => (Err(ApiError::PrefillFailed { status: None }), blame(prefill)),
+        },
+        // Dropping the handle leaves prefill running.
+        response = &mut decode => (response, None),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn forward_to_response_worker(
     ctx: &AppContext,
     worker: &Worker,
+    path: &str,
     headers: &HeaderMap,
     body: Bytes,
     engine_rid: Option<&str>,
     load_guards: LoadGuards,
     metrics: &DispatchMetrics,
     expiration: CancellationToken,
+    stream_abort: CancellationToken,
 ) -> Result<Response<Body>, ApiError> {
     if metrics.streaming {
         // Load and duration guards live until the SSE pump ends, not just until headers arrive.
@@ -215,7 +414,7 @@ async fn forward_to_response_worker(
                 &worker.url,
                 worker.protocol(),
                 &worker.breaker,
-                CHAT_PATH,
+                path,
                 headers,
                 body,
                 engine_rid,
@@ -223,6 +422,7 @@ async fn forward_to_response_worker(
                 Some(metrics.first_byte_callback()),
                 Some(metrics.stream_end_callback(worker.url.clone())),
                 Some(expiration),
+                Some(stream_abort),
             )
             .await
     } else {
@@ -233,7 +433,7 @@ async fn forward_to_response_worker(
                 &worker.url,
                 worker.protocol(),
                 &worker.breaker,
-                CHAT_PATH,
+                path,
                 headers,
                 body,
                 engine_rid,
@@ -254,7 +454,7 @@ struct DispatchMetrics {
 impl DispatchMetrics {
     fn new(
         ctx: &AppContext,
-        request: &PreparedChatRequest,
+        request: &PreparedRequest,
         response_worker: &Worker,
         request_started_at: Instant,
     ) -> Self {
@@ -302,30 +502,46 @@ impl DispatchMetrics {
         })
     }
 
-    // HTTP status determines the outcome; router cancellations and dispatch failures stay distinct.
+    /// Logs a blamed prefill's failure against it; its task already recorded the outcome.
     fn record_dispatch_result(
         &self,
         result: &Result<Response<Body>, ApiError>,
         engine_rid: Option<String>,
+        blame: Option<&Blame>,
     ) -> RequestLogContext {
-        let http_status = match result {
-            Ok(response) => response.status().as_u16(),
-            Err(error) => error.status_code().as_u16(),
-        };
-        let outcome = match result {
-            Err(ApiError::StaleRequestExpired { .. }) => {
-                self.registry
-                    .record_stale_request(StaleRequestOutcome::Expired);
-                RequestOutcome::Cancelled
+        if let Err(ApiError::StaleRequestExpired { .. }) = result {
+            self.registry
+                .record_stale_request(StaleRequestOutcome::Expired);
+        }
+        let outcome = dispatch_outcome(result);
+        let worker_url = match blame {
+            // The prefill task books its own outcome, so recording `outcome`
+            // here would double-count it against prefill. Decode still has to
+            // be accounted for: its dispatch reached the worker and was then
+            // abandoned, and leaving it out would silently shrink decode's
+            // dispatch counts during exactly the prefill incident an operator
+            // is reading them to understand.
+            Some(blame) => {
+                if blame.decode_dispatched {
+                    self.registry.record_worker_request(
+                        &self.worker_url,
+                        &self.model,
+                        self.mode,
+                        RequestOutcome::Cancelled,
+                    );
+                }
+                &blame.prefill.url
             }
-            // These 503s come from the router, not worker backpressure.
-            Err(ApiError::BreakerOpen { .. } | ApiError::WorkerMisconfigured { .. }) => {
-                RequestOutcome::Error
+            None => {
+                self.registry.record_worker_request(
+                    &self.worker_url,
+                    &self.model,
+                    self.mode,
+                    outcome,
+                );
+                &self.worker_url
             }
-            _ => outcome_from_status(http_status),
         };
-        self.registry
-            .record_worker_request(&self.worker_url, &self.model, self.mode, outcome);
         if !self.streaming {
             self.registry.observe_request_duration(
                 &self.model,
@@ -334,12 +550,25 @@ impl DispatchMetrics {
         }
         // The app middleware emits the access log and edge counters exactly once.
         RequestLogContext {
-            worker_url: self.worker_url.clone(),
+            worker_url: worker_url.clone(),
             model_id: self.model.clone(),
             streaming: self.streaming,
             outcome,
             engine_rid,
         }
+    }
+}
+
+// HTTP status determines the outcome; router cancellations and dispatch failures stay distinct.
+fn dispatch_outcome(result: &Result<Response<Body>, ApiError>) -> RequestOutcome {
+    match result {
+        Ok(response) => outcome_from_status(response.status().as_u16()),
+        Err(ApiError::StaleRequestExpired { .. }) => RequestOutcome::Cancelled,
+        // These 503s come from the router, not worker backpressure.
+        Err(ApiError::BreakerOpen { .. } | ApiError::WorkerMisconfigured { .. }) => {
+            RequestOutcome::Error
+        }
+        Err(error) => outcome_from_status(error.status_code().as_u16()),
     }
 }
 

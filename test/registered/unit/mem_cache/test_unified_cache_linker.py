@@ -414,7 +414,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
         self.assertEqual(consumer.finish_external_linker_loads([req]), [])
         self._bind_loaded_request(consumer, consumer_req_pool, req, tokens, loaded)
-        consumer.cache_unfinished_req(req)
+        consumer.insert_req(req, up_to=req.extend_range.end)
         consumer.dec_lock_ref(req.last_node, req.lock_receipt)
         final_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
@@ -616,7 +616,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self._bind_loaded_request(consumer, consumer_req_pool, req, tokens[:4], loaded)
         if load_landed:
             self.assertEqual(consumer.finish_external_linker_loads([req]), [])
-            consumer.cache_unfinished_req(req)
+            consumer.insert_req(req, up_to=req.extend_range.end)
             consumer.dec_lock_ref(req.last_node, req.lock_receipt)
             final = consumer.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
