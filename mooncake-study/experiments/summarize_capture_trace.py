@@ -1,7 +1,8 @@
-"""Attribute GPU kernels and D2H events using explicit capture CPU scopes.
+"""Attribute CPU operators, GPU kernels and DMA to explicit capture CPU scopes.
 
 CUDA correlation IDs connect device activity to a runtime/driver call inside
 the named CPU range. Summed device durations are work, not serving wall time.
+CPU operator durations are inclusive and may overlap through nested dispatch.
 """
 
 import argparse
@@ -33,6 +34,7 @@ def summarize(path):
                 {
                     "cpu_calls": 0,
                     "cpu_scope_us": 0.0,
+                    "cpu_operators": {},
                     "gpu_kernel_calls": 0,
                     "gpu_kernel_us": 0.0,
                     "d2h_calls": 0,
@@ -58,7 +60,10 @@ def summarize(path):
         indices[thread] = ([event["ts"] for event in ranges], ranges)
     correlations = {}
     for event in events:
-        if event.get("cat") not in ("cuda_runtime", "cuda_driver"):
+        category = event.get("cat")
+        if category not in ("cuda_runtime", "cuda_driver", "cpu_op"):
+            continue
+        if category == "cpu_op" and event.get("ph") != "X":
             continue
         index = indices.get((event["pid"], event["tid"]))
         if index is None:
@@ -68,6 +73,13 @@ def summarize(path):
             continue
         scope = index[1][position]
         if event["ts"] + event.get("dur", 0) > scope["ts"] + scope["dur"]:
+            continue
+        if category == "cpu_op":
+            operator = groups[scope["name"]]["cpu_operators"].setdefault(
+                event["name"], {"calls": 0, "inclusive_us": 0.0}
+            )
+            operator["calls"] += 1
+            operator["inclusive_us"] += event["dur"]
             continue
         correlation = event.get("args", {}).get("correlation")
         if correlation is not None:
@@ -106,6 +118,7 @@ def summarize(path):
         "trace": str(path),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "cpu_operator_attribution": "Complete CPU operator events contained in a capture scope on the same process/thread. Durations are inclusive and nested calls overlap; do not sum them as wall time or treat operator events as allocation counts.",
         "groups": groups,
         "all_kernel_us": sum(
             event["dur"]

@@ -222,9 +222,6 @@ class RequestCaptureContext:
                 if self.teacher_staging is not None
                 else rows.logits.device
             )
-        self.slot.tensors["logits_positions"][index : index + count].copy_(
-            torch.arange(position, position + count)
-        )
         self.teacher_rows += count
 
     def trim_terminal_prefix(self):
@@ -296,6 +293,13 @@ class RequestCaptureContext:
         self._flush_kv()
         self._flush_staging(self.teacher_staging)
         if self.owns_aux:
+            # The teacher ledger already checked every position. Materialize
+            # only the committed prefix after speculative/lookahead trimming.
+            torch.arange(
+                self.prompt_length,
+                n,
+                out=self.slot.tensors["logits_positions"][:r],
+            )
             self.slot.tensors["token_ids"][:n].copy_(
                 torch.tensor(self.token_ids, dtype=torch.int32)
             )

@@ -418,6 +418,11 @@ binding 阶段投票。启动阶段只同步本设备的当前 stream，热路�
 采样修改不能影响这些结果。验证和测量范围见
 [`experiments/TEACHER_SELECTION.md`](experiments/TEACHER_SELECTION.md)。
 
+`RequestCaptureContext` 每次追加 teacher 行时检查位置连续性；在裁剪到最终
+接受前缀后，由 `seal()` 一次写入 `logits_positions = P ... N-1`，避免逐 token
+创建和复制 CPU 位置 tensor。该字段使用现有 Host buffer，格式不变；实际 forward
+的 `position_ids` 仍按原路径采集，CUDA 完成事件和发布前内容校验保持不变。
+
 #### 7.3.1 当前 prefill CUDA Graph 验收
 
 现有采集钩子在 graph replay 返回后、sampler 修改 logits 之前运行，使用本轮真实

@@ -31,6 +31,10 @@ in [Remote RDMA Store Validation](RDMA.md).
 streaming timing and the opt-in join between request latency and validated
 Mooncake publications for comparing direct and staged transfers.
 
+[Deferred Teacher Position Metadata](CONTEXT_METADATA.md) covers materializing
+the committed logits-position prefix at seal, CPU operator attribution and
+the unresolved serving-tail investigation with all comparison runs retained.
+
 [Host-Known Teacher Row Selection](TEACHER_SELECTION.md) covers contiguous
 teacher-row views, independent compact output ownership, and microbenchmark and
 serving comparisons against the index-upload/gather path.

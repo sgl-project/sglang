@@ -1,0 +1,1950 @@
+{
+  "schema_version": 1,
+  "baseline_revision": "f8c0e1616eb3760292eab038c9dbc51b81f29495",
+  "branch": "codex/dspark-maas-capture",
+  "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+  "runtime_lock": {
+    "path": "mooncake-study/experiments/h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84"
+  },
+  "change": "Materialize the aux owner's committed logits_positions directly at seal after trimming; retain per-append continuity checks, observed position_ids, CUDA fences and publication validation.",
+  "checks": {
+    "black_python_files": 4,
+    "full_ruff_clean_files": 4,
+    "diff_check": "passed"
+  },
+  "validation": {
+    "test_methods": 123,
+    "focused_methods": 114,
+    "trace_analyzer_methods": 5,
+    "runtime_methods": 2,
+    "pd_runtime_methods": 2,
+    "serving_timed_requests": 6144,
+    "serving_output_tokens": 196608,
+    "serving_post_exit_snapshots": 200,
+    "pd_post_exit_snapshots": 10,
+    "verified_prometheus_scrapes": 4,
+    "serving_payload_bytes": 124704000,
+    "request_file_hashes_and_publication_membership": "passed",
+    "all_ten_jobs_terminal_success": true
+  },
+  "limitations": [
+    "Single H100, Qwen3-0.6B BF16, local TCP Store and HTTP test Catalog; no new distributed or RDMA coverage.",
+    "One ordinary off/on/off round per source, followed by candidate-first diagnostic rounds with scheduler GC logging. Logging changes the environment; these are not pooled as equivalent repetitions.",
+    "The ordinary candidate throughput and p99 TTFT regress. Diagnostic reversal does not reproduce the large spike but still has higher candidate TTFT and mixed raw/off-normalized throughput. End-to-end speedup is not established.",
+    "CPU trace operator events include nested dispatch; counts are not allocation counts, durations are inclusive and cannot be summed as wall time.",
+    "Position materialization at seal is outside teacher-append profiling scopes; scope time reduction is not total request or service latency reduction.",
+    "Profile driver verifies publication counts but does not read tensors back. Separate runtime and serving suites provide numerical/contract checks.",
+    "Long diagnostic scheduler GC events precede the client's model_info request; no attribution of the original in-flight spike is proven. Client/tokenizer GC is not instrumented and request records lack a wall-clock anchor.",
+    "Serving uses a GPFS journal; profiler uses a node-local journal. Startup, warmup, drain and readback are excluded from request timing.",
+    "Production SLO, production Catalog retention, SpecForge checkpoint integration and trained draft quality remain open."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+    "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+    "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+    "python/sglang/srt/training_capture/cohort.py": "6bd093ee9a219970b08023d279852b07caaacf288f2f617236b6b2e1c7d5af56",
+    "python/sglang/srt/training_capture/cohort_coordinator.py": "b1f4d340cab3b2400e7415c17773b27510524f8d3df55c6ec8af89455e3504f1",
+    "python/sglang/srt/training_capture/cohort_exchange.py": "b37abb0499a23fa8650521fe28c04a7219b887f5d2920e6f8070d4bfacae2ed3",
+    "python/sglang/srt/training_capture/cohort_service.py": "60f8578cf250b4f3dbf97b15d67a2c78a67eb6b836a5bcda85dfdaf90ecf9324",
+    "python/sglang/srt/training_capture/cohort_startup.py": "dfacd1a45203de5f3c08ccf73b06933f7aa4183bd670979981cfe2cb960208ed",
+    "python/sglang/srt/training_capture/cohort_writer.py": "8f47827eb4e8ca2d3e4f68a91a21d56e13e84530952d5f3ea71843b7f3647d69",
+    "python/sglang/srt/training_capture/config.py": "9cf427b9f673c376f728aa4bec45b0b4a31bffb360ce88731b32b8fccc34530d",
+    "python/sglang/srt/training_capture/context.py": "548ba9ac33f40cd2589ccf67c76b66ec2d307df7e8323ec788ed515c1a812de7",
+    "python/sglang/srt/training_capture/coordinator.py": "9e5ad5eac75c1a5337bde61fec32036627e14182458fedf81e22dc81cdb2fb33",
+    "python/sglang/srt/training_capture/host_pool.py": "591086d65bd855dfb671588c4c7e1b0af7270237ef738e0967db32f5e5816bfc",
+    "python/sglang/srt/training_capture/identity.py": "47f91ad994b716d27454eace428d9d0a5ce7468c5708e4dd3d3e385119c8ac24",
+    "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+    "python/sglang/srt/training_capture/kv_exporter.py": "2cecaf4db75bd9b2b0adf664f12fd6c56cfaba74be01b1c755b40cfd62299c8f",
+    "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+    "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+    "python/sglang/srt/training_capture/metrics.py": "422f9522d27718ed015c354c9b1ad7bb6c9b49f366a4e8b02de083f7e424ac1f",
+    "python/sglang/srt/training_capture/mooncake_store.py": "94525a4eb4088ab847c9dffd66d8a3c509b44d30244da76cba7647cd0944e139",
+    "python/sglang/srt/training_capture/pd_capture.py": "a2e239ca22f3318a85d5bd27c872047975843a84676fc70ca85a693256e9f36f",
+    "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+    "python/sglang/srt/training_capture/protocol.py": "e57f130767eb7ca4aef6dc63a7cfdbaa37cc1d02326a068bc973d818a7bb9d62",
+    "python/sglang/srt/training_capture/request_router.py": "b97ca76fd4621398c617414098c539850e331e0ee42d88e91eb7e0cb41f09824",
+    "python/sglang/srt/training_capture/resources.py": "4f615e4b1b79b94637ba664e05e93bdbb827f865a176d06abbf23e8bcd02cd8d",
+    "python/sglang/srt/training_capture/snapshot.py": "82e7dce85b0ecac6538aac26a21d22286e35c19e59a01b0ca2735e4da0dec3b3",
+    "python/sglang/srt/training_capture/snapshot_writer.py": "ec60267c9e9057c3b8fcc3c5b66bcd9987dff65279514f4007637c861dd3a1f5",
+    "python/sglang/srt/training_capture/startup.py": "00d81ee4757ef83347248e419065a81dd8f812837f5589a91fd9b7511e895371",
+    "python/sglang/srt/training_capture/teacher.py": "6a267208c1ca42d209920e7cfcbd9b3441ce6894060b0988ada23375870d82ab",
+    "python/sglang/srt/training_capture/teacher_staging.py": "9afe4b9bb7bdf16e43156377b47d034f9707ed1c09b62dbfdac3795bb7032fd0",
+    "python/sglang/srt/training_capture/timings.py": "9bea8c331ae56ed343f85d79451dfe22b512beef7f339167f00cc8e3da8c9278",
+    "python/sglang/srt/training_capture/topology.py": "b35eef08cd7ac804817c5b22c232e9c1e6dd76fc292220acc928eb58af5f1a35",
+    "python/sglang/benchmark/serving.py": "0f2e715e717ab89b0b398276644b8995915125bd7f2864a047f49bf5291c0ba4",
+    "python/sglang/test/training_capture_benchmark_client.py": "3c7e1c0a658de37e8a22d137adb59947799d853a0522a03d5e2a9dce507bda55",
+    "mooncake-study/experiments/benchmark_training_capture.py": "5291e4f07cb9301b50e1ac20a9c5ec4cce9f6e6641a1f6058e438cb287fa28fc",
+    "mooncake-study/experiments/profile_training_capture.py": "a1213e86c0ff89ce5927c8033130e8cfba6edc87dde2dd36200dd76d658d707d",
+    "python/sglang/test/training_capture_profile_server.py": "9b54a9b0d23e62befcd454aa17694c6121e20d2511e52fce0e2b7c9ce75f53bf",
+    "mooncake-study/experiments/summarize_capture_trace.py": "ad20aa43d24cf42f90011eba44065bd31b79f10693cf9bfc5bfc48e1a4e6e7aa",
+    "test/registered/unit/training_capture/test_context.py": "6bebcab6a7ed802976d3640fed233df7b75e2ca23efbb702a11efce05f0530ff",
+    "test/registered/unit/training_capture/test_trace_attribution.py": "43d35a00cd9870879034dc3bb502dbc86b952d95726a3bb4ccdc95a50e324700",
+    "test/registered/storage/test_training_capture_runtime.py": "d61586428b26bc49c16b64e29b4e7f05a83379fc2219c625c9bfa947e0f79ddd",
+    "test/registered/storage/test_training_capture_pd.py": "24cd1594e9938a52a21948bb5d02f4c70f926d35b10c741f548caa7b3626ae7b"
+  },
+  "source_verification": {
+    "final_frozen_source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v2",
+    "runtime_frozen_source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1",
+    "matched_v2_files": 42,
+    "production_changes": [
+      "python/sglang/srt/training_capture/context.py"
+    ],
+    "outer_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "serving": [
+    {
+      "variant": "before",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before/report.json",
+        "sha256": "bedb3bc8e19196cee3156ecea0cc457c5e439e11c59d385cd30e7de9d5d63285"
+      },
+      "declared_source_revision": "f8c0e1616eb3760292eab038c9dbc51b81f29495",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "f8c0e1616eb3760292eab038c9dbc51b81f29495",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before",
+        "num_prompts": 512,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600,
+        "request_details": true
+      },
+      "versions": {
+        "torch": "2.13.0",
+        "transformers": "5.12.1",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      },
+      "comparison": {
+        "baseline_bracket_mean": {
+          "median_ttft_ms": 38.41578867286444,
+          "p95_ttft_ms": 39.12502285093069,
+          "p99_ttft_ms": 73.02416168153286,
+          "median_tpot_ms": 1.474214207020498,
+          "p95_tpot_ms": 1.57444910596936,
+          "p99_tpot_ms": 1.5846795528646438,
+          "output_throughput": 2973.24549870753
+        },
+        "baseline_after_over_before": {
+          "median_ttft_ms": 1.009065935189924,
+          "p95_ttft_ms": 1.0076564081662083,
+          "p99_ttft_ms": 0.6413656436227452,
+          "median_tpot_ms": 1.0020547802966466,
+          "p95_tpot_ms": 1.0040203570759492,
+          "p99_tpot_ms": 1.0066807191787301,
+          "output_throughput": 0.9998868951397598
+        },
+        "capture_over_baseline": [
+          {
+            "sample_ratio": 0.1,
+            "ratios": {
+              "median_ttft_ms": 1.1270600225137126,
+              "p95_ttft_ms": 1.314356993346759,
+              "p99_ttft_ms": 0.805037329714643,
+              "median_tpot_ms": 1.311335123091506,
+              "p95_tpot_ms": 2.0606949315033267,
+              "p99_tpot_ms": 2.151525906464606,
+              "output_throughput": 0.8275300789967187
+            }
+          }
+        ]
+      },
+      "phases": [
+        {
+          "sample_ratio": null,
+          "requests_per_second": 92.91917663985404,
+          "median_ttft_ms": 38.242436945438385,
+          "p99_ttft_ms": 88.97976141422987,
+          "median_tpot_ms": 1.4727011683487123,
+          "p99_tpot_ms": 1.5794037763149507,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {},
+          "capture_counters": {},
+          "stage_metrics_verified": false,
+          "metrics": null,
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before/round-0-phase-0-off/requests.json",
+            "sha256": "e209f24429a9c46615454244426ef9abbc124e2e716b8a195b40b8585532f3fa"
+          },
+          "publication_identities": 0,
+          "worst_ttft": [
+            {
+              "request_index": 1,
+              "trace_id": "66810b8d201bc1d6e9987848563149c0a3141d484fed7d33d25692f85fa4ae2b",
+              "published": false,
+              "start_offset_ms": 0.6388276815414429,
+              "ttft_ms": 89.80229124426842,
+              "e2e_latency_ms": 136.9749754667282,
+              "tpot_ms": 1.52169949104709,
+              "max_itl_ms": 4.8641785979270935
+            },
+            {
+              "request_index": 2,
+              "trace_id": "10c21aea364792d868788d6b674165ca8364d917af572d4e11b6ea0c490c763d",
+              "published": false,
+              "start_offset_ms": 0.9217299520969391,
+              "ttft_ms": 89.60995078086853,
+              "e2e_latency_ms": 136.95524632930756,
+              "tpot_ms": 1.5272675983367427,
+              "max_itl_ms": 5.048710852861404
+            },
+            {
+              "request_index": 3,
+              "trace_id": "7693d2455a67dd0b994e73ce6ed7582d31ac30a1e889bd705e745623d4246db0",
+              "published": false,
+              "start_offset_ms": 1.0893940925598145,
+              "ttft_ms": 89.36991542577744,
+              "e2e_latency_ms": 136.58474385738373,
+              "tpot_ms": 1.523058981664719,
+              "max_itl_ms": 4.889264702796936
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 0,
+              "trace_id": "753dd39929e62d02a614ca33276cec55320c09b8f8424da98f4ce470e41844e6",
+              "published": false,
+              "start_offset_ms": 0,
+              "ttft_ms": 87.18317747116089,
+              "e2e_latency_ms": 137.20080628991127,
+              "tpot_ms": 1.6134718973790445,
+              "max_itl_ms": 5.31436875462532
+            },
+            {
+              "request_index": 88,
+              "trace_id": "e122e08164490676406c7b14e2e29b93089f05333035cfafaff3a7482f1bed8d",
+              "published": false,
+              "start_offset_ms": 987.7654165029526,
+              "ttft_ms": 35.87303310632706,
+              "e2e_latency_ms": 85.13109385967255,
+              "tpot_ms": 1.5889697017208222,
+              "max_itl_ms": 5.349721759557724
+            },
+            {
+              "request_index": 112,
+              "trace_id": "54a61a9115acd99680867bbcce8ae72fe210472ea7897010eabb62935ea7b759",
+              "published": false,
+              "start_offset_ms": 1243.2130053639412,
+              "ttft_ms": 36.15795820951462,
+              "e2e_latency_ms": 85.17618849873543,
+              "tpot_ms": 1.581233235136155,
+              "max_itl_ms": 4.819728434085846
+            }
+          ]
+        },
+        {
+          "sample_ratio": 0.1,
+          "requests_per_second": 76.88906507569001,
+          "median_ttft_ms": 43.296899646520615,
+          "p99_ttft_ms": 58.78717612475157,
+          "median_tpot_ms": 1.9331888686264715,
+          "p99_tpot_ms": 3.409479111433029,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {
+            "validated_samples": 50,
+            "manifest_bytes": 430650,
+            "payload_bytes": 31176000,
+            "aux_payload_bytes": 1684800,
+            "payload_objects": 700,
+            "kv_payload_bytes": 29491200
+          },
+          "capture_counters": {
+            "considered": 512,
+            "sampled_out": 462,
+            "admitted": 50,
+            "overlap_forwards": 1355,
+            "eager_forwards": 43,
+            "cuda_graph_forwards": 1312,
+            "sealed": 50,
+            "writer_started": 50,
+            "copies_completed": 50,
+            "snapshot_built": 50,
+            "ready": 50
+          },
+          "stage_metrics_verified": true,
+          "metrics": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before/round-0-phase-1-0.1/metrics.prom",
+            "sha256": "ff1f14ad737c66f0291b84dd99f1cf0decb84fa86c9201770a96db23104f4810"
+          },
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before/round-0-phase-1-0.1/requests.json",
+            "sha256": "f5edb9e0381aa23e5e21e02e3b93524810efe25aa2dbe2d803d10dcbabf351e9"
+          },
+          "publication_identities": 50,
+          "worst_ttft": [
+            {
+              "request_index": 1,
+              "trace_id": "659775b9a82c84d6d1d5978d4ee741813384fb44163344e041acf8677cdb9116",
+              "published": false,
+              "start_offset_ms": 0.6360448896884918,
+              "ttft_ms": 59.65700000524521,
+              "e2e_latency_ms": 119.68955397605896,
+              "tpot_ms": 1.9365339990585082,
+              "max_itl_ms": 4.12619486451149
+            },
+            {
+              "request_index": 2,
+              "trace_id": "0601c1827b51937e1476abe92435a5fdaeae9a4af704b423af73689a1490b57c",
+              "published": true,
+              "start_offset_ms": 0.9142681956291199,
+              "ttft_ms": 59.44138020277023,
+              "e2e_latency_ms": 119.60389465093613,
+              "tpot_ms": 1.9407262725214804,
+              "max_itl_ms": 4.2580775916576385
+            },
+            {
+              "request_index": 3,
+              "trace_id": "b0a83c5b05f5b9987987cb5cce528d15f8090d93c1a967fb639b25595b8cb4c9",
+              "published": false,
+              "start_offset_ms": 1.079365611076355,
+              "ttft_ms": 59.264685958623886,
+              "e2e_latency_ms": 119.38703805208206,
+              "tpot_ms": 1.9394307126921992,
+              "max_itl_ms": 4.21886146068573
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 120,
+              "trace_id": "37b28eaf09e6388bd5d54d7b209c5cf483ea2a61a07d1a5c2e55acf892b6a711",
+              "published": false,
+              "start_offset_ms": 1592.0020043849945,
+              "ttft_ms": 47.073036432266235,
+              "e2e_latency_ms": 157.94194489717484,
+              "tpot_ms": 3.576416402093826,
+              "max_itl_ms": 8.843585848808289
+            },
+            {
+              "request_index": 112,
+              "trace_id": "fa636af6bd7cb0c0b92a302b3995bbba89e40ad5aafb588bd956f3eb7d74582c",
+              "published": false,
+              "start_offset_ms": 1443.794373422861,
+              "ttft_ms": 41.08751192688942,
+              "e2e_latency_ms": 147.3790667951107,
+              "tpot_ms": 3.428759834458751,
+              "max_itl_ms": 8.621271699666977
+            },
+            {
+              "request_index": 240,
+              "trace_id": "348b091b88a1f3c2728937757639ffd426b9be7b393538cfa403d043f5dfc718",
+              "published": false,
+              "start_offset_ms": 3125.7961355149746,
+              "ttft_ms": 37.95287013053894,
+              "e2e_latency_ms": 143.88033375144005,
+              "tpot_ms": 3.417014955512939,
+              "max_itl_ms": 8.758306503295898
+            }
+          ]
+        },
+        {
+          "sample_ratio": null,
+          "requests_per_second": 92.90866702936655,
+          "median_ttft_ms": 38.58914040029049,
+          "p99_ttft_ms": 57.06856194883585,
+          "median_tpot_ms": 1.4757272456922839,
+          "p99_tpot_ms": 1.589955329414337,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {},
+          "capture_counters": {},
+          "stage_metrics_verified": false,
+          "metrics": null,
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before/round-0-phase-2-off/requests.json",
+            "sha256": "e11c2cea1d6f3dbb054c4478315caf336a541b1cabbaabbaaee0d8bce394ed24"
+          },
+          "publication_identities": 0,
+          "worst_ttft": [
+            {
+              "request_index": 1,
+              "trace_id": "2e9f06164bb5bb6540fc9cfb2bcbb8b28af1b9e1fbf94deee1e1e0ca4ce5d952",
+              "published": false,
+              "start_offset_ms": 0.596214085817337,
+              "ttft_ms": 57.912904769182205,
+              "e2e_latency_ms": 104.20206189155579,
+              "tpot_ms": 1.4931986168507607,
+              "max_itl_ms": 3.869004547595978
+            },
+            {
+              "request_index": 2,
+              "trace_id": "2491243b42a37821d749dde596476052cb4d2b68f34323d11e7e46537cc62ab3",
+              "published": false,
+              "start_offset_ms": 0.8842051029205322,
+              "ttft_ms": 57.5842447578907,
+              "e2e_latency_ms": 103.60052436590195,
+              "tpot_ms": 1.4843961163874595,
+              "max_itl_ms": 3.5860277712345123
+            },
+            {
+              "request_index": 3,
+              "trace_id": "f3e16f0edc137b78ad62b22a3f2fb0d45165bc33b9f60110f125321bfd9ccb59",
+              "published": false,
+              "start_offset_ms": 1.0563693940639496,
+              "ttft_ms": 57.51923844218254,
+              "e2e_latency_ms": 103.99239137768745,
+              "tpot_ms": 1.4991339656614489,
+              "max_itl_ms": 4.053104668855667
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 72,
+              "trace_id": "b9113b7f3023eef6f38128fd22322d95c9f148d55cd4722aca67162db723b23b",
+              "published": false,
+              "start_offset_ms": 789.0473119914532,
+              "ttft_ms": 36.151524633169174,
+              "e2e_latency_ms": 87.38049864768982,
+              "tpot_ms": 1.6525475488555046,
+              "max_itl_ms": 4.750199615955353
+            },
+            {
+              "request_index": 472,
+              "trace_id": "0ba34dca05bbafeefa64c297c085b0aae94517a86de2c996c56cbb679ff7ba14",
+              "published": false,
+              "start_offset_ms": 5070.751830935478,
+              "ttft_ms": 36.2214632332325,
+              "e2e_latency_ms": 87.01562508940697,
+              "tpot_ms": 1.6385213501991764,
+              "max_itl_ms": 4.756055772304535
+            },
+            {
+              "request_index": 0,
+              "trace_id": "269093b31e8a9869150c6c5a479e770ed6390b67d379dbfd5049465699066ddb",
+              "published": false,
+              "start_offset_ms": 0,
+              "ttft_ms": 54.36180531978607,
+              "e2e_latency_ms": 104.9945242702961,
+              "tpot_ms": 1.6333135145325814,
+              "max_itl_ms": 6.321702152490616
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "after",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after/report.json",
+        "sha256": "4708a8a3491e94949282b9563202d9311de4f1210e2a9f0abd01b0e71e28cb74"
+      },
+      "declared_source_revision": "f8c0e1616-plus-context-metadata-v1",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "f8c0e1616-plus-context-metadata-v1",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after",
+        "num_prompts": 512,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600,
+        "request_details": true
+      },
+      "versions": {
+        "torch": "2.13.0",
+        "transformers": "5.12.1",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      },
+      "comparison": {
+        "baseline_bracket_mean": {
+          "median_ttft_ms": 38.39614521712065,
+          "p95_ttft_ms": 39.100013580173254,
+          "p99_ttft_ms": 72.92970215901732,
+          "median_tpot_ms": 1.475175361960165,
+          "p95_tpot_ms": 1.5765119313953384,
+          "p99_tpot_ms": 1.8634406933861394,
+          "output_throughput": 2963.38693073167
+        },
+        "baseline_after_over_before": {
+          "median_ttft_ms": 0.9853588529326911,
+          "p95_ttft_ms": 0.990435056490888,
+          "p99_ttft_ms": 0.6518243487808849,
+          "median_tpot_ms": 0.9989275586289864,
+          "p95_tpot_ms": 1.0008025626429022,
+          "p99_tpot_ms": 1.0467478686842926,
+          "output_throughput": 1.0100473226573063
+        },
+        "capture_over_baseline": [
+          {
+            "sample_ratio": 0.1,
+            "ratios": {
+              "median_ttft_ms": 1.1089520800255228,
+              "p95_ttft_ms": 1.411580802593937,
+              "p99_ttft_ms": 8.245418456857493,
+              "median_tpot_ms": 1.334025176058611,
+              "p95_tpot_ms": 2.1456755050574228,
+              "p99_tpot_ms": 2.6874273160436464,
+              "output_throughput": 0.742556750627312
+            }
+          }
+        ]
+      },
+      "phases": [
+        {
+          "sample_ratio": null,
+          "requests_per_second": 92.14294662768303,
+          "median_ttft_ms": 38.679299876093864,
+          "p99_ttft_ms": 88.30200646072626,
+          "median_tpot_ms": 1.475966805892606,
+          "p99_tpot_ms": 1.820879573783567,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {},
+          "capture_counters": {},
+          "stage_metrics_verified": false,
+          "metrics": null,
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after/round-0-phase-0-off/requests.json",
+            "sha256": "5a8346574da9c6b0bba28457d574607429baa8fbf00fda2a4487f7b516e27a13"
+          },
+          "publication_identities": 0,
+          "worst_ttft": [
+            {
+              "request_index": 1,
+              "trace_id": "ebb6cd4385b751fbaae8adee550eaa4e3561a8c947d08eb0ce88850bb940f221",
+              "published": false,
+              "start_offset_ms": 0.6519556045532227,
+              "ttft_ms": 89.2496295273304,
+              "e2e_latency_ms": 135.67037507891655,
+              "tpot_ms": 1.497443404889876,
+              "max_itl_ms": 4.010334610939026
+            },
+            {
+              "request_index": 2,
+              "trace_id": "340a04bd423f6e6475560440d232da9445e33c850b9b911795a52fb0f28edba1",
+              "published": false,
+              "start_offset_ms": 0.9370781481266022,
+              "ttft_ms": 88.88347819447517,
+              "e2e_latency_ms": 135.1340003311634,
+              "tpot_ms": 1.491952326989943,
+              "max_itl_ms": 3.830011934041977
+            },
+            {
+              "request_index": 3,
+              "trace_id": "7d7f77f0dc1ffdb83ce87744f09b239cd49ca9e9df4829105b54775143a4c19a",
+              "published": false,
+              "start_offset_ms": 1.1068284511566162,
+              "ttft_ms": 88.67142722010612,
+              "e2e_latency_ms": 134.64603200554848,
+              "tpot_ms": 1.483051767272334,
+              "max_itl_ms": 3.5444609820842743
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 408,
+              "trace_id": "50d2f9830bd31bdd54fa9a96f8db93adf90ee7f08895f4acfdcd56173f7b3f1e",
+              "published": false,
+              "start_offset_ms": 4419.1745184361935,
+              "ttft_ms": 36.30323335528374,
+              "e2e_latency_ms": 95.63152864575386,
+              "tpot_ms": 1.9138159771119394,
+              "max_itl_ms": 9.96064767241478
+            },
+            {
+              "request_index": 412,
+              "trace_id": "bcd1922e3c1cc784a7417b240db857d13beb837b8e63da0689c6b1566df96dc9",
+              "published": false,
+              "start_offset_ms": 4419.92973536253,
+              "ttft_ms": 38.62446919083595,
+              "e2e_latency_ms": 95.21522745490074,
+              "tpot_ms": 1.8255083310988642,
+              "max_itl_ms": 10.01913845539093
+            },
+            {
+              "request_index": 413,
+              "trace_id": "97155b849a4ee7bebab035a5de3cadbc811d29607d5c926eb110ba70521cae89",
+              "published": false,
+              "start_offset_ms": 4420.060187578201,
+              "ttft_ms": 38.48337009549141,
+              "e2e_latency_ms": 95.03529593348503,
+              "tpot_ms": 1.8242556721933427,
+              "max_itl_ms": 9.99809056520462
+            }
+          ]
+        },
+        {
+          "sample_ratio": 0.1,
+          "requests_per_second": 68.765092816736,
+          "median_ttft_ms": 42.57948510348797,
+          "p99_ttft_ms": 601.3359122350812,
+          "median_tpot_ms": 1.9679210719562346,
+          "p99_tpot_ms": 5.0078614212332235,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {
+            "validated_samples": 50,
+            "manifest_bytes": 430350,
+            "payload_bytes": 31176000,
+            "aux_payload_bytes": 1684800,
+            "payload_objects": 700,
+            "kv_payload_bytes": 29491200
+          },
+          "capture_counters": {
+            "considered": 512,
+            "sampled_out": 462,
+            "admitted": 50,
+            "overlap_forwards": 1355,
+            "eager_forwards": 43,
+            "cuda_graph_forwards": 1312,
+            "sealed": 50,
+            "writer_started": 50,
+            "copies_completed": 50,
+            "snapshot_built": 50,
+            "ready": 50
+          },
+          "stage_metrics_verified": true,
+          "metrics": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after/round-0-phase-1-0.1/metrics.prom",
+            "sha256": "18b49722b6ae48cdec2667047419f6a0eb5a2e8eabe5bdd933c6e119ff30e089"
+          },
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after/round-0-phase-1-0.1/requests.json",
+            "sha256": "e25a760b3a754381d777daf4815b0ab2b249775f50ca62ce2c3f2cddb0cb9641"
+          },
+          "publication_identities": 50,
+          "worst_ttft": [
+            {
+              "request_index": 489,
+              "trace_id": "a52c9c33a5a7a7927b52c7a23e4ab7898a2b30936021452a7c7278e53e6d4931",
+              "published": false,
+              "start_offset_ms": 6441.683627665043,
+              "ttft_ms": 602.0313538610935,
+              "e2e_latency_ms": 757.439449429512,
+              "tpot_ms": 5.01316437317479,
+              "max_itl_ms": 110.2190800011158
+            },
+            {
+              "request_index": 490,
+              "trace_id": "4056608d5c914a31f58bce8318f33c65d85a6362fac7a08431cc5d1f3ba1bc66",
+              "published": false,
+              "start_offset_ms": 6441.847387701273,
+              "ttft_ms": 601.8560081720352,
+              "e2e_latency_ms": 757.2241723537445,
+              "tpot_ms": 5.011876263926106,
+              "max_itl_ms": 110.21841689944267
+            },
+            {
+              "request_index": 491,
+              "trace_id": "9739aa14ec848e99c89b8c7bbcf0e8d121a23cdfb769b5fdc424602fb92c9204",
+              "published": true,
+              "start_offset_ms": 6441.981207579374,
+              "ttft_ms": 601.6130521893501,
+              "e2e_latency_ms": 756.6520534455776,
+              "tpot_ms": 5.001258105039597,
+              "max_itl_ms": 110.21265760064125
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 493,
+              "trace_id": "77336cf738013ffac341333337a15ff6d40fc468b793d3ca2bec5979b365c6d8",
+              "published": false,
+              "start_offset_ms": 6442.219976335764,
+              "ttft_ms": 601.5059873461723,
+              "e2e_latency_ms": 756.9535970687866,
+              "tpot_ms": 5.014439023310138,
+              "max_itl_ms": 110.21943762898445
+            },
+            {
+              "request_index": 489,
+              "trace_id": "a52c9c33a5a7a7927b52c7a23e4ab7898a2b30936021452a7c7278e53e6d4931",
+              "published": false,
+              "start_offset_ms": 6441.683627665043,
+              "ttft_ms": 602.0313538610935,
+              "e2e_latency_ms": 757.439449429512,
+              "tpot_ms": 5.01316437317479,
+              "max_itl_ms": 110.2190800011158
+            },
+            {
+              "request_index": 490,
+              "trace_id": "4056608d5c914a31f58bce8318f33c65d85a6362fac7a08431cc5d1f3ba1bc66",
+              "published": false,
+              "start_offset_ms": 6441.847387701273,
+              "ttft_ms": 601.8560081720352,
+              "e2e_latency_ms": 757.2241723537445,
+              "tpot_ms": 5.011876263926106,
+              "max_itl_ms": 110.21841689944267
+            }
+          ]
+        },
+        {
+          "sample_ratio": null,
+          "requests_per_second": 93.06873654304633,
+          "median_ttft_ms": 38.11299055814743,
+          "p99_ttft_ms": 57.55739785730839,
+          "median_tpot_ms": 1.474383918027724,
+          "p99_tpot_ms": 1.9060018129887117,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {},
+          "capture_counters": {},
+          "stage_metrics_verified": false,
+          "metrics": null,
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after/round-0-phase-2-off/requests.json",
+            "sha256": "40e7e3c373c343dfffe82b2dccf7a64914f67a2996b93190f30a4914430240f9"
+          },
+          "publication_identities": 0,
+          "worst_ttft": [
+            {
+              "request_index": 1,
+              "trace_id": "35ad16914d096dce2bc27b6b1fbdee949335f95020db3bc9238c7ab6e289e4d9",
+              "published": false,
+              "start_offset_ms": 0.6398074328899384,
+              "ttft_ms": 58.49793553352356,
+              "e2e_latency_ms": 105.11909425258636,
+              "tpot_ms": 1.5039083457762195,
+              "max_itl_ms": 3.9812400937080383
+            },
+            {
+              "request_index": 2,
+              "trace_id": "5fa70d84c132d4cfe7e4028e560d60e5092cd4a0bd16d0b461a388db4d3cdd8c",
+              "published": false,
+              "start_offset_ms": 0.9276680648326874,
+              "ttft_ms": 58.15497413277626,
+              "e2e_latency_ms": 104.71664369106293,
+              "tpot_ms": 1.5019893405898925,
+              "max_itl_ms": 3.913652151823044
+            },
+            {
+              "request_index": 3,
+              "trace_id": "829065dd40c3a7977569f9300a6dc72b45cff89b1ece924aeb4420f62ca1e823",
+              "published": false,
+              "start_offset_ms": 1.1034943163394928,
+              "ttft_ms": 58.047737926244736,
+              "e2e_latency_ms": 104.7060415148735,
+              "tpot_ms": 1.5051065673751216,
+              "max_itl_ms": 4.020221531391144
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 184,
+              "trace_id": "8bd9ac37f4e48b50b970f2f0df52c3c371f6876013f9bd53de274979c8f34d34",
+              "published": false,
+              "start_offset_ms": 1973.9357605576515,
+              "ttft_ms": 36.27654165029526,
+              "e2e_latency_ms": 98.31428900361061,
+              "tpot_ms": 2.00121765655856,
+              "max_itl_ms": 12.003403156995773
+            },
+            {
+              "request_index": 456,
+              "trace_id": "40f76d9d3d5b81d686401e699b6bdcc6a449dc6b0e4888c702d2c646b13bde95",
+              "published": false,
+              "start_offset_ms": 4882.541216909885,
+              "ttft_ms": 35.77069565653801,
+              "e2e_latency_ms": 97.16635569930077,
+              "tpot_ms": 1.9805051626697663,
+              "max_itl_ms": 8.54453444480896
+            },
+            {
+              "request_index": 186,
+              "trace_id": "b29bb0ee55c81976101b597e8a90841f974b9d3ef99c8988fee516f93d454a0c",
+              "published": false,
+              "start_offset_ms": 1974.4502753019333,
+              "ttft_ms": 38.854170590639114,
+              "e2e_latency_ms": 98.05161133408546,
+              "tpot_ms": 1.9095948626918178,
+              "max_itl_ms": 11.800069361925125
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "after-gc-diagnostic",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after-gc-diagnostic/report.json",
+        "sha256": "e00cbed57bdbda67085c7c4c8f274eb51b1396877f1f27ded7d143ee3bd1d391"
+      },
+      "declared_source_revision": "f8c0e1616-plus-context-metadata-v1",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "f8c0e1616-plus-context-metadata-v1",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after-gc-diagnostic",
+        "num_prompts": 512,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600,
+        "request_details": true
+      },
+      "versions": {
+        "torch": "2.13.0",
+        "transformers": "5.12.1",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      },
+      "comparison": {
+        "baseline_bracket_mean": {
+          "median_ttft_ms": 38.85529935359955,
+          "p95_ttft_ms": 39.86258199438453,
+          "p99_ttft_ms": 84.90988597273827,
+          "median_tpot_ms": 1.4771606412626082,
+          "p95_tpot_ms": 1.584333064214837,
+          "p99_tpot_ms": 1.9871111130041461,
+          "output_throughput": 2934.205831335912
+        },
+        "baseline_after_over_before": {
+          "median_ttft_ms": 1.022674693455208,
+          "p95_ttft_ms": 1.022947084487189,
+          "p99_ttft_ms": 0.5215174138203567,
+          "median_tpot_ms": 1.0013528296673642,
+          "p95_tpot_ms": 1.0099770257216785,
+          "p99_tpot_ms": 1.502280100796512,
+          "output_throughput": 0.9909123058033529
+        },
+        "capture_over_baseline": [
+          {
+            "sample_ratio": 0.1,
+            "ratios": {
+              "median_ttft_ms": 1.1012208848586884,
+              "p95_ttft_ms": 1.2970216067444227,
+              "p99_ttft_ms": 0.8545583089740144,
+              "median_tpot_ms": 1.2919212693652418,
+              "p95_tpot_ms": 2.016355788916068,
+              "p99_tpot_ms": 1.675451986830267,
+              "output_throughput": 0.8432213372837557
+            }
+          }
+        ]
+      },
+      "phases": [
+        {
+          "sample_ratio": null,
+          "requests_per_second": 92.11247724168126,
+          "median_ttft_ms": 38.41972164809704,
+          "p99_ttft_ms": 111.61211196333169,
+          "median_tpot_ms": 1.4761621432919656,
+          "p99_tpot_ms": 1.588240351167417,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {},
+          "capture_counters": {},
+          "stage_metrics_verified": false,
+          "metrics": null,
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after-gc-diagnostic/round-0-phase-0-off/requests.json",
+            "sha256": "ea29a3c7cf22b7951362fc4e5d1bce64124d0f968d77cb5e37a1d4524a8b1db5"
+          },
+          "publication_identities": 0,
+          "worst_ttft": [
+            {
+              "request_index": 1,
+              "trace_id": "0cc5a825d1173b28194a56646b829591812b3e25efc00fbb5a6476ef157cecff",
+              "published": false,
+              "start_offset_ms": 0.6100758910179138,
+              "ttft_ms": 112.49569803476334,
+              "e2e_latency_ms": 158.79230573773384,
+              "tpot_ms": 1.493438958160339,
+              "max_itl_ms": 4.109278321266174
+            },
+            {
+              "request_index": 2,
+              "trace_id": "45999dfa7d1274dd7fabd9b93a5c3d606caee08941e54c961d2af930884e8ce4",
+              "published": false,
+              "start_offset_ms": 0.8903369307518005,
+              "ttft_ms": 112.16888576745987,
+              "e2e_latency_ms": 158.25962275266647,
+              "tpot_ms": 1.4867979672647291,
+              "max_itl_ms": 3.926943987607956
+            },
+            {
+              "request_index": 3,
+              "trace_id": "7bc1921e9f08a1b6cc82587f7301c913d95058406689d969fb37873f867c176f",
+              "published": false,
+              "start_offset_ms": 1.0566450655460358,
+              "ttft_ms": 112.02032119035721,
+              "e2e_latency_ms": 158.17581117153168,
+              "tpot_ms": 1.4888867735862732,
+              "max_itl_ms": 4.0002018213272095
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 0,
+              "trace_id": "b50a179b492bdc9064351c56fabdbe1b5a5c2fc4d46eb5ad7dea835c5dd5dad8",
+              "published": false,
+              "start_offset_ms": 0,
+              "ttft_ms": 107.59186744689941,
+              "e2e_latency_ms": 159.29174050688744,
+              "tpot_ms": 1.667737840644775,
+              "max_itl_ms": 7.563706487417221
+            },
+            {
+              "request_index": 288,
+              "trace_id": "ca76bf335aeaba25fe1552ec8bd625d97afb51801866a92044e3f376b13f6944",
+              "published": false,
+              "start_offset_ms": 3151.054222136736,
+              "ttft_ms": 37.50041499733925,
+              "e2e_latency_ms": 88.67891132831573,
+              "tpot_ms": 1.6509192364831125,
+              "max_itl_ms": 4.758436232805252
+            },
+            {
+              "request_index": 352,
+              "trace_id": "5d59cde0962d092b99e62f25cd9d39e1cc518a24fde38f6bb6700cc7ff44de6a",
+              "published": false,
+              "start_offset_ms": 3839.764315634966,
+              "ttft_ms": 36.17262840270996,
+              "e2e_latency_ms": 85.92581748962402,
+              "tpot_ms": 1.6049415834488407,
+              "max_itl_ms": 4.8043616116046906
+            }
+          ]
+        },
+        {
+          "sample_ratio": 0.1,
+          "requests_per_second": 77.31828015515194,
+          "median_ttft_ms": 42.78826713562012,
+          "p99_ttft_ms": 72.5604485720396,
+          "median_tpot_ms": 1.9083752507163632,
+          "p99_tpot_ms": 3.3293092623353,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {
+            "validated_samples": 50,
+            "manifest_bytes": 430350,
+            "payload_bytes": 31176000,
+            "aux_payload_bytes": 1684800,
+            "payload_objects": 700,
+            "kv_payload_bytes": 29491200
+          },
+          "capture_counters": {
+            "considered": 512,
+            "sampled_out": 462,
+            "admitted": 50,
+            "overlap_forwards": 1355,
+            "eager_forwards": 43,
+            "cuda_graph_forwards": 1312,
+            "sealed": 50,
+            "writer_started": 50,
+            "copies_completed": 50,
+            "snapshot_built": 50,
+            "ready": 50
+          },
+          "stage_metrics_verified": true,
+          "metrics": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after-gc-diagnostic/round-0-phase-1-0.1/metrics.prom",
+            "sha256": "bd64c1aff7f60d032ab436f65e8693549baf25100aead055ffb6136e5c90397b"
+          },
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after-gc-diagnostic/round-0-phase-1-0.1/requests.json",
+            "sha256": "3e375217445635798aa96de79e1e56f468a7a6d95bff2a1cc7076c7ecf1e3e7c"
+          },
+          "publication_identities": 50,
+          "worst_ttft": [
+            {
+              "request_index": 1,
+              "trace_id": "df95872d65f994edad7072bf6fb03aa225716c4c3053142638be737ad5a7fd72",
+              "published": false,
+              "start_offset_ms": 0.6291493773460388,
+              "ttft_ms": 73.48805665969849,
+              "e2e_latency_ms": 132.45107233524323,
+              "tpot_ms": 1.9020327637272496,
+              "max_itl_ms": 4.40046563744545
+            },
+            {
+              "request_index": 2,
+              "trace_id": "126f71aaf2e478da17773e82ddfb6895cfb112ee7e2a8cc2e4d3d9ee21b29e8e",
+              "published": true,
+              "start_offset_ms": 0.9168684482574463,
+              "ttft_ms": 73.07576760649681,
+              "e2e_latency_ms": 131.5625123679638,
+              "tpot_ms": 1.8866691858537736,
+              "max_itl_ms": 3.898467868566513
+            },
+            {
+              "request_index": 3,
+              "trace_id": "08c74cd5d72bef37ca6a1eef5384ee49db61adf4794a060e9bb0f066795e8e6d",
+              "published": false,
+              "start_offset_ms": 1.0809898376464844,
+              "ttft_ms": 72.96749204397202,
+              "e2e_latency_ms": 131.82785734534264,
+              "tpot_ms": 1.8987214613345362,
+              "max_itl_ms": 4.287462681531906
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 120,
+              "trace_id": "a28151c3cd1e2c3464a38be1dff5bc5ef4916944a608a46e32b62d5d83dd9007",
+              "published": false,
+              "start_offset_ms": 1591.8907076120377,
+              "ttft_ms": 47.350019216537476,
+              "e2e_latency_ms": 155.62191233038902,
+              "tpot_ms": 3.49264171335005,
+              "max_itl_ms": 8.762191981077194
+            },
+            {
+              "request_index": 488,
+              "trace_id": "35e47ccf7ade3129d11e6f9ea5d8ea8f8dec7f67fb14563c23ac3b0c728b598a",
+              "published": false,
+              "start_offset_ms": 6236.546728760004,
+              "ttft_ms": 41.663676500320435,
+              "e2e_latency_ms": 146.93769440054893,
+              "tpot_ms": 3.3959360612976934,
+              "max_itl_ms": 8.511926978826523
+            },
+            {
+              "request_index": 240,
+              "trace_id": "ccd4b7ae21dcd3e168ff0afd31ba15d3824ed129376514f738bebe1b8738fda1",
+              "published": false,
+              "start_offset_ms": 3114.587504416704,
+              "ttft_ms": 37.03094273805618,
+              "e2e_latency_ms": 141.3007155060768,
+              "tpot_ms": 3.3635410570329234,
+              "max_itl_ms": 8.474092930555344
+            }
+          ]
+        },
+        {
+          "sample_ratio": null,
+          "requests_per_second": 91.27538721681324,
+          "median_ttft_ms": 39.29087705910206,
+          "p99_ttft_ms": 58.20765998214483,
+          "median_tpot_ms": 1.4781591392332507,
+          "p99_tpot_ms": 2.385981874840875,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {},
+          "capture_counters": {},
+          "stage_metrics_verified": false,
+          "metrics": null,
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after-gc-diagnostic/round-0-phase-2-off/requests.json",
+            "sha256": "3446ff725a5c308c593d94310998443605297929ddeb61fa889f8a93a66bed14"
+          },
+          "publication_identities": 0,
+          "worst_ttft": [
+            {
+              "request_index": 1,
+              "trace_id": "fb962be776aef90805030ac588ab55a27eb9f6284b42f29ff125581ebc303a0e",
+              "published": false,
+              "start_offset_ms": 0.6408765912055969,
+              "ttft_ms": 59.142496436834335,
+              "e2e_latency_ms": 105.55590316653252,
+              "tpot_ms": 1.4972066686999412,
+              "max_itl_ms": 4.01601567864418
+            },
+            {
+              "request_index": 2,
+              "trace_id": "1c239cf0701403336775466503de8e951abeed7a3bb9e8de46be9e843b8b7c47",
+              "published": false,
+              "start_offset_ms": 0.9438768029212952,
+              "ttft_ms": 58.805644512176514,
+              "e2e_latency_ms": 105.20109534263611,
+              "tpot_ms": 1.4966274461438578,
+              "max_itl_ms": 3.9763450622558594
+            },
+            {
+              "request_index": 3,
+              "trace_id": "2034639a6425092fe9bb78ae2896b4cd85d7fb4831ed1bb65f8a15634f359bfb",
+              "published": false,
+              "start_offset_ms": 1.123584806919098,
+              "ttft_ms": 58.59304592013359,
+              "e2e_latency_ms": 104.87448424100876,
+              "tpot_ms": 1.4929496232540376,
+              "max_itl_ms": 3.880079835653305
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 480,
+              "trace_id": "92c5638c9602e7b6cfdf8617608af75a5c82052b371766507295ff3ef7f4746e",
+              "published": false,
+              "start_offset_ms": 5203.586433082819,
+              "ttft_ms": 37.1905080974102,
+              "e2e_latency_ms": 114.1572929918766,
+              "tpot_ms": 2.4827995127247227,
+              "max_itl_ms": 7.918950170278549
+            },
+            {
+              "request_index": 486,
+              "trace_id": "8c2561264057889e66de0fb8317b17fc93339032b8bf91aa96ecd6cde53bce01",
+              "published": false,
+              "start_offset_ms": 5204.56263050437,
+              "ttft_ms": 39.40076380968094,
+              "e2e_latency_ms": 113.64299058914185,
+              "tpot_ms": 2.3949105412729326,
+              "max_itl_ms": 8.052852004766464
+            },
+            {
+              "request_index": 484,
+              "trace_id": "ff58f56fe49f3a138965c032b9eaa40f712e01044d3ef62dd46ba80922059ded",
+              "published": false,
+              "start_offset_ms": 5204.330708831549,
+              "ttft_ms": 39.62228074669838,
+              "e2e_latency_ms": 113.82714286446571,
+              "tpot_ms": 2.393705229605398,
+              "max_itl_ms": 8.019935339689255
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "before-gc-diagnostic",
+      "report": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before-gc-diagnostic/report.json",
+        "sha256": "a0e3d70cba350992597fa1025dfbe90125f8a6b31a2e75839258d5bc5a701634"
+      },
+      "declared_source_revision": "f8c0e1616eb3760292eab038c9dbc51b81f29495",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "f8c0e1616eb3760292eab038c9dbc51b81f29495",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before-gc-diagnostic",
+        "num_prompts": 512,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600,
+        "request_details": true
+      },
+      "versions": {
+        "torch": "2.13.0",
+        "transformers": "5.12.1",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      },
+      "comparison": {
+        "baseline_bracket_mean": {
+          "median_ttft_ms": 38.49113546311855,
+          "p95_ttft_ms": 39.76731272414327,
+          "p99_ttft_ms": 82.30539219453931,
+          "median_tpot_ms": 1.4764014331083142,
+          "p95_tpot_ms": 1.6928358033539788,
+          "p99_tpot_ms": 2.9747518386331295,
+          "output_throughput": 2891.980292792008
+        },
+        "baseline_after_over_before": {
+          "median_ttft_ms": 0.9950297961701858,
+          "p95_ttft_ms": 1.0078472395790297,
+          "p99_ttft_ms": 0.5157229743412798,
+          "median_tpot_ms": 1.0008041325516286,
+          "p95_tpot_ms": 1.1470461250866804,
+          "p99_tpot_ms": 2.5600503512005774,
+          "output_throughput": 0.9667965472274788
+        },
+        "capture_over_baseline": [
+          {
+            "sample_ratio": 0.1,
+            "ratios": {
+              "median_ttft_ms": 1.1154236841047016,
+              "p95_ttft_ms": 1.2677969849100255,
+              "p99_ttft_ms": 0.7219064257445231,
+              "median_tpot_ms": 1.3296786209315647,
+              "p95_tpot_ms": 1.9188565703041929,
+              "p99_tpot_ms": 1.1625722365088291,
+              "output_throughput": 0.8473860551889428
+            }
+          }
+        ]
+      },
+      "phases": [
+        {
+          "sample_ratio": null,
+          "requests_per_second": 91.90008420255539,
+          "median_ttft_ms": 38.58702816069126,
+          "p99_ttft_ms": 108.60215697437525,
+          "median_tpot_ms": 1.4758080604576294,
+          "p99_tpot_ms": 1.6711852615398746,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {},
+          "capture_counters": {},
+          "stage_metrics_verified": false,
+          "metrics": null,
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before-gc-diagnostic/round-0-phase-0-off/requests.json",
+            "sha256": "3cfbf77a4b39525abcb00a6cf09546de7295218bc4fb01ff95e9f88c1913159e"
+          },
+          "publication_identities": 0,
+          "worst_ttft": [
+            {
+              "request_index": 1,
+              "trace_id": "1d5f23653cc22a2ea93bf32d48256705841815bea7a1aedb1bff8f90cc5f9ffb",
+              "published": false,
+              "start_offset_ms": 0.6229691207408905,
+              "ttft_ms": 109.358049929142,
+              "e2e_latency_ms": 155.631672590971,
+              "tpot_ms": 1.4926975052202902,
+              "max_itl_ms": 3.8837864995002747
+            },
+            {
+              "request_index": 2,
+              "trace_id": "77ec3b504d96c20635f2b025e8e7be59cafa8c389a0d95bb278e38391fe0cb6e",
+              "published": false,
+              "start_offset_ms": 0.9067505598068237,
+              "ttft_ms": 109.12986099720001,
+              "e2e_latency_ms": 155.48894554376602,
+              "tpot_ms": 1.4954543402118068,
+              "max_itl_ms": 3.9779730141162872
+            },
+            {
+              "request_index": 3,
+              "trace_id": "86090206cb5a153db2c9dcc9031112f12d4cb1c4e0526ee6fb71b12a31d9c7b6",
+              "published": false,
+              "start_offset_ms": 1.072380691766739,
+              "ttft_ms": 109.00096967816353,
+              "e2e_latency_ms": 155.38081154227257,
+              "tpot_ms": 1.4961239311002916,
+              "max_itl_ms": 4.0219612419605255
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 64,
+              "trace_id": "449c0a1edd1cbe18a407560be2b86365b7854a9348736013efee6c2faa084409",
+              "published": false,
+              "start_offset_ms": 754.2842365801334,
+              "ttft_ms": 35.8855314552784,
+              "e2e_latency_ms": 90.22469818592072,
+              "tpot_ms": 1.7528763461497523,
+              "max_itl_ms": 5.70615753531456
+            },
+            {
+              "request_index": 67,
+              "trace_id": "fcf3db6cbb951bc8a8cd49ff818c5c0f3938f2e061a0786a0bfd50a4406fab8b",
+              "published": false,
+              "start_offset_ms": 754.9007534980774,
+              "ttft_ms": 38.38992118835449,
+              "e2e_latency_ms": 90.43702855706215,
+              "tpot_ms": 1.6789389473776664,
+              "max_itl_ms": 5.110587924718857
+            },
+            {
+              "request_index": 65,
+              "trace_id": "01429f22e3b4c8546090dabea771d9f87155e4b1d7c0c7086618e1edbbbfec52",
+              "published": false,
+              "start_offset_ms": 754.6029537916183,
+              "ttft_ms": 38.678426295518875,
+              "e2e_latency_ms": 90.66485241055489,
+              "tpot_ms": 1.6769814875818068,
+              "max_itl_ms": 5.138486623764038
+            }
+          ]
+        },
+        {
+          "sample_ratio": 0.1,
+          "requests_per_second": 76.58199287478699,
+          "median_ttft_ms": 42.93392412364483,
+          "p99_ttft_ms": 59.41679149866104,
+          "median_tpot_ms": 1.9631394215168492,
+          "p99_tpot_ms": 3.458363898098469,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {
+            "validated_samples": 50,
+            "manifest_bytes": 430650,
+            "payload_bytes": 31176000,
+            "aux_payload_bytes": 1684800,
+            "payload_objects": 700,
+            "kv_payload_bytes": 29491200
+          },
+          "capture_counters": {
+            "considered": 512,
+            "sampled_out": 462,
+            "admitted": 50,
+            "overlap_forwards": 1355,
+            "eager_forwards": 43,
+            "cuda_graph_forwards": 1312,
+            "sealed": 50,
+            "writer_started": 50,
+            "copies_completed": 50,
+            "snapshot_built": 50,
+            "ready": 50
+          },
+          "stage_metrics_verified": true,
+          "metrics": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before-gc-diagnostic/round-0-phase-1-0.1/metrics.prom",
+            "sha256": "23ad62c5ca9d1495fd094ea4f7740cb1f8ce4e4b7d3d01ab07d70a83aa0e5731"
+          },
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before-gc-diagnostic/round-0-phase-1-0.1/requests.json",
+            "sha256": "e11f4ea276fb501df8931e2342109c458753ba58b85444c9d07aeb7ae4c339cf"
+          },
+          "publication_identities": 50,
+          "worst_ttft": [
+            {
+              "request_index": 1,
+              "trace_id": "35ba24a61c422ad0a89e5c0c16143e99ec78aed55b4c8555826cccba98e487ce",
+              "published": false,
+              "start_offset_ms": 0.6232708692550659,
+              "ttft_ms": 60.232825577259064,
+              "e2e_latency_ms": 121.58941477537155,
+              "tpot_ms": 1.9792448128423383,
+              "max_itl_ms": 4.025910049676895
+            },
+            {
+              "request_index": 2,
+              "trace_id": "10e9daabe8427a2f833bde774fcc1ee9dfc6ae182d488ace196702ffca9de700",
+              "published": true,
+              "start_offset_ms": 0.9122192859649658,
+              "ttft_ms": 59.98428910970688,
+              "e2e_latency_ms": 121.62361294031143,
+              "tpot_ms": 1.9883652848582114,
+              "max_itl_ms": 4.14898619055748
+            },
+            {
+              "request_index": 3,
+              "trace_id": "b70726930dde6c867f278c870dde2aba3776165e92aa4f5a6f3ea73f95178864",
+              "published": false,
+              "start_offset_ms": 1.0835304856300354,
+              "ttft_ms": 59.828344732522964,
+              "e2e_latency_ms": 121.53247371315956,
+              "tpot_ms": 1.9904557735689226,
+              "max_itl_ms": 4.219230264425278
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 120,
+              "trace_id": "ab57e7ea61792ebc9d1ba14eb8168502eb2d8990bcdfb3de82d2f25a2efa2fd4",
+              "published": false,
+              "start_offset_ms": 1580.1266767084599,
+              "ttft_ms": 48.12682792544365,
+              "e2e_latency_ms": 160.53061187267303,
+              "tpot_ms": 3.6259285144267546,
+              "max_itl_ms": 8.9019276201725
+            },
+            {
+              "request_index": 488,
+              "trace_id": "a940a9be8cf0b02af28a947fc7825845717b97fa100506fb34b56817fe9f0fb4",
+              "published": false,
+              "start_offset_ms": 6291.483163833618,
+              "ttft_ms": 45.22997885942459,
+              "e2e_latency_ms": 152.88319438695908,
+              "tpot_ms": 3.472684371855951,
+              "max_itl_ms": 8.580747991800308
+            },
+            {
+              "request_index": 122,
+              "trace_id": "bcfe45f83b66c55cc302841ac376c8f0c46865c1efaed50a0283eeda4adf272a",
+              "published": false,
+              "start_offset_ms": 1580.617245286703,
+              "ttft_ms": 52.80892178416252,
+              "e2e_latency_ms": 160.19299998879433,
+              "tpot_ms": 3.464002522730058,
+              "max_itl_ms": 6.134454160928726
+            }
+          ]
+        },
+        {
+          "sample_ratio": null,
+          "requests_per_second": 88.84868409694512,
+          "median_ttft_ms": 38.395242765545845,
+          "p99_ttft_ms": 56.00862741470337,
+          "median_tpot_ms": 1.4769948057589992,
+          "p99_tpot_ms": 4.2783184157263845,
+          "requests": 512,
+          "output_tokens": 16384,
+          "readback": {},
+          "capture_counters": {},
+          "stage_metrics_verified": false,
+          "metrics": null,
+          "request_details": {
+            "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before-gc-diagnostic/round-0-phase-2-off/requests.json",
+            "sha256": "142947a1e2965c1a57affd187616b1880bfdbf43679588a63452aaf238c884fe"
+          },
+          "publication_identities": 0,
+          "worst_ttft": [
+            {
+              "request_index": 1,
+              "trace_id": "9dba62574d4d6fffea6f1bc6d442d71c9a4094ff34ec500c1ef8b8905ba2c565",
+              "published": false,
+              "start_offset_ms": 0.628642737865448,
+              "ttft_ms": 57.04299360513687,
+              "e2e_latency_ms": 103.49906980991364,
+              "tpot_ms": 1.4985831033798955,
+              "max_itl_ms": 4.120495170354843
+            },
+            {
+              "request_index": 2,
+              "trace_id": "88f507f0dc82d3234923537982b17ef82daf199a13df391f99e7c9257d4e529f",
+              "published": false,
+              "start_offset_ms": 0.9270794689655304,
+              "ttft_ms": 56.73125013709068,
+              "e2e_latency_ms": 103.15044224262238,
+              "tpot_ms": 1.4973932937268288,
+              "max_itl_ms": 4.080452024936676
+            },
+            {
+              "request_index": 3,
+              "trace_id": "c5eb89728bd9c4a45ec93fea53331c415fa4fe44b7dd0c3329f9139fe5eb2bc9",
+              "published": false,
+              "start_offset_ms": 1.1033937335014343,
+              "ttft_ms": 56.4342737197876,
+              "e2e_latency_ms": 102.38761827349663,
+              "tpot_ms": 1.4823659533454525,
+              "max_itl_ms": 3.5972557961940765
+            }
+          ],
+          "worst_tpot": [
+            {
+              "request_index": 440,
+              "trace_id": "8cf82efdb0e2ce9a95f06a91f7bf90d18b2bec9394f5b39d8d4f48b932d90290",
+              "published": false,
+              "start_offset_ms": 4895.090665668249,
+              "ttft_ms": 36.977630108594894,
+              "e2e_latency_ms": 172.76649549603462,
+              "tpot_ms": 4.380285980239991,
+              "max_itl_ms": 109.9720261991024
+            },
+            {
+              "request_index": 444,
+              "trace_id": "e1a8c49c167a7e66b8bd8a033e003ef575ef8761539a1bd072db56135e09024e",
+              "published": false,
+              "start_offset_ms": 4895.83382755518,
+              "ttft_ms": 39.34773802757263,
+              "e2e_latency_ms": 172.1733920276165,
+              "tpot_ms": 4.284698516130447,
+              "max_itl_ms": 109.9865585565567
+            },
+            {
+              "request_index": 441,
+              "trace_id": "1caf55ddb8d12dc6937fc7cdbe2702e7206d84f527fd818b75f8e7c18dc1cccf",
+              "published": false,
+              "start_offset_ms": 4895.409528166056,
+              "ttft_ms": 39.76297751069069,
+              "e2e_latency_ms": 172.5473664700985,
+              "tpot_ms": 4.283367385787349,
+              "max_itl_ms": 109.98539626598358
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "jobs": [
+    {
+      "role": "baseline_profile",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-before --timeout-seconds 1000 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-before/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/profile_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision f8c0e1616eb3760292eab038c9dbc51b81f29495 --output-dir /tmp/dspark-capture-context-before-20261002",
+      "id": "01790970972481676126-e742a2cb95fe",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-before",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790970972481676126-e742a2cb95fe.json",
+        "sha256": "cd035bac94f9a8678d83d5ec05e141f4b8768efae080d5dddfde949d261c75a2"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790971208.1839254,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790970972481676126-e742a2cb95fe.log",
+        "sha256": "7a7f91bcf475b472baa7fcb748ec626786072c1156b7eda921c4b0f033647c40"
+      }
+    },
+    {
+      "role": "baseline_serving",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-before --timeout-seconds 1000 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-before/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/benchmark_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision f8c0e1616eb3760292eab038c9dbc51b81f29495 --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before --num-prompts 512 --input-len 16 --output-len 32 --concurrency 8 --capture-slots 16 --ratios 0.1 --repeats 1 --request-details",
+      "id": "01790970972796303971-0a06f333c2d0",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-before",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790970972796303971-0a06f333c2d0.json",
+        "sha256": "98617819cbd4f3b12758b1a9f878347f8787bf4b01dab007c84ef7fab22ab299"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790971413.2009075,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790970972796303971-0a06f333c2d0.log",
+        "sha256": "79907c7e5446c7ab7df6521e95908b226fa2fd56925a75c85fded7cd07ea40dc"
+      }
+    },
+    {
+      "role": "focused_regression",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1/test/registered/unit/training_capture -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m unittest test_context test_partition_context test_teacher_staging test_cuda_snapshot test_coordinator test_pd_capture test_snapshot_writer -v",
+      "id": "01790971143241873823-873502a5d322",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790971143241873823-873502a5d322.json",
+        "sha256": "ceba2212b093f094df73e03f8b1032af7871a96fd25097a45eac2c8ad5c3e848"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790971478.8691401,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790971143241873823-873502a5d322.log",
+        "sha256": "2c47736b7b14a7a42e27ba2419056e19d4dc655c5d9615b5872627be477ab1e3"
+      },
+      "test_methods": 114,
+      "test_seconds": 53.306
+    },
+    {
+      "role": "candidate_profile",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1/python -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/profile_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision f8c0e1616-plus-context-metadata-v1 --output-dir /tmp/dspark-capture-context-after-20261002",
+      "id": "01790971143578863055-ce25c35968c7",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790971143578863055-ce25c35968c7.json",
+        "sha256": "45f760f6829a9b7743f2b52a7f7f96903feff89eaf1407132e850b69cdb4a9c8"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790971702.4699311,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790971143578863055-ce25c35968c7.log",
+        "sha256": "6971e03a03bb6cc5c2728c249256f41a5f0531d6e160945f289e441bcbc7f5ab"
+      }
+    },
+    {
+      "role": "candidate_serving",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1/python -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/benchmark_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision f8c0e1616-plus-context-metadata-v1 --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after --num-prompts 512 --input-len 16 --output-len 32 --concurrency 8 --capture-slots 16 --ratios 0.1 --repeats 1 --request-details",
+      "id": "01790971143922190787-ef6bcbde7556",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790971143922190787-ef6bcbde7556.json",
+        "sha256": "4081b970e52e54a9c0201218e1e3820241352a7a7b3e6c49a29f88e54f153849"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790971908.5071647,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790971143922190787-ef6bcbde7556.log",
+        "sha256": "a421cf2f9a400513c00c4311fa76edc6ad30ccc0451c335d6c520fd8b42fdeb6"
+      }
+    },
+    {
+      "role": "runtime",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1 --timeout-seconds 1800 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1/python -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_runtime.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+      "id": "01790971529303506431-61f3f0a944c0",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790971529303506431-61f3f0a944c0.json",
+        "sha256": "3907b5292c274cfb2f673702d1edf2ad56c71836e09ecfc970597b463855454d"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790972694.6609836,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790971529303506431-61f3f0a944c0.log",
+        "sha256": "aa470f24f3b293ce51128092cad2371c0c090fb8576781965115a8d82e7c6b99"
+      },
+      "test_methods": 2,
+      "test_seconds": 774.144
+    },
+    {
+      "role": "pd_runtime",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd.py",
+      "id": "01790971529645791494-de69cb5447ff",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790971529645791494-de69cb5447ff.json",
+        "sha256": "3ccd3c6d48b6b85e236ebd11c0e3ee1c3c140ef155f070c03c336a37d3e65447"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790972870.0940237,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790971529645791494-de69cb5447ff.log",
+        "sha256": "a3a214a9e623acd042f9dd9d66c334b34054c1dd1f3a587a6bf7b4e6401d87cd"
+      },
+      "test_methods": 2,
+      "test_seconds": 163.401
+    },
+    {
+      "role": "final_trace_analyzer_tests",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v2 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v2/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v2/test/registered/unit/training_capture -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m unittest test_trace_attribution -v",
+      "id": "01790971728320348927-95b3de577a23",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v2",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790971728320348927-95b3de577a23.json",
+        "sha256": "58d7b4ac274cacabdfe847ec65fa9269aac74512da7c344255ecb963bbed20aa"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790972881.884596,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790971728320348927-95b3de577a23.log",
+        "sha256": "c5d89742f1837cf2021e65a9dbd7a59427f09909d728b37a2e838b4866ef2723"
+      },
+      "test_methods": 5,
+      "test_seconds": 0.015
+    },
+    {
+      "role": "candidate_gc_diagnostic",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1 --timeout-seconds 1200 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env SGLANG_LOG_GC=1 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/benchmark_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision f8c0e1616-plus-context-metadata-v1 --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-after-gc-diagnostic --num-prompts 512 --input-len 16 --output-len 32 --concurrency 8 --capture-slots 16 --ratios 0.1 --repeats 1 --request-details",
+      "id": "01790972155290388901-aadef70df376",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-v1",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790972155290388901-aadef70df376.json",
+        "sha256": "3df34e2455b3839a2140bcf4956cc617c256e88dd966859cdaba06cfa7e9f090"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790973085.4019928,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790972155290388901-aadef70df376.log",
+        "sha256": "93ad95f59a3706fea53fb73a6bd35ec8a88f66209ab630bcad0d45b8ec7350bd"
+      },
+      "scheduler_gc": {
+        "events": 71,
+        "max_seconds": 0.2607,
+        "events_at_least_10ms": [
+          {
+            "unix": 1790972998.9211898,
+            "generation": 0,
+            "seconds": 0.0515
+          },
+          {
+            "unix": 1790973006.12629,
+            "generation": 0,
+            "seconds": 0.2607
+          }
+        ]
+      }
+    },
+    {
+      "role": "baseline_gc_diagnostic",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-before --timeout-seconds 1200 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-before/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env SGLANG_LOG_GC=1 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/benchmark_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision f8c0e1616eb3760292eab038c9dbc51b81f29495 --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/context-metadata-before-gc-diagnostic --num-prompts 512 --input-len 16 --output-len 32 --concurrency 8 --capture-slots 16 --ratios 0.1 --repeats 1 --request-details",
+      "id": "01790972155667540224-933fa94dc3b1",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-context-metadata-before",
+      "result": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790972155667540224-933fa94dc3b1.json",
+        "sha256": "e01949615a4955e6e88305432e0bbcd6e0ddf0918deb4c04adc6c47b932fe501"
+      },
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790973290.9042132,
+      "log": {
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790972155667540224-933fa94dc3b1.log",
+        "sha256": "28424bcdca7cbf64eefdbb18c367c3d329d3d6fcafc9cef0c589b6766d452903"
+      },
+      "scheduler_gc": {
+        "events": 71,
+        "max_seconds": 0.3324,
+        "events_at_least_10ms": [
+          {
+            "unix": 1790973202.622337,
+            "generation": 0,
+            "seconds": 0.3324
+          },
+          {
+            "unix": 1790973209.1272724,
+            "generation": 0,
+            "seconds": 0.0213
+          }
+        ]
+      }
+    }
+  ],
+  "profile_summaries": [
+    {
+      "path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/before-summary.json",
+      "sha256": "8e23639bb541dcf16e5b5b750a0542ea0395cfb946c384f0aa5268b8c54af37d"
+    },
+    {
+      "path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/after-summary.json",
+      "sha256": "fa4797d065326fd6c72f0f3a7353d94b2e56aa684273e206fa3f68e0a00e5f01"
+    }
+  ],
+  "profile_artifacts": [
+    {
+      "node_path": "/tmp/dspark-capture-context-before-20261002/report.json",
+      "archive_path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/before/report.json",
+      "sha256": "80e0282afe692bb3ef9ab2df0a5aa6259ff27f4d8d70dece0d32d5b284157801"
+    },
+    {
+      "node_path": "/tmp/dspark-capture-context-before-20261002/on/prefill/prefill-1790971114.2379892-TP-0.trace.json.gz",
+      "archive_path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/before/on/prefill/prefill-1790971114.2379892-TP-0.trace.json.gz",
+      "sha256": "9486b26957fe8b60b022065ab8b77e3694d747a1efa51546c79dbf4b6b6794e3"
+    },
+    {
+      "node_path": "/tmp/dspark-capture-context-before-20261002/on/decode/decode-1790971151.410628-TP-0.trace.json.gz",
+      "archive_path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/before/on/decode/decode-1790971151.410628-TP-0.trace.json.gz",
+      "sha256": "b0415a415fe71cf96c34d9c03df763dc2ae2724b3758caeb1be4d8d7d058c03f"
+    },
+    {
+      "node_path": "/tmp/dspark-capture-context-before-20261002/off/prefill/prefill-1790971026.2638223-TP-0.trace.json.gz",
+      "archive_path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/before/off/prefill/prefill-1790971026.2638223-TP-0.trace.json.gz",
+      "sha256": "50d190d9b3aa1d26b6cd7fd45719eadb744dc09890fc23354902fa0c9eaa597b"
+    },
+    {
+      "node_path": "/tmp/dspark-capture-context-before-20261002/off/decode/decode-1790971050.4943032-TP-0.trace.json.gz",
+      "archive_path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/before/off/decode/decode-1790971050.4943032-TP-0.trace.json.gz",
+      "sha256": "4ed754cfbcc352dcda85e58e1e447fa0109e7d9dc0459d8bf0bb1f2980b8d8ff"
+    },
+    {
+      "node_path": "/tmp/dspark-capture-context-after-20261002/report.json",
+      "archive_path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/after/report.json",
+      "sha256": "1d863720f9ccd082265af64d73b4eff4ec1cd8a1f56c846f06aa4f2d9645669b"
+    },
+    {
+      "node_path": "/tmp/dspark-capture-context-after-20261002/on/prefill/prefill-1790971609.3593845-TP-0.trace.json.gz",
+      "archive_path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/after/on/prefill/prefill-1790971609.3593845-TP-0.trace.json.gz",
+      "sha256": "cd3e2f05927e3ea5c8a92332a24dc7da8fa7698438e1a2030d44de475555a1ee"
+    },
+    {
+      "node_path": "/tmp/dspark-capture-context-after-20261002/on/decode/decode-1790971646.642358-TP-0.trace.json.gz",
+      "archive_path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/after/on/decode/decode-1790971646.642358-TP-0.trace.json.gz",
+      "sha256": "21fdbd6eb9749c2d6a1c8a1f99eae385d2273068a19f674209f2c483b219abca"
+    },
+    {
+      "node_path": "/tmp/dspark-capture-context-after-20261002/off/prefill/prefill-1790971521.5820498-TP-0.trace.json.gz",
+      "archive_path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/after/off/prefill/prefill-1790971521.5820498-TP-0.trace.json.gz",
+      "sha256": "dc575894917ab39f6c565532d561b5efa17edc4c0885c115e53a750e2ed4f977"
+    },
+    {
+      "node_path": "/tmp/dspark-capture-context-after-20261002/off/decode/decode-1790971545.8948326-TP-0.trace.json.gz",
+      "archive_path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/after/off/decode/decode-1790971545.8948326-TP-0.trace.json.gz",
+      "sha256": "736996aaddd6a6b23ffd36fd0f088daec4fd0c0155746178338c3e7d2b1f3f81"
+    }
+  ],
+  "profile_archive_verification": "All ten archive hashes match node originals; archive hashes rechecked during evidence collection. Agent-local archive is not GPU-visible.",
+  "profile_comparison": [
+    {
+      "workload": "128 input / 1 output",
+      "before_trace": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/before/on/prefill/prefill-1790971114.2379892-TP-0.trace.json.gz",
+      "after_trace": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/after/on/prefill/prefill-1790971609.3593845-TP-0.trace.json.gz",
+      "all_capture_groups_device_counts_and_bytes_equal": true,
+      "teacher_append_before": {
+        "cpu_calls": 45,
+        "cpu_scope_us": 11324.6,
+        "cpu_operators": {
+          "aten::slice": {
+            "calls": 315,
+            "inclusive_us": 1032.2510000000002
+          },
+          "aten::as_strided": {
+            "calls": 315,
+            "inclusive_us": 155.92699999999988
+          },
+          "aten::copy_": {
+            "calls": 180,
+            "inclusive_us": 1590.915
+          },
+          "aten::record_stream": {
+            "calls": 135,
+            "inclusive_us": 228.154
+          },
+          "aten::arange": {
+            "calls": 90,
+            "inclusive_us": 1061.0119999999997
+          },
+          "aten::empty": {
+            "calls": 45,
+            "inclusive_us": 93.41699999999999
+          },
+          "aten::resize_": {
+            "calls": 45,
+            "inclusive_us": 95.97000000000001
+          }
+        },
+        "gpu_kernel_calls": 0,
+        "gpu_kernel_us": 0,
+        "d2h_calls": 135,
+        "d2h_us": 322.2779999999999,
+        "d2h_bytes": 46260,
+        "d2h_events_missing_bytes": 0,
+        "d2d_calls": 0,
+        "d2d_us": 0,
+        "d2d_bytes": 0,
+        "d2d_events_missing_bytes": 0
+      },
+      "teacher_append_after": {
+        "cpu_calls": 45,
+        "cpu_scope_us": 9561.559000000001,
+        "cpu_operators": {
+          "aten::slice": {
+            "calls": 270,
+            "inclusive_us": 949.2489999999998
+          },
+          "aten::as_strided": {
+            "calls": 270,
+            "inclusive_us": 132.80999999999995
+          },
+          "aten::copy_": {
+            "calls": 135,
+            "inclusive_us": 1482.0149999999996
+          },
+          "aten::record_stream": {
+            "calls": 135,
+            "inclusive_us": 221.84200000000004
+          }
+        },
+        "gpu_kernel_calls": 0,
+        "gpu_kernel_us": 0,
+        "d2h_calls": 135,
+        "d2h_us": 321.28000000000014,
+        "d2h_bytes": 46260,
+        "d2h_events_missing_bytes": 0,
+        "d2d_calls": 0,
+        "d2d_us": 0,
+        "d2d_bytes": 0,
+        "d2d_events_missing_bytes": 0
+      },
+      "teacher_append_cpu_reduction_fraction": 0.1556824082086784
+    },
+    {
+      "workload": "1 input / 32 output",
+      "before_trace": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/before/on/decode/decode-1790971151.410628-TP-0.trace.json.gz",
+      "after_trace": "/gpfs/user/fuxuanwei/mooncake-lab-archive/context-metadata/after/on/decode/decode-1790971646.642358-TP-0.trace.json.gz",
+      "all_capture_groups_device_counts_and_bytes_equal": true,
+      "teacher_append_before": {
+        "cpu_calls": 1320,
+        "cpu_scope_us": 283948.099,
+        "cpu_operators": {
+          "aten::slice": {
+            "calls": 9240,
+            "inclusive_us": 26648.27500000004
+          },
+          "aten::as_strided": {
+            "calls": 9240,
+            "inclusive_us": 3825.728
+          },
+          "aten::copy_": {
+            "calls": 5280,
+            "inclusive_us": 44586.305999999975
+          },
+          "aten::record_stream": {
+            "calls": 3960,
+            "inclusive_us": 6420.79999999999
+          },
+          "aten::arange": {
+            "calls": 2640,
+            "inclusive_us": 14097.254999999996
+          },
+          "aten::empty": {
+            "calls": 1320,
+            "inclusive_us": 948.8489999999997
+          },
+          "aten::resize_": {
+            "calls": 1320,
+            "inclusive_us": 966.9490000000005
+          }
+        },
+        "gpu_kernel_calls": 0,
+        "gpu_kernel_us": 0,
+        "d2h_calls": 3960,
+        "d2h_us": 10023.681999999948,
+        "d2h_bytes": 1356960,
+        "d2h_events_missing_bytes": 0,
+        "d2d_calls": 0,
+        "d2d_us": 0,
+        "d2d_bytes": 0,
+        "d2d_events_missing_bytes": 0
+      },
+      "teacher_append_after": {
+        "cpu_calls": 1320,
+        "cpu_scope_us": 246772.87900000002,
+        "cpu_operators": {
+          "aten::slice": {
+            "calls": 7920,
+            "inclusive_us": 22992.643000000004
+          },
+          "aten::as_strided": {
+            "calls": 7920,
+            "inclusive_us": 3267.149000000021
+          },
+          "aten::copy_": {
+            "calls": 3960,
+            "inclusive_us": 40977.53499999993
+          },
+          "aten::record_stream": {
+            "calls": 3960,
+            "inclusive_us": 6114.098000000008
+          }
+        },
+        "gpu_kernel_calls": 0,
+        "gpu_kernel_us": 0,
+        "d2h_calls": 3960,
+        "d2h_us": 10013.830999999944,
+        "d2h_bytes": 1356960,
+        "d2h_events_missing_bytes": 0,
+        "d2d_calls": 0,
+        "d2d_us": 0,
+        "d2d_bytes": 0,
+        "d2d_events_missing_bytes": 0
+      },
+      "teacher_append_cpu_reduction_fraction": 0.13092258807480162
+    }
+  ],
+  "scheduler_gc_interpretation": {
+    "candidate_longest_seconds": 0.2607,
+    "baseline_longest_seconds": 0.3324,
+    "occurred_before": "Native benchmark client GET /model_info, which precedes tokenizer/dataset loading and timed request execution",
+    "original_ordinary_run_gc_evidence": "not recorded",
+    "causal_attribution": "unproven"
+  },
+  "resident": {
+    "job": "job-fe1ce1dcdea6-20261001023258",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+    "gpu_uuid": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "worker_pid": 1,
+    "idle_pid": 21242,
+    "queue": 0,
+    "process_check": "ps confirms worker and idle load alive after all ten results; nvidia-smi confirms the same H100",
+    "additional_allocations": 0
+  }
+}

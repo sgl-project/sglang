@@ -86,6 +86,38 @@ class TestCaptureTraceAttribution(CustomTestCase):
         self.assertIsNone(group["d2h_bytes"])
         self.assertEqual(group["d2h_events_missing_bytes"], 1)
 
+    def test_cpu_operators_require_containment_and_keep_nested_inclusive_times(self):
+        other_process = self.event("foreign", "cpu_op", 12, 1)
+        other_process["pid"] = 2
+        instant = self.event("instant", "cpu_op", 15, 0)
+        instant["ph"] = "i"
+        result = self.evaluate(
+            [
+                self.event("training_capture.teacher_d2h", "user_annotation", 10, 20),
+                self.event("aten::arange", "cpu_op", 12, 10, correlation=7),
+                self.event("aten::arange", "cpu_op", 13, 8),
+                self.event("aten::copy_", "cpu_op", 22, 2),
+                self.event("aten::copy_", "cpu_op", 29, 1),
+                self.event("before", "cpu_op", 9, 2),
+                self.event("beyond", "cpu_op", 29, 2),
+                self.event("other_thread", "cpu_op", 12, 1, thread=2),
+                other_process,
+                instant,
+                self.event("unrelated", "kernel", 40, 4, correlation=7),
+            ]
+        )
+        group = result["groups"]["training_capture.teacher_d2h"]
+        self.assertEqual(group["cpu_scope_us"], 20)
+        self.assertEqual(
+            group["cpu_operators"],
+            {
+                "aten::arange": {"calls": 2, "inclusive_us": 18},
+                "aten::copy_": {"calls": 2, "inclusive_us": 3},
+            },
+        )
+        self.assertEqual(group["gpu_kernel_calls"], 0)
+        self.assertEqual(result["all_kernel_us"], 4)
+
     def test_device_staging_copy_is_counted_separately_from_d2h(self):
         for size in (1028, None):
             with self.subTest(bytes=size):

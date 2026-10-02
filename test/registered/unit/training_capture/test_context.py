@@ -117,6 +117,52 @@ class TestCaptureContext(CustomTestCase):
         with self.assertRaises(ContractError):
             self.snapshot()
 
+    def test_seal_materializes_only_the_trimmed_teacher_position_prefix(self):
+        self.slot.tensors["logits_positions"].fill_(-1)
+        self.context.export_kv(self.exporter, torch.tensor([1, 3, 5, 7, 9]), end=5)
+        rows = capture_teacher(torch.arange(256).float().expand(4, -1), 256)
+        self.context.record_teacher_range(rows, row=0, position=2, count=4)
+        self.context.commit_token(position=2, token_id=10)
+        self.context.commit_token(position=3, token_id=11)
+        self.context.trim_terminal_prefix()
+        self.context.seal("length")
+        manifest, tensors = self.snapshot()
+        validate_tensors(manifest, tensors)
+        self.assertEqual(manifest.sequence.response_length, 2)
+        self.assertEqual(self.slot.tensors["logits_positions"][:2].tolist(), [2, 3])
+        self.assertTrue((self.slot.tensors["logits_positions"][2:] == -1).all())
+
+    def test_reused_slot_rebuilds_teacher_positions_for_a_different_prompt(self):
+        for prompt, outputs in (((3, 4), (10, 11, 12)), ((3, 4, 5, 6), (13,))):
+            with self.subTest(prompt=prompt):
+                self.context = RequestCaptureContext(
+                    slot=self.slot,
+                    prompt_ids=prompt,
+                    max_tokens=8,
+                    vocab_size=256,
+                )
+                self.context.export_kv(
+                    self.exporter, torch.arange(len(prompt)), end=len(prompt)
+                )
+                for position, token in enumerate(outputs, start=len(prompt)):
+                    if position > len(prompt):
+                        self.context.export_kv(
+                            self.exporter, torch.tensor([position - 1]), end=position
+                        )
+                    self.context.record_teacher(self.rows, row=0, position=position)
+                    self.context.commit_token(position=position, token_id=token)
+                self.context.seal("length")
+                manifest, tensors = self.snapshot()
+                validate_tensors(manifest, tensors)
+                self.assertEqual(
+                    self.slot.tensors["logits_positions"][: len(outputs)].tolist(),
+                    list(range(len(prompt), len(prompt) + len(outputs))),
+                )
+                previous_slot = self.slot
+                self.pool.release(self.slot, transfer_complete=True)
+                self.slot = self.pool.acquire()
+                self.assertIs(self.slot, previous_slot)
+
     def test_cancellation_after_seal_prevents_later_snapshot_preparation(self):
         """Sealed data still awaits publication and must remain cancellable."""
         self.context.export_kv(self.exporter, torch.tensor([1, 3]), end=2)

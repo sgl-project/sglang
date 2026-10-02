@@ -558,6 +558,11 @@ prefix or capacity. Aux commits additionally require matching teacher rows.
 Trim lookahead/verify suffixes with `trim_terminal_prefix`, then call `seal` on
 every owner. Sealing flushes any staged KV tail, validates local coverage and
 forms the sequence metadata; only aux writes masks and final token payloads.
+The aux owner also materializes `logits_positions` directly into its registered
+buffer at seal, using the final committed response length. Teacher appends still
+validate position continuity immediately, but no longer allocate/copy a position
+tensor per append. Collecting slots are not complete snapshots. Observed model
+`position_ids`, CUDA completion fences and publication validation are unchanged.
 In the background writer, `prepare_partition(**metadata)` waits for CUDA
 completion and returns the local descriptors/views, binding the committed token
 ledger to `token_ids_sha256`. The caller supplies identical global metadata on
