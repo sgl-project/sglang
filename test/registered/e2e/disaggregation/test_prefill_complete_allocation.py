@@ -250,9 +250,6 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                 "ignore_eos": True,
             },
         }
-        reference = requests.post(self.lb_url + "/generate", json=payload, timeout=60)
-        reference.raise_for_status()
-        reference = reference.json()
         rid = "prefill-complete-rebootstrap-" + uuid.uuid4().hex
         requests.post(
             self.decode_url + "/slow_down",
@@ -270,10 +267,22 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                 response.raise_for_status()
                 retractions = 0
                 final = None
+                emitted = []
                 for line in response.iter_lines():
                     if not line.startswith(b"data: ") or line == b"data: [DONE]":
                         continue
                     final = json.loads(line[6:])
+                    self.assertNotIn("error", final)
+                    meta = final["meta_info"]
+                    output = [
+                        (logprob, token_id)
+                        for logprob, token_id, *_ in meta["output_token_logprobs"]
+                    ]
+                    self.assertEqual(len(output), meta["completion_tokens"])
+                    # Recompute may change future token choices, but must not
+                    # rewrite tokens or logprobs already emitted by this request.
+                    self.assertEqual(output[: len(emitted)], emitted)
+                    emitted = output
                     if (
                         retractions < 3
                         and final["meta_info"]["completion_tokens"] > retractions * 32
@@ -300,14 +309,7 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                 self.assertEqual(retractions, 3)
                 self.assertGreaterEqual(final["meta_info"]["num_retractions"], 3, final)
                 self.assertEqual(final["meta_info"]["completion_tokens"], 256, final)
-                self.assertEqual(final["text"], reference["text"])
-                self.assertEqual(
-                    [item[1] for item in final["meta_info"]["output_token_logprobs"]],
-                    [
-                        item[1]
-                        for item in reference["meta_info"]["output_token_logprobs"]
-                    ],
-                )
+                self.assertTrue(all(math.isfinite(logprob) for logprob, _ in emitted))
         finally:
             if paused:
                 requests.post(
@@ -321,6 +323,7 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                 timeout=10,
             ).raise_for_status()
         self._flush_when_idle()
+        self.generate("The capital of France is")
 
 
 class TestPrefillCompleteRetry(_PrefillCompleteServer):
