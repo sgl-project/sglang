@@ -4,6 +4,7 @@ import itertools
 import os
 import sys
 
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -30,8 +31,13 @@ def load_batch(self, forward_batch, **kwargs):
 
 def execute(self, forward_batch, **kwargs):
     output = _execute(self, forward_batch, **kwargs)
-    forward_batch.training_capture_test_prefill_graph["output_hidden_states"] = (
-        output.hidden_states is not None
+    frame = forward_batch.training_capture_test_prefill_graph
+    frame["output_hidden_states"] = getattr(output, "hidden_states", None) is not None
+    frame["output_kind"] = type(output).__name__
+    frame["pipeline_output_rows"] = (
+        {name: value.shape[0] for name, value in output.tensors.items()}
+        if isinstance(output, PPProxyTensors)
+        else None
     )
     return output
 

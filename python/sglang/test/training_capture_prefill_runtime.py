@@ -20,12 +20,24 @@ from sglang.test.training_capture_utils import read_snapshot
 class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
     """Reuse the real Store/HTTP Catalog fixture; serving is not disaggregated."""
 
+    tp_size = 1
+    pp_size = 1
+
     def exercise_prefill(self, backend, *, overlap=True, target_kv=False):
+        if (
+            self.tp_size * self.pp_size > 1
+            and backend != "disabled"
+            and "eager_outputs" not in self.drafts
+        ):
+            self.exercise_prefill("disabled", overlap=False)
         if target_kv and "prefill_seed" not in self.drafts:
             # Bind the synthetic draft to the same live target implementation
             # and attention backend, using a verified Store sample.
             self.drafts["prefill_seed"] = self.exercise_prefill("full", overlap=False)
-        root = self.root / f"prefill-{backend}-{overlap}-{target_kv}"
+        root = (
+            self.root
+            / f"prefill-{backend}-{overlap}-{target_kv}-tp{self.tp_size}-pp{self.pp_size}"
+        )
         root.mkdir()
         draft = None
         if target_kv:
@@ -71,6 +83,8 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             "prefill": {"backend": backend, "bs": [16, 32, 64, 128], "max_bs": 128},
             "decode": {"backend": "full", "bs": [1, 2, 4], "max_bs": 4},
         }
+        if backend == "disabled":
+            graph_config["decode"]["backend"] = "disabled"
         if backend == "full":
             graph_config["prefill"]["full_prefill_max_req"] = 4
         with (
@@ -83,6 +97,12 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                 url,
                 timeout=600,
                 other_args=[
+                    "--tp-size",
+                    str(self.tp_size),
+                    "--pp-size",
+                    str(self.pp_size),
+                    "--pp-max-micro-batch-size",
+                    "4",
                     "--training-capture-config",
                     str(path),
                     "--skip-server-warmup",
@@ -103,6 +123,11 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                     "--cuda-graph-config",
                     json.dumps(graph_config),
                     *(
+                        ["--enable-torch-compile-debug-mode"]
+                        if backend == "tc_piecewise"
+                        else []
+                    ),
+                    *(
                         [
                             "--speculative-algorithm",
                             "DSPARK",
@@ -120,6 +145,7 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
         self.addCleanup(self.stop_process, process)
         first_publication = len(self.catalog.publications)
         expected = {}
+        responses = {}
 
         def state():
             response = requests.get(url + "/server_info", timeout=10)
@@ -153,18 +179,27 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                 timeout=120,
             )
             self.assertEqual(response.status_code, 200, response.text)
+            results = response.json()
+            responses[name] = [result["output_ids"] for result in results]
             for rid, prompt, length, result in zip(
-                rids, prompts, response_lengths, response.json(), strict=True
+                rids, prompts, response_lengths, results, strict=True
             ):
                 self.assertEqual(len(result["output_ids"]), length)
+                if bias:
+                    self.assertEqual(result["output_ids"], [100] * length)
                 expected[hashlib.sha256(rid.encode()).hexdigest()] = (
                     prompt + result["output_ids"]
                 )
+            if self.tp_size * self.pp_size > 1 and backend != "disabled":
+                for actual, baseline in zip(
+                    responses[name], self.drafts["eager_outputs"][name], strict=True
+                ):
+                    self.assertEqual(actual, baseline[: len(actual)])
             self.catalog.wait_publications(first_publication + len(expected))
 
         try:
             prompt = [100, 200, 300, 400] * 67 + [501, 502, 503]
-            response_length = 8 if target_kv else 4
+            response_length = 8 if target_kv or backend == "disabled" else 4
             generate("chunked", [prompt], [response_length])
             generate("cached-one-token", [prompt], [1])
             generate(
@@ -186,7 +221,7 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                     ],
                     [response_length, response_length - 1, 1],
                 )
-            if target_kv:
+            if target_kv or self.tp_size * self.pp_size > 1:
                 generate("reject", [list(range(8000, 8013))], [6], bias=False)
             publications = self.catalog.wait_publications(
                 first_publication + len(expected)
@@ -199,24 +234,45 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
 
         references = [
             torch.load(path, weights_only=True)
-            for path in sorted(((draft or root) / "capture-reference").glob("*.pt"))
+            for path in sorted(((draft or root) / "capture-reference").rglob("*.pt"))
         ]
         prefill = [r for r in references if r["forward_mode"] == "EXTEND"]
         replay = [r for r in prefill if r["cuda_graph"]]
-        self.assertTrue(replay, "no actual prefill graph replay")
+        if backend == "disabled":
+            self.assertFalse(any(r["cuda_graph"] for r in references))
+        else:
+            self.assertTrue(replay, "no actual prefill graph replay")
         self.assertTrue(all(r["prefill_graph"] is not None for r in replay))
+        ranks = {(tp, pp) for tp in range(self.tp_size) for pp in range(self.pp_size)}
+        self.assertEqual(
+            {
+                (r["tp_rank"], r["pp_rank"])
+                for r in (prefill if backend == "disabled" else replay)
+            },
+            ranks,
+        )
         for item in replay:
             self.assertEqual(item["prefill_graph"]["capture_hidden_mode"], "NULL")
             self.assertEqual(item["prefill_graph"]["runtime_hidden_mode"], "NULL")
             self.assertFalse(item["prefill_graph"]["output_hidden_states"])
-        self.assertTrue(
-            any(
-                r["prefill_graph"]["raw_tokens"] < r["prefill_graph"]["padded_tokens"]
-                for r in replay
-            ),
-            "no token-padded prefill graph replay",
-        )
-        self.assertTrue(any(r["batch_size"] == 3 for r in replay))
+            if item["pp_rank"] < self.pp_size - 1:
+                self.assertEqual(item["prefill_graph"]["output_kind"], "PPProxyTensors")
+                self.assertTrue(item["prefill_graph"]["pipeline_output_rows"])
+                self.assertEqual(
+                    set(item["prefill_graph"]["pipeline_output_rows"].values()),
+                    {item["prefill_graph"]["raw_tokens"]},
+                )
+        if backend != "disabled":
+            self.assertTrue(
+                any(
+                    r["prefill_graph"]["raw_tokens"]
+                    < r["prefill_graph"]["padded_tokens"]
+                    for r in replay
+                ),
+                "no token-padded prefill graph replay",
+            )
+            self.assertTrue(any(r["batch_size"] == 3 for r in replay))
+            self.assertTrue(any(r["extend_prefix_length"] >= 271 for r in replay))
         if backend == "full":
             self.assertTrue(
                 any(
@@ -224,7 +280,6 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                     for r in replay
                 )
             )
-        self.assertTrue(any(r["extend_prefix_length"] >= 271 for r in replay))
         self.assertTrue(any(not r["predictions"] for r in prefill))
         self.assertTrue(any(r["extend_prefix_length"] == 128 for r in prefill))
         self.assertTrue(any(r["extend_prefix_length"] == 256 for r in prefill))
@@ -235,16 +290,24 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             self.assertTrue(any(r["num_commit"] < r["verify_width"] for r in verify))
             observations = [
                 json.loads(line)
-                for line in (draft / "observations.jsonl").read_text().splitlines()
+                for path in draft.glob("observations*.jsonl")
+                for line in path.read_text().splitlines()
             ]
-            self.assertTrue(any(o["kind"] == "projection" for o in observations))
+            self.assertEqual(
+                {
+                    (o["tp_rank"], o["pp_rank"])
+                    for o in observations
+                    if o["kind"] == "projection"
+                },
+                ranks,
+            )
             self.assertTrue(
                 any(
                     o["kind"] == "target_verify" and o["cuda_graph"]
                     for o in observations
                 )
             )
-        else:
+        elif backend != "disabled":
             self.assertTrue(
                 any(
                     r["forward_mode"] == "DECODE" and r["cuda_graph"]
@@ -264,7 +327,8 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             buffers.setdefault(r["prefill_graph"]["input_buffer"], set()).add(
                 r["prefill_graph"]["replay_id"]
             )
-        self.assertTrue(any(len(replays) > 1 for replays in buffers.values()))
+        if backend != "disabled":
+            self.assertTrue(any(len(replays) > 1 for replays in buffers.values()))
 
         # Open a new client after the producer has exited and all graph buffers
         # have been destroyed. No target model runs to reconstruct the sample.
@@ -275,6 +339,10 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
         seed = None
         for publication in publications:
             manifest, tensors = read_snapshot(reader, publication)
+            self.assertEqual(
+                (manifest.topology.tp_size, manifest.topology.pp_size),
+                (self.tp_size, self.pp_size),
+            )
             trace = manifest.provenance.trace_id
             self.assertNotIn(trace, captured)
             captured[trace] = tensors["token_ids"].tolist()
@@ -298,6 +366,8 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             json.dumps(
                 {
                     "prefill_capture": backend,
+                    "tp_size": self.tp_size,
+                    "pp_size": self.pp_size,
                     "target_kv": target_kv,
                     "overlap": overlap,
                     "samples": len(captured),
@@ -337,4 +407,8 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             ),
             flush=True,
         )
+        if backend in ("full", "disabled") and not overlap and not target_kv:
+            self.drafts.setdefault("prefill_seed", seed)
+        if backend == "disabled":
+            self.drafts["eager_outputs"] = responses
         return seed

@@ -1,0 +1,2742 @@
+{
+  "schema_version": 1,
+  "experiment": "distributed_prefill_graph_training_capture",
+  "date_utc": "2026-10-02",
+  "baseline_commit": "1b9213f9b85958667835669f4e17c73f2008f488",
+  "branch": "codex/dspark-maas-capture",
+  "runtime_lock": {
+    "path": "mooncake-study/experiments/h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84",
+    "temporary_container_setup": "Removed optional base-image flashinfer-cubin 0.6.12 and flashinfer-jit-cache 0.6.12+cu130, following the existing overlay lock; source JIT uses pinned FlashInfer 0.6.17."
+  },
+  "allocations": {
+    "temporary_two_h100": {
+      "job": "job-57cab3f6e629-20261002155224",
+      "pod": "job-57cab3f6e629-20261002155224-master-0",
+      "node": "node199",
+      "gpu_uuids": [
+        "GPU-9a2310f8-4162-b824-638e-95729f284b28",
+        "GPU-ba8dcfbf-4408-a5f3-86bb-310df1785097"
+      ],
+      "image": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+      "deletion": {
+        "api_code": 0,
+        "request_id": "ReqID-20261002-165025-5883-e707",
+        "pod_absent": true
+      }
+    },
+    "resident": {
+      "job": "job-fe1ce1dcdea6-20261001023258",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "retained": true,
+      "final_status": {
+        "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+        "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+        "pid": 1,
+        "mode": "idle_load",
+        "heartbeat_unix": 1790931017.0597086,
+        "idle_pid": 47320,
+        "active_job": null,
+        "active_pid": null,
+        "queued": 0,
+        "paused": false,
+        "heartbeat_age_seconds": 0.33666157722473145
+      },
+      "queue_relocation": "Seven not-yet-started CPU/single-GPU jobs were atomically moved to the resident worker queue. It stopped idle load before experiments and resumed afterwards."
+    },
+    "initial_submission": {
+      "job": "job-47f11954bcf0-20261002155049",
+      "note": "Malformed northjob command separator; removed before experiments. Omit -- before the executable in northjob create.",
+      "pod_absent": true
+    }
+  },
+  "scope": {
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "dtype": "bfloat16",
+    "target_attention": "flashinfer",
+    "draft_attention": "triton",
+    "draft": "synthetic untrained two-layer KV-input DSpark",
+    "verify_mode": "static",
+    "piecewise_compiler": "eager",
+    "store_protocol": "tcp",
+    "catalog": "HTTP test double",
+    "topologies": [
+      {
+        "tp": 1,
+        "pp": 2,
+        "overlap": false
+      },
+      {
+        "tp": 2,
+        "pp": 1,
+        "overlap": true
+      },
+      {
+        "tp": 1,
+        "pp": 1,
+        "overlap": "synchronous and overlap"
+      }
+    ],
+    "selected_layers": [
+      0,
+      14,
+      27
+    ],
+    "kv_d2h_batch_tokens": 16,
+    "teacher_d2h_batch_tokens": 16,
+    "max_device_bytes": 8388608,
+    "final_piecewise_input_address_assertions": true
+  },
+  "acceptance_totals": {
+    "cpu_distinct_test_methods": 83,
+    "cpu_test_executions": 88,
+    "runtime_test_methods_executed": 24,
+    "primary_distributed_graph_samples": 120,
+    "primary_distributed_eager_samples": 20,
+    "primary_single_gpu_graph_samples": 76,
+    "primary_single_gpu_seed_samples": 9,
+    "supplemental_address_check_samples": 58,
+    "complete_post_exit_snapshots": 283
+  },
+  "sources": [
+    {
+      "root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-before",
+      "sha256": {
+        "python/sglang/srt/model_executor/cuda_graph_buffer_registry.py": "28fbde4e1e9f2824928b29283690fed9e7f38cac435d416f355fb92d8ea346fd",
+        "python/sglang/srt/model_executor/model_runner_components/layer_setup.py": "235c9ecd3a707645fd3aeeb54602c4233d23cf23a216e16ed8ef7cd6be2f4e4c",
+        "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py": "d547c64b5adb17a93a01180ae5470b556347197f42cf1a18f1a95cc3a1109580",
+        "python/sglang/srt/model_executor/runner_utils/buffers.py": "7f81f621ac9ca29037ad3a489e392a47c8384ee01734e6a31a5307567e09a5f8",
+        "python/sglang/test/training_capture_prefill_runtime.py": "a2d08d93e1efcf6132e1631d3a9120afa25cf9c7143f4e86ff3a15fcb0ce2868",
+        "python/sglang/test/training_capture_prefill_server.py": "e0e5f47b3a615d11a0f4f9ca5f98bfc5e406fd8704fe1f48cb73fbcd7967d542",
+        "test/registered/unit/model_executor/model_runner_components/test_layer_setup.py": "28fa29e4944905c00e7d2b7c638f652dfb4775f97a1af1e6ddb00db1146b61d7",
+        "test/registered/unit/model_executor/runner/test_prefill_pipeline_graph.py": "e2a09916b6fc747551317459360cd0fe9a38d358589c83cbc5f72c5af8d55588",
+        "test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py": "932c368d881f21787686e84140eb074062fdae9da0a3fd17473de2d6c1f29e43",
+        "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3",
+        "python/sglang/test/dspark_target_kv_prefill_server.py": "f1278ed96e28e32fe8c78a9ef7f30dc7eaba25a34ed505865922c21462209a27"
+      }
+    },
+    {
+      "root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v1",
+      "sha256": {
+        "python/sglang/srt/model_executor/cuda_graph_buffer_registry.py": "bc8b6d2f2081efbd8d08d2f5362609deae3280a2204833ecb8c3532e464deb8a",
+        "python/sglang/srt/model_executor/model_runner_components/layer_setup.py": "235c9ecd3a707645fd3aeeb54602c4233d23cf23a216e16ed8ef7cd6be2f4e4c",
+        "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py": "073301dd60b17187aa1821dcb8ba2390c04d29ca5a8586e0d532f853838d4e13",
+        "python/sglang/srt/model_executor/runner_utils/buffers.py": "9ec1c0cd8bdde6843f0b6ea43f80926a638ddda59c88b0516d270bde126d7dbc",
+        "python/sglang/test/training_capture_prefill_runtime.py": "3942be10dfaca40ca295da4bffce8fa425c31426bee8488045950668b96c1041",
+        "python/sglang/test/training_capture_prefill_server.py": "9d1e9d60f8ee2659ea948a171aaecf4ed0ccfc1264f8a8fcbd1170baa688bdd5",
+        "test/registered/storage/test_training_capture_pipeline_prefill_graph.py": "d732b3b299bb9e97aeb17ad600d1c329dde3fcdc1591cae5eebf7f8a2308733e",
+        "test/registered/unit/model_executor/model_runner_components/test_layer_setup.py": "28fa29e4944905c00e7d2b7c638f652dfb4775f97a1af1e6ddb00db1146b61d7",
+        "test/registered/unit/model_executor/runner/test_prefill_pipeline_graph.py": "a14fbacabf85294cee48c9902c648265656526786a3b461bc42795372445b7ba",
+        "test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py": "932c368d881f21787686e84140eb074062fdae9da0a3fd17473de2d6c1f29e43",
+        "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3",
+        "python/sglang/test/dspark_target_kv_prefill_server.py": "f1278ed96e28e32fe8c78a9ef7f30dc7eaba25a34ed505865922c21462209a27"
+      }
+    },
+    {
+      "root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v2",
+      "sha256": {
+        "python/sglang/srt/model_executor/cuda_graph_buffer_registry.py": "bc8b6d2f2081efbd8d08d2f5362609deae3280a2204833ecb8c3532e464deb8a",
+        "python/sglang/srt/model_executor/model_runner_components/layer_setup.py": "c7ef4893b6f54116f36907797167cab8c1103ae6adae1067213e0f7ab2a08be2",
+        "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py": "073301dd60b17187aa1821dcb8ba2390c04d29ca5a8586e0d532f853838d4e13",
+        "python/sglang/srt/model_executor/runner_utils/buffers.py": "9ec1c0cd8bdde6843f0b6ea43f80926a638ddda59c88b0516d270bde126d7dbc",
+        "python/sglang/test/training_capture_prefill_runtime.py": "18e46d8c86cad9f5f2c65efd5f4df40efbbc81f9c21d793c4f9f498d6875806a",
+        "python/sglang/test/training_capture_prefill_server.py": "9d1e9d60f8ee2659ea948a171aaecf4ed0ccfc1264f8a8fcbd1170baa688bdd5",
+        "test/registered/storage/test_training_capture_pipeline_prefill_graph.py": "d732b3b299bb9e97aeb17ad600d1c329dde3fcdc1591cae5eebf7f8a2308733e",
+        "test/registered/unit/model_executor/model_runner_components/test_layer_setup.py": "dc13201fb5dfce34752818d07abad8c40a5cc1c2060efb6d7083a7ac5a7fa886",
+        "test/registered/unit/model_executor/runner/test_prefill_pipeline_graph.py": "52bce90f5a10816d9dd644e1bc56a48907e6480d588c2ee5149073761c511c51",
+        "test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py": "932c368d881f21787686e84140eb074062fdae9da0a3fd17473de2d6c1f29e43",
+        "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3",
+        "python/sglang/test/dspark_target_kv_prefill_server.py": "f1278ed96e28e32fe8c78a9ef7f30dc7eaba25a34ed505865922c21462209a27"
+      }
+    },
+    {
+      "root": "/gpfs/user/fuxuanwei/sglang/mooncake-study/implementation/sglang",
+      "sha256": {
+        "python/sglang/srt/model_executor/cuda_graph_buffer_registry.py": "bc8b6d2f2081efbd8d08d2f5362609deae3280a2204833ecb8c3532e464deb8a",
+        "python/sglang/srt/model_executor/model_runner_components/layer_setup.py": "2590e11cb45f01b45fabdf30953bcd08c176c84887e2cae3c25829ef1bda750f",
+        "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py": "155899dd9d6c00f1125283319a102404b89d8b130aa376c8169a2bd360a21b8b",
+        "python/sglang/srt/model_executor/runner_utils/buffers.py": "9ec1c0cd8bdde6843f0b6ea43f80926a638ddda59c88b0516d270bde126d7dbc",
+        "python/sglang/test/training_capture_prefill_runtime.py": "babb77da3a573e9ed3a39836bb4c6353787519e8583ebf542ef06e2a34a95ddf",
+        "python/sglang/test/training_capture_prefill_server.py": "9d1e9d60f8ee2659ea948a171aaecf4ed0ccfc1264f8a8fcbd1170baa688bdd5",
+        "test/registered/storage/test_training_capture_pipeline_prefill_graph.py": "d732b3b299bb9e97aeb17ad600d1c329dde3fcdc1591cae5eebf7f8a2308733e",
+        "test/registered/storage/test_training_capture_tensor_prefill_graph.py": "959173d8724ada878cc3c0e12b5c20af521ceff07b7840450fbd03e082d83921",
+        "test/registered/unit/model_executor/model_runner_components/test_layer_setup.py": "dc13201fb5dfce34752818d07abad8c40a5cc1c2060efb6d7083a7ac5a7fa886",
+        "test/registered/unit/model_executor/runner/test_prefill_pipeline_graph.py": "5dac1205379216b87250424a5ed9bcef9754fc1f4733e6f097f0ddc6496c8964",
+        "test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py": "932c368d881f21787686e84140eb074062fdae9da0a3fd17473de2d6c1f29e43",
+        "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3",
+        "python/sglang/test/dspark_target_kv_prefill_server.py": "f1278ed96e28e32fe8c78a9ef7f30dc7eaba25a34ed505865922c21462209a27"
+      }
+    },
+    {
+      "root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v3",
+      "sha256": {
+        "python/sglang/srt/model_executor/cuda_graph_buffer_registry.py": "bc8b6d2f2081efbd8d08d2f5362609deae3280a2204833ecb8c3532e464deb8a",
+        "python/sglang/srt/model_executor/model_runner_components/layer_setup.py": "2590e11cb45f01b45fabdf30953bcd08c176c84887e2cae3c25829ef1bda750f",
+        "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py": "073301dd60b17187aa1821dcb8ba2390c04d29ca5a8586e0d532f853838d4e13",
+        "python/sglang/srt/model_executor/runner_utils/buffers.py": "9ec1c0cd8bdde6843f0b6ea43f80926a638ddda59c88b0516d270bde126d7dbc",
+        "python/sglang/test/training_capture_prefill_runtime.py": "05f994f0361d710eefe23a50d66ae8cb2433bfa53da7157df2d4e62c84d26882",
+        "python/sglang/test/training_capture_prefill_server.py": "9d1e9d60f8ee2659ea948a171aaecf4ed0ccfc1264f8a8fcbd1170baa688bdd5",
+        "test/registered/storage/test_training_capture_pipeline_prefill_graph.py": "d732b3b299bb9e97aeb17ad600d1c329dde3fcdc1591cae5eebf7f8a2308733e",
+        "test/registered/storage/test_training_capture_tensor_prefill_graph.py": "959173d8724ada878cc3c0e12b5c20af521ceff07b7840450fbd03e082d83921",
+        "test/registered/unit/model_executor/model_runner_components/test_layer_setup.py": "dc13201fb5dfce34752818d07abad8c40a5cc1c2060efb6d7083a7ac5a7fa886",
+        "test/registered/unit/model_executor/runner/test_prefill_pipeline_graph.py": "52bce90f5a10816d9dd644e1bc56a48907e6480d588c2ee5149073761c511c51",
+        "test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py": "932c368d881f21787686e84140eb074062fdae9da0a3fd17473de2d6c1f29e43",
+        "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3",
+        "python/sglang/test/dspark_target_kv_prefill_server.py": "f1278ed96e28e32fe8c78a9ef7f30dc7eaba25a34ed505865922c21462209a27"
+      }
+    },
+    {
+      "root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v4",
+      "sha256": {
+        "python/sglang/srt/model_executor/cuda_graph_buffer_registry.py": "bc8b6d2f2081efbd8d08d2f5362609deae3280a2204833ecb8c3532e464deb8a",
+        "python/sglang/srt/model_executor/model_runner_components/layer_setup.py": "2590e11cb45f01b45fabdf30953bcd08c176c84887e2cae3c25829ef1bda750f",
+        "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py": "155899dd9d6c00f1125283319a102404b89d8b130aa376c8169a2bd360a21b8b",
+        "python/sglang/srt/model_executor/runner_utils/buffers.py": "9ec1c0cd8bdde6843f0b6ea43f80926a638ddda59c88b0516d270bde126d7dbc",
+        "python/sglang/test/training_capture_prefill_runtime.py": "babb77da3a573e9ed3a39836bb4c6353787519e8583ebf542ef06e2a34a95ddf",
+        "python/sglang/test/training_capture_prefill_server.py": "9d1e9d60f8ee2659ea948a171aaecf4ed0ccfc1264f8a8fcbd1170baa688bdd5",
+        "test/registered/storage/test_training_capture_pipeline_prefill_graph.py": "d732b3b299bb9e97aeb17ad600d1c329dde3fcdc1591cae5eebf7f8a2308733e",
+        "test/registered/storage/test_training_capture_tensor_prefill_graph.py": "959173d8724ada878cc3c0e12b5c20af521ceff07b7840450fbd03e082d83921",
+        "test/registered/unit/model_executor/model_runner_components/test_layer_setup.py": "dc13201fb5dfce34752818d07abad8c40a5cc1c2060efb6d7083a7ac5a7fa886",
+        "test/registered/unit/model_executor/runner/test_prefill_pipeline_graph.py": "5dac1205379216b87250424a5ed9bcef9754fc1f4733e6f097f0ddc6496c8964",
+        "test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py": "932c368d881f21787686e84140eb074062fdae9da0a3fd17473de2d6c1f29e43",
+        "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3",
+        "python/sglang/test/dspark_target_kv_prefill_server.py": "f1278ed96e28e32fe8c78a9ef7f30dc7eaba25a34ed505865922c21462209a27"
+      }
+    }
+  ],
+  "jobs": [
+    {
+      "name": "before_environment",
+      "id": "01790927977227565529-3ae0f14395a6",
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-before",
+      "note": "FlashInfer optional cache from the base image mismatched the pinned overlay; failed before test execution.",
+      "test_command": "python test/registered/unit/model_executor/runner/test_prefill_pipeline_graph.py",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790927977227565529-3ae0f14395a6",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790927996.125083,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790927977227565529-3ae0f14395a6.log"
+      },
+      "log_sha256": "17e5e47e26bad32227d60e191de6e0f3d20d2ba8f7e52dd73808eaf4f5e9e442",
+      "test_summary": [],
+      "captures": [],
+      "cpu_only": true,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": false
+    },
+    {
+      "name": "before_unit",
+      "id": "01790928288317135809-ef55984ec403",
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-before",
+      "note": "Expected baseline errors: no prefill PP buffers, registry slots or supported PP output.",
+      "test_command": "python test/registered/unit/model_executor/runner/test_prefill_pipeline_graph.py",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790928288317135809-ef55984ec403",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790928304.5317812,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790928288317135809-ef55984ec403.log"
+      },
+      "log_sha256": "fa135edd8eb274d8f0350ad1c9094fb1380f93d008804d043568a0da31ac0291",
+      "test_summary": [
+        "Ran 4 tests in 0.009s",
+        "FAILED (errors=6)"
+      ],
+      "captures": [],
+      "cpu_only": true,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": false
+    },
+    {
+      "name": "unit_v1",
+      "id": "01790928477962114256-d671c4d177ca",
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v1",
+      "note": "Preliminary four-test pass before global layer discovery was fixed.",
+      "test_command": "python test/registered/unit/model_executor/runner/test_prefill_pipeline_graph.py",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790928477962114256-d671c4d177ca",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790928493.4559994,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790928477962114256-d671c4d177ca.log"
+      },
+      "log_sha256": "b3ac1e2bf0991bc0e31a7e741ed274c0ac27fff9dbfa2dd9ac9927e77ce895dd",
+      "test_summary": [
+        "Ran 4 tests in 0.008s",
+        "OK"
+      ],
+      "captures": [],
+      "cpu_only": true,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": false
+    },
+    {
+      "name": "full_pp_v1",
+      "id": "01790928478279909841-dde64b696a82",
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v1",
+      "note": "Real PP stages disabled prefill graphs because layer discovery dropped remote-stage placeholders.",
+      "test_command": "python test/registered/storage/test_training_capture_pipeline_prefill_graph.py -f TestPipelinePrefillGraphCapture.test_ar_full TestPipelinePrefillGraphCapture.test_dspark_full",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790928478279909841-dde64b696a82",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790928694.3491955,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790928478279909841-dde64b696a82.log"
+      },
+      "log_sha256": "fcbd5d5eeecb0bb5206a547b154e677d4d0c28adaf9a1e05e0381be28db9ff1b",
+      "test_summary": [
+        "Ran 1 test in 189.367s",
+        "FAILED (errors=1)"
+      ],
+      "captures": [],
+      "cpu_only": false,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": false
+    },
+    {
+      "name": "unit_invocation_v2",
+      "id": "01790929300037411828-0762497e0c5c",
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v2",
+      "note": "Incorrect unittest module invocation collided with Python's test package; corrected by direct file invocation.",
+      "test_command": "python -m unittest test.registered.unit.model_executor.runner.test_prefill_pipeline_graph test.registered.unit.model_executor.model_runner_components.test_layer_setup",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790929300037411828-0762497e0c5c",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790929300.436134,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790929300037411828-0762497e0c5c.log"
+      },
+      "log_sha256": "1e28c6e9596a89bae45f585534e2232c765a42535b270810d157f35c51c41c03",
+      "test_summary": [
+        "Ran 2 tests in 0.000s",
+        "FAILED (errors=2)"
+      ],
+      "captures": [],
+      "cpu_only": true,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": false
+    },
+    {
+      "name": "full_pp_v2",
+      "id": "01790929300360255639-82ed40798150",
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v2",
+      "note": "Preliminary Full AR and DSpark pass with eager comparison.",
+      "test_command": "python test/registered/storage/test_training_capture_pipeline_prefill_graph.py -f TestPipelinePrefillGraphCapture.test_ar_full TestPipelinePrefillGraphCapture.test_dspark_full",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790929300360255639-82ed40798150",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790929446.262277,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790929300360255639-82ed40798150.log"
+      },
+      "log_sha256": "d91a9a5dc37eedcbd031392d6d296b6c1d495a4c0d287eb1172ce91e85eedfc9",
+      "test_summary": [
+        "Ran 2 tests in 128.327s",
+        "OK"
+      ],
+      "captures": [
+        {
+          "prefill_capture": "disabled",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13785932,
+          "source_frames": 114,
+          "prefill_replay_frames": 0,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [],
+          "graph_prefix_lengths": [],
+          "reused_graph_buffers": 0,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "eager_forwards": 41,
+            "sealed": 10,
+            "ready": 0
+          }
+        },
+        {
+          "prefill_capture": "full",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13465916,
+          "source_frames": 66,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "cuda_graph_forwards": 24,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 0
+          }
+        },
+        {
+          "prefill_capture": "full",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": true,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13859660,
+          "source_frames": 58,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 34,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            -1
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "cuda_graph_forwards": 20,
+            "speculative_verify_forwards": 13,
+            "speculative_commits_copied": 17,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 0
+          }
+        }
+      ],
+      "cpu_only": false,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": false
+    },
+    {
+      "name": "unit_pp_v2",
+      "id": "01790929348730632721-2c63e6049f4d",
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v2",
+      "note": "Five PP unit tests before the piecewise pointer fix.",
+      "test_command": "python test/registered/unit/model_executor/runner/test_prefill_pipeline_graph.py",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790929348730632721-2c63e6049f4d",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790929458.2949576,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790929348730632721-2c63e6049f4d.log"
+      },
+      "log_sha256": "cdc71ac6f5465d1ee9ac0623a49a8e1981bc35f34f4ec22955c45eab022175f2",
+      "test_summary": [
+        "Ran 5 tests in 0.007s",
+        "OK"
+      ],
+      "captures": [],
+      "cpu_only": true,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": false
+    },
+    {
+      "name": "unit_layers_v2",
+      "id": "01790929349064116993-3a14e468e37f",
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v2",
+      "note": "Three layer discovery tests.",
+      "test_command": "python test/registered/unit/model_executor/model_runner_components/test_layer_setup.py",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790929349064116993-3a14e468e37f",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790929466.3196712,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790929349064116993-3a14e468e37f.log"
+      },
+      "log_sha256": "cc02037cff234db8231c8f8c1ad63f4c2e7e5b3302a4293564e98f78ddd50a78",
+      "test_summary": [
+        "Ran 3 tests in 0.000s",
+        "OK"
+      ],
+      "captures": [],
+      "cpu_only": true,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": false
+    },
+    {
+      "name": "unit_registry_v2",
+      "id": "01790929349367629257-4713d8299e9f",
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v2",
+      "note": "37 registry tests, including shared decode PP geometry; same buffers/registry code as final.",
+      "test_command": "python test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790929349367629257-4713d8299e9f",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790929477.0988452,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790929349367629257-4713d8299e9f.log"
+      },
+      "log_sha256": "79a5a33ee9f039c93afa3597d4f5ceb145f32096264e3e6729e228408e369bd7",
+      "test_summary": [
+        "Ran 37 tests in 2.701s",
+        "OK"
+      ],
+      "captures": [],
+      "cpu_only": true,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": true
+    },
+    {
+      "name": "pp_matrix_v3",
+      "id": "01790929614784442502-11c04a844dff",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790929614784442502-11c04a844dff",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790929788.7299137,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790929614784442502-11c04a844dff.log"
+      },
+      "log_sha256": "c646443a0ca8a86d77763ca6e3cba436bc2adb1cdbd1bc2bd35e3406648f7266",
+      "test_summary": [
+        "Ran 3 tests in 159.926s",
+        "FAILED (errors=1)"
+      ],
+      "captures": [
+        {
+          "prefill_capture": "disabled",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13785932,
+          "source_frames": 114,
+          "prefill_replay_frames": 0,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [],
+          "graph_prefix_lengths": [],
+          "reused_graph_buffers": 0,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "eager_forwards": 41,
+            "sealed": 10,
+            "ready": 0
+          }
+        },
+        {
+          "prefill_capture": "breakable",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13465916,
+          "source_frames": 66,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "cuda_graph_forwards": 24,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 0
+          }
+        },
+        {
+          "prefill_capture": "full",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13465916,
+          "source_frames": 66,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "cuda_graph_forwards": 24,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 0
+          }
+        }
+      ],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v3",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pipeline_prefill_graph.py -f",
+      "cpu_only": false,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": false,
+      "note": "Unbiased generation detects stale piecewise PP input pointers: [0,68034,68034,68034,68034,68034] versus eager [8,220,17,15,17,18]. Superseded by v4 with stable staging addresses and compiler address assertions."
+    },
+    {
+      "name": "tp_matrix_v3",
+      "id": "01790929615147704348-8fefd43bf765",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790929615147704348-8fefd43bf765",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930131.0861256,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790929615147704348-8fefd43bf765.log"
+      },
+      "log_sha256": "075423898c869d0f87aa4746b1d750d173a82e5e4ed162e523fdb903e64c50eb",
+      "test_summary": [
+        "Ran 6 tests in 330.710s",
+        "OK"
+      ],
+      "captures": [
+        {
+          "prefill_capture": "disabled",
+          "tp_size": 2,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 344,
+          "tensor_bytes": 13785932,
+          "source_frames": 114,
+          "prefill_replay_frames": 0,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [],
+          "graph_prefix_lengths": [],
+          "reused_graph_buffers": 0,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "eager_forwards": 41,
+            "sealed": 10,
+            "ready": 10
+          }
+        },
+        {
+          "prefill_capture": "breakable",
+          "tp_size": 2,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 344,
+          "tensor_bytes": 13588796,
+          "source_frames": 86,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "overlap_forwards": 31,
+            "cuda_graph_forwards": 30,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 10
+          }
+        },
+        {
+          "prefill_capture": "full",
+          "tp_size": 2,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 344,
+          "tensor_bytes": 13588796,
+          "source_frames": 86,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "overlap_forwards": 31,
+            "cuda_graph_forwards": 30,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 10
+          }
+        },
+        {
+          "prefill_capture": "tc_piecewise",
+          "tp_size": 2,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 344,
+          "tensor_bytes": 13588796,
+          "source_frames": 86,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "overlap_forwards": 31,
+            "cuda_graph_forwards": 30,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 10
+          }
+        },
+        {
+          "prefill_capture": "breakable",
+          "tp_size": 2,
+          "pp_size": 1,
+          "target_kv": true,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 344,
+          "tensor_bytes": 13908812,
+          "source_frames": 78,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 54,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            0,
+            3
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "overlap_forwards": 27,
+            "cuda_graph_forwards": 26,
+            "speculative_verify_forwards": 19,
+            "speculative_commits_copied": 27,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 10
+          }
+        },
+        {
+          "prefill_capture": "full",
+          "tp_size": 2,
+          "pp_size": 1,
+          "target_kv": true,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 344,
+          "tensor_bytes": 13908812,
+          "source_frames": 78,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 54,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            0,
+            3
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "overlap_forwards": 27,
+            "cuda_graph_forwards": 26,
+            "speculative_verify_forwards": 19,
+            "speculative_commits_copied": 27,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 10
+          }
+        },
+        {
+          "prefill_capture": "tc_piecewise",
+          "tp_size": 2,
+          "pp_size": 1,
+          "target_kv": true,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 344,
+          "tensor_bytes": 13908812,
+          "source_frames": 78,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 54,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            0,
+            3
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "overlap_forwards": 27,
+            "cuda_graph_forwards": 26,
+            "speculative_verify_forwards": 19,
+            "speculative_commits_copied": 27,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 10
+          }
+        }
+      ],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v3",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_tensor_prefill_graph.py -f",
+      "cpu_only": false,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": true,
+      "note": "PP1 execution does not use the subsequently fixed PP input helper. Piecewise also revalidated on final v4 source with captured-input-address assertions."
+    },
+    {
+      "name": "ar_single_v3",
+      "id": "01790929615467264061-0a88a1b83f81",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790929615467264061-0a88a1b83f81",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930290.6953871,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790929615467264061-0a88a1b83f81.log"
+      },
+      "log_sha256": "a498cd867d702c0be14c7bcf16f86d42553a18c454181bfcf01a60f7356cec35",
+      "test_summary": [
+        "Ran 4 tests in 148.103s",
+        "OK"
+      ],
+      "captures": [
+        {
+          "prefill_capture": "breakable",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": true,
+          "samples": 9,
+          "tensor_objects": 198,
+          "tensor_bytes": 13348866,
+          "source_frames": 36,
+          "prefill_replay_frames": 10,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 10,
+            "excluded_health_check": 1,
+            "admitted": 9,
+            "overlap_forwards": 24,
+            "cuda_graph_forwards": 23,
+            "sealed": 9,
+            "writer_started": 9,
+            "copies_completed": 9,
+            "snapshot_built": 9,
+            "ready": 9,
+            "eager_forwards": 1
+          }
+        },
+        {
+          "prefill_capture": "full",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": true,
+          "samples": 9,
+          "tensor_objects": 198,
+          "tensor_bytes": 13348866,
+          "source_frames": 36,
+          "prefill_replay_frames": 10,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 10,
+            "excluded_health_check": 1,
+            "admitted": 9,
+            "overlap_forwards": 24,
+            "cuda_graph_forwards": 23,
+            "sealed": 9,
+            "writer_started": 9,
+            "copies_completed": 9,
+            "snapshot_built": 9,
+            "ready": 9,
+            "eager_forwards": 1
+          }
+        },
+        {
+          "prefill_capture": "full",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 9,
+          "tensor_objects": 198,
+          "tensor_bytes": 13238274,
+          "source_frames": 27,
+          "prefill_replay_frames": 10,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 10,
+            "excluded_health_check": 1,
+            "admitted": 9,
+            "cuda_graph_forwards": 18,
+            "sealed": 9,
+            "writer_started": 9,
+            "copies_completed": 9,
+            "snapshot_built": 9,
+            "ready": 9,
+            "eager_forwards": 1
+          }
+        },
+        {
+          "prefill_capture": "tc_piecewise",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": true,
+          "samples": 9,
+          "tensor_objects": 198,
+          "tensor_bytes": 13348866,
+          "source_frames": 36,
+          "prefill_replay_frames": 10,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 10,
+            "excluded_health_check": 1,
+            "admitted": 9,
+            "overlap_forwards": 24,
+            "cuda_graph_forwards": 23,
+            "sealed": 9,
+            "writer_started": 9,
+            "copies_completed": 9,
+            "snapshot_built": 9,
+            "ready": 9,
+            "eager_forwards": 1
+          }
+        }
+      ],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v3",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_prefill_graph.py -f",
+      "cpu_only": false,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": true,
+      "note": "PP1 execution does not use the subsequently fixed PP input helper. Piecewise also revalidated on final v4 source with captured-input-address assertions."
+    },
+    {
+      "name": "dspark_single_v3",
+      "id": "01790929615807787059-8b8c38c46500",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790929615807787059-8b8c38c46500",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930493.1965373,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790929615807787059-8b8c38c46500.log"
+      },
+      "log_sha256": "07d42407560bbe73f7b4d1351ba6a2ce72e3244c746e37e68824672de932cc8f",
+      "test_summary": [
+        "Ran 4 tests in 190.909s",
+        "OK"
+      ],
+      "captures": [
+        {
+          "prefill_capture": "full",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 9,
+          "tensor_objects": 198,
+          "tensor_bytes": 13238274,
+          "source_frames": 27,
+          "prefill_replay_frames": 10,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 10,
+            "excluded_health_check": 1,
+            "admitted": 9,
+            "cuda_graph_forwards": 18,
+            "sealed": 9,
+            "writer_started": 9,
+            "copies_completed": 9,
+            "snapshot_built": 9,
+            "ready": 9,
+            "eager_forwards": 1
+          }
+        },
+        {
+          "prefill_capture": "breakable",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": true,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13908812,
+          "source_frames": 39,
+          "prefill_replay_frames": 11,
+          "verify_replay_frames": 27,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            0,
+            3
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 11,
+            "excluded_health_check": 1,
+            "admitted": 10,
+            "overlap_forwards": 27,
+            "cuda_graph_forwards": 26,
+            "speculative_verify_forwards": 19,
+            "speculative_commits_copied": 27,
+            "sealed": 10,
+            "writer_started": 10,
+            "copies_completed": 10,
+            "snapshot_built": 10,
+            "ready": 10,
+            "eager_forwards": 1
+          }
+        },
+        {
+          "prefill_capture": "full",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": true,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13908812,
+          "source_frames": 39,
+          "prefill_replay_frames": 11,
+          "verify_replay_frames": 27,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            0,
+            3
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 11,
+            "excluded_health_check": 1,
+            "admitted": 10,
+            "overlap_forwards": 27,
+            "cuda_graph_forwards": 26,
+            "speculative_verify_forwards": 19,
+            "speculative_commits_copied": 27,
+            "sealed": 10,
+            "writer_started": 10,
+            "copies_completed": 10,
+            "snapshot_built": 10,
+            "ready": 10,
+            "eager_forwards": 1
+          }
+        },
+        {
+          "prefill_capture": "full",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": true,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13859660,
+          "source_frames": 29,
+          "prefill_replay_frames": 11,
+          "verify_replay_frames": 17,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            -1
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 11,
+            "excluded_health_check": 1,
+            "admitted": 10,
+            "cuda_graph_forwards": 20,
+            "speculative_verify_forwards": 13,
+            "speculative_commits_copied": 17,
+            "sealed": 10,
+            "writer_started": 10,
+            "copies_completed": 10,
+            "snapshot_built": 10,
+            "ready": 10,
+            "eager_forwards": 1
+          }
+        },
+        {
+          "prefill_capture": "tc_piecewise",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": true,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13908812,
+          "source_frames": 39,
+          "prefill_replay_frames": 11,
+          "verify_replay_frames": 27,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            0,
+            3
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 11,
+            "excluded_health_check": 1,
+            "admitted": 10,
+            "overlap_forwards": 27,
+            "cuda_graph_forwards": 26,
+            "speculative_verify_forwards": 19,
+            "speculative_commits_copied": 27,
+            "sealed": 10,
+            "writer_started": 10,
+            "copies_completed": 10,
+            "snapshot_built": 10,
+            "ready": 10,
+            "eager_forwards": 1
+          }
+        }
+      ],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v3",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_dspark_prefill_graph.py -f",
+      "cpu_only": false,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": true,
+      "note": "PP1 execution does not use the subsequently fixed PP input helper. Piecewise also revalidated on final v4 source with captured-input-address assertions."
+    },
+    {
+      "name": "runner_units_v3",
+      "id": "01790929616119822454-ace227e63075",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "result": {
+        "job_id": "01790929616119822454-ace227e63075",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930398.467378,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790929616119822454-ace227e63075.log"
+      },
+      "log_sha256": "21f5c3bafe95598e0fa1095f8e5691cd6f4df436a6c0028476152c4ff39af163",
+      "test_summary": [
+        "Ran 26 tests in 0.784s",
+        "OK"
+      ],
+      "captures": [],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v3",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m unittest discover -s test/registered/unit/model_executor/runner -p 'test_*.py'",
+      "cpu_only": true,
+      "allocation": "resident",
+      "acceptance_evidence": true
+    },
+    {
+      "name": "prefill_units_v3",
+      "id": "01790929616463829185-8ff6985f5579",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "result": {
+        "job_id": "01790929616463829185-8ff6985f5579",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930410.506436,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790929616463829185-8ff6985f5579.log"
+      },
+      "log_sha256": "f52f497af0ce2d4bdbf8e7a802878ee24efdcd83917e39bda402829aec6e5c10",
+      "test_summary": [
+        "Ran 11 tests in 0.004s",
+        "OK"
+      ],
+      "captures": [],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v3",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m unittest discover -s test/registered/unit/model_executor -p 'test_prefill*.py'",
+      "cpu_only": true,
+      "allocation": "resident",
+      "acceptance_evidence": true
+    },
+    {
+      "name": "layer_units_v3",
+      "id": "01790929616779410913-c0b75fe9ad7d",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "result": {
+        "job_id": "01790929616779410913-c0b75fe9ad7d",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930418.2842727,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790929616779410913-c0b75fe9ad7d.log"
+      },
+      "log_sha256": "6182d7c2e02bea47cb2aeaa3fdbf319b2ae7c07e1715417c16f5035d5944369b",
+      "test_summary": [
+        "Ran 3 tests in 0.000s",
+        "OK"
+      ],
+      "captures": [],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v3",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/unit/model_executor/model_runner_components/test_layer_setup.py",
+      "cpu_only": true,
+      "allocation": "resident",
+      "acceptance_evidence": true
+    },
+    {
+      "name": "prefix_units_v3",
+      "id": "01790929617151584183-70b307197ea0",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "result": {
+        "job_id": "01790929617151584183-70b307197ea0",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930429.571407,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790929617151584183-70b307197ea0.log"
+      },
+      "log_sha256": "2b7f24457dda68f7a94c4910bab81c805078a7bab4edbb52660d4c16ce71f737",
+      "test_summary": [
+        "Ran 5 tests in 0.027s",
+        "OK"
+      ],
+      "captures": [],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v3",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/unit/model_executor/test_chunked_prefix_cache_gate.py",
+      "cpu_only": true,
+      "allocation": "resident",
+      "acceptance_evidence": true
+    },
+    {
+      "name": "unit_pp_v4",
+      "id": "01790930069254483495-260627ff35f2",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "result": {
+        "job_id": "01790930069254483495-260627ff35f2",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930443.965186,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790930069254483495-260627ff35f2.log"
+      },
+      "log_sha256": "2c52b33d63816f34e5094d010fcfeb884a58ca8afce210ef7c926411cb6519c2",
+      "test_summary": [
+        "Ran 6 tests in 0.007s",
+        "OK"
+      ],
+      "captures": [],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v4",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/unit/model_executor/runner/test_prefill_pipeline_graph.py",
+      "cpu_only": true,
+      "allocation": "resident",
+      "acceptance_evidence": true
+    },
+    {
+      "name": "pp_matrix_v4",
+      "id": "01790930069587543396-6259850a3567",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790930069587543396-6259850a3567",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930789.6864066,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790930069587543396-6259850a3567.log"
+      },
+      "log_sha256": "6ef0db543f6e9b2b4519aeed7165b5f987b6e1be83f00eeb4d160e7be1df7e69",
+      "test_summary": [
+        "Ran 6 tests in 284.237s",
+        "OK"
+      ],
+      "captures": [
+        {
+          "prefill_capture": "disabled",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13785932,
+          "source_frames": 114,
+          "prefill_replay_frames": 0,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [],
+          "graph_prefix_lengths": [],
+          "reused_graph_buffers": 0,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "eager_forwards": 41,
+            "sealed": 10,
+            "ready": 0
+          }
+        },
+        {
+          "prefill_capture": "breakable",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13465916,
+          "source_frames": 66,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "cuda_graph_forwards": 24,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 0
+          }
+        },
+        {
+          "prefill_capture": "full",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13465916,
+          "source_frames": 66,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "cuda_graph_forwards": 24,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 0
+          }
+        },
+        {
+          "prefill_capture": "tc_piecewise",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13465916,
+          "source_frames": 66,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "cuda_graph_forwards": 24,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 0
+          }
+        },
+        {
+          "prefill_capture": "breakable",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": true,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13859660,
+          "source_frames": 58,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 34,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            -1
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "cuda_graph_forwards": 20,
+            "speculative_verify_forwards": 13,
+            "speculative_commits_copied": 17,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 0
+          }
+        },
+        {
+          "prefill_capture": "full",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": true,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13859660,
+          "source_frames": 58,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 34,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            -1
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "cuda_graph_forwards": 20,
+            "speculative_verify_forwards": 13,
+            "speculative_commits_copied": 17,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 0
+          }
+        },
+        {
+          "prefill_capture": "tc_piecewise",
+          "tp_size": 1,
+          "pp_size": 2,
+          "target_kv": true,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13859660,
+          "source_frames": 58,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 34,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            -1
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "cuda_graph_forwards": 20,
+            "speculative_verify_forwards": 13,
+            "speculative_commits_copied": 17,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 0
+          }
+        }
+      ],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v4",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pipeline_prefill_graph.py -f",
+      "cpu_only": false,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": true
+    },
+    {
+      "name": "tp_piecewise_v4",
+      "id": "01790930069906952015-1314800df700",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp",
+      "result": {
+        "job_id": "01790930069906952015-1314800df700",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930940.2376025,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-prefill-pp/logs/01790930069906952015-1314800df700.log"
+      },
+      "log_sha256": "09c6dbe0bd8bd3754c4c0f6a9f6dc4f6c16e01005ed9e40134cdd28dd566a599",
+      "test_summary": [
+        "Ran 2 tests in 138.814s",
+        "OK"
+      ],
+      "captures": [
+        {
+          "prefill_capture": "disabled",
+          "tp_size": 2,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 10,
+          "tensor_objects": 344,
+          "tensor_bytes": 13785932,
+          "source_frames": 114,
+          "prefill_replay_frames": 0,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [],
+          "graph_prefix_lengths": [],
+          "reused_graph_buffers": 0,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "eager_forwards": 41,
+            "sealed": 10,
+            "ready": 10
+          }
+        },
+        {
+          "prefill_capture": "tc_piecewise",
+          "tp_size": 2,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 344,
+          "tensor_bytes": 13588796,
+          "source_frames": 86,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "overlap_forwards": 31,
+            "cuda_graph_forwards": 30,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 10
+          }
+        },
+        {
+          "prefill_capture": "tc_piecewise",
+          "tp_size": 2,
+          "pp_size": 1,
+          "target_kv": true,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 344,
+          "tensor_bytes": 13908812,
+          "source_frames": 78,
+          "prefill_replay_frames": 22,
+          "verify_replay_frames": 54,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            0,
+            3
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 2,
+          "producer_exited": true,
+          "capture_counters": {
+            "admitted": 10,
+            "overlap_forwards": 27,
+            "cuda_graph_forwards": 26,
+            "speculative_verify_forwards": 19,
+            "speculative_commits_copied": 27,
+            "sealed": 10,
+            "eager_forwards": 1,
+            "ready": 10
+          }
+        }
+      ],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v4",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_tensor_prefill_graph.py -f TestTensorPrefillGraphCapture.test_ar_piecewise TestTensorPrefillGraphCapture.test_dspark_piecewise",
+      "cpu_only": false,
+      "allocation": "temporary_two_h100",
+      "acceptance_evidence": true
+    },
+    {
+      "name": "ar_piecewise_v4",
+      "id": "01790930070207791229-8d43400ac087",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "result": {
+        "job_id": "01790930070207791229-8d43400ac087",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930513.661206,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790930070207791229-8d43400ac087.log"
+      },
+      "log_sha256": "2d0bf1b3039c69c0e016b64ab78b4e372e23b4fe7b93a20669aac198757fbbe1",
+      "test_summary": [
+        "Ran 1 test in 58.250s",
+        "OK"
+      ],
+      "captures": [
+        {
+          "prefill_capture": "tc_piecewise",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": true,
+          "samples": 9,
+          "tensor_objects": 198,
+          "tensor_bytes": 13348866,
+          "source_frames": 36,
+          "prefill_replay_frames": 10,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 10,
+            "excluded_health_check": 1,
+            "admitted": 9,
+            "overlap_forwards": 24,
+            "cuda_graph_forwards": 23,
+            "sealed": 9,
+            "writer_started": 9,
+            "copies_completed": 9,
+            "snapshot_built": 9,
+            "ready": 9,
+            "eager_forwards": 1
+          }
+        }
+      ],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v4",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_prefill_graph.py -f TestPrefillGraphCapture.test_torch_compile_piecewise_overlap",
+      "cpu_only": false,
+      "allocation": "resident",
+      "acceptance_evidence": true
+    },
+    {
+      "name": "dspark_piecewise_v4",
+      "id": "01790930070523169669-300df998b5a7",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "result": {
+        "job_id": "01790930070523169669-300df998b5a7",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790930616.159463,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790930070523169669-300df998b5a7.log"
+      },
+      "log_sha256": "e214387b7defec219b03ad9409116f0e2b647cce37de98b86d10d74a3a3429d5",
+      "test_summary": [
+        "Ran 1 test in 90.940s",
+        "OK"
+      ],
+      "captures": [
+        {
+          "prefill_capture": "full",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": false,
+          "overlap": false,
+          "samples": 9,
+          "tensor_objects": 198,
+          "tensor_bytes": 13238274,
+          "source_frames": 27,
+          "prefill_replay_frames": 10,
+          "verify_replay_frames": 0,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [],
+          "graph_shapes": [
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 10,
+            "excluded_health_check": 1,
+            "admitted": 9,
+            "cuda_graph_forwards": 18,
+            "sealed": 9,
+            "writer_started": 9,
+            "copies_completed": 9,
+            "snapshot_built": 9,
+            "ready": 9,
+            "eager_forwards": 1
+          }
+        },
+        {
+          "prefill_capture": "tc_piecewise",
+          "tp_size": 1,
+          "pp_size": 1,
+          "target_kv": true,
+          "overlap": true,
+          "samples": 10,
+          "tensor_objects": 212,
+          "tensor_bytes": 13908812,
+          "source_frames": 39,
+          "prefill_replay_frames": 11,
+          "verify_replay_frames": 27,
+          "prefill_hidden_states": false,
+          "verify_result_lags": [
+            0,
+            3
+          ],
+          "graph_shapes": [
+            [
+              1,
+              13,
+              16
+            ],
+            [
+              1,
+              15,
+              16
+            ],
+            [
+              1,
+              19,
+              32
+            ],
+            [
+              1,
+              128,
+              128
+            ],
+            [
+              3,
+              113,
+              128
+            ]
+          ],
+          "graph_prefix_lengths": [
+            0,
+            128,
+            256,
+            271
+          ],
+          "reused_graph_buffers": 1,
+          "producer_exited": true,
+          "capture_counters": {
+            "considered": 11,
+            "excluded_health_check": 1,
+            "admitted": 10,
+            "overlap_forwards": 27,
+            "cuda_graph_forwards": 26,
+            "speculative_verify_forwards": 19,
+            "speculative_commits_copied": 27,
+            "sealed": 10,
+            "writer_started": 10,
+            "copies_completed": 10,
+            "snapshot_built": 10,
+            "ready": 10,
+            "eager_forwards": 1
+          }
+        }
+      ],
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pp-prefill-v4",
+      "test_command": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_dspark_prefill_graph.py -f TestTargetKVPrefillGraphCapture.test_torch_compile_piecewise_overlap",
+      "cpu_only": false,
+      "allocation": "resident",
+      "acceptance_evidence": true
+    }
+  ],
+  "checks": {
+    "all_22_jobs_terminal": true,
+    "all_acceptance_jobs_pass": true,
+    "checkout_matches_final_frozen_source": true,
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "changed_production_files_add_no_ruff_I_F_diagnostics": [
+      {
+        "path": "python/sglang/srt/model_executor/cuda_graph_buffer_registry.py",
+        "baseline": [
+          {
+            "code": "I001",
+            "message": "Import block is un-sorted or un-formatted"
+          }
+        ],
+        "current": [
+          {
+            "code": "I001",
+            "message": "Import block is un-sorted or un-formatted"
+          }
+        ]
+      },
+      {
+        "path": "python/sglang/srt/model_executor/model_runner_components/layer_setup.py",
+        "baseline": [],
+        "current": []
+      },
+      {
+        "path": "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py",
+        "baseline": [
+          {
+            "code": "I001",
+            "message": "Import block is un-sorted or un-formatted"
+          }
+        ],
+        "current": [
+          {
+            "code": "I001",
+            "message": "Import block is un-sorted or un-formatted"
+          }
+        ]
+      },
+      {
+        "path": "python/sglang/srt/model_executor/runner_utils/buffers.py",
+        "baseline": [
+          {
+            "code": "I001",
+            "message": "Import block is un-sorted or un-formatted"
+          }
+        ],
+        "current": [
+          {
+            "code": "I001",
+            "message": "Import block is un-sorted or un-formatted"
+          }
+        ]
+      }
+    ],
+    "new_and_touched_test_files_full_ruff": "pass",
+    "git_diff_check": "pass"
+  },
+  "remaining": [
+    "mixed TP/PP prefill graphs",
+    "P/D prefill graphs",
+    "other model families and speculative modes",
+    "MLA-specific prefix graphs",
+    "mixed prefill/decode batches",
+    "Inductor",
+    "this prefill combination over RDMA",
+    "production Catalog retention",
+    "trained draft quality",
+    "serving SLOs"
+  ]
+}

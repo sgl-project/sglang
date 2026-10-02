@@ -3,6 +3,7 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
 )
@@ -12,6 +13,27 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestComputeAttentionAndMoeLayers(unittest.TestCase):
+    def test_pipeline_holes_preserve_global_attention_ids(self):
+        first, second = SimpleNamespace(), SimpleNamespace()
+        layer_model = SimpleNamespace(
+            layers=[
+                PPMissingLayer(),
+                SimpleNamespace(self_attn=SimpleNamespace(attn=first)),
+                SimpleNamespace(self_attn=SimpleNamespace(attn=second)),
+                PPMissingLayer(),
+            ]
+        )
+        result = compute_attention_and_moe_layers(layer_model)
+        self.assertEqual(result.attention_layers, [None, first, second, None])
+        self.assertEqual(result.mha_companion_layers, [None] * 4)
+        self.assertTrue(all(len(items) == 4 for items in result))
+
+    def test_unknown_local_layer_still_fails_complete_discovery(self):
+        layer_model = SimpleNamespace(layers=[PPMissingLayer(), SimpleNamespace()])
+        result = compute_attention_and_moe_layers(layer_model)
+        self.assertEqual(result.attention_layers, [None])
+        self.assertLess(len(result.attention_layers), len(layer_model.layers))
+
     def test_deepseek_mla_registers_mha_companion(self):
         attn_mqa = SimpleNamespace()
         attn_mha = SimpleNamespace()

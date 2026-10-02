@@ -60,6 +60,43 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         foreach_copy(group_dsts, group_srcs)
 
 
+def _allocate_pp_proxy_buffers(
+    *,
+    pp_size: int,
+    max_num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    hc_hidden_size: int | None = None,
+    pp_proxy_topk_size: int | None = None,
+    pp_proxy_residual_num_blocks: int | None = None,
+) -> dict[str, torch.Tensor] | None:
+    if pp_size <= 1:
+        return None
+    # Every activation has a token axis, including speculative verify rows.
+    # mHC folds the residual into a wider hidden-state tensor.
+    buffers = {
+        "hidden_states": torch.zeros(
+            (
+                max_num_tokens,
+                hc_hidden_size if hc_hidden_size is not None else hidden_size,
+            ),
+            dtype=dtype,
+        )
+    }
+    if hc_hidden_size is None:
+        residual_shape = (
+            (max_num_tokens, pp_proxy_residual_num_blocks, hidden_size)
+            if pp_proxy_residual_num_blocks is not None
+            else (max_num_tokens, hidden_size)
+        )
+        buffers["residual"] = torch.zeros(residual_shape, dtype=dtype)
+    if pp_proxy_topk_size is not None:
+        buffers["topk_indices"] = torch.zeros(
+            (max_num_tokens, pp_proxy_topk_size), dtype=torch.int32
+        )
+    return buffers
+
+
 @dataclass
 class DecodeInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
@@ -129,29 +166,15 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
             )
 
-            if pp_size > 1:
-                is_mhc = hc_hidden_size is not None
-                hs = hc_hidden_size if is_mhc else hidden_size
-                pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
-                }
-                if not is_mhc:
-                    # PP activations have one row per token, including every
-                    # speculative verify token within each request.
-                    residual_shape = (
-                        (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
-                        if pp_proxy_residual_num_blocks is not None
-                        else (max_num_token, hidden_size)
-                    )
-                    pp_proxy_tensors["residual"] = torch.zeros(
-                        residual_shape, dtype=dtype
-                    )
-                if pp_proxy_topk_size is not None:
-                    pp_proxy_tensors["topk_indices"] = torch.zeros(
-                        (max_num_token, pp_proxy_topk_size), dtype=torch.int32
-                    )
-            else:
-                pp_proxy_tensors = None
+            pp_proxy_tensors = _allocate_pp_proxy_buffers(
+                pp_size=pp_size,
+                max_num_tokens=max_num_token,
+                hidden_size=hidden_size,
+                dtype=dtype,
+                hc_hidden_size=hc_hidden_size,
+                pp_proxy_topk_size=pp_proxy_topk_size,
+                pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
+            )
 
             if is_encoder_decoder:
                 encoder_lens = torch.full(
@@ -342,6 +365,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    pp_proxy_tensors: dict[str, torch.Tensor] | None = None
 
     @classmethod
     def create(
@@ -355,6 +379,10 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
+        pp_size: int = 1,
+        hc_hidden_size: int | None = None,
+        pp_proxy_topk_size: int | None = None,
+        pp_proxy_residual_num_blocks: int | None = None,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
@@ -374,6 +402,15 @@ class PrefillInputBuffers(ForwardInputBuffers):
                 else None
             )
             positions = torch.zeros((max_num_tokens,), dtype=torch.int64)
+            pp_proxy_tensors = _allocate_pp_proxy_buffers(
+                pp_size=pp_size,
+                max_num_tokens=max_num_tokens,
+                hidden_size=hidden_size,
+                dtype=dtype,
+                hc_hidden_size=hc_hidden_size,
+                pp_proxy_topk_size=pp_proxy_topk_size,
+                pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
+            )
 
             if is_multimodal:
                 input_embeds = torch.zeros((max_num_tokens, hidden_size), dtype=dtype)
@@ -392,6 +429,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
     def populate_from_forward_batch(

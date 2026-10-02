@@ -37,7 +37,7 @@ it does not redefine the goal as the modules already implemented.
 | Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture matches a full target contract; deployed TP/PP model validation remains open |
 | Startup identity exchange | Bounded JSON over the existing CPU group, phase failure votes and final digest agreement | Real four-process Gloo TP2/PP2 and TP4/PP1 cases pass, including local failures, peer exit and finite waits; distributed request/resource coordination remains open |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
-| Prefill graph collection | Capture uses live request lengths after graph replay and owns compact teacher/KV buffers; KV-input DSpark uses its resolved hidden-state requirement | AR and static target-KV DSpark pass Full synchronous/overlap, Breakable and default torch.compile piecewise with padding, chunked/cached prefixes, batch reuse and post-exit Store parity; distributed and other speculative prefill graphs remain open |
+| Prefill graph collection | Live request lengths, owned teacher/KV staging, resolved hidden capture, and stable PP activation inputs/outputs | AR and static target-KV DSpark pass Full, Breakable and default torch.compile piecewise on PP2 synchronous, TP2 overlap and single GPU, with eager output comparison and post-exit Store parity; mixed TP/PP, P/D and other speculative prefill graphs remain open |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production checkpoint-manager integration and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
@@ -3430,10 +3430,56 @@ Catalog test double. It does not validate distributed or other speculative
 prefill graphs, MLA-specific prefix graphs, mixed prefill/decode batches,
 Inductor, this combination over RDMA, trained-model quality or serving SLOs.
 
+## Distributed Prefill Graphs
+
+Prefill now stages PP activations on the token axis, clears padded rows, rejects
+missing/misaligned stage inputs and trims every intermediate output before
+pipeline transport. Layer discovery preserves global attention IDs across
+remote-stage placeholders. Unknown local layers still fail the graph eligibility
+check. Decode and prefill share the existing activation allocation geometry.
+
+The initial real PP test exposed the layer-discovery fallback. The first full
+matrix then caught a second defect through unbiased greedy output comparison:
+piecewise graphs replayed capture-time addresses while the runner supplied new
+clones. Full/Breakable now clone inside their captured body; piecewise receives
+stable registry views, refreshed before every replay. A focused CPU regression
+models capture-time pointer reuse, and piecewise runtime cases enable the
+compiler's input-address assertion.
+
+The primary matrices pass six tests each: PP2 synchronous in 284.237s and TP2
+overlap in 330.710s. Each topology covers AR and static KV-input DSpark with
+Full, Breakable and default-eager torch.compile piecewise prefill, producing
+60 graph samples and ten separate eager baseline samples. Every rank records
+actual replay, with 22 prefill source frames per graph case. Generated tokens
+match the eager baseline, including an unbiased response. Post-exit Store
+readback checks selected KV, raw top-128 scores/IDs, LSE, tokens, masks, positions,
+terminal validity, topology and complete owner coverage.
+
+Single-GPU AR (four tests, 148.103s) and DSpark (four tests, 190.909s) regressions
+pass with 36 and 40 samples respectively, plus nine AR seed samples. CPU checks
+pass 37 registry, 26 runner, 11 prefill helper, three layer-discovery and five
+prefix-gate tests; the final six-test PP file replaces the earlier five-test
+version and adds the piecewise pointer regression. These are 83 distinct test
+methods across the passing runs. See [the runbook](experiments/DISTRIBUTED_PREFILL_CAPTURE.md)
+and [retained evidence](experiments/distributed-prefill-capture.json) for source
+versions, supplemental address checks, failed attempts and resource cleanup.
+
+Final-source piecewise address checks pass two TP2 and two single-GPU tests.
+All 22 jobs are terminal. The temporary two-H100 allocation is deleted, its
+pod is absent, and the resident H100 has resumed idle load. All primary and
+supplemental acceptance runs total 283 post-exit snapshot checks. The original
+staged index remains unchanged; changed production files add no Ruff I/F
+diagnostics, and new/touched test files pass full Ruff.
+
+Scope remains BF16 Qwen3-0.6B, synthetic static KV-input DSpark, FlashInfer
+target, Triton draft, TCP Store and a Catalog test double. Mixed TP/PP and P/D
+prefill graphs, Inductor, other models/speculative modes, RDMA combinations,
+production retention, trained quality and serving SLOs remain open.
+
 ## Next Implementation
 
-1. Extend passing single-GPU AR/static target-KV DSpark prefill graph coverage to
-   distributed, other speculative and mixed-batch execution. Extend distributed
+1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
+   coverage to mixed TP/PP, P/D, other speculative and mixed-batch execution. Extend distributed
    pressure beyond passing
    colocated and P/D synchronous TP1/PP2 and TP2/PP2 DSpark to AR and asymmetric
    combined topologies. Broaden real-request coverage to speculative cache

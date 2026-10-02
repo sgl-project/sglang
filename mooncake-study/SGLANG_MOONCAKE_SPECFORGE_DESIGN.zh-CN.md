@@ -436,6 +436,23 @@ Triton draft、TCP Store 和 Catalog test double。合成 draft 用于正确性�
 复现与证据见 [`experiments/DSPARK_PREFILL_CAPTURE.md`](experiments/DSPARK_PREFILL_CAPTURE.md)
 和 [`experiments/dspark-prefill-capture.json`](experiments/dspark-prefill-capture.json)。
 
+分布式 prefill 现已扩展到 TP1/PP2 同步和 TP2/PP1 overlap。每种拓扑均通过
+AR、静态 KV-input DSpark 与 Full/Breakable/tc_piecewise 的六项组合，共
+120 个 graph 样本，另有每种拓扑各 10 个独立 eager 基线样本。所有 rank 必须
+实际 replay；生成 token 与 eager 一致，服务退出后的 Mooncake 读回仍须逐张量
+验证 KV、原始 top128/ID/LSE、token、mask、位置及终止有效性。
+
+PP prefill 的 activation 由 runner 自己持有，按 token 轴复制、清零 padding，
+输出裁剪后再发送到下一 stage。layer discovery 保留远端层占位，确保 attention
+使用全局 layer ID。Full/Breakable 在捕获的 body 内 clone；piecewise 使用每轮
+刷新的固定地址 buffer，因为在 compiled model 外新建 clone 会让子图读到旧地址。
+这个问题由无 bias 的 eager 对照实际发现，修复后还通过了输入地址断言。
+
+该验证使用默认 eager compiler、真实 TCP Store 和测试 Catalog，不证明混合
+TP/PP、P/D prefill graph、Inductor、RDMA 组合或服务性能。复现和完整记录见
+[`experiments/DISTRIBUTED_PREFILL_CAPTURE.md`](experiments/DISTRIBUTED_PREFILL_CAPTURE.md)
+和 [`experiments/distributed-prefill-capture.json`](experiments/distributed-prefill-capture.json)。
+
 ### 7.4 选层 KV 导出
 
 `SelectedLayerKVExporter` 接收 request logical positions 到物理 slot 的映射，以及当前 target KV pool。它只导出 contract 中明确选择的层和有效位置。
