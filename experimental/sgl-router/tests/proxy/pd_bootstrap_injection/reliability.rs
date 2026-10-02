@@ -290,3 +290,26 @@ async fn prefill_sse_error_event_is_a_prefill_failure() {
         assert_eq!(outcomes(&ctx, &prefill.url, "prefill"), ["error"]);
     }
 }
+
+/// Native `/generate` streams a prefill failure as an abort, not an error event.
+#[tokio::test]
+async fn prefill_native_abort_event_is_a_prefill_failure() {
+    let abort = "data: {\"meta_info\": {\"finish_reason\": {\"type\": \"abort\"}}}\n\n";
+    let prefill = MockWorker::start(vec![abort]).await;
+    let decode = MockWorker::start_hanging(Duration::from_secs(10)).await;
+    let ctx = pd_ctx(&prefill.url, &decode.url, false);
+    let request = Request::post("/generate")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"stream": true}).to_string()))
+        .unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        build_router(ctx.clone()).oneshot(request),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.headers()["x-router-error-code"], "prefill_failed");
+    assert_eq!(outcomes(&ctx, &prefill.url, "prefill"), ["error"]);
+}

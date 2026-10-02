@@ -325,11 +325,14 @@ fn spawn_prefill_request(
 /// `prefill_failed`.
 async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
     let status = match result {
-        // A streaming prefill reports a late failure as a 200 carrying an SSE error event.
+        // A streaming prefill reports a late failure as a 200 carrying an SSE error event,
+        // or for native `/generate` an abort event.
         Ok(response) if response.status().is_success() => {
             let status = response.status();
             match axum::body::to_bytes(response.into_body(), usize::MAX).await {
-                Ok(body) if !sse::has_error_event(&body) => return None,
+                Ok(body) if !sse::has_error_event(&body) && !sse::has_abort_event(&body) => {
+                    return None
+                }
                 _ => status,
             }
         }

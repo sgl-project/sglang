@@ -24,8 +24,8 @@ const GENERATE_PATH: &str = "/generate";
 
 /// Validated routing inputs and the original body, ready for worker selection.
 ///
-/// A `/generate` batch runs each prompt as its own engine request: the input and
-/// output counts sum over prompts, while the sequence counts bound the longest.
+/// Each `/generate` prompt and `n` sample is its own engine request: input and output
+/// counts sum over them, while the sequence counts bound the longest.
 pub(super) struct PreparedRequest {
     /// Engine endpoint the request is forwarded to.
     pub(super) path: &'static str,
@@ -121,7 +121,8 @@ impl PreparedRequest {
         }
         let tokens = request_tokens_for(&ctx.tokenizers, &model, &value);
         let batch = batch_prompt_tokens(&value);
-        let fans_out = batch.is_some() || parallel_samples(&value) > 1;
+        let samples = parallel_samples(&value);
+        let fans_out = batch.is_some() || samples > 1;
         let lengths = batch.unwrap_or_else(|| {
             let embeds = input_embeds(&value).map(|rows| rows.len().max(1));
             vec![embeds.unwrap_or_else(|| input_token_count(tokens.as_ref(), &body))]
@@ -141,10 +142,15 @@ impl PreparedRequest {
             path: GENERATE_PATH,
             model,
             streaming: stream.unwrap_or(false),
-            output_tokens: outputs
-                .as_ref()
-                .map(|outputs| outputs.iter().fold(0, |sum: u64, &o| sum.saturating_add(o))),
-            input_token_count: lengths.iter().sum::<usize>().max(1),
+            output_tokens: outputs.as_ref().map(|outputs| {
+                let output = outputs.iter().fold(0, |sum: u64, &o| sum.saturating_add(o));
+                output.saturating_mul(samples)
+            }),
+            input_token_count: lengths
+                .iter()
+                .sum::<usize>()
+                .max(1)
+                .saturating_mul(samples as usize),
             sequence_token_count: sequence_tokens,
             expected_peak_sequence_tokens: outputs.map(|outputs| {
                 let peaks = lengths.iter().zip(outputs);
@@ -260,7 +266,7 @@ fn batch_prompt_tokens(value: &Value) -> Option<Vec<usize>> {
     )
 }
 
-/// Samples per prompt; beam search returns its `n` from one request.
+/// Samples per prompt, at least one; beam search returns its `n` from one request.
 fn parallel_samples(value: &Value) -> u64 {
     let params = match &value["sampling_params"] {
         Value::Array(batch) => batch.first().unwrap_or(&Value::Null),
@@ -268,7 +274,7 @@ fn parallel_samples(value: &Value) -> u64 {
     };
     match params["beam_width"].as_u64() {
         Some(width) if width > 1 => 1,
-        _ => params["n"].as_u64().unwrap_or(1),
+        _ => params["n"].as_u64().unwrap_or(1).max(1),
     }
 }
 
@@ -981,10 +987,11 @@ mod tests {
                 true,
                 (2, 1, None, None),
             ),
+            // Each sample is its own engine request, with its own KV.
             (
-                json!({"input_ids": [1], "sampling_params": {"n": 2}}),
+                json!({"input_ids": [1], "sampling_params": {"n": 2, "max_new_tokens": 8}}),
                 true,
-                (1, 1, None, None),
+                (2, 1, Some(16), Some(9)),
             ),
             (
                 json!({"input_ids": [1], "sampling_params": {"n": 2, "beam_width": 2}}),

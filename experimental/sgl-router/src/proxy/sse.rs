@@ -77,6 +77,15 @@ pub fn has_error_event(body: &[u8]) -> bool {
     ErrorEventScanner::default().feed(body)
 }
 
+/// Whether a buffered SSE body carries a native `/generate` abort,
+/// which the engine streams as `meta_info.finish_reason`, not as an error event.
+pub fn has_abort_event(body: &[u8]) -> bool {
+    body.split(|&b| b == b'\n')
+        .filter_map(|line| line.strip_prefix(b"data:"))
+        .filter_map(|data| serde_json::from_slice::<serde_json::Value>(data).ok())
+        .any(|event| event["meta_info"]["finish_reason"]["type"] == "abort")
+}
+
 /// Bounds on a streaming response beyond what the upstream stream itself provides.
 #[derive(Debug, Clone, Default)]
 pub struct StreamLimits {
@@ -612,6 +621,15 @@ mod tests {
         assert!(
             scanner.feed(b"data: {\"error\": {\"message\": \"queue is full\", \"code\": 503}}\n\n")
         );
+    }
+
+    #[test]
+    fn abort_event_detects_native_generate_abort() {
+        let abort = br#"{"text": "", "meta_info": {"finish_reason": {"type": "abort", "status_code": 500}}}"#;
+        let stop = br#"{"text": "hi", "meta_info": {"finish_reason": {"type": "stop"}}}"#;
+        let stream = |event: &[u8]| [b"data: ", event, b"\n\ndata: [DONE]\n\n"].concat();
+        assert!(has_abort_event(&stream(abort)));
+        assert!(!has_abort_event(&stream(stop)));
     }
 
     #[test]

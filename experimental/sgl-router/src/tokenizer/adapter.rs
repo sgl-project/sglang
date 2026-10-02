@@ -62,6 +62,8 @@ pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<(Vec<u32>, Vec
         return Ok(Default::default());
     }
     // Through `files`, which downloads it: a cold HF cache holds only tokenizer.json.
+    // A failed download leaves the special tokens unknown, so /generate keeps text.
+    files.ensure_downloaded("tokenizer_config.json")?;
     let config = files.json("tokenizer_config.json")?.unwrap_or_default();
     let plain = create_tokenizer_from_file(&path)?;
     let ids = |t: &dyn traits::Tokenizer, text: &str| -> Result<Vec<u32>> {
@@ -368,6 +370,20 @@ impl ModelFiles {
             }
         };
         path.is_file().then_some(path)
+    }
+
+    /// Fail if the model may ship `file` but it cannot be downloaded,
+    /// which the readers below only warn about and report as absent.
+    pub fn ensure_downloaded(&self, file: &str) -> Result<()> {
+        if self.local_dir.is_none()
+            && self
+                .repo_files
+                .as_ref()
+                .is_none_or(|files| files.contains(file))
+        {
+            download_repo_file(&self.source, file)?;
+        }
+        Ok(())
     }
 
     /// Read the text `file`; `None` when the model ships no such file.
