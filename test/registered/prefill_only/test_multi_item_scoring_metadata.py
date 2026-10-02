@@ -13,6 +13,7 @@ import torch
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
@@ -44,7 +45,7 @@ def _run(fb, enable_mis=True):
     return FlashInferAttnBackend._process_multi_item_scoring(backend, fb)
 
 
-class TestMISMetadataBuild(unittest.TestCase):
+class TestMISMetadataBuild(CustomTestCase):
     def test_single_sequence(self):
         # Docstring Case 1: query of 7 tokens then 3 single-token items, each
         # preceded by a delimiter at indices 7, 9, 11, 13 (seq len 14).

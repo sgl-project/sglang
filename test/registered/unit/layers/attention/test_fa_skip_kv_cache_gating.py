@@ -8,11 +8,12 @@ from types import SimpleNamespace
 
 import sglang.srt
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestFaSkipKvCacheGating(unittest.TestCase):
+class TestFaSkipKvCacheGating(CustomTestCase):
     def test_raw_kv_requires_opt_in_and_structural_preconditions(self):
         path = (
             Path(next(iter(sglang.srt.__path__)))

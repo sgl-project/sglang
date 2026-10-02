@@ -23,6 +23,7 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
 )
 from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -66,7 +67,7 @@ def _stream(embeddings):
     return streamer.send_to_detokenizer.send_output.call_args.args[0]
 
 
-class TestEmbeddingEncodingFormat(unittest.IsolatedAsyncioTestCase):
+class TestEmbeddingEncodingFormat(unittest.IsolatedAsyncioTestCase, CustomTestCase):
     def setUp(self):
         sparse = patch.object(
             envs.SGLANG_EMBEDDINGS_SPARSE_HEAD, "is_set", return_value=False
