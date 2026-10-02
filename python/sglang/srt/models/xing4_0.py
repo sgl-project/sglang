@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -41,7 +42,19 @@ from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.configs.xing4_0 import Xing4_0Config
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.layer_boundary import (
+    AttentionInputs,
+    ProducerReduction,
+    declare_attn,
+    declare_ffn,
+    get_attn_tp_context,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.ops import attn_tp_all_reduce
+from sglang.srt.layers.layer_boundary.residual import access as residual_access
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
@@ -391,6 +404,7 @@ class Xing4_0DecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             layer_id=layer_id,
+            reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
             is_nextn=is_nextn,
@@ -441,27 +455,53 @@ class Xing4_0DecoderLayer(nn.Module):
             self.attn_hc = mHCModule(config, config.num_hidden_layers)
             self.ffn_hc = mHCModule(config, config.num_hidden_layers)
 
-        from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
+        self._stage_enters_stack = (layer_id) == 0
+        self._stage_terminal = (layer_id) == (
+            1 if is_nextn else config.num_hidden_layers
+        ) - 1
+        self._stage_previous_sparse = is_previous_layer_sparse
+        self._stage_next_sparse = is_next_layer_sparse
+
+        # KTEPWrapperMethod returns a TP-local partial: GPU expert partitions
+        # are present on their respective ranks, while the complete CPU-expert
+        # contribution exists only on TP rank 0.  Declare such an FFN output as
+        # TAIL_AFTER_SUM so the boundary never defers its post-experts
+        # all-reduce to a later layer; the CPU contribution is then counted
+        # exactly once inside the MoE's own collective.
+        self.is_kt_moe = isinstance(self.mlp, deepseek_v2.DeepseekV2MoE) and isinstance(
+            self.mlp.experts.quant_method, KTEPWrapperMethod
+        )
+        ffn_reduction = (
+            ProducerReduction.TAIL_AFTER_SUM
+            if self.is_kt_moe
+            else ProducerReduction.EXIT_SCOPED
         )
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=is_nextn or (layer_id == config.num_hidden_layers - 1),
-            qkv_latent_func=self.self_attn.prepare_qkv_latent,
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (
+                declare_attn(),
+                self.input_layernorm,
+                {"qkv_latent_func": self.self_attn.prepare_qkv_latent},
+            ),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=self._stage_next_sparse,
+                    reduction=ffn_reduction,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=self._stage_previous_sparse,
+                next_layer_sparse=self.is_layer_sparse,
+            )
+            if not self._stage_enters_stack
+            else None,
+            terminal=self._stage_terminal,
         )
 
     def forward(
@@ -469,7 +509,6 @@ class Xing4_0DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: torch.Tensor | None,
         zero_allocator,
         gemm_output_zero_allocator=None,
         llama_4_scaling: torch.Tensor | None = None,
@@ -489,33 +528,51 @@ class Xing4_0DecoderLayer(nn.Module):
 
             hidden_states = aggregated_hidden_states.reshape(-1, C)
 
-            # Use prepare_attn to set up attn_inputs_ (needed by MLA attention)
-            hidden_states, residual = (
-                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+            # The legacy ``prepare_attn`` entry (invoked here with
+            # residual=None) applied the input RMSNorm on the residual-is-None
+            # path before publishing the attention inputs, so the mHC branch
+            # always ran MLA on normed rows.  Keep that norm now that this path
+            # bypasses the stage boundary.
+            hidden_states = self.input_layernorm(hidden_states)
+
+            # Hand the aggregated input to the MLA attention's qkv-latent hook
+            # (the new-architecture replacement for the old ``prepare_attn``
+            # bookkeeping).  The aggregation above always produces full rows on
+            # this rank, so the input is marked pre-gathered even when the
+            # forward runs with attn-TP input scattering enabled.
+            get_attn_tp_context().set_attn_inputs(
+                AttentionInputs(
                     hidden_states,
-                    None,
                     forward_batch,
+                    self.self_attn.prepare_qkv_latent,
+                    is_pre_gathered=True,
                 )
             )
 
-            attn_kwargs = {
-                "positions": positions,
-                "hidden_states": hidden_states,
-                "forward_batch": forward_batch,
-                "zero_allocator": zero_allocator,
-                "layer_scatter_modes": self.layer_scatter_modes,
-                "llama_4_scaling": llama_4_scaling,
-                "prev_topk_indices": prev_topk_indices,
-            }
-            hidden_states = self.self_attn(**attn_kwargs)
+            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    zero_allocator=zero_allocator,
+                    llama_4_scaling=llama_4_scaling,
+                    input_on_attn_tp_slices=False,
+                    prev_topk_indices=prev_topk_indices,
+                )
             if isinstance(hidden_states, tuple):
                 hidden_states, topk_indices = hidden_states
             else:
                 topk_indices = None
 
-            from sglang.srt.layers.communicator import get_attn_tp_context
-
             get_attn_tp_context().clear_attn_inputs()
+
+            # Complete the attention output's partial sum over the attention-TP
+            # group (o_proj is built with reduce_results=False): the fused
+            # mhc_post mixing below consumes the full contribution, so this
+            # layer never defers the reduction to a stage boundary.
+            hidden_states = attn_tp_all_reduce(
+                hidden_states, forward_batch, may_quantize=False
+            )
 
             hidden_states = hidden_states.reshape(S, B, C)
 
@@ -565,36 +622,31 @@ class Xing4_0DecoderLayer(nn.Module):
                 layer_output_with_bias=(hidden_states, None),
             )
 
-            return hidden_states, None, topk_indices
+            return hidden_states, topk_indices
 
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
+        hidden_states_orig = residual_access.buffer(hidden_states)
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
         )
 
-        attn_kwargs = {
-            "positions": positions,
-            "hidden_states": hidden_states,
-            "forward_batch": forward_batch,
-            "zero_allocator": zero_allocator,
-            "layer_scatter_modes": self.layer_scatter_modes,
-            "prev_topk_indices": prev_topk_indices,
-        }
-        if not self.use_mha:
-            attn_kwargs["llama_4_scaling"] = llama_4_scaling
-        attn_output = self.self_attn(**attn_kwargs)
-        if isinstance(attn_output, tuple):
-            attn_output, topk_indices = attn_output
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            attn_kwargs = {
+                "positions": positions,
+                "hidden_states": hidden_states,
+                "forward_batch": forward_batch,
+                "zero_allocator": zero_allocator,
+                "input_on_attn_tp_slices": self.attn_boundary.input_on_attn_tp_slices,
+                "prev_topk_indices": prev_topk_indices,
+            }
+            if not self.use_mha:
+                attn_kwargs["llama_4_scaling"] = llama_4_scaling
+            hidden_states = self.self_attn(**attn_kwargs)
+        if isinstance(hidden_states, tuple):
+            hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
-
-        hidden_states = attn_output
-
-        from sglang.srt.layers.communicator import get_attn_tp_context
 
         get_attn_tp_context().clear_attn_inputs()
 
@@ -602,62 +654,50 @@ class Xing4_0DecoderLayer(nn.Module):
             isinstance(self.self_attn, deepseek_v2.DeepseekV2AttentionMLA)
             and hidden_states.dtype == torch.float16
         ):
+            # Scaling the attention's partial sum scales its complete sum; at
+            # layer 0 the raw embedding sits in the residual stream.
             hidden_states *= 1.0 / self.routed_scaling_factor
             if self.layer_id == 0:
-                residual *= 1.0 / self.routed_scaling_factor
+                stream = forward_batch.residual_stream
+                if stream is not None and stream.residual is not None:
+                    stream.residual *= 1.0 / self.routed_scaling_factor
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
+        if isinstance(self.mlp, deepseek_v2.DeepseekV2MLP):
+            gemm_output_zero_allocator = None
 
-        # KTEPWrapperMethod returns a TP-local partial: GPU expert partitions
-        # are present on their respective ranks, while the complete CPU-expert
-        # contribution exists only on TP rank 0.  Force DeepseekV2MoE to perform
-        # its post-experts all-reduce immediately so the CPU contribution is
-        # counted exactly once.  Deferring this collective to the next layer or
-        # replacing it with reduce-scatter would make the wrapper's communication
-        # contract dependent on a later path.
-        is_kt_moe = isinstance(self.mlp, deepseek_v2.DeepseekV2MoE) and isinstance(
-            self.mlp.experts.quant_method, KTEPWrapperMethod
-        )
-        if is_kt_moe:
-            fuse_mlp_allreduce = False
-            mlp_reduce_scatter = False
-
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
+        if (
+            isinstance(self.mlp, deepseek_v2.DeepseekV2MoE)
+            and not self.mlp.experts.moe_runner_config.inplace
+            and not torch.compiler.is_compiling()
+            # A deferred MoE finalize handoff from the previous layer is no buffer.
+            and isinstance(hidden_states_orig, torch.Tensor)
         ):
+            from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
+
+            _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
+        else:
+            _mlp_ctx = nullcontext()
+
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit, _mlp_ctx:
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
                 gemm_output_zero_allocator,
             )
+        hidden_states = ffn_exit.finish(hidden_states)
 
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-
-        if not fuse_mlp_allreduce:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-
+        mlp_output = residual_access.buffer(hidden_states)
         if (
             isinstance(self.mlp, deepseek_v2.DeepseekV2MLP)
-            and hidden_states.dtype == torch.float16
+            and mlp_output is not None
+            and mlp_output.dtype == torch.float16
         ):
-            hidden_states *= 1.0 / self.routed_scaling_factor
+            mlp_output *= 1.0 / self.routed_scaling_factor
 
-        return hidden_states, residual, topk_indices
+        return hidden_states, topk_indices
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
@@ -672,46 +712,43 @@ class Xing4_0DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: torch.Tensor | None,
         zero_allocator,
         tbo_subbatch_index: int | None = None,
     ):
-        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
+            hidden_states, forward_batch
         )
+        if get_moe_a2a_backend().is_mori():
+            state.num_tokens = hidden_states.shape[0]
         state.update(
-            {
-                "forward_batch": forward_batch,
-                "positions": positions,
-                "zero_allocator": zero_allocator,
-                "tbo_subbatch_index": tbo_subbatch_index,
-            }
-        )
-
-    def op_comm_prepare_mlp(self, state):
-        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
-            self.layer_communicator.prepare_mlp(
-                state.pop("hidden_states_after_attn"),
-                state.pop("residual_after_input_ln"),
-                state.forward_batch,
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                zero_allocator=zero_allocator,
+                tbo_subbatch_index=tbo_subbatch_index,
             )
         )
 
-    def op_comm_postprocess_layer(self, state):
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            state.pop("hidden_states_mlp_output"),
-            state.pop("residual_after_comm_pre_mlp"),
-            state.forward_batch,
+    def op_comm_prepare_mlp(self, state):
+        hidden_states = self.attn_boundary.finish(
+            state.pop("hidden_states_after_attn"), state.forward_batch
+        )
+        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
+            hidden_states, state.forward_batch
         )
 
-        output = {
-            "positions": state.positions,
-            "hidden_states": hidden_states,
-            "residual": residual,
-            "forward_batch": state.forward_batch,
-            "zero_allocator": state.zero_allocator,
-            "tbo_subbatch_index": state.tbo_subbatch_index,
-        }
+    def op_comm_postprocess_layer(self, state):
+        hidden_states = self.ffn_boundary.finish_complete_output(
+            state.pop("hidden_states_mlp_output"), state.forward_batch
+        )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            forward_batch=state.forward_batch,
+            zero_allocator=state.zero_allocator,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
 
         state.clear(
             expect_keys={
@@ -788,9 +825,22 @@ class Xing4_0Model(nn.Module):
                         "to Xing4_0Model.forward"
                     )
                 hidden_states = self.embed_input_ids(input_ids)
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors.inputs_embeds
+            if self.hc_mult > 1:
+                # mHC layers carry their own multi-stream residual between
+                # layers and never touch the ordinary residual stream.  Start a
+                # fresh stream so the terminal complete_output/final_norm (or
+                # to_pp) steps pass the tensors through untouched; receiving
+                # via attn_boundary.from_pp would instead write the incoming
+                # tensor into the stream and trip its output checks.
+                hidden_states = pp_proxy_tensors["hidden_states"]
+                residual_batch.start(forward_batch)
+            else:
+                hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                    pp_proxy_tensors, forward_batch
+                )
 
         n_streams = self.hc_mult
         if n_streams > 1:
@@ -798,8 +848,6 @@ class Xing4_0Model(nn.Module):
             C = hidden_states.shape[1]
             hidden_states = hidden_states.reshape(S, 1, C)
             hidden_states = input_expand(hidden_states, n_streams)
-
-        residual = None
 
         from sglang.srt.utils import BumpAllocator
 
@@ -815,23 +863,27 @@ class Xing4_0Model(nn.Module):
         for layer in self.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
-            hidden_states, residual, topk_indices = layer(
+            hidden_states, topk_indices = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
-                residual=residual,
                 zero_allocator=zero_allocator,
                 prev_topk_indices=topk_indices,
             )
 
         if not self.pp_group.is_last_rank:
-            return hidden_states
+            return residual_batch.to_pp(hidden_states, forward_batch)
+
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if n_streams > 1:
             hidden_states = output_contract(hidden_states, n_streams)
             hidden_states = hidden_states.reshape(S, C)
 
-        hidden_states = self.norm(hidden_states)
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
         return hidden_states
 
 
@@ -897,7 +949,12 @@ class Xing4_0ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.logits_processor = LogitsProcessor(config)
 
-        self.capture_aux_hidden_states = False
+        q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
+        get_attn_tp_context().init_context(
+            q_lora_rank,
+            self.use_dsa,
+            is_mhc=getattr(config, "hc_mult", 1) > 1,
+        )
 
     @property
     def start_layer(self):
@@ -916,8 +973,6 @@ class Xing4_0ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: PPProxyTensors | None = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.communicator import get_attn_tp_context
-
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
