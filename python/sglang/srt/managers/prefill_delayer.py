@@ -248,21 +248,26 @@ class PrefillDelayer:
             global_waiting_queue_max = int(global_waiting_queue_len.max().item())
 
             # Queue-based trigger: delay prefill until the waiting queue
-            # reaches queue_min = min(running_req * ratio, max_prefill_bs),
+            # reaches queue_min = running_req * ratio, capped by
+            # prefill_max_requests when a request limit is configured, and
             # capped by a wall-clock timeout to bound worst-case TTFT.
             # Targets workloads where decode requests finish one-at-a-time
             # and fragment prefill into many tiny batches.
             queue_condition = False
             if self._queue_trigger_enabled and global_running_batch_max > 0:
-                queue_capacity = (
-                    self._prefill_max_requests
-                    if self._prefill_max_requests is not None
-                    else global_max_prefill_bs_max
+                queue_min_effective = int(
+                    global_running_batch_max * self._queue_min_ratio
                 )
-                queue_min_effective = min(
-                    int(global_running_batch_max * self._queue_min_ratio),
-                    queue_capacity,
-                )
+                if self._prefill_max_requests is not None:
+                    # Never wait for more requests than one prefill batch may
+                    # admit. Only a static limit may cap the threshold: the
+                    # observed max_prefill_bs is a high-watermark over recent
+                    # attempts, and a delayed pass feeds it a waiting-queue
+                    # estimate, so capping by it collapses the threshold from
+                    # inside the very delay it is supposed to bound.
+                    queue_min_effective = min(
+                        queue_min_effective, self._prefill_max_requests
+                    )
                 queue_condition = (
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
@@ -280,9 +285,23 @@ class PrefillDelayer:
             if slot_condition or queue_condition:
                 # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
                 # the first merge_batch causes the decoding to fail to reach the maximum batch size.
-                if self.skip_first_delayer:
+                # The one-shot bypass belongs to that merge, so a queue-only
+                # trigger must not consume it - and must not be skipped by it.
+                if self.skip_first_delayer and slot_condition:
                     self.skip_first_delayer = False
                     pass
+                elif queue_condition:
+                    # A queue-triggered delay is bounded by max_delay_ms alone:
+                    # queue_condition above already turns false once the wall
+                    # clock expires, so max_delay_passes must not cut it short.
+                    next_state = prev_state or _State()
+                    next_state = next_state.bump_delayed_count()
+                    return _NegotiateOutput(
+                        next_state=next_state,
+                        output_allow=False,
+                        output_reason="delay",
+                        **debug_info,
+                    )
                 else:
                     # Bound the wait like the "mixed" branch: on a saturated
                     # engine slot_condition may never turn false, so cap the

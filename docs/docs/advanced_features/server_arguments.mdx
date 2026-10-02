@@ -582,7 +582,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--prefill-delayer-queue-min-ratio`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opt-in to the adaptive queue-based delay trigger (independent of the slot-based one). Defers prefill until the waiting queue reaches `min(running_req * ratio, max_prefill_bs)` so small fragments batch into a larger prefill. Unset keeps the original slot-only behavior. Typical: `0.1`–`0.5`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opt-in to the adaptive queue-based delay trigger (independent of the slot-based one). Defers prefill until the waiting queue reaches `running_req * ratio` (capped by `--prefill-max-requests` when set), or until `--prefill-delayer-max-delay-ms` elapses, so small fragments batch into a larger prefill. Unset keeps the original slot-only behavior. Typical: `0.1`–`0.5`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>
