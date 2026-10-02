@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Request validation, optional tokenization, and outgoing body preparation for
-//! chat completions, the native `/generate` endpoint, embeddings and rerank.
+//! chat completions, the native `/generate` endpoint, embeddings, classify and rerank.
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
@@ -21,7 +21,8 @@ const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
 const GENERATE_PATH: &str = "/generate";
-const EMBEDDINGS_PATH: &str = "/v1/embeddings";
+pub(super) const EMBEDDINGS_PATH: &str = "/v1/embeddings";
+pub(super) const CLASSIFY_PATH: &str = "/v1/classify";
 const RERANK_PATH: &str = "/v1/rerank";
 
 /// Validated routing inputs and the original body, ready for worker selection.
@@ -45,7 +46,7 @@ pub(super) struct PreparedRequest {
     pub(super) expected_peak_sequence_tokens: Option<u64>,
     caller_set_rid: bool,
     pub(super) fans_out: bool,
-    /// `None` for `/generate`, embeddings and rerank, which prepare their own body.
+    /// `None` for `/generate`, embeddings, classify and rerank, which prepare their own body.
     forwarding_scope: Option<ForwardingScope>,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
@@ -177,10 +178,11 @@ impl PreparedRequest {
         })
     }
 
-    /// The engine's OpenAI `EmbeddingRequest`, whose text `input` is forwarded
-    /// as token IDs, as `/generate` forwards `text`.
+    /// The engine's OpenAI `EmbeddingRequest` or its `ClassifyRequest`, whose text
+    /// `input` is forwarded as token IDs, as `/generate` forwards `text`.
     pub(super) fn embeddings(
         ctx: &AppContext,
+        path: &'static str,
         model: ModelId,
         mut body: Bytes,
         mut value: Value,
@@ -188,7 +190,9 @@ impl PreparedRequest {
         let batch = is_embedding_batch(&value["input"]);
         let text_ids = tokenize_input_text(ctx, &model, &value["input"]);
         let forward = !ctx.config.model.disable_input_ids_forwarding;
-        if let Some(ids) = text_ids.as_ref().filter(|_| forward) {
+        // `ClassifyRequest` takes the token IDs of one prompt, not of a batch.
+        let takes_ids = !(batch && path == CLASSIFY_PATH);
+        if let Some(ids) = text_ids.as_ref().filter(|_| forward && takes_ids) {
             value["input"] = if batch { json!(ids) } else { json!(ids[0]) };
             body = serde_json::to_vec(&value)
                 .map_err(|error| ApiError::Internal(error.into()))?
@@ -213,7 +217,7 @@ impl PreparedRequest {
             tokens,
             caller_set_rid: !value["rid"].is_null(),
             fans_out: batch,
-            ..Self::no_output(EMBEDDINGS_PATH, model, body, &lengths)
+            ..Self::no_output(path, model, body, &lengths)
         })
     }
 
@@ -258,9 +262,10 @@ impl PreparedRequest {
         }
     }
 
-    /// Whether the engine endpoint honors a routed DP rank; embeddings and rerank take none.
+    /// Whether the engine endpoint honors a routed DP rank; embeddings, classify
+    /// and rerank take none.
     pub(super) fn accepts_dp_rank(&self) -> bool {
-        !matches!(self.path, EMBEDDINGS_PATH | RERANK_PATH)
+        !matches!(self.path, EMBEDDINGS_PATH | CLASSIFY_PATH | RERANK_PATH)
     }
 
     pub(super) fn engine_rid(&self) -> Option<String> {
@@ -1166,7 +1171,7 @@ mod tests {
     fn prepare_embeddings(ctx: &AppContext, input: Value) -> (PreparedRequest, Value) {
         let body = Bytes::from(json!({"model": "stub-model", "input": input}).to_string());
         let (model, value) = parse_embedding_request(&body).unwrap();
-        let r = PreparedRequest::embeddings(ctx, model, body, value).unwrap();
+        let r = PreparedRequest::embeddings(ctx, EMBEDDINGS_PATH, model, body, value).unwrap();
         let input = serde_json::from_slice::<Value>(&r.body).unwrap()["input"].take();
         (r, input)
     }
