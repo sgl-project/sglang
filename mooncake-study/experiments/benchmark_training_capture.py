@@ -294,6 +294,7 @@ def capture_config(args, directory, address, catalog, ratio):
         "max_host_bytes": args.host_mib << 20,
         "kv_d2h_batch_tokens": args.kv_d2h_batch_tokens,
         "teacher_d2h_batch_tokens": args.teacher_d2h_batch_tokens,
+        "teacher_topk_backend": getattr(args, "teacher_topk_backend", "torch"),
         "max_device_bytes": args.device_mib << 20,
         "storage_chunk_tokens": 64,
     }
@@ -683,6 +684,9 @@ def main():
     parser.add_argument("--host-mib", type=int, default=256)
     parser.add_argument("--kv-d2h-batch-tokens", type=int, default=1)
     parser.add_argument("--teacher-d2h-batch-tokens", type=int, default=1)
+    parser.add_argument(
+        "--teacher-topk-backend", choices=("torch", "flashinfer"), default="torch"
+    )
     parser.add_argument("--device-mib", type=int, default=0)
     parser.add_argument("--segment-mib", type=int, default=2048)
     parser.add_argument("--phase-timeout", type=int, default=600)

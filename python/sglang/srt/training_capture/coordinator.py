@@ -141,7 +141,9 @@ class CaptureCoordinator:
                 dp_rank=dp_rank,
             )
             warmup_teacher_capture(
-                contract.teacher.vocab_size, getattr(pool, "device", "cpu")
+                contract.teacher.vocab_size,
+                getattr(pool, "device", "cpu"),
+                topk_backend=config.teacher_topk_backend,
             )
             return contract
 
@@ -697,6 +699,7 @@ class CaptureCoordinator:
                     logits_output.next_token_logits,
                     self.teacher.vocab_size,
                     teacher_indices,
+                    topk_backend=self.config.teacher_topk_backend,
                 )
                 for row, (req, record, position) in enumerate(teacher_records):
                     record.context.record_teacher(rows, row=row, position=position)
@@ -797,6 +800,7 @@ class CaptureCoordinator:
                         logits_output.next_token_logits,
                         self.teacher.vocab_size,
                         indices,
+                        topk_backend=self.config.teacher_topk_backend,
                     )
                     if owns_aux
                     else None

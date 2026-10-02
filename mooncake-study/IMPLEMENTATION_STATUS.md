@@ -4059,6 +4059,41 @@ passing. The resident H100 resumes idle load. See the
 [runbook](experiments/GC_CONTROL.md) and [evidence](experiments/gc-control.json)
 for the one-pair measurement limits and the corrected baseline regression.
 
+## Optional Teacher Top-128 Backend
+
+An opt-in `teacher_topk_backend="flashinfer"` uses the pinned library dispatch
+for nonempty CUDA FP32 scores with at least 32,768 vocabulary entries. Each
+call owns scratch; padded/strided inputs are made contiguous as needed. AR,
+speculative verify and P/D first-teacher capture share the setting, including
+startup warmup and policy agreement. Torch remains the default and the fallback
+for other dtypes/devices, smaller vocabularies and empty selections. The wire
+contract, raw-score semantics, full-vocabulary LSE and publication checks stay
+the same. Library upgrades require revalidating the internal dispatch interface.
+
+All nine teacher CUDA methods pass, including ties, nonfinite values, four
+dtypes, arbitrary row selection, source overwrite and concurrent streams/graphs.
+The initial 111-method unit run has one stale startup fixture error; the fixture
+is corrected and its focused regression passes. The unchanged production code
+and CUDA test class are hash/AST checked across frozen versions. Real Qwen3
+AR/static target-KV/ragged DSpark inference passes both runtime methods in
+774.041 seconds. Both single-GPU P/D methods pass in 184.481 seconds, including
+ten complete post-exit snapshots and fault/cancellation exclusion.
+
+The 24-case complete-extraction microbenchmark reduces FP32 eager time by
+34.3-42.5%; BF16 retains Torch. Actual decode traces reduce teacher kernels from
+23 to six per call and average GPU work from 89.6 to 75.0 microseconds. However,
+the controlled 1,024-request off/on/off serving brackets show **no throughput
+improvement**: Torch capture reaches 78.818 requests/s (85.30% of its off mean),
+FlashInfer 77.655 requests/s (84.33%). Both collect and validate 92 snapshots.
+The six phases total 6,144 requests and 184 post-exit snapshots. Defaults are
+unchanged; this is one warm-cache workload, not production SLO acceptance.
+
+All ten experiment jobs and the offline audit are terminal; the original test
+fixture failure is retained. Exact source/artifact hashes, replayed request and
+pause diagnostics, profile traces, scope attribution and measurement limits are
+in [the runbook](experiments/TEACHER_TOPK.md) and
+[evidence](experiments/teacher-topk.json). The resident H100 resumes idle load.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph

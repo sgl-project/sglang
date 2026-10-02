@@ -352,6 +352,7 @@ class TestCaptureStartup(CustomTestCase):
             storage_chunk_tokens=2,
             expected_weights_revision="weights",
             expected_tokenizer_revision="tokenizer",
+            teacher_topk_backend="flashinfer",
         )
 
         def exchange(*, build_local, **kwargs):
@@ -392,7 +393,7 @@ class TestCaptureStartup(CustomTestCase):
                     startup_group=object(),
                 )
             finally:
-                warmup.assert_called_once_with(256, "cuda:0")
+                warmup.assert_called_once_with(256, "cuda:0", topk_backend="flashinfer")
                 connect.assert_not_called()
 
 

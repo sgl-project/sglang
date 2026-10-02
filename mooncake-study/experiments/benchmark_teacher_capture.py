@@ -5,6 +5,7 @@ import hashlib
 import json
 import statistics
 import time
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -84,8 +85,14 @@ def benchmark(args):
     # Production warms FP32 scores before admission; retain the observed cost.
     start = time.perf_counter()
     for vocab in args.vocabularies:
-        warmup_teacher_capture(vocab, "cuda")
+        warmup_teacher_capture(vocab, "cuda", topk_backend=args.topk_backend)
     warmup_seconds = time.perf_counter() - start
+    reference = (
+        reference_capture
+        if args.reference_backend == "original"
+        else partial(capture_teacher, topk_backend="torch")
+    )
+    current = partial(capture_teacher, topk_backend=args.topk_backend)
     rows = []
     for dtype in (torch.float32, torch.bfloat16):
         for vocab in args.vocabularies:
@@ -99,11 +106,25 @@ def benchmark(args):
                         else None
                     )
                     arguments = raw, vocab, indices
-                    expected = reference_capture(*arguments)
-                    actual = capture_teacher(*arguments)
-                    torch.testing.assert_close(
-                        actual.token_ids, expected.token_ids, rtol=0, atol=0
-                    )
+                    expected = reference(*arguments)
+                    actual = current(*arguments)
+                    if args.topk_backend == "torch":
+                        torch.testing.assert_close(
+                            actual.token_ids, expected.token_ids, rtol=0, atol=0
+                        )
+                    else:
+                        scores = raw[:, :vocab]
+                        if indices is not None:
+                            scores = scores.index_select(0, indices)
+                        torch.testing.assert_close(
+                            actual.logits,
+                            scores.gather(1, actual.token_ids.long()).float(),
+                            rtol=0,
+                            atol=0,
+                        )
+                        ordered = actual.token_ids.sort(-1).values
+                        if not (ordered[:, 1:] != ordered[:, :-1]).all():
+                            raise RuntimeError("teacher top-k IDs must be unique")
                     torch.testing.assert_close(
                         actual.logits, expected.logits, rtol=0, atol=0
                     )
@@ -112,8 +133,8 @@ def benchmark(args):
                     )
                     error = (actual.logsumexp - expected.logsumexp).abs().max().item()
                     functions = {
-                        "reference": reference_capture,
-                        "current": capture_teacher,
+                        "reference": reference,
+                        "current": current,
                     }
                     graphs = {
                         name: graph_call(fn, arguments, args.iterations)
@@ -163,6 +184,12 @@ def main():
     parser.add_argument("--rows", nargs="+", type=int, default=[1, 4, 32, 128])
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--topk-backend", choices=("torch", "flashinfer"), default="torch"
+    )
+    parser.add_argument(
+        "--reference-backend", choices=("original", "torch"), default="original"
+    )
     args = parser.parse_args()
     if (
         min(args.vocabularies) < 128

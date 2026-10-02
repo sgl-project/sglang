@@ -156,6 +156,31 @@ class TestCaptureTraceAttribution(CustomTestCase):
                 self.assertEqual(group["d2d_events_missing_bytes"], int(size is None))
                 self.assertEqual(result["all_d2d_us"], 12)
 
+    def test_cuda_api_without_device_activity_and_nested_driver_time(self):
+        instant = self.event("instant", "cuda_runtime", 15, 0, correlation=7)
+        instant["ph"] = "i"
+        result = self.evaluate(
+            [
+                self.event("training_capture.teacher_d2h", "user_annotation", 10, 20),
+                self.event("cudaEventRecord", "cuda_runtime", 12, 8),
+                self.event("cuEventRecord", "cuda_driver", 13, 6),
+                self.event("cudaEventRecord", "cuda_runtime", 24, 2),
+                self.event("cudaEventRecord", "cuda_runtime", 24, 2, thread=2),
+                self.event("beyond", "cuda_driver", 29, 2),
+                instant,
+                self.event("unrelated", "kernel", 40, 4, correlation=7),
+            ]
+        )
+        group = result["groups"]["training_capture.teacher_d2h"]
+        self.assertEqual(
+            group["cuda_api"],
+            {
+                "cuda_runtime:cudaEventRecord": {"calls": 2, "inclusive_us": 10},
+                "cuda_driver:cuEventRecord": {"calls": 1, "inclusive_us": 6},
+            },
+        )
+        self.assertEqual(group["gpu_kernel_calls"], 0)
+
     def test_ambiguous_scope_and_correlation_are_rejected(self):
         scope = self.event("training_capture.kv", "user_annotation", 10, 10)
         for extra in (

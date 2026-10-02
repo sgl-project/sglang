@@ -99,6 +99,7 @@ class CaptureConfig(StrictStruct):
     max_host_bytes: Positive = 512 << 20
     kv_d2h_batch_tokens: Positive = 1
     teacher_d2h_batch_tokens: Positive = 1
+    teacher_topk_backend: Literal["torch", "flashinfer"] = "torch"
     max_device_bytes: Nonnegative = 0
     manifest_buffer_bytes: Positive = 1 << 20
     storage_chunk_tokens: Positive = 256

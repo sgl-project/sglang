@@ -13,11 +13,38 @@ class TeacherRows(msgspec.Struct, frozen=True):
     logsumexp: torch.Tensor
 
 
+def _top128(scores, backend):
+    if (
+        backend == "flashinfer"
+        and scores.is_cuda
+        and scores.dtype == torch.float32
+        and scores.shape[0] > 0
+        and scores.shape[1] >= 32768
+    ):
+        from flashinfer.topk import get_topk_module
+
+        # The pinned FlashInfer public wrapper shares a per-device workspace.
+        # Own this scratch so concurrent producer streams cannot overwrite it.
+        with torch.cuda.device(scores.device):
+            scores = scores.contiguous()
+            workspace = torch.zeros(1 << 20, dtype=torch.uint8, device=scores.device)
+            values = torch.empty(
+                (scores.shape[0], 128), dtype=scores.dtype, device=scores.device
+            )
+            ids = get_topk_module().radix_topk(
+                scores, 128, True, True, 1, workspace, values, False
+            )
+        return values, ids
+    return torch.topk(scores, k=128, dim=-1, sorted=True)
+
+
 @torch.no_grad()
 def capture_teacher(
     raw_logits: torch.Tensor,
     vocab_size: int,
     row_indices: torch.Tensor | list[int] | None = None,
+    *,
+    topk_backend: str = "torch",
 ) -> TeacherRows:
     """All returned tensors own storage independent of the logits/graph buffer."""
     if raw_logits.ndim != 2 or not raw_logits.is_floating_point():
@@ -26,6 +53,8 @@ def capture_teacher(
         )
     if not 128 <= vocab_size <= raw_logits.shape[1]:
         raise ContractError("teacher capture requires the complete unpadded vocabulary")
+    if topk_backend not in ("torch", "flashinfer"):
+        raise ContractError("unknown teacher top-k backend")
     scores = raw_logits[:, :vocab_size]
     if isinstance(row_indices, list):
         if any(
@@ -45,7 +74,7 @@ def capture_teacher(
             )
     if row_indices is not None:
         scores = scores.index_select(0, row_indices)
-    values, ids = torch.topk(scores, k=128, dim=-1, sorted=True)
+    values, ids = _top128(scores, topk_backend)
     if scores.is_cuda and scores.dtype in (
         torch.float16,
         torch.bfloat16,
@@ -64,12 +93,14 @@ def capture_teacher(
     )
 
 
-def warmup_teacher_capture(vocab_size: int, device: torch.device | str):
+def warmup_teacher_capture(
+    vocab_size: int, device: torch.device | str, *, topk_backend: str = "torch"
+):
     """Compile the FP32 serving path before admitting the first capture."""
     device = torch.device(device)
     if device.type != "cuda":
         return
     with torch.cuda.device(device):
         scores = torch.zeros((1, vocab_size), dtype=torch.float32, device=device)
-        capture_teacher(scores, vocab_size)
+        capture_teacher(scores, vocab_size, topk_backend=topk_backend)
         torch.cuda.current_stream(device).synchronize()

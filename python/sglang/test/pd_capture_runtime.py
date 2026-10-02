@@ -49,6 +49,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
     transfer_protocol = "tcp"
     ib_device = None
     teacher_d2h_batch_tokens = 1
+    teacher_topk_backend = "torch"
     target_attention_backend = None
     observer_module = "sglang.test.pd_capture_server"
     validate_prefill_graph = False
@@ -154,6 +155,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
             "max_host_bytes": 64 << 20,
             "kv_d2h_batch_tokens": 16,
             "teacher_d2h_batch_tokens": self.teacher_d2h_batch_tokens,
+            "teacher_topk_backend": self.teacher_topk_backend,
             "max_device_bytes": 8 << 20,
             "storage_chunk_tokens": 64,
             "http_timeout_seconds": 2.0,

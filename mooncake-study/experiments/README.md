@@ -48,6 +48,10 @@ and checks request lifetime with exact publication/readback validation.
 teacher-row views, independent compact output ownership, and microbenchmark and
 serving comparisons against the index-upload/gather path.
 
+[Optional Teacher Top-128 Backend](TEACHER_TOPK.md) documents the opt-in
+FlashInfer FP32 path, per-call scratch ownership, numerical comparisons and
+controlled serving/profile commands. Torch remains the default.
+
 [P/D Prefill Graph Capture](PD_PREFILL_CAPTURE.md) covers the independent P/D
 workers' Full, Breakable and piecewise graph paths for AR and static target-KV
 DSpark, with raw source comparison and post-exit Store reads on the resident GPU.

@@ -107,6 +107,7 @@ class PrefillCaptureCoordinator:
                         logits_output.next_token_logits,
                         self.teacher.vocab_size,
                         [row],
+                        topk_backend=self.config.teacher_topk_backend,
                     )
                     state.handoff = None
                     self.counters["pd_teacher_copied"] += 1

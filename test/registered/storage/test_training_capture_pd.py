@@ -1,5 +1,7 @@
 """Single-GPU real PD capture, source parity, handoff faults and cancellation."""
 
+import argparse
+import sys
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -19,4 +21,10 @@ class TestPDCaptureRuntime(PDCaptureRuntimeBase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--teacher-topk-backend", choices=("torch", "flashinfer"), default="torch"
+    )
+    args, remaining = parser.parse_known_args()
+    TestPDCaptureRuntime.teacher_topk_backend = args.teacher_topk_backend
+    unittest.main(argv=[sys.argv[0], *remaining])

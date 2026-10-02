@@ -35,6 +35,7 @@ def summarize(path):
                     "cpu_calls": 0,
                     "cpu_scope_us": 0.0,
                     "cpu_operators": {},
+                    "cuda_api": {},
                     "gpu_kernel_calls": 0,
                     "gpu_kernel_us": 0.0,
                     "d2h_calls": 0,
@@ -63,7 +64,7 @@ def summarize(path):
         category = event.get("cat")
         if category not in ("cuda_runtime", "cuda_driver", "cpu_op"):
             continue
-        if category == "cpu_op" and event.get("ph") != "X":
+        if event.get("ph") != "X":
             continue
         index = indices.get((event["pid"], event["tid"]))
         if index is None:
@@ -81,6 +82,11 @@ def summarize(path):
             operator["calls"] += 1
             operator["inclusive_us"] += event["dur"]
             continue
+        api = groups[scope["name"]]["cuda_api"].setdefault(
+            category + ":" + event["name"], {"calls": 0, "inclusive_us": 0.0}
+        )
+        api["calls"] += 1
+        api["inclusive_us"] += event["dur"]
         correlation = event.get("args", {}).get("correlation")
         if correlation is not None:
             previous = correlations.setdefault(correlation, scope["name"])
@@ -119,6 +125,7 @@ def summarize(path):
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
         "cpu_operator_attribution": "Complete CPU operator events contained in a capture scope on the same process/thread. Durations are inclusive and nested calls overlap; do not sum them as wall time or treat operator events as allocation counts.",
+        "cuda_api_attribution": "Complete runtime/driver API events contained in a capture scope on the same process/thread, including calls without device correlation. Nested calls may overlap; durations are CPU API time, not device work or removable wall time.",
         "groups": groups,
         "all_kernel_us": sum(
             event["dur"]

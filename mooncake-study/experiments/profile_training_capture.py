@@ -198,6 +198,9 @@ def main():
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 14, 27])
     parser.add_argument("--kv-d2h-batch-tokens", type=int, default=1)
     parser.add_argument("--teacher-d2h-batch-tokens", type=int, default=1)
+    parser.add_argument(
+        "--teacher-topk-backend", choices=("torch", "flashinfer"), default="torch"
+    )
     parser.add_argument("--device-mib", type=int, default=0)
     args = parser.parse_args()
     if (

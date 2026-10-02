@@ -163,6 +163,7 @@ class TestCaptureConfiguration(CustomTestCase):
             {"kv_d2h_batch_tokens": 16},
             {"teacher_d2h_batch_tokens": 0},
             {"teacher_d2h_batch_tokens": 16},
+            {"teacher_topk_backend": "unknown"},
             {"max_device_bytes": -1},
             {"sample_ratio": 2},
             {"catalog_endpoint": "file:///tmp/catalog"},

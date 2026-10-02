@@ -401,9 +401,19 @@ capture = TeacherBatchHandle(ids.to(torch.int32), values.float(), lse, row_map)
 
 实现中的 CUDA FP16/BF16/FP32 路径复用 SGLang 现有 `row_logsumexp`，
 按 FP32 累积并将 `(max, log_sum)` 合成为协议要求的完整词表 LSE；
-top-128 仍使用 `torch.topk`，不使用只支持小 k 的融合 top-k kernel。
+top-128 默认使用 `torch.topk`，不使用只支持小 k 的融合 top-k kernel。
 CPU 与其他浮点 dtype 保留上述 Torch 参考路径。紧凑结果仍独立持有内存，
 采样器修改与 graph buffer 复用不能改变已取得的数据。
+
+可选配置 `teacher_topk_backend="flashinfer"` 在非空 CUDA FP32 输入、
+去除 padding 后词表至少 32768 时使用锁定版本 FlashInfer 0.6.17 的 top-k dispatch。
+其他情况回退 Torch。每次调用独立持有 1 MiB scratch，避免公共接口的设备级
+共享 scratch 被并发 stream 覆盖；输入必要时转为连续张量，返回值仍为独立
+存储的 raw logits 和 int32 ID。相同分值的边界 token 允许不同于 Torch 的
+选择，但值与对应 ID 必须精确匹配源 logits，LSE 保持完整词表归一化。
+AR、speculative verify 与 P/D 首行使用相同配置，启动预热和分布式配置投票
+包含所选后端。内部库接口的版本约束、验证和复现命令见
+[`experiments/TEACHER_TOPK.md`](experiments/TEACHER_TOPK.md)。
 
 服务 logits 为 FP32。采集工厂在绑定 target contract 时预热该 dtype，
 发生在任何请求准入及 P worker 的提前返回之前；分布式编译失败进入已有
