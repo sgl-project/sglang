@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import ClassVar, Optional
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.layers.moe.utils import MSCCLPPEPLayout, MSCCLPPMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -19,9 +19,6 @@ from .utils import (
     MSCCLPPExpertMajorLatencyDispatchOutput,
     MSCCLPPRankMajorLatencyDispatchOutput,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
 
 
 class _MSCCLPPDispatcherImplBase(ABC):
@@ -262,7 +259,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         num_blocks = (130, 32) if self.overlap_enabled else None
 
         # Allocating these capacity-scaled resources per layer would OOM large
-        # MoE models, so LL implementations with identical geometry share them.
+        # MoE models, so Latency implementations with identical geometry share them.
         (
             self._ep_group,
             self._moe_comm,
