@@ -462,6 +462,8 @@ class BeamModel(nn.Module):
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
+        # Decoder layers whose outputs feed a speculative drafter (DFlash).
+        self.layers_to_capture = ()
 
     def forward(
         self,
@@ -477,13 +479,20 @@ class BeamModel(nn.Module):
             )
         else:
             hidden_states = pp_proxy_tensors["hidden_states"]
+        aux_hidden_states = []
         for layer_id in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[layer_id](
                 positions, hidden_states, forward_batch
             )
+            if layer_id in self.layers_to_capture:
+                # The post-layer residual stream, before the final norm.
+                aux_hidden_states.append(hidden_states)
         if not self.pp_group.is_last_rank:
             return PPProxyTensors({"hidden_states": hidden_states})
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if self.layers_to_capture:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 def is_serialized_w4a4_nvfp4(quant_config: QuantizationConfig) -> bool:
@@ -552,6 +561,7 @@ class BeamForCausalLM(nn.Module):
         # The default head projection returns BF16; LogitsProcessor promotes
         # its output to FP32 before softcap and logprobs.
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     @torch.no_grad()
     def forward(
@@ -567,9 +577,28 @@ class BeamForCausalLM(nn.Module):
         )
         if not self.model.pp_group.is_last_rank:
             return hidden_states
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
+
+    def set_dflash_layers_to_capture(self, layer_ids):
+        """Capture the listed decoder layers' outputs for the DFlash drafter."""
+        if self.model.pp_group.world_size != 1:
+            raise ValueError("Beam DFlash capture currently requires PP=1")
+        layer_ids = tuple(layer_ids)
+        if (
+            not layer_ids
+            or list(layer_ids) != sorted(set(layer_ids))
+            or any(i < 0 or i >= self.config.num_hidden_layers for i in layer_ids)
+        ):
+            raise ValueError(
+                "DFlash capture layers must be sorted, unique, and in range"
+            )
+        self.model.layers_to_capture = layer_ids
+        self.capture_aux_hidden_states = True
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

@@ -80,6 +80,27 @@ class _LoadedExpert:
         self.shards[expert_id, shard_id] = weight.clone()
 
 
+class AddLayer(torch.nn.Module):
+    def __init__(self, amount):
+        super().__init__()
+        self.amount = amount
+
+    def forward(self, positions, hidden, batch):
+        return hidden + self.amount
+
+
+def stub_beam_model(layers, norm, layers_to_capture):
+    model = BeamModel.__new__(BeamModel)
+    torch.nn.Module.__init__(model)
+    model.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+    model.embed_tokens = torch.nn.Identity()
+    model.layers = torch.nn.ModuleList(layers)
+    model.norm = norm
+    model.start_layer, model.end_layer = 0, len(layers)
+    model.layers_to_capture = layers_to_capture
+    return model
+
+
 class TestBeamConfig(CustomTestCase):
     def test_unsupported_attention_and_head_parallelism_fail_before_allocation(self):
         for field in ("enable_dp_attention", "enable_dp_lm_head"):
@@ -813,6 +834,42 @@ class TestBeamLoading(CustomTestCase):
                 expected = fp32_projection if use_fp32_lm_head else bf16_projection
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                 self.assertEqual(actual.dtype, expected.dtype)
+
+
+class TestBeamDFlashCapture(CustomTestCase):
+    def test_dflash_captures_post_layer_before_final_norm(self):
+        norm = torch.nn.Linear(1, 1, bias=False)
+        norm.weight.data.fill_(10)
+        model = stub_beam_model([AddLayer(1), AddLayer(2), AddLayer(3)], norm, (0, 2))
+        hidden, aux = model(torch.zeros(2, 1), torch.arange(2), None)
+        torch.testing.assert_close(hidden, torch.full((2, 1), 60.0))
+        torch.testing.assert_close(aux[0], torch.ones(2, 1))
+        torch.testing.assert_close(aux[1], torch.full((2, 1), 6.0))
+
+    def test_no_capture_returns_only_the_normed_stream(self):
+        model = stub_beam_model([AddLayer(1)], torch.nn.Identity(), ())
+        hidden = model(torch.zeros(2, 1), torch.arange(2), None)
+        torch.testing.assert_close(hidden, torch.ones(2, 1))
+
+    def test_dflash_rejects_ambiguous_capture_order(self):
+        model = BeamForCausalLM.__new__(BeamForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.config = BeamConfig(num_hidden_layers=4)
+        model.model = SimpleNamespace(pp_group=SimpleNamespace(world_size=1))
+        for ids in ([], [1, 1], [2, 0], [-1], [4]):
+            with self.subTest(ids=ids), self.assertRaises(ValueError):
+                model.set_dflash_layers_to_capture(ids)
+        model.set_dflash_layers_to_capture([0, 3])
+        self.assertTrue(model.capture_aux_hidden_states)
+        self.assertEqual(model.model.layers_to_capture, (0, 3))
+
+    def test_dflash_capture_requires_a_single_pipeline_stage(self):
+        model = BeamForCausalLM.__new__(BeamForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.config = BeamConfig(num_hidden_layers=4)
+        model.model = SimpleNamespace(pp_group=SimpleNamespace(world_size=2))
+        with self.assertRaisesRegex(ValueError, "PP=1"):
+            model.set_dflash_layers_to_capture([0])
 
 
 if __name__ == "__main__":

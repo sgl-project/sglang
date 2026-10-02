@@ -1241,9 +1241,14 @@ class MuseGlimmerAssistantModel(DFlashDraftModel):
     """Alias for checkpoints declaring architectures=["MuseGlimmerAssistantModel"]."""
 
 
+class DFlash2BeamDraftModel(DFlash2DraftModel):
+    """Alias for checkpoints declaring architectures=["DFlash2BeamDraftModel"]."""
+
+
 EntryClass = [
     DFlashDraftModel,
     DFlashLagunaForCausalLM,
     MuseGlimmerAssistantModel,
     DFlash2DraftModel,
+    DFlash2BeamDraftModel,
 ]
