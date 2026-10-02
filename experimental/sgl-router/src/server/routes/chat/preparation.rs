@@ -246,11 +246,13 @@ impl PreparedRequest {
             content => content.as_str().map_or(0, str::len),
         };
         let query = text_len(&value["query"]);
+        // Qwen rerankers include the instruction in every query-document prompt.
+        let instruct = value["instruct"].as_str().map_or(0, str::len);
         let lengths: Vec<usize> = value["documents"]
             .as_array()
             .into_iter()
             .flatten()
-            .map(|document| estimate_prefill_tokens(query + text_len(document)))
+            .map(|document| estimate_prefill_tokens(instruct + query + text_len(document)))
             .collect();
         let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
         Ok(Self {
@@ -1233,10 +1235,24 @@ mod tests {
     fn rerank_estimates_each_query_document_pair() {
         let image = json!({"type": "image_url", "image_url": {"url": "x".repeat(4096)}});
         let documents = json!(["abcd", [{"type": "text", "text": "abcdefgh"}, image]]);
-        let body = json!({"query": "abcd", "documents": documents}).to_string();
-        let r = PreparedRequest::rerank(ModelId("stub-model".into()), body.into()).unwrap();
-        // (4 + 4) / 4 and (4 + 8) / 4 estimated tokens.
-        assert_eq!((r.input_token_count, r.sequence_token_count), (5, 3));
+        let mut body = json!({"query": "abcd", "documents": documents});
+        for (instruct, total, longest) in [
+            (None, 5, 3),
+            (Some(Value::Null), 5, 3),
+            (Some(json!("")), 5, 3),
+            (Some(json!("abcdefgh")), 9, 5),
+        ] {
+            if let Some(instruct) = instruct {
+                body["instruct"] = instruct;
+            }
+            let r = PreparedRequest::rerank(ModelId("stub-model".into()), body.to_string().into())
+                .unwrap();
+            assert_eq!(
+                (r.input_token_count, r.sequence_token_count),
+                (total, longest)
+            );
+            assert_eq!(r.expected_peak_sequence_tokens, Some(longest as u64));
+        }
     }
 
     #[test]
