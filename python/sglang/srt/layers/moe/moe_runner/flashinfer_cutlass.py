@@ -9,7 +9,6 @@ small quant_info payload and route through ``MoeRunner``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -27,7 +26,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.common import is_sm120, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -263,15 +262,13 @@ def _sm120_moe_gemv_enabled() -> bool:
     return os.environ.get("SGLANG_NEMOTRON_MOE_GEMV", "1") == "1"
 
 
-@lru_cache(maxsize=1)
-def _sm120_mtp_mma_enabled() -> bool:
+def _sm120_mtp_mma_supported() -> bool:
     import os
 
     # This implementation preserves FlashInfer's default FP4 quantizer and
     # fused FC2 epilogue. Other quantization recipes retain the stock runner.
     return (
-        envs.SGLANG_SM120_MTP_MOE_MMA.get()
-        and torch.cuda.get_device_capability() == (12, 0)
+        is_sm120()
         and envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
         and not envs.FLASHINFER_NVFP4_4OVER6.get()
         and os.environ.get("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0"
@@ -309,7 +306,7 @@ def _run_flashinfer_cutlass(
         and not runner_config.is_gated
         and runner_config.activation == "relu2"
         and x.ndim == 2
-        and 1 <= x.shape[0] <= 16
+        and 1 <= x.shape[0] <= 4
         and x.shape[1] == 1024
         and x_sf is None
         and x.dtype == output_dtype == torch.bfloat16
@@ -318,7 +315,7 @@ def _run_flashinfer_cutlass(
         and quant_info.w13_weight.shape == (512, 2688, 512)
         and quant_info.w2_weight.shape == (512, 1024, 1344)
         and topk_ids.shape == (x.shape[0], 22)
-        and _sm120_mtp_mma_enabled()
+        and _sm120_mtp_mma_supported()
         # Keep the original tuning forward: FlashInfer 0.6.18 shares mutable
         # MoERunner bucket state across target and draft quantization types.
         # Bypassing target calls during tuning changes draft tactic keys.

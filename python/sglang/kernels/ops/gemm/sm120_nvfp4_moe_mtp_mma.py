@@ -1,4 +1,4 @@
-"""Native SM120 NVFP4 MoE for 1 to 16 tokens with production rounding."""
+"""Native SM120 NVFP4 MoE for 1 to 4 tokens with production rounding."""
 
 import torch
 
@@ -23,16 +23,6 @@ def _module():
 
 def nvfp4_moe_mtp_mma(x, w1, s1, w2, s2, a1, a2, g1, g2, ids, routing, out=None):
     m = x.shape[0]
-    if m >= 8:
-        from sglang.kernels.ops.gemm.sm120_nvfp4_moe_mtp_union import (
-            nvfp4_moe_mtp_union,
-        )
-
-        # Reuse an expert's weights across token rows once the larger batch
-        # amortizes routing lookup and input-quantization launch overhead.
-        return nvfp4_moe_mtp_union(
-            x, w1, s1, w2, s2, a1, a2, g1, g2, ids, routing, out=out
-        )
     module = _module()
     if out is None:
         out = torch.empty((m, 1024), dtype=torch.bfloat16, device=x.device)

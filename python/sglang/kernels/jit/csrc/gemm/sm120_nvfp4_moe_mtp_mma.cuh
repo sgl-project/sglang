@@ -258,7 +258,7 @@ __global__ void reduce(const bf16_t* __restrict__ partial, bf16_t* __restrict__ 
 template <uint32_t N1, uint32_t K1, uint32_t N2, uint32_t K2, uint32_t TopK, bool PDL>
 struct Sm120Nvfp4MoeMtpMma {
   static_assert(N1 == 2688 && K1 == 1024 && N2 == 1024 && K2 == 2688 && TopK == 22);
-  /// Run 1 to 16 token rows with BF16 epilogues and deterministic reduction.
+  /// Run 1 to 4 token rows with BF16 epilogues and deterministic reduction.
   static void
   run(tvm::ffi::TensorView x,
       tvm::ffi::TensorView w1,
@@ -281,7 +281,7 @@ struct Sm120Nvfp4MoeMtpMma {
     dev.set_options<kDLCUDA>();
     auto rows = SymbolicSize{"token_rows"};
     TensorMatcher({rows, K1}).with_dtype<bf16_t>().with_device(dev).verify(x);
-    CHECK_HOST(rows.unwrap() >= 1 && rows.unwrap() <= 16) << "Expected 1 <= M <= 16";
+    CHECK_HOST(rows.unwrap() >= 1 && rows.unwrap() <= 4) << "Expected 1 <= M <= 4";
     const uint32_t M = static_cast<uint32_t>(rows.unwrap());
     TensorMatcher({512 * N1 * K1 / 2}).with_dtype<uint8_t>().with_device(dev).verify(w1);
     TensorMatcher({512 * N2 * K2 / 2}).with_dtype<uint8_t>().with_device(dev).verify(w2);

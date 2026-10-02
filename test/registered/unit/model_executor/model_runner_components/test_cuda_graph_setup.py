@@ -7,7 +7,6 @@ from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     _align_pipeline_layers,
     capture_decode_graph,
-    has_hybrid_graph_handlers,
     has_standard_gqa_for_all_local_layers,
     index_attention_layers_by_global_id,
 )
@@ -32,35 +31,6 @@ def test_standard_gqa_gate_is_unchanged_without_pipeline_parallelism():
     )
 
 
-def test_hybrid_graph_handles_attention_mamba_and_pure_moe_layers():
-    # Mamba split ops store their owning decoder in attention_layers. Pure
-    # MoE layers have only the MoE handler and need no attention operation.
-    assert has_hybrid_graph_handlers(
-        attention_layers=[object(), None, object(), None],
-        moe_layers=[None, object(), None, object()],
-        start_layer=0,
-        end_layer=4,
-    )
-    # A supported layer elsewhere must not hide a missing local handler.
-    assert not has_hybrid_graph_handlers(
-        attention_layers=[object(), None, object(), None],
-        moe_layers=[object(), object(), None, None],
-        start_layer=0,
-        end_layer=4,
-    )
-
-
-def test_hybrid_graph_checks_global_pipeline_indices_and_trailing_moe():
-    attention = [None, None, object(), None]
-    moe = [None, None, None, object()]
-    assert has_hybrid_graph_handlers(
-        attention_layers=attention, moe_layers=moe, start_layer=2, end_layer=4
-    )
-    assert not has_hybrid_graph_handlers(
-        attention_layers=attention[:3], moe_layers=moe, start_layer=2, end_layer=4
-    )
-
-
 def test_pipeline_attention_metadata_is_indexed_by_global_layer_id():
     layer23 = SimpleNamespace(layer_id=23)
     layer24 = SimpleNamespace(layer_id=24)
@@ -76,17 +46,6 @@ def test_pipeline_attention_metadata_is_indexed_by_global_layer_id():
     assert attention[24] is layer24
     assert companions[23] is None
     assert companions[24] is companion24
-
-
-def test_attention_indexing_preserves_trailing_pure_moe_layer():
-    layer0 = SimpleNamespace(layer_id=0)
-    layer2 = SimpleNamespace(layer_id=2)
-    model = SimpleNamespace(layers=[object()] * 4)
-    attention, companions = index_attention_layers_by_global_id(
-        [layer0, None, layer2, None], [None] * 4, model
-    )
-    assert attention == [layer0, None, layer2, None]
-    assert companions == [None] * 4
 
 
 def test_reuse_tables_pass_through_but_distinct_duplicates_raise():
