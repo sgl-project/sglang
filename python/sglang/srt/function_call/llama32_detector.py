@@ -33,6 +33,7 @@ class Llama32Detector(BaseFormatDetector):
         # Here we use ';' as the separator, which might have compatibility issues
         # if users define to use a different separator in their prompt
         self.tool_call_separator = ";"
+        self._allow_json_fallback = True
 
     def _convert_python_dict_to_json(self, text: str) -> str:
         """Convert Python dict strings to JSON format."""
@@ -126,10 +127,45 @@ class Llama32Detector(BaseFormatDetector):
 
         # Temporarily replace buffer for parsing
         original_buffer = self._buffer
+        if self.bot_token in original_buffer:
+            self._allow_json_fallback = False
+
+        if (
+            self._allow_json_fallback
+            and original_buffer.startswith("{")
+            and self.bot_token not in original_buffer
+            and not self._ends_with_partial_token(original_buffer, self.bot_token)
+        ):
+            # A leading brace is only a heuristic for untagged tool calls.
+            # Wait for a complete object: arguments may precede the tool name.
+            # Try the original JSON first, since quote conversion can alter text
+            # inside an ordinary JSON string. Never emit the converted text.
+            for candidate in (original_buffer, converted_buffer):
+                try:
+                    action, _ = json.JSONDecoder().raw_decode(candidate)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(action, dict) and "name" not in action:
+                    self._buffer = ""
+                    return StreamingParseResult(normal_text=original_buffer)
+                break
+
         self._buffer = converted_buffer
 
         try:
             result = super().parse_streaming_increment("", tools)
+            if result.calls or (
+                converted_buffer and not self._buffer and not result.normal_text
+            ):
+                # A recognized or rejected tool must not later fall back to
+                # ordinary JSON when the base parser resets its buffer.
+                self._allow_json_fallback = False
+            if self._allow_json_fallback and result.normal_text == converted_buffer:
+                result.normal_text = original_buffer
+            elif self._allow_json_fallback and self._buffer == converted_buffer:
+                # Keep the original spelling while the tool-call heuristic is
+                # undecided, including across single-character chunks.
+                self._buffer = original_buffer
             return result
         except:
             # Fall back to original buffer
