@@ -24,6 +24,14 @@ def handle_dllm_inference(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dllm_algorithm is None:
         return
+    # Rejected rather than disabled: a user asking for deterministic output must
+    # not silently get nondeterministic output.
+    if cfg.enable_deterministic_inference:
+        raise ValueError(
+            "--enable-deterministic-inference is not supported for diffusion LLM "
+            "inference: dLLM prefill does not support the deterministic prefill "
+            "split, and dLLM sampling has no seeded path."
+        )
     from sglang.srt.dllm.algorithm import get_algorithm_cls
 
     get_algorithm_cls(cfg.dllm_algorithm).configure_server_args(server_args)

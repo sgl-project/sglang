@@ -10,6 +10,7 @@ import unittest
 
 import torch
 
+from sglang.srt.dllm import sampling as dllm_sampling
 from sglang.srt.dllm.algorithm.joint_threshold import JointThreshold
 from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
 from sglang.srt.dllm.config import DllmConfig
@@ -35,17 +36,20 @@ class _FakeForwardBatch:
         self.sampling_info = sampling_info
 
 
-def _sampling_info(top_ks, temperatures, top_ps):
+def _sampling_info(top_ks, temperatures, top_ps, min_ps=None, device="cpu"):
+    min_ps = min_ps or [0.0] * len(top_ks)
     return SamplingBatchInfo(
-        temperatures=torch.tensor(temperatures, dtype=torch.float).view(-1, 1),
-        top_ps=torch.tensor(top_ps, dtype=torch.float),
-        top_ks=torch.tensor(top_ks, dtype=torch.int32),
-        min_ps=torch.zeros(len(top_ks), dtype=torch.float),
+        temperatures=torch.tensor(temperatures, dtype=torch.float, device=device).view(
+            -1, 1
+        ),
+        top_ps=torch.tensor(top_ps, dtype=torch.float, device=device),
+        top_ks=torch.tensor(top_ks, dtype=torch.int32, device=device),
+        min_ps=torch.tensor(min_ps, dtype=torch.float, device=device),
         is_all_greedy=all(k <= 1 for k in top_ks),
         is_any_greedy=any(k <= 1 for k in top_ks),
         need_top_p_sampling=any(p != 1.0 for p in top_ps),
         need_top_k_sampling=any(k != NO_TOP_K for k in top_ks),
-        need_min_p_sampling=False,
+        need_min_p_sampling=any(p > 0 for p in min_ps),
         vocab_size=VOCAB_SIZE,
     )
 
@@ -230,6 +234,33 @@ class TestDllmSamplingPlan(CustomTestCase):
                 > cold.confidence(logits=logits, req_ids=req_ids, token_ids=runner_up)
             )
         )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "flashinfer kernels need CUDA")
+    def test_min_p_neighbour_keeps_joint_top_k_top_p_support(self):
+        """A min-p row in the batch must not change another row's filtering.
+
+        With top_k=2, top_p=0.5 over [.4, .3, .2, .1], joint filtering keeps
+        tokens 0 and 1 (token 1's prefix mass .4 is under .5). Applying top-p
+        after top-k renormalization instead sees a prefix of .57 and drops
+        token 1.
+        """
+        num_draws = 4096
+        probs = torch.zeros(num_draws, VOCAB_SIZE, device="cuda")
+        probs[:, :4] = torch.tensor([0.4, 0.3, 0.2, 0.1])
+        # Every draw comes from request 0; request 1 only sets need_min_p_sampling.
+        req_ids = torch.zeros(num_draws, dtype=torch.int64, device="cuda")
+        for min_ps in ([0.0], [0.0, 0.9]):
+            num_reqs = len(min_ps)
+            sampling_info = _sampling_info(
+                [2] * num_reqs, [1.0] * num_reqs, [0.5] * num_reqs, min_ps, "cuda"
+            )
+            tokens = dllm_sampling._flashinfer_sample(
+                probs=probs, sampling_info=sampling_info, req_ids=req_ids
+            )
+            counts = torch.bincount(tokens.long(), minlength=VOCAB_SIZE).tolist()
+            # Support is {0, 1} with token 1 at 3/7, ~1755 draws.
+            self.assertEqual(counts[0] + counts[1], num_draws, f"{min_ps=}")
+            self.assertGreater(counts[1], num_draws // 4, f"{min_ps=}")
 
 
 if __name__ == "__main__":

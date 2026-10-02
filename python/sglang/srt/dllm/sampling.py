@@ -78,9 +78,16 @@ def _flashinfer_sample(
     req_ids: torch.Tensor,
 ) -> torch.Tensor:
     if sampling_info.need_min_p_sampling:
-        probs = top_k_renorm_prob(probs, sampling_info.top_ks[req_ids])
-        probs = top_p_renorm_prob(probs, sampling_info.top_ps[req_ids])
-        return min_p_sampling_from_probs(probs, sampling_info.min_ps[req_ids])
+        # need_min_p_sampling is batch-wide, so every row lands here when one
+        # row sets min_p. Filter top-k and top-p jointly, as the kernel below
+        # does, so a row's support does not depend on its neighbors: both
+        # renorms read the unfiltered probs, and their supports are intersected.
+        filtered = top_k_renorm_prob(probs, sampling_info.top_ks[req_ids])
+        top_p_probs = top_p_renorm_prob(probs, sampling_info.top_ps[req_ids])
+        filtered.masked_fill_(top_p_probs <= 0, 0)
+        # The intersection drops mass; the kernel takes probabilities.
+        filtered.div_(filtered.sum(dim=-1, keepdim=True))
+        return min_p_sampling_from_probs(filtered, sampling_info.min_ps[req_ids])
     return top_k_top_p_sampling_from_probs(
         probs.contiguous(),
         sampling_info.top_ks[req_ids],
@@ -109,6 +116,8 @@ class DllmSamplingPlan(msgspec.Struct):
     ) -> Optional[DllmSamplingPlan]:
         if sampling_info is None or sampling_info.is_all_greedy:
             return None
+        # handle_dllm_inference rejects deterministic inference, the only mode
+        # that sets a seed, at startup.
         assert sampling_info.sampling_seed is None, (
             "Deterministic sampling is not supported for diffusion LLM decoding"
         )
