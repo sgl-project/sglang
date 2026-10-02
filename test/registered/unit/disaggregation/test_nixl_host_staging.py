@@ -18,6 +18,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import KVTransferError
@@ -162,6 +163,14 @@ class Agent:
         return dict(pending)
 
 
+class BusyLock:
+    """A socket send lock another sender thread holds."""
+
+    def acquire(self, blocking=True):
+        assert not blocking, "HOST blocked on a busy socket lock"
+        return False
+
+
 def endpoint_name(endpoint):
     return endpoint.split("//")[-1].rsplit(":", 1)[0]
 
@@ -198,6 +207,7 @@ class Rig:
         self.destination = np.array(pages_dst[:count], dtype=np.int32)
         self.pages, self.ring, self.host, self.mla = pages, ring, host, mla
         self.registry, self.dcp, self.draft = {}, dcp, draft
+        self.control_full = False  # Prefill control sockets refuse sends.
         if dcp > 1:
             # DCP relayout moves single tokens: 4-token pages, 4/8 bytes per token.
             # A draft entry (the last) stays unsharded: dcp tokens per decode row.
@@ -345,8 +355,9 @@ class Rig:
             aux_data_lens=[t.nbytes for t in aux],
             aux_item_lens=[t.nbytes for t in aux],
         )
-        m._send_multipart_locked = lambda endpoint, parts, is_ipv6=False: (
-            self.to_decode(endpoint_name(endpoint), parts)
+        m._socket_send_locks = defaultdict(threading.Lock)
+        m._connect = lambda endpoint, is_ipv6=False: NS(
+            send_multipart=lambda parts, flags=0: self.control(endpoint, parts, flags)
         )
         if not self.host:
             m.host_staging = None
@@ -465,6 +476,12 @@ class Rig:
         q._commit_hicache_local_restore_to_req = Mock()
         rank.name = name
         return rank
+
+    def control(self, endpoint, parts, flags):
+        if self.control_full:
+            assert flags & zmq.NOBLOCK, "HOST blocked on a full control socket"
+            raise zmq.Again()
+        self.to_decode(endpoint_name(endpoint), parts)
 
     def to_decode(self, name, msg):
         m = next(rank.m for rank in self.ranks if rank.name == name)
@@ -603,6 +620,12 @@ class HostStagingTest(unittest.TestCase):
             "contiguous both sides (rows merge)": {
                 "pages_src": (3, 4, 5, 6),
                 "pages_dst": (8, 9, 10, 11),
+            },
+            "rows coalesce past a slot (row split)": {
+                "count": 5,  # 5 x 20-byte pages: a 100-byte row, 88-byte payload.
+                "pages_src": (3, 4, 5, 6, 7),
+                "pages_dst": (8, 9, 10, 11, 12),
+                "slot_bytes": 600,
             },
             "chunked, split parts, ring wrap": {
                 "count": 9,
@@ -949,6 +972,31 @@ class HostStagingTest(unittest.TestCase):
                     else manager._prep_dlist
                 )
                 unused.assert_not_called()
+
+    def test_control_send_never_blocks_the_progress_thread(self):
+        # This thread alone enforces WRITE deadlines: a socket lock another sender
+        # holds, or a full socket, defers the STAGING_REQ to a later tick.
+        rig = Rig(count=4)
+        host = rig.prefill.host_staging
+        rig.submit([4])
+        for _ in range(200):
+            if host.queue:
+                break
+            time.sleep(0.001)
+        locks = rig.prefill._socket_send_locks
+        rig.prefill._socket_send_locks = defaultdict(BusyLock)
+        host.progress()
+        rig.prefill._socket_send_locks, rig.control_full = locks, True
+        host.progress()
+        self.assertTrue(any(slot.request for slot in host.slots))
+        self.assertFalse(rig.handler.staging_allocator.allocations)
+        rig.control_full = False
+        admitted, deadline = [], time.monotonic() + 5
+        while not admitted and time.monotonic() < deadline:
+            admitted = rig.tick()
+            time.sleep(0.001)
+        self.assertEqual(admitted, [rig.req.req])
+        rig.assert_bytes(self)
 
     def test_unfinished_chunk_insert_skip_is_rank_invariant(self):
         # Gather state differs per TP rank; the insert decision must not.

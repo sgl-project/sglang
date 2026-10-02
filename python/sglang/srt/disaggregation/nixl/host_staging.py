@@ -159,6 +159,7 @@ class HostSlot:
     part: HostPart | None = None
     copy_done: object = None
     handle: object = None
+    request: tuple | None = None  # Unsent STAGING_REQ: (endpoint, is_ipv6, parts).
 
 
 class HostStaging:
@@ -280,12 +281,20 @@ class HostStaging:
         encoded = notif.encode("ascii")
         if len(encoded) > HEADER["notif"].itemsize:
             raise ValueError("Host staging notification too long")
-        # Split on row boundaries so each part fits one slot.
         budget = self.slot_bytes - payload_offset(0) - PAYLOAD_ALIGN
+        # Split rows (coalesced or native) larger than a slot: validation and the
+        # byte copy take any sub-range of a row.
+        cap = budget - ROW.itemsize  # > 0: __init__ keeps budget >= PAYLOAD_ALIGN.
+        if (lens > cap).any():
+            n = ((lens + (cap - 1)) // cap).astype(np.int64)
+            rep = np.repeat(np.arange(len(lens)), n)
+            piece = np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)
+            off = piece.astype(np.uint64) * np.uint64(cap)
+            src, dst = src[rep] + off, dst[rep] + off
+            lens = np.minimum(lens[rep] - off, np.uint64(cap))
+        # Split on row boundaries so each part fits one slot.
         cuts, used = [0], 0
         for i, n in enumerate(lens.tolist()):
-            if n + ROW.itemsize > budget:
-                raise ValueError(f"Host staging row of {n} bytes exceeds the slot")
             if used + n + ROW.itemsize > budget:
                 cuts.append(i)
                 used = 0
@@ -433,8 +442,9 @@ class HostStaging:
             copy_done.record(slot.stream)
         slot.copy_done = copy_done  # Published once recorded.
         address = NetworkAddress(req.endpoint, req.dst_port)
-        manager._send_multipart_locked(
+        slot.request = (
             address.to_tcp(),
+            address.is_ipv6,
             [
                 b"STAGING_REQ",
                 str(part.room).encode(),
@@ -446,12 +456,34 @@ class HostStaging:
                 str(manager.local_ip).encode(),
                 str(manager.rank_port).encode(),
             ],
-            is_ipv6=address.is_ipv6,
         )
+        self._try_send(slot)
+
+    def _try_send(self, slot):
+        """Send the slot's STAGING_REQ if the socket takes it now; else retry.
+
+        Never block this thread: it alone enforces every slot's WRITE deadline,
+        which decode's ring reuse after its drain-ack wait relies on.
+        """
+        endpoint, is_ipv6, parts = slot.request
+        manager = self.manager
+        sock = manager._connect(endpoint, is_ipv6=is_ipv6)
+        lock = manager._socket_send_locks[endpoint]
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            sock.send_multipart(parts, flags=zmq.NOBLOCK)
+            slot.request = None
+        except zmq.Again:
+            pass
+        finally:
+            lock.release()
 
     def _advance(self, slot):
         part, manager = slot.part, self.manager
         if slot.handle is None:
+            if slot.request is not None:
+                self._try_send(slot)
             # Nothing leaves the slot, not even a dropped part, while its gather
             # (queued behind the forward) may still write it.
             if not slot.copy_done.query():
@@ -515,7 +547,7 @@ class HostStaging:
     def _finish(self, slot, state):
         # Caller holds self.lock.
         slot.part.write.settle(state)
-        slot.part = slot.handle = None
+        slot.part = slot.handle = slot.request = None
 
 
 class HostDecodeStagingHandler(DecodeStagingHandler):
