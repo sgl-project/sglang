@@ -10,6 +10,7 @@ import math
 import pathlib
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 try:
@@ -318,6 +319,75 @@ class TestCoverageReport(unittest.TestCase):
             kv_tokens=0, slots=0, chunked_prefill_size=4096, max_running_requests=0
         )
         self.assertEqual(report.coverage, 1.0)
+
+
+class TestUnifiedPoolCapacity(unittest.TestCase):
+    """Exercise the assembler's sizing helpers without importing GPU kernels."""
+
+    @classmethod
+    def setUpClass(cls):
+        names = {
+            "_device_pool_bytes",
+            "_mamba_host_bytes_per_slot",
+            "_resolve_hicache_mamba_split",
+        }
+        tree = ast.parse(_ASSEMBLER_PATH.read_text(encoding="utf-8"))
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        module = ast.Module(
+            body=ast.parse("from __future__ import annotations").body + functions,
+            type_ignores=[],
+        )
+        namespace = dict(vars(sizing))
+        namespace["get_memory"] = lambda: SimpleNamespace(hicache_size=32)
+        exec(compile(module, str(_ASSEMBLER_PATH), "exec"), namespace)
+        cls.resolve = staticmethod(namespace["_resolve_hicache_mamba_split"])
+
+    def _split(self, pool, knob):
+        mamba = SimpleNamespace(
+            get_kv_size_bytes=lambda: 16_000_000,
+            num_mamba_layers=1,
+            mamba_cache=SimpleNamespace(
+                conv=[],
+                temporal=SimpleNamespace(
+                    shape=(1, 8, 1000, 1000), dtype=SimpleNamespace(itemsize=2)
+                ),
+            ),
+        )
+        return self.resolve(
+            knob=knob,
+            kv_pools=(pool,),
+            mamba_pool=mamba,
+            params=SimpleNamespace(
+                chunked_prefill_size=4096, req_to_token_pool=SimpleNamespace(size=8)
+            ),
+        )
+
+    def test_unified_physical_view_matches_its_logical_host_capacity(self):
+        logical = SimpleNamespace(
+            size=1_000_000, get_kv_size_bytes=lambda: 3_000_000_000
+        )
+        unified = SimpleNamespace(
+            size=2_000_000,
+            get_kv_size_bytes=lambda: (0, 0),
+            host_capacity_bytes=3_000_000_000,
+            host_capacity_tokens=1_000_000,
+        )
+        for knob in (14.0, "auto"):
+            with self.subTest(knob=knob):
+                self.assertEqual(self._split(unified, knob), self._split(logical, knob))
+
+    def test_none_capacity_metadata_preserves_device_pool_fallback(self):
+        pool = SimpleNamespace(size=1_000_000, get_kv_size_bytes=lambda: (1e9, 2e9))
+        for knob in (14.0, "auto"):
+            expected = self._split(pool, knob)
+            pool.host_capacity_bytes = None
+            pool.host_capacity_tokens = None
+            with self.subTest(knob=knob):
+                self.assertEqual(self._split(pool, knob), expected)
 
 
 class TestCoverageInputGuard(unittest.TestCase):

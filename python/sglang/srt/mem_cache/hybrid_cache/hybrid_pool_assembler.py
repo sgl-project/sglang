@@ -208,7 +208,9 @@ def _split_hicache_size(
 
 
 def _device_pool_bytes(pool: Any) -> int:
-    size_bytes = pool.get_kv_size_bytes()
+    size_bytes = getattr(pool, "host_capacity_bytes", None)
+    if size_bytes is None:
+        size_bytes = pool.get_kv_size_bytes()
     return sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes
 
 
@@ -234,16 +236,21 @@ def _resolve_hicache_mamba_split(
     GB), the Mamba host share (GB) and the resolved split for the boot line.
 
     The KV pools stay byte-proportional among themselves; only the Mamba share
-    is taken from the knob. Bytes per token are the device pools' bytes over
-    the anchor pool's tokens, which is what the proportional split implies.
+    is taken from the knob. Bytes per token use logical host-capacity metadata
+    when available, otherwise the device pools and anchor token count.
     """
     hicache_size = get_memory().hicache_size
     kv_pool_bytes = tuple(_device_pool_bytes(pool) for pool in kv_pools)
     device_kv_bytes = sum(kv_pool_bytes)
+    # Unified pools expose physical views whose size and device bytes do not
+    # describe their logical host tier. Match _split_hicache_size's contract.
+    kv_tokens = getattr(kv_pools[0], "host_capacity_tokens", None)
+    if kv_tokens is None:
+        kv_tokens = kv_pools[0].size
     split = resolve_mamba_host_split(
         hicache_size_gb=hicache_size,
         knob=knob,
-        kv_bytes_per_token=device_kv_bytes / kv_pools[0].size,
+        kv_bytes_per_token=device_kv_bytes / kv_tokens,
         mamba_bytes_per_slot=_mamba_host_bytes_per_slot(mamba_pool),
         device_kv_bytes=device_kv_bytes,
         device_mamba_bytes=_device_pool_bytes(mamba_pool),
