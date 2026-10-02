@@ -618,8 +618,12 @@ class DeepseekMLARocmForwardMixin:
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
-        fuse_bmm_rope_cache = not q_replicate_active and (
-            _can_fuse_bmm_rope_cat_and_cache(self)
+        # The fused kernel wins at decode-sized batches (decode, target verify,
+        # draft extend); prefill shapes run faster as the two separate launches.
+        fuse_bmm_rope_cache = (
+            not q_replicate_active
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            and _can_fuse_bmm_rope_cat_and_cache(self)
         )
 
         if q_replicate_active:
