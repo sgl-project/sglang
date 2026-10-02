@@ -414,6 +414,7 @@ mod tests {
                     label_selector: "app=sglang".into(),
                 },
                 peer_selector: Some("kubernetes.io/service-name=sgl-router".into()),
+                version_group_label: None,
             })
         };
 
@@ -649,7 +650,7 @@ mod tests {
                 url: "http://p0:30000".into(),
                 mode: WorkerMode::Prefill,
                 model_ids: vec![ModelId("m".into())],
-                bootstrap_port: None,
+                ..Default::default()
             })
             .unwrap();
         let app = crate::server::app::build_router(ctx.clone());
