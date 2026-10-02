@@ -64,6 +64,9 @@ if _is_cuda:
         silu_and_mul,
         silu_and_mul_with_activation_rounding,
     )
+    from sglang.kernels.ops.quantization.per_token_group_quant import (
+        per_token_group_quant,
+    )
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -123,6 +126,34 @@ def _validate_fused_swiglu_interleaved(
         raise ValueError(
             "fuse_swiglu_interleaved set on an incompatible fused_moe call"
         )
+
+
+def _activation_row_filter(
+    *,
+    down_moe_use_tma: bool,
+    filter_expert: bool,
+    topk_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    block_size_m: int,
+) -> Dict[str, Any]:
+    """Row filter for the CUDA JIT gated activations; empty computes every row."""
+    # HIP/XPU compute every row: the down kernel zeros filtered rows without
+    # reading their input.
+    if not _is_cuda or not (down_moe_use_tma or filter_expert):
+        return {}
+    if not down_moe_use_tma:
+        return dict(expert_ids=topk_ids.view(-1), expert_step=1)
+    # The TMA down buffer is sorted, block-padded and sized for the worst case;
+    # compute only the rows the down GEMM reads.
+    return dict(
+        expert_ids=expert_ids,
+        expert_step=block_size_m,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        num_valid_tokens=topk_ids.numel(),
+    )
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
@@ -670,6 +701,16 @@ def _fused_moe_kernel_sequence(
             dtype=hidden_states.dtype,
         )
 
+    row_filter = _activation_row_filter(
+        down_moe_use_tma=down_moe_use_tma,
+        filter_expert=filter_expert,
+        topk_ids=topk_ids,
+        expert_ids=expert_ids,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        block_size_m=config["BLOCK_SIZE_M"],
+    )
+
     # Activation function with multiplication
     if fuse_swiglu_interleaved:
         # silu(gate) * up was already applied by the up-GEMM epilogue.
@@ -749,17 +790,9 @@ def _fused_moe_kernel_sequence(
                     swiglu_limit=swiglu_limit_for_triton,
                 )
         elif _is_cuda or _is_hip or _is_xpu:
-            if filter_expert and _is_cuda:
-                # HIP/XPU fall through to the unfiltered path: the down kernel
-                # zeros filtered rows without reading their input.
-                silu_and_mul(
-                    intermediate_cache1.view(-1, N),
-                    intermediate_cache2,
-                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
-                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
-                )
-            else:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            silu_and_mul(
+                intermediate_cache1.view(-1, N), intermediate_cache2, **row_filter
+            )
         elif _is_musa:
             intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
         else:
@@ -790,15 +823,9 @@ def _fused_moe_kernel_sequence(
             activation_fn = (
                 gelu_tanh_and_mul if activation == "gelu_tanh" else gelu_and_mul
             )
-            if filter_expert and _is_cuda:
-                activation_fn(
-                    intermediate_cache1.view(-1, N),
-                    intermediate_cache2,
-                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
-                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
-                )
-            else:
-                activation_fn(intermediate_cache1.view(-1, N), intermediate_cache2)
+            activation_fn(
+                intermediate_cache1.view(-1, N), intermediate_cache2, **row_filter
+            )
         else:
             if _has_vllm_ops:
                 getattr(vllm_ops, f"{activation}_and_mul")(
@@ -844,6 +871,24 @@ def _fused_moe_kernel_sequence(
     if use_fused_moe_sum_all_reduce:
         out_slice = out_hidden_states
         out_slice.zero_()
+
+    if (
+        _is_cuda
+        and down_moe_use_tma
+        and use_fp8_w8a8
+        and block_shape is not None
+        and a2_scale is None
+        and intermediate_cache2.shape[-1] != block_shape[1]
+    ):
+        # Same quant the down call would run, restricted to the rows the down
+        # GEMM reads; a single whole-row group keeps that call's per-token kernel.
+        intermediate_cache2, a2_scale = per_token_group_quant(
+            intermediate_cache2,
+            group_size=block_shape[1],
+            sorted_token_ids=sorted_token_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            num_valid_tokens=topk_ids.numel(),
+        )
 
     invoke_fused_moe_kernel(
         intermediate_cache2,
