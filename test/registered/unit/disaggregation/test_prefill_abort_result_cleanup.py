@@ -89,8 +89,7 @@ def _result():
     return GenerationBatchResult(next_token_ids=torch.tensor([11]))
 
 
-def _free_req(req, _tree_cache, *, is_insert):
-    assert is_insert is False
+def _free_req(req, _tree_cache):
     req.kv.req_pool_idx = None
     req.kv.mark_kv_released()
     req.kv.mamba_pool_idx = None
@@ -106,7 +105,7 @@ def test_aborted_final_result_releases_hybrid_cache(
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
     checkpoint_kv_cache.assert_not_called()
     req.disagg_kv_sender.abort.assert_called_once_with()
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
@@ -122,7 +121,10 @@ def test_aborted_final_result_releases_hybrid_cache(
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
-def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
+@patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+def test_aborted_middle_result_releases_after_last_chunk(
+    checkpoint_kv_cache, release_kv_cache
+):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=1)
     req.extend_range = SimpleNamespace(end=50)
@@ -130,12 +132,16 @@ def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
     assert req.inflight_middle_chunks == 0
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    checkpoint_kv_cache.assert_not_called()
+    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
-def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
+@patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+def test_aborted_middle_result_waits_for_inflight_chunk(
+    checkpoint_kv_cache, release_kv_cache
+):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=1)
     req.extend_range = SimpleNamespace(end=len(req.origin_input_ids))
@@ -147,7 +153,8 @@ def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    checkpoint_kv_cache.assert_not_called()
+    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
@@ -164,14 +171,18 @@ def test_delayed_result_ignores_already_retired_request(release_kv_cache):
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
-def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
+@patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+def test_sender_abort_failure_does_not_skip_local_cleanup(
+    checkpoint_kv_cache, release_kv_cache
+):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=0)
     req.disagg_kv_sender.abort.side_effect = RuntimeError("transport is down")
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    checkpoint_kv_cache.assert_not_called()
+    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
     assert req.finished()
@@ -193,7 +204,7 @@ def test_grammar_rejection_retires_prefill_before_transfer(
     req.grammar.accept_token.assert_called_once_with(11)
     assert req.grammar.finished
     assert req.finished()
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
     checkpoint_kv_cache.assert_not_called()
     scheduler.send_kv_chunk.assert_not_called()
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
@@ -226,8 +237,14 @@ def test_aborted_result_releases_mamba_allocated_before_kv():
     ],
 )
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
 def test_sampling_mask_abort_preserves_error_and_releases_once(
-    release_kv_cache, status, http_status, err_type, transport_error
+    checkpoint_kv_cache,
+    release_kv_cache,
+    status,
+    http_status,
+    err_type,
+    transport_error,
 ):
     """A failed sender notification must not leak ownership or lose the API error."""
     scheduler = _Scheduler()
@@ -258,7 +275,8 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     assert req.metadata_buffer_index == -1
     assert not req.pending_bootstrap
     assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    checkpoint_kv_cache.assert_not_called()
+    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
     req.disagg_kv_sender.abort.assert_called_once_with()
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
     scheduler.tree_cache.finish.assert_called_once_with(

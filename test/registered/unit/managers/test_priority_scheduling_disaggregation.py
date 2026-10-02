@@ -321,6 +321,9 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             patch(
                 "sglang.srt.disaggregation.prefill.release_kv_cache"
             ) as release_kv_cache,
+            patch(
+                "sglang.srt.disaggregation.prefill.checkpoint_kv_cache"
+            ) as checkpoint_kv_cache,
             patch("sglang.srt.disaggregation.prefill.prepare_abort"),
             patch(
                 "sglang.srt.disaggregation.prefill.get_parallel",
@@ -332,7 +335,8 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
         component.free_out_of_window_slots.assert_called_once()
         cache.insert.assert_not_called()
-        release_kv_cache.assert_called_once_with(req, cache, is_insert=False)
+        checkpoint_kv_cache.assert_not_called()
+        release_kv_cache.assert_called_once_with(req, cache)
         cache.finish.assert_called_once_with(
             req.cache_request_handle, CacheRequestOutcome.ABORT
         )
@@ -382,16 +386,20 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             pending_bootstrap=True,
         )
 
-        with patch(
-            "sglang.srt.disaggregation.prefill.release_kv_cache"
-        ) as release_kv_cache:
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.release_kv_cache"
+            ) as release_kv_cache,
+            patch(
+                "sglang.srt.disaggregation.prefill.checkpoint_kv_cache"
+            ) as checkpoint_kv_cache,
+        ):
             SchedulerDisaggregationPrefillMixin.release_aborted_prefill_waiting_req(
                 scheduler, req
             )
 
-        release_kv_cache.assert_called_once_with(
-            req, scheduler.tree_cache, is_insert=False
-        )
+        checkpoint_kv_cache.assert_not_called()
+        release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
         sender.abort.assert_called_once()
         self.assertFalse(req.pending_bootstrap)
 

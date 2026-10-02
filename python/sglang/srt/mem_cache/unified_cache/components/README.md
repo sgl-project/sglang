@@ -230,11 +230,11 @@ receipt proves were taken. The eventual full release must pass
 
 ### `checkpoint(req: Req, *, up_to: int)`
 
-Insert a request's KV into the tree: at every checkpoint while it runs, and once more when it finishes.
+Insert a request's KV into the tree: while it runs, and once more when it has finished.
 
 | Aspect | Detail |
 |--------|--------|
-| **Purpose** | Publish the request's KV `[cache_protected_len, up_to)` so other requests can match it; nodes past `req.kv.cache_inserted_len` count one hit (a request counts each node once). `checkpoint_kv_cache` calls it with `req.extend_range.end` while the request runs; `release_kv_cache` calls it with the request-owned length when it finishes (`req.finished()`), then frees `[cache_protected_len, up_to)` and everything past it and unpins; with `is_insert=False` it skips the insert and calls `on_release(req, inserted=False)` for component cleanup |
+| **Purpose** | Publish the request's KV `[cache_protected_len, up_to)` so other requests can match it; nodes past `req.kv.cache_inserted_len` count one hit (a request counts each node once). `checkpoint_kv_cache` calls it with `req.extend_range.end` while the request runs and with the request-owned length once it has finished (`req.finished()`); `release_kv_cache` then frees `[cache_protected_len, owned)` and everything past it, unpins and calls `on_release(req)`, where each component frees what the request still holds (a finished checkpoint has already handed its Mamba slot to the tree) |
 | **Inputs** | `req` — the request; `up_to` — row position the insert may read up to |
 | **Output** | `None` |
 | **Mutation** | Component hooks → `insert` → re-match → writes the tree's indices back into the row → moves the request's lock from the old `req.last_node` to the node the insert ended on → updates `req.prefix_indices`, `req.kv.cache_protected_len`, `req.kv.cache_inserted_len`, `req.last_node` → component cleanup. A finished request's component state (Mamba) is handed to the tree instead of forked, and what it still held is freed. Frees no KV slot: `release_kv_cache` does that afterwards. |

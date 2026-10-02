@@ -463,10 +463,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Insert the request's KV up to row position ``up_to`` into the tree,
         repoint the row onto the tree's copy, re-anchor ``req.last_node`` on
         the node the insert ended on and advance ``cache_protected_len``.
-        Called at every checkpoint of a running request and once more when
-        it finishes (``req.finished()``), when the tree also takes over the
-        component state the request no longer needs. Nothing here frees a
-        slot: ``release_kv_cache`` frees ``[cache_protected_len, up_to)`` and
+        Called while the request runs and once more when it has finished
+        (``req.finished()``), when the tree also takes over the component
+        state the request no longer needs. Nothing here frees a slot:
+        ``release_kv_cache`` frees ``[cache_protected_len, owned)`` and
         everything after, and unpins."""
 
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
@@ -521,9 +521,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Return True after taking the row; the caller then releases nothing."""
         return False
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        """The row is freed and the lock dropped; ``inserted`` says whether the
-        KV went into the tree first. Drop per-request state kept outside the tree."""
+    def on_release(self, req: Req) -> None:
+        """The row is freed and the lock dropped. Collect whatever the request
+        still holds outside the tree: how it left decides what that is (a final
+        ``checkpoint`` already handed its state over, an abort left it behind),
+        so implementations read the request's state, not a mode flag."""
 
     def evictable_size(self):
         return 0

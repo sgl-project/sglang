@@ -80,6 +80,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._pending_stores: list[LMCachePendingStore] = []
         self._pending_store_counts: dict[str, int] = {}
         self._session_finish_requested: set[str] = set()
+        # Requests whose final checkpoint already ended their session.
+        self._finished_rids: set[str] = set()
         self._lmcache_closed = False
         atexit.register(self.shutdown)
 
@@ -248,10 +250,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
         return True
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        super().on_release(req, inserted=inserted)
-        if not inserted:
-            self.release_aborted_request(req.cache_request_handle)
+    def on_release(self, req: Req) -> None:
+        super().on_release(req)
+        if req.rid in self._finished_rids:
+            self._finished_rids.discard(req.rid)
+            return
+        self.release_aborted_request(req.cache_request_handle)
 
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
         self._publish_external_loaded_prefix(req, token_ids_len=up_to)
@@ -260,6 +264,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._submit_store(req, req.full_untruncated_fill_ids[:up_to])
         if req.finished():
             self._request_session_finish(req.rid)
+            self._finished_rids.add(req.rid)
 
     def check_hicache_events(self) -> None:
         """Poll LMCache retrieve/store futures at the scheduler safe point."""
@@ -416,6 +421,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self._pending_stores.clear()
             self._pending_store_counts.clear()
             self._session_finish_requested.clear()
+            self._finished_rids.clear()
             self.prefetch_loaded_tokens_by_reqid.clear()
             connector.end_all_sessions()
         super().reset()

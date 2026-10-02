@@ -646,6 +646,9 @@ class MambaComponent(TreeComponent):
         insert_params: Optional[InsertParams] = None,
     ) -> None:
         if is_finished:
+            if not req.kv.holds_mamba:
+                # Already handed to the tree or freed; nothing left to release.
+                return
             mamba_value_inserted = (
                 insert_result is not None and not insert_result.mamba_exist
             )
@@ -673,7 +676,10 @@ class MambaComponent(TreeComponent):
                 )
                 return
 
-            if not mamba_value_inserted:
+            if mamba_value_inserted:
+                # The tree owns the slot from here on.
+                req.kv.mamba_pool_idx = None
+            else:
                 pool.free_mamba_cache(req)
         else:
             if insert_params.mamba_value is not None and (
