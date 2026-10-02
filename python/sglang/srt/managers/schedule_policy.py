@@ -158,17 +158,26 @@ def estimate_prefill_extend_tile_metrics(
     }
 
 
-def refresh_waiting_prefix(tree_cache: BasePrefixCache, req: Req) -> None:
-    token_ids = req.origin_input_ids + req.output_ids
+def _req_radix_key(
+    tree_cache: BasePrefixCache, req: Req, token_ids: array[int]
+) -> RadixKey:
+    # unified_kv SWA lives in a per-request ring that's not content-stable and is
+    # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
+    # the match by the trailing sliding window so it gets re-prefilled, rewriting
+    # this request's SWA ring. No-op for other layouts.
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    return RadixKey(
+        token_ids=token_ids,
+        extra_key=req.extra_key,
+        limit=key_limit,
+        cache_salt=req.cache_salt,
+    )
+
+
+def refresh_waiting_prefix(tree_cache: BasePrefixCache, req: Req) -> None:
     tree_cache.refresh_device_prefix(
-        RadixKey(
-            token_ids=token_ids,
-            extra_key=req.extra_key,
-            limit=key_limit,
-            cache_salt=req.cache_salt,
-        )
+        _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)
     )
 
 
@@ -183,21 +192,9 @@ def match_prefix_for_req(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
-    # unified_kv SWA lives in a per-request ring that's not content-stable and is
-    # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
-    # the match by the trailing sliding window so it gets re-prefilled, rewriting
-    # this request's SWA ring. No-op for other layouts.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
-
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=RadixKey(
-                token_ids=token_ids,
-                extra_key=req.extra_key,
-                limit=key_limit,
-                cache_salt=req.cache_salt,
-            ),
+            key=_req_radix_key(tree_cache, req, token_ids),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
         )
