@@ -33,7 +33,9 @@ DRAFT_MODEL = "z-lab/Qwen3.8-27B-DFlash2"
 # The checkpoint's sliding_window of 2048, less the current token.
 DRAFT_WINDOW = 2047
 DRAFT_BLOCK_SIZE = 8
-DRAFT_KV_RATIO = 0.25
+# Small enough that cached prompts run the draft pool out of room before the
+# target's Mamba state pool.
+DRAFT_KV_RATIO = 0.15
 MAX_RUNNING_REQUESTS = 8
 # The target resumes a prefix hit at its last linear-attention checkpoint,
 # which is chunk aligned; allow one chunk of slack before the prompt end.
@@ -48,6 +50,12 @@ _LONG_PROMPT = " ".join(
 _ESSAY_QUESTION = (
     "\n\nWrite a detailed essay on how foxes and dogs are portrayed in folklore, "
     "with examples from at least three cultures."
+)
+# Longer than one draft window and shorter than one prefill chunk, so a cached
+# prompt keeps one window. A prompt spanning chunks keeps one per chunk.
+_WINDOW_PROMPT = " ".join(
+    f"Entry {i}: the quick brown fox number {i} jumps over the lazy dog number {i + 1}."
+    for i in range(95)
 )
 
 
@@ -179,27 +187,33 @@ class TestDFlashDraftKVRatio(CustomTestCase, GSM8KMixin):
         self.assertEqual(cold["text"], warm["text"])
         self.assertIsNone(self.process.poll())
 
-    def test_evicted_window_falls_back(self):
-        """More cached prefixes than the draft pool holds: the oldest loses its
-        window, and a hit on it re-prefills instead of reading freed slots."""
+    def _overflow_draft_pool(self) -> tuple:
+        """Cache more window-sized prompts than the draft pool holds windows for,
+        oldest first. Returns the oldest prompt and its first response."""
         self._flush_cache()
-        _, _, draft_tokens, cap = self._pool_sizing()
-        # One more than the pool holds, at the window each cached prefix keeps.
-        num_prompts = (draft_tokens - cap) // DRAFT_WINDOW + 2
+        _, _, draft_tokens, _ = self._pool_sizing()
+        # Requests run one at a time, so cached windows can fill nearly the whole
+        # pool. A few more prompts than fit evict the oldest prompt's window.
+        num_prompts = draft_tokens // (DRAFT_WINDOW + self.page_size) + 4
         prompts = [
-            _LONG_PROMPT.replace("quick", f"quick-{i}") + _ESSAY_QUESTION
+            _WINDOW_PROMPT.replace("quick", f"quick-{i}") + _ESSAY_QUESTION
             for i in range(num_prompts)
         ]
         cold = self._generate(prompts[0], 64)
-        prompt_tokens = cold["meta_info"]["prompt_tokens"]
+        self.assertGreater(cold["meta_info"]["prompt_tokens"], DRAFT_WINDOW)
         for prompt in prompts[1:]:
             self._generate(prompt, 8)
-        warm = self._generate(prompts[0], 64)
+        print(f"cached {num_prompts} prompts for {draft_tokens} draft slots")
+        return prompts[0], cold
+
+    def test_evicted_window_falls_back(self):
+        """More cached prefixes than the draft pool holds: the oldest loses its
+        window, and a hit on it re-prefills instead of reading freed slots."""
+        prompt, cold = self._overflow_draft_pool()
+        prompt_tokens = cold["meta_info"]["prompt_tokens"]
+        warm = self._generate(prompt, 64)
         cached_tokens = warm["meta_info"]["cached_tokens"]
-        print(
-            f"after {num_prompts} prefixes: prompt_tokens={prompt_tokens}, "
-            f"cached_tokens={cached_tokens}"
-        )
+        print(f"oldest prompt: prompt_tokens={prompt_tokens}, cached={cached_tokens}")
         self.assertLessEqual(cached_tokens, prompt_tokens - DRAFT_WINDOW)
         self.assertEqual(cold["text"], warm["text"])
         self.assertIsNone(self.process.poll())
