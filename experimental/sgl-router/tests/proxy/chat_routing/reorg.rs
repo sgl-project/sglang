@@ -390,6 +390,52 @@ async fn generate_batch_fits_a_bucket_by_its_longest_prompt() {
 }
 
 #[tokio::test]
+async fn generate_embeddings_fit_by_sequence_length() {
+    let worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut bucket = Bucket::new("short", BucketGroups::Plain(group("w", policy)));
+    bucket.max_context_tokens = Some(64);
+    let app = build_router(context(&[("w", Stage::Plain, &worker)], vec![bucket]));
+    // Embedding width and batch size do not increase the longest sequence.
+    let prompt = serde_json::json!([vec![0.5; 4096]]);
+    for embeddings in [prompt.clone(), serde_json::json!([prompt, prompt])] {
+        let body = serde_json::json!({
+            "input_embeds": embeddings,
+            "sampling_params": {"max_new_tokens": 8}
+        });
+        let request = Request::post("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test]
+async fn generate_batch_context_limit_pairs_each_prompt_with_its_output_budget() {
+    let worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut bucket = Bucket::new("short", BucketGroups::Plain(group("w", policy)));
+    bucket.max_context_tokens = Some(64);
+    let app = build_router(context(&[("w", Stage::Plain, &worker)], vec![bucket]));
+    for (first_output, status) in [(1, StatusCode::OK), (5, StatusCode::BAD_REQUEST)] {
+        // Peaks are [61, 61] or [65, 61], not max(input) + max(output) = 120.
+        let body = serde_json::json!({
+            "input_ids": [vec![1; 60], vec![1]],
+            "sampling_params": [{"max_new_tokens": first_output}, {"max_new_tokens": 60}]
+        });
+        let request = Request::post("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), status);
+    }
+}
+
+#[tokio::test]
 async fn rejects_unsupported_length_unknown_model_and_overflow_before_policy() {
     let worker = MockWorker::start(vec![]).await;
     let policy = Arc::new(FirstPolicy::default());

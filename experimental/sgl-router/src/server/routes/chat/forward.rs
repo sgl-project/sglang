@@ -65,8 +65,8 @@ pub(super) async fn forward_request(
     let dp_aware = ctx.config.model.dp_aware;
     // The engine gives fan-out item i the room `room + i`, so in PD decode looks
     // for each item on a different prefill rank; one pinned rank would break that.
-    let pin_prefill = dp_aware && !(decode.is_some() && request.fans_out);
-    let prefill_rank = pin_prefill
+    let unpin_prefill = dp_aware && decode.is_some() && request.fans_out;
+    let prefill_rank = (dp_aware && !unpin_prefill)
         .then(|| prompt_dp_rank(ctx, &request, &headers, &prefill))
         .flatten();
     let decode_rank = decode
@@ -112,7 +112,13 @@ pub(super) async fn forward_request(
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
-    let (prefill_headers, prefill_body) = with_dp_rank(headers.clone(), &body, path, prefill_rank);
+    let prefill_body = if unpin_prefill {
+        without_dp_rank(&body)?
+    } else {
+        body.clone()
+    };
+    let (prefill_headers, prefill_body) =
+        with_dp_rank(headers.clone(), &prefill_body, path, prefill_rank);
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -249,6 +255,20 @@ fn with_dp_rank(
         body.clone()
     };
     (headers, body)
+}
+
+/// Let the engine route each PD batch item by its own bootstrap room.
+fn without_dp_rank(body: &Bytes) -> Result<Bytes, ApiError> {
+    let mut fields: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(body).map_err(|error| ApiError::Internal(error.into()))?;
+    let routed = fields.remove("routed_dp_rank");
+    let legacy = fields.remove("data_parallel_rank");
+    if routed.is_none() && legacy.is_none() {
+        return Ok(body.clone());
+    }
+    serde_json::to_vec(&fields)
+        .map(Bytes::from)
+        .map_err(|error| ApiError::Internal(error.into()))
 }
 
 fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {

@@ -610,6 +610,8 @@ pub(crate) struct DecodeSelectionInputs<'a> {
     /// `request_input_tokens` only for a batch.
     pub request_sequence_tokens: u64,
     pub requested_max_output_tokens: Option<u64>,
+    /// Largest per-item input + output bound; unknown if any output budget is unset.
+    pub expected_peak_sequence_tokens: Option<u64>,
     pub ttft_slo_ms: Option<u64>,
     pub tps_slo: Option<f64>,
     /// Required: every rung resolves its proposal against the snapshot, so
@@ -635,20 +637,11 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
         inputs.request_input_tokens,
         inputs.requested_max_output_tokens,
     );
-    // Only an explicit output budget justifies reserving peak sequence room;
-    // without one the projection degenerates to the input length and would
-    // bucket every request as if it decoded nothing.
-    let expected_peak_sequence_tokens = inputs.requested_max_output_tokens.map(|_| {
-        projected_decode_kv_tokens(
-            inputs.request_sequence_tokens,
-            inputs.requested_max_output_tokens,
-        )
-    });
     let decode_domains = inputs.bucket_selector.decode_domains(
         inputs.decode_workers,
         BucketRequest {
             input_tokens: inputs.request_sequence_tokens,
-            expected_peak_sequence_tokens,
+            expected_peak_sequence_tokens: inputs.expected_peak_sequence_tokens,
             ttft_slo_ms: inputs.ttft_slo_ms,
             tps_slo: inputs.tps_slo,
         },
@@ -871,6 +864,7 @@ mod tests {
             request_input_tokens,
             request_sequence_tokens: request_input_tokens,
             requested_max_output_tokens: None,
+            expected_peak_sequence_tokens: None,
             ttft_slo_ms: None,
             tps_slo: None,
             load_snapshot,

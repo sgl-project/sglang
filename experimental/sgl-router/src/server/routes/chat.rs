@@ -333,6 +333,10 @@ fn pick_decode_worker(
         request_input_tokens: request.input_token_count as u64,
         request_sequence_tokens: request.sequence_token_count as u64,
         requested_max_output_tokens: request.max_output_tokens,
+        // Preserve the legacy path's saturating projection on overflow.
+        expected_peak_sequence_tokens: request
+            .expected_peak_sequence_tokens()
+            .unwrap_or(Some(u64::MAX)),
         ttft_slo_ms: routing.ttft_slo_ms,
         tps_slo: routing.tps_slo,
         load_snapshot: routing.load_snapshot.as_ref(),

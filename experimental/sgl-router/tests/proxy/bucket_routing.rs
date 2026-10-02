@@ -412,9 +412,10 @@ async fn decode_bucket_uses_input_plus_requested_output_budget() {
     let short_decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let long_decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let mut short_bucket = bucket("d-short", BucketStage::Decode, 20, "d-short");
-    short_bucket.max_sequence_tokens = Some(1_024);
+    short_bucket.max_sequence_tokens = Some(64);
+    short_bucket.max_context_tokens = Some(64);
     let mut long_bucket = bucket("d-long", BucketStage::Decode, 30, "d-long");
-    long_bucket.min_sequence_tokens = Some(1_025);
+    long_bucket.min_sequence_tokens = Some(65);
     let bucket_config = BucketConfig {
         buckets: vec![
             bucket("p", BucketStage::Prefill, 10, "p"),
@@ -435,7 +436,9 @@ async fn decode_bucket_uses_input_plus_requested_output_budget() {
         None,
     );
 
-    let response = build_router(ctx)
+    let app = build_router(ctx);
+    let response = app
+        .clone()
         .oneshot(chat_request(None, Some(2_000)))
         .await
         .unwrap();
@@ -455,6 +458,25 @@ async fn decode_bucket_uses_input_plus_requested_output_budget() {
     assert!(
         short_decode.captured.lock().unwrap().last_body.is_none(),
         "the incompatible short Decode Bucket must not receive the request"
+    );
+
+    // Each prompt plus its own output budget fits: neither item needs 120 tokens.
+    let request = Request::post("/generate")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "input_ids": [vec![1; 60], vec![2]],
+                "sampling_params": [{"max_new_tokens": 1}, {"max_new_tokens": 60}],
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-sgl-decode-url"],
+        short_decode.url.as_str(),
+        "a batch must fit the Decode Bucket by each item's own peak sequence length"
     );
 }
 

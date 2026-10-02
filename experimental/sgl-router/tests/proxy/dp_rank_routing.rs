@@ -230,8 +230,15 @@ async fn pd_batch_leaves_the_prefill_rank_to_the_engine() {
         (&decode, WorkerMode::Decode, 2),
     ];
     let app = router(sticky_config(), &workers, Default::default());
-    send_generate(app, json!({"text": ["a", "b"]})).await;
+    send_generate(
+        app,
+        json!({"text": ["a", "b"], "routed_dp_rank": 3, "data_parallel_rank": 3}),
+    )
+    .await;
 
-    assert_eq!(prefill.captured_json().await.get("routed_dp_rank"), None);
+    let (p, d) = (prefill.captured_json().await, decode.captured_json().await);
+    assert_eq!(p.get("routed_dp_rank"), None);
+    assert_eq!(p.get("data_parallel_rank"), None);
     assert_eq!(prefill.captured.lock().unwrap().headers.get(RANK), None);
+    assert!(d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2));
 }

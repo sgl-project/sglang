@@ -23,14 +23,7 @@ pub(super) async fn select_workers(
 ) -> Result<SelectedWorkers, ApiError> {
     // Buckets and context limits bound one sequence, not a whole batch.
     let input_tokens = request.sequence_token_count as u64;
-    let expected_peak_tokens = request
-        .max_output_tokens
-        .map(|output| {
-            input_tokens.checked_add(output).ok_or_else(|| {
-                ApiError::BadRequest("input and output token counts overflow".into())
-            })
-        })
-        .transpose()?;
+    let expected_peak_tokens = request.expected_peak_sequence_tokens()?;
 
     let ttft_ms = if resolver.ttft_slo != SloPreference::Disabled {
         parse_optional_positive_u64_header(headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?

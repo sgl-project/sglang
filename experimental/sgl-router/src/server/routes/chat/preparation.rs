@@ -111,7 +111,11 @@ impl PreparedRequest {
                 items.into_iter().max().unwrap_or(1),
             ),
             None => {
-                let tokens = input_token_count(tokens.as_ref(), &body);
+                let tokens = value["input_embeds"]
+                    .as_array()
+                    .filter(|_| value["text"].is_null() && value["input_ids"].is_null())
+                    .map(|rows| rows.len().max(1))
+                    .unwrap_or_else(|| input_token_count(tokens.as_ref(), &body));
                 (tokens, tokens)
             }
         };
@@ -130,6 +134,38 @@ impl PreparedRequest {
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
         })
+    }
+
+    /// Context limits bound each prompt together with its own output budget.
+    pub(super) fn expected_peak_sequence_tokens(&self) -> Result<Option<u64>, ApiError> {
+        let Some(output) = self.max_output_tokens else {
+            return Ok(None);
+        };
+        let peak = |input: usize, output: u64| {
+            (input as u64).checked_add(output).ok_or_else(|| {
+                ApiError::BadRequest("input and output token counts overflow".into())
+            })
+        };
+        if self.path == GENERATE_PATH {
+            let value = self.parsed_body.as_ref().expect("generate body is parsed");
+            if let (Some(lengths), Some(params)) = (
+                batch_prompt_tokens(value),
+                value["sampling_params"].as_array(),
+            ) {
+                if lengths.len() != params.len() {
+                    return Ok(None); // Leave invalid batch cardinality to the engine.
+                }
+                let mut longest = 0;
+                for (input, params) in lengths.into_iter().zip(params) {
+                    let Some(output) = params["max_new_tokens"].as_u64() else {
+                        return Ok(None);
+                    };
+                    longest = longest.max(peak(input, output)?);
+                }
+                return Ok(Some(longest));
+            }
+        }
+        peak(self.sequence_token_count, output).map(Some)
     }
 
     pub(super) fn engine_rid(&self) -> Option<String> {
@@ -192,8 +228,8 @@ fn max_new_tokens(sampling_params: &Value) -> Option<u64> {
     }
 }
 
-/// Per-prompt token counts of a `/generate` batch: exact for nested `input_ids`,
-/// estimated for a `text` list. `None` for a single prompt.
+/// Per-prompt token counts of a `/generate` batch: exact for nested `input_ids`
+/// or `input_embeds`, estimated for a `text` list. `None` for a single prompt.
 fn batch_prompt_tokens(value: &Value) -> Option<Vec<usize>> {
     if let Some(texts) = value["text"].as_array() {
         let estimate = |text: &Value| estimate_prefill_tokens(text.as_str().map_or(0, str::len));
@@ -201,7 +237,13 @@ fn batch_prompt_tokens(value: &Value) -> Option<Vec<usize>> {
     }
     let rows = value["input_ids"]
         .as_array()
-        .filter(|rows| rows.first().is_some_and(Value::is_array))?;
+        .filter(|rows| rows.first().is_some_and(Value::is_array))
+        .or_else(|| {
+            value["input_embeds"]
+                .as_array()
+                .filter(|_| value["text"].is_null() && value["input_ids"].is_null())
+                .filter(|rows| rows.first().is_some_and(|row| row[0].is_array()))
+        })?;
     Some(
         rows.iter()
             .map(|row| row.as_array().map_or(0, Vec::len).max(1))
@@ -947,17 +989,35 @@ mod tests {
         let mixed =
             prepare(json!({"text": ["a", "b"], "sampling_params": [{"max_new_tokens": 16}, {}]}));
         assert_eq!(mixed.max_output_tokens, None);
+        assert_eq!(mixed.expected_peak_sequence_tokens().unwrap(), None);
+        // The engine ignores embeddings when token IDs are also supplied.
+        for embeds in [
+            json!(vec![vec![0.5; 4]; 100]),
+            json!([vec![vec![0.5; 4]; 100]]),
+        ] {
+            let single = prepare(json!({"input_ids": [1], "input_embeds": embeds}));
+            assert_eq!(
+                (single.input_token_count, single.sequence_token_count),
+                (1, 1)
+            );
+        }
     }
 
     #[test]
     fn generate_batch_counts_load_in_total_and_buckets_per_prompt() {
         let ctx = AppContext::stub();
-        let body = Bytes::from(json!({"input_ids": [[1], [2, 3, 4]]}).to_string());
-        let batch = PreparedRequest::generate(&ctx, ModelId("stub-model".into()), body).unwrap();
-        assert_eq!(
-            (batch.input_token_count, batch.sequence_token_count),
-            (4, 3)
-        );
+        for body in [
+            json!({"input_ids": [[1], [2, 3, 4]]}),
+            json!({"input_embeds": [vec![vec![0.5; 4]; 1], vec![vec![0.5; 4]; 3]]}),
+        ] {
+            let body = Bytes::from(body.to_string());
+            let batch =
+                PreparedRequest::generate(&ctx, ModelId("stub-model".into()), body).unwrap();
+            assert_eq!(
+                (batch.input_token_count, batch.sequence_token_count),
+                (4, 3)
+            );
+        }
     }
 
     #[test]
