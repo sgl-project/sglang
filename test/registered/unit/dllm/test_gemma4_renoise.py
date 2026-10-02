@@ -24,6 +24,7 @@ def _config(*, block_size=3, fdfo=False, **algorithm_config):
         algorithm="Gemma4Renoise",
         algorithm_config=algorithm_config,
         block_size=block_size,
+        prefill_block_size=block_size,
         mask_id=-1,
         max_running_requests=8,
         first_done_first_out_mode=fdfo,
@@ -260,6 +261,8 @@ class TestGemma4Renoise(unittest.TestCase):
             max_running_requests=None,
             dllm_algorithm_config=None,
             dllm_fdfo=True,
+            dllm_prefill_block_size=None,
+            max_prefill_tokens=None,
         )
 
         with patch(
@@ -268,7 +271,15 @@ class TestGemma4Renoise(unittest.TestCase):
         ):
             config = DllmConfig.from_server_args(server_args)
             self.assertEqual(config.block_size, 192)
+            self.assertEqual(config.prefill_block_size, 192)
             self.assertTrue(config.requires_separate_context_encoding)
+
+            # Context encoding is not block-sized, so a multi-block prefill
+            # size has nothing to configure.
+            server_args.dllm_prefill_block_size = 384
+            with self.assertRaisesRegex(ValueError, "encodes context separately"):
+                DllmConfig.from_server_args(server_args)
+            server_args.dllm_prefill_block_size = None
 
             server_args.dllm_algorithm = "LowConfidence"
             with self.assertRaisesRegex(ValueError, "requires the Gemma4Renoise"):

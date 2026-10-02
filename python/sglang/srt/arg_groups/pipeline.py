@@ -201,6 +201,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_platform_defaults, server_args)
 
+    from sglang.srt.arg_groups.dllm_hook import handle_dllm_cuda_graph_compatibility
+
+    # dLLM graph and chunked-prefill constraints must precede memory sizing.
+    run_hook(handle_dllm_cuda_graph_compatibility, server_args)
+
     from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 
     run_hook(handle_gpu_memory_settings, server_args)

@@ -42,6 +42,27 @@ class ReqDllmMixin:
             DllmReqPhase.INCOMING_PREFILL,
         ]
 
+    def reset_dllm_for_retract(self: Req):
+        """Drop the denoising state a retracted request can no longer back with KV.
+
+        Called right after ``Req.reset_for_retract()``, which already clears
+        ``dllm_initialized`` and ``extend_range``. The decoded ``output_ids``
+        deliberately survive: ``_init_fill_ids_for_dllm`` rebuilds the fill ids
+        from ``origin_input_ids + output_ids``, so retraction costs the recompute
+        of the prefix KV, not the generated tokens. The unresolved FDFO block is
+        dropped because the KV that backed it has been freed.
+        """
+        self.dllm_incomplete_ids = array("q")
+        self.dllm_algo_state = None
+        self.dllm_block_offset = 0
+        context_len = len(self.origin_input_ids) + len(self.output_ids)
+        self.dllm_phase = (
+            DllmReqPhase.INCOMING_DECODE
+            if not self.dllm_config.requires_separate_context_encoding
+            and context_len < self.dllm_config.block_size
+            else DllmReqPhase.INCOMING_PREFILL
+        )
+
     def determine_dllm_phase(self: Req):
         if self.dllm_incomplete_ids:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
@@ -68,6 +89,9 @@ class ReqDllmMixin:
         )
 
     def _init_fill_ids_for_dllm(self: Req):
+        # A pure prefill round can extend more than one dLLM decode block.
+        # Keep the decode position base in sync with the actual amount of KV
+        # committed by the preceding round rather than assuming one block.
         if self.dllm_incomplete_ids:
             prefix_len = len(self.prefix_indices)
             assert len(self.dllm_incomplete_ids) == self.dllm_config.block_size
@@ -80,6 +104,8 @@ class ReqDllmMixin:
             return
 
         if self.dllm_config.requires_separate_context_encoding:
+            # The canvas starts after the whole context, which the causal
+            # encoder pass prefills first; it is not block-aligned.
             self._refresh_fill_ids()
             self.dllm_block_offset = self.seqlen
             if self.dllm_initialized:
@@ -88,15 +114,13 @@ class ReqDllmMixin:
             self.dllm_block_offset = (
                 0
                 if not self.dllm_initialized
-                else self.dllm_block_offset + self.dllm_config.block_size
+                else self.dllm_block_offset
+                + (self.extend_range.length if self.extend_range is not None else 0)
             )
             self.full_untruncated_fill_ids = (
                 self.origin_input_ids
                 + self.output_ids
-                + array(
-                    "q",
-                    [self.dllm_config.mask_id] * self.dllm_config.block_size,
-                )
+                + array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)
             )
         self.dllm_initialized = True
 

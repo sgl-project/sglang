@@ -67,10 +67,11 @@ class _Req:
 class _Batch:
     def __init__(self, reqs):
         self.reqs = reqs
+        # ScheduleBatch declares the scheduler-selected phase; the result
+        # handler reads it.
+        self.is_dllm_prefill = all(req.is_dllm_prefill() for req in reqs)
         self.forward_mode = (
-            ForwardMode.EXTEND
-            if all(req.is_dllm_prefill() for req in reqs)
-            else ForwardMode.DLLM_EXTEND
+            ForwardMode.EXTEND if self.is_dllm_prefill else ForwardMode.DLLM_EXTEND
         )
         self.return_logprob = False
         self.prefill_stats = object()
@@ -86,6 +87,7 @@ class _Scheduler(SchedulerDllmMixin):
             algorithm="Gemma4Renoise",
             algorithm_config={},
             block_size=block_size,
+            prefill_block_size=block_size,
             mask_id=-1,
             max_running_requests=8,
             first_done_first_out_mode=fdfo,
@@ -116,33 +118,28 @@ def _result(next_token_ids, *, accept_lengths=None, algo_states=None):
 
 class TestGemma4ContextLifecycle(unittest.TestCase):
     def test_scheduler_uses_standard_extend_for_context_only(self):
-        scheduler = SimpleNamespace(
-            dllm_config=SimpleNamespace(requires_separate_context_encoding=True),
-            dllm_manager=SimpleNamespace(
-                get_prefill_requests=Mock(return_value=[object()]),
-                get_decode_requests=Mock(return_value=[]),
-            ),
-            _process_batch_by_phase=Mock(),
-        )
-
-        mode = SchedulerDllmMixin._process_dllm_batches(
-            scheduler, Mock(), running_batch=Mock()
-        )
-        self.assertEqual(mode, ForwardMode.EXTEND)
-
-        scheduler.dllm_config.requires_separate_context_encoding = False
-        mode = SchedulerDllmMixin._process_dllm_batches(
-            scheduler, Mock(), running_batch=Mock()
-        )
-        self.assertEqual(mode, ForwardMode.DLLM_EXTEND)
-
-        scheduler.dllm_config.requires_separate_context_encoding = True
-        scheduler.dllm_manager.get_prefill_requests.return_value = []
-        scheduler.dllm_manager.get_decode_requests.return_value = [object()]
-        mode = SchedulerDllmMixin._process_dllm_batches(
-            scheduler, Mock(), running_batch=Mock()
-        )
-        self.assertEqual(mode, ForwardMode.DLLM_EXTEND)
+        # Every dLLM prefill, context encoding included, is a standard EXTEND;
+        # only the canvas denoise uses DLLM_EXTEND.
+        for separate_context in (True, False):
+            scheduler = SimpleNamespace(
+                dllm_config=SimpleNamespace(
+                    requires_separate_context_encoding=separate_context
+                ),
+                dllm_manager=SimpleNamespace(
+                    get_prefill_requests=Mock(return_value=[object()]),
+                    get_decode_requests=Mock(return_value=[object()]),
+                ),
+                _process_batch_by_phase=Mock(),
+            )
+            with self.subTest(separate_context=separate_context):
+                mode = SchedulerDllmMixin._process_dllm_batches(
+                    scheduler, Mock(), running_batch=Mock(), is_prefill=True
+                )
+                self.assertEqual(mode, ForwardMode.EXTEND)
+                mode = SchedulerDllmMixin._process_dllm_batches(
+                    scheduler, Mock(), running_batch=Mock(), is_prefill=False
+                )
+                self.assertEqual(mode, ForwardMode.DLLM_EXTEND)
 
     def test_context_result_skips_fdfo_token_processing(self):
         scheduler = _Scheduler(fdfo=True)
@@ -172,10 +169,12 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.dllm_block_size = 8
         adder.rem_dllm_tokens = 64
+        adder.rem_input_tokens = 64
         adder.is_hybrid_swa = True
         req = _Req(context_len=40, block_size=8, prefill=True)
 
-        for reserved, expected in ((0, 28), (20, 8), (28, 0), (32, -4)):
+        # An exhausted SWA pool admits nothing rather than a negative length.
+        for reserved, expected in ((0, 28), (20, 8), (28, 0), (32, 0)):
             with self.subTest(reserved=reserved):
                 budget.swa_offset = reserved
                 self.assertEqual(adder._get_dllm_remain_tokens(req), expected)
@@ -188,6 +187,10 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.dllm_block_size = 256
         adder.rem_dllm_tokens = 1024
+        adder.memory_budget = SimpleNamespace(
+            remaining_total=4096, remaining_current=4096
+        )
+        adder.is_hybrid_swa = False
         adder.can_run_list = []
         adder._mamba_gap_budget_for_req = lambda req: 0
         adder._update_prefill_budget = Mock()
@@ -495,6 +498,16 @@ class TestGemma4RequestValidation(unittest.TestCase):
         )
         scheduler = SimpleNamespace(dllm_config=None)
         self.assertIsNone(SchedulerDllmMixin.validate_dllm_request(scheduler, object()))
+
+    def test_algorithms_without_logprobs_reject_return_logprob(self):
+        # The base default: no dLLM result path fills logprobs, so a request
+        # asking for them would stream empty arrays.
+        for algorithm in ("LowConfidence", "JointThreshold"):
+            with self.subTest(algorithm=algorithm):
+                error = self._validate(algorithm=algorithm, return_logprob=True)
+                self.assertIn("return_logprob", error)
+                self.assertIn(algorithm, error)
+                self.assertIsNone(self._validate(algorithm=algorithm))
 
     def test_greedy_temperature_is_accepted_after_normalization(self):
         params = SamplingParams(temperature=0)
