@@ -428,6 +428,12 @@ pub(super) fn generate_room_id() -> u64 {
     rand::random::<u64>() & (i64::MAX as u64)
 }
 
+/// A room with `room % dp_ranks == rank`, which is how decode finds the prefill rank.
+pub(super) fn generate_room_id_for_rank(rank: u32, dp_ranks: u32) -> u64 {
+    let dp_ranks = u64::from(dp_ranks);
+    (generate_room_id() >> 1) / dp_ranks * dp_ranks + u64::from(rank)
+}
+
 pub(super) struct BootstrapFields {
     pub(super) host: String,
     pub(super) port: Option<u16>,
@@ -785,6 +791,14 @@ mod tests {
     fn bucket_routing_requests_tokens_even_for_a_non_token_policy() {
         assert!(should_tokenize_request(false, false, true));
         assert!(!should_tokenize_request(false, false, false));
+    }
+
+    #[test]
+    fn rank_aligned_room_ids_map_back_to_their_rank() {
+        for _ in 0..1_000 {
+            let room = generate_room_id_for_rank(6, 7);
+            assert!(room <= i64::MAX as u64 && room % 7 == 6);
+        }
     }
 
     #[test]
