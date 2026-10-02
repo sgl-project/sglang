@@ -240,7 +240,8 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_FA3)
+# common_ops' SM90 CUTLASS kernels (FP8/INT8 GEMM, MoE) need sm_90a, with or without FA3.
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
