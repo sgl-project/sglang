@@ -48,11 +48,14 @@ class TestEmbeddingRequestLengthAbort(CustomTestCase):
     def _handle(self, num_tokens):
         fake_self = MagicMock()
         fake_self.max_req_input_len = MAX_REQ_INPUT_LEN
-        with patch.object(
-            scheduler_module,
-            "get_serving",
-            return_value=SimpleNamespace(allow_auto_truncate=False),
-        ), get_parallel().override(tp_rank=1):
+        with (
+            patch.object(
+                scheduler_module,
+                "get_serving",
+                return_value=SimpleNamespace(allow_auto_truncate=False),
+            ),
+            get_parallel().override(tp_rank=1),
+        ):
             Scheduler.handle_embedding_request(fake_self, _make_recv_req(num_tokens))
         fake_self._add_request_to_queue.assert_called_once()
         return fake_self._add_request_to_queue.call_args.args[0]
