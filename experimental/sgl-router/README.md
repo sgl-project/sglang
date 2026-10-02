@@ -183,8 +183,10 @@ model, KV-event publisher, HTTP/2 support and DP size. An engine launched with
 
 ### Fleet-wide sampling contract
 
-`--override-sampling-params` fixes the sampling configuration for every client
-of this router, independently of what the engine's own defaults happen to be:
+`--override-sampling-params` fixes the sampling configuration for every
+chat-completions client of this router, independently of what the engine's own
+defaults happen to be (native [`/generate`](#native-generate) passes its
+`sampling_params` through, as the engine does):
 
 ```bash
 sgl-router \
@@ -363,7 +365,8 @@ with chat completions.
 There is no chat template to render, so whenever a tokenizer is loaded the
 router tokenizes under any policy: it reads caller `input_ids` as sent, or
 tokenizes a single `text` prompt. A batch (`text` list or nested `input_ids`)
-routes on load, and the whole batch goes to one worker. `text` is tokenized
+routes on load, and the whole batch goes to one worker. Load counts every
+prompt in it, while bucket limits apply to its longest one. `text` is tokenized
 without special tokens, while the engine adds them, so for a tokenizer that
 prepends BOS only `input_ids` requests match cached prefixes.
 
@@ -371,8 +374,10 @@ The body is forwarded as sent, plus PD bootstrap fields and, for a single prompt
 whose caller sent none, a minted `rid`. The router does not forward its own
 `input_ids` here, and `--override-sampling-params` does not apply: `/generate`
 nests sampling parameters under `sampling_params`, which pass through untouched.
-Under `--dp-aware`, a PD batch or `n > 1` request leaves the prefill rank to the
-engine, which gives item `i` the bootstrap room `room + i`.
+Under `--dp-aware`, the chosen rank is also written as `routed_dp_rank` into each
+worker's body, since the native endpoint ignores `X-Data-Parallel-Rank`. A PD
+batch or `n > 1` request leaves the prefill rank to the engine, which gives item
+`i` the bootstrap room `room + i`.
 
 ## DeepSeek V4
 

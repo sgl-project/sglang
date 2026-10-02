@@ -21,7 +21,8 @@ pub(super) async fn select_workers(
     request: &PreparedRequest,
     headers: &HeaderMap,
 ) -> Result<SelectedWorkers, ApiError> {
-    let input_tokens = request.input_token_count as u64;
+    // Buckets and context limits bound one sequence, not a whole batch.
+    let input_tokens = request.sequence_token_count as u64;
     let expected_peak_tokens = request
         .max_output_tokens
         .map(|output| {

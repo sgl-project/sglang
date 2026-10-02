@@ -98,6 +98,19 @@ impl MockWorker {
         }
     }
 
+    /// The last request body as JSON, polled because a PD prefill is dispatched in the background.
+    #[allow(dead_code)] // Only used by some test files.
+    pub async fn captured_json(&self) -> Value {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(body) = self.captured.lock().unwrap().last_body.clone() {
+                return serde_json::from_slice(&body).unwrap();
+            }
+            assert!(start.elapsed() < Duration::from_secs(2), "no body captured");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Bind to a random port and start a worker that accepts the request,
     /// sleeps for `delay`, then returns `200 OK` with an empty JSON object.
     /// Used to test router behaviour when the upstream wedges after accepting

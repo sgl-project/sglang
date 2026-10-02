@@ -20,7 +20,7 @@ use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, HashTr
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tower::ServiceExt;
 
 use crate::common::cache_aware_fixture::{config, MODEL};
@@ -75,18 +75,6 @@ async fn send(app: &Router, method: &str, body: &Value) -> Response {
     app.clone().oneshot(request).await.unwrap()
 }
 
-/// A PD prefill is dispatched in the background, so poll for its body.
-async fn captured_body(mock: &MockWorker) -> Value {
-    let start = Instant::now();
-    loop {
-        if let Some(body) = mock.captured.lock().unwrap().last_body.clone() {
-            return serde_json::from_slice(&body).unwrap();
-        }
-        assert!(start.elapsed() < Duration::from_secs(2), "no body captured");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
 #[tokio::test]
 async fn generate_forwards_the_engine_body_and_response() {
     let engine = MockWorker::start(vec![]).await;
@@ -98,7 +86,7 @@ async fn generate_forwards_the_engine_body_and_response() {
     let response: Value = serde_json::from_slice(&collect_body(res.into_body()).await).unwrap();
 
     // Only an rid for abort-on-disconnect is added: no `model`, no router `input_ids`.
-    let mut forwarded = captured_body(&engine).await;
+    let mut forwarded = engine.captured_json().await;
     let rid = forwarded.as_object_mut().unwrap().remove("rid").unwrap();
     assert!(rid
         .as_str()
@@ -114,7 +102,7 @@ async fn generate_accepts_put_and_keeps_a_caller_rid() {
     let sent = json!({"text": ["a", "b"], "rid": ["r0", "r1"]});
 
     assert_eq!(send(&app, "PUT", &sent).await.status(), StatusCode::OK);
-    assert_eq!(captured_body(&engine).await, sent);
+    assert_eq!(engine.captured_json().await, sent);
 }
 
 #[tokio::test]
@@ -144,7 +132,7 @@ async fn pd_generate_sends_one_bootstrap_room_to_both_workers() {
 
     let res = send(&app, "POST", &json!({"text": "hi"})).await;
     assert_eq!(res.status(), StatusCode::OK);
-    let (p, d) = (captured_body(&prefill).await, captured_body(&decode).await);
+    let (p, d) = (prefill.captured_json().await, decode.captured_json().await);
     for key in [
         "text",
         "rid",

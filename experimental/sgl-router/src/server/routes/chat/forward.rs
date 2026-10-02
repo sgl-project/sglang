@@ -5,7 +5,8 @@
 
 use super::nonempty_header;
 use super::preparation::{
-    generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
+    generate_room_id, generate_room_id_for_rank, with_routed_dp_rank, BootstrapFields,
+    PreparedRequest, GENERATE_PATH,
 };
 use crate::discovery::WorkerMode;
 use crate::policies::dp_rank::select_dp_rank;
@@ -111,7 +112,7 @@ pub(super) async fn forward_request(
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
-    let prefill_headers = with_dp_rank(headers.clone(), prefill_rank);
+    let (prefill_headers, prefill_body) = with_dp_rank(headers.clone(), &body, path, prefill_rank);
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -120,7 +121,7 @@ pub(super) async fn forward_request(
 
     // In PD mode, prefill runs independently and decode supplies the client response.
     let stream_abort = CancellationToken::new();
-    let (response_worker, response_headers, response_load_guards, prefill_task) =
+    let (response_worker, response_headers, response_body, response_load_guards, prefill_task) =
         if let Some((decode, bootstrap)) = pd {
             let task = spawn_prefill_request(
                 ctx,
@@ -128,7 +129,7 @@ pub(super) async fn forward_request(
                 Arc::clone(&prefill),
                 path,
                 prefill_headers,
-                body.clone(),
+                prefill_body,
                 prefill_load_guards,
                 bootstrap.room,
                 stream_abort.clone(),
@@ -139,15 +140,22 @@ pub(super) async fn forward_request(
                     .register(decode.id.clone(), decode.url.clone(), 0, 1),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
-            let decode_headers = with_dp_rank(headers, decode_rank);
+            let (decode_headers, decode_body) = with_dp_rank(headers, &body, path, decode_rank);
             (
                 decode,
                 decode_headers,
+                decode_body,
                 decode_load_guards,
                 Some((task, prefill)),
             )
         } else {
-            (prefill, prefill_headers, prefill_load_guards, None)
+            (
+                prefill,
+                prefill_headers,
+                prefill_body,
+                prefill_load_guards,
+                None,
+            )
         };
 
     // In PD mode, prefill can finish before decode. Watch the registration
@@ -158,7 +166,7 @@ pub(super) async fn forward_request(
         &response_worker,
         path,
         &response_headers,
-        body,
+        response_body,
         engine_rid.as_deref(),
         response_load_guards,
         &metrics,
@@ -223,11 +231,24 @@ fn prompt_dp_rank(
     select_dp_rank(worker, key, &prefix_depths)
 }
 
-fn with_dp_rank(mut headers: HeaderMap, rank: Option<u32>) -> HeaderMap {
-    if let Some(rank) = rank {
-        headers.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(rank));
-    }
-    headers
+/// Pins `rank` in the header, and also in the body for native `/generate`,
+/// which ignores the header.
+fn with_dp_rank(
+    mut headers: HeaderMap,
+    body: &Bytes,
+    path: &str,
+    rank: Option<u32>,
+) -> (HeaderMap, Bytes) {
+    let Some(rank) = rank else {
+        return (headers, body.clone());
+    };
+    headers.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(rank));
+    let body = if path == GENERATE_PATH {
+        with_routed_dp_rank(body, rank)
+    } else {
+        body.clone()
+    };
+    (headers, body)
 }
 
 fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {

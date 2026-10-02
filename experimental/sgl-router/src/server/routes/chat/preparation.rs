@@ -20,7 +20,7 @@ use serde_json::{json, Number, Value};
 const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
-const GENERATE_PATH: &str = "/generate";
+pub(super) const GENERATE_PATH: &str = "/generate";
 
 /// Validated routing inputs and the original body, ready for worker selection.
 pub(super) struct PreparedRequest {
@@ -33,6 +33,9 @@ pub(super) struct PreparedRequest {
     pub(super) tokens: Option<RequestTokens>,
     /// Token count for routing/load accounting; estimated from body size when unavailable.
     pub(super) input_token_count: usize,
+    /// The longest single prompt, for bucket and context checks; differs from
+    /// `input_token_count` only for a `/generate` batch.
+    pub(super) sequence_token_count: usize,
     caller_set_rid: bool,
     pub(super) fans_out: bool,
     /// `None` for `/generate`, which never carries router tokens and books no forwarding outcome.
@@ -71,12 +74,14 @@ impl PreparedRequest {
         let tokens = parsed_body
             .as_ref()
             .and_then(|parsed_body| request_tokens_for(&ctx.tokenizers, &model, parsed_body));
+        let input_tokens = input_token_count(tokens.as_ref(), &body);
         Ok(Self {
             path: CHAT_PATH,
             model,
             streaming: fields.stream.unwrap_or(false),
             max_output_tokens: fields.requested_max_output_tokens(),
-            input_token_count: input_token_count(tokens.as_ref(), &body),
+            input_token_count: input_tokens,
+            sequence_token_count: input_tokens,
             body,
             tokens,
             caller_set_rid: fields.caller_set_rid,
@@ -98,12 +103,25 @@ impl PreparedRequest {
         let stream =
             Option::<bool>::deserialize(&value["stream"]).map_err(|_| invalid_request())?;
         let tokens = request_tokens_for(&ctx.tokenizers, &model, &value);
+        // Each batch item is its own engine request: load counts them all,
+        // while buckets and context checks see the longest one.
+        let (input_tokens, sequence_tokens) = match batch_prompt_tokens(&value) {
+            Some(items) => (
+                items.iter().sum::<usize>().max(1),
+                items.into_iter().max().unwrap_or(1),
+            ),
+            None => {
+                let tokens = input_token_count(tokens.as_ref(), &body);
+                (tokens, tokens)
+            }
+        };
         Ok(Self {
             path: GENERATE_PATH,
             model,
             streaming: stream.unwrap_or(false),
             max_output_tokens: max_new_tokens(&value["sampling_params"]),
-            input_token_count: input_token_count(tokens.as_ref(), &body),
+            input_token_count: input_tokens,
+            sequence_token_count: sequence_tokens,
             body,
             tokens,
             caller_set_rid: !value["rid"].is_null(),
@@ -159,16 +177,40 @@ impl PreparedRequest {
     }
 }
 
-/// The largest `max_new_tokens` across a batch; `None` leaves the engine default.
+/// The largest `max_new_tokens` across a batch; `None` when any item leaves the
+/// engine default, which the router cannot see.
 fn max_new_tokens(sampling_params: &Value) -> Option<u64> {
     let max_new_tokens = |params: &Value| params.get("max_new_tokens")?.as_u64();
     match sampling_params {
-        Value::Array(batch) => batch.iter().filter_map(max_new_tokens).max(),
+        Value::Array(batch) => batch
+            .iter()
+            .map(max_new_tokens)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .max(),
         params => max_new_tokens(params),
     }
 }
 
-/// The engine splits a batch (`text` list, nested `input_ids`) or `n > 1` into one request per item.
+/// Per-prompt token counts of a `/generate` batch: exact for nested `input_ids`,
+/// estimated for a `text` list. `None` for a single prompt.
+fn batch_prompt_tokens(value: &Value) -> Option<Vec<usize>> {
+    if let Some(texts) = value["text"].as_array() {
+        let estimate = |text: &Value| estimate_prefill_tokens(text.as_str().map_or(0, str::len));
+        return Some(texts.iter().map(estimate).collect());
+    }
+    let rows = value["input_ids"]
+        .as_array()
+        .filter(|rows| rows.first().is_some_and(Value::is_array))?;
+    Some(
+        rows.iter()
+            .map(|row| row.as_array().map_or(0, Vec::len).max(1))
+            .collect(),
+    )
+}
+
+/// The engine splits a batch (`text` list, nested `input_ids` or `input_embeds`)
+/// or `n > 1` into one request per item.
 fn generate_fans_out(value: &Value) -> bool {
     let params = match &value["sampling_params"] {
         Value::Array(batch) => batch.first().unwrap_or(&Value::Null),
@@ -176,6 +218,7 @@ fn generate_fans_out(value: &Value) -> bool {
     };
     value["text"].is_array()
         || value["input_ids"][0].is_array()
+        || value["input_embeds"][0][0].is_array()
         || params
             .get("n")
             .and_then(Value::as_u64)
@@ -475,12 +518,12 @@ fn requests_multiple_samples(
 fn input_token_count(tokens: Option<&RequestTokens>, body: &Bytes) -> usize {
     tokens
         .map(|tokens| tokens.ids.len().max(1))
-        .unwrap_or_else(|| estimate_prefill_tokens(body))
+        .unwrap_or_else(|| estimate_prefill_tokens(body.len()))
 }
 
-fn estimate_prefill_tokens(body: &Bytes) -> usize {
+fn estimate_prefill_tokens(bytes: usize) -> usize {
     // Never 0: a zero-load entry is invisible to the cache-aware imbalance fast path.
-    (body.len() / BYTES_PER_TOKEN_ESTIMATE).max(1)
+    (bytes / BYTES_PER_TOKEN_ESTIMATE).max(1)
 }
 
 /// The engine stores bootstrap rooms as signed int64 values.
@@ -536,6 +579,25 @@ fn append_top_level_fields(
     }
     output.extend_from_slice(&body[close..]);
     Some(Bytes::from(output))
+}
+
+/// Native `/generate` ignores `X-Data-Parallel-Rank` and reads the rank from the
+/// body; appended last so it wins over a caller's `routed_dp_rank`.
+pub(super) fn with_routed_dp_rank(body: &Bytes, rank: u32) -> Bytes {
+    let Some(close) = body.iter().rposition(|&b| b == b'}') else {
+        return body.clone();
+    };
+    let empty = body[..close]
+        .iter()
+        .rfind(|b| !b.is_ascii_whitespace())
+        .is_some_and(|&b| b == b'{');
+    let mut output = body[..close].to_vec();
+    if !empty {
+        output.push(b',');
+    }
+    output.extend_from_slice(format!("\"routed_dp_rank\":{rank}").as_bytes());
+    output.extend_from_slice(&body[close..]);
+    Bytes::from(output)
 }
 
 /// Preserve original bytes where possible; reuse parsed JSON for token or bootstrap injection.
@@ -874,11 +936,40 @@ mod tests {
         for batch in [
             json!({"text": ["a", "b"], "sampling_params": [{"max_new_tokens": 8}, {"max_new_tokens": 32}]}),
             json!({"input_ids": [[1], [2]], "sampling_params": {"max_new_tokens": 32}}),
+            json!({"input_embeds": [[[0.5]], [[0.5]]], "sampling_params": {"max_new_tokens": 32}}),
             json!({"text": "a", "sampling_params": {"n": 2, "max_new_tokens": 32}}),
         ] {
             let batch = prepare(batch);
             assert!(batch.fans_out);
             assert_eq!(batch.max_output_tokens, Some(32));
+        }
+        // The second item runs to the engine default, so the batch bound is unknown.
+        let mixed =
+            prepare(json!({"text": ["a", "b"], "sampling_params": [{"max_new_tokens": 16}, {}]}));
+        assert_eq!(mixed.max_output_tokens, None);
+    }
+
+    #[test]
+    fn generate_batch_counts_load_in_total_and_buckets_per_prompt() {
+        let ctx = AppContext::stub();
+        let body = Bytes::from(json!({"input_ids": [[1], [2, 3, 4]]}).to_string());
+        let batch = PreparedRequest::generate(&ctx, ModelId("stub-model".into()), body).unwrap();
+        assert_eq!(
+            (batch.input_token_count, batch.sequence_token_count),
+            (4, 3)
+        );
+    }
+
+    #[test]
+    fn routed_dp_rank_is_appended_last() {
+        for (body, expected) in [
+            (
+                r#"{"text":"hi","routed_dp_rank":0}"#,
+                r#"{"text":"hi","routed_dp_rank":0,"routed_dp_rank":3}"#,
+            ),
+            ("{ }", r#"{ "routed_dp_rank":3}"#),
+        ] {
+            assert_eq!(with_routed_dp_rank(&Bytes::from(body), 3), expected);
         }
     }
 

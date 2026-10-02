@@ -186,6 +186,38 @@ async fn any_policy_picks_the_rank_with_the_deepest_prefix() {
     }
 }
 
+/// Sends `body` to native `/generate` under a sticky key.
+async fn send_generate(app: axum::Router, body: serde_json::Value) {
+    let request = Request::post("/generate")
+        .header("content-type", "application/json")
+        .header(KEY, "conv-pd")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    assert!(app.oneshot(request).await.unwrap().status().is_success());
+}
+
+/// Native `/generate` ignores the rank header, so each PD worker gets its rank in its own body.
+#[tokio::test]
+async fn pd_generate_carries_each_rank_in_its_body() {
+    let (prefill, decode) = (
+        MockWorker::start(vec![]).await,
+        MockWorker::start(vec![]).await,
+    );
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 4),
+        (&decode, WorkerMode::Decode, 2),
+    ];
+    let app = router(sticky_config(), &workers, Default::default());
+    send_generate(app, json!({"text": "hi"})).await;
+
+    let (p, d) = (prefill.captured_json().await, decode.captured_json().await);
+    assert_eq!(
+        p["routed_dp_rank"],
+        p["bootstrap_room"].as_u64().unwrap() % 4
+    );
+    assert!(d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2));
+}
+
 /// The engine gives batch item i the room `room + i`, so one pinned prefill rank would break decode.
 #[tokio::test]
 async fn pd_batch_leaves_the_prefill_rank_to_the_engine() {
@@ -197,21 +229,9 @@ async fn pd_batch_leaves_the_prefill_rank_to_the_engine() {
         (&prefill, WorkerMode::Prefill, 4),
         (&decode, WorkerMode::Decode, 2),
     ];
-    let request = Request::post("/generate")
-        .header("content-type", "application/json")
-        .header(KEY, "conv-pd")
-        .body(Body::from(json!({"text": ["a", "b"]}).to_string()))
-        .unwrap();
     let app = router(sticky_config(), &workers, Default::default());
-    assert!(app.oneshot(request).await.unwrap().status().is_success());
+    send_generate(app, json!({"text": ["a", "b"]})).await;
 
-    let start = Instant::now();
-    while prefill.captured.lock().unwrap().last_body.is_none() {
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "no prefill request"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    assert_eq!(prefill.captured_json().await.get("routed_dp_rank"), None);
     assert_eq!(prefill.captured.lock().unwrap().headers.get(RANK), None);
 }

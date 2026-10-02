@@ -368,6 +368,27 @@ async fn missing_decode_in_all_buckets_does_not_dispatch_prefill() {
     );
 }
 
+/// Each `/generate` batch item is its own engine request, so bucket limits
+/// bound the longest prompt rather than the whole batch.
+#[tokio::test]
+async fn generate_batch_fits_a_bucket_by_its_longest_prompt() {
+    let worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut bucket = Bucket::new("short", BucketGroups::Plain(group("w", policy.clone())));
+    bucket.limits.max = Some(64);
+    bucket.max_context_tokens = Some(64);
+    let app = build_router(context(&[("w", Stage::Plain, &worker)], vec![bucket]));
+    let prompts: Vec<_> = (0..128).map(|id| [id]).collect();
+    let body = serde_json::json!({"input_ids": prompts, "sampling_params": {"max_new_tokens": 8}});
+    let request = Request::post("/generate")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    let calls = policy.calls.lock().unwrap();
+    assert_eq!((calls[0].2, calls[0].3), (1, Some(9)));
+}
+
 #[tokio::test]
 async fn rejects_unsupported_length_unknown_model_and_overflow_before_policy() {
     let worker = MockWorker::start(vec![]).await;
