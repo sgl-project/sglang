@@ -270,6 +270,72 @@ def _sparse_gqa_chunk_prefill(
     )
 
 
+@triton.jit
+def _pack_qsa_prefill_kv(
+    k,
+    v,
+    packed_k,
+    packed_v,
+    req_to_token,
+    req_indices,
+    cu_k,
+    SK0: tl.constexpr,
+    SK1: tl.constexpr,
+    SK2: tl.constexpr,
+    SV0: tl.constexpr,
+    SV1: tl.constexpr,
+    SV2: tl.constexpr,
+    SR0: tl.constexpr,
+    SR1: tl.constexpr,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    batch = tl.program_id(1)
+    start = tl.load(cu_k + batch).to(tl.int64)
+    end = tl.load(cu_k + batch + 1).to(tl.int64)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    token = offsets // (HEADS * DIM)
+    valid = token < end - start
+    req = tl.load(req_indices + batch).to(tl.int64)
+    dst = start * HEADS * DIM + offsets
+    head = offsets // DIM % HEADS
+    dim = offsets % DIM
+    slot = tl.load(req_to_token + req * SR0 + token * SR1, valid, 0).to(tl.int64)
+    keys = tl.load(k + slot * SK0 + head * SK1 + dim * SK2, valid, 0.0)
+    values = tl.load(v + slot * SV0 + head * SV1 + dim * SV2, valid, 0.0)
+    tl.store(packed_k + dst, keys, valid)
+    tl.store(packed_v + dst, values, valid)
+
+
+def pack_qsa_prefill_kv(
+    k, v, req_to_token, req_indices, cu_k, total_k, max_k, *, output_dtype=None
+):
+    heads, dim = k.shape[1:]
+    packed_k = torch.empty(
+        (total_k, heads, dim), dtype=output_dtype or k.dtype, device=k.device
+    )
+    packed_v = torch.empty(
+        (total_k, heads, dim), dtype=output_dtype or v.dtype, device=v.device
+    )
+    _pack_qsa_prefill_kv[(triton.cdiv(max_k * heads * dim, 1024), req_indices.numel())](
+        k,
+        v,
+        packed_k,
+        packed_v,
+        req_to_token,
+        req_indices,
+        cu_k,
+        *k.stride(),
+        *v.stride(),
+        *req_to_token.stride(),
+        HEADS=heads,
+        DIM=dim,
+        BLOCK=1024,
+    )
+    return packed_k, packed_v
+
+
 def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
