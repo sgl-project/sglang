@@ -152,17 +152,26 @@ class TargetVerifyExecutor:
         layout: Optional[RaggedVerifyLayout],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
+        verify_width: int,
+        epilogue: Optional[DsparkVerifyEpilogue],
         simulate_bonus_sampling_info=None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
         Folded path: the accept/finalize/out-token kernels already ran inside
-        the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
+        the target-verify cuda graph (``epilogue``); read its buffers.
         Eager path: run them here, including the SGLANG_SIMULATE_ACC_LEN
-        override.
+        override. A ``verify_width`` below the full width verifies only the
+        first ``verify_width - 1`` drafts; the out tokens then have that width.
         """
         if folded_accept:
-            return self.verify_epilogue.read_accept(bs)
+            return epilogue.read_accept(bs)
+
+        gamma = verify_width - 1
+        if verify_width != self.verify_num_draft_tokens:
+            verify_ids_2d = verify_ids_2d[:, :verify_width].contiguous()
+            draft_tokens = draft_tokens[:, :gamma].contiguous()
+            draft_block = narrow_draft_block(draft_block, gamma)
 
         simulate = self._simulate_acc_len > 0
         # Simulated acceptance overwrites correct_len below, so a sampling accept
@@ -174,8 +183,8 @@ class TargetVerifyExecutor:
             draft_block=draft_block,
             sampling_info=accept_sampling_info,
             draft_input=draft_input,
-            gamma=self.gamma,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_width,
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
         )
@@ -190,7 +199,7 @@ class TargetVerifyExecutor:
                     greedy_bonus=bonus,
                     sampling_info=simulate_bonus_sampling_info,
                     bs=bs,
-                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    verify_num_draft_tokens=verify_width,
                 )
 
         site = (
@@ -211,8 +220,8 @@ class TargetVerifyExecutor:
             draft_tokens=draft_tokens,
             correct_len=correct_len,
             bonus=bonus,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            gamma=self.gamma,
+            verify_num_draft_tokens=verify_width,
+            gamma=gamma,
         )
         return AcceptOuts(
             correct_len=correct_len,
@@ -300,15 +309,18 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        verify_width: int,
     ) -> TargetVerifyResult:
-        verify_w = self.verify_num_draft_tokens
+        if verify_width != self.verify_num_draft_tokens:
+            verify_ids_2d = verify_ids_2d[:, :verify_width].contiguous()
+            verify_window = narrow_verify_window(verify_window, verify_width)
         positions_2d = verify_window.positions_2d
         verify_cache_loc = verify_window.verify_cache_loc
 
         verify_input = DFlashVerifyInput(
             draft_token=verify_ids_2d.reshape(-1),
             positions=positions_2d.reshape(-1),
-            draft_token_num=verify_w,
+            draft_token_num=verify_width,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
@@ -318,7 +330,7 @@ class TargetVerifyExecutor:
         seq_lens_sum_backup = batch.seq_lens_sum
         if not self._verify_backend_self_adds_seq_lens():
             if seq_lens_cpu_backup is not None:
-                batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
+                batch.seq_lens_cpu = seq_lens_cpu_backup + verify_width
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             elif draft_input.nxt_kv_lens_cpu is not None:
                 batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
@@ -335,7 +347,7 @@ class TargetVerifyExecutor:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=verify_w,
+                draft_token_num=verify_width,
             )
 
         return result
@@ -380,6 +392,7 @@ class TargetVerifyExecutor:
         commit_lens: torch.Tensor,
         bs: int,
         run_compact: bool,
+        verify_width: int,
     ) -> None:
         if run_compact:
             self.kv_injector.inject_ragged(
@@ -393,7 +406,9 @@ class TargetVerifyExecutor:
         hidden = logits_output.hidden_states
         if hidden is None:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
-        hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
+        if verify_width != self.verify_num_draft_tokens:
+            verify_window = narrow_verify_window(verify_window, verify_width)
+        hidden = hidden.view(bs, verify_width, -1)
         state_slot = None
         if is_unified_kv_triton():
             # unified_kv needs the per-token draft req slot to address the SWA ring
@@ -918,3 +933,28 @@ def accept_draft_tokens(
         sampling_trim=sampling_trim,
     )
     return selected.correct_len, selected.bonus, selected.cap_trim_lens
+
+
+def narrow_verify_window(window: VerifyWindow, width: int) -> VerifyWindow:
+    """The first ``width`` positions of each request's verify window."""
+    cache_loc_2d = window.verify_cache_loc_2d[:, :width].contiguous()
+    return VerifyWindow(
+        positions_2d=window.positions_2d[:, :width].contiguous(),
+        verify_cache_loc=cache_loc_2d.reshape(-1),
+        verify_cache_loc_2d=cache_loc_2d,
+    )
+
+
+def narrow_draft_block(block: DraftBlockResult, gamma: int) -> DraftBlockResult:
+    """The first ``gamma`` drafts of a proposal (rejection sampling reads only the
+    verified positions)."""
+    return DraftBlockResult(
+        draft_tokens=block.draft_tokens[:, :gamma].contiguous(),
+        corrected_logits=(
+            None
+            if block.corrected_logits is None
+            else block.corrected_logits[:, :gamma].contiguous()
+        ),
+        greedy_mask=block.greedy_mask,
+        temperatures=block.temperatures,
+    )

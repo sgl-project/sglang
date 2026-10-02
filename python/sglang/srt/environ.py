@@ -555,6 +555,12 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Extra uniform verify widths (tokens per request, below gamma + 1) captured for
+    # the static verify; each step verifies at the width with the best predicted
+    # throughput. Needs --speculative-dspark-sps-table-path.
+    SGLANG_DSPARK_VERIFY_WIDTHS = EnvTuple(tuple())
+    # Verify every step at this captured width instead of the policy's choice.
+    SGLANG_DSPARK_FORCE_VERIFY_WIDTH = EnvInt(None)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
