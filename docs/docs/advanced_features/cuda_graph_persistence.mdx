@@ -1,0 +1,46 @@
+---
+title: "CUDA Graph Persistence"
+metatags:
+    description: "Save the captured CUDA graphs once and restore them on later starts with Foundry (--cuda-graph-persistence)."
+---
+
+## Overview
+
+CUDA graph capture (kernel warmup, attention-metadata setup and one capture per batch size) is a large part of a server's cold start. With `--cuda-graph-persistence`, [Foundry](https://github.com/foundry-org/foundry) saves the captured graphs, together with the memory layout they reference, on a first start (`save`) and rebuilds them from that archive on later starts (`load`) instead of capturing. SGLang's capture loop still runs on `load`; only the per-shape capture is replaced by the restore.
+
+Foundry runs a CUDA driver hook in the scheduler processes (preloaded by SGLang around their spawn) that places every device allocation at the same address on `save` and `load`.
+
+## Installation
+
+Foundry is an optional dependency. Its CUDA extension is built against the installed `torch`, so install it without build isolation (it needs Boost filesystem/json and CMake >= 4.0):
+
+```bash
+pip install --no-build-isolation "sglang[foundry]"
+```
+
+## Usage
+
+```bash
+# First start: capture as usual and write the archive (./foundry_archive by default).
+sglang serve --model-path Qwen/Qwen3-1.7B --cuda-graph-persistence save
+
+# Later starts: restore the graphs from the archive.
+sglang serve --model-path Qwen/Qwen3-1.7B --cuda-graph-persistence load
+```
+
+`--cuda-graph-persistence-config` names an optional Foundry TOML (`workspace_root` for the archive directory, `base_addr` / `region_size` for the address region, `scratch_space_size`); its `mode` key is ignored, the flag's mode wins:
+
+```toml
+workspace_root = "/data/foundry_archive/qwen3-1.7b"
+region_size = "256GB"
+```
+
+`save` and `load` must use the same model, flags, parallel layout and GPU type; remove the archive before a `save` of another configuration.
+
+## What it changes
+
+- Decode graphs use the `full` backend; prefill graphs are `full` or `disabled` (default `disabled`). Other backends are rejected.
+- Flags and environment variables that select state a restored graph cannot replay (custom all-reduce IPC buffers, NCCL symmetric memory / NVLS / buffer registration, MSCCL++, two-batch overlap, the memory saver, graph-pool borrow / precarve, the metadata glue graph) are pinned; each pin prints a `[Foundry] pin:` line, and an explicit contrary value stops the launch with the reason.
+- Speculative decoding, LoRA, PD multiplexing, elastic-EP graph recapture and post-capture KV sizing are not supported.
+
+The call sites are in `sglang/srt/utils/foundry_adapter.py`; `test/registered/unit/utils/test_foundry_call_sites.py` pins their positions.
