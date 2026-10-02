@@ -269,7 +269,7 @@ export const benchmarks = [
   // measurement: they exist so the BF16 + TileLang rows above (which match on
   // hw + strategy alone) cannot be attributed to it, since findBenchmark prefers
   // the most specific match. The enabling PR reports a relative A/B against
-  // BF16 + TileLang on 4x H200 (TP4); absolute numbers here are still pending.
+  // BF16 + TileLang on H200 (TP4/EP4 and TP8/EP8); absolute numbers here are still pending.
   // Do not add defaultAccuracy to glm-5.3-flash.jsx without revisiting these
   // rows: effectiveAccuracy merges the variant default under any entry that
   // exists, which would attribute unmeasured accuracy to this pairing and flip
