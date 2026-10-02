@@ -535,7 +535,6 @@ class Qwen3MoeAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -838,9 +837,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
         # Qwen3MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
@@ -871,12 +867,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -896,8 +892,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
-            capture_output=capture_output,
+            capture_gathered=captured_last_layer_outputs,
+            capture=capture_output,
             **kwargs,
         )
 
@@ -945,7 +941,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.postprocess(
+        hidden_states = self.ffn_boundary.finish_complete_output(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -1099,11 +1095,8 @@ class Qwen3MoeForCausalLM(nn.Module):
                 )
 
         if end == self.model.config.num_hidden_layers:
-            forward_batch.hidden_states = residual_batch.complete_output(
-                forward_batch.hidden_states, forward_batch
-            )
             # norm
-            hidden_states = residual_batch.norm(
+            hidden_states = residual_batch.final_norm(
                 forward_batch.hidden_states, forward_batch, self.model.norm
             )
             forward_batch.hidden_states = hidden_states

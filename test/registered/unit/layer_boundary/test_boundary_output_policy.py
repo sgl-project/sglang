@@ -148,24 +148,24 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                     return value[:1]
 
                 selected = (
-                    "_reduce_and_redistribute_output_varlen"
+                    "dp_reduce_scatterv"
                     if varlen and policy in ("rsv", "rs+rsv")
-                    else "_reduce_and_redistribute_output_max_len"
+                    else "dp_reduce_scatter"
                     if max_len and can_rs and policy in ("rs", "rs+rsv")
-                    else "_redistribute_output"
+                    else "_dp_scatter_step"
                 )
                 with (
                     fixture.planning(parallel),
                     patch_communicator("should_use_dp_reduce_scatterv", lambda: varlen),
                     patch_communicator("can_use_dp_reduce_scatter", lambda: can_rs),
-                    patch_communicator("_to_local_tokens", move),
+                    patch_communicator("to_dp_local", move),
                 ):
                     with layer.ffn.plan.output.ffn_exit(
                         self.batch(max_len), stream=ResidualStream()
                     ) as output:
                         self.assertEqual(
                             get_forward().mlp_reduce_scatter,
-                            selected != "_redistribute_output",
+                            selected != "_dp_scatter_step",
                         )
                     result, _ = finish_exit(output, torch.ones(2, 4), torch.zeros(1, 4))
                 self.assertEqual(calls, [selected])
@@ -197,11 +197,11 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                             "should_use_dp_reduce_scatterv", lambda: varlen
                         ),
                         patch_communicator("can_use_dp_reduce_scatter", lambda: True),
-                        patch_communicator("_to_local_tokens", move),
+                        patch_communicator("to_dp_local", move),
                     ):
-                        output = layer.ffn.postprocess(hidden, batch)
-                        value, saved_residual = batch.residual_stream.finish(output)
-                    self.assertEqual(calls, ["_redistribute_output"])
+                        output = layer.ffn.finish_complete_output(hidden, batch)
+                        value, saved_residual = batch.residual_stream.export(output)
+                    self.assertEqual(calls, ["_dp_scatter_step"])
                     torch.testing.assert_close(value, hidden[:1])
                     self.assertIs(saved_residual, residual)
 
@@ -252,7 +252,7 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                     fixture.planning(parallel),
                     patch_communicator("should_use_dp_reduce_scatterv", lambda: False),
                     patch_communicator("can_use_dp_reduce_scatter", lambda: True),
-                    patch_communicator("_to_local_tokens", move),
+                    patch_communicator("to_dp_local", move),
                 ):
                     with layer.ffn.plan.output.ffn_exit(
                         self.batch(), stream=ResidualStream()
@@ -275,10 +275,10 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
             parallel,
             output=OutputTransform(lambda x: x.square()),
         )
-        output = layer.ffn.plan._paths.get(BatchVariant.ORDINARY).output
-        self.assertFalse(output.leaves_for_next_layer)
-        self.assertFalse(output.leaves_for_reduce_scatter)
-        self.assertFalse(output.leaves_for_reduce_scatterv)
+        output = layer.ffn.plan.paths.get(BatchVariant.ORDINARY).output
+        self.assertFalse(output.may_defer_to_next)
+        self.assertFalse(output.may_reduce_scatter)
+        self.assertFalse(output.may_reduce_scatterv)
 
 
 if __name__ == "__main__":
