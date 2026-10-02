@@ -994,5 +994,86 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
         self.assertEqual(out.tolist(), [0, 0])
 
 
+class TestTrtllmSparseTablePool(CustomTestCase):
+    def setUp(self):
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            TrtllmSparseTablePool,
+        )
+
+        self.dev = "cuda" if torch.cuda.is_available() else "cpu"
+        self.kw = dict(dtype=torch.int32, device=self.dev)
+        self.pool = TrtllmSparseTablePool(self.kw)
+
+    def test_view_is_stable_and_reinerts_pad_rows(self):
+        self.pool.preallocate("t", 128, fill=-1, width=4)
+        big = self.pool.view("t", 100, fill=-1, width=4)
+        big.fill_(7)
+        small = self.pool.view("t", 10, fill=-1, width=4, rows_written_by_caller=True)
+        # Same parent every step (kernel-visible address never moves), stride == width.
+        self.assertEqual(small.data_ptr(), big.data_ptr())
+        self.assertEqual(small.stride(0), 4)
+        # Rows past `rows` up to the 64-row tile are re-inerted; [:rows] is left
+        # to the caller when it promises to write them.
+        self.assertTrue(torch.all(self.pool._bufs["t"][10:64] == -1))
+        self.assertTrue(torch.all(small == 7))
+        src = torch.arange(5, **self.kw)
+        self.assertEqual(
+            self.pool.view("l", 5, fill=128, src=src).tolist(), [0, 1, 2, 3, 4]
+        )
+
+    def test_copy_unless_aliased(self):
+        from sglang.srt.layers.attention.dsv4.metadata import copy_unless_aliased
+
+        parent = torch.zeros(4, 6, **self.kw)
+        tail = parent[:, 2:]
+        copy_unless_aliased(tail, tail)
+        self.assertTrue(torch.all(parent == 0))
+        copy_unless_aliased(tail, torch.full((4, 4), 3, **self.kw))
+        self.assertTrue(torch.all(parent[:, 2:] == 3) and torch.all(parent[:, :2] == 0))
+
+    def test_topk_writes_table_aliases_c4_indices_into_the_tail(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            SWA_WINDOW,
+            DSV4AttnMetadata,
+        )
+
+        n = 64  # tile-aligned, so no per-step pad parents are involved
+        core = object.__new__(DSV4AttnMetadata)
+        core.cuda_int32_kwargs = self.kw
+        core.trtllm_table_pool = self.pool
+        core.present_ratios = (4,)
+        core.index_topk = 1024
+        core.seq_lens_casual = torch.full((n,), 500, **self.kw)
+        core.swa_page_indices = torch.zeros(n, SWA_WINDOW, **self.kw)
+        core.c4_sparse_topk_lengths = torch.full((n,), 125, **self.kw)
+        core.c128_page_indices = None
+        core.trtllm_topk_writes_table = True
+
+        core.c4_sparse_raw_indices = None
+        core.c4_sparse_page_indices = None
+        core.init_trtllm_sparse_buffers()
+        tail = core.trtllm_c4_indices[:, SWA_WINDOW:]
+        self.assertEqual(core.c4_sparse_page_indices.data_ptr(), tail.data_ptr())
+        self.assertEqual(core.c4_sparse_page_indices.stride(), tail.stride())
+        self.assertEqual(core.trtllm_c4_lens.tolist(), [125 + SWA_WINDOW] * n)
+
+        # A raw-indices side channel routes the indexer to the v1 kernel: no alias.
+        core.c4_sparse_raw_indices = torch.empty(1, **self.kw)
+        core.c4_sparse_page_indices = torch.full((n, tail.shape[1]), -1, **self.kw)
+        core.init_trtllm_sparse_buffers()
+        self.assertNotEqual(core.c4_sparse_page_indices.data_ptr(), tail.data_ptr())
+
+    def test_uniform_qmeta_floors_padded_requests_at_q_len(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
+
+        core = object.__new__(DSV4AttnMetadata)
+        core.cuda_int32_kwargs = self.kw
+        # Request 0: 100 committed + 4 new tokens; request 1: graph-padded (all 1s).
+        core.seq_lens_casual = torch.tensor([101, 102, 103, 104, 1, 1, 1, 1], **self.kw)
+        core.init_trtllm_uniform_qmeta(4)
+        self.assertEqual(core.trtllm_seq_lens_req.tolist(), [104, 4])
+        self.assertEqual(core.trtllm_cum_seq_lens_q.tolist(), [0, 4, 8])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -697,9 +697,12 @@ class DSV4AttnMetadata:
             f"{num_tokens=} {q_len=}"
         )
         num_reqs = num_tokens // q_len
-        # Per-request KV totals are the causal length of each request's last
-        # token. contiguous() is intentionally paid once here, not per layer.
-        self.trtllm_seq_lens_req = self.seq_lens_casual[q_len - 1 :: q_len].contiguous()
+        # Per-request KV total = the causal length of the request's last token.
+        # Padded requests carry the graph fill length (1) for q_len tokens; the
+        # kernel requires seq_len >= q_len, so floor at q_len (outputs discarded).
+        self.trtllm_seq_lens_req = (
+            self.seq_lens_casual[q_len - 1 :: q_len].clamp(min=q_len).contiguous()
+        )
         self.trtllm_cum_seq_lens_q = torch.arange(
             0,
             (num_reqs + 1) * q_len,
