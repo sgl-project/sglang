@@ -35,7 +35,11 @@ from sglang.srt.training_capture.startup import (
     coordinate_resource_startup,
     coordinate_target_startup,
 )
-from sglang.srt.training_capture.teacher import TeacherRows, capture_teacher
+from sglang.srt.training_capture.teacher import (
+    TeacherRows,
+    capture_teacher,
+    warmup_teacher_capture,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +124,7 @@ class CaptureCoordinator:
         def build_local():
             nonlocal config
             config = CaptureConfig.load(config_path)
-            return bind_rank_target_contract(
+            contract = bind_rank_target_contract(
                 model_id=config.model_id,
                 selected_layer_ids=config.selected_layer_ids,
                 storage_chunk_tokens=config.storage_chunk_tokens,
@@ -136,6 +140,10 @@ class CaptureCoordinator:
                 pp_size=pp_size,
                 dp_rank=dp_rank,
             )
+            warmup_teacher_capture(
+                contract.teacher.vocab_size, getattr(pool, "device", "cpu")
+            )
+            return contract
 
         topology = {"tp_size": tp_size, "pp_size": pp_size, "dp_rank": dp_rank}
         if startup_group is None:

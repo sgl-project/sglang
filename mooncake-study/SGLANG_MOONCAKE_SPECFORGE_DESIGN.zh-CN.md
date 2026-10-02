@@ -399,6 +399,18 @@ capture = TeacherBatchHandle(ids.to(torch.int32), values.float(), lse, row_map)
 - decode、prefill、abort、请求恰在 prefill 完成等路径都要在 release 前处理。
 - `return_logprob/top_logprobs_num` 不能代替本接口；DSpark 某些服务路径还明确拒绝外部 logprob。
 
+实现中的 CUDA FP16/BF16/FP32 路径复用 SGLang 现有 `row_logsumexp`，
+按 FP32 累积并将 `(max, log_sum)` 合成为协议要求的完整词表 LSE；
+top-128 仍使用 `torch.topk`，不使用只支持小 k 的融合 top-k kernel。
+CPU 与其他浮点 dtype 保留上述 Torch 参考路径。紧凑结果仍独立持有内存，
+采样器修改与 graph buffer 复用不能改变已取得的数据。
+
+服务 logits 为 FP32。采集工厂在绑定 target contract 时预热该 dtype，
+发生在任何请求准入及 P worker 的提前返回之前；分布式编译失败进入已有
+binding 阶段投票。启动阶段只同步本设备的当前 stream，热路径不新增同步。
+这项优化的数值范围、微基准与服务测量见
+[`experiments/TEACHER_LSE.md`](experiments/TEACHER_LSE.md)。
+
 #### 7.3.1 当前 prefill CUDA Graph 验收
 
 现有采集钩子在 graph replay 返回后、sampler 修改 logits 之前运行，使用本轮真实

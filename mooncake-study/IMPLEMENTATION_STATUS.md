@@ -3742,6 +3742,48 @@ without another GPU allocation. See the
 [runbook](experiments/PUBLICATION_VALIDATION.md) and
 [source/log evidence](experiments/publication-validation.json).
 
+## Single-Pass Teacher LSE
+
+CUDA teacher extraction now reuses SGLang's existing single-pass row-LSE kernel
+for FP16/BF16/FP32 inputs. It accumulates in FP32 and produces the contract's
+absolute full-vocabulary LSE. Top-128 IDs and raw values still use `torch.topk`;
+the small-k fused selector is not used. CPU and other floating dtypes retain
+the Torch normalizer. Output ownership, stream ordering, padding exclusion and
+publication validation remain in place.
+
+The serving FP32 path is warmed during local target-contract binding, before
+admission and P/D's prefill early return. Startup synchronizes the current
+device stream; the hot path adds no synchronization. Compilation failures enter
+the existing binding vote before Store connection. All 39 regression methods
+pass, including numerical/stride/nonfinite/empty/duplicate-row cases, graph
+replay, CUDA ownership, real Gloo startup, complete AR/static/ragged DSpark
+inference/lifecycle and P/D handoff failures/cancellation. Numerical tolerances
+were not relaxed.
+
+A standalone microbenchmark compares complete teacher extraction with the
+original implementation in 32 FP32/BF16 cases. Exact top-k comparisons pass;
+maximum LSE difference is 1.90735e-6 within `rtol=atol=1e-6`. Eager median time
+falls 12.83%-42.83% and batched graph time falls 7.72%-44.54%. At FP32, vocabulary
+151,936 and four explicitly selected rows, eager time falls from 170.04 to
+141.67 us and graph time from 106.31 to 95.10 us. These isolate teacher work;
+production capture continues to run after model replay.
+
+Two 512-request off/on/off rounds per source use 16 input/32 output tokens,
+concurrency eight and 10% fixed sampling. Both capture 100 samples with identical
+payload sizes; all 200 snapshots pass post-exit readback and all four actual
+metrics checks pass without stage errors, Catalog failures or quarantine.
+Observed serving throughput is 63.73 versus 64.21 requests/s (0.74% difference),
+with varying tails and up to 11.19% throughput drift within an off bracket.
+An end-to-end speedup is not established. Capture-on still retains only about
+69%-72% of off throughput, leaving performance acceptance open.
+
+All ten submitted jobs are terminal and successful, and the resident H100 has
+resumed its idle workload without an additional allocation. Five Python files
+pass Black/I/F with no new full-Ruff warning. Source, log, microbenchmark and
+serving evidence are in the [runbook](experiments/TEACHER_LSE.md) and
+[evidence index](experiments/teacher-lse.json). Production target identity and
+acceptable TTFT/TPOT/throughput overhead remain unspecified.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
@@ -3773,8 +3815,9 @@ without another GPU allocation. See the
    representative workloads and SLO thresholds, and complete dashboard runtime
    acceptance and rollout/rollback checks. Investigate the timing experiment's
    short-request p99 TTFT increase, which the latest unchanged baseline did not
-   reproduce. After consolidating single-rank content validation, profile the
-   remaining capture and control/durability costs without dropping publication
+   reproduce. After consolidating single-rank content validation and reducing
+   teacher LSE work, profile the remaining capture and control/durability costs
+   without dropping publication
    checks. Per-model numerical/runtime validation and
    runtime identity coverage also need expansion beyond the tested combination.
 5. Integrate with the SpecForge-owned production Catalog and consumer when

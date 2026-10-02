@@ -1,0 +1,1657 @@
+{
+  "schema_version": 1,
+  "experiment": "single_pass_teacher_lse",
+  "date_utc": "2026-10-02",
+  "baseline_commit": "323df135666b7ed0cc3676592683fc8f0fd39d15",
+  "branch": "codex/dspark-maas-capture",
+  "runtime_lock": {
+    "path": "mooncake-study/experiments/h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84",
+    "versions": {
+      "torch": "2.13.0",
+      "transformers": "5.12.1",
+      "sglang-kernel": "0.4.6.post1",
+      "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+    }
+  },
+  "allocation": {
+    "job": "job-fe1ce1dcdea6-20261001023258",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "node": "node064",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "gpu_uuid": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "additional_gpus": 0,
+    "final_worker": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790953570.745083,
+      "idle_pid": 1674,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.414975643157959
+    },
+    "final_gpu_observation": "NVIDIA H100 80GB HBM3, GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495, 1101 MiB, 60 %",
+    "final_process_observation": "PID  PPID     ELAPSED COMMAND\n    1     0  1-20:32:44 python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60\n 1674     1       05:18 /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6",
+    "final_nvml_process_observation": "6175, [Not Found], 1092 MiB"
+  },
+  "source": {
+    "before_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-before",
+    "after_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1",
+    "changed_production_modules": [
+      {
+        "path": "python/sglang/srt/training_capture/teacher.py",
+        "before_sha256": "ca48d11bf2eff16bf206aaa9928f820e6ed8d134e1b55622c68c116473a7a708",
+        "after_sha256": "02d1343b0d5e8cebc5169a199e2005a0167a22ff9cf1336475953f9825760043"
+      },
+      {
+        "path": "python/sglang/srt/training_capture/coordinator.py",
+        "before_sha256": "7ed1a9646f1639cf26eda7dbfd1843f88c5ca860a9cbb2306214334c74a82b8d",
+        "after_sha256": "e323b7fa2321faf104319287cd3ebc8d3e35bbc88e04b0abe8455776a12bc2d5"
+      }
+    ],
+    "final_file_sha256": {
+      "python/sglang/srt/training_capture/teacher.py": "02d1343b0d5e8cebc5169a199e2005a0167a22ff9cf1336475953f9825760043",
+      "python/sglang/srt/training_capture/coordinator.py": "e323b7fa2321faf104319287cd3ebc8d3e35bbc88e04b0abe8455776a12bc2d5",
+      "test/registered/unit/training_capture/test_teacher_cuda.py": "67e9a7f7a0be9976a9dbcf126e461f8fafba2dee975e078fea1ecc3322c622ba",
+      "test/registered/unit/training_capture/test_startup.py": "cb0eba941f208b2d40c3f55fb43a4195d900093c1daf0ec4df6bfb9bb4284015",
+      "mooncake-study/experiments/benchmark_teacher_capture.py": "0cf2d9224983e80e399907409bb0ec36a157dba89f41dbbf43c6aa6d57f76188",
+      "python/sglang/srt/layers/logsumexp.py": "43cf9edc381dfe0fd7b86b71dc8ce2b94542fbf2dbbe4ba319d51d79327f0482",
+      "python/sglang/srt/layers/logits_processor.py": "8df0b86bcf2dfc2bea4f2bae82433860ed88233616c923a5443602bca9378a11",
+      "mooncake-study/experiments/benchmark_training_capture.py": "9e2e7df815f759c7805f669f3805b68ba96dfcf52026fb821c25650ee716c35d",
+      "test/registered/unit/training_capture/test_cohort_startup.py": "89ffab29aeaa57b87139ea2b173441cbcec0084dc7228bb643b001968a36bcfa",
+      "test/registered/unit/training_capture/test_cuda_snapshot.py": "0bc81729318651aa4e1bc2e208d6599635a32d8b69e89b4d871ecccc8904be91",
+      "test/registered/unit/training_capture/test_buffers.py": "1d7ce5bec8fc5bbcc95a9e5d0241ee825d6737614e4d664a69604a40e10cbe3f",
+      "test/registered/storage/test_training_capture_runtime.py": "d61586428b26bc49c16b64e29b4e7f05a83379fc2219c625c9bfa947e0f79ddd",
+      "test/registered/storage/test_training_capture_pd.py": "24cd1594e9938a52a21948bb5d02f4c70f926d35b10c741f548caa7b3626ae7b"
+    },
+    "freeze_validation": "All 13 listed files match the tested frozen after tree. The standalone microbenchmark was added after the unit jobs; production/test files were not overwritten while jobs used them.",
+    "identical_serving_driver_sha256": "9e2e7df815f759c7805f669f3805b68ba96dfcf52026fb821c25650ee716c35d",
+    "before_producer_hashes": {
+      "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+      "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+      "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+      "python/sglang/srt/training_capture/cohort.py": "6bd093ee9a219970b08023d279852b07caaacf288f2f617236b6b2e1c7d5af56",
+      "python/sglang/srt/training_capture/cohort_coordinator.py": "961190814973e95f106d493a5db10c8c4696d20381de5917e66372193544101e",
+      "python/sglang/srt/training_capture/cohort_exchange.py": "b37abb0499a23fa8650521fe28c04a7219b887f5d2920e6f8070d4bfacae2ed3",
+      "python/sglang/srt/training_capture/cohort_service.py": "d57c7ee616c08a01c49d6fd643012da63a24bd51cde3f78f25b0f3eb3207b1b3",
+      "python/sglang/srt/training_capture/cohort_startup.py": "dfacd1a45203de5f3c08ccf73b06933f7aa4183bd670979981cfe2cb960208ed",
+      "python/sglang/srt/training_capture/cohort_writer.py": "8f47827eb4e8ca2d3e4f68a91a21d56e13e84530952d5f3ea71843b7f3647d69",
+      "python/sglang/srt/training_capture/config.py": "9cf427b9f673c376f728aa4bec45b0b4a31bffb360ce88731b32b8fccc34530d",
+      "python/sglang/srt/training_capture/context.py": "3ff2fcc98ee9ca6c60527d175e2dd8cf01c71c3e7a6017e2d23c56bcc8589a94",
+      "python/sglang/srt/training_capture/coordinator.py": "7ed1a9646f1639cf26eda7dbfd1843f88c5ca860a9cbb2306214334c74a82b8d",
+      "python/sglang/srt/training_capture/host_pool.py": "591086d65bd855dfb671588c4c7e1b0af7270237ef738e0967db32f5e5816bfc",
+      "python/sglang/srt/training_capture/identity.py": "47f91ad994b716d27454eace428d9d0a5ce7468c5708e4dd3d3e385119c8ac24",
+      "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+      "python/sglang/srt/training_capture/kv_exporter.py": "2cecaf4db75bd9b2b0adf664f12fd6c56cfaba74be01b1c755b40cfd62299c8f",
+      "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+      "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+      "python/sglang/srt/training_capture/metrics.py": "a99419f6013159c0e533b950280d49ed6e5cf4882924197eb485585223f34d98",
+      "python/sglang/srt/training_capture/mooncake_store.py": "94525a4eb4088ab847c9dffd66d8a3c509b44d30244da76cba7647cd0944e139",
+      "python/sglang/srt/training_capture/pd_capture.py": "81fb0550f2ea923aeda71add0c5f29955f00a7bb0e8c917880bfbb4315be81db",
+      "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+      "python/sglang/srt/training_capture/protocol.py": "e57f130767eb7ca4aef6dc63a7cfdbaa37cc1d02326a068bc973d818a7bb9d62",
+      "python/sglang/srt/training_capture/request_router.py": "b97ca76fd4621398c617414098c539850e331e0ee42d88e91eb7e0cb41f09824",
+      "python/sglang/srt/training_capture/resources.py": "4f615e4b1b79b94637ba664e05e93bdbb827f865a176d06abbf23e8bcd02cd8d",
+      "python/sglang/srt/training_capture/snapshot.py": "82e7dce85b0ecac6538aac26a21d22286e35c19e59a01b0ca2735e4da0dec3b3",
+      "python/sglang/srt/training_capture/snapshot_writer.py": "ec60267c9e9057c3b8fcc3c5b66bcd9987dff65279514f4007637c861dd3a1f5",
+      "python/sglang/srt/training_capture/startup.py": "00d81ee4757ef83347248e419065a81dd8f812837f5589a91fd9b7511e895371",
+      "python/sglang/srt/training_capture/teacher.py": "ca48d11bf2eff16bf206aaa9928f820e6ed8d134e1b55622c68c116473a7a708",
+      "python/sglang/srt/training_capture/teacher_staging.py": "9afe4b9bb7bdf16e43156377b47d034f9707ed1c09b62dbfdac3795bb7032fd0",
+      "python/sglang/srt/training_capture/timings.py": "9bea8c331ae56ed343f85d79451dfe22b512beef7f339167f00cc8e3da8c9278",
+      "python/sglang/srt/training_capture/topology.py": "b35eef08cd7ac804817c5b22c232e9c1e6dd76fc292220acc928eb58af5f1a35"
+    },
+    "after_producer_hashes": {
+      "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+      "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+      "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+      "python/sglang/srt/training_capture/cohort.py": "6bd093ee9a219970b08023d279852b07caaacf288f2f617236b6b2e1c7d5af56",
+      "python/sglang/srt/training_capture/cohort_coordinator.py": "961190814973e95f106d493a5db10c8c4696d20381de5917e66372193544101e",
+      "python/sglang/srt/training_capture/cohort_exchange.py": "b37abb0499a23fa8650521fe28c04a7219b887f5d2920e6f8070d4bfacae2ed3",
+      "python/sglang/srt/training_capture/cohort_service.py": "d57c7ee616c08a01c49d6fd643012da63a24bd51cde3f78f25b0f3eb3207b1b3",
+      "python/sglang/srt/training_capture/cohort_startup.py": "dfacd1a45203de5f3c08ccf73b06933f7aa4183bd670979981cfe2cb960208ed",
+      "python/sglang/srt/training_capture/cohort_writer.py": "8f47827eb4e8ca2d3e4f68a91a21d56e13e84530952d5f3ea71843b7f3647d69",
+      "python/sglang/srt/training_capture/config.py": "9cf427b9f673c376f728aa4bec45b0b4a31bffb360ce88731b32b8fccc34530d",
+      "python/sglang/srt/training_capture/context.py": "3ff2fcc98ee9ca6c60527d175e2dd8cf01c71c3e7a6017e2d23c56bcc8589a94",
+      "python/sglang/srt/training_capture/coordinator.py": "e323b7fa2321faf104319287cd3ebc8d3e35bbc88e04b0abe8455776a12bc2d5",
+      "python/sglang/srt/training_capture/host_pool.py": "591086d65bd855dfb671588c4c7e1b0af7270237ef738e0967db32f5e5816bfc",
+      "python/sglang/srt/training_capture/identity.py": "47f91ad994b716d27454eace428d9d0a5ce7468c5708e4dd3d3e385119c8ac24",
+      "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+      "python/sglang/srt/training_capture/kv_exporter.py": "2cecaf4db75bd9b2b0adf664f12fd6c56cfaba74be01b1c755b40cfd62299c8f",
+      "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+      "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+      "python/sglang/srt/training_capture/metrics.py": "a99419f6013159c0e533b950280d49ed6e5cf4882924197eb485585223f34d98",
+      "python/sglang/srt/training_capture/mooncake_store.py": "94525a4eb4088ab847c9dffd66d8a3c509b44d30244da76cba7647cd0944e139",
+      "python/sglang/srt/training_capture/pd_capture.py": "81fb0550f2ea923aeda71add0c5f29955f00a7bb0e8c917880bfbb4315be81db",
+      "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+      "python/sglang/srt/training_capture/protocol.py": "e57f130767eb7ca4aef6dc63a7cfdbaa37cc1d02326a068bc973d818a7bb9d62",
+      "python/sglang/srt/training_capture/request_router.py": "b97ca76fd4621398c617414098c539850e331e0ee42d88e91eb7e0cb41f09824",
+      "python/sglang/srt/training_capture/resources.py": "4f615e4b1b79b94637ba664e05e93bdbb827f865a176d06abbf23e8bcd02cd8d",
+      "python/sglang/srt/training_capture/snapshot.py": "82e7dce85b0ecac6538aac26a21d22286e35c19e59a01b0ca2735e4da0dec3b3",
+      "python/sglang/srt/training_capture/snapshot_writer.py": "ec60267c9e9057c3b8fcc3c5b66bcd9987dff65279514f4007637c861dd3a1f5",
+      "python/sglang/srt/training_capture/startup.py": "00d81ee4757ef83347248e419065a81dd8f812837f5589a91fd9b7511e895371",
+      "python/sglang/srt/training_capture/teacher.py": "02d1343b0d5e8cebc5169a199e2005a0167a22ff9cf1336475953f9825760043",
+      "python/sglang/srt/training_capture/teacher_staging.py": "9afe4b9bb7bdf16e43156377b47d034f9707ed1c09b62dbfdac3795bb7032fd0",
+      "python/sglang/srt/training_capture/timings.py": "9bea8c331ae56ed343f85d79451dfe22b512beef7f339167f00cc8e3da8c9278",
+      "python/sglang/srt/training_capture/topology.py": "b35eef08cd7ac804817c5b22c232e9c1e6dd76fc292220acc928eb58af5f1a35"
+    }
+  },
+  "implementation": {
+    "normalization": "Existing row_logsumexp for CUDA FP16/BF16/FP32, with FP32 accumulation and absolute FP32 max+log_sum output. CPU/other float dtypes retain Torch normalization.",
+    "selection": "Unchanged torch.topk(k=128), raw values and int32 vocabulary IDs; no small-k fused selector is used.",
+    "ownership": "Owned outputs on the calling stream before serving-side mutations. Full-vocabulary padded columns excluded.",
+    "startup": "One FP32 vocabulary row warmed during target-contract binding, including P/D prefill. Current device stream synchronized at startup only; failures use the existing binding vote before Store connection.",
+    "scope": "No Store or wire protocol changes, no new hot-path synchronization, no changed loss or teacher-value semantics."
+  },
+  "microbenchmark": {
+    "report": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-micro/report.json",
+    "status": "completed",
+    "scope": "Complete teacher extraction including top-k, LSE, conversions and optional row selection. Eager host wall time includes dispatch and final synchronization. Batched CUDA-graph event time amortizes host submission; neither is serving latency. No Store, D2H or Catalog work is included.",
+    "config": {
+      "output": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-micro/report.json",
+      "source_revision": "323df135666b7ed0cc3676592683fc8f0fd39d15+single-pass-teacher-lse",
+      "vocabularies": [
+        32768,
+        151936
+      ],
+      "rows": [
+        1,
+        4,
+        32,
+        128
+      ],
+      "iterations": 30,
+      "repeats": 3
+    },
+    "warmup_seconds": 0.7890120483934879,
+    "warmup_limit": "Shared Triton cache was already used by probe/unit tests; not a clean-cache or startup SLA measurement.",
+    "cases": [
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 32768,
+        "rows": 1,
+        "selected_rows": false,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 154.71341709295908,
+            "batched_graph_us": 70.67637125651042
+          },
+          "current": {
+            "eager_wall_us": 132.17106461524963,
+            "batched_graph_us": 57.003841400146484
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 32768,
+        "rows": 1,
+        "selected_rows": true,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 163.76376152038574,
+            "batched_graph_us": 73.19882710774739
+          },
+          "current": {
+            "eager_wall_us": 142.3913985490799,
+            "batched_graph_us": 58.91914367675781
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 32768,
+        "rows": 4,
+        "selected_rows": false,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 162.8391444683075,
+            "batched_graph_us": 77.71999994913737
+          },
+          "current": {
+            "eager_wall_us": 141.17682973543802,
+            "batched_graph_us": 62.06261316935221
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 32768,
+        "rows": 4,
+        "selected_rows": true,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 163.82249693075815,
+            "batched_graph_us": 79.54570770263672
+          },
+          "current": {
+            "eager_wall_us": 142.24921663602194,
+            "batched_graph_us": 63.97504170735677
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 32768,
+        "rows": 32,
+        "selected_rows": false,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 164.23501074314117,
+            "batched_graph_us": 96.19455973307292
+          },
+          "current": {
+            "eager_wall_us": 143.16973586877188,
+            "batched_graph_us": 78.4219741821289
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 32768,
+        "rows": 32,
+        "selected_rows": true,
+        "max_lse_abs_error": 9.5367431640625e-7,
+        "median": {
+          "reference": {
+            "eager_wall_us": 169.13637518882751,
+            "batched_graph_us": 95.73535919189453
+          },
+          "current": {
+            "eager_wall_us": 147.33771483103433,
+            "batched_graph_us": 77.70869572957356
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 32768,
+        "rows": 128,
+        "selected_rows": false,
+        "max_lse_abs_error": 9.5367431640625e-7,
+        "median": {
+          "reference": {
+            "eager_wall_us": 200.40534436702728,
+            "batched_graph_us": 163.91136169433594
+          },
+          "current": {
+            "eager_wall_us": 154.64884539445242,
+            "batched_graph_us": 128.02560170491537
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 32768,
+        "rows": 128,
+        "selected_rows": true,
+        "max_lse_abs_error": 9.5367431640625e-7,
+        "median": {
+          "reference": {
+            "eager_wall_us": 196.63671652475992,
+            "batched_graph_us": 162.0184580485026
+          },
+          "current": {
+            "eager_wall_us": 150.87611973285675,
+            "batched_graph_us": 125.7849629720052
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 151936,
+        "rows": 1,
+        "selected_rows": false,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 160.8888308207194,
+            "batched_graph_us": 88.461119333903
+          },
+          "current": {
+            "eager_wall_us": 131.5819720427195,
+            "batched_graph_us": 81.63520177205403
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 151936,
+        "rows": 1,
+        "selected_rows": true,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 170.98200817902884,
+            "batched_graph_us": 92.55104064941406
+          },
+          "current": {
+            "eager_wall_us": 142.3665632804235,
+            "batched_graph_us": 85.36064147949219
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 151936,
+        "rows": 4,
+        "selected_rows": false,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 169.60004965464273,
+            "batched_graph_us": 104.96330897013347
+          },
+          "current": {
+            "eager_wall_us": 140.2915765841802,
+            "batched_graph_us": 93.22794596354167
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 151936,
+        "rows": 4,
+        "selected_rows": true,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 170.03814379374185,
+            "batched_graph_us": 106.30687713623047
+          },
+          "current": {
+            "eager_wall_us": 141.67303840319315,
+            "batched_graph_us": 95.09536107381184
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 151936,
+        "rows": 32,
+        "selected_rows": false,
+        "max_lse_abs_error": 0.0000019073486328125,
+        "median": {
+          "reference": {
+            "eager_wall_us": 220.64720590909323,
+            "batched_graph_us": 187.01343536376953
+          },
+          "current": {
+            "eager_wall_us": 176.69362326463065,
+            "batched_graph_us": 149.57152048746744
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 151936,
+        "rows": 32,
+        "selected_rows": true,
+        "max_lse_abs_error": 9.5367431640625e-7,
+        "median": {
+          "reference": {
+            "eager_wall_us": 220.95677753289542,
+            "batched_graph_us": 185.34015655517578
+          },
+          "current": {
+            "eager_wall_us": 173.7107833226522,
+            "batched_graph_us": 145.491943359375
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 151936,
+        "rows": 128,
+        "selected_rows": false,
+        "max_lse_abs_error": 0.0000019073486328125,
+        "median": {
+          "reference": {
+            "eager_wall_us": 718.0187851190567,
+            "batched_graph_us": 674.6892801920573
+          },
+          "current": {
+            "eager_wall_us": 547.5044250488281,
+            "batched_graph_us": 510.91583251953125
+          }
+        }
+      },
+      {
+        "dtype": "torch.float32",
+        "vocabulary": 151936,
+        "rows": 128,
+        "selected_rows": true,
+        "max_lse_abs_error": 0.0000019073486328125,
+        "median": {
+          "reference": {
+            "eager_wall_us": 701.0944187641144,
+            "batched_graph_us": 656.5818786621094
+          },
+          "current": {
+            "eager_wall_us": 531.6141992807388,
+            "batched_graph_us": 493.81663004557294
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 32768,
+        "rows": 1,
+        "selected_rows": false,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 160.2504402399063,
+            "batched_graph_us": 63.43786875406901
+          },
+          "current": {
+            "eager_wall_us": 131.51876628398895,
+            "batched_graph_us": 46.36864026387533
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 32768,
+        "rows": 1,
+        "selected_rows": true,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 170.8748439947764,
+            "batched_graph_us": 66.05845133463542
+          },
+          "current": {
+            "eager_wall_us": 141.20849470297495,
+            "batched_graph_us": 48.733011881510414
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 32768,
+        "rows": 4,
+        "selected_rows": false,
+        "max_lse_abs_error": 9.5367431640625e-7,
+        "median": {
+          "reference": {
+            "eager_wall_us": 163.55551779270172,
+            "batched_graph_us": 71.90794626871745
+          },
+          "current": {
+            "eager_wall_us": 133.28678905963898,
+            "batched_graph_us": 52.20714569091797
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 32768,
+        "rows": 4,
+        "selected_rows": true,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 164.02962307135263,
+            "batched_graph_us": 72.4509874979655
+          },
+          "current": {
+            "eager_wall_us": 136.19959354400635,
+            "batched_graph_us": 53.58207702636719
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 32768,
+        "rows": 32,
+        "selected_rows": false,
+        "max_lse_abs_error": 9.5367431640625e-7,
+        "median": {
+          "reference": {
+            "eager_wall_us": 162.93153166770935,
+            "batched_graph_us": 87.54197438557942
+          },
+          "current": {
+            "eager_wall_us": 132.90109733740488,
+            "batched_graph_us": 63.8325309753418
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 32768,
+        "rows": 32,
+        "selected_rows": true,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 168.9425359169642,
+            "batched_graph_us": 85.57439804077148
+          },
+          "current": {
+            "eager_wall_us": 140.13350009918213,
+            "batched_graph_us": 62.48287836710612
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 32768,
+        "rows": 128,
+        "selected_rows": false,
+        "max_lse_abs_error": 9.5367431640625e-7,
+        "median": {
+          "reference": {
+            "eager_wall_us": 186.21919055779776,
+            "batched_graph_us": 152.18538920084634
+          },
+          "current": {
+            "eager_wall_us": 134.87127919991812,
+            "batched_graph_us": 98.58816146850586
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 32768,
+        "rows": 128,
+        "selected_rows": true,
+        "max_lse_abs_error": 9.5367431640625e-7,
+        "median": {
+          "reference": {
+            "eager_wall_us": 175.93192557493845,
+            "batched_graph_us": 143.98539225260416
+          },
+          "current": {
+            "eager_wall_us": 142.86749064922333,
+            "batched_graph_us": 93.3845329284668
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 151936,
+        "rows": 1,
+        "selected_rows": false,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 169.44197316964468,
+            "batched_graph_us": 75.9608523050944
+          },
+          "current": {
+            "eager_wall_us": 131.90793494383493,
+            "batched_graph_us": 65.27999877929688
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 151936,
+        "rows": 1,
+        "selected_rows": true,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 177.94755597909293,
+            "batched_graph_us": 78.9474105834961
+          },
+          "current": {
+            "eager_wall_us": 141.87407990296683,
+            "batched_graph_us": 68.62858454386394
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 151936,
+        "rows": 4,
+        "selected_rows": false,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 168.41255128383636,
+            "batched_graph_us": 90.60864130655925
+          },
+          "current": {
+            "eager_wall_us": 131.4852386713028,
+            "batched_graph_us": 74.7050666809082
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 151936,
+        "rows": 4,
+        "selected_rows": true,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 175.0800758600235,
+            "batched_graph_us": 91.27424240112305
+          },
+          "current": {
+            "eager_wall_us": 135.9860102335612,
+            "batched_graph_us": 76.82389577229817
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 151936,
+        "rows": 32,
+        "selected_rows": false,
+        "max_lse_abs_error": 9.5367431640625e-7,
+        "median": {
+          "reference": {
+            "eager_wall_us": 204.4379711151123,
+            "batched_graph_us": 177.05525716145834
+          },
+          "current": {
+            "eager_wall_us": 135.40896276632944,
+            "batched_graph_us": 113.06495666503906
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 151936,
+        "rows": 32,
+        "selected_rows": true,
+        "max_lse_abs_error": 0,
+        "median": {
+          "reference": {
+            "eager_wall_us": 195.37595411141714,
+            "batched_graph_us": 166.8956756591797
+          },
+          "current": {
+            "eager_wall_us": 140.55867989857992,
+            "batched_graph_us": 108.67380777994792
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 151936,
+        "rows": 128,
+        "selected_rows": false,
+        "max_lse_abs_error": 9.5367431640625e-7,
+        "median": {
+          "reference": {
+            "eager_wall_us": 596.6261029243469,
+            "batched_graph_us": 564.6500142415365
+          },
+          "current": {
+            "eager_wall_us": 344.6027636528015,
+            "batched_graph_us": 321.78794860839844
+          }
+        }
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "vocabulary": 151936,
+        "rows": 128,
+        "selected_rows": true,
+        "max_lse_abs_error": 9.5367431640625e-7,
+        "median": {
+          "reference": {
+            "eager_wall_us": 562.5101427237192,
+            "batched_graph_us": 528.1575520833334
+          },
+          "current": {
+            "eager_wall_us": 321.56407833099365,
+            "batched_graph_us": 292.9030354817708
+          }
+        }
+      }
+    ],
+    "max_lse_abs_error": 0.0000019073486328125,
+    "topk_comparison": "All IDs and raw values exact; LSE rtol=atol=1e-6.",
+    "raw_observations": "All repetitions are retained in the hashed raw report and job log."
+  },
+  "preliminary_probe": {
+    "job_id": "01790950531729251372-6d6592f43dd1",
+    "source_commit": "323df135666b7ed0cc3676592683fc8f0fd39d15",
+    "script": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/teacher-lse-probe.py",
+    "result": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790950531729251372-6d6592f43dd1.json",
+    "log": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790950531729251372-6d6592f43dd1.log",
+    "scope": "24 LSE-only cases, FP32/BF16, three vocabulary sizes and four row counts. CUDA-event intervals around CPU-fed loops include launch gaps. Superseded for performance conclusions by complete extraction measurements.",
+    "outcome": {
+      "job_id": "01790950531729251372-6d6592f43dd1",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790950542.713276,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790950531729251372-6d6592f43dd1.log"
+    }
+  },
+  "verification": {
+    "regression_methods": 39,
+    "formatting": "Five Python files pass Black/I/F. New/other changed files pass full Ruff; coordinator has only nine baseline BLE001 findings.",
+    "numerical": "FP16/BF16/FP32, stride/padding/boundary/empty/duplicate-row/FP64-fallback, offsets and nonfinite rows; FP64 sum of FP32 scores reference at rtol=atol=1e-6.",
+    "lifecycle": "CUDA source reuse, stream/tail fences, graph replay, Gloo startup and cohort cleanup, compile-failure callback before Store, full actual AR/static/ragged DSpark/lifecycle and actual P/D faults/cancellation/post-exit reads.",
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "submitted_jobs": 10,
+    "all_jobs_terminal_success": true,
+    "serving_checks": "All four measured capture-on phases: admitted=READY=readback=50, no admission backpressure/Catalog error/quarantine; all four fields of 13 stages match real Prometheus scrapes. Normal stage counts equal publications, catalog_written=2x, recovery_read=0, errors=0."
+  },
+  "remaining_gates": [
+    "Production target model and TTFT/TPOT/throughput limits are not specified",
+    "Representative serving SLO acceptance and balanced longer measurements",
+    "Live dashboard/rollout acceptance",
+    "Additional models/hardware/distributed performance",
+    "Production Catalog/consumer integration and trained draft quality"
+  ],
+  "serving": {
+    "before": {
+      "report": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-before/report.json",
+      "status": "completed",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "323df135666b7ed0cc3676592683fc8f0fd39d15",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-before",
+        "num_prompts": 512,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 2,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600
+      },
+      "rounds": [
+        {
+          "repetition": 0,
+          "ready": 50,
+          "requests_per_second": 63.460907264003986,
+          "output_tokens_per_second": 2030.7490324481275,
+          "relative_to_off": 0.7207373029309285,
+          "p99_ttft_ms": 62.2405149042606,
+          "p99_tpot_ms": 3.4816662798966127,
+          "p95_tpot_ms": 3.3744822766992355,
+          "client_seconds": 8.067959032952785,
+          "post_client_capture_drain_seconds": 0.008201520889997482,
+          "counter_delta": {
+            "considered": 512,
+            "sampled_out": 462,
+            "admitted": 50,
+            "overlap_forwards": 1355,
+            "eager_forwards": 43,
+            "cuda_graph_forwards": 1312,
+            "sealed": 50,
+            "writer_started": 50,
+            "copies_completed": 50,
+            "snapshot_built": 50,
+            "ready": 50
+          },
+          "stage_delta": {
+            "queue_wait": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.18911096081137657
+            },
+            "copy_wait": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.01776190847158432
+            },
+            "snapshot_build": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.12853923439979553
+            },
+            "validation": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.18186775594949722
+            },
+            "catalog_register": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.04612220078706741
+            },
+            "store_payload": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.1002400703728199
+            },
+            "catalog_written": {
+              "calls": 100,
+              "errors": 0,
+              "seconds": 0.07109919562935829
+            },
+            "journal_save": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.1769426017999649
+            },
+            "catalog_seal": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.06713119894266129
+            },
+            "store_manifest": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.01864614710211754
+            },
+            "catalog_publish": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.02967202290892601
+            },
+            "journal_complete": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.05823647603392601
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0
+            }
+          },
+          "metrics_verified": true,
+          "metrics_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-before/round-0-phase-1-0.1/metrics.prom",
+          "readback": {
+            "validated_samples": 50,
+            "manifest_bytes": 430650,
+            "payload_bytes": 31176000,
+            "aux_payload_bytes": 1684800,
+            "payload_objects": 700,
+            "kv_payload_bytes": 29491200
+          },
+          "host": {
+            "allocated_bytes": 27018240,
+            "device_allocated_bytes": 0,
+            "device_limit_bytes": 0,
+            "free": 0,
+            "filling": 16,
+            "quarantined": 0
+          },
+          "baseline_bracket": {
+            "median_ttft_ms": 39.040619507431984,
+            "p95_ttft_ms": 43.798375967890024,
+            "p99_ttft_ms": 293.24858736246824,
+            "median_tpot_ms": 1.4759883464824768,
+            "p95_tpot_ms": 1.5791354700922966,
+            "p99_tpot_ms": 1.6262812984566533,
+            "output_throughput": 2817.5994557100694
+          },
+          "baseline_after_over_before": {
+            "median_ttft_ms": 0.9859222548496444,
+            "p95_ttft_ms": 0.8966330078954501,
+            "p99_ttft_ms": 0.10337910875701282,
+            "median_tpot_ms": 0.998385785573914,
+            "p95_tpot_ms": 0.9962108484794436,
+            "p99_tpot_ms": 0.9738562849657982,
+            "output_throughput": 1.1118608468609787
+          }
+        },
+        {
+          "repetition": 1,
+          "ready": 50,
+          "requests_per_second": 64.00466133329019,
+          "output_tokens_per_second": 2048.149162665286,
+          "relative_to_off": 0.6938314408896967,
+          "p99_ttft_ms": 59.83414083719252,
+          "p99_tpot_ms": 3.4597235725771998,
+          "p95_tpot_ms": 3.340266014058744,
+          "client_seconds": 7.9994173757731915,
+          "post_client_capture_drain_seconds": 0.008389405906200409,
+          "counter_delta": {
+            "considered": 512,
+            "sampled_out": 462,
+            "admitted": 50,
+            "overlap_forwards": 1355,
+            "eager_forwards": 43,
+            "cuda_graph_forwards": 1312,
+            "sealed": 50,
+            "writer_started": 50,
+            "copies_completed": 50,
+            "snapshot_built": 50,
+            "ready": 50
+          },
+          "stage_delta": {
+            "queue_wait": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.1837148778140545
+            },
+            "copy_wait": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.01832326501607895
+            },
+            "snapshot_build": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.1260707788169384
+            },
+            "validation": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.17846086621284485
+            },
+            "catalog_register": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.09601151943206787
+            },
+            "store_payload": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.09570369496941566
+            },
+            "catalog_written": {
+              "calls": 100,
+              "errors": 0,
+              "seconds": 0.07102413848042488
+            },
+            "journal_save": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.18261005729436874
+            },
+            "catalog_seal": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.06389080733060837
+            },
+            "store_manifest": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.017877276986837387
+            },
+            "catalog_publish": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.028938915580511093
+            },
+            "journal_complete": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.05836280435323715
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0
+            }
+          },
+          "metrics_verified": true,
+          "metrics_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-before/round-1-phase-1-0.1/metrics.prom",
+          "readback": {
+            "validated_samples": 50,
+            "manifest_bytes": 430650,
+            "payload_bytes": 31176000,
+            "aux_payload_bytes": 1684800,
+            "payload_objects": 700,
+            "kv_payload_bytes": 29491200
+          },
+          "host": {
+            "allocated_bytes": 27018240,
+            "device_allocated_bytes": 0,
+            "device_limit_bytes": 0,
+            "free": 0,
+            "filling": 16,
+            "quarantined": 0
+          },
+          "baseline_bracket": {
+            "median_ttft_ms": 39.083424024283886,
+            "p95_ttft_ms": 42.21442872658372,
+            "p99_ttft_ms": 54.557225704193115,
+            "median_tpot_ms": 1.4757378207099052,
+            "p95_tpot_ms": 1.5908492218342518,
+            "p99_tpot_ms": 1.7291627944477144,
+            "output_throughput": 2951.94054630755
+          },
+          "baseline_after_over_before": {
+            "median_ttft_ms": 0.9950517704093731,
+            "p95_ttft_ms": 1.0377397353779432,
+            "p99_ttft_ms": 1.0005938795603777,
+            "median_tpot_ms": 1.0014969237032192,
+            "p95_tpot_ms": 1.0203648134774066,
+            "p99_tpot_ms": 1.1837655897988661,
+            "output_throughput": 0.9960647724593177
+          }
+        }
+      ],
+      "totals": {
+        "ready": 100,
+        "requests": 1024,
+        "output_tokens": 32768,
+        "client_seconds": 16.067376408725977,
+        "payload_bytes": 62352000,
+        "payload_objects": 1400,
+        "requests_per_second": 63.731624501177386,
+        "output_tokens_per_second": 2039.4119840376763
+      }
+    },
+    "after": {
+      "report": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-after/report.json",
+      "status": "completed",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "323df135666b7ed0cc3676592683fc8f0fd39d15+single-pass-teacher-lse",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-after",
+        "num_prompts": 512,
+        "input_len": 16,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 2,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 1,
+        "teacher_d2h_batch_tokens": 1,
+        "device_mib": 0,
+        "segment_mib": 2048,
+        "phase_timeout": 600
+      },
+      "rounds": [
+        {
+          "repetition": 0,
+          "ready": 50,
+          "requests_per_second": 64.96328535009785,
+          "output_tokens_per_second": 2078.825131203131,
+          "relative_to_off": 0.7054609206378595,
+          "p99_ttft_ms": 60.696914568543434,
+          "p99_tpot_ms": 3.587394545395528,
+          "p95_tpot_ms": 3.268310541827832,
+          "client_seconds": 7.881374798715115,
+          "post_client_capture_drain_seconds": 0.008317720144987106,
+          "counter_delta": {
+            "considered": 512,
+            "sampled_out": 462,
+            "admitted": 50,
+            "overlap_forwards": 1355,
+            "eager_forwards": 43,
+            "cuda_graph_forwards": 1312,
+            "sealed": 50,
+            "writer_started": 50,
+            "copies_completed": 50,
+            "snapshot_built": 50,
+            "ready": 50
+          },
+          "stage_delta": {
+            "queue_wait": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.2056327387690544
+            },
+            "copy_wait": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.01745382323861122
+            },
+            "snapshot_build": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.12426761165261269
+            },
+            "validation": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.17647439613938332
+            },
+            "catalog_register": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.06969133764505386
+            },
+            "store_payload": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.09622481092810631
+            },
+            "catalog_written": {
+              "calls": 100,
+              "errors": 0,
+              "seconds": 0.06694163009524345
+            },
+            "journal_save": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.16142624616622925
+            },
+            "catalog_seal": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.06369736045598984
+            },
+            "store_manifest": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.016478553414344788
+            },
+            "catalog_publish": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.0272747203707695
+            },
+            "journal_complete": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.04826134443283081
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0
+            }
+          },
+          "metrics_verified": true,
+          "metrics_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-after/round-0-phase-1-0.1/metrics.prom",
+          "readback": {
+            "validated_samples": 50,
+            "manifest_bytes": 431850,
+            "payload_bytes": 31176000,
+            "aux_payload_bytes": 1684800,
+            "payload_objects": 700,
+            "kv_payload_bytes": 29491200
+          },
+          "host": {
+            "allocated_bytes": 27018240,
+            "device_allocated_bytes": 0,
+            "device_limit_bytes": 0,
+            "free": 0,
+            "filling": 16,
+            "quarantined": 0
+          },
+          "baseline_bracket": {
+            "median_ttft_ms": 38.46815600991249,
+            "p95_ttft_ms": 41.04431979358196,
+            "p99_ttft_ms": 78.41661201789975,
+            "median_tpot_ms": 1.4729675866903795,
+            "p95_tpot_ms": 1.5731763124706284,
+            "p99_tpot_ms": 2.9434629800098553,
+            "output_throughput": 2946.761571602735
+          },
+          "baseline_after_over_before": {
+            "median_ttft_ms": 0.9890989037744988,
+            "p95_ttft_ms": 0.9719638316324671,
+            "p99_ttft_ms": 0.5323590478183311,
+            "median_tpot_ms": 0.9997765662631536,
+            "p95_tpot_ms": 0.999027303209783,
+            "p99_tpot_ms": 0.3677975078287085,
+            "output_throughput": 1.0305272477957863
+          }
+        },
+        {
+          "repetition": 1,
+          "ready": 50,
+          "requests_per_second": 63.464573495018165,
+          "output_tokens_per_second": 2030.8663518405813,
+          "relative_to_off": 0.6878864890154898,
+          "p99_ttft_ms": 62.04639311879868,
+          "p99_tpot_ms": 3.500817164538368,
+          "p95_tpot_ms": 3.3926345468048127,
+          "client_seconds": 8.067492961883545,
+          "post_client_capture_drain_seconds": 0.008248187601566315,
+          "counter_delta": {
+            "considered": 512,
+            "sampled_out": 462,
+            "admitted": 50,
+            "overlap_forwards": 1355,
+            "eager_forwards": 43,
+            "cuda_graph_forwards": 1312,
+            "sealed": 50,
+            "writer_started": 50,
+            "copies_completed": 50,
+            "snapshot_built": 50,
+            "ready": 50
+          },
+          "stage_delta": {
+            "queue_wait": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.17712778225541115
+            },
+            "copy_wait": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.016798481345176697
+            },
+            "snapshot_build": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.12796348333358765
+            },
+            "validation": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.17733340337872505
+            },
+            "catalog_register": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.0471612922847271
+            },
+            "store_payload": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.10040931031107903
+            },
+            "catalog_written": {
+              "calls": 100,
+              "errors": 0,
+              "seconds": 0.11928936839103699
+            },
+            "journal_save": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.1630612574517727
+            },
+            "catalog_seal": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.06444096565246582
+            },
+            "store_manifest": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.018552713096141815
+            },
+            "catalog_publish": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.028513584285974503
+            },
+            "journal_complete": {
+              "calls": 50,
+              "errors": 0,
+              "seconds": 0.052959732711315155
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0
+            }
+          },
+          "metrics_verified": true,
+          "metrics_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-after/round-1-phase-1-0.1/metrics.prom",
+          "readback": {
+            "validated_samples": 50,
+            "manifest_bytes": 431850,
+            "payload_bytes": 31176000,
+            "aux_payload_bytes": 1684800,
+            "payload_objects": 700,
+            "kv_payload_bytes": 29491200
+          },
+          "host": {
+            "allocated_bytes": 27018240,
+            "device_allocated_bytes": 0,
+            "device_limit_bytes": 0,
+            "free": 0,
+            "filling": 16,
+            "quarantined": 0
+          },
+          "baseline_bracket": {
+            "median_ttft_ms": 38.57675287872553,
+            "p95_ttft_ms": 41.30713948979974,
+            "p99_ttft_ms": 54.7047427482903,
+            "median_tpot_ms": 1.4751411433662138,
+            "p95_tpot_ms": 1.576546267155678,
+            "p99_tpot_ms": 2.995934602353842,
+            "output_throughput": 2952.3277230625336
+          },
+          "baseline_after_over_before": {
+            "median_ttft_ms": 1.029249697644219,
+            "p95_ttft_ms": 1.0378717333948708,
+            "p99_ttft_ms": 0.9888307641399726,
+            "median_tpot_ms": 0.9997472089435985,
+            "p95_tpot_ms": 1.0024422761398202,
+            "p99_tpot_ms": 2.776388785116504,
+            "output_throughput": 0.9704599078342099
+          }
+        }
+      ],
+      "totals": {
+        "ready": 100,
+        "requests": 1024,
+        "output_tokens": 32768,
+        "client_seconds": 15.94886776059866,
+        "payload_bytes": 62352000,
+        "payload_objects": 1400,
+        "requests_per_second": 64.20518467961534,
+        "output_tokens_per_second": 2054.565909747691
+      }
+    }
+  },
+  "serving_interpretation": {
+    "validated_samples": 200,
+    "payload_bytes": 124704000,
+    "payload_objects": 2800,
+    "metrics_scrapes": 4,
+    "observed_request_throughput_change_percent": 0.743053675697869,
+    "conclusion": "Microbenchmark gains do not establish an end-to-end serving speedup. Tails vary and the first baseline off bracket drifts by 11.19%; capture-on retains only 69%-72% of off throughput. Production SLO acceptance remains open."
+  },
+  "jobs": [
+    {
+      "name": "teacher_cuda",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1",
+      "timeout_seconds": 300,
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/unit/training_capture/test_teacher_cuda.py",
+        "-f"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951243920986113-f61ea11db4b5.json",
+      "job_id": "01790951243920986113-f61ea11db4b5",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790951263.0004783,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951243920986113-f61ea11db4b5.log",
+      "test_summary": {
+        "methods": 4,
+        "seconds": 4.933
+      }
+    },
+    {
+      "name": "ownership_cuda",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1",
+      "timeout_seconds": 300,
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/unit/training_capture/test_cuda_snapshot.py",
+        "-f"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951244372725755-29dc583a1d17.json",
+      "job_id": "01790951244372725755-29dc583a1d17",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790951275.1263676,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951244372725755-29dc583a1d17.log",
+      "test_summary": {
+        "methods": 7,
+        "seconds": 1.04
+      }
+    },
+    {
+      "name": "startup_cpu",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1",
+      "timeout_seconds": 900,
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "CUDA_VISIBLE_DEVICES": "999"
+      },
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "test/registered/unit/training_capture",
+        "-p",
+        "test_*startup.py",
+        "-f"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951244743588332-cfe65da7fd54.json",
+      "job_id": "01790951244743588332-cfe65da7fd54",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790951343.1064792,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951244743588332-cfe65da7fd54.log",
+      "test_summary": {
+        "methods": 6,
+        "seconds": 57.172
+      }
+    },
+    {
+      "name": "buffers_cpu",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1",
+      "timeout_seconds": 300,
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "CUDA_VISIBLE_DEVICES": "999"
+      },
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/unit/training_capture/test_buffers.py",
+        "-f"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951245030771209-b06a2f63a870.json",
+      "job_id": "01790951245030771209-b06a2f63a870",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790951354.3929267,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951245030771209-b06a2f63a870.log",
+      "test_summary": {
+        "methods": 18,
+        "seconds": 0.013
+      }
+    },
+    {
+      "name": "microbenchmark",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1",
+      "timeout_seconds": 900,
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/benchmark_teacher_capture.py",
+        "--output",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-micro/report.json",
+        "--source-revision",
+        "323df135666b7ed0cc3676592683fc8f0fd39d15+single-pass-teacher-lse"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951596554295174-9d725ace4b3c.json",
+      "job_id": "01790951596554295174-9d725ace4b3c",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790951619.7132,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951596554295174-9d725ace4b3c.log"
+    },
+    {
+      "name": "runtime",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1",
+      "timeout_seconds": 1800,
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "-f"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951596851645501-83e8e6ac240d.json",
+      "job_id": "01790951596851645501-83e8e6ac240d",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790952351.629393,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951596851645501-83e8e6ac240d.log",
+      "test_summary": {
+        "methods": 2,
+        "seconds": 720.805
+      }
+    },
+    {
+      "name": "pd",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1",
+      "timeout_seconds": 900,
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      },
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_pd.py",
+        "-f"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951597180394802-4312b942d2e2.json",
+      "job_id": "01790951597180394802-4312b942d2e2",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790952535.0390859,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951597180394802-4312b942d2e2.log",
+      "test_summary": {
+        "methods": 2,
+        "seconds": 172.192
+      }
+    },
+    {
+      "name": "serving_before",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-before",
+      "timeout_seconds": 1800,
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-before/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/benchmark_training_capture.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--source-revision",
+        "323df135666b7ed0cc3676592683fc8f0fd39d15",
+        "--output-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-before",
+        "--num-prompts",
+        "512",
+        "--input-len",
+        "16",
+        "--output-len",
+        "32",
+        "--concurrency",
+        "8",
+        "--capture-slots",
+        "16",
+        "--ratios",
+        "0.1",
+        "--repeats",
+        "2"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951597535318080-1cd4d8fee34f.json",
+      "job_id": "01790951597535318080-1cd4d8fee34f",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790952901.1515095,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951597535318080-1cd4d8fee34f.log"
+    },
+    {
+      "name": "serving_after",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1",
+      "timeout_seconds": 1800,
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-lse-v1/python",
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1"
+      },
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "mooncake-study/experiments/benchmark_training_capture.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--source-revision",
+        "323df135666b7ed0cc3676592683fc8f0fd39d15+single-pass-teacher-lse",
+        "--output-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-after",
+        "--num-prompts",
+        "512",
+        "--input-len",
+        "16",
+        "--output-len",
+        "32",
+        "--concurrency",
+        "8",
+        "--capture-slots",
+        "16",
+        "--ratios",
+        "0.1",
+        "--repeats",
+        "2"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951597867628115-52b26944d5ce.json",
+      "job_id": "01790951597867628115-52b26944d5ce",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790953252.9603164,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951597867628115-52b26944d5ce.log"
+    }
+  ],
+  "artifact_sha256": {
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/teacher-lse-probe.py": "bb78db5f3fd793d3b0e1ea4c463055a63c086fe5e738614746aa777fba4074eb",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790950531729251372-6d6592f43dd1.log": "06902e918646955b8a525a31dcbe69d45ed02a95817bb793c3a7ae942e4ea40d",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790950531729251372-6d6592f43dd1.json": "129e651b6cb0cd3204db254527af949a93b77930697de402b797de6b9b2e1f8d",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-micro/report.json": "9d2852de9777e292c08f775fb6d7ca4f5d8165e7ee727370ee2d134a01266eff",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951243920986113-f61ea11db4b5.log": "8deb0cc5ecb03b79b501ba042fa561157659f49d67eb93383da2c2e5271c1b7a",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951243920986113-f61ea11db4b5.json": "39eee4772ecf73cf9191729d6e10ed2a7fd1110b4701a81bc2a980bd6efd5ce0",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951244372725755-29dc583a1d17.log": "79fbaa8380fdc17148e2db29044ca8012660978c5e1017935df93812373fc9bb",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951244372725755-29dc583a1d17.json": "0ceb79990ef8c9bc2ba0acea2b3eeb4337130b2c2fe9eeef8c040c09c9e0c0f9",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951244743588332-cfe65da7fd54.log": "48c7cf84752ce2134153e2d770f9d987edab389dbc85b11d241b2f6d010d4b37",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951244743588332-cfe65da7fd54.json": "19fa222200b9ee3f03b8c4af1b9001aeef972745b4f2c01cbfb5456f5b4885d4",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951245030771209-b06a2f63a870.log": "a7f1d971d976bab52037b47bec4f514dbcd347819946ef6b10f6f12e58e8acbe",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951245030771209-b06a2f63a870.json": "0d5b6672ce9a0d775ae834ab1d63d854e7af628acc86ff5b863960084b9fa75a",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951596554295174-9d725ace4b3c.log": "9b7eb71c521b2896ca484a946d919bd893904ffbf6f9c1e98e6d43c4c6d20fe2",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951596554295174-9d725ace4b3c.json": "052a4c3d6a3ccba81a2a45cd928005bb3f4e309ecaa27c1652d7583e22c4a792",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951596851645501-83e8e6ac240d.log": "ee11ddc1d08a050b0c26d80a1a7850826cfed09b76a45d4fb0dc12d0ff755a96",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951596851645501-83e8e6ac240d.json": "94aefff1aeeb1d2d17bd97004e6938bac5f5fc28a059d03c67cf9dcbc37af49a",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951597180394802-4312b942d2e2.log": "0351c3fa3e8d879acee4c005a8cdaf3989db9e01fed1f3730eee1bf8e4434f1a",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951597180394802-4312b942d2e2.json": "9abd58a9f0d7ab4ed3a0ecc4dc9945766ddcf1f13778d3a9b8b6e69b88e153b6",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-before/report.json": "352a9b53f18824f9fb2163e043a5fa5d196601f9603db1e974d38f53bb399209",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-after/report.json": "fe343285ec83f8696abbd58c85e53ba098880279bcfdc0ccbbfc42bc8ad0e778",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-before/round-0-phase-1-0.1/metrics.prom": "5dc839466ec468df128656b88d5c2d4f51e8186061c724eca6785bd0b608cd7e",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-before/round-1-phase-1-0.1/metrics.prom": "1ea4c8c9d3686c04459ea5d174d578bd335b9dddfcc454cb460efec70052b19a",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-after/round-0-phase-1-0.1/metrics.prom": "6fb764716aa65486877639a910093a9f62a57f92b7193663efae72b8621fbb77",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-lse-serving-after/round-1-phase-1-0.1/metrics.prom": "3ca0c0cf2c66e6f7e530985c2a600baa9a5d9dae9460087bb6846f29651df30e",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951597535318080-1cd4d8fee34f.log": "9b5ad5ef9b2825ef7380cd0a82c3642475b8b1d03dc5fa8edab4b274a19fb17c",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951597535318080-1cd4d8fee34f.json": "07f0ec0f51cb177e41de42ded9e7950daa4f44f3d660a85cc36d0fee8481e66e",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790951597867628115-52b26944d5ce.log": "2d6c00d6b265bb7e207ee4e9a78e8de2539373c5327fe654848be7c23ef8cd71",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790951597867628115-52b26944d5ce.json": "48a3c285ea3e255f4cf314f78ef1afd5fbe67356f36066c4d0e0b7708b3b60b2"
+  }
+}

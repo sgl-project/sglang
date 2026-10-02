@@ -28,8 +28,30 @@ def capture_teacher(
     if row_indices is not None:
         scores = scores.index_select(0, row_indices)
     values, ids = torch.topk(scores, k=128, dim=-1, sorted=True)
+    if scores.is_cuda and scores.dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        from sglang.srt.layers.logsumexp import row_logsumexp
+
+        maximum, log_sum = row_logsumexp(scores)
+        logsumexp = maximum + log_sum
+    else:
+        logsumexp = torch.logsumexp(scores.float(), dim=-1)
     return TeacherRows(
         token_ids=ids.to(torch.int32),
         logits=values.float(),
-        logsumexp=torch.logsumexp(scores.float(), dim=-1),
+        logsumexp=logsumexp,
     )
+
+
+def warmup_teacher_capture(vocab_size: int, device: torch.device | str):
+    """Compile the FP32 serving path before admitting the first capture."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        return
+    with torch.cuda.device(device):
+        scores = torch.zeros((1, vocab_size), dtype=torch.float32, device=device)
+        capture_teacher(scores, vocab_size)
+        torch.cuda.current_stream(device).synchronize()

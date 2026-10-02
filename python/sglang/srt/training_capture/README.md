@@ -249,7 +249,14 @@ The dashboard plots scheduler quantiles/budgets separately from serving histogra
 
 - `teacher.capture_teacher` reads the unpadded vocabulary before serving-side
   processors and returns independent top-128 IDs, raw values, and full-vocabulary
-  LSE. All operations run on the calling CUDA stream.
+  LSE. All operations run on the calling CUDA stream. FP16/BF16/FP32 CUDA scores
+  reuse the existing single-pass row-LSE kernel with FP32 accumulation; top-128
+  selection remains `torch.topk`. CPU and other floating dtypes retain the Torch
+  normalizer. Serving initializes the FP32 path during target-contract binding,
+  before admission and before P/D's prefill early return. Warmup synchronizes
+  only its startup stream; failures participate in the existing startup vote.
+  See the [teacher LSE experiment](../../../../mooncake-study/experiments/TEACHER_LSE.md)
+  for numerical and performance evidence.
 - `SelectedLayerKVExporter` gathers the selected layers through logical-to-pool
   slot indices into independent temporaries and copies into pinned Host views.
   Enqueue before source-slot reuse. The caller must retain Host slots and record

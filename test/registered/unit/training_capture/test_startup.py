@@ -9,6 +9,7 @@ import unittest
 from contextlib import ExitStack
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
@@ -205,9 +206,11 @@ def startup_worker(rank, root, timeout_case):
                             if case == "policy_local_error" and rank == 1:
                                 raise ValueError("draft checkpoint is invalid")
                             return {
-                                "weights": "other"
-                                if case == "policy_disagreement" and rank == 2
-                                else "common"
+                                "weights": (
+                                    "other"
+                                    if case == "policy_disagreement" and rank == 2
+                                    else "common"
+                                )
                             }
 
                         startup.coordinate_policy_startup(
@@ -337,6 +340,59 @@ class TestCaptureStartup(CustomTestCase):
                 )
             finally:
                 vote.assert_called_once()
+                connect.assert_not_called()
+
+    def test_teacher_warmup_failure_occurs_inside_the_startup_vote(self):
+        from sglang.srt.training_capture.coordinator import CaptureCoordinator
+
+        contract = rank_contract(0, tp_size=2, pp_size=2)
+        config = SimpleNamespace(
+            model_id="startup-fixture",
+            selected_layer_ids=[1, 3],
+            storage_chunk_tokens=2,
+            expected_weights_revision="weights",
+            expected_tokenizer_revision="tokenizer",
+        )
+
+        def exchange(*, build_local, **kwargs):
+            with self.assertRaisesRegex(RuntimeError, "compile failed"):
+                build_local()
+            raise startup.CaptureStartupError("binding", [0])
+
+        with (
+            patch(
+                "sglang.srt.training_capture.coordinator.CaptureConfig.load",
+                return_value=config,
+            ),
+            patch(
+                "sglang.srt.training_capture.coordinator.bind_rank_target_contract",
+                return_value=contract,
+            ),
+            patch(
+                "sglang.srt.training_capture.coordinator.warmup_teacher_capture",
+                side_effect=RuntimeError("compile failed"),
+            ) as warmup,
+            patch(
+                "sglang.srt.training_capture.coordinator.coordinate_target_startup",
+                side_effect=exchange,
+            ),
+            patch(
+                "sglang.srt.training_capture.resources.MooncakeSnapshotStore.connect"
+            ) as connect,
+            self.assertRaises(startup.CaptureStartupError),
+        ):
+            try:
+                CaptureCoordinator.create(
+                    config_path="capture.json",
+                    model=None,
+                    model_config=None,
+                    tokenizer_path=None,
+                    pool=SimpleNamespace(device="cuda:0"),
+                    req_to_token=None,
+                    startup_group=object(),
+                )
+            finally:
+                warmup.assert_called_once_with(256, "cuda:0")
                 connect.assert_not_called()
 
 
