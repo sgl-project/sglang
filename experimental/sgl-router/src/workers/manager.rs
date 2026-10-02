@@ -6,8 +6,10 @@ use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::state::kv_events::KvEventIndex;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
-use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
-use crate::workers::{WireProtocol, Worker, WorkerRegistry};
+use crate::workers::introspect::{
+    worker_client, DisaggregationRole, WorkerIntrospector, SERVER_INFO_TIMEOUT,
+};
+use crate::workers::{EngineProfile, WireProtocol, Worker, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,8 +122,8 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// `cfg` is `None` the default CB config is used for every worker
 /// (threshold = 3).
 ///
-/// Uses the default HTTP client (2-second timeout) for worker
-/// introspection.  Tests that want a tighter timeout call
+/// Introspects workers with a 2-second timeout, sending `--worker-api-key`
+/// when set.  Tests that want a tighter timeout call
 /// [`run_with_introspector`] directly.
 pub async fn run_with_config(
     rx: mpsc::Receiver<DiscoveryEvent>,
@@ -130,13 +132,15 @@ pub async fn run_with_config(
     kv_index: Option<Arc<KvEventIndex>>,
     router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
 ) {
+    let auth = cfg.as_ref().and_then(|c| c.server.worker_auth.clone());
+    let introspector = WorkerIntrospector::with_client(worker_client(SERVER_INFO_TIMEOUT, auth));
     run_with_introspector(
         rx,
         registry,
         cfg,
         kv_index,
         router_inflight_load,
-        Arc::new(WorkerIntrospector::default()),
+        Arc::new(introspector),
     )
     .await
 }
@@ -438,6 +442,7 @@ fn reconcile_unresolved_workers(
             mode: worker.mode(),
             model_ids: worker.model_ids.clone(),
             bootstrap_port: worker.bootstrap_port(),
+            version_group: worker.version_group().map(str::to_owned),
         };
         // `debug!` not `info!`: this fires every interval for each
         // still-unresolved worker, so info-level would spam for one that is
@@ -560,10 +565,13 @@ async fn register_one(
     // path quiet, matching why its own progress message stays at `debug!`.
     let previous_protocol = registry.get(&spec.id).map(|w| w.protocol());
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
-    // `protocol` rides beside the spec rather than on it: `WorkerSpec` is the
-    // serde wire type for `DiscoveryEvent`, and no discovery backend can know
-    // a worker's protocol.
-    if let Err(e) = registry.add_with_cb(spec, cb, protocol) {
+    // The profile rides beside the spec rather than on it: `WorkerSpec` is the
+    // serde wire type for `DiscoveryEvent`, and no discovery backend can know it.
+    let profile = EngineProfile {
+        protocol,
+        dp_ranks: info.dp_ranks,
+    };
+    if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration
         // time. Log loudly so the operator notices the conflicting
         // worker — the alternative (silently dropping into either pool)
@@ -613,11 +621,12 @@ mod tests {
             observability: Default::default(),
             model: ModelConfig {
                 id: id.into(),
-                tokenizer_path: "/tmp/x".into(),
+                tokenizer_path: Some("/tmp/x".into()),
                 disable_input_ids_forwarding: false,
                 tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
+                dp_aware: false,
                 bucket_config: None,
                 circuit_breaker: Some(RawCbConfig {
                     threshold: NonZeroU32::new(threshold).unwrap(),
@@ -647,7 +656,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
-            bootstrap_port: None,
+            ..Default::default()
         };
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
@@ -762,7 +771,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -806,7 +815,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -855,7 +864,7 @@ mod tests {
                 url,
                 mode: WorkerMode::Plain,
                 model_ids: Vec::new(),
-                bootstrap_port: None,
+                ..Default::default()
             };
             tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
             let registered = tokio::time::timeout(Duration::from_secs(2), async {
@@ -925,7 +934,7 @@ mod tests {
             url: worker_url.clone(),
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait until the manager has both registered the worker AND
@@ -1026,7 +1035,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait for the manager to land the registry write so the
@@ -1106,7 +1115,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -1224,7 +1233,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1283,6 +1292,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![model.clone()],
             bootstrap_port: None,
+            version_group: Some("v1".into()),
         }))
         .await
         .unwrap();
@@ -1304,6 +1314,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(registry.healthy_workers_for(&model).len(), 1);
+        assert_eq!(registry.get(&id).unwrap().version_group(), Some("v1"));
         drop(tx);
         manager.await.unwrap();
     }
@@ -1343,7 +1354,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
 
@@ -1432,7 +1443,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1556,7 +1567,7 @@ mod tests {
             url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1683,7 +1694,7 @@ mod tests {
             url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1754,7 +1765,7 @@ mod tests {
             url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
