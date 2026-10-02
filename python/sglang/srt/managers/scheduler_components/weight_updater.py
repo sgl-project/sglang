@@ -115,6 +115,7 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
     loaded_weights: bool = False
     sync_base: bool = True
     pending_version: Optional[str] = None
+    requires_post_load: bool = False
 
 
 @dataclass(kw_only=True, slots=True)
@@ -261,7 +262,67 @@ class SchedulerWeightUpdaterManager:
                 message="update_weights_from_distributed must run between "
                 "begin_weight_update() and end_weight_update()",
             )
+        if recv_req.m2n_group_names is not None and recv_req.load_format != "nccl_m2n":
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False, message="m2n_group_names requires load_format=nccl_m2n"
+            )
         with self._observe_weight_load("distributed"):
+            if recv_req.load_format == "nccl_m2n":
+                try:
+                    if not self._session.sync_base:
+                        raise ValueError("M2N requires a sync_base=True session")
+                    if recv_req.selector not in ("target", "all"):
+                        raise ValueError(
+                            "NCCL M2N can update only the target model runner"
+                        )
+                    if self.draft_worker is not None and (
+                        recv_req.selector != "target"
+                        or self._session.selector != "target"
+                    ):
+                        raise ValueError(
+                            "NCCL M2N with a draft requires a target-only weight-update session"
+                        )
+                    if recv_req.m2n_group_names is None:
+                        self.tp_worker.model_runner.weight_updater.receive_weights_from_m2n(
+                            recv_req.group_name
+                        )
+                    else:
+                        if (
+                            not recv_req.m2n_group_names
+                            or recv_req.m2n_group_names[0] != recv_req.group_name
+                        ):
+                            raise ValueError(
+                                "The first m2n_group_names entry must match group_name"
+                            )
+                        self.tp_worker.model_runner.weight_updater.receive_weights_from_m2n_groups(
+                            recv_req.m2n_group_names
+                        )
+                    success, message = (
+                        True,
+                        "Succeeded to update parameter online through NCCL M2N.",
+                    )
+                except Exception as e:
+                    success = False
+                    message = (
+                        f"Failed to update parameter online through NCCL M2N: {e}. "
+                        "The ModelRunner weights may be partially updated; restart "
+                        "the affected rollout engines before another weight update."
+                    )
+                    logger.error(message)
+                if success:
+                    # M2N writes model storage directly, bypassing load_weights().
+                    # Residual broadcast updates may subsequently set
+                    # loaded_weights, so remember independently that the
+                    # session still needs model-level post-load processing.
+                    self._session = msgspec.structs.replace(
+                        self._session, requires_post_load=True
+                    )
+                    self.flush_cache_after_weight_update(recv_req)
+                    self.record_weight_version_after_update(recv_req.weight_version)
+                return UpdateWeightsFromDistributedReqOutput(
+                    success=success, message=message
+                )
+
             # only the target runner joined the update group; drafts load its receive
             target = self.tp_worker.model_runner.weight_updater
             try:
@@ -405,6 +466,18 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
+        target_runner = getattr(self.tp_worker, "model_runner", None)
+        # Reject before the sender starts NCCL transfers or any draft storage changes.
+        if (
+            self.draft_worker is not None
+            and recv_req.selector != "target"
+            and target_runner is not None
+            and target_runner.weight_updater._m2n_receivers
+        ):
+            return BeginWeightUpdateReqOutput(
+                success=False,
+                message="NCCL M2N with a draft requires selector='target'; draft weights stay frozen.",
+            )
         self._lora_stash = {}
         if recv_req.sync_base:
             for _, runner in self._select_runners(recv_req.selector):
@@ -423,7 +496,9 @@ class SchedulerWeightUpdaterManager:
                 message="no weight-update session is open; call begin_weight_update() first",
             )
         if self._session.sync_base:
-            run_post_load = not self._session.loaded_weights
+            run_post_load = (
+                self._session.requires_post_load or not self._session.loaded_weights
+            )
             for _, runner in self._select_runners(self._session.selector):
                 runner.weight_updater.end_weight_update(run_post_load=run_post_load)
         if recv_req.abort:
