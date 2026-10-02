@@ -238,15 +238,14 @@ def test_flydsl_multi_iteration_dim():
     torch.testing.assert_close(y, y_ref, atol=1.0, rtol=5e-2)
 
 
-@pytest.mark.parametrize("dim,waves", [(1024, 2), (3072, 6), (4096, 8), (5120, 10)])
-def test_flydsl_norm_scale_shift_wave_count_dims(dim, waves):
-    """Each hidden size a model actually uses picks a wave count and stays correct.
+@pytest.mark.parametrize("dim", [1024, 3072, 4096, 5120])
+def test_flydsl_norm_scale_shift_wave_count_dims(dim):
+    """Each hidden size a model actually uses picks a block and stays correct.
 
     The tile is ``BLOCK * VEC``; ``_pick_num_waves`` takes the largest block
     whose tile divides D, so these four dims exercise every entry of
-    ``_BLOCK_CHOICES``.  The wave counts here are the wave64 ones -- a wave32
-    part runs the same block in twice as many waves.  Before the per-dim
-    selection only D=5120 (and its multiples) reached the kernel at all.
+    ``_BLOCK_CHOICES``.  Before the per-dim selection only D=5120 (and its
+    multiples) reached the kernel at all.
     """
     _, nss_op = _flydsl_ops()
     from sglang.kernels.ops.diffusion import flydsl_norm_supports
@@ -328,13 +327,13 @@ def test_flydsl_imports_without_flydsl_source_tree():
         "import importlib, sys;"
         f"m = importlib.import_module('{FLYDSL_MODULE}');"
         "assert 'kernels' not in sys.modules, 'leaked FlyDSL source-tree kernels package';"
-        "print('OK', m._NUM_WAVES_CHOICES)"
+        "print('OK', m._BLOCK_CHOICES)"
     )
     r = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, env=env
     )
     assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
-    assert "OK (10, 8, 6, 2)" in r.stdout, r.stdout
+    assert "OK (640, 512, 384, 128)" in r.stdout, r.stdout
 
 
 if __name__ == "__main__":
