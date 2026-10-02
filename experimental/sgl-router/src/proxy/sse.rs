@@ -31,7 +31,7 @@ pub enum StreamEndReason {
 #[derive(Debug, Clone, Copy)]
 pub struct StreamEnd {
     pub reason: StreamEndReason,
-    /// An SSE error event (`data: {"error"...}`) rode the stream.
+    /// An SSE error event (`data: {"error"...}`) or native error abort rode the stream.
     pub saw_error_event: bool,
 }
 
@@ -49,11 +49,20 @@ fn is_error_event_line(line: &[u8]) -> bool {
 /// Line-start bytes that suffice to decide `is_error_event_line`.
 const LINE_PROBE: usize = 32;
 
+/// Native `/generate` streams an error as an abort with a status code,
+/// which a user abort leaves null; neither key can occur unescaped in a JSON string.
+const NATIVE_ABORT: &[u8] = br#""type":"abort""#;
+const NATIVE_STATUS: &[u8] = br#""status_code":"#;
+
 /// Finds error events emitted after an SSE response commits a 200.
 /// Line-anchored, so lookalike text inside event payloads cannot match.
 #[derive(Default)]
 struct ErrorEventScanner {
     line_start: Vec<u8>,
+    /// The current line's last bytes, so a native key split across chunks matches.
+    line_tail: Vec<u8>,
+    native_abort: bool,
+    native_status: bool,
 }
 
 impl ErrorEventScanner {
@@ -61,29 +70,44 @@ impl ErrorEventScanner {
         let mut hit = false;
         for (i, segment) in chunk.split(|&b| b == b'\n').enumerate() {
             if i > 0 {
-                hit |= is_error_event_line(&self.line_start);
+                let native = self.native_abort && self.native_status;
+                hit |= is_error_event_line(&self.line_start)
+                    || (native && self.line_start.starts_with(b"data:"));
                 self.line_start.clear();
+                self.line_tail.clear();
+                (self.native_abort, self.native_status) = (false, false);
             }
             let room = LINE_PROBE - self.line_start.len();
             self.line_start
                 .extend_from_slice(&segment[..segment.len().min(room)]);
+            self.scan_native(segment);
         }
         hit
+    }
+
+    /// Look for the native error keys in `segment` and where it joins the line so far.
+    fn scan_native(&mut self, segment: &[u8]) {
+        let head = &segment[..segment.len().min(NATIVE_STATUS.len())];
+        let boundary = [self.line_tail.as_slice(), head].concat();
+        for hay in [boundary.as_slice(), segment] {
+            let quotes = hay.iter().enumerate().filter(|&(_, &b)| b == b'"');
+            for rest in quotes.map(|(i, _)| &hay[i..]) {
+                self.native_abort |= rest.starts_with(NATIVE_ABORT);
+                let status = rest.strip_prefix(NATIVE_STATUS).and_then(<[u8]>::first);
+                self.native_status |= status.is_some_and(u8::is_ascii_digit);
+            }
+        }
+        let keep = segment.len().min(NATIVE_STATUS.len());
+        self.line_tail
+            .extend_from_slice(&segment[segment.len() - keep..]);
+        let excess = self.line_tail.len().saturating_sub(NATIVE_STATUS.len());
+        self.line_tail.drain(..excess);
     }
 }
 
 /// Whether a buffered SSE body carries an error event.
 pub fn has_error_event(body: &[u8]) -> bool {
     ErrorEventScanner::default().feed(body)
-}
-
-/// Whether a buffered SSE body carries a native `/generate` abort,
-/// which the engine streams as `meta_info.finish_reason`, not as an error event.
-pub fn has_abort_event(body: &[u8]) -> bool {
-    body.split(|&b| b == b'\n')
-        .filter_map(|line| line.strip_prefix(b"data:"))
-        .filter_map(|data| serde_json::from_slice::<serde_json::Value>(data).ok())
-        .any(|event| event["meta_info"]["finish_reason"]["type"] == "abort")
 }
 
 /// Bounds on a streaming response beyond what the upstream stream itself provides.
@@ -624,12 +648,20 @@ mod tests {
     }
 
     #[test]
-    fn abort_event_detects_native_generate_abort() {
-        let abort = br#"{"text": "", "meta_info": {"finish_reason": {"type": "abort", "status_code": 500}}}"#;
-        let stop = br#"{"text": "hi", "meta_info": {"finish_reason": {"type": "stop"}}}"#;
-        let stream = |event: &[u8]| [b"data: ", event, b"\n\ndata: [DONE]\n\n"].concat();
-        assert!(has_abort_event(&stream(abort)));
-        assert!(!has_abort_event(&stream(stop)));
+    fn error_event_scanner_detects_native_error_abort() {
+        let event = |reason: &str| {
+            format!("data: {{\"text\":\"\",\"meta_info\":{{\"finish_reason\":{reason}}}}}\n\n")
+        };
+        let error = event(r#"{"type":"abort","message":"boom","status_code":500}"#);
+        assert!(has_error_event(error.as_bytes()));
+        // A user abort (`/abort_request`) carries no status code; lookalike text is escaped.
+        let user = event(r#"{"type":"abort","message":"Aborted","status_code":null}"#);
+        assert!(!has_error_event(user.as_bytes()));
+        let text = r#"data: {"text":"\"type\":\"abort\",\"status_code\":500"}"#;
+        assert!(!has_error_event(format!("{text}\n\n").as_bytes()));
+        let mut scanner = ErrorEventScanner::default();
+        let bytes = error.as_bytes().chunks(1);
+        assert!(bytes.fold(false, |hit, byte| scanner.feed(byte) || hit));
     }
 
     #[test]
@@ -669,6 +701,7 @@ mod tests {
         let big = vec![b'x'; 1 << 20];
         assert!(!scanner.feed(&big));
         assert_eq!(scanner.line_start.len(), LINE_PROBE);
+        assert_eq!(scanner.line_tail.len(), NATIVE_STATUS.len());
     }
 
     fn body_with_completion(

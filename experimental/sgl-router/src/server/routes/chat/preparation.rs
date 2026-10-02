@@ -120,7 +120,7 @@ impl PreparedRequest {
                 .into();
         }
         let tokens = request_tokens_for(&ctx.tokenizers, &model, &value);
-        let batch = batch_prompt_tokens(&value);
+        let batch = batch_prompt_tokens(ctx, &model, &value);
         let samples = parallel_samples(&value);
         let fans_out = batch.is_some() || samples > 1;
         let lengths = batch.unwrap_or_else(|| {
@@ -247,11 +247,15 @@ fn input_embeds(value: &Value) -> Option<&Vec<Value>> {
 }
 
 /// Per-prompt token counts of a batch: exact for nested `input_ids` or
-/// `input_embeds`, estimated for a `text` list. `None` for a single prompt.
-fn batch_prompt_tokens(value: &Value) -> Option<Vec<usize>> {
+/// `input_embeds`, tokenized for a `text` list. `None` for a single prompt.
+fn batch_prompt_tokens(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Vec<usize>> {
     if let Some(texts) = value["text"].as_array() {
-        let estimate = |text: &Value| estimate_prefill_tokens(text.as_str().map_or(0, str::len));
-        return Some(texts.iter().map(estimate).collect());
+        let count = |text: &Value| {
+            let text = text.as_str().unwrap_or_default();
+            let ids = ctx.tokenizers.encode_prompt(&model.0, text);
+            ids.map_or_else(|| estimate_prefill_tokens(text.len()), |ids| ids.len())
+        };
+        return Some(texts.iter().map(count).collect());
     }
     let rows = value["input_ids"]
         .as_array()
@@ -1029,6 +1033,9 @@ mod tests {
         // The processor expands multimodal placeholders from the text itself.
         let image = prepare_generate(json!({"text": "hi", "image_data": "a.png"}));
         assert_eq!(body(&image)["text"], "hi");
+        // Text left to the engine still counts its tokens, in a batch as for one prompt.
+        let images = prepare_generate(json!({"text": ["hi", "hi"], "image_data": ["a", "b"]}));
+        assert_eq!(images.input_token_count, 2 * ids.len());
     }
 
     #[test]

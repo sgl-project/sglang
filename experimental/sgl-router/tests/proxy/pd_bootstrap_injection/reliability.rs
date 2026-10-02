@@ -294,7 +294,8 @@ async fn prefill_sse_error_event_is_a_prefill_failure() {
 /// Native `/generate` streams a prefill failure as an abort, not an error event.
 #[tokio::test]
 async fn prefill_native_abort_event_is_a_prefill_failure() {
-    let abort = "data: {\"meta_info\": {\"finish_reason\": {\"type\": \"abort\"}}}\n\n";
+    let abort =
+        "data: {\"meta_info\":{\"finish_reason\":{\"type\":\"abort\",\"status_code\":500}}}\n\n";
     let prefill = MockWorker::start(vec![abort]).await;
     let decode = MockWorker::start_hanging(Duration::from_secs(10)).await;
     let ctx = pd_ctx(&prefill.url, &decode.url, false);
