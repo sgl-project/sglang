@@ -361,9 +361,8 @@ impl ModelFiles {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(repo = %self.source, %file, error = %format!("{e:#}"),
-                            "could not download; chat-formatter detection and prompt special \
-                             tokens may be degraded for this model (check HF_TOKEN / network for \
-                             a gated or private repo)");
+                            "could not download; chat-formatter detection may be degraded for this \
+                             model (check HF_TOKEN / network for a gated or private repo)");
                         return None;
                     }
                 }

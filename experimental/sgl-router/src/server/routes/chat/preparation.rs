@@ -111,7 +111,13 @@ impl PreparedRequest {
             Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
         let stream =
             Option::<bool>::deserialize(&value["stream"]).map_err(|_| invalid_request())?;
-        if let Some(input_ids) = tokenize_text(ctx, &model, &value) {
+        let text_ids = tokenize_text(ctx, &model, &value);
+        // Routing sees `text` as the engine's ids, whether or not they are forwarded.
+        let routed = text_ids.as_ref().map(|ids| json!({ "input_ids": ids }));
+        let routed = routed.as_ref().unwrap_or(&value);
+        let tokens = request_tokens_for(&ctx.tokenizers, &model, routed);
+        let batch = batch_prompt_tokens(routed);
+        if let Some(input_ids) = text_ids.filter(|_| forwards_text_ids(ctx, &value)) {
             let fields = value.as_object_mut().expect("parsed as an object");
             fields.remove("text");
             fields.insert("input_ids".into(), input_ids);
@@ -119,18 +125,6 @@ impl PreparedRequest {
                 .map_err(|error| ApiError::Internal(error.into()))?
                 .into();
         }
-        // Text left to the engine still routes on its tokens, special tokens included.
-        let prompt = value["text"]
-            .as_str()
-            .filter(|_| !has_caller_input_ids(&value));
-        let tokens = match prompt.and_then(|text| ctx.tokenizers.encode_prompt(&model.0, text)) {
-            Some(ids) => Some(RequestTokens {
-                ids,
-                rendered_from_chat: false,
-            }),
-            None => request_tokens_for(&ctx.tokenizers, &model, &value),
-        };
-        let batch = batch_prompt_tokens(ctx, &model, &value);
         let samples = parallel_samples(&value);
         let fans_out = batch.is_some() || samples > 1;
         let lengths = batch.unwrap_or_else(|| {
@@ -222,20 +216,9 @@ impl PreparedRequest {
     }
 }
 
-/// `text` as engine-equivalent `input_ids` of the same shape. `None` leaves the
-/// text to the engine: caller inputs win, its processor expands multimodal
-/// placeholders from the text, and `--disable-input-ids-forwarding` opts out.
+/// `text` as the engine's `input_ids`, of the same shape; `None` when the caller sent ids.
 fn tokenize_text(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Value> {
-    let engine_inputs = [
-        "input_ids",
-        "input_embeds",
-        "image_data",
-        "video_data",
-        "audio_data",
-    ];
-    if ctx.config.model.disable_input_ids_forwarding
-        || engine_inputs.iter().any(|key| !value[key].is_null())
-    {
+    if has_caller_input_ids(value) {
         return None;
     }
     let encode = |text: &Value| ctx.tokenizers.encode_prompt(&model.0, text.as_str()?);
@@ -249,6 +232,14 @@ fn tokenize_text(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Val
     }
 }
 
+/// Whether `text` may reach the engine as `input_ids`: not when its processor expands
+/// multimodal placeholders from the text, nor under `--disable-input-ids-forwarding`.
+fn forwards_text_ids(ctx: &AppContext, value: &Value) -> bool {
+    let engine_inputs = ["input_embeds", "image_data", "video_data", "audio_data"];
+    !ctx.config.model.disable_input_ids_forwarding
+        && engine_inputs.iter().all(|key| value[key].is_null())
+}
+
 /// `input_embeds`, which the engine reads only without `text` and `input_ids`.
 fn input_embeds(value: &Value) -> Option<&Vec<Value>> {
     value["input_embeds"]
@@ -257,15 +248,11 @@ fn input_embeds(value: &Value) -> Option<&Vec<Value>> {
 }
 
 /// Per-prompt token counts of a batch: exact for nested `input_ids` or
-/// `input_embeds`, tokenized for a `text` list. `None` for a single prompt.
-fn batch_prompt_tokens(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Vec<usize>> {
+/// `input_embeds`, estimated for a `text` list. `None` for a single prompt.
+fn batch_prompt_tokens(value: &Value) -> Option<Vec<usize>> {
     if let Some(texts) = value["text"].as_array() {
-        let count = |text: &Value| {
-            let text = text.as_str().unwrap_or_default();
-            let ids = ctx.tokenizers.encode_prompt(&model.0, text);
-            ids.map_or_else(|| estimate_prefill_tokens(text.len()), |ids| ids.len())
-        };
-        return Some(texts.iter().map(count).collect());
+        let estimate = |text: &Value| estimate_prefill_tokens(text.as_str().map_or(0, str::len));
+        return Some(texts.iter().map(estimate).collect());
     }
     let rows = value["input_ids"]
         .as_array()

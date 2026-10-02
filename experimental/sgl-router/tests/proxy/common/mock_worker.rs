@@ -157,7 +157,6 @@ impl MockWorker {
         };
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(hang_handler))
-            .route("/generate", post(hang_handler))
             .route("/server_info", get(serve_tiny_server_info))
             .route("/abort_request", abort_request_route(abort_log.clone()))
             .with_state(state);
