@@ -45,7 +45,10 @@ The final handoff observer records capture/current epochs and whether a real
 teacher payload exists. These observations distinguish a valid late payload
 discarded by D from a payload that P never produced after its own abort.
 Production modules do not contain this gate and are not modified by the tests.
-The entrypoint explicitly rejects TP/PP sizes other than one.
+The initial entrypoint was restricted to TP1/PP1. Its current rank-aware gate
+and scheduler-ordered release also serve the
+[distributed control matrix](DISTRIBUTED_PD_CAPTURE_CONTROL.md); the results in
+this document remain the original single-rank run.
 
 The additional CPU test starts with an already materialized teacher tensor, or
 its already encoded PP handoff, then aborts and resumes P. Neither representation
@@ -66,6 +69,8 @@ Catalog retention, or deployment SLOs. The test observers deliberately copy raw
 tensors and write reference files, so these timings are not serving benchmarks.
 The route's authentication was tested separately in
 [the initial operator-control run](CAPTURE_CONTROL.md).
+Subsequent matching TP2/PP1 and TP1/PP2 live-control evidence is recorded in the
+distributed matrix; it does not extend this original run to cross-node control.
 
 ## Results
 

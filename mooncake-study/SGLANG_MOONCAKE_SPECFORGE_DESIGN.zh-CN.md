@@ -1467,7 +1467,13 @@ P/D 分别控制两个服务端点：先暂停 D，保留 P 完成已有 handoff
 两个独立 HTTP 端点的 AR 与静态 target-KV DSpark，包括 eager、decode graph
 和 overlap、分块 prefill 期间暂停、abort/resume 后迟到的 teacher handoff、
 解码期间只终止采集，以及两端退出后的 32 份 Store 样本校验。
-此验证不替代多 GPU/跨节点控制、生产 SLO、真实灰度流程或训练收益验收。
+后续[双卡控制矩阵](experiments/DISTRIBUTED_PD_CAPTURE_CONTROL.md) 已覆盖
+两端匹配的 TP2/PP1 与 TP1/PP2，AR 和静态 target-KV DSpark 的八组运行，
+每次控制均核对各 rank 状态，并在两端退出后校验 64 份完整样本。PP2 graph
+使用同步调度，TP2 graph 同时覆盖 overlap。`resume` 返回仍可能早于后台
+ticket 恢复可用；分布式 `abort` 除当前请求外还会作废未绑定预留。
+这些测试不改变 HTTP 响应的异步语义，也不替代混合/非对称拓扑、跨节点控制、
+生产 SLO、真实灰度流程或训练收益验收。
 
 ## 21. 待定参数与研究风险
 

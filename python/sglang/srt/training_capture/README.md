@@ -171,7 +171,13 @@ The [P/D control matrix](../../../../mooncake-study/experiments/PD_CAPTURE_CONTR
 covers separate TP1/PP1 P/D HTTP endpoints with AR and static target-KV DSpark,
 in eager and decode graph/overlap execution. It validates partial-prefill pause,
 late teacher handoff after abort/resume, and active decode abort while ordinary
-generation completes. It does not certify multi-GPU or cross-node control.
+generation completes. The
+[distributed matrix](../../../../mooncake-study/experiments/DISTRIBUTED_PD_CAPTURE_CONTROL.md)
+adds matching TP2/PP1 and TP1/PP2 on two H100s, with every rank's control state
+checked and complete post-exit Store readback. PP2 graph execution is synchronous;
+TP2 graph execution includes overlap. Resume can precede background ticket
+readiness, and abort also retires unbound tickets. These tests do not certify
+mixed/asymmetric topologies, cross-node control or a global drain barrier.
 
 ### Reservation Refill
 

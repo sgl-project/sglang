@@ -1,0 +1,1996 @@
+{
+  "schema_version": 1,
+  "change": "Validate matching TP2/PP1 and TP1/PP2 live P/D capture controls",
+  "parent_commit": "aede6f2bec875b9486a930a35a2866e35cef0362",
+  "branch": "codex/dspark-maas-capture",
+  "date_utc": "2026-10-02",
+  "runtime_lock": {
+    "path": "h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84",
+    "observed": {
+      "python": "3.12.3",
+      "packages": {
+        "torch": "2.13.0",
+        "transformers": "5.12.1",
+        "flashinfer-python": "0.6.17",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      }
+    },
+    "container_setup": "Removed inherited optional flashinfer-cubin 0.6.12 and flashinfer-jit-cache 0.6.12+cu130 from the temporary container to match the locked 0.6.17 overlay."
+  },
+  "allocation": {
+    "temporary": {
+      "job": "job-f63122ef7493-20261003005634",
+      "pod": "job-f63122ef7493-20261003005634-master-0",
+      "node": "node199",
+      "gpu_uuids": [
+        "GPU-d509370c-2949-982e-9f93-c0653fe393c0",
+        "GPU-a1a12d9d-32a7-7f7d-b7d4-6393e2ab46de"
+      ],
+      "image": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+      "command": "northjob create --job-name dspark-pd-control-2h100-20261002 --workspace /gpfs/users/fuxuanwei-1/dspark-maas-lab --nnodes 1 --nproc-per-node 1 --gpu-per-node 2 --gpu-resource h100 --mem-per-proc 240 --k8s-namespace qiji --k8s-priority 1 --k8s-no-hostnetwork --k8s-images harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855 python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control serve --no-idle-load",
+      "final_worker_state": {
+        "worker_id": "7e4d9a97a7af4ea28a84ff877e982751",
+        "hostname": "job-f63122ef7493-20261003005634-master-0",
+        "pid": 1,
+        "mode": "idle",
+        "heartbeat_unix": 1790962820.038169,
+        "idle_pid": null,
+        "active_job": null,
+        "active_pid": null,
+        "queued": 0,
+        "paused": false,
+        "heartbeat_age_seconds": 0.40015411376953125
+      },
+      "gpu_process_list_empty": true,
+      "remaining_processes": "1 Ss   python3         python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control serve --no-idle-load",
+      "deletion": {
+        "api_code": 0,
+        "request_id": "ReqID-20261003-014036-9030-eace",
+        "pod_absent": true
+      }
+    },
+    "resident": {
+      "job": "job-fe1ce1dcdea6-20261001023258",
+      "retained": true,
+      "final_mode": "idle_load",
+      "active_job": null,
+      "queued": 0
+    }
+  },
+  "validation": {
+    "methods": 12,
+    "snapshots": 96,
+    "ordinary_requests": 180,
+    "distributed": {
+      "methods": 8,
+      "seconds": 788.538,
+      "snapshots": 64,
+      "ordinary_requests": 120,
+      "failed_request_captures": 40,
+      "failed_unbound_captures": 72
+    },
+    "single_rank": {
+      "methods": 4,
+      "seconds": 449.052,
+      "snapshots": 32,
+      "ordinary_requests": 60,
+      "failed_request_captures": 20,
+      "failed_unbound_captures": 0
+    },
+    "source_python_files_changed": 3,
+    "black_passed": true,
+    "full_ruff_passed": true,
+    "production_modules_changed": false,
+    "all_python_py_files_match_frozen_source": true,
+    "final_source": "sglang-pd-distributed-control-v4",
+    "interim_runs_excluded_from_acceptance_counts": true,
+    "synthetic_seed_samples_excluded": true
+  },
+  "jobs": [
+    {
+      "version": "v1",
+      "kind": "distributed",
+      "id": "01790960493619347068-55aab1927732",
+      "note": "Resume readiness was asynchronous; the probe sent a request before tickets became available.",
+      "state": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v1",
+      "submission_command": "kubectl exec -n qiji job-f63122ef7493-20261003005634-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v1 --timeout-seconds 2400 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v1/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_distributed_control.py -f -v",
+      "test_summary": "Ran 1 test in 220.851s\nFAILED (errors=1)",
+      "result": {
+        "job_id": "01790960493619347068-55aab1927732",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790960736.2980568,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/logs/01790960493619347068-55aab1927732.log"
+      },
+      "included_in_final_acceptance": false
+    },
+    {
+      "version": "v1",
+      "kind": "regression",
+      "id": "01790960493972720388-f20a0fd72e39",
+      "note": null,
+      "state": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v1",
+      "submission_command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v1 --timeout-seconds 1200 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v1/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_control.py -f -v",
+      "test_summary": "Ran 4 tests in 448.444s\nOK",
+      "result": {
+        "job_id": "01790960493972720388-f20a0fd72e39",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790960955.9894893,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790960493972720388-f20a0fd72e39.log"
+      },
+      "included_in_final_acceptance": false
+    },
+    {
+      "version": "v2",
+      "kind": "distributed",
+      "id": "01790960906978458863-7c23197162f7",
+      "note": "Independent filesystem release let PP ranks select different pipeline iterations; request timed out.",
+      "state": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v2",
+      "submission_command": "kubectl exec -n qiji job-f63122ef7493-20261003005634-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v2 --timeout-seconds 2400 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v2/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_distributed_control.py -f -v",
+      "test_summary": "Ran 1 test in 254.484s\nFAILED (errors=1)",
+      "result": {
+        "job_id": "01790960906978458863-7c23197162f7",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790961175.4998236,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/logs/01790960906978458863-7c23197162f7.log"
+      },
+      "included_in_final_acceptance": false
+    },
+    {
+      "version": "v3",
+      "kind": "distributed",
+      "id": "01790961347925820513-391468308e2b",
+      "note": "The assertion counted only the active request, but abort also correctly failed unbound spare tickets.",
+      "state": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v3",
+      "submission_command": "kubectl exec -n qiji job-f63122ef7493-20261003005634-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v3 --timeout-seconds 2400 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v3/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_distributed_control.py -f -v",
+      "test_summary": "Ran 1 test in 146.653s\nFAILED (errors=1)",
+      "result": {
+        "job_id": "01790961347925820513-391468308e2b",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790961508.702549,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/logs/01790961347925820513-391468308e2b.log"
+      },
+      "included_in_final_acceptance": false
+    },
+    {
+      "version": "v3",
+      "kind": "regression",
+      "id": "01790961348272645802-21ef2dd822cb",
+      "note": null,
+      "state": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v3",
+      "submission_command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v3 --timeout-seconds 1200 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v3/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_control.py -f -v",
+      "test_summary": "Ran 4 tests in 446.878s\nOK",
+      "result": {
+        "job_id": "01790961348272645802-21ef2dd822cb",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790961809.3276458,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790961348272645802-21ef2dd822cb.log"
+      },
+      "included_in_final_acceptance": false
+    },
+    {
+      "version": "v4",
+      "kind": "distributed",
+      "id": "01790961918886501970-e5c3fa26eb7b",
+      "note": null,
+      "state": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v4",
+      "submission_command": "kubectl exec -n qiji job-f63122ef7493-20261003005634-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v4 --timeout-seconds 2400 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v4/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_distributed_control.py -f -v",
+      "test_summary": "Ran 8 tests in 788.538s\nOK",
+      "result": {
+        "job_id": "01790961918886501970-e5c3fa26eb7b",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790962722.3133032,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/logs/01790961918886501970-e5c3fa26eb7b.log"
+      },
+      "included_in_final_acceptance": true
+    },
+    {
+      "version": "v4",
+      "kind": "regression",
+      "id": "01790961919223101261-07aec6da21d5",
+      "note": null,
+      "state": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v4",
+      "submission_command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v4 --timeout-seconds 1200 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v4/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_control.py -f -v",
+      "test_summary": "Ran 4 tests in 449.052s\nOK",
+      "result": {
+        "job_id": "01790961919223101261-07aec6da21d5",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790962382.5651593,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790961919223101261-07aec6da21d5.log"
+      },
+      "included_in_final_acceptance": true
+    }
+  ],
+  "sources": {
+    "worktree": "/gpfs/user/fuxuanwei/sglang/mooncake-study/implementation/sglang",
+    "current_code_and_final_mirror_sha256": {
+      "python/sglang/test/pd_capture_control_server.py": "f8941147002bb691957ee8ef7a35ae3bfb3b28bed2a39f2770ea96a2cd2a4e8c",
+      "test/registered/storage/test_training_capture_pd_control.py": "db9fe4e435861bd7db9213aad4788e9e723185341cb467204b38abea54215160",
+      "test/registered/storage/test_training_capture_pd_distributed_control.py": "ba1746690ebefa4fd70507f5a36c67df8fa35fd9d070bffe2b1ed701292cee0e",
+      "python/sglang/srt/training_capture/coordinator.py": "02ccbb75d426f704f7407ba364e6a098a76d4b2ff5f90feb74b892efa4d27355",
+      "python/sglang/srt/training_capture/cohort_coordinator.py": "b1f4d340cab3b2400e7415c17773b27510524f8d3df55c6ec8af89455e3504f1",
+      "python/sglang/srt/training_capture/cohort_service.py": "60f8578cf250b4f3dbf97b15d67a2c78a67eb6b836a5bcda85dfdaf90ecf9324",
+      "python/sglang/srt/training_capture/pd_capture.py": "ea2a78c9f662f7914da840dcba443404fc69687f29fa50d8c084c4674b07cf08",
+      "python/sglang/srt/managers/scheduler.py": "c8457d7b0b7f638bba75d9b32416a7e9fbf43e73b77763d269ed31cbda58602a",
+      "python/sglang/srt/managers/scheduler_pp_mixin.py": "10ea4e48c0acf6d1c86d21322d4be5266b14baa95310dff71dad9af945ddb9e9",
+      "python/sglang/test/pd_capture_runtime.py": "ddee6e187186af801f553db1a703709d2f7d9241aa1fb60aa4acd19b31eaef62",
+      "python/sglang/test/pd_capture_server.py": "9787493bba282776148e2223f0fa9565de6c2ab44569ed4c5e368686d8d74dc0",
+      "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3"
+    },
+    "test_versions": {
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v1": {
+        "python/sglang/test/pd_capture_control_server.py": "3c2046b4050a90d27ae54ef506eb857f6e39a3d32a70b4ce33570ec8f9290f37",
+        "test/registered/storage/test_training_capture_pd_control.py": "ca231e81f5615d196cde41974fb878c441d3fb5dfe245e877cae9de8bcf0317d",
+        "test/registered/storage/test_training_capture_pd_distributed_control.py": "ba1746690ebefa4fd70507f5a36c67df8fa35fd9d070bffe2b1ed701292cee0e"
+      },
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v2": {
+        "python/sglang/test/pd_capture_control_server.py": "c3c4acbbd725100381a841e3ce9b9228fb183e8e87ad3173e5f3337e256a661d",
+        "test/registered/storage/test_training_capture_pd_control.py": "924020df4e7de1bd588585a293d93edf8a6e4cde7c6ad51ad76a63ba0185ecc3",
+        "test/registered/storage/test_training_capture_pd_distributed_control.py": "ba1746690ebefa4fd70507f5a36c67df8fa35fd9d070bffe2b1ed701292cee0e"
+      },
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v3": {
+        "python/sglang/test/pd_capture_control_server.py": "3299e3dda9c7332dae7894b6ccb9824f18b36713426747ba7448a77297eaf10d",
+        "test/registered/storage/test_training_capture_pd_control.py": "9489b49449d0265a4fec7844eaf8327b4e6ab5d61905eb406f42049049672b64",
+        "test/registered/storage/test_training_capture_pd_distributed_control.py": "ba1746690ebefa4fd70507f5a36c67df8fa35fd9d070bffe2b1ed701292cee0e"
+      },
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-control-v4": {
+        "python/sglang/test/pd_capture_control_server.py": "f8941147002bb691957ee8ef7a35ae3bfb3b28bed2a39f2770ea96a2cd2a4e8c",
+        "test/registered/storage/test_training_capture_pd_control.py": "db9fe4e435861bd7db9213aad4788e9e723185341cb467204b38abea54215160",
+        "test/registered/storage/test_training_capture_pd_distributed_control.py": "ba1746690ebefa4fd70507f5a36c67df8fa35fd9d070bffe2b1ed701292cee0e"
+      }
+    },
+    "documentation_updated_after_tests": true
+  },
+  "final_distributed_matrix": [
+    {
+      "tp_size": 1,
+      "pp_size": 2,
+      "draft_kind": "target_kv",
+      "replay": false,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": false
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "5a7bf5ef5dbd433b99d77b05854fe4ae",
+        "control-gated-abort-prefill": "84d735b897bc41c68f0b3317885ac1cf",
+        "control-gated-abort-prefill-decode": "1edaeed2b4644a18ab996e65ca20734f",
+        "control-only-p-paused": "08fd2d6f1c51436483a0b0756375cf41",
+        "control-running-decode": "3dda1c1482b645b89a873cbad4827fae"
+      },
+      "failed_unbound_captures": [
+        "15f5a32aaedb438a8f54ab2fab250d70",
+        "1b5c2f1f76b340dfb13bee694e9a1800",
+        "6f8cae09968d4ef9b7fc4efd764cbd62",
+        "8af5c9f55f694847808c85fe0c47392f",
+        "a28dfdccb17f4c738761d829383f7942",
+        "a63fc69a11ce4e158d7413197928f3ca",
+        "dc711bfc46814504b231e1f13b805800",
+        "e8f0399487b9481f9e275f3d7f95afc8",
+        "ea910f84d835464a97d48b74a7c9af9c"
+      ],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "eager_forwards": 35,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 0,
+              "sealed": 8,
+              "speculative_commits_copied": 35,
+              "speculative_verify_forwards": 35
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          },
+          "pp1-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "eager_forwards": 35,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8,
+              "speculative_commits_copied": 35,
+              "speculative_verify_forwards": 35
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_pp_handoff_received": 10,
+              "pd_selected": 12
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          },
+          "pp1-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_pp_handoff_received": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 2,
+      "draft_kind": "target_kv",
+      "replay": true,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": false
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "8348085b1211415f8120b2c88f170bef",
+        "control-gated-abort-prefill": "521693835e5e42e0bff2cc3c4a0c1b03",
+        "control-gated-abort-prefill-decode": "19a48e147d594c75b33766b4acea80df",
+        "control-only-p-paused": "6fe71a1aa90a43aaa19b95de21f47086",
+        "control-running-decode": "503837e3938e4707b73f09016e6d35eb"
+      },
+      "failed_unbound_captures": [
+        "421bf87718fb4525b46d74c12bfafd7c",
+        "60962a105d104f6d9b8a15bb21e44b48",
+        "696d20d51b8f4aaf87cb395ca10772ac",
+        "6bd5f89eadbd4f48bc09892de7769397",
+        "a2424b38abc04d13a7ee2ac1e0fdde0a",
+        "c210f5de793246ef8853e844c1772843",
+        "d685248e30734afeb8f9665fd2cbe09d",
+        "d7d389a6d64f4178ae0e21a4bc2093a6",
+        "f0d60c19b5cd4d0893856ec23e0690c2"
+      ],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "cuda_graph_forwards": 35,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 0,
+              "sealed": 8,
+              "speculative_commits_copied": 35,
+              "speculative_verify_forwards": 35
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          },
+          "pp1-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "cuda_graph_forwards": 35,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8,
+              "speculative_commits_copied": 35,
+              "speculative_verify_forwards": 35
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_pp_handoff_received": 10,
+              "pd_selected": 12
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          },
+          "pp1-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_pp_handoff_received": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "draft_kind": "target_kv",
+      "replay": false,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          },
+          "pp0-tp1": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp0-tp1": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp0-tp1": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          },
+          "pp0-tp1": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "34ffb21b4ffd418994970c6d387bacd1",
+        "control-gated-abort-prefill": "37bcf8fb0a824d278eb4faff680323ba",
+        "control-gated-abort-prefill-decode": "7db75aba29934a4aae7c65fa6eff642e",
+        "control-only-p-paused": "ea0305b8a6f24c06ae30e51c1cad9345",
+        "control-running-decode": "ace86c1a071d47c4864ee88a5a127896"
+      },
+      "failed_unbound_captures": [
+        "22cbabfe96d748d2bc6f32032a920237",
+        "4fc65771062f4f5d80ea03b17edb1911",
+        "73e41c88e8d14e96af0b0faf24e8e065",
+        "90ddb7acad9a48c8b5ec166f6d62113b",
+        "b177f4d47fa04af7bbb8fe2e51156bbf",
+        "dd8bac12a5074556b132e5f54e3108ee",
+        "e467c8250d514e81877f387e944dcf82",
+        "e64967a0a25b42bc99e99932c5beffac",
+        "f790852349284240a912cbe7c4439f6b"
+      ],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "eager_forwards": 35,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8,
+              "speculative_commits_copied": 35,
+              "speculative_verify_forwards": 35
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          },
+          "pp0-tp1": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "eager_forwards": 35,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 0,
+              "sealed": 8,
+              "speculative_commits_copied": 35,
+              "speculative_verify_forwards": 35
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          },
+          "pp0-tp1": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "draft_kind": "target_kv",
+      "replay": true,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          },
+          "pp0-tp1": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp0-tp1": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp0-tp1": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          },
+          "pp0-tp1": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "a7f6292bf06b48ac84f183a605c52ca3",
+        "control-gated-abort-prefill": "68568f2d5471408eb14aabccc6b5257c",
+        "control-gated-abort-prefill-decode": "275de5f38a594438b32204c252535ad6",
+        "control-only-p-paused": "924b0f5ab1044c0abeacdf36f9fcc2b2",
+        "control-running-decode": "060a315d9b22412fb134cdf32da5f657"
+      },
+      "failed_unbound_captures": [
+        "0531b6905ec944598abbc94bf173fa9c",
+        "0a384a38b990457997279269a9e55f9f",
+        "0c5a1b29a0dd46b694cd25931b4af078",
+        "292307273d3743b79878ba3858e09554",
+        "68c698eaf57a4af3a1d417152c31a25f",
+        "6f03fb7252084a339c59c7b96531eb38",
+        "ee6b53b3a192421da7b18d9e8e9157db",
+        "ef1fbf241d774ea98cda1eb920888458",
+        "f1b2af987a24487caf3a9deb0e145e66"
+      ],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "cuda_graph_forwards": 43,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "overlap_forwards": 43,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8,
+              "speculative_commits_copied": 43,
+              "speculative_verify_forwards": 43
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": true,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          },
+          "pp0-tp1": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "cuda_graph_forwards": 43,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "overlap_forwards": 43,
+              "pd_handoff_committed": 9,
+              "ready": 0,
+              "sealed": 8,
+              "speculative_commits_copied": 43,
+              "speculative_verify_forwards": 43
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": true,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          },
+          "pp0-tp1": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 2,
+      "draft_kind": null,
+      "replay": false,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": false
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "590aa2df030343b1a696ce80b9e7cbae",
+        "control-gated-abort-prefill": "51a04dd8b8d44772a3b57e005cfe82e7",
+        "control-gated-abort-prefill-decode": "ea46d182131d4fe5bd6df2b2e6fa7b6a",
+        "control-only-p-paused": "97d41a33c01848cab11f93d1a53a6af4",
+        "control-running-decode": "b3f599c5297d441d883ac95e692381a1"
+      },
+      "failed_unbound_captures": [
+        "06f22fb987e047c1ac71a2586652f3b1",
+        "269563b0713145d798a73e79f1be85ed",
+        "5d47510dd8fa42e88eea5f4fd2b8d6da",
+        "809a6425a32244c0bb73f6d5a248584f",
+        "a651879179864d4aae2045326d41f503",
+        "c0ab2a86b429420e9a05c418eb2c49f9",
+        "d8c17d798cbe47de91c60458bfb42b7c",
+        "dfaced37d7ff4e078fd1dc61c821cbbb",
+        "fc443591e3d94460be4cd01df53075cc"
+      ],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "eager_forwards": 122,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 0,
+              "sealed": 8
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          },
+          "pp1-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "eager_forwards": 122,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_pp_handoff_received": 10,
+              "pd_selected": 12
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          },
+          "pp1-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_pp_handoff_received": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 2,
+      "draft_kind": null,
+      "replay": true,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": false
+          },
+          "pp1-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": false
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "9122f0f9394948a2a87b2662f54b8519",
+        "control-gated-abort-prefill": "c9a1c5d060c94c3eaa09bef4224d9062",
+        "control-gated-abort-prefill-decode": "003a03d4375344bba775ceacbe12af12",
+        "control-only-p-paused": "4cb97fa088204f508fd0d8f26c658a5f",
+        "control-running-decode": "8dbc06e414a84885879d5918914a32e3"
+      },
+      "failed_unbound_captures": [
+        "0cba0c02f10c43f9ab0dda0070d80572",
+        "4b89d85bde474993a26029cb6d094f19",
+        "9711e2d426704a0790e23872ebb4c9ca",
+        "b1f9228daa6b4fc783e3c6b195c4c2d2",
+        "cc3174e98b16468e99874ad1e79697c2",
+        "d03df885822d4d2eb3e33d4cb7e70a72",
+        "d77f286eb51a43ba99476835377e94a6",
+        "e98a285ddcca4f88ab53b00f51e91211",
+        "f177dd4c5d4d413eb0dea05379fb5fc4"
+      ],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "cuda_graph_forwards": 125,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 0,
+              "sealed": 8
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          },
+          "pp1-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "cuda_graph_forwards": 125,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_pp_handoff_received": 10,
+              "pd_selected": 12
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          },
+          "pp1-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_pp_handoff_received": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": false,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          },
+          "pp0-tp1": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp0-tp1": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp0-tp1": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          },
+          "pp0-tp1": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "d418c8c9d9b740ada7439993c0840765",
+        "control-gated-abort-prefill": "9ef461124e2c4f90bd06168b234f5785",
+        "control-gated-abort-prefill-decode": "49f4747e47b440a2b8c0d4e9034c4c55",
+        "control-only-p-paused": "2c377995ef0c4d14b9e1aab8c6aabb2a",
+        "control-running-decode": "578ca245356443e2afe0859b37045041"
+      },
+      "failed_unbound_captures": [
+        "3334cff131a84a9c817aefcdaf51588c",
+        "4072fc336a254230aa0c7b8d20dacc48",
+        "44569df517d14e0aafe49ed087c6adae",
+        "a86ae9b857fb4c0eb90962457e3b1be2",
+        "b7e3b9afac1e43c29d71dae4ed86bd02",
+        "b807ce8cd4144a688bf4a87cca4cb94b",
+        "c13a9ddc1a4e465eb0cc056d9603cf58",
+        "efbca85457254a7ab1fbfec2f7b98c6e",
+        "f8b2d190298a43028bf18f97bdf50d4f"
+      ],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "eager_forwards": 123,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          },
+          "pp0-tp1": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "eager_forwards": 123,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 0,
+              "sealed": 8
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          },
+          "pp0-tp1": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": true,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          },
+          "pp0-tp1": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp0-tp1": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          },
+          "pp0-tp1": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          },
+          "pp0-tp1": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "f644b57328ad4d72a93b5bb5688ceba1",
+        "control-gated-abort-prefill": "01e6dab9d2a84350a6bb79cab97310c2",
+        "control-gated-abort-prefill-decode": "416738ce388741f4bba1bb19353068d8",
+        "control-only-p-paused": "5a442e1627cf47f9962f83568b7199d6",
+        "control-running-decode": "1859179ec1844980b64741e625798f64"
+      },
+      "failed_unbound_captures": [
+        "0d8fcf02d1e64787a4b126e9fcd0fbaa",
+        "33a51245874c4dd8b40e3671ed5a6228",
+        "749b61f65c654f5ab56ec9d6f66a84b4",
+        "9aa9c5aed26e4194a5e57bfee9e6449f",
+        "a2fb0543f8184ff68b2ffb9dcf61ee1f",
+        "d6cf95e27a544329bb3802aa2d60fcbe",
+        "dec0d42742514cda82e565c72099694b",
+        "ed7648b1792d4494943c004119204d08",
+        "fc590007c240491d9a89704d338da350"
+      ],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "cuda_graph_forwards": 133,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "overlap_forwards": 133,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": true,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          },
+          "pp0-tp1": {
+            "counters": {
+              "admitted": 13,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "cuda_graph_forwards": 133,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "overlap_forwards": 133,
+              "pd_handoff_committed": 9,
+              "ready": 0,
+              "sealed": 8
+            },
+            "states": {
+              "available": 0,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "admission_paused": true,
+            "enable_overlap": true,
+            "quarantined": 0,
+            "stage_errors": 0,
+            "test_service_admission_ready": false,
+            "test_invalid_captures": []
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          },
+          "pp0-tp1": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    }
+  ],
+  "final_single_rank_regression": [
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": "target_kv",
+      "replay": false,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "aeb91838d5d7490b92f6043d30214b61",
+        "control-gated-abort-prefill": "e7aea65e5304474093c3b088a06d346f",
+        "control-gated-abort-prefill-decode": "980dd0906435413d92925e77e6ae938d",
+        "control-only-p-paused": "fa814b3cc23c4741b4f2b3252065b672",
+        "control-running-decode": "261cb01695764778a6353e59c4327d71"
+      },
+      "failed_unbound_captures": [],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "considered": 15,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "copies_completed": 13,
+              "eager_forwards": 35,
+              "excluded_paused": 2,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8,
+              "snapshot_built": 8,
+              "speculative_commits_copied": 35,
+              "speculative_verify_forwards": 35,
+              "writer_started": 13
+            },
+            "states": {
+              "available": 4
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": "target_kv",
+      "replay": true,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "f60e8caa292a4369966e5f9c92e1506b",
+        "control-gated-abort-prefill": "848fd40a34644859ab7e2b13df86f8d0",
+        "control-gated-abort-prefill-decode": "8a39dd2efe66482489aecd2090b2cef0",
+        "control-only-p-paused": "12ed246ad4e34bc98af7ccaee542187e",
+        "control-running-decode": "512f807eb25442ce8919011e843ce867"
+      },
+      "failed_unbound_captures": [],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "considered": 15,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "copies_completed": 13,
+              "cuda_graph_forwards": 43,
+              "excluded_paused": 2,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "overlap_forwards": 43,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8,
+              "snapshot_built": 8,
+              "speculative_commits_copied": 43,
+              "speculative_verify_forwards": 43,
+              "writer_started": 13
+            },
+            "states": {
+              "available": 4
+            },
+            "admission_paused": true,
+            "enable_overlap": true,
+            "quarantined": 0,
+            "stage_errors": 0
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": false,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "7b6a9be864dc4fce8e76d1b17899e228",
+        "control-gated-abort-prefill": "f1dc190cfa9042a09d4571b17e54f22f",
+        "control-gated-abort-prefill-decode": "c69e28609fe04640b28ad6a08bd4cec2",
+        "control-only-p-paused": "95283a1f010342f297132d2717b65f03",
+        "control-running-decode": "5ef61afd891b4a87b2018f2ca7baa573"
+      },
+      "failed_unbound_captures": [],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "considered": 15,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "copies_completed": 13,
+              "eager_forwards": 124,
+              "excluded_paused": 2,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8,
+              "snapshot_built": 8,
+              "writer_started": 13
+            },
+            "states": {
+              "available": 4
+            },
+            "admission_paused": true,
+            "enable_overlap": false,
+            "quarantined": 0,
+            "stage_errors": 0
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": true,
+      "post_exit_snapshots": 8,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 1,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        },
+        "control-gated-abort-prefill": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 1,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-abort-prefill-decode": {
+          "pp0-tp0": {
+            "capture_epoch": 1,
+            "current_epoch": 2,
+            "payload_present": false,
+            "teacher_present": false
+          }
+        },
+        "control-gated-drain": {
+          "pp0-tp0": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "payload_present": true,
+            "teacher_present": true
+          }
+        }
+      },
+      "failed_request_captures": {
+        "control-gated-abort-decode": "16e9ccddca024bfe8d40b73f347d914a",
+        "control-gated-abort-prefill": "6e8bf3862d544cc29098afa44545bf23",
+        "control-gated-abort-prefill-decode": "ec37e0cfc77f4f008692b38f8dead032",
+        "control-only-p-paused": "97315b9a89aa4df6b13654f4c86b8580",
+        "control-running-decode": "95482972d86848b2b1864f7ea4acd0c7"
+      },
+      "failed_unbound_captures": [],
+      "rank_states": {
+        "decode": {
+          "pp0-tp0": {
+            "counters": {
+              "admitted": 13,
+              "considered": 15,
+              "control_abort": 3,
+              "control_pause": 3,
+              "control_resume": 5,
+              "copies_completed": 13,
+              "cuda_graph_forwards": 134,
+              "excluded_paused": 2,
+              "failed_operator_aborted": 3,
+              "failed_pd_handoff_failed": 2,
+              "overlap_forwards": 134,
+              "pd_handoff_committed": 9,
+              "ready": 8,
+              "sealed": 8,
+              "snapshot_built": 8,
+              "writer_started": 13
+            },
+            "states": {
+              "available": 4
+            },
+            "admission_paused": true,
+            "enable_overlap": true,
+            "quarantined": 0,
+            "stage_errors": 0
+          }
+        },
+        "prefill": {
+          "pp0-tp0": {
+            "counters": {
+              "control_abort": 2,
+              "control_pause": 3,
+              "control_resume": 5,
+              "pd_handoff_ready": 10,
+              "pd_selected": 12,
+              "pd_teacher_copied": 10
+            },
+            "admission_paused": false,
+            "stage_errors": 0
+          }
+        }
+      }
+    }
+  ],
+  "artifact_sha256": {
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/logs/01790960493619347068-55aab1927732.log": "25c6c8ed41cc391e6431569f31918f96efdaf80dd1e4827bda0d816c146521cb",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/results/01790960493619347068-55aab1927732.json": "ca5310398d7a274603e34de0534b65bed44c8c690cd79e87357a1aa76d7ab3e0",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790960493972720388-f20a0fd72e39.log": "0fdf59e73e8000fd916157751e6f0bde27a12b58f2a84496ee301f4e771c04ab",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790960493972720388-f20a0fd72e39.json": "d79a1a04dacf9a7d311de502f50a3bd4784be0bee80c86c1b9ed881847071b34",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/logs/01790960906978458863-7c23197162f7.log": "b3c5d57e4eda95938591ea625ce492b6857a21131dc8d85ad2e09904068ca8ca",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/results/01790960906978458863-7c23197162f7.json": "c0024daf52cc3e185ab67cf3eedae03246d194513794ebdcb46c43b638c2e0c1",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/logs/01790961347925820513-391468308e2b.log": "c0ba1ebc3425a54d47ad6772291609dd361075281b29ca4295e7ef638f840bc7",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/results/01790961347925820513-391468308e2b.json": "f0ce88c749ed931c10ab01c41a1ac41ebf69878a16e2de963a07b78356f73c1b",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790961348272645802-21ef2dd822cb.log": "6b91156377906052748f9a72e9f72b45e5f4b82ff07c310266ee3200d26f388a",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790961348272645802-21ef2dd822cb.json": "54a0a7bc86affac19acafe21a48b0463c11754523ccbafd43e8aea635d305445",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/logs/01790961918886501970-e5c3fa26eb7b.log": "99f7a6de1503f7980d12bb9c066b96d9fda52f51feb77243f0b79ad093db50f5",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-control/results/01790961918886501970-e5c3fa26eb7b.json": "1d135170015d01e05b9006b43ae10fc83547da7f1f69ab6b43e5009ab4effa00",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790961919223101261-07aec6da21d5.log": "48d3558fd8788903a0d4561ec90ed69bbbf43542c5200ff3ba02442b85e0f9e1",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790961919223101261-07aec6da21d5.json": "c3bc1c99d0149e45e2a29a260880f0825ad9b74ff597cfbbfd431807ade76540"
+  },
+  "limits": [
+    "Two independent P/D groups share a two-H100 node; only matching TP2/PP1 and TP1/PP2 control is validated here.",
+    "PP2 graph is synchronous; TP2 graph includes overlap. Prefill graphs are disabled.",
+    "Mixed TP/PP, asymmetric P/D and cross-node/RDMA control remain untested by this lane.",
+    "Raw source observers, per-rank state files and the scheduler-ordered test gate are test-only. Timings are not serving benchmarks.",
+    "The filesystem nonce and numeric test gate key do not add a production management interface or all-rank barrier.",
+    "The HTTP Catalog is a test implementation, and the Store segment is owned by the test process independently of P/D. No production retention or Store-node restart claim.",
+    "DSpark uses a synthetic static target-KV checkpoint, not a trained model; no confidence-scheduled DSpark or training-quality acceptance.",
+    "Production SLOs and deployment rollout orchestration remain open."
+  ],
+  "outer_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+}

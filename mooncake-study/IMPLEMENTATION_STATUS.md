@@ -45,7 +45,7 @@ it does not redefine the goal as the modules already implemented.
 | Checkpoint artifact audit | Offline API/CLI binds config, weights, golden fixture and complete numerical report; optional pinned acceptance artifact | Nine CPU tests, five parity regressions and a fresh retained BF16 parity/audit run pass; production exporter, report trust and quality/SLO acceptance remain separate |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
-| Operator capture control | Authenticated pause/resume/abort management route, distributed readiness gating, P/D teacher epoch fencing, independent pause metrics | Initial 107 methods/16 post-exit snapshots pass; separate-endpoint TP1/PP1 AR/static target-KV DSpark control adds a four-cell eager/graph-overlap matrix with 32 post-exit snapshots and a 15-method CPU P/D suite; multi-GPU and cross-node live control remain open |
+| Operator capture control | Authenticated pause/resume/abort management route, distributed readiness gating, P/D teacher epoch fencing, independent pause metrics | Initial HTTP/CPU and single-rank P/D suites pass; matching TP2/PP1 and TP1/PP2 AR/static target-KV DSpark add eight live-control cells with 64 complete post-exit snapshots; mixed/asymmetric and cross-node live control remain open |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes synchronous/overlap and eager/graph combinations; retired captures fail once, released slots are reused, fresh admission and exact post-exit Store reads pass; distributed pressure and SLOs remain open |
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes colocated and P/D PP1 synchronous/overlap and eager/graph combinations, plus synchronous TP1/PP2 and TP2/PP2 eager/graph; P/D checks exact all-layer CPU restore and failed Catalog leases |
 | PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2, synchronous P2/D2 and P2/D1, matching TP2/PP2, and cross-node TP1 RDMA pass eager/graph source parity and failure exclusion; wider distributed RDMA remains open |
@@ -3869,6 +3869,44 @@ hashes and per-mode state. This covers synthetic-checkpoint execution, not
 trained-draft quality. Real multi-GPU TP/PP, cross-node/RDMA management, global
 drain acknowledgement and production SLO/retention acceptance remain open.
 
+## Distributed P/D Capture Control
+
+The live-control matrix now covers matching TP2/PP1 and TP1/PP2 P/D groups on
+two H100s. AR and static target-KV DSpark each pass eager and decode graph
+execution; TP2 graph uses overlap, while PP2 remains synchronous. No production
+module changes were needed. The test server records actual scheduler state on
+every rank after each real HTTP pause/resume/abort command, using nonces to reject
+stale observations. The HTTP response remains an asynchronous local reply.
+
+Partial-prefill gates and handoff observations are rank-specific. Their release
+follows the existing scheduler message sequence so PP stages resume the same
+iteration. Tests require exact capture-ID agreement and failure for each aborted
+or missing-teacher request. Extra failed unbound tickets must never have been
+admitted to a request, registered/written payloads or published. Final drain
+waits for invalid cohort handles as well as local writer/collection states.
+
+The final matrix passes **eight methods in 788.538 seconds**, completing **120
+generation requests** and checking **64 snapshots** after both P/D process trees
+exit. Every cell checks all selected layers/heads, raw top-128 IDs/values, LSE,
+tokens, masks, positions and manifest topology against independent source
+observations. Each rank admits 13 captures; the auxiliary owner publishes eight,
+five request captures fail as intended, and nine spare tickets are discarded
+without payload writes. Quarantine, admission backpressure, writer-stage errors
+and Catalog errors remain zero. The final single-GPU regression adds **four
+methods in 449.052 seconds** and **32 snapshots**, for **12 final methods, 180
+requests and 96 validated snapshots**. Earlier passes and draft seeds are excluded.
+
+Three initial test failures clarified asynchronous readiness after resume,
+pipeline ordering of gate release, and abort's cancellation of spare tickets.
+Their frozen sources/results are retained alongside the final passing version.
+All three Python files pass Black and full Ruff. The temporary two-H100 job was
+deleted after confirming idle state and empty GPU/serving process lists; the
+resident H100 has resumed idle load. See the
+[runbook](experiments/DISTRIBUTED_PD_CAPTURE_CONTROL.md) and
+[evidence index](experiments/distributed-pd-capture-control.json).
+Mixed TP/PP, asymmetric P/D, cross-node/RDMA control, confidence-scheduled DSpark,
+production retention/SLOs and trained-model quality remain outside this evidence.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
@@ -3899,8 +3937,8 @@ drain acknowledgement and production SLO/retention acceptance remain open.
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to
    representative workloads and SLO thresholds, and complete dashboard runtime
    acceptance and rollout/rollback checks beyond the new single-GPU live capture
-   controls and passing TP1/PP1 separate-endpoint P/D matrix, including real
-   multi-GPU TP/PP and cross-node P/D control.
+   controls and passing TP1/PP1, TP2/PP1 and TP1/PP2 separate-endpoint P/D matrices,
+   including mixed/asymmetric and cross-node P/D control.
    Investigate the timing experiment's
    short-request p99 TTFT increase, which the latest unchanged baseline did not
    reproduce. After consolidating single-rank content validation and reducing

@@ -5,6 +5,7 @@ import json
 import shutil
 import time
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -23,6 +24,32 @@ class TestPDCaptureControl(PDCaptureRuntimeBase):
     observer_module = "sglang.test.pd_capture_control_server"
     teacher_d2h_batch_tokens = 16
     draft_kind = None
+    tp_size = 1
+    pp_size = 1
+
+    def rank_names(self):
+        return [
+            f"pp{pp}-tp{tp}" for pp in range(self.pp_size) for tp in range(self.tp_size)
+        ]
+
+    def all_states(self, role):
+        root = self.control_root / role / "control-gates"
+        root.mkdir(exist_ok=True)
+        nonce = str(time.monotonic_ns())
+        (root / "state-request").write_text(nonce)
+        self.state(role)
+        deadline = time.monotonic() + 10
+        states = {}
+        while len(states) != len(self.rank_names()):
+            for rank in self.rank_names():
+                path = root / rank / "state.json"
+                if path.exists():
+                    value = json.loads(path.read_text())
+                    if value["nonce"] == nonce:
+                        states[rank] = value["state"]
+            self.assertLess(time.monotonic(), deadline, (role, nonce, states))
+            time.sleep(0.01)
+        return states
 
     def state(self, role):
         url = self.prefill_url if role == "prefill" else self.decode_url
@@ -40,6 +67,12 @@ class TestPDCaptureControl(PDCaptureRuntimeBase):
         state = response.json()["results"][0]["state"]
         self.assertEqual(state["admission_paused"], action != "resume")
         self.assertIsNone(state["disabled_reason"], state)
+        self.control_counts[role]["control_" + action] += 1
+        for rank, observed in self.all_states(role).items():
+            self.assertEqual(observed["admission_paused"], action != "resume", rank)
+            self.assertIsNone(observed["disabled_reason"], (rank, observed))
+            for counter, count in self.control_counts[role].items():
+                self.assertEqual(observed["counters"].get(counter), count, rank)
         return state
 
     def wait_until(self, predicate):
@@ -49,8 +82,20 @@ class TestPDCaptureControl(PDCaptureRuntimeBase):
             time.sleep(0.01)
 
     def wait_capture_capacity(self, count):
-        if not self.capture_state()["admission_paused"]:
-            super().wait_capture_capacity(count)
+        state = self.capture_state()
+        if state["admission_paused"]:
+            return
+        if "request_router" not in state:
+            return super().wait_capture_capacity(count)
+        # Resume clears the manual flag before the background all-rank vote
+        # restores ticket availability. A correctness probe needs both ready.
+        self.wait_until(
+            lambda: all(
+                item["test_service_admission_ready"]
+                and item["states"].get("available", 0) >= count
+                for item in self.all_states("decode").values()
+            )
+        )
 
     def failures(self):
         with self.catalog.condition:
@@ -60,10 +105,42 @@ class TestPDCaptureControl(PDCaptureRuntimeBase):
                 if record["state"] == "FAILED"
             }
 
-    def assert_failed(self, previous, reason):
-        self.wait_until(lambda: len(self.failures()) > len(previous))
+    def assert_failed(self, previous, reason, rid):
+        root = self.control_root / "decode" / "control-gates"
+        paths = [root / rank / (rid + ".admission") for rank in self.rank_names()]
+        self.wait_until(lambda: all(path.exists() for path in paths))
+        capture_ids = {json.loads(path.read_text())["capture_id"] for path in paths}
+        self.assertEqual(len(capture_ids), 1)
+        capture_id = capture_ids.pop()
+        self.assertIsNotNone(capture_id)
+        self.assertNotIn(capture_id, previous)
+        self.wait_until(lambda: capture_id in self.failures())
         added = {k: v for k, v in self.failures().items() if k not in previous}
-        self.assertEqual(list(added.values()), [reason])
+        distributed = self.tp_size * self.pp_size > 1
+        self.assertEqual(added[capture_id], "cohort_failed" if distributed else reason)
+        self.failed_requests[rid] = capture_id
+        if not distributed:
+            self.assertEqual(set(added), {capture_id})
+            return
+        self.check_unbound_failures(added)
+
+    def check_unbound_failures(self, failures):
+        # Abort also retires spare tickets. They must never have been admitted
+        # to another request, written any payload, or become a publication.
+        root = self.control_root / "decode" / "control-gates"
+        admitted = {
+            json.loads(path.read_text())["capture_id"]
+            for path in root.glob("*/*.admission")
+        }
+        for key in set(failures) - set(self.failed_requests.values()):
+            self.assertGreater(self.tp_size * self.pp_size, 1)
+            self.assertNotIn(key, admitted)
+            self.assertEqual(failures[key], "cohort_failed")
+            with self.catalog.condition:
+                self.assertFalse(self.catalog.captures[key]["registered"])
+                self.assertFalse(self.catalog.captures[key]["written"])
+                self.assertNotIn(key, self.catalog.publications)
+            self.failed_unbound.add(key)
 
     def remember(self, rid, prompt, result, expected):
         expected[hashlib.sha256(rid.encode()).hexdigest()] = (prompt, result)
@@ -72,28 +149,44 @@ class TestPDCaptureControl(PDCaptureRuntimeBase):
         gates = root / "prefill" / "control-gates"
         gates.mkdir(exist_ok=True)
         hold = gates / (rid + ".hold")
-        entered = gates / (rid + ".entered")
+        entered = [gates / rank / (rid + ".entered") for rank in self.rank_names()]
         hold.touch()
         with ThreadPoolExecutor(max_workers=1) as executor:
             pending = executor.submit(self.generate, rid, prompt, 16, biased=True)
             try:
-                self.wait_until(entered.exists)
-                captured = json.loads(entered.read_text())
-                self.assertTrue(captured["attempted"])
-                self.assertTrue(captured["selected"])
-                self.assertGreater(captured["chunk_end"], 0)
-                self.assertLess(captured["chunk_end"], len(prompt))
+                self.wait_until(lambda: all(path.exists() for path in entered))
+                for path in entered:
+                    captured = json.loads(path.read_text())
+                    self.assertTrue(captured["attempted"], path)
+                    self.assertTrue(captured["selected"], path)
+                    self.assertGreater(captured["chunk_end"], 0)
+                    self.assertLess(captured["chunk_end"], len(prompt))
                 self.assertEqual(self.state("decode")["states"].get("active"), 1)
                 action()
             finally:
+                response = requests.post(
+                    self.prefill_url + "/set_internal_state",
+                    json={"server_args": {"training_capture_test_release:" + rid: 1}},
+                    timeout=10,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertTrue(all(response.json()), response.text)
+                for state in self.all_states("prefill").values():
+                    self.assertIn(rid, state["test_released_gates"])
                 hold.unlink(missing_ok=True)
             result = pending.result(timeout=120)
-        handoff = json.loads((gates / (rid + ".handoff")).read_text())
+        handoff = {
+            rank: json.loads((gates / rank / (rid + ".handoff")).read_text())
+            for rank in self.rank_names()
+        }
         return result, handoff
 
     def exercise_controls(self, replay):
         root = self.root / f"control-replay-{replay}"
         root.mkdir()
+        self.control_root = root
+        self.control_counts = {role: Counter() for role in ("prefill", "decode")}
+        self.failed_requests, self.failed_unbound = {}, set()
         draft = (
             Path(shutil.copytree(self.get_draft(self.draft_kind), root / "draft"))
             if self.draft_kind
@@ -101,12 +194,18 @@ class TestPDCaptureControl(PDCaptureRuntimeBase):
         )
         self.bootstrap_port, self.bootstrap_room = self.new_bootstrap_port(), 12000
         prefill, self.prefill_url = self.launch(
-            "prefill", root, replay=replay, tp_size=1, pp_size=1
+            "prefill", root, replay=replay, tp_size=self.tp_size, pp_size=self.pp_size
         )
         decode, self.decode_url = self.launch(
-            "decode", root, replay=replay, tp_size=1, pp_size=1, draft=draft
+            "decode",
+            root,
+            replay=replay,
+            tp_size=self.tp_size,
+            pp_size=self.pp_size,
+            draft=draft,
         )
         first = len(self.catalog.publications)
+        initial_failures = self.failures()
         expected, handoffs = {}, {}
         short = [1, 16, 17, 18]
 
@@ -142,7 +241,9 @@ class TestPDCaptureControl(PDCaptureRuntimeBase):
         prompt = list(range(1000, 1200))
         rid = "control-gated-drain"
         result, handoffs[rid] = self.gated_request(root, rid, prompt, pause_inflight)
-        self.assertTrue(handoffs[rid]["payload_present"])
+        self.assertTrue(
+            all(value["payload_present"] for value in handoffs[rid].values())
+        )
         self.remember(rid, prompt, result, expected)
         self.catalog.wait_publications(first + len(expected), timeout=30)
         self.control("prefill", "resume")
@@ -164,23 +265,22 @@ class TestPDCaptureControl(PDCaptureRuntimeBase):
 
             _, handoffs[rid] = self.gated_request(root, rid, prompt, abort_and_resume)
             reason = "operator_aborted" if "decode" in roles else "pd_handoff_failed"
-            self.assert_failed(previous, reason)
+            self.assert_failed(previous, reason, rid)
             self.assertEqual(len(self.catalog.publications), first + len(expected))
             self.assertEqual(
                 self.state("decode")["counters"].get("pd_handoff_committed", 0), before
             )
-            self.assertEqual(handoffs[rid]["payload_present"], "prefill" not in roles)
-            if "prefill" in roles:
-                self.assertLess(
-                    handoffs[rid]["capture_epoch"], handoffs[rid]["current_epoch"]
-                )
+            for value in handoffs[rid].values():
+                self.assertEqual(value["payload_present"], "prefill" not in roles)
+                if "prefill" in roles:
+                    self.assertLess(value["capture_epoch"], value["current_epoch"])
             published(f"control-recovered-{index}")
 
         # A paused P with running D must lose the sample, not the inference.
         previous = self.failures()
         self.control("prefill", "pause")
         self.generate("control-only-p-paused", short, 16, biased=True)
-        self.assert_failed(previous, "pd_handoff_failed")
+        self.assert_failed(previous, "pd_handoff_failed", "control-only-p-paused")
         self.assertEqual(len(self.catalog.publications), first + len(expected))
         self.control("prefill", "resume")
         published("control-final-resume")
@@ -199,23 +299,52 @@ class TestPDCaptureControl(PDCaptureRuntimeBase):
             self.assertEqual(self.state("decode")["states"].get("active"), 1)
             self.control("decode", "abort")
             pending.result(timeout=120)
-        self.assert_failed(previous, "operator_aborted")
+        self.assert_failed(previous, "operator_aborted", "control-running-decode")
         self.control("decode", "resume")
         published("control-after-running-abort")
         self.control("decode", "pause")
         self.wait_until(
-            lambda: not any(
-                n
-                for state, n in self.state("decode")["states"].items()
-                if state != "available"
+            lambda: all(
+                not observed.get("test_invalid_captures")
+                and not any(
+                    n for state, n in observed["states"].items() if state != "available"
+                )
+                for observed in self.all_states("decode").values()
             )
         )
+        failures = {
+            key: reason
+            for key, reason in self.failures().items()
+            if key not in initial_failures
+        }
+        self.check_unbound_failures(failures)
+        self.assertEqual(len(self.failed_requests), 5)
+        self.assertEqual(
+            set(failures), set(self.failed_requests.values()) | self.failed_unbound
+        )
         final_d, final_p = self.state("decode"), self.state("prefill")
+        rank_states = {role: self.all_states(role) for role in ("prefill", "decode")}
+        self.assertEqual(
+            sum(s["counters"]["ready"] for s in rank_states["decode"].values()),
+            len(expected),
+        )
+        for state in rank_states["decode"].values():
+            self.assertEqual(state["host_pool"]["quarantined"], 0)
+            self.assertEqual(state["counters"].get("admission_backpressure", 0), 0)
+            self.assertIsNone(state["disabled_reason"])
+            writer = state.get("cohort_writer")
+            if writer is not None:
+                self.assertIsNone(writer["error"], writer)
+            if replay:
+                self.assertGreater(state["counters"].get("cuda_graph_forwards", 0), 0)
+            if replay and self.pp_size == 1:
+                self.assertGreater(state["counters"].get("overlap_forwards", 0), 0)
         self.assertEqual(final_d["host_pool"]["quarantined"], 0)
         self.assertEqual(final_d["counters"].get("admission_backpressure", 0), 0)
         if replay:
             self.assertGreater(final_d["counters"].get("cuda_graph_forwards", 0), 0)
-            self.assertGreater(final_d["counters"].get("overlap_forwards", 0), 0)
+            if self.pp_size == 1:
+                self.assertGreater(final_d["counters"].get("overlap_forwards", 0), 0)
         if draft:
             self.assertGreater(
                 final_d["counters"].get("speculative_verify_forwards", 0), 0
@@ -237,6 +366,8 @@ class TestPDCaptureControl(PDCaptureRuntimeBase):
         self.addCleanup(reader.close)
         for publication in publications:
             manifest, tensors = read_snapshot(reader, publication)
+            self.assertEqual(manifest.topology.tp_size, self.tp_size)
+            self.assertEqual(manifest.topology.pp_size, self.pp_size)
             prompt, result = expected.pop(manifest.provenance.trace_id)
             self.assertEqual(
                 tensors["token_ids"].tolist(), prompt + result["output_ids"]
@@ -263,6 +394,11 @@ class TestPDCaptureControl(PDCaptureRuntimeBase):
                     "handoffs": handoffs,
                     "decode": final_d,
                     "prefill": final_p,
+                    "tp_size": self.tp_size,
+                    "pp_size": self.pp_size,
+                    "rank_states": rank_states,
+                    "failed_request_captures": self.failed_requests,
+                    "failed_unbound_captures": sorted(self.failed_unbound),
                 },
                 sort_keys=True,
             ),

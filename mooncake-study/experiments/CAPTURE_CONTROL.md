@@ -95,8 +95,9 @@ multi-node control behavior.
   cancellation, source parity and five post-exit Store snapshots each. Live HTTP
   controls on separate P/D endpoints were not exercised by this initial run.
   The subsequent [P/D control matrix](PD_CAPTURE_CONTROL.md) validates TP1/PP1
-  separate-endpoint AR and static target-KV DSpark control. Real multi-GPU TP/PP
-  and cross-node live control still need dedicated integration coverage.
+  separate-endpoint AR and static target-KV DSpark control. The later
+  [distributed matrix](DISTRIBUTED_PD_CAPTURE_CONTROL.md) adds matching TP2/PP1
+  and TP1/PP2. Mixed/asymmetric topologies and cross-node live control remain open.
 
 Unit job: `01790955971085003936-cd670ad63a29` (80.134 s).
 Eager HTTP: `01790956196564215278-85cff0a67a54` (49.126 s).
