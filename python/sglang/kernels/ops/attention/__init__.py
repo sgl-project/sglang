@@ -307,6 +307,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="attention.topk_transform_kpool_v2",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.topk:topk_transform_kpool_v2",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.fast_topk",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.fast_topk:fast_topk",

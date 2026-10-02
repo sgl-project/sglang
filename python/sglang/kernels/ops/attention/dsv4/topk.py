@@ -54,6 +54,7 @@ def _jit_topk_v2_module():
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
         ("topk_plan", f"{kernel}::plan"),
+        ("topk_transform_kpool", f"{kernel}::transform_kpool"),
     ]
     if is_hip_runtime():
         # transform_packed only exists under USE_ROCM, see topk_v2.cuh
@@ -153,7 +154,12 @@ def topk_transform_paged_torch(
 _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
-def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = -1) -> torch.Tensor:
+def plan_topk_v2(
+    seq_lens: torch.Tensor,
+    static_threshold: int = -1,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
     NOTE: every entry of ``seq_lens`` must be NON-NEGATIVE.
@@ -164,7 +170,11 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = -1) -> torch.Te
     """
     module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
-    metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+    metadata = (
+        seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+        if out is None
+        else out
+    )
     module.topk_plan(seq_lens, metadata, static_threshold)
     return metadata
 
@@ -278,6 +288,31 @@ def topk_transform_paged_v2(
         page_size,
         metadata,
         out_raw_indices,
+    )
+
+
+def topk_transform_kpool_v2(
+    scores: torch.Tensor,
+    pool_lens: torch.Tensor,
+    out: torch.Tensor,
+    pool_size: int,
+    metadata: torch.Tensor,
+    *,
+    token_seq_lens: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+    out_offsets: Optional[torch.Tensor] = None,
+) -> None:
+    _jit_topk_v2_module().topk_transform_kpool(
+        scores,
+        pool_lens,
+        token_seq_lens,
+        page_table,
+        out_offsets,
+        out,
+        page_size,
+        pool_size,
+        metadata,
     )
 
 
