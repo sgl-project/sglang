@@ -1405,6 +1405,10 @@ class ScoringRequest(BaseModel):
     temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)
     return_token_logprobs: bool = False
     item_first: bool = False
+    # OpenAI serving layer entry timestamp (perf_counter), propagated to
+    # the internal score sub-request so its trace/e2e latency starts at the
+    # /v1/score HTTP entry instead of after score-side tokenization.
+    received_time: Optional[float] = None
     return_pooled_hidden_states: bool = False
 
     # Setwise readout: when set, the readout is taken AT every occurrence of this

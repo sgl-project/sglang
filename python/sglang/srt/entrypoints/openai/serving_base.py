@@ -11,7 +11,11 @@ from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
-from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ErrorResponse,
+    OpenAIServingRequest,
+    ScoringRequest,
+)
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
@@ -93,7 +97,10 @@ class OpenAIServingBase(ABC):
                 request, raw_request
             )
 
-            if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
+            if isinstance(
+                adapted_request,
+                (GenerateReqInput, EmbeddingReqInput, ScoringRequest),
+            ):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
 
