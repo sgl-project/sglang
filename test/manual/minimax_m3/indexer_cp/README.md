@@ -63,7 +63,7 @@ SGLANG_USE_AITER=1 SGLANG_USE_AITER_AG=1 \
 SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX=1 \
 HIP_VISIBLE_DEVICES=0,1,2,3 \
 python -m torch.distributed.run --standalone --nproc_per_node=4 \
-  test/manual/minimax_m3/indexer_cp/benchmark_cp.py \
+  test/manual/minimax_m3/indexer_cp/bench_cp.py \
   --output /tmp/minimax-indexer-cp.json
 ```
 
@@ -101,9 +101,9 @@ gate, backend dispatch, model accuracy, or serving throughput.
 
 ## Results: 2026-09-28
 
-Raw samples and source hashes are in [results-gfx950.json](results-gfx950.json).
-GPU identifiers have been omitted; timings and correctness results are unchanged.
-Context lengths use K = 1,024 tokens. A negative latency change is an improvement.
+Regenerate the raw samples with the command above; the environment is recorded under
+Methodology. Context lengths use K = 1,024 tokens.
+A negative latency change is an improvement.
 
 | Context | Batch | Native TP (µs) | CP (µs) | CP latency change | Native / CP |
 | --- | ---: | ---: | ---: | ---: | ---: |
