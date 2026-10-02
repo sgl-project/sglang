@@ -1,12 +1,7 @@
 """DeepSeek V4 trtllm-gen sparse MLA backend for SM100/SM103.
 
-Subclasses :class:`DeepseekV4AttnBackend` (FlashMLA) and overrides only the
-kernel dispatch: decode / target-verify / draft-extend and dense prefill go
-through ``trtllm_batch_decode_sparse_mla_dsv4`` against the uniform 512-dim
-FP8 KV pools. Metadata construction (including the trtllm combined sparse
-tables, ``DSV4AttnMetadata.init_trtllm_sparse_buffers``) stays on the shared
-metadata class so BCG capture/replay ``copy_``/``assign_fields`` semantics
-are identical for both backends.
+Overrides only the kernel dispatch of :class:`DeepseekV4AttnBackend`; metadata
+construction (incl. the trtllm combined tables) stays on the shared class.
 """
 
 from __future__ import annotations
@@ -85,12 +80,9 @@ def _trtllm_query_row_capacity(model_runner: ModelRunner) -> int:
 
 
 def _install_persistent_trtllm_semaphores(capacity_rows: int) -> None:
-    """Install a persistent counter buffer sized by query rows.
-
-    FlashInfer sizes this private buffer by request count, while the DSV4
-    VarSeq kernel indexes it by query row. Remove this workaround once
-    FlashInfer accepts a caller-owned buffer.
-    """
+    """FlashInfer sizes its counter buffer by request count while the kernel
+    indexes it by query row; install one sized by rows (remove once FlashInfer
+    accepts a caller-owned buffer)."""
     global _trtllm_semaphore_installed, _trtllm_semaphore_rows
     _trtllm_semaphore_rows = max(_trtllm_semaphore_rows, capacity_rows)
     if _trtllm_semaphore_installed:
@@ -135,27 +127,9 @@ def _check_trtllm_query_rows(num_rows: int) -> None:
 
 
 class TrtllmSparseTablePool:
-    """Persistent backing storage for the trtllm combined sparse tables.
-
-    The trtllm-gen kernel consumes exact-address int32 tables; building them
-    as fresh allocations every step made their addresses and lifetime a
-    function of allocator/capture state, which correlated with historical
-    layout-dependent faults and silent accuracy drift. This pool allocates
-    each table role ONCE (constant column width, conservatively 64-row-aligned
-    capacity, filled with its inert value) and hands out ``[:rows]`` views
-    that are re-inerted and rewritten in place every step:
-
-    - addresses are stable, so CUDA graphs capture permanent pointers and
-      there is nothing for the capture pool to recycle;
-    - every mapped byte is either the inert fill or a value the current step
-      legitimately wrote, keeping any padding/guard region deterministic;
-    - views keep row stride == column width, so downstream ``.contiguous()``
-      calls never copy.
-
-    Roles used from CUDA-graph capture must be preallocated via
-    ``preallocate`` before the first capture; ``view`` asserts it never
-    (re)allocates while a stream is capturing.
-    """
+    """One persistent, inert-filled parent per table role; ``view`` hands out
+    ``[:rows]`` slices rewritten in place each step, so kernel-visible
+    addresses never depend on allocator state (CUDA-graph safe)."""
 
     def __init__(self, int32_kwargs: dict):
         self._kwargs = int32_kwargs
@@ -274,21 +248,18 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             and not get_exec().features.enable_return_indexer_topk
         )
 
-        # Persistent combined-table storage (see TrtllmSparseTablePool). The
-        # decode-side roles are consumed inside CUDA-graph capture, so they
-        # are preallocated here at their maxima: rows = one row per query
-        # token of the largest verify batch; c128 columns = the whole
-        # context in 128-token pages (per-row lens bound what the kernel
-        # actually reads, so unused columns are dead weight, not reads).
+        # Table roles are preallocated at their maxima so no table is
+        # allocated while serving: decode rows = query rows of the largest
+        # verify batch, prefill rows = the chunk bound; c128 width = the whole
+        # context in 128-token pages (per-row lens bound the kernel's reads).
         self.trtllm_table_pool = TrtllmSparseTablePool(self.cuda_int32_kwargs)
         max_decode_rows = self.req_to_token.shape[0] * (
             self.speculative_num_draft_tokens or 1
         )
+        max_prefill_rows = _trtllm_query_row_capacity(model_runner)
         w4 = ceil_align(self.index_topk, PAGE_INDEX_ALIGNED_SIZE)
-        # c128 pages for the longest representable sequence: bound by the
-        # req_to_token row length (context + scheduler margin), which is what
-        # graph capture uses as its max seq len, plus one alignment block for
-        # the producer's own padding.
+        # c128 pages of the longest representable sequence, plus the producer's
+        # own alignment block.
         w128 = (
             ceil_align(
                 ceil_div(self.MAX_SEQ_LEN_FOR_CAPTURE, 128), PAGE_INDEX_ALIGNED_SIZE
@@ -297,15 +268,22 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         )
         pool = self.trtllm_table_pool
         pool.preallocate("d_swa_lens", max_decode_rows, fill=SWA_WINDOW)
-        pool.preallocate("d_c4", max_decode_rows, fill=-1, width=SWA_WINDOW + w4)
-        pool.preallocate("d_c4_lens", max_decode_rows, fill=SWA_WINDOW)
-        pool.preallocate("d_c128", max_decode_rows, fill=-1, width=SWA_WINDOW + w128)
-        pool.preallocate("d_c128_lens", max_decode_rows, fill=SWA_WINDOW)
-        # Prefill c128 also uses a full-context-width parent (its per-chunk
-        # width varies, and constant width keeps row stride == width so
-        # nothing downstream re-copies). Rows grow on demand (prefill is
-        # eager); other prefill roles carry their width at the call site.
-        pool.preallocate("p_c128", 64, fill=-1, width=SWA_WINDOW + w128)
+        pool.preallocate("p_swa", max_prefill_rows, fill=-1, width=SWA_WINDOW)
+        pool.preallocate("p_swa_lens", max_prefill_rows, fill=SWA_WINDOW)
+        if self.has_c4:
+            pool.preallocate("d_c4", max_decode_rows, fill=-1, width=SWA_WINDOW + w4)
+            pool.preallocate("d_c4_lens", max_decode_rows, fill=SWA_WINDOW)
+            pool.preallocate("p_c4", max_prefill_rows, fill=-1, width=SWA_WINDOW + w4)
+            pool.preallocate("p_c4_lens", max_prefill_rows, fill=SWA_WINDOW)
+        if self.has_c128:
+            pool.preallocate(
+                "d_c128", max_decode_rows, fill=-1, width=SWA_WINDOW + w128
+            )
+            pool.preallocate("d_c128_lens", max_decode_rows, fill=SWA_WINDOW)
+            pool.preallocate(
+                "p_c128", max_prefill_rows, fill=-1, width=SWA_WINDOW + w128
+            )
+            pool.preallocate("p_c128_lens", max_prefill_rows, fill=SWA_WINDOW)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         super().init_cuda_graph_state(max_bs, max_num_tokens)
@@ -439,16 +417,9 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         attn_sink: torch.Tensor,
         extra_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Sparse MLA decode via ``trtllm_batch_decode_sparse_mla_dsv4``.
-
-        The combined sparse table lives in preallocated metadata buffers.
-        Uniform multi-token metadata (target-verify / draft-extend, built by
-        ``init_trtllm_uniform_qmeta``) switches the call to varlen mode:
-        ``cum_seq_lens_q`` describes the per-request token runs and
-        ``seq_lens`` becomes per-request totals, while the per-token table
-        rows and lens are consumed in flattened query-token order (kernel
-        contract). Plain decode stays one row per request.
-        """
+        """Sparse MLA decode. Uniform multi-token metadata (verify /
+        draft-extend) switches the call to varlen mode with per-request
+        ``seq_lens``; plain decode stays one row per request."""
 
         from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 
@@ -504,13 +475,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             assert SWA_WINDOW + width == sparse_indices.shape[1], (
                 f"{width=} {sparse_indices.shape=}"
             )
-            # Only the index tail is per-layer (each layer's indexer top-k);
-            # the lens (metadata-level c4_sparse_topk_lengths + SWA_WINDOW)
-            # were written once per step by init_trtllm_sparse_buffers. When
-            # trtllm_topk_writes_table aliased c4_sparse_page_indices to this
-            # very tail, the indexer already wrote it in place -- skip the
-            # copy (the alias decision is capture-stable, so this host branch
-            # is safe under CUDA graphs).
+            # Per-layer top-k into the table tail; a no-op when the indexer
+            # already wrote the tail in place (alias decision is capture-stable).
             copy_unless_aliased(sparse_indices[:, SWA_WINDOW:], extra_indices)
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
@@ -594,20 +560,9 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         attn_sink: torch.Tensor,
         extra_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Sparse MLA prefill in the dense, one-query-token-per-entry shape.
-
-        Treating every query token as a batch entry makes each query length
-        exactly one. This changes the kernel-visible shape from
-        ``(request_batch, max_q_len)`` to ``(sum_q, 1)`` and avoids the empty
-        rectangular work of a highly ragged VarSeq launch. B200 kernel and
-        end-to-end measurements both favor this representation for generic
-        mixed/chunked prefill.
-
-        The sparse table has one row per query token: the token's own causal
-        SWA window in columns ``[0:128)`` and its compressed tier after.
-        ``seq_lens`` is therefore the per-token causal KV length from
-        ``core.seq_lens_casual`` rather than one total per request.
-        """
+        """Sparse MLA prefill in the dense one-query-token-per-entry shape
+        (``(sum_q, 1)``, per-token causal ``seq_lens``): faster than VarSeq on
+        ragged chunks."""
 
         from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 
