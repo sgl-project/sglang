@@ -192,9 +192,7 @@ class Step3TextAttention(nn.Module):
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
-        self.all_tp_rank = get_parallel().tp_rank
         self.total_num_heads = num_heads
-        self.attn_tp_rank = attn_tp_rank
         self.layer_id = layer_id
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -379,12 +377,13 @@ class Step3TextDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=self.is_next_layer_sparse,
+                    next_layer_sparse=self.is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=self.is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=self.is_previous_layer_sparse,
+                next_layer_sparse=self.is_layer_sparse,
             )
             if layer_id != 0
             else None,
@@ -478,10 +477,9 @@ class Step3TextModel(nn.Module):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states, forward_batch)
 
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
         return hidden_states
 
 
