@@ -1,21 +1,92 @@
 ---
 title: pplx-decider-v1-27b
-description: "Serve Perplexity's pplx-decider-v1-27b decision model, fine-tuned from Qwen3.8-27B, through the System One compatible /v1/systemone route of SGLang."
+description: "Deploy pplx-decider-v1-27b with SGLang. Perplexity's decision model, fine-tuned from Qwen3.8-27B, answers choice, yes or no, and score questions on one NVIDIA H200."
+tag: NEW
 ---
 
-## Model
+## Deployment
 
-[pplx-decider-v1-27b](https://huggingface.co/perplexity-ai/pplx-decider-v1-27b) is a decision model fine-tuned from Qwen3.8-27B. It replaces the language model head with a readout over 255 answer codes and answers choice, yes or no (`noul`), and score questions about a text state and optional images, with a probability for every option and no generated text.
+<a id="install" />
 
-## Launch
+<Accordion title="Install SGLang">
+
+Until a release includes pplx-decider support, use a [nightly build](/docs/get-started/install#nightly-builds). The nightly image carries it:
 
 ```bash Command
-sglang serve --model-path perplexity-ai/pplx-decider-v1-27b --host 127.0.0.1 --port 30000
+docker pull lmsysorg/sglang:dev
 ```
 
-No extra flag is needed, and one H200 serves it in BF16. SGLang reads the checkpoint's `decision_config.json`, loads its readout, and serves `/v1/systemone` with the prompt, answer codes, and calibrated temperature the model was trained with.
+</Accordion>
 
-## Request
+The recipe below serves the model in BF16 on one H200 with no extra flag. SGLang reads the checkpoint's `decision_config.json`, loads its decision readout, and answers on `/v1/systemone` with the prompt, answer codes, and calibrated temperature the model was trained with.
+
+import { Deployment } from "/src/snippets/_deployment.jsx"
+import { config } from "/src/snippets/configs/perplexity-ai/pplx-decider-v1-27b.jsx"
+
+<Deployment config={config} />
+
+## 1. Model Introduction
+
+**pplx-decider-v1-27b** is a decision model from Perplexity, fine-tuned from Qwen3.8-27B under the Apache-2.0 license. It replaces the language model head with a readout over 255 answer codes, and answers choice, yes or no (`noul`), and score questions about a text state and optional images with a probability for every option, without generating text.
+
+**Resources:** [HuggingFace](https://huggingface.co/perplexity-ai/pplx-decider-v1-27b).
+
+## 2. Configuration Tips
+
+- **Route.** Send requests to `/v1/systemone`, the System One API the checkpoint was trained for. `/v1/decisions` refuses this checkpoint because its labels and prompt are not the ones the readout learned, and chat or generation requests are not meaningful without a language model head.
+- **Clients.** Clients of the System One API, including the TypeSafe SDKs, work by pointing their base URL at the server. See [System One compatible API](/docs/supported-models/decision_models#system-one-compatible-api) for the request and response reference.
+- **Images.** Pass each image in `images` as base64 bytes or a URL. They precede the text in every question, as in the checkpoint's reference code.
+
+## 3. Advanced Usage
+
+### 3.1 Text Decisions
+
+<Accordion title="Text Decision Example (Python)">
+
+```python Example
+import requests
+
+response = requests.post(
+    "http://localhost:30000/v1/systemone",
+    json={
+        "model": "perplexity-ai/pplx-decider-v1-27b",
+        "state": "My Stripe integration keeps failing. I'm losing sales. Please help ASAP.",
+        "questions": {
+            "routing": {
+                "type": "choice",
+                "instructions": "Which team should handle this request?",
+                "criteria": {
+                    "billing": "Charges and refunds",
+                    "technical_support": "Integration errors",
+                    "sales": "Questions about buying a product",
+                },
+            },
+            "urgency": {"type": "noul", "instructions": "Does this message express urgency?"},
+        },
+    },
+    timeout=60,
+)
+response.raise_for_status()
+for name, answer in response.json()["answers"].items():
+    print(name, answer)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+routing {'type': 'choice', 'choice': 'technical_support', 'confidence': 0.987854396908662, 'probabilities': {'billing': 0.004840538662952211, 'technical_support': 0.9919029312724412, 'sales': 0.0032565300646064375}}
+urgency {'type': 'noul', 'noul': 0.9929980993021188}
+```
+
+</Accordion>
+
+### 3.2 Image Decisions
+
+The example output below came from a mostly red test image.
+
+<Accordion title="Image Decision Example (Python)">
 
 ```python Example
 import base64
@@ -23,36 +94,11 @@ from pathlib import Path
 
 import requests
 
-URL = "http://127.0.0.1:30000/v1/systemone"
-teams = {
-    "type": "choice",
-    "instructions": "Which team should handle this request?",
-    "criteria": {
-        "billing": "Charges and refunds",
-        "technical_support": "Integration errors",
-        "sales": "Questions about buying a product",
-    },
-}
-response = requests.post(
-    URL,
-    json={
-        "model": "pplx-decider-v1-27b",
-        "state": "My Stripe integration keeps failing. I'm losing sales. Please help ASAP.",
-        "questions": {
-            "routing": teams,
-            "urgency": {"type": "noul", "instructions": "Does this message express urgency?"},
-        },
-    },
-    timeout=60,
-)
-response.raise_for_status()
-print(response.json()["answers"])
-
 image = base64.b64encode(Path("screenshot.png").read_bytes()).decode("ascii")
 response = requests.post(
-    URL,
+    "http://localhost:30000/v1/systemone",
     json={
-        "model": "pplx-decider-v1-27b",
+        "model": "perplexity-ai/pplx-decider-v1-27b",
         "state": "Look at the supplied image.",
         "images": [image],
         "questions": {
@@ -65,11 +111,16 @@ response = requests.post(
     },
     timeout=60,
 )
+response.raise_for_status()
 print(response.json()["answers"]["color"])
 ```
 
-A `choice` answer has the most probable option, a `noul` answer the probability of true, and a `score` answer the probability-weighted mean level, each with `probabilities` and `confidence`. Clients of the System One API, including the TypeSafe SDKs, work by pointing their base URL at the server. See [System One compatible API](/docs/supported-models/decision_models#system-one-compatible-api) for the request and response reference.
+</Accordion>
 
-## Limits
+<Accordion title="Example Output">
 
-Use `/v1/systemone`. `/v1/decisions` refuses this checkpoint because its labels and prompt are not the ones the readout was trained on, and chat or generation requests are not meaningful without a language model head.
+```text Output
+{'type': 'choice', 'choice': 'red', 'confidence': 0.9498445161931509, 'probabilities': {'red': 0.9623833871448632, 'green': 0.009006826727044857, 'blue': 0.00926546931819573, 'other': 0.01934431680989631}}
+```
+
+</Accordion>
