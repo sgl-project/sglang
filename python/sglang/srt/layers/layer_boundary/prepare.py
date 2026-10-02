@@ -24,7 +24,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.cp.interleave_boundary import (
+from sglang.srt.layers.cp.interleave import (
     attn_cp_gather,
 )
 from sglang.srt.layers.dp_attention import (
