@@ -270,18 +270,22 @@ def _load_nccl_ep():
 class NcclEpBuffer:
     """Process-wide NCCL EP group + static recv buffers (mirrors DeepEPBuffer).
 
-    State lives on ``ctx.resources.buffers["nccl_ep_state"]``; the group is
-    created once from the sglang EP group's ``ncclComm_t``.
+    State lives on ``ctx.resources.buffers["nccl_ep_state"]`` and, for TBO,
+    ``nccl_ep_state_1``. Each lane creates its group once from the EP
+    communicator and retains its own scratch and persistent eager handles.
     """
 
     @classmethod
-    def _state(cls):
+    def _state(cls, instance_id=0):
         from types import SimpleNamespace
 
         from sglang.srt.runtime_context import get_resources
 
+        if instance_id not in (0, 1):
+            raise ValueError("NCCL EP supports two TBO subbatches")
         buffers = get_resources().buffers
-        state = buffers.get("nccl_ep_state")
+        key = "nccl_ep_state" if instance_id == 0 else "nccl_ep_state_1"
+        state = buffers.get(key)
         if state is None:
             state = SimpleNamespace(
                 group=None,
@@ -313,7 +317,7 @@ class NcclEpBuffer:
                 rm_pre_reduced=None,
                 rm_combined=None,
             )
-            buffers["nccl_ep_state"] = state
+            buffers[key] = state
         return state
 
     @classmethod
@@ -326,8 +330,9 @@ class NcclEpBuffer:
         max_dispatch_tokens_per_rank: int,
         router_topk: int,
         layout,
+        instance_id: int = 0,
     ) -> NcclEpBuffer:
-        state = cls._state()
+        state = cls._state(instance_id)
         pynccl = ep_group.pynccl_comm
         if pynccl is None or not getattr(pynccl, "available", False):
             raise RuntimeError("NCCL EP requires a live PyNccl communicator")
@@ -525,15 +530,28 @@ class NcclEpBuffer:
 
     @classmethod
     def destroy(cls):
-        state = cls._state()
-        if state.borrower is not None:
+        from sglang.srt.runtime_context import get_resources
+
+        states = [
+            get_resources().buffers[key]
+            for key in ("nccl_ep_state", "nccl_ep_state_1")
+            if key in get_resources().buffers
+        ]
+        # Check all lanes before releasing any resource.
+        if any(state.borrower is not None for state in states):
             raise RuntimeError("NCCL EP eager group has an incomplete transaction")
-        for dispatcher in tuple(state.dispatchers):
+        dispatchers = {
+            dispatcher for state in states for dispatcher in state.dispatchers
+        }
+        if any(dispatcher._stage != _Stage.INITIAL for dispatcher in dispatchers):
+            raise RuntimeError("Cannot close NCCL EP during an active transaction")
+        for dispatcher in dispatchers:
             dispatcher.close()
-        if state.group is not None:
-            state.group.destroy()
-            state.group = None
-        state.dispatchers.clear()
+        for state in states:
+            if state.group is not None:
+                state.group.destroy()
+                state.group = None
+            state.dispatchers.clear()
 
 
 # ----------------------------- Dispatcher (LL path) -----------------------------
@@ -555,8 +573,17 @@ class NcclEpDispatcher(BaseDispatcher):
     after dispatch to feed ``apply_deepep_ll``.
     """
 
-    def __init__(self, moe_runner_config: MoeRunnerConfig, ep_group: GroupCoordinator):
+    def __init__(
+        self,
+        moe_runner_config: MoeRunnerConfig,
+        ep_group: GroupCoordinator,
+        *,
+        instance_id: int | None = None,
+    ):
         super().__init__()
+        if instance_id not in (None, 0, 1):
+            raise ValueError("NCCL EP supports two TBO subbatches")
+        self.instance_id = instance_id
         if moe_runner_config.params_dtype != torch.bfloat16:
             raise ValueError(
                 "NCCL EP LL requires bfloat16 parameters (--dtype bfloat16)"
@@ -624,11 +651,15 @@ class NcclEpDispatcher(BaseDispatcher):
         self._active_buffer = self.buffer
         self._saved_eager_handle = None
 
-        from sglang.srt.layers.moe.utils import is_sbo_enabled
+        from sglang.srt.layers.moe.utils import is_sbo_enabled, is_tbo_enabled
 
         from .nccl_ep_stream import get_nccl_ep_stream
 
-        self._comm = get_nccl_ep_stream(ep_group.device) if is_sbo_enabled() else None
+        self._comm = (
+            get_nccl_ep_stream(ep_group.device, instance_id=instance_id or 0)
+            if is_sbo_enabled() or is_tbo_enabled()
+            else None
+        )
 
         # Staged execution state machine (mirrors deepep.py _Stage).
         self._stage = _Stage.INITIAL
@@ -687,6 +718,7 @@ class NcclEpDispatcher(BaseDispatcher):
                 self.num_max_dispatch_tokens_per_rank,
                 self.router_topk,
                 self.layout,
+                instance_id=self.instance_id or 0,
             )
             self.buffer.dispatchers.add(self)
             self._comm_initialized = True
@@ -779,9 +811,14 @@ class NcclEpDispatcher(BaseDispatcher):
                 self._graph_resources = graph_owner
             else:
                 if owner is not None:
-                    session = owner.submission_session("transaction")
-                    session.__enter__()
-                    self._eager_session = session
+                    if self.instance_id is not None:
+                        # Staged lanes finish in non-LIFO order; the runner owns
+                        # the outer submission session.
+                        owner.require_session("eager")
+                    else:
+                        session = owner.submission_session("transaction")
+                        session.__enter__()
+                        self._eager_session = session
                 try:
                     self._ensure_buffer()
                     state = self.buffer
@@ -1110,6 +1147,9 @@ class NcclEpDispatcher(BaseDispatcher):
             self.handle = self._saved_eager_handle
             self._saved_eager_handle = None
         else:
+            # The next staged layer may reuse this lane before its output is consumed.
+            if self.instance_id is not None:
+                combined = combined.clone()
             self._active_buffer.borrower = None
             if not self._handle_persistent:
                 self.handle.destroy()

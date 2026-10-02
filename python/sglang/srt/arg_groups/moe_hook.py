@@ -244,14 +244,13 @@ def handle_a2a_moe(server_args: Any):
 
     cfg = resolving_view(server_args)
 
-    nccl_ep_overlap = (
-        cfg.moe_a2a_backend == "nccl_ep" and cfg.enable_single_batch_overlap
+    nccl_ep_overlap = cfg.moe_a2a_backend == "nccl_ep" and (
+        cfg.enable_single_batch_overlap or cfg.enable_two_batch_overlap
     )
     if nccl_ep_overlap:
         if (
             cfg.device != "cuda"
             or cfg.moe_runner_backend != "triton"
-            or cfg.enable_two_batch_overlap
             or cfg.nnodes != 1
             or cfg.enable_pdmux
             or cfg.enable_torch_compile
@@ -261,7 +260,7 @@ def handle_a2a_moe(server_args: Any):
         ):
             raise ValueError(
                 "NCCL EP overlap requires single-node CUDA NCCL EP Triton "
-                "SBO without TBO, PDMux, compile, memory saver, speculation or EPLB"
+                "TBO/SBO without PDMux, compile, memory saver, speculation or EPLB"
             )
         model = model_config_of(server_args)
         quant = getattr(model.hf_config, "quantization_config", {}) or {}
@@ -726,8 +725,6 @@ def handle_nccl_ep_token_budget(server_args: Any):
         raise ValueError("NCCL EP CUDA Graph requires the resolved NCCL EP backend")
     if cfg.moe_a2a_backend != "nccl_ep":
         return
-    if cfg.enable_two_batch_overlap:
-        raise ValueError("NCCL EP LL does not support two batch overlap")
     if cfg.enable_eplb:
         raise ValueError("NCCL EP LL does not support EPLB")
     if cfg.moe_runner_backend == "triton":

@@ -855,6 +855,7 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_nccl_ep()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
@@ -1965,6 +1966,10 @@ class DeepseekV2MoE(nn.Module):
 
     def op_output(self, state):
         final_hidden_states = state.pop("hidden_states_after_combine")
+        scaling_fused = _use_aiter or (
+            get_moe_a2a_backend().is_nccl_ep()
+            and self.experts.should_fuse_routed_scaling_factor_in_topk
+        )
 
         if get_moe_a2a_backend().is_mori():
             num_tokens = state.pop("num_tokens")
@@ -1972,12 +1977,12 @@ class DeepseekV2MoE(nn.Module):
 
         if (shared_output := state.pop("shared_output")) is not None:
             x = shared_output
-            if _use_aiter:
+            if scaling_fused:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
-        elif _use_aiter:
+        elif scaling_fused:
             # fused in aiter_biased_grouped_topk so we can skip here
             pass
         else:

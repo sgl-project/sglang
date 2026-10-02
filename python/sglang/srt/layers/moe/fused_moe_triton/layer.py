@@ -234,8 +234,12 @@ def create_moe_dispatcher(
         # dispatcher always runs _quantize_fp8 in the EM path, producing a
         # valid scale for both FP8 and W4AFP8 expert compute.
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+        from sglang.srt.layers.moe.utils import is_tbo_enabled
 
-        return NcclEpDispatcher(
+        dispatcher_type = (
+            MaybeTboDeepEPDispatcher if is_tbo_enabled() else NcclEpDispatcher
+        )
+        return dispatcher_type(
             moe_runner_config=moe_runner_config,
             ep_group=get_parallel().tp_group,
         )

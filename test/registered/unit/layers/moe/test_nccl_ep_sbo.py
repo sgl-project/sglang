@@ -11,9 +11,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 from nccl_ep_test.fake_ep import dispatcher_environment
-from nccl_ep_test.moe_model import make_moe, metadata
+from nccl_ep_test.moe_model import make_moe
 from nccl_ep_test.sglang_graph import backend_for
 from nccl_ep_test.shared_compute import make_shared_mlp
+from nccl_ep_test.tbo_model import metadata
 from nccl_ep_test.triton_compute import configure_compute, make_compute_fixture
 
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags

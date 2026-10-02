@@ -751,7 +751,6 @@ def validate_nccl_ep_cuda_graph_config(server_args: Any):
     unsupported = [
         name.replace("_", "-")
         for name in (
-            "enable_two_batch_overlap",
             "enable_pdmux",
             "enable_eplb",
             "elastic_ep_backend",

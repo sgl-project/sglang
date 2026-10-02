@@ -287,6 +287,10 @@ def exercise_runner(
                 if generation % 2 == 0
                 else CaptureHiddenMode.FULL
             )
+            if runner.capture_hidden_mode != mode:
+                runner.backend.cleanup()
+                runner.capture_hidden_mode = mode
+                runner.capture()
             for iteration, raw in enumerate(
                 (max(1, buckets[0] - 3), buckets[0] + 1, max(1, buckets[0] - 3))
             ):
@@ -395,9 +399,7 @@ def exercise_cleanup(*, buckets=(8, 16, 32), layers=2, identity=False, **unused)
             )  # Keep traceback/executable references alive.
         else:
             raise AssertionError("Controlled capture failure did not occur")
-        graph_groups = [
-            item for item in audit.groups.values() if item["rdma_buffer_size"] == 0
-        ]
+        graph_groups = [item for item in audit.groups.values() if item["graph_owned"]]
         assert len(graph_groups) == 1 and all(item["closed"] for item in graph_groups)
         assert all(graph.audit_reset for graph in audit.graphs)
         fail = False
