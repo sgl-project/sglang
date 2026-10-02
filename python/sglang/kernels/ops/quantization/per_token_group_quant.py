@@ -32,6 +32,7 @@ def _jit_module(
     fuse_silu_and_mul: bool,
     masked_layout: bool,
     use_pdl: bool,
+    sorted_layout: bool = False,
 ) -> Module:
     assert in_dtype in _SUPPORTED_INPUT_DTYPES
     assert out_dtype in _SUPPORTED_OUTPUT_DTYPES
@@ -46,15 +47,13 @@ def _jit_module(
         fuse_silu_and_mul,
         use_pdl,
     )
-    launcher = (
-        "PerTokenGroupQuantMaskedKernel"
-        if masked_layout
-        else "PerTokenGroupQuantFlatKernel"
-    )
+    assert not (masked_layout and sorted_layout)
+    layout = "masked" if masked_layout else ("sorted" if sorted_layout else "flat")
+    launcher = f"PerTokenGroupQuant{layout.capitalize()}Kernel"
     return load_jit(
         "per_token_group_quant",
         *trait_args,
-        "masked" if masked_layout else "flat",
+        layout,
         cuda_files=["gemm/per_token_group_quant.cuh"],
         cuda_wrappers=[("per_token_group_quant", f"{launcher}<{trait_args}>::run")],
         extra_cuda_cflags=["--use_fast_math"],
@@ -95,6 +94,9 @@ def _per_token_group_quant_custom_op(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     expected_m: Optional[int] = None,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
 ) -> None:
     num_groups = output_q.shape[-1] // group_size
     row_major, aligned = _infer_scale_layout(output_s, scale_ue8m0, num_groups)
@@ -108,10 +110,20 @@ def _per_token_group_quant_custom_op(
         bool(fuse_silu_and_mul),
         masked_m is not None,
         is_arch_support_pdl(),
+        sorted_token_ids is not None,
     )
     if masked_m is not None:
         module.per_token_group_quant(
             input, output_q, output_s, masked_m, int(expected_m or -1)
+        )
+    elif sorted_token_ids is not None:
+        module.per_token_group_quant(
+            input,
+            output_q,
+            output_s,
+            sorted_token_ids,
+            num_tokens_post_padded,
+            num_valid_tokens,
         )
     else:
         module.per_token_group_quant(input, output_q, output_s)
@@ -171,6 +183,9 @@ def per_token_group_quant(
     *,
     out_dtype: Optional[torch.dtype] = None,
     column_major_scales: bool = False,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token-group quantization. Returns ``(output_q, output_s)``.
 
@@ -193,6 +208,11 @@ def per_token_group_quant(
     The packed layouts require ``scale_ue8m0=True``.
 
     ``expected_m`` (masked only) is an optional expected-tokens-per-expert hint.
+
+    ``sorted_token_ids`` selects the sorted layout: ``input`` rows follow
+    ``moe_align_block_size`` (with ``num_tokens_post_padded`` and
+    ``num_valid_tokens = topk_ids.numel()``), and rows the MoE GEMM never reads
+    may be skipped and left unwritten.
 
     Inputs are bf16/fp16; group size is one of 16/32/64/128/256; the quant range
     follows ``output_q.dtype`` (fp8_e4m3: +-448, int8: [-128, 127]).
@@ -219,5 +239,8 @@ def per_token_group_quant(
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
         expected_m=expected_m,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        num_valid_tokens=num_valid_tokens,
     )
     return output_q, output_s

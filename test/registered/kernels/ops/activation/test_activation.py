@@ -168,6 +168,43 @@ def test_activation_filter_expert_none_skipped(op_name: str) -> None:
     torch.testing.assert_close(out_filtered, out_unfiltered, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.parametrize("op_name", OPS)
+@pytest.mark.parametrize("block_m", [16, 64])
+def test_activation_sorted_rows(op_name: str, block_m: int) -> None:
+    """Sorted MoE layout: rows past num_tokens_post_padded, padding sentinels and
+    -1 expert blocks are left untouched; every other row is bit-identical."""
+    num_valid, num_blocks = 300, 40
+    rows = num_blocks * block_m + 7  # buffer tail past the last full block
+    num_post = (num_blocks - 3) * block_m
+    sorted_ids = torch.randint(0, num_valid, (rows,), dtype=torch.int32, device="cuda")
+    sorted_ids[torch.rand(rows, device="cuda") < 0.3] = num_valid
+    expert_ids = torch.randint(
+        0, 8, (num_blocks + 1,), dtype=torch.int32, device="cuda"
+    )
+    expert_ids[::5] = -1
+    x = torch.randn(rows, 1024, dtype=torch.bfloat16, device="cuda")
+    out = torch.full((rows, 512), float("nan"), dtype=x.dtype, device="cuda")
+
+    run_activation(
+        op_name,
+        x,
+        out,
+        expert_ids,
+        block_m,
+        sorted_token_ids=sorted_ids,
+        num_tokens_post_padded=torch.tensor(
+            [num_post], dtype=torch.int32, device="cuda"
+        ),
+        num_valid_tokens=num_valid,
+    )
+
+    row = torch.arange(rows, device="cuda")
+    kept = (row < num_post) & (sorted_ids < num_valid)
+    kept &= expert_ids[row // block_m] != -1
+    assert torch.equal(out[kept], run_activation(op_name, x, None)[kept])
+    assert torch.isnan(out[~kept]).all()
+
+
 def test_activation_filter_expert_int64_under_torch_compile() -> None:
     """torch.topk routing ids remain usable after AOTAutograd realizes int64."""
     shape = (32, 512)
