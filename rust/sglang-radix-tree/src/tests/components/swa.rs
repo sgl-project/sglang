@@ -875,7 +875,7 @@ fn insert_params_swa<'k>(
         prev_prefix_len,
         swa_evicted_seqlen,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,

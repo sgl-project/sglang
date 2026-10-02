@@ -29,7 +29,7 @@ fn insert(core: &mut TestCore, key: &[i64], values: &[u32]) -> InsertResult<Page
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         mamba_value: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         track_adopted_ranges: false,
     })
@@ -81,7 +81,7 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
             prev_prefix_len: 2,
             swa_evicted_seqlen: 0,
             mamba_value: None,
-            chunked: false,
+            inserted_len: 0,
             priority: 0,
             track_adopted_ranges: false,
         },
@@ -168,7 +168,7 @@ fn continuation_insert_rejects_a_host_only_anchor() {
                 prev_prefix_len: 2,
                 swa_evicted_seqlen: 0,
                 mamba_value: None,
-                chunked: false,
+                inserted_len: 0,
                 priority: 0,
                 track_adopted_ranges: false,
             },
@@ -203,7 +203,7 @@ fn full_kv_prefix_len_is_the_full_hit_not_the_admitted_prefix_on_mamba_trees() {
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         mamba_value: Some(PageValue::from_vec(vec![7])),
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         track_adopted_ranges: false,
     });
@@ -226,7 +226,7 @@ fn continuation(
     anchor: sglang_radix_tree::NodeId,
     key: &[i64],
     values: &[u32],
-    chunked: bool,
+    inserted_len: usize,
 ) -> InsertResult<PageValue<u32>> {
     tree.insert_suffix_from_node(
         anchor,
@@ -241,7 +241,7 @@ fn continuation(
             prev_prefix_len: 2,
             swa_evicted_seqlen: 0,
             mamba_value: None,
-            chunked,
+            inserted_len,
             priority: 0,
             track_adopted_ranges: false,
         },
@@ -260,7 +260,7 @@ fn backups(result: &InsertResult<PageValue<u32>>) -> Vec<&BackupKV> {
 }
 
 #[test]
-fn finished_continuation_inserts_replay_hit_counts_and_write_through_on_the_prefix() {
+fn continuation_inserts_count_each_request_once_per_node() {
     let mut tree = TestCore::new(
         CacheInitParams {
             enable_hicache: true,
@@ -277,16 +277,85 @@ fn finished_continuation_inserts_replay_hit_counts_and_write_through_on_the_pref
         })
         .last_device_node_id;
 
-    // Per-step growth is chunked: no hit count moves, so nothing reaches the threshold.
-    let grown = continuation(&mut tree, anchor, &[10, 20, 50, 60], &[5, 6], true);
+    // This request already counted the prefix; only its new suffix counts a hit.
+    let grown = continuation(&mut tree, anchor, &[10, 20, 50, 60], &[5, 6], 2);
     assert!(backups(&grown).is_empty());
 
     // Finishing a second request through the prefix is its second hit, which a
     // root walk turns into a write-through backup of the anchor.
-    let finished = continuation(&mut tree, anchor, &[10, 20, 70, 80], &[7, 8], false);
+    let finished = continuation(&mut tree, anchor, &[10, 20, 70, 80], &[7, 8], 0);
     let triggered = backups(&finished);
     assert_eq!(triggered.len(), 1);
     assert_eq!(triggered[0].node_ids, vec![anchor]);
+}
+
+#[test]
+fn continuation_hit_watermarks_match_root_inserts_across_retained_nodes() {
+    let build_tree = || {
+        let mut tree = TestCore::new(
+            CacheInitParams {
+                enable_hicache: true,
+                write_through_threshold: 3,
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        insert(&mut tree, &[10, 20, 30, 40], &[1, 2, 3, 4]);
+        for prefix in [vec![10], vec![10, 20]] {
+            tree.match_prefix(&MatchPrefixParams {
+                key: &prefix,
+                namespace: KeyNamespaceRef::default(),
+            });
+        }
+        let anchor = tree
+            .match_prefix(&MatchPrefixParams {
+                key: &vec![10, 20],
+                namespace: KeyNamespaceRef::default(),
+            })
+            .last_device_node_id;
+        (tree, anchor)
+    };
+    for (inserted_len, probe_len) in (0..=4).flat_map(|len| [1, 2, 4].map(|probe| (len, probe))) {
+        // Build both trees identically so their node handles can be compared.
+        let (mut tree, anchor) = build_tree();
+        let (mut root_tree, _) = build_tree();
+        let key = vec![10, 20, 30, 40];
+        let root_result = root_tree.insert(&InsertParams {
+            key: &key,
+            namespace: KeyNamespaceRef::default(),
+            session_id: None,
+            rotation_base: None,
+            value: PageValue::from_vec(vec![1, 2, 3, 4]),
+            prev_prefix_len: 0,
+            swa_evicted_seqlen: 0,
+            swa_branching_seqlen: None,
+            mamba_value: None,
+            inserted_len,
+            priority: 0,
+            track_adopted_ranges: false,
+        });
+        let suffix_result = continuation(&mut tree, anchor, &key, &[3, 4], inserted_len);
+        let backed_nodes = |result: &InsertResult<PageValue<u32>>| {
+            backups(result)
+                .into_iter()
+                .flat_map(|backup| backup.node_ids.iter().copied())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        assert_eq!(backed_nodes(&suffix_result), backed_nodes(&root_result));
+        // Probe each node separately: a deep backup can include ancestors that
+        // never crossed the threshold, hiding an incorrect prefix hit count.
+        let root_probe = insert(
+            &mut root_tree,
+            &key[..probe_len],
+            &[1, 2, 3, 4][..probe_len],
+        );
+        let suffix_probe = insert(&mut tree, &key[..probe_len], &[1, 2, 3, 4][..probe_len]);
+        assert_eq!(
+            backed_nodes(&suffix_probe),
+            backed_nodes(&root_probe),
+            "watermark {inserted_len}, probe length {probe_len}"
+        );
+    }
 }
 
 #[test]
@@ -312,7 +381,7 @@ fn empty_insert_leaves_the_donated_mamba_slot_with_the_caller() {
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         mamba_value: Some(PageValue::from_vec(vec![7])),
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         track_adopted_ranges: false,
     });
@@ -372,7 +441,7 @@ fn inserted_values_do_not_retain_the_caller_buffer() {
             prev_prefix_len: 2,
             swa_evicted_seqlen: 0,
             mamba_value: None,
-            chunked: false,
+            inserted_len: 0,
             priority: 0,
             track_adopted_ranges: false,
         },
@@ -412,7 +481,7 @@ fn continuation_insert_preserves_rotation_checks_before_prefix_side_effects() {
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
         mamba_value: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         track_adopted_ranges: true,
     };
@@ -422,8 +491,8 @@ fn continuation_insert_preserves_rotation_checks_before_prefix_side_effects() {
     params.value = PageValue::from_vec(vec![3, 4]);
     params.prev_prefix_len = 2;
     params.rotation_base = Some(8);
-    for chunked in [true, false] {
-        params.chunked = chunked;
+    for inserted_len in [2, 0] {
+        params.inserted_len = inserted_len;
         let rejected = tree.insert_suffix_from_node(anchor, 2, &params);
         assert!(rejected.rotation_tail_declined);
         assert_eq!(rejected.prefix_len, 2);
@@ -467,7 +536,7 @@ fn page_value_swa_window_validates_and_attaches_loaded_indices() {
             swa_evicted_seqlen: 4,
             swa_branching_seqlen: None,
             mamba_value: None,
-            chunked: false,
+            inserted_len: 0,
             priority: 0,
             track_adopted_ranges: false,
         })

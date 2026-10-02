@@ -158,8 +158,9 @@ pub struct InsertParams<'k, K: ChildKeyType, V: RadixValue> {
     pub swa_branching_seqlen: Option<usize>,
     /// The donated mamba slot for the insert target leaf; None on non-mamba trees.
     pub mamba_value: Option<V>,
-    /// Whether this is a chunked-prefill insert (no hit-count bump).
-    pub chunked: bool,
+    /// The inserting request already inserted [0, here); only the nodes past it
+    /// count a hit (and get threshold-checked), so a request counts each node once.
+    pub inserted_len: usize,
     /// Eviction priority floor applied along the walked path.
     pub priority: i64,
     /// Whether the result should report which incoming ranges the tree retained.
@@ -267,7 +268,7 @@ pub struct InsertWalkState<K: ChildKeyType, V: RadixValue> {
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
     mamba_value: Option<V>,
-    chunked: bool,
+    inserted_len: usize,
     priority: i64,
     track_adopted_ranges: bool,
     total_prefix_length: usize,
@@ -1715,9 +1716,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     }
 
     /// Increment hit count; check whether a write backup should be fired.
-    pub(crate) fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_, chunked: bool) -> bool {
+    pub(crate) fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_) -> bool {
         let node = self.arena.node_mut(node_id);
-        if node.evicted() || chunked {
+        if node.evicted() {
             return false;
         }
         if self.is_write_back {
@@ -1755,12 +1756,11 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// `prefix_len`. Only the suffix key and value enter the resumable walk, so
     /// decode or chunked-prefill growth skips a second root walk.
     ///
-    /// A non-chunked insert replays what a root walk does to the retained prefix,
+    /// The insert replays what a root walk does to the retained prefix,
     /// root first: access tick and LRU refresh, priority floor, hit count, and the
-    /// write-through backup trigger, at O(depth) cost. A chunked insert never bumps
-    /// hit counts, so it touches only the anchor. Anchor validation still walks
-    /// the retained path. Use chunked inserts for per-step growth and finish
-    /// the request with a non-chunked insert. The
+    /// write-through backup trigger, at O(depth) cost. Only nodes ending past
+    /// `params.inserted_len` count a hit, as in a root insert. Advance that
+    /// watermark after each insert so a request counts each node once. The
     /// component overlap hooks (SWA tombstone recovery, duplicate-slot release)
     /// are never replayed because they need the prefix KV, which this API does
     /// not receive.
@@ -1969,7 +1969,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
             mamba_value: params.mamba_value.as_ref().map(V::shallow_clone),
-            chunked: params.chunked,
+            inserted_len: params.inserted_len,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
             total_prefix_length: prefix_len,
@@ -1997,17 +1997,16 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// Apply the per-node effects of reaching `anchor` to the retained prefix.
     ///
     /// A root walk touches every node it passes, raises its priority floor, and
-    /// bumps its hit count, which is where write-through backups originate. A
-    /// non-chunked continuation replays that root first so LRU, LFU/SLRU, and
-    /// write-through behavior match a root insert. Chunked inserts never bump hit
-    /// counts, so they touch only the anchor and stay O(1).
+    /// bumps its hit count past the request's watermark, which is where
+    /// write-through backups originate. A continuation replays that root first
+    /// so LRU, LFU/SLRU, and write-through behavior match a root insert.
     fn visit_retained_prefix_(
         &mut self,
         anchor: NodeIdx_,
         params: &InsertParams<'_, K, V>,
         actions: &mut Vec<CacheAction<V>>,
     ) {
-        if params.chunked || self.arena.node(anchor).is_root() {
+        if self.arena.node(anchor).is_root() {
             self.touch_node_(anchor);
             let node = self.arena.node_mut(anchor);
             node.priority = node.priority.max(params.priority);
@@ -2024,14 +2023,17 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         // One action suffices: the deepest trigger's chain already covers every
         // unbacked ancestor, which is what a root walk's barriers converge to.
         let mut backup_from = None;
+        let mut node_end = 0;
         for &node_id in path.iter().rev() {
             self.touch_node_(node_id);
             let is_root = {
                 let node = self.arena.node_mut(node_id);
                 node.priority = node.priority.max(params.priority);
+                node_end += node.key.atom_len();
                 node.is_root()
             };
-            if !is_root && self.inc_hit_count_and_check_(node_id, params.chunked) {
+            if !is_root && node_end > params.inserted_len && self.inc_hit_count_and_check_(node_id)
+            {
                 backup_from = Some(node_id);
             }
         }
@@ -2189,7 +2191,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(V::shallow_clone),
-            chunked: state.chunked,
+            inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
         };
@@ -2272,7 +2274,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             }
         }
 
-        if self.inc_hit_count_and_check_(node_id, state.chunked) {
+        // Nodes this request already inserted were counted back then.
+        let node_end = state.total_prefix_length + prefix_len;
+        if node_end > state.inserted_len && self.inc_hit_count_and_check_(node_id) {
             let backup = self
                 .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ false);
             state.pending_actions.push(CacheAction::BackupKV(backup));
@@ -2339,7 +2343,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(V::shallow_clone),
-            chunked: state.chunked,
+            inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
         };
@@ -2376,7 +2380,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         target_node_id: NodeIdx_,
     ) -> bool {
         if state.is_new_leaf {
-            return self.inc_hit_count_and_check_(target_node_id, state.chunked);
+            // The new leaf runs to the end of the aligned key.
+            return state.aligned_key_len > state.inserted_len
+                && self.inc_hit_count_and_check_(target_node_id);
         }
 
         let node = self.arena.node(target_node_id);

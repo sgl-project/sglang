@@ -44,6 +44,7 @@ fn config_for(_worker_url: &str) -> Config {
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
