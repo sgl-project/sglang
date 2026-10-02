@@ -459,7 +459,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def insert_req(self, req: Req, *, up_to: int, **kwargs):
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs):
         """Insert the request's KV up to row position ``up_to`` into the tree,
         repoint the row onto the tree's copy, re-anchor ``req.last_node`` on
         the node the insert ended on and advance ``cache_protected_len``.
