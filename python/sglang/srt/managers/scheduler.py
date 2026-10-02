@@ -4976,14 +4976,20 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_normal()
     elif disaggregation_mode == DisaggregationMode.PREFILL:
         if server_args.pp_size > 1:
-            scheduler.event_loop_pp_disagg_prefill()
+            if scheduler.spec_algorithm.is_dspark():
+                scheduler.event_loop_pp_dspark()
+            else:
+                scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_prefill()
         else:
             scheduler.event_loop_normal_disagg_prefill()
     elif disaggregation_mode == DisaggregationMode.DECODE:
         if server_args.pp_size > 1:
-            scheduler.event_loop_pp_disagg_decode()
+            if scheduler.spec_algorithm.is_dspark():
+                scheduler.event_loop_pp_dspark()
+            else:
+                scheduler.event_loop_pp_disagg_decode()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_decode()
         else:

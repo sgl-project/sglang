@@ -1,0 +1,567 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-02",
+  "base_commit": "1c41aec0aad679fdd56445bd7477647ff0605124",
+  "feature": "Synchronous static target-KV DSpark pipeline P/D serving and owner-local Mooncake training snapshots",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "resident_node": "node064",
+    "resident_gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "temporary_job": "job-3cff8f981484-20261002102322",
+    "temporary_node": "node071",
+    "temporary_gpus": [
+      "GPU-7dc47845-2810-8101-7c87-dfc12d2bfbd3",
+      "GPU-7f16324c-fde5-ce5e-0ee0-81cc3c5872f4"
+    ],
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "versions": {
+      "python": "3.12.3",
+      "packages": {
+        "torch": "2.13.0",
+        "flashinfer-python": "0.6.17",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "sglang-kernel": "0.4.6.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "initial_gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "final_gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-pp-final",
+    "temporary_environment_adjustment": "Removed incompatible flashinfer-cubin 0.6.12 and flashinfer-jit-cache 0.6.12+cu130 from both temporary pod system Python installations; shared runtime venv and resident packages unchanged.",
+    "intermediate_gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-pp-final",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang:v0.5.15",
+    "image_id": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "followon_temporary_job": "job-b74b08058818-20261002111607",
+    "followon_node": "node071",
+    "followon_image_id": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "followon_gpus": [
+      "GPU-7dc47845-2810-8101-7c87-dfc12d2bfbd3",
+      "GPU-7f16324c-fde5-ce5e-0ee0-81cc3c5872f4"
+    ]
+  },
+  "implementation": [
+    "Route speculative PP P/D through the synchronous stage coordinator and existing disaggregated planners.",
+    "Coordinate ordered request IDs, bootstrap rooms, phase labels and poll results before consuming P/D queues.",
+    "Require metadata readiness and all-stage terminal transfer state before success/failure cleanup; request abort markers cannot bypass a live backend transfer.",
+    "Reduce bootstrap metadata slots and decode request/metadata/token budgets before admission or resume.",
+    "Broadcast the last P stage TP0 first-teacher handoff after sampled-token D2H, before sending the final KV chunk.",
+    "Rebuild D draft context from received target KV, then retain owner-local Store writes and cohort publication.",
+    "Permit Mooncake static target-KV PP with DP1/CP1 and device KV cache; reject optimistic prefill, transfer staging and KV offload.",
+    "Extend the real P/D fixture to stop both model producers and re-read every published tensor with digest/content validation."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/disaggregation/decode.py": "d3f6c9a611e17964cc1ea712f19d3c624c7b00b3d248b55049c25c7b86dd110d",
+    "python/sglang/srt/disaggregation/prefill.py": "00e395fad398a2c4b1b2786111bf6eff698f0cce678436e72b216f6b6a61f7c0",
+    "python/sglang/srt/managers/scheduler.py": "ec44560a1bec67046f1dd5b893e2ac7b66b1ba88fb17f1051833e7c597ec4685",
+    "python/sglang/srt/managers/scheduler_pp_mixin.py": "10ea4e48c0acf6d1c86d21322d4be5266b14baa95310dff71dad9af945ddb9e9",
+    "python/sglang/srt/server_args.py": "5361465cc917821d827e6619f3e284242c19124a85b6e4d472679b51a445e0b1",
+    "python/sglang/srt/speculative/dspark_components/dspark_pd_queue.py": "35a152c727717686c7f803223719f03cec1a31cdcac8420ad937e8cd286a07fc",
+    "python/sglang/srt/speculative/dspark_components/dspark_pp_coordinator.py": "21cff352f7ad2ef291da6c9b02ba50802e8add2fad80b59c3dec8607dbbe320b",
+    "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": "582a413411a3e1c8705a158333e47c00b5a6ec70c2b159ba87dff3cb45a50cd1",
+    "python/sglang/srt/training_capture/config.py": "14160fa8f464fd9e3a96ba91f94915fa2274bd43356e20a0936dd50179ce3b6a",
+    "python/sglang/srt/training_capture/pd_capture.py": "81fb0550f2ea923aeda71add0c5f29955f00a7bb0e8c917880bfbb4315be81db",
+    "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3",
+    "python/sglang/test/dspark_capture_pressure.py": "cff55aef11cd44792417c24b518f9cc8c1688db0abd90ab15eda15f772801bc1",
+    "python/sglang/test/dspark_target_kv_server.py": "4bf0856cc4516dc49a8034378280ef46cf71838ae7e817a07fa1ebbe1de8757b",
+    "python/sglang/test/pd_capture_runtime.py": "9779c662bd29df78f4e5d9dec0e87ad77bbf9eef438516bab8e83f8394bc1ab2",
+    "python/sglang/test/training_capture_utils.py": "80601e4c429c531411722fce31b5fba881f66f3ed4ed69670496f6c449d5da98",
+    "test/registered/storage/test_training_capture_dspark_pp.py": "30ba3a6ca87cfe65e8e1e9ecbf1b157b0b02a7ee619b6a80fcbe26e58aecd343",
+    "test/registered/storage/test_training_capture_pd_dspark.py": "2842b2114bdc99cea4cc3fd1621f3b516178b25f46499ced899f6d79f9d19668",
+    "test/registered/storage/test_training_capture_pd_dspark_hidden.py": "f439c71f93b63154ac3e3463a894d2a0137fda79a1668518f9aeb7ad8fa0a1fa",
+    "test/registered/storage/test_training_capture_pd_dspark_pp.py": "ff560a67dcc0a813c1258efc70cafd55b0d6024eef091ba64338fd76e1415e20",
+    "test/registered/storage/test_training_capture_pd_pp.py": "011e33796a42a5dbe62c4e60b1731c7c76dedd541d43bd9b54c456a332f59933",
+    "test/registered/unit/disaggregation/test_decode_queue_cleanup.py": "c20b73d6c45b269881d909f64a296334d4271ee0707b3d99d7a1ba5920efaf16",
+    "test/registered/unit/disaggregation/test_pp_transfer_readiness.py": "cd3ad34d2a8fcde6b690c70e68fa7179f9ea452bbce2279e5a470031bf43561d",
+    "test/registered/unit/server_args/test_server_args.py": "c50b692c8dba8d2e6717194ba3cbc205d5190f35d9d2dfbcc91d18d30d4c6ae4",
+    "test/registered/unit/spec/test_dspark_pd_queue.py": "873f7c33f041ef2e3013ddedb832bf3993189402d0dd497ce5e0185ea574d24b",
+    "test/registered/unit/spec/test_dspark_pp_scheduler.py": "1718647173f345fee296ba3103e8fbf97f0bc4431098a223c89f12104828eb22",
+    "test/registered/unit/training_capture/test_config.py": "361eb817118bc35742e46abcc6efbf473d1958239eb41dc68ebaf9e3488f8f79",
+    "test/registered/unit/training_capture/test_pd_capture.py": "194488410d0208180ae69710b188d5eb82cd74bfa07c39fb037a022a04f79bf5"
+  },
+  "gpu_source_hashes_match": true,
+  "source_sync_note": "Checkouts stayed frozen during every importing test. PP1 P/D and colocated PP2 regressions ran before refinements to the new PP P/D coordinator, which those paths do not use. The final queue test verifies all-stage terminal state, including abort markers. Runtime iterations added post-exit readback, then bounded waiting for the complete producer process tree. Final PP P/D and AR PP2 P/D suites use the final isolated checkout with that strict process-exit check. Earlier iterative PP P/D runs are retained as intermediate evidence and are excluded from final test totals.",
+  "tests": [
+    {
+      "file": "test/registered/unit/spec/test_dspark_pd_queue.py",
+      "tests": 2,
+      "seconds": 12.114,
+      "exec_session_id": 53466,
+      "outcome": "completed",
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-queue-release-20261002.log",
+      "log_sha256": "b8125d96687d36d09c5db0acb6c18d216a80bdcd79dd557de71ec07302cceff5"
+    },
+    {
+      "file": "test/registered/unit/spec/test_dspark_pp_scheduler.py",
+      "job_id": "01790907841051570192-e35afe4599a6",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790907877.8362489,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790907841051570192-e35afe4599a6.log",
+      "tests": 6,
+      "seconds": 0.905,
+      "log_sha256": "71ca92ef3a41f43f7006627e3d384311bb4366f4dcd7103aefdb25679347bf1d"
+    },
+    {
+      "file": "test/registered/unit/disaggregation/test_decode_queue_cleanup.py",
+      "job_id": "01790907841396189257-99cf7433f9c9",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790907890.3683906,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790907841396189257-99cf7433f9c9.log",
+      "tests": 6,
+      "seconds": 0.008,
+      "log_sha256": "858af488b75c8702a4974c5fbcc5aee339b1176dd4dd8fb750fd007094c5caad"
+    },
+    {
+      "file": "test/registered/unit/disaggregation/test_pp_transfer_readiness.py",
+      "job_id": "01790907625578834930-727bb03c6776",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790907686.246358,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790907625578834930-727bb03c6776.log",
+      "tests": 3,
+      "seconds": 0.003,
+      "log_sha256": "13b813cdd301e4431e871d510b317c4455395afbac644b0b7da79144124fa50d"
+    },
+    {
+      "file": "test/registered/unit/training_capture/test_config.py",
+      "job_id": "01790907625919059323-a565c753b2e7",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790907697.2775064,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790907625919059323-a565c753b2e7.log",
+      "tests": 8,
+      "seconds": 0.009,
+      "log_sha256": "11bd17a385e44a8458245f15a610c4b53f193765d59965c6a56a1bb7b4ea6e21"
+    },
+    {
+      "file": "test/registered/unit/training_capture/test_pd_capture.py",
+      "job_id": "01790907626255036813-6cb353035b96",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790907717.0789847,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790907626255036813-6cb353035b96.log",
+      "tests": 12,
+      "seconds": 8.577,
+      "log_sha256": "23c99806557611e8e351d661be987e11e1887d9f5dc5b5b7271d1b98151385a0"
+    },
+    {
+      "file": "test/registered/unit/server_args/test_server_args.py",
+      "job_id": "01790907649862530122-01b24b5915c8",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790907731.6207697,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790907649862530122-01b24b5915c8.log",
+      "tests": 147,
+      "seconds": 3.049,
+      "log_sha256": "483a991e7dc4daec8d9b81cfae2db155991c8e8ffdf1819feafd0db7b4f23393"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark.py",
+      "job_id": "01790908372365050478-5f4e9b769761",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790908713.4652464,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790908372365050478-5f4e9b769761.log",
+      "tests": 4,
+      "seconds": 327.271,
+      "log_sha256": "fb177fb716b72d8c887987982d4649008d97467281b7261c55d17f864a1681ca",
+      "checked_snapshots": 24
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark_hidden.py",
+      "job_id": "01790908372691295013-160c43b2f6b5",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790909112.7777276,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790908372691295013-160c43b2f6b5.log",
+      "tests": 6,
+      "seconds": 388.18,
+      "log_sha256": "7de43f9b7e6ddb778115f8f2e4519f21acb2dfea29db7582f888cff5c6f1b69c",
+      "checked_snapshots": 36
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_dspark_pp.py",
+      "tests": 2,
+      "seconds": 250.689,
+      "exec_session_id": 86529,
+      "outcome": "completed",
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-colocated-regression-20261002.log",
+      "log_sha256": "690448e0fd37e120ebd8423d9b6ae1eedd8ebb00ea40d9da7e56ca171eaad9db",
+      "checked_snapshots": 20
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_pp.py",
+      "tests": 2,
+      "seconds": 139.549,
+      "exec_session_id": 70642,
+      "temporary_job": "job-3cff8f981484-20261002102322",
+      "outcome": "completed",
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-ar-verified-20261002.log",
+      "log_sha256": "ee51c926f8486c1d82458ee0442068b0829b66be0677f76484e5c69f386a1cc9",
+      "post_exit_snapshots": 10,
+      "checked_snapshots": 10
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark_pp.py",
+      "tests": 6,
+      "seconds": 548.107,
+      "exec_session_id": 33788,
+      "temporary_job": "job-b74b08058818-20261002111607",
+      "outcome": "completed",
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-dspark-verified-20261002.log",
+      "log_sha256": "377fc3a6c107fdc0ab95a1bbe8805cb02e00ac622ee53b09af76eefe7d85b10d",
+      "post_exit_snapshots": 36,
+      "checked_snapshots": 36
+    }
+  ],
+  "intermediate_runs": [
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark_pp.py",
+      "tests": 6,
+      "seconds": 547.365,
+      "exec_session_id": 13302,
+      "outcome": "completed",
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-dspark-initial-20261002.log",
+      "log_sha256": "91ebe30cd66eb32bf1d0d6e19c30fcb961e796bdca65fd5a60bee05c22020004",
+      "note": "Initial implementation before all-stage-terminal refinement; model processes alive during snapshot parity reads."
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark_pp.py",
+      "tests": 6,
+      "seconds": 523.068,
+      "exec_session_id": 68749,
+      "outcome": "completed",
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-dspark-final-20261002.log",
+      "log_sha256": "02a88daf962736dd114f2b59b864d39979131f3dd2545fb8366197952a7ed927",
+      "note": "Final production source with all-stage-terminal refinement; before explicit producer-exit readback was added."
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark_pp.py",
+      "tests": 6,
+      "seconds": 492.02,
+      "exec_session_id": 41775,
+      "outcome": "completed",
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-dspark-postexit-20261002.log",
+      "log_sha256": "cb48df20ab741efb8e795085755ade607ea7e5af7a9abf3ac88aef8da6c61e77",
+      "post_exit_snapshots": 36,
+      "note": "Strengthened fixture after both producers exit; before the request-abort terminal-state refinement."
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark_pp.py",
+      "tests": 6,
+      "seconds": 491.834,
+      "exec_session_id": 74855,
+      "outcome": "completed",
+      "returncode": 0,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pd-pp-dspark-release-20261002.log",
+      "log_sha256": "57c5c899332a6b136a39903f969aa70080b8cd2c63f0a6a79484ec634ef1a994",
+      "post_exit_snapshots": 36,
+      "note": "Final production source including request-abort terminal-state refinement; test cleanup stopped all producer processes but waited only for roots. Final verification also waits for every descendant to release resources."
+    }
+  ],
+  "verification_notes": [
+    "All suites ran as complete files with -v -f.",
+    "Server-args suite used runpy with DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN bound to local /gpfs/models/huggingface.co/Qwen/Qwen2.5-1.5B-Instruct, avoiding a remote config dependency.",
+    "Independent online attention/logits observers check KV, raw top-128 IDs/values, full-vocabulary logsumexp, tokens, masks and position alignment.",
+    "Catalog is the HTTP test double; P/D and Store both use real Mooncake TCP. Model-stage communication uses NCCL.",
+    "Earlier PDCaptureRuntimeBase runs read snapshots while producers were live. Subsequent intermediate runs read after stopping producer roots. Final runtime cases use kill_process_tree(wait_timeout=20) before readback, waiting for all descendants to stop holding resources."
+  ],
+  "failed_attempts": [
+    {
+      "job_id": "01790907625246911087-d527e01e64df",
+      "file": "test/registered/unit/disaggregation/test_decode_queue_cleanup.py",
+      "tests": 6,
+      "errors": 1,
+      "reason": "MagicMock synthesized the optional dspark_pd_queue_coordinator and routed a PP1 fixture through the new path. Set that fixture attribute explicitly to None; all six tests pass in the recorded final run."
+    },
+    {
+      "job_id": "job-6b7036964373-20261002102216",
+      "reason": "Northjob preserved a literal -- in the submitted sleep command. Deleted the malformed Pending allocation and recreated it without the separator; no runtime tests used that job."
+    }
+  ],
+  "checks": {
+    "black_files": 14,
+    "ruff": {
+      "current": 600,
+      "baseline": 600,
+      "differences": []
+    },
+    "git_diff_check": true,
+    "original_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "scope": [
+    "Synthetic untrained draft and Qwen3-0.6B only; no trained-checkpoint quality claim.",
+    "TP1 P2/D2 and P2/D1; real combined TP2/PP2, replicated-head deployments and cross-node PP RDMA remain open.",
+    "Static target-KV, synchronous non-overlap PP scheduling, dense device KV pools, DP1/CP1.",
+    "PP hidden-input, confidence scheduling, async microbatch throughput, HiCache/offload and transfer staging remain unsupported.",
+    "P/D memory-pressure retraction requires separate real-request coverage beyond common-capacity unit checks.",
+    "Production Catalog retention, consumer replay/training quality and performance SLOs remain open."
+  ],
+  "cleanup": {
+    "initial_temporary_job_deleted": true,
+    "initial_temporary_pod_absent": true,
+    "initial_no_live_test_model_store_processes": true,
+    "followon_temporary_job_deleted": true,
+    "followon_temporary_pod_absent": true,
+    "followon_no_live_test_model_store_processes": true,
+    "resident_status": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790911714.3434567,
+      "idle_pid": 14770,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.14445090293884277
+    },
+    "resident_idle_duty_cycle": 0.6
+  },
+  "pipeline_pd_cases": [
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 2,
+      "decode_pp": 2,
+      "replay": false,
+      "draft_kind": "target_kv",
+      "prefill_draft": false,
+      "ragged_mode": "static",
+      "post_exit_snapshots": 6,
+      "counters": {
+        "admitted": 9,
+        "eager_forwards": 10,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 0,
+        "sealed": 6,
+        "speculative_commits_copied": 11,
+        "speculative_verify_forwards": 10
+      },
+      "writer": {
+        "counters": {
+          "failed": 3,
+          "stored": 6,
+          "submitted": 9
+        },
+        "error": null,
+        "oldest_seconds": 0,
+        "pending": 0,
+        "ready": true,
+        "recovery_error": null,
+        "states": {},
+        "stopping": false
+      },
+      "states": {
+        "available": 4,
+        "pending_publication": 0,
+        "writing": 0
+      },
+      "quarantined": 0
+    },
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 2,
+      "decode_pp": 2,
+      "replay": true,
+      "draft_kind": "target_kv",
+      "prefill_draft": false,
+      "ragged_mode": "static",
+      "post_exit_snapshots": 6,
+      "counters": {
+        "admitted": 9,
+        "cuda_graph_forwards": 10,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 0,
+        "sealed": 6,
+        "speculative_commits_copied": 11,
+        "speculative_verify_forwards": 10
+      },
+      "writer": {
+        "counters": {
+          "failed": 3,
+          "stored": 6,
+          "submitted": 9
+        },
+        "error": null,
+        "oldest_seconds": 0,
+        "pending": 0,
+        "ready": true,
+        "recovery_error": null,
+        "states": {},
+        "stopping": false
+      },
+      "states": {
+        "available": 4,
+        "pending_publication": 0,
+        "writing": 0
+      },
+      "quarantined": 0
+    },
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 2,
+      "decode_pp": 2,
+      "replay": false,
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "ragged_mode": "static",
+      "post_exit_snapshots": 6,
+      "counters": {
+        "admitted": 9,
+        "eager_forwards": 10,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 0,
+        "sealed": 6,
+        "speculative_commits_copied": 11,
+        "speculative_verify_forwards": 10
+      },
+      "writer": {
+        "counters": {
+          "failed": 3,
+          "stored": 6,
+          "submitted": 9
+        },
+        "error": null,
+        "oldest_seconds": 0,
+        "pending": 0,
+        "ready": true,
+        "recovery_error": null,
+        "states": {},
+        "stopping": false
+      },
+      "states": {
+        "available": 4,
+        "pending_publication": 0,
+        "writing": 0
+      },
+      "quarantined": 0
+    },
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 2,
+      "decode_pp": 2,
+      "replay": true,
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "ragged_mode": "static",
+      "post_exit_snapshots": 6,
+      "counters": {
+        "admitted": 9,
+        "cuda_graph_forwards": 10,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 0,
+        "sealed": 6,
+        "speculative_commits_copied": 11,
+        "speculative_verify_forwards": 10
+      },
+      "writer": {
+        "counters": {
+          "failed": 3,
+          "stored": 6,
+          "submitted": 9
+        },
+        "error": null,
+        "oldest_seconds": 0,
+        "pending": 0,
+        "ready": true,
+        "recovery_error": null,
+        "states": {},
+        "stopping": false
+      },
+      "states": {
+        "available": 4,
+        "pending_publication": 0,
+        "writing": 0
+      },
+      "quarantined": 0
+    },
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 2,
+      "decode_pp": 1,
+      "replay": false,
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "ragged_mode": "static",
+      "post_exit_snapshots": 6,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      },
+      "writer": null,
+      "states": {
+        "available": 2
+      },
+      "quarantined": 0
+    },
+    {
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 2,
+      "decode_pp": 1,
+      "replay": true,
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "ragged_mode": "static",
+      "post_exit_snapshots": 6,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      },
+      "writer": null,
+      "states": {
+        "available": 2
+      },
+      "quarantined": 0
+    }
+  ],
+  "total_final_tests": 204,
+  "total_checked_snapshots": 126,
+  "strict_post_exit_pd_snapshots": 46
+}

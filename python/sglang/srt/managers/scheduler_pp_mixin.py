@@ -14,7 +14,10 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -80,6 +83,15 @@ class SchedulerPPMixin:
             pp_group=self.pp_group,
             tp_group=self.tp_group,
         )
+        pd_mode = self.disaggregation_mode
+        if pd_mode != DisaggregationMode.NULL:
+            from sglang.srt.speculative.dspark_components.dspark_pd_queue import (
+                DSparkPDQueueCoordinator,
+            )
+
+            self.dspark_pd_queue_coordinator = DSparkPDQueueCoordinator(
+                self.world_group, self.server_args
+            )
         while not self.gracefully_exit:
             self.running_mbs[0] = self.running_batch
             self.mbs[0] = self.last_batch
@@ -91,9 +103,22 @@ class SchedulerPPMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
+            if pd_mode == DisaggregationMode.PREFILL:
+                self.waiting_queue.extend(
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                )
+                plan = self.get_next_disagg_prefill_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
+            elif pd_mode == DisaggregationMode.DECODE:
+                self.process_decode_queue()
+                plan = self.get_next_disagg_decode_batch_to_run(
+                    running_batch=self.running_batch
+                )
+            else:
+                plan = self.get_next_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
@@ -101,14 +126,30 @@ class SchedulerPPMixin:
             self.mbs[0] = batch
             if batch:
                 result = self.run_batch(batch)
+                if pd_mode == DisaggregationMode.PREFILL:
+                    self._pp_dspark_prefill_handoffs(batch, result)
                 self.process_batch_result(batch, result)
             else:
                 self.dspark_pp_coordinator.run_batch(None)
                 self._sched_idled = True
                 self.on_idle()
+            if pd_mode == DisaggregationMode.PREFILL:
+                self.process_disagg_prefill_inflight_queue()
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _pp_dspark_prefill_handoffs(self, batch, result):
+        capture = self.tp_worker.training_capture
+        if capture is None:
+            return
+        owner = (self.pp_group.world_size - 1) * self.tp_group.world_size
+        payload = None
+        if self.world_group.rank_in_group == owner:
+            result.copy_done.synchronize()
+            payload = capture.pack_pp_handoffs(batch, result.next_token_ids)
+        payload = self.world_group.broadcast_object(payload, src=owner)
+        capture.accept_pp_handoffs(batch, payload)
 
     def _pp_dspark_timeout_ids(self, reqs, field, timeout_s, *, running=False):
         """Use one clock and one request timeline for timeout decisions."""

@@ -99,11 +99,7 @@ class TestCaptureConfiguration(CustomTestCase):
                 self.args.speculative_algorithm = None
                 validate_capture_server_args(self.args)
                 self.args.speculative_algorithm = "DSPARK"
-                if pp == 1:
-                    validate_capture_server_args(self.args)
-                else:
-                    with self.assertRaisesRegex(ValueError, "pipeline speculative"):
-                        validate_capture_server_args(self.args)
+                validate_capture_server_args(self.args)
             self.args.pp_size = 1
             for name, value in (
                 ("disaggregation_transfer_backend", "nixl"),

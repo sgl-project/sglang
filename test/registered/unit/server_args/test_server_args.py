@@ -64,6 +64,28 @@ class TestPipelineDSparkArgs(CustomTestCase):
             with self.subTest(algorithm=algorithm):
                 self.args(speculative_algorithm=algorithm).check_server_args()
 
+    def test_pipeline_allows_mooncake_prefill_and_decode(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                self.args(disaggregation_mode=mode).check_server_args()
+
+    def test_pipeline_pd_rejects_uncoordinated_transfer_modes(self):
+        for changes in (
+            {"disaggregation_transfer_backend": "fake"},
+            {"optimistic_prefill_attempts": 1},
+            {"disaggregation_decode_enable_offload_kvcache": True},
+        ):
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(AssertionError, "Pipeline DSPARK P/D requires"),
+            ):
+                self.args(disaggregation_mode="decode", **changes).check_server_args()
+        with (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.override(True),
+            self.assertRaisesRegex(AssertionError, "Pipeline DSPARK P/D requires"),
+        ):
+            self.args(disaggregation_mode="decode").check_server_args()
+
     def test_pipeline_rejects_overlap_and_other_drafts(self):
         for changes in (
             {"disable_overlap_schedule": False},
@@ -78,8 +100,6 @@ class TestPipelineDSparkArgs(CustomTestCase):
 
     def test_pipeline_dspark_rejects_uncoordinated_readiness(self):
         for changes in (
-            {"disaggregation_mode": "prefill"},
-            {"disaggregation_mode": "decode"},
             {"dp_size": 2},
             {"attn_cp_size": 2},
             {"dcp_size": 2},

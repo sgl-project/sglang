@@ -95,7 +95,8 @@ execution. Snapshot readback uses independent online KV/logit observations.
 
 The separate serving test now covers TP1/PP2 model initialization, scheduling,
 cancellation/retraction, actual PP capture and source-KV NCCL projection.
-P/D readiness and latency/throughput validation remain required. Boundary
+P/D readiness has separate coverage in [the P/D runbook](PIPELINE_PD.md).
+Latency/throughput validation remains required. Boundary
 fences cannot recover a crashed process, failed device communication or a rank
 stranded inside an internal model/injector collective. Process-group failure
 handling and restart still apply. The synchronous ordering, metadata validation

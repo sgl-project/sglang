@@ -149,9 +149,11 @@ checkpoint variant; changing the target also requires a matching draft contract.
 Current capability gates allow TP and require DP=1, dense
 unquantized NHD target/draft pools, no LoRA, and standard RoPE. PP1 supports
 synchronous scheduling and normal overlap; disaggregated serving requires the
-Mooncake backend. PP>1 supports colocated static target-KV serving through the
-synchronous pipeline loop below, with DP1/CP1 and device KV cache. Hidden-input,
-confidence-scheduled, overlap and disaggregated PP speculation remain rejected.
+Mooncake backend. PP>1 supports colocated and Mooncake P/D static target-KV
+serving through the synchronous pipeline loop below, with DP1/CP1 and device KV
+cache. Hidden-input, confidence-scheduled and overlap PP speculation remain
+rejected. P/D PP additionally excludes optimistic prefill, KV offload and transfer
+staging until their readiness/resource protocols are integrated.
 Target identity binding currently
 supports Qwen3, Qwen2 and Llama text models; real-model evidence currently covers
 Qwen3-0.6B at TP1/PP1, TP2/PP1 and TP1/PP2. Static verify
@@ -279,7 +281,8 @@ The worker phases above must be scheduled separately: running a cross-stage KV
 collective inside a stage's forward before it sends activation would strand
 later stages. The synchronous scheduler uses the coordinator below for this
 ordering and result distribution; it does not use the asynchronous result relay
-for speculative batch execution. P/D PP integration remains open. See
+for speculative batch execution. Its P/D variant synchronizes the first teacher
+before ordinary result processing sends the last KV chunk. See
 [the result-channel runbook](experiments/PIPELINE_RESULT.md).
 
 ### Pipeline Shared Modules Prerequisite
@@ -371,8 +374,7 @@ The synchronous PP scheduler now instantiates this coordinator. Its isolated
 Gloo/NCCL tests use production worker phase methods and
 transport with deterministic target/proposal/acceptance/projection boundaries;
 they do not load a full pipeline draft or execute a real source-KV encoder.
-Real colocated serving has separate coverage below; P/D PP integration remains
-required. See
+Real colocated and P/D serving have separate coverage below. See
 [the coordinator runbook](experiments/PIPELINE_COORDINATOR.md).
 
 ### Synchronous Pipeline Serving
@@ -410,8 +412,8 @@ pool pressure in eager and decode graph modes. It independently checks selected
 KV, raw top-128 values/IDs, logsumexp, masks and positions after Mooncake readback,
 including readback after serving exits. The synthetic draft checks mechanics,
 not training quality. This loop keeps one batch outstanding; asynchronous PP
-microbatch depth does not introduce concurrency here. P/D PP speculation,
-combined real-model TP2/PP2, host-tier cache integration, other model families and
+microbatch depth does not introduce concurrency here. The P/D variant is described
+below. Combined real-model TP2/PP2, host-tier cache integration, other model families and
 performance SLO validation remain open. See
 [the serving runbook](experiments/PIPELINE_SERVING.md).
 
@@ -426,6 +428,22 @@ accepted verify rows extend D's projection through the existing injector.
 Legacy hidden-input drafts retain their P-side projection and draft-KV transfer.
 The existing serving restriction against decode radix cache with speculation
 still applies; D uses chunk cache while P can reuse radix prefixes.
+
+For PP, the same synchronous loop calls the existing P/D batch planners and
+installs `DSparkPDQueueCoordinator`. Bootstrap, waiting and transfer queues agree
+on phase labels, ordered request IDs/bootstrap rooms and readiness across all
+PP/TP ranks. Missing metadata holds the transfer; corrupt room IDs or failures
+produce a common failure. Transfer queues wait for every stage to become terminal
+before success/failure cleanup, preserving other stages' in-flight buffer ownership.
+Metadata/request-slot/token budgets use common minima before admission or resume.
+
+Before P result processing sends the final KV chunk, the last P stage's TP0 waits
+for the sampled-token D2H event and broadcasts the bounded first-teacher handoff.
+Every P stage validates it against its capture context. D then consumes that
+teacher together with received target KV and uses the existing cohort writer.
+P may run AR or load a target-KV draft. Real-model coverage includes TP1 P2/D2
+with a draft on D alone or both sides, and P2/D1 with drafts on both sides, in
+eager/graph execution. See [the P/D runbook](experiments/PIPELINE_PD.md).
 
 Example with an exported checkpoint and local target artifacts:
 
@@ -479,9 +497,9 @@ Mooncake writer and Catalog producer protocol are reused. The manifest records
 `capture_mode=speculative_accepted_target_path`; its tensor contract is unchanged.
 The collector supports static, cap-accept and compact verification. The target-KV
 v1 checkpoint described above remains static-only; confidence-scheduled modes
-use the existing hidden-input draft and confidence head. Colocated static
-target-KV PP capture uses the synchronous pipeline path above. Simulated
-acceptance, disaggregated PP speculation and other speculative algorithms remain
+use the existing hidden-input draft and confidence head. Static target-KV PP
+capture uses the synchronous pipeline paths above, including P/D.
+Simulated acceptance and other speculative algorithms remain
 rejected by the capture capability gate.
 
 `TargetVerifyExecutor` calls `CaptureCoordinator.after_verify_forward` immediately

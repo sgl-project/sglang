@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -13,12 +14,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSparkPipelineLoop(CustomTestCase):
-    def exercise(self, *, last_stage=False, pause=False):
+    def exercise(
+        self, *, last_stage=False, pause=False, pd_mode=DisaggregationMode.NULL
+    ):
         events = []
         batch = SimpleNamespace(reqs=[object()])
         scheduler = SimpleNamespace(
             gracefully_exit=False,
             _engine_paused=False,
+            disaggregation_mode=pd_mode,
+            server_args=SimpleNamespace(),
+            waiting_queue=[],
             model_worker=object(),
             world_group=object(),
             pp_group=SimpleNamespace(is_last_rank=last_stage),
@@ -64,6 +70,23 @@ class TestDSparkPipelineLoop(CustomTestCase):
             ("relay", request)
         )
         scheduler.get_next_batch_to_run = plan
+        scheduler.get_next_disagg_prefill_batch_to_run = plan
+        scheduler.get_next_disagg_decode_batch_to_run = plan
+        scheduler.process_decode_queue = lambda: events.append(("decode_queue",))
+        scheduler.process_disagg_prefill_inflight_queue = lambda: events.append(
+            ("inflight",)
+        )
+        scheduler._pp_dspark_prefill_handoffs = lambda current, result: events.append(
+            ("handoff",)
+        )
+
+        def bootstrap():
+            events.append(("bootstrap",))
+            return []
+
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            pop_bootstrapped=bootstrap
+        )
         scheduler.run_batch = run
         scheduler.process_batch_result = lambda current, result: events.append(
             ("result",)
@@ -93,12 +116,21 @@ class TestDSparkPipelineLoop(CustomTestCase):
             expected.append(("receive", request))
             if not last_stage:
                 expected.append(("relay", request))
-            expected.extend([("process", request), ("plan",)])
+            expected.append(("process", request))
+            if pd_mode == DisaggregationMode.PREFILL:
+                expected.append(("bootstrap",))
+            elif pd_mode == DisaggregationMode.DECODE:
+                expected.append(("decode_queue",))
+            expected.append(("plan",))
             expected.extend(
                 [("coordinate_idle", None), ("idle",)]
                 if request == "idle"
-                else [("run",), ("result",)]
+                else [("run",)]
+                + ([("handoff",)] if pd_mode == DisaggregationMode.PREFILL else [])
+                + [("result",)]
             )
+            if pd_mode == DisaggregationMode.PREFILL:
+                expected.append(("inflight",))
         self.assertEqual(events, expected)
         self.assertIsNone(scheduler.last_batch)
         self.assertIsNone(scheduler.mbs[0])
@@ -111,6 +143,52 @@ class TestDSparkPipelineLoop(CustomTestCase):
 
     def test_pause_keeps_receiving_and_resume_preserves_batch_state(self):
         self.exercise(pause=True)
+
+    def test_prefill_coordinates_bootstrap_handoff_and_release(self):
+        self.exercise(pd_mode=DisaggregationMode.PREFILL)
+
+    def test_decode_advances_queues_before_batch_planning(self):
+        self.exercise(pd_mode=DisaggregationMode.DECODE)
+
+    def test_teacher_copy_completes_before_broadcast_and_accept(self):
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                events = []
+                capture = SimpleNamespace(
+                    pack_pp_handoffs=lambda batch, tokens, events=events: events.append(
+                        "pack"
+                    )
+                    or (b"teacher",),
+                    accept_pp_handoffs=lambda batch, payload, events=events: events.append(
+                        ("accept", payload)
+                    ),
+                )
+                scheduler = SimpleNamespace(
+                    tp_worker=SimpleNamespace(training_capture=capture),
+                    pp_group=SimpleNamespace(world_size=2),
+                    tp_group=SimpleNamespace(world_size=1),
+                    world_group=SimpleNamespace(
+                        rank_in_group=rank,
+                        broadcast_object=lambda payload, src, events=events: events.append(
+                            ("broadcast", src)
+                        )
+                        or (b"teacher",),
+                    ),
+                )
+                result = SimpleNamespace(
+                    copy_done=SimpleNamespace(
+                        synchronize=lambda events=events: events.append("copy")
+                    ),
+                    next_token_ids=object(),
+                )
+                SchedulerPPMixin._pp_dspark_prefill_handoffs(
+                    scheduler, object(), result
+                )
+                self.assertEqual(
+                    events,
+                    (["copy", "pack"] if rank == 1 else [])
+                    + [("broadcast", 1), ("accept", (b"teacher",))],
+                )
 
 
 if __name__ == "__main__":

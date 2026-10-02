@@ -397,6 +397,13 @@ class PrefillBootstrapQueue:
         bootstrapped_reqs = []
         failed_reqs = []
         indices_to_remove = set()
+        sync = getattr(self.scheduler, "dspark_pd_queue_coordinator", None)
+        if sync is not None:
+            polls = sync.poll("prefill_bootstrap", self.queue, is_send=True)
+            (metadata_budget,) = sync.minimum(
+                "prefill_metadata",
+                (self.req_to_metadata_buffer_idx_allocator.available_size(),),
+            )
 
         if len(self.queue) == 0:
             if return_failed_reqs is False:
@@ -404,7 +411,9 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        if self.pp_size > 1:
+        if sync is not None:
+            pass
+        elif self.pp_size > 1:
             polls = poll_and_all_reduce_pp(
                 (req.rid for req in self.queue),
                 KVPoll.WaitingForInput,
@@ -449,12 +458,17 @@ class PrefillBootstrapQueue:
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
             elif poll == KVPoll.WaitingForInput:
+                needs_metadata = req.metadata_buffer_index < 0
+                if sync is not None and needs_metadata and metadata_budget <= 0:
+                    continue
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
                 elif not self.finalize_bootstrap(req):
                     continue
+                if sync is not None and needs_metadata:
+                    metadata_budget -= 1
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
@@ -507,13 +521,17 @@ class SchedulerDisaggregationPrefillMixin:
         the post-forward bootstrap check.
         """
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
-        if not candidates:
-            return
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in candidates],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
+        sync = getattr(self, "dspark_pd_queue_coordinator", None)
+        if sync is not None:
+            polls = sync.poll("prefill_waiting", candidates, is_send=True)
+        else:
+            if not candidates:
+                return
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in candidates],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
         failed = set()
         for req, poll in zip(candidates, polls):
             if poll == KVPoll.Failed:
@@ -834,16 +852,23 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
-        if len(self.disagg_prefill_inflight_queue) == 0:
-            return []
-
         done_reqs = []
-
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
+        sync = getattr(self, "dspark_pd_queue_coordinator", None)
+        if sync is not None:
+            polls = sync.poll(
+                "prefill_inflight",
+                self.disagg_prefill_inflight_queue,
+                is_send=True,
+                terminal=True,
+            )
+        else:
+            if len(self.disagg_prefill_inflight_queue) == 0:
+                return []
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue

@@ -9007,15 +9007,21 @@ class ServerArgs:
             ), "Pipeline parallelism requires non-overlap AR or target-KV DSPARK"
             if self.speculative_algorithm == "DSPARK":
                 assert (
-                    self.disaggregation_mode == "null"
-                    and self.dp_size == 1
+                    self.dp_size == 1
                     and self.attn_cp_size == 1
                     and self.dcp_size == 1
                     and not self.enable_dp_attention
                     and not self.enable_hierarchical_cache
                     and not self.enable_lmcache
                     and not self.enable_flexkv
-                ), "Pipeline DSPARK requires DP1/CP1, colocated serving and device KV cache"
+                ), "Pipeline DSPARK requires DP1/CP1 and device KV cache"
+                if self.disaggregation_mode != "null":
+                    assert (
+                        self.disaggregation_transfer_backend == "mooncake"
+                        and self.optimistic_prefill_attempts == 0
+                        and not self.disaggregation_decode_enable_offload_kvcache
+                        and not envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+                    ), "Pipeline DSPARK P/D requires Mooncake without optimistic prefill, KV offload or transfer staging"
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "

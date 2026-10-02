@@ -95,7 +95,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
-        scheduler = MagicMock()
+        scheduler = MagicMock(dspark_pd_queue_coordinator=None)
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
@@ -142,7 +142,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
-        scheduler = MagicMock()
+        scheduler = MagicMock(dspark_pd_queue_coordinator=None)
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
@@ -209,7 +209,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.spec_algorithm.is_none.return_value = True
         queue._clean_hicache_prefetch_resources = MagicMock()
 
-        scheduler = MagicMock()
+        scheduler = MagicMock(dspark_pd_queue_coordinator=None)
         scheduler.enable_decode_hicache = False
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()

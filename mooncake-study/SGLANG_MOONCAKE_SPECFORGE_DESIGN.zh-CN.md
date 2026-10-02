@@ -849,8 +849,9 @@ PD 的 TransferEngine KV 交接不是 Store 样本提交，两个完成事件分
 #### 13.3.1 当前实现: D 统一导出与发布
 
 `pd_capture.py` 实现 D 统一导出路径。当前接入 Mooncake backend、DP=1，
-普通 AR 支持 TP 分片与 PP；P/D 模式的 DSpark 推测采集支持 TP、要求 PP=1。
-P/D PP speculative 与跨节点 TP/PP 组合仍需后续实现与验证。TP=PP=1 的普通 AR 和
+普通 AR 支持 TP 分片与 PP；静态 target-KV DSpark 推测采集也已接通同步 PP P/D。
+真实模型已覆盖 TP1 的 P2/D2 与 P2/D1；TP2/PP2 组合及跨节点 PP 仍需验证。
+hidden-input/confidence-scheduled PP 仍未支持。TP=PP=1 的普通 AR 和
 target-KV DSpark 已通过跨节点 P/D RDMA 的 eager/graph 验证；跨节点 Store RDMA
 的独立验收范围见第 8.2 节。
 AR 的 P/D TP 数可以不同，模型必须满足全局 teacher/KV 契约。
@@ -864,8 +865,16 @@ P=PP1、D=PP2 等展开拓扑仍不受底层传输支持。
 cohort 失败和资源回收流程。PP CUDA graph 的 activation 按 token 数分配与
 截取，并在执行前刷新提前规划时尚未收到的数据。两张 H100 上的 Qwen3-0.6B
 TP1/PP2 eager/graph 已验证输出、KV、raw top-128、mask、取消和自然显存压力。
-这条合设路径不包含 P/D PP、异步 microbatch、host-tier cache 或训练质量验证。
-实现和复现范围见 [PP serving runbook](experiments/PIPELINE_SERVING.md)。
+异步 microbatch、host-tier cache 或训练质量仍需单独验证。
+合设实现和复现范围见 [PP serving runbook](experiments/PIPELINE_SERVING.md)。
+
+P/D 的同步 PP 路径新增 `DSparkPDQueueCoordinator`，在各阶段消费 bootstrap、
+传输或撤回队列前，统一请求顺序、bootstrap room、就绪状态和可用资源额度。
+某一级传输失败时，需等各级传输都进入终态才能统一释放，避免提前复用仍被访问的
+buffer。P 端最后一级的 TP0 在 sampled-token D2H 完成后广播首条 teacher；
+各级验证同一 capture context，再由原有结果处理发送最后一段 KV。D 使用收到的
+target KV 投影 draft context，不执行 target prefill。完整实现与边界见
+[PP P/D runbook](experiments/PIPELINE_PD.md)。
 
 1. D 在发布 KV 接收地址前，通过原有 Host 配额与 Catalog reservation 申请采集。
    `begin_pd_transfer(req)` 生成有界 MessagePack `CaptureTransferContext`，作为

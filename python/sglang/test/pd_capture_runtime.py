@@ -117,7 +117,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
     def stop_process(process):
         if process.poll() is not None:
             return
-        kill_process_tree(process.pid)
+        kill_process_tree(process.pid, wait_timeout=20)
         process.wait(timeout=20)
 
     def launch(
@@ -619,6 +619,11 @@ class PDCaptureRuntimeBase(CustomTestCase):
             self.assertGreater(state["counters"]["speculative_commits_copied"], 0)
         self.assertIsNone(prefill.poll())
         self.assertIsNone(decode.poll())
+        self.stop_process(prefill)
+        self.stop_process(decode)
+        for publication in publications[first:]:
+            # Verify every object digest after both producers have exited.
+            read_snapshot(self.reader, publication)
         print(
             json.dumps(
                 {
@@ -630,6 +635,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     "draft_kind": draft_kind,
                     "prefill_draft": prefill_draft,
                     "ragged_mode": ragged_mode,
+                    "post_exit_snapshots": expected,
                     "capture": state,
                 },
                 sort_keys=True,
