@@ -207,7 +207,10 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         if query is None and save_kv_cache:
             assert k is not None and k_rope is not None
             self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, self._kv_write_loc(forward_batch), k, k_rope
+                layer,
+                self._kv_write_loc(forward_batch),
+                k,
+                k_rope,
             )
 
         if query is not None:

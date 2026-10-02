@@ -1764,11 +1764,53 @@ class KVWriteLoc:
     loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
     ``loc`` is the generic fallback. Bundling them lets a backend issue one
     ``set_kv_buffer`` call regardless of pool type.
+
+    ``physical`` marks the locs as physical token ids: the batch's write loc
+    after ``rebind_write_loc``, or ids a backend translated itself. A unified
+    pool's write door refuses a loc not marked physical; other pools do not
+    check.
     """
 
     loc: torch.Tensor
     swa_loc: Optional[torch.Tensor] = None
     full_loc: Optional[torch.Tensor] = None
+    physical: bool = False
+
+    @classmethod
+    def for_batch(
+        cls,
+        forward_batch,
+        *,
+        swa_loc: Optional[torch.Tensor] = None,
+        full_loc: Optional[torch.Tensor] = None,
+    ) -> KVWriteLoc:
+        """The batch's ``out_cache_loc`` as a write loc, carrying the batch's
+        physical mark. A ``swa_loc`` or ``full_loc`` passed here travels under
+        the same mark, so it must be derived from that rebound loc (as
+        ``sliding_window_write_loc_for`` does); a loc produced separately
+        states its own mark with ``KVWriteLoc(loc, physical=...)``."""
+        return cls(
+            forward_batch.out_cache_loc,
+            swa_loc,
+            full_loc,
+            physical=forward_batch.out_cache_loc_is_physical,
+        )
+
+    @classmethod
+    def for_layer(
+        cls,
+        forward_batch,
+        layer,
+        *,
+        swa_loc: Optional[torch.Tensor] = None,
+        full_loc: Optional[torch.Tensor] = None,
+    ) -> KVWriteLoc:
+        """``layer``'s write loc: the batch's, or for a cross-attention layer
+        ``encoder_out_cache_loc``, which nothing translates and so is never
+        marked physical."""
+        if layer.is_cross_attention:
+            return cls(forward_batch.encoder_out_cache_loc, swa_loc, full_loc)
+        return cls.for_batch(forward_batch, swa_loc=swa_loc, full_loc=full_loc)
 
     def __post_init__(self):
         # swa_loc / full_loc are resolved once at metadata-init from the full
@@ -1785,6 +1827,11 @@ def unwrap_write_loc(loc_info):
     if isinstance(loc_info, KVWriteLoc):
         return loc_info.loc, loc_info.swa_loc, loc_info.full_loc
     return loc_info, None, None
+
+
+def write_loc_is_physical(loc_info) -> bool:
+    """Whether ``loc_info`` is a ``KVWriteLoc`` marked physical; a bare loc is not."""
+    return isinstance(loc_info, KVWriteLoc) and loc_info.physical
 
 
 class KvBufferDesc:
@@ -1913,6 +1960,21 @@ class KVCache(abc.ABC):
     def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
         k_buffer, v_buffer = self.get_kv_buffer(self.start_layer)
         return k_buffer.shape, v_buffer.shape
+
+    # Unified pools set this: their write doors take physical ids only.
+    requires_physical_write_loc = False
+
+    def _check_physical_write_loc(self, loc_info, where: str) -> None:
+        # A flag read, no device sync: cheap enough to run on every write-door
+        # call. Fused writers that scatter through `get_kv_buffer`, and a
+        # replayed cuda graph, do not pass through here.
+        if self.requires_physical_write_loc and not write_loc_is_physical(loc_info):
+            raise ValueError(
+                f"{where}: write loc is not marked physical. Hand the pool "
+                "KVWriteLoc.for_batch(forward_batch) after "
+                "KVIndexTranslator.rebind_write_loc, or KVWriteLoc(loc, "
+                "physical=True) for ids translated separately."
+            )
 
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
@@ -2607,6 +2669,7 @@ class MHATokenToKVPool(KVCache):
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
+        self._check_physical_write_loc(loc_info, "set_kv_buffer (MHA)")
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
@@ -4200,7 +4263,7 @@ class HybridLinearKVPool(KVCache):
     def set_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
@@ -4210,10 +4273,13 @@ class HybridLinearKVPool(KVCache):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
         # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
         # `loc` is already physical) — either way the pool writes a PHYSICAL loc.
-        loc, _, full_loc = unwrap_write_loc(loc)
+        loc, _, full_loc = unwrap_write_loc(loc_info)
         layer_id = self._transfer_full_attention_id(layer.layer_id)
+        write_loc = KVWriteLoc(
+            full_loc if full_loc is not None else loc,
+            physical=write_loc_is_physical(loc_info),
+        )
         if not self.use_mla:
-            write_loc = full_loc if full_loc is not None else loc
             self.full_kv_pool.set_kv_buffer(
                 layer,
                 write_loc,
@@ -4225,9 +4291,6 @@ class HybridLinearKVPool(KVCache):
                 dcp_kv_mask=dcp_kv_mask,
             )
         else:
-            # Mirror the MHA branch: `full_loc` is the unified pool's
-            # pre-translated (kernel-facing) loc; None for a static pool.
-            write_loc = full_loc if full_loc is not None else loc
             with self._transfer_id_context(layer):
                 self.full_kv_pool.set_kv_buffer(
                     layer,
@@ -4269,13 +4332,15 @@ class HybridLinearKVPool(KVCache):
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
         with self._transfer_id_context(layer):
-            self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+            self.full_kv_pool.set_mla_kv_buffer(
+                layer, loc_info, cache_k_nope, cache_k_rope
+            )
 
     def get_mla_kv_buffer(
         self,
@@ -4553,6 +4618,7 @@ class MLATokenToKVPool(KVCache):
         layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
+        self._check_physical_write_loc(loc_info, "set_kv_buffer (MLA)")
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
@@ -4626,11 +4692,13 @@ class MLATokenToKVPool(KVCache):
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
         layer_id_override: Optional[int] = None,
     ):
+        loc, _, _ = unwrap_write_loc(loc_info)
+        self._check_physical_write_loc(loc_info, "set_mla_kv_buffer (MLA)")
         # loc is widened under DCP unless the pool declares it resolved.
         maybe_detect_oob(
             loc,
@@ -4821,10 +4889,11 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(
             loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA-FP4)"
         )

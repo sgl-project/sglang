@@ -30,10 +30,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _loc_info(virtual_loc, swa_phys=None, full_phys=None):
+def _loc_info(virtual_loc, swa_phys=None, full_phys=None, physical=False):
     from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
-    return KVWriteLoc(virtual_loc, swa_phys, full_phys)
+    return KVWriteLoc(virtual_loc, swa_phys, full_phys, physical=physical)
 
 
 class _RecordingPool:
@@ -41,9 +41,17 @@ class _RecordingPool:
 
     def __init__(self):
         self.calls = []
+        self.physical = []
 
-    def set_kv_buffer(self, layer, loc, cache_k, cache_v, *args, **kwargs):
+    def set_kv_buffer(self, layer, loc_info, cache_k, cache_v, *args, **kwargs):
+        from sglang.srt.mem_cache.memory_pool import (
+            unwrap_write_loc,
+            write_loc_is_physical,
+        )
+
+        loc, _, _ = unwrap_write_loc(loc_info)
         self.calls.append((loc, kwargs))
+        self.physical.append(write_loc_is_physical(loc_info))
 
 
 class TestUnifiedSWARouting(unittest.TestCase):
@@ -229,6 +237,23 @@ class TestHybridLinearFullLocRouting(unittest.TestCase):
                         # is already physical, so write it directly.
                         self.assertIs(forwarded, loc)
                     self.assertNotIn("already_physical", kwargs)
+
+    def test_forwards_the_physical_mark(self):
+        # The sub-pool decides on the mark, so the composite must pass it
+        # through unchanged either way.
+        for physical in (True, False):
+            pool = self._make_bare_pool(use_mla=False)
+            pool.set_kv_buffer(
+                types.SimpleNamespace(layer_id=0),
+                _loc_info(
+                    torch.tensor([1, 2]),
+                    full_phys=torch.tensor([5, 6]),
+                    physical=physical,
+                ),
+                torch.zeros(2, 4, 8),
+                torch.zeros(2, 4, 8),
+            )
+            self.assertEqual(pool.full_kv_pool.physical, [physical])
 
 
 class _RecordingMLAPool(_RecordingPool):

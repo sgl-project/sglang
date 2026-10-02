@@ -1316,11 +1316,6 @@ class FlashInferAttnBackend(AttentionBackend):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
 
         logits_soft_cap = layer.logit_cap
 
@@ -1354,7 +1349,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 assert v is not None
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1456,7 +1455,11 @@ class FlashInferAttnBackend(AttentionBackend):
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1477,18 +1480,17 @@ class FlashInferAttnBackend(AttentionBackend):
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
