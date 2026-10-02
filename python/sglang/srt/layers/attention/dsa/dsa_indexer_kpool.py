@@ -81,6 +81,20 @@ def _slice_rows(
     return None if tensor is None else tensor[rows]
 
 
+# One measured budget per device for the process lifetime, as in the DSA indexer.
+# mem_get_info syncs the host, and this indexer runs in every sparse-attention layer.
+_MQA_LOGITS_BUDGET_BYTES: Dict[int, int] = {}
+
+
+def _get_mqa_logits_budget_bytes(device_index: int) -> int:
+    cached_budget = _MQA_LOGITS_BUDGET_BYTES.get(device_index)
+    if cached_budget is not None:
+        return cached_budget
+    budget_bytes = mqa_logits_budget_bytes(device_index=device_index, allow_sync=True)
+    _MQA_LOGITS_BUDGET_BYTES[device_index] = budget_bytes
+    return budget_bytes
+
+
 def _mqa_logits_row_chunks(
     *, num_rows: int, num_cols: int, device: torch.device
 ) -> Tuple[slice, ...]:
@@ -95,9 +109,7 @@ def _mqa_logits_row_chunks(
     need_chunk, budget_bytes = mqa_logits_should_chunk(
         num_rows=num_rows,
         num_cols=num_cols,
-        get_budget_bytes=lambda: mqa_logits_budget_bytes(
-            device_index=device_index, allow_sync=True
-        ),
+        get_budget_bytes=lambda: _get_mqa_logits_budget_bytes(device_index),
         rocm=is_hip(),
     )
     rows_per_chunk = (
