@@ -387,6 +387,12 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         metadata.c128_topk_lengths_clamp1 = torch.tensor(
             [base + 39, base + 40], dtype=torch.int32
         )
+        metadata.trtllm_seq_lens_req = torch.tensor(
+            [base + 41, base + 42], dtype=torch.int32
+        )
+        metadata.trtllm_cum_seq_lens_q = torch.tensor(
+            [0, base + 1, base + 2], dtype=torch.int32
+        )
         metadata.c0_flashmla_metadata = object()
         metadata.c4_flashmla_metadata = object()
         metadata.c128_flashmla_metadata = object()
@@ -533,6 +539,26 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             SharedReadEnds.PRE_REPLAY,
         )
 
+    def test_trtllm_warmup_does_not_create_flashmla_scheduler_metadata(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.trtllm_attn = True
+        backend.forward_metadata = DSV4Metadata(
+            self._make_core_metadata(0), indexer_metadata=None
+        )
+        backend._current_capture_raw = None
+
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend._create_flashmla_metadata"
+        ) as create:
+            backend.on_after_cuda_graph_warmup()
+
+        create.assert_not_called()
+
     def test_snapshot_builds_cache_only_for_sparse_prefill(self):
         from sglang.srt.environ import envs
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -634,6 +660,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             "c4_topk_lengths_raw",
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
+            "trtllm_seq_lens_req",
+            "trtllm_cum_seq_lens_q",
         ]
         reference_assign_fields = [
             "page_table",
@@ -766,6 +794,103 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertNotEqual(grown.data_ptr(), first.data_ptr())
         self.assertEqual(workspace._buffer.data_ptr(), grown.data_ptr())
 
+    def test_trtllm_padded_output_reuses_storage_and_zeros_only_tail(self):
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            DeepseekV4TrtllmAttnBackend,
+        )
+
+        backend = object.__new__(DeepseekV4TrtllmAttnBackend)
+        backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
+        backend.trtllm_eager_output_buffer = None
+        backend._padded_output_zeroed = None
+
+        output = backend._padded_output_buffer(num_rows=8, num_real_rows=6, num_heads=2)
+
+        self.assertEqual(
+            output.data_ptr(), backend.trtllm_graph_output_buffer.data_ptr()
+        )
+        self.assertTrue(torch.all(output[:6] == 7))
+        self.assertTrue(torch.all(output[6:] == 0))
+
+        # The tail is zeroed once per (buffer, rows, real rows): the kernel only
+        # ever writes [:real rows], so the other layers of the step skip the
+        # memset. A different shape re-zeroes.
+        output[6:] = 3
+        again = backend._padded_output_buffer(num_rows=8, num_real_rows=6, num_heads=2)
+        self.assertTrue(torch.all(again[6:] == 3))
+        other = backend._padded_output_buffer(num_rows=8, num_real_rows=5, num_heads=2)
+        self.assertTrue(torch.all(other[5:] == 0))
+
+    def test_trtllm_prefill_slices_padding_in_dense_token_layout(self):
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            DeepseekV4TrtllmAttnBackend,
+        )
+
+        core = SimpleNamespace(
+            trtllm_prefill_qmeta=None,
+            seq_lens_casual=torch.tensor(
+                [6, 7, 8, 14, 15, 16, 0, 0], dtype=torch.int64
+            ),
+            trtllm_prefill_swa_indices=torch.zeros((6, 128), dtype=torch.int32),
+            trtllm_prefill_swa_lens=torch.full((6,), 128, dtype=torch.int32),
+            trtllm_prefill_c4_indices=None,
+            trtllm_prefill_c4_lens=None,
+            trtllm_prefill_c128=None,
+        )
+        backend = object.__new__(DeepseekV4TrtllmAttnBackend)
+        backend.device = torch.device("cpu")
+        backend.forward_metadata = SimpleNamespace(core_attn_metadata=core)
+        backend.trtllm_workspace_buffer = torch.empty(1, dtype=torch.int8)
+        backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
+        backend.trtllm_eager_output_buffer = None
+        backend._padded_output_zeroed = None
+        backend._trtllm_kv_cache_views = lambda _layer_id, _ratio: (
+            torch.empty(1),
+            torch.empty(1),
+        )
+        backend._get_trtllm_bmm_scales = lambda _layer: (1.0, 1.0)
+
+        captured = {}
+
+        def fake_attention(**kwargs):
+            captured.update(kwargs)
+            return kwargs["out"]
+
+        forward_batch = SimpleNamespace(
+            extend_seq_lens_cpu=[3, 3],
+        )
+        q = torch.empty((8, 2, 512), dtype=torch.float8_e4m3fn)
+
+        # The semaphore-capacity guard reads a module global that only the
+        # real backend __init__ installs; this backend is hand-built.
+        with (
+            mock.patch(
+                "sglang.srt.layers.attention.deepseek_v4_trtllm_backend._trtllm_semaphore_rows",
+                64,
+            ),
+            mock.patch(
+                "flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4",
+                side_effect=fake_attention,
+            ),
+        ):
+            output = backend._forward_trtllm_prefill(
+                q=q,
+                layer=SimpleNamespace(layer_id=0),
+                compress_ratio=0,
+                forward_batch=forward_batch,
+                attn_sink=torch.zeros(2, dtype=torch.float32),
+                extra_indices=None,
+            )
+
+        self.assertEqual(captured["query"].shape, (6, 1, 2, 512))
+        self.assertNotIn("cum_seq_lens_q", captured)
+        self.assertNotIn("max_q_len", captured)
+        self.assertEqual(captured["seq_lens"].tolist(), [6, 7, 8, 14, 15, 16])
+        self.assertEqual(captured["sparse_indices"].shape, (6, 128))
+        self.assertEqual(captured["out"].shape, (6, 1, 2, 512))
+        self.assertEqual(output.shape, (8, 2, 512))
+        self.assertTrue(torch.all(output[6:] == 0))
+
     def test_sparse_prefill_c4_uses_live_extent(self):
         page_table = torch.zeros((2, 4096), dtype=torch.int32)
         for max_seq_len in (3, 4, 255, 256, 259, 260):
@@ -867,6 +992,87 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
         fb = self._make_fb(torch.tensor([0, 0]), ForwardMode.IDLE)
         out = backend.get_swa_out_cache_loc(fb)
         self.assertEqual(out.tolist(), [0, 0])
+
+
+class TestTrtllmSparseTablePool(CustomTestCase):
+    def setUp(self):
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            TrtllmSparseTablePool,
+        )
+
+        self.dev = "cuda" if torch.cuda.is_available() else "cpu"
+        self.kw = dict(dtype=torch.int32, device=self.dev)
+        self.pool = TrtllmSparseTablePool(self.kw)
+
+    def test_view_is_stable_and_reinerts_pad_rows(self):
+        self.pool.preallocate("t", 128, fill=-1, width=4)
+        big = self.pool.view("t", 100, fill=-1, width=4)
+        big.fill_(7)
+        small = self.pool.view("t", 10, fill=-1, width=4, rows_written_by_caller=True)
+        # Same parent every step (kernel-visible address never moves), stride == width.
+        self.assertEqual(small.data_ptr(), big.data_ptr())
+        self.assertEqual(small.stride(0), 4)
+        # Rows past `rows` up to the 64-row tile are re-inerted; [:rows] is left
+        # to the caller when it promises to write them.
+        self.assertTrue(torch.all(self.pool._bufs["t"][10:64] == -1))
+        self.assertTrue(torch.all(small == 7))
+        src = torch.arange(5, **self.kw)
+        self.assertEqual(
+            self.pool.view("l", 5, fill=128, src=src).tolist(), [0, 1, 2, 3, 4]
+        )
+
+    def test_copy_unless_aliased(self):
+        from sglang.srt.layers.attention.dsv4.metadata import copy_unless_aliased
+
+        parent = torch.zeros(4, 6, **self.kw)
+        tail = parent[:, 2:]
+        copy_unless_aliased(tail, tail)
+        self.assertTrue(torch.all(parent == 0))
+        copy_unless_aliased(tail, torch.full((4, 4), 3, **self.kw))
+        self.assertTrue(torch.all(parent[:, 2:] == 3) and torch.all(parent[:, :2] == 0))
+
+    def test_topk_writes_table_aliases_c4_indices_into_the_tail(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            SWA_WINDOW,
+            DSV4AttnMetadata,
+        )
+
+        n = 64  # tile-aligned, so no per-step pad parents are involved
+        core = object.__new__(DSV4AttnMetadata)
+        core.cuda_int32_kwargs = self.kw
+        core.trtllm_table_pool = self.pool
+        core.present_ratios = (4,)
+        core.index_topk = 1024
+        core.seq_lens_casual = torch.full((n,), 500, **self.kw)
+        core.swa_page_indices = torch.zeros(n, SWA_WINDOW, **self.kw)
+        core.c4_sparse_topk_lengths = torch.full((n,), 125, **self.kw)
+        core.c128_page_indices = None
+        core.trtllm_topk_writes_table = True
+
+        core.c4_sparse_raw_indices = None
+        core.c4_sparse_page_indices = None
+        core.init_trtllm_sparse_buffers()
+        tail = core.trtllm_c4_indices[:, SWA_WINDOW:]
+        self.assertEqual(core.c4_sparse_page_indices.data_ptr(), tail.data_ptr())
+        self.assertEqual(core.c4_sparse_page_indices.stride(), tail.stride())
+        self.assertEqual(core.trtllm_c4_lens.tolist(), [125 + SWA_WINDOW] * n)
+
+        # A raw-indices side channel routes the indexer to the v1 kernel: no alias.
+        core.c4_sparse_raw_indices = torch.empty(1, **self.kw)
+        core.c4_sparse_page_indices = torch.full((n, tail.shape[1]), -1, **self.kw)
+        core.init_trtllm_sparse_buffers()
+        self.assertNotEqual(core.c4_sparse_page_indices.data_ptr(), tail.data_ptr())
+
+    def test_uniform_qmeta_floors_padded_requests_at_q_len(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
+
+        core = object.__new__(DSV4AttnMetadata)
+        core.cuda_int32_kwargs = self.kw
+        # Request 0: 100 committed + 4 new tokens; request 1: graph-padded (all 1s).
+        core.seq_lens_casual = torch.tensor([101, 102, 103, 104, 1, 1, 1, 1], **self.kw)
+        core.init_trtllm_uniform_qmeta(4)
+        self.assertEqual(core.trtllm_seq_lens_req.tolist(), [104, 4])
+        self.assertEqual(core.trtllm_cum_seq_lens_q.tolist(), [0, 4, 8])
 
 
 if __name__ == "__main__":

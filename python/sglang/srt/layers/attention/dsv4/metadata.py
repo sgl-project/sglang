@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_rows_per_chunk,
     mqa_logits_should_chunk,
 )
+from sglang.srt.mem_cache.dsv41_request_window import WindowLayout
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -137,7 +138,9 @@ def copy_metadata(
         if src_val is None and dst_val is None:
             continue
         assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-        if hasattr(dst_val, "copy_"):
+        if isinstance(dst_val, torch.Tensor) and isinstance(src_val, torch.Tensor):
+            copy_unless_aliased(dst_val, src_val)
+        elif isinstance(dst_val, WindowLayout):
             dst_val.copy_(src_val)
         else:
             warnings.warn(
@@ -382,6 +385,21 @@ class PagedIndexerMetadata:
             assign_fields=assign_fields,
         )
         self.nonpaged_plan = None
+
+
+def copy_unless_aliased(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """``dst.copy_(src)`` unless both already name the same storage.
+
+    Fields backed by persistent backend-owned storage (the trtllm
+    TrtllmSparseTablePool) hand out the same view in producer and consumer;
+    the content is already in place, so the self-copy is skipped."""
+    if (
+        dst.data_ptr() == src.data_ptr()
+        and dst.shape == src.shape
+        and dst.stride() == src.stride()
+    ):
+        return
+    dst.copy_(src)
 
 
 def maybe_copy_inplace(dst, *, src) -> None:
