@@ -277,6 +277,28 @@ class DecodeKVCacheOffloadManager:
         self._check_offload_progress(n_write)
         self._check_backup_progress(n_backup)
 
+    def drain_before_retraction(self):
+        """Drain offloads, then refuse retraction on every rank if any rank still tracks a D2H copy."""
+        self.check_offload_progress()
+        cc = self.cache_controller
+        # Retraction frees the device KV these copies read. Storage backups read only
+        # host memory, so they do not count.
+        pending = torch.tensor(
+            [bool(cc.ack_write_queue or self.ongoing_offload or self.offload_inflight)],
+            dtype=torch.int,
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                pending, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
+            )
+        if pending.item():
+            raise RuntimeError(
+                "Decode KV offload copies are still pending on some rank; "
+                f"refusing to retract (local: {len(cc.ack_write_queue)} acks, "
+                f"{len(self.ongoing_offload)} copies, "
+                f"{len(self.offload_inflight)} requests)."
+            )
+
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
         while finish_count > 0:
@@ -315,18 +337,19 @@ class DecodeKVCacheOffloadManager:
     def _release_finished_req(self, req: Req):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
         # so a previously-released request must be skipped here to avoid
-        # non-idempotent side effects (e.g. tree_cache.protected_size_
-        # double-decrement, host pool double-free).
+        # non-idempotent side effects (double free, double unpin).
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
 
         # Released only at request finish; a mid-decode free races with
-        # concurrent admission over live slots.
-        self.tree_cache.free_kv_row(req.kv, [(0, req.kv.kv_allocated_len)])
-
+        # concurrent admission over live slots. The prefix the prealloc match
+        # took from the tree stays with the tree: not freed, only unlocked.
+        self.tree_cache.free_kv_row(
+            req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
+        )
+        self.tree_cache.unpin(req)
         self.req_to_token_pool.free(req)
         req.kv.mark_kv_released()
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
         self.offloaded_state.pop(req, None)
 
     def _check_backup_progress(self, finish_count):

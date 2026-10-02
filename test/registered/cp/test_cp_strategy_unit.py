@@ -614,6 +614,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         swa_loc = torch.arange(5) + 16
         forward_batch = SimpleNamespace(
             out_cache_loc=cache_loc,
+            out_cache_loc_is_physical=False,
             encoder_out_cache_loc=torch.arange(3) + 32,
         )
         layer = SimpleNamespace(
