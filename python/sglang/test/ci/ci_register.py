@@ -166,6 +166,7 @@ def register_ppu_ci(
     """Marker for PPU CI registration (parsed via AST; runtime no-op)."""
     return None
 
+
 def register_mps_ci(
     est_time: float,
     suite: Optional[str] = None,
