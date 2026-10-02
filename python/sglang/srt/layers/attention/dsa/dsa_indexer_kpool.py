@@ -32,7 +32,14 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    ceil_align,
+    is_cuda,
+    is_hip,
+    is_npu,
+    print_warning_once,
+)
 
 if is_cuda():
     try:
@@ -74,6 +81,31 @@ def _should_fuse_kpool_topk(metadata: BaseIndexerMetadata) -> bool:
     return envs.SGLANG_DSA_FUSE_TOPK.get() and not getattr(
         metadata, "force_unfused_topk", False
     )
+
+
+def _topk_v2_plan_for(
+    owned_plan: Optional[torch.Tensor], pool_lens: torch.Tensor
+) -> Optional[torch.Tensor]:
+    from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+        build_kpool_topk_v2_plan,
+    )
+
+    if owned_plan is not None and owned_plan.shape[0] == pool_lens.shape[0] + 1:
+        return owned_plan
+    if owned_plan is not None:
+        # A rebuild captured into a graph would launch on every replay, per layer.
+        assert not (
+            capture_mode.is_capture_mode or torch.cuda.is_current_stream_capturing()
+        ), (
+            "k-pool top-k v2: metadata plan covers "
+            f"{owned_plan.shape[0] - 1} rows but the sliced pooled lengths have "
+            f"{pool_lens.shape[0]}; refusing to rebuild it inside a CUDA graph"
+        )
+        print_warning_once(
+            "k-pool top-k v2: metadata plan does not match the sliced pooled "
+            "lengths; rebuilding it per layer."
+        )
+    return build_kpool_topk_v2_plan(pool_lens)
 
 
 def _slice_rows(
@@ -759,6 +791,7 @@ class IndexerKPool(MultiPlatformOp):
         row_starts: Optional[torch.Tensor] = None,
         out_rows: Optional[int] = None,
         page_table_row_index: Optional[torch.Tensor] = None,
+        topk_v2_plan: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             topk_from_pooled_history_logits,
@@ -787,6 +820,7 @@ class IndexerKPool(MultiPlatformOp):
             row_starts=row_starts,
             out_rows=out_rows,
             page_table_row_index=page_table_row_index,
+            topk_v2_plan=topk_v2_plan,
         )
 
     def _get_kpool_decode_metadata(
@@ -796,7 +830,13 @@ class IndexerKPool(MultiPlatformOp):
         seqlens_32: torch.Tensor,
         blocksize: int,
         build_schedule_metadata: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             build_pooled_page_table_64,
         )
@@ -819,9 +859,13 @@ class IndexerKPool(MultiPlatformOp):
                 pool_context_lens,
                 pool_block_tables,
                 pool_schedule_metadata,
+                _topk_v2_plan_for(
+                    owned_plan=plan.pool_topk_v2_plan, pool_lens=pool_seqlens
+                ),
             )
 
         pool_seqlens = attn_metadata.pooled_cache_seqlens_int32
+        topk_v2_plan = attn_metadata.pooled_topk_v2_plan
         pool_block_tables = attn_metadata.pooled_real_page_table
         pool_schedule_metadata = attn_metadata.pooled_paged_mqa_schedule_metadata
 
@@ -837,6 +881,7 @@ class IndexerKPool(MultiPlatformOp):
                 block_tables, self.index_kpool
             ).contiguous()
             pool_schedule_metadata = None
+            topk_v2_plan = None
         else:
             pool_seqlens = pool_seqlens[: seqlens_32.shape[0]]
             pool_block_tables = pool_block_tables[
@@ -855,6 +900,7 @@ class IndexerKPool(MultiPlatformOp):
             pool_context_lens,
             pool_block_tables,
             pool_schedule_metadata,
+            _topk_v2_plan_for(owned_plan=topk_v2_plan, pool_lens=pool_seqlens),
         )
 
     @staticmethod
@@ -993,16 +1039,18 @@ class IndexerKPool(MultiPlatformOp):
             and self._should_use_tilelang_paged_mqa_logits(q_fp8)
         )
 
-        pool_seqlens, pool_context_lens, pool_block_tables, pool_schedule_metadata = (
-            self._get_kpool_decode_metadata(
-                metadata,
-                block_tables,
-                seqlens_32,
-                blocksize,
-                build_schedule_metadata=not (
-                    use_aiter_paged_mqa or use_tilelang_paged_mqa
-                ),
-            )
+        (
+            pool_seqlens,
+            pool_context_lens,
+            pool_block_tables,
+            pool_schedule_metadata,
+            topk_v2_plan,
+        ) = self._get_kpool_decode_metadata(
+            metadata,
+            block_tables,
+            seqlens_32,
+            blocksize,
+            build_schedule_metadata=not (use_aiter_paged_mqa or use_tilelang_paged_mqa),
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
         if use_aiter_paged_mqa:
@@ -1057,6 +1105,7 @@ class IndexerKPool(MultiPlatformOp):
         topk_result = self._topk_from_kpool_logits(
             logits,
             pool_seqlens,
+            topk_v2_plan=topk_v2_plan,
             seq_lens=seqlens_32,
             page_table=page_table_1,
             topk_offsets=topk_offsets,
@@ -1081,11 +1130,27 @@ class IndexerKPool(MultiPlatformOp):
         row_chunks: Tuple[slice, ...],
         out_rows: Optional[int],
     ) -> torch.Tensor:
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            build_kpool_topk_v2_plan,
+            can_use_kpool_topk_v2,
+        )
+
         # Each row's top-k reads only its own logits row, pooled length and
         # page-table row, so row chunks select the same pages as one pass.
         single_chunk = len(row_chunks) == 1
         topk_result = None
         for rows in row_chunks:
+            chunk_row_starts = _slice_rows(tensor=topk_row_starts, rows=rows)
+            chunk_page_table_row_index = _slice_rows(
+                tensor=page_table_row_index, rows=rows
+            )
+            # V2 reads its plan before the PDL wait; launch the logits producer in between.
+            # Empty logits skip the v2 launch, so no producer is needed in that case.
+            topk_v2_plan = (
+                build_kpool_topk_v2_plan(pool_lens[rows])
+                if chunk_row_starts is None and chunk_page_table_row_index is None
+                else None
+            )
             if kv_fp8 is None:
                 # No pooled keys yet: every row scores an empty key set.
                 logits = torch.empty(
@@ -1108,6 +1173,16 @@ class IndexerKPool(MultiPlatformOp):
             topk_chunk = self._topk_from_kpool_logits(
                 logits=logits,
                 pool_lens=pool_lens[rows],
+                topk_v2_plan=(
+                    topk_v2_plan
+                    if can_use_kpool_topk_v2(
+                        logits=logits,
+                        pool_size=self.index_kpool,
+                        row_starts=chunk_row_starts,
+                        page_table_row_index=chunk_page_table_row_index,
+                    )
+                    else None
+                ),
                 seq_lens=_slice_rows(tensor=seq_lens, rows=rows),
                 # Addressed by request-pool ID through page_table_row_index,
                 # so never sliced; without a row index it is per-query.
@@ -1117,11 +1192,9 @@ class IndexerKPool(MultiPlatformOp):
                     else _slice_rows(tensor=page_table, rows=rows)
                 ),
                 topk_offsets=_slice_rows(tensor=topk_offsets, rows=rows),
-                row_starts=_slice_rows(tensor=topk_row_starts, rows=rows),
+                row_starts=chunk_row_starts,
                 out_rows=out_rows if single_chunk else None,
-                page_table_row_index=_slice_rows(
-                    tensor=page_table_row_index, rows=rows
-                ),
+                page_table_row_index=chunk_page_table_row_index,
             )
             if single_chunk:
                 return topk_chunk

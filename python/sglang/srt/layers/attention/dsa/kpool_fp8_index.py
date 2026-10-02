@@ -4,10 +4,14 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
 )
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
 
 BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
@@ -582,6 +586,91 @@ def _append_kpool_tail_to_topk_kernel(
     tl.store(out_ptr + row * out_stride_0 + cols * out_stride_1, value, mask=mask)
 
 
+def kpool_topk_v2_enabled() -> bool:
+    return _is_cuda and envs.SGLANG_OPT_USE_TOPK_V2.get()
+
+
+def build_kpool_topk_v2_plan(pool_lens: torch.Tensor) -> Optional[torch.Tensor]:
+    if not kpool_topk_v2_enabled():
+        return None
+    plan = pool_lens.new_empty((pool_lens.shape[0] + 1, 2), dtype=torch.int32)
+    # Cluster plan entries embed lengths; refresh them whenever pool_lens changes.
+    refresh_kpool_topk_v2_plan(plan=plan, pool_lens=pool_lens)
+    return plan
+
+
+def refresh_kpool_topk_v2_plan(plan: torch.Tensor, pool_lens: torch.Tensor) -> None:
+    from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+
+    # Keep the captured address; zero entries the planner leaves unwritten for small batches.
+    plan.zero_()
+    plan_topk_v2(pool_lens.to(torch.int32), out=plan)
+
+
+def can_use_kpool_topk_v2(
+    logits: torch.Tensor,
+    pool_size: int,
+    *,
+    row_starts: torch.Tensor | None,
+    page_table_row_index: torch.Tensor | None,
+) -> bool:
+    # V2 loads complete 16B vectors, including the last partial pool-length vector.
+    # Require aligned rows and a width covering that read, even without allocation padding.
+    return (
+        kpool_topk_v2_enabled()
+        and row_starts is None
+        and page_table_row_index is None
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+        and logits.shape[1] % 4 == 0
+        and logits.data_ptr() % 16 == 0
+        and pool_size > 1
+        and pool_size & (pool_size - 1) == 0
+    )
+
+
+def _kpool_topk_v2(
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    pool_size: int,
+    topk: int,
+    *,
+    page_table: torch.Tensor | None,
+    topk_offsets: torch.Tensor | None,
+    seq_lens: torch.Tensor | None,
+    out_rows: int | None,
+    topk_v2_plan: torch.Tensor | None,
+) -> torch.Tensor:
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_kpool_v2
+
+    rows = logits.shape[0]
+    # The caller supplies a plan over these pooled lengths; routing never rebuilds it.
+    assert topk_v2_plan is not None and topk_v2_plan.shape[0] == rows + 1, (
+        "k-pool top-k v2 needs a plan built from the same pooled lengths, "
+        f"got {None if topk_v2_plan is None else tuple(topk_v2_plan.shape)} "
+        f"for {rows} rows"
+    )
+    group_lengths = group_lengths.to(torch.int32)
+    out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
+    # Padded rows past `rows` keep the -1 fill; the kernel writes only real rows.
+    if out_rows is None or out_rows == rows:
+        full = logits.new_empty((rows, out_cols), dtype=torch.int32)
+    else:
+        full = logits.new_full((out_rows, out_cols), -1, dtype=torch.int32)
+    topk_transform_kpool_v2(
+        scores=logits,
+        pool_lens=group_lengths,
+        out=full[:rows],
+        pool_size=pool_size,
+        metadata=topk_v2_plan,
+        token_seq_lens=None if seq_lens is None else seq_lens.to(torch.int32),
+        page_table=page_table,
+        out_offsets=topk_offsets,
+    )
+    return full
+
+
 def topk_from_pooled_history_logits(
     logits: torch.Tensor,
     group_lengths: torch.Tensor,
@@ -593,6 +682,7 @@ def topk_from_pooled_history_logits(
     row_starts: torch.Tensor | None = None,
     out_rows: int | None = None,
     page_table_row_index: torch.Tensor | None = None,
+    topk_v2_plan: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert logits.ndim == 2
     assert group_lengths.ndim == 1
@@ -618,6 +708,24 @@ def topk_from_pooled_history_logits(
         raise NotImplementedError(
             "index_kpool topk requires CUDA float32 logits; PyTorch topk fallback "
             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
+        )
+
+    if can_use_kpool_topk_v2(
+        logits=logits,
+        pool_size=pool_size,
+        row_starts=row_starts,
+        page_table_row_index=page_table_row_index,
+    ):
+        return _kpool_topk_v2(
+            logits=logits,
+            group_lengths=group_lengths,
+            pool_size=pool_size,
+            topk=topk,
+            page_table=page_table,
+            topk_offsets=topk_offsets,
+            seq_lens=seq_lens,
+            out_rows=out_rows,
+            topk_v2_plan=topk_v2_plan,
         )
 
     if group_topk in (128, 160, 192, 224, 256, 512):
