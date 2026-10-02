@@ -719,7 +719,26 @@ impl TokenizerRegistry {
             adapter::note_k3_encoder(adapter::K3EncoderState::Active);
             return Some(ChatEncoder::KimiK3(tk));
         }
-        match adapter::load_tokenizer_config(tokenizer_path) {
+        // A sibling `chat_template.jinja` overrides the config's `chat_template`
+        // (transformers' precedence); it may also be the only template source.
+        let cfg = adapter::load_tokenizer_config(tokenizer_path);
+        let jinja = adapter::load_chat_template_jinja(tokenizer_path).unwrap_or_else(|e| {
+            tracing::warn!(model = %model_id, error = %e,
+                "failed to read chat_template.jinja; using tokenizer_config.json only");
+            None
+        });
+        let cfg = match (cfg, jinja) {
+            (Ok(cfg_json), Some(tmpl)) => {
+                let mut cfg_json = cfg_json.unwrap_or_else(|| serde_json::json!({}));
+                if let Some(obj) = cfg_json.as_object_mut() {
+                    obj.insert("chat_template".into(), serde_json::Value::String(tmpl));
+                }
+                tracing::info!(model = %model_id, "chat template taken from chat_template.jinja");
+                Ok(Some(cfg_json))
+            }
+            (cfg, _) => cfg,
+        };
+        match cfg {
             Ok(Some(cfg_json)) => match ChatTemplate::from_tokenizer_config(&cfg_json) {
                 Ok(Some(tmpl)) => {
                     tracing::info!(model = %model_id,
@@ -1714,6 +1733,74 @@ mod tests {
             .unwrap()
             .expect("the directory's own tokenizer_config.json is loaded");
         assert_eq!(cfg["chat_template"], "REAL");
+    }
+
+    /// Step-5-style checkpoint: `tokenizer_config.json` has no `chat_template`,
+    /// the template ships only as `chat_template.jinja` (and uses
+    /// `{% generation %}`). The router must still pick it up.
+    #[test]
+    fn chat_template_jinja_file_enables_chat_encoder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            "tests/fixtures/tiny_tokenizer.json",
+            dir.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"bos_token":"<s>"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{{ bos_token }}{% for m in messages %}{% generation %}{{ m['content'] }}{% endgeneration %}{% endfor %}",
+        )
+        .unwrap();
+        assert_eq!(
+            adapter::load_chat_template_jinja(dir.path().to_str().unwrap()).unwrap().as_deref(),
+            Some("{{ bos_token }}{% for m in messages %}{% generation %}{{ m['content'] }}{% endgeneration %}{% endfor %}"),
+        );
+        let mut c = cfg();
+        c.model.tokenizer_path = dir
+            .path()
+            .join("tokenizer.json")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let reg = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert!(reg.has_chat_encoder(&c.model.id));
+    }
+
+    /// transformers' precedence: a sibling `chat_template.jinja` wins over the
+    /// config field (here the config's template would not even compile).
+    #[test]
+    fn chat_template_jinja_overrides_tokenizer_config_template() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            "tests/fixtures/tiny_tokenizer.json",
+            dir.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"{% invalid %}","bos_token":"<s>"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("chat_template.jinja"), "{{ bos_token }}X").unwrap();
+        let mut c = cfg();
+        c.model.tokenizer_path = dir.path().to_str().unwrap().to_owned();
+        let reg = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert!(reg.has_chat_encoder(&c.model.id));
+    }
+
+    #[test]
+    fn load_chat_template_jinja_absent_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("tokenizer.json");
+        std::fs::write(&tok, "{}").unwrap();
+        assert!(adapter::load_chat_template_jinja(tok.to_str().unwrap())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

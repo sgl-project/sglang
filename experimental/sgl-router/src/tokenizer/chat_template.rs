@@ -98,7 +98,7 @@ impl ChatTemplate {
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_function("raise_exception", raise_exception);
         env.add_function("strftime_now", strftime_now);
-        env.add_template_owned(TEMPLATE_NAME, template_src)
+        env.add_template_owned(TEMPLATE_NAME, strip_generation_tags(&template_src))
             .context("compile chat template from tokenizer_config.json")?;
 
         Ok(Some(Self {
@@ -137,6 +137,34 @@ impl ChatTemplate {
         }
         tmpl.render(ctx).context("render chat template")
     }
+}
+
+/// Remove `{% generation %}` / `{% endgeneration %}` (with optional `-`
+/// whitespace control) and keep the body.
+///
+/// transformers registers these as an extension that only marks assistant spans
+/// for `return_assistant_tokens_mask`; they render nothing. minijinja has no
+/// such statement, so the whole template would fail to compile (Step-5 ships
+/// one) and routing would fall back to raw text.
+fn strip_generation_tags(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(start) = rest.find("{%") {
+        let Some(len) = rest[start..].find("%}").map(|e| e + 2) else {
+            break;
+        };
+        let inner = rest[start + 2..start + len - 2]
+            .trim_start_matches('-')
+            .trim_end_matches('-')
+            .trim();
+        out.push_str(&rest[..start]);
+        if inner != "generation" && inner != "endgeneration" {
+            out.push_str(&rest[start..start + len]);
+        }
+        rest = &rest[start + len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Pull the chat-template source out of `tokenizer_config.json`.
@@ -200,6 +228,56 @@ mod tests {
             {"role": "system", "content": "be brief"},
             {"role": "user", "content": "hi"}
         ])
+    }
+
+    #[test]
+    fn strip_generation_tags_keeps_body_and_other_tags() {
+        assert_eq!(
+            strip_generation_tags("A{% generation %}B{% endgeneration %}C"),
+            "ABC"
+        );
+        assert_eq!(
+            strip_generation_tags("A{%- generation -%}B{%-endgeneration%}C"),
+            "ABC"
+        );
+        assert_eq!(
+            strip_generation_tags("{% if x %}{% generation %}y{% endgeneration %}{% endif %}{% set generation_x = 1 %}"),
+            "{% if x %}y{% endif %}{% set generation_x = 1 %}"
+        );
+        assert_eq!(
+            strip_generation_tags("no tags {{ a }} %}"),
+            "no tags {{ a }} %}"
+        );
+        assert_eq!(
+            strip_generation_tags("dangling {% generation"),
+            "dangling {% generation"
+        );
+    }
+
+    /// Step-5 wraps assistant content in `{% generation %}`; minijinja has no
+    /// such statement, so without stripping the template fails to compile.
+    #[test]
+    fn template_with_generation_tags_compiles_and_renders_like_without() {
+        let with = "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{% if m['role'] == 'assistant' %}{% generation %}{{ m['content'] }}{% endgeneration %}{% else %}{{ m['content'] }}{% endif %}{% endfor %}";
+        let without = "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{% if m['role'] == 'assistant' %}{{ m['content'] }}{% else %}{{ m['content'] }}{% endif %}{% endfor %}";
+        let msgs =
+            json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]);
+        let a = ChatTemplate::from_tokenizer_config(
+            &json!({"chat_template": with, "bos_token": "<s>"}),
+        )
+        .unwrap()
+        .unwrap()
+        .render(&msgs)
+        .unwrap();
+        let b = ChatTemplate::from_tokenizer_config(
+            &json!({"chat_template": without, "bos_token": "<s>"}),
+        )
+        .unwrap()
+        .unwrap()
+        .render(&msgs)
+        .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, "<s><|user|>hi<|assistant|>yo");
     }
 
     #[test]
