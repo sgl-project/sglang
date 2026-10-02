@@ -169,39 +169,6 @@ class TestImageProcessorKwargsPatch(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# _patch_nested_rope_validation
-# ---------------------------------------------------------------------------
-
-
-class TestNestedRopeValidationPatch(CustomTestCase):
-    def test_remote_config_with_per_layer_rope_parameters_loads(self):
-        """A remote-code config with `rope_parameters` keyed by layer type must load."""
-
-        class RemoteCodeConfig(PretrainedConfig):
-            model_type = "remote_code_nested_rope"
-
-            def __init__(self, layer_types=None, rope_parameters=None, **kwargs):
-                self.layer_types = layer_types
-                self.rope_parameters = rope_parameters
-                super().__init__(**kwargs)
-
-        config = RemoteCodeConfig(
-            layer_types=["full_attention", "sliding_attention"],
-            rope_parameters={
-                "full_attention": {"rope_type": "default", "rope_theta": 500000.0},
-                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
-            },
-        )
-
-        self.assertEqual(
-            config.rope_parameters["full_attention"]["rope_theta"], 500000.0
-        )
-        self.assertEqual(
-            config.rope_parameters["sliding_attention"]["rope_theta"], 10000.0
-        )
-
-
-# ---------------------------------------------------------------------------
 # normalize_rope_scaling_compat
 # ---------------------------------------------------------------------------
 

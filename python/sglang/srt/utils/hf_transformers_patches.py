@@ -249,8 +249,6 @@ def _patch_nested_rope_validation():
             try:
                 return _orig(self)
             except AttributeError:
-                # A nested `rope_parameters` can hold scalars beside its per-layer
-                # dicts (Laguna's `rope_theta`), and v5.17 calls `.get` on every value.
                 # Backport of huggingface/transformers#48798; drop once transformers >= 5.18.
                 rope_parameters = getattr(self, "rope_parameters", None)
                 layer_types = getattr(self, "layer_types", None) or ()
