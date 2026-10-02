@@ -148,6 +148,20 @@ buckets and are not accepted on this path.
 
 Omitting `--chat-routing` keeps the existing policies and defaults.
 
+Both reorg affinity policies accept `--affinity-mode prefer` (default) or
+`balanced`. Prefer keeps an admissible session binding or the best admissible
+prefix owner. Balanced samples a power-of-two alternative and switches only
+when the affinity engine's waiting uncached tokens exceed both
+`alternative * --affinity-load-factor` (default 2) and
+`alternative + --affinity-load-gap` (default 1024). Missing fresh native load
+preserves admissible affinity; ties also preserve it.
+
+Both modes fall back within the group when affinity fails admission, excluding
+rejected engines. The fallback winner must pass admission; failure advances to
+the next bucket. Session replacements are bound after admission during selection,
+not after dispatch. Reorg rejects legacy pressure guards, cache switch margins,
+and queue/saturation gates in favor of these shared affinity settings.
+
 ### Optional tokenizer for load-only routing
 
 `--no-tokenizer` skips tokenizer loading for load-only policies such as

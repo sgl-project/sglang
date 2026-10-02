@@ -500,9 +500,13 @@ pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
 /// this, so the no-affinity path never drifts from the configured default.
 pub const DEFAULT_MIN_LOAD_CHOICES: usize = 2;
 
-/// Controls whether admission may select a session-affinity backup.
+/// Affinity preference; legacy routing uses Strict/Soft, reorg uses Prefer/Balanced.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum AffinityMode {
+    /// Reorg: retain admissible affinity, otherwise fall back and rebind.
+    Prefer,
+    /// Reorg: allow a sufficiently less-loaded alternative.
+    Balanced,
     /// Keep the primary after it passes admission.
     #[value(name = "strict")]
     Strict,
@@ -535,6 +539,8 @@ pub struct AffinityConfig {
     pub session_eviction_interval_secs: u64,
     pub stable_pair: bool,
     pub mode: AffinityMode,
+    pub load_factor: f64,
+    pub load_gap: u64,
     pub session_affinity_mode: SessionAffinityMode,
     pub pressure_guard: bool,
     pub pressure_abs_threshold_tokens: u64,
@@ -574,6 +580,8 @@ impl Default for AffinityConfig {
             session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
             stable_pair: false,
             mode: AffinityMode::Soft,
+            load_factor: 2.0,
+            load_gap: 1_024,
             session_affinity_mode: SessionAffinityMode::Bucket,
             pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
