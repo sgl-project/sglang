@@ -1386,6 +1386,9 @@ class Envs:
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # GDN --enable-linear-replayssm-spec: recurrent verify writing the raw window
+    # to a ring, folded on commit, instead of the compact circular replay.
+    SGLANG_ENABLE_GDN_REPLAYSSM_FOLD = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)

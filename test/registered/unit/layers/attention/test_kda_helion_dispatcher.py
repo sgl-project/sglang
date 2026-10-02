@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels.kda_helion import HelionKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
@@ -145,6 +146,26 @@ class TestHelionKDADispatcher(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "Triton, or Helion"):
                 handle_linear_attn_backend(flashinfer_args)
+
+    def test_gdn_replayssm_fold_refuses_pipeline_parallelism(self):
+        def args(pp_size):
+            return ServerArgs(
+                model_path="dummy",
+                linear_attn_decode_backend="triton",
+                enable_linear_replayssm_spec=True,
+                pp_size=pp_size,
+            )
+
+        with (
+            envs.SGLANG_ENABLE_GDN_REPLAYSSM_FOLD.override(True),
+            override_platform(is_sm100=False),
+            override_platform(is_cuda=False),
+        ):
+            handle_linear_attn_backend(args(1))
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_ENABLE_GDN_REPLAYSSM_FOLD does not support pipeline"
+            ):
+                handle_linear_attn_backend(args(2))
 
     def test_explicit_base_backend_is_not_replaced_by_flashinfer(self):
         args = ServerArgs(
