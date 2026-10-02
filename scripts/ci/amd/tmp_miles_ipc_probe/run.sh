@@ -17,6 +17,15 @@ run() {
   done
 }
 
+rocm-smi --showtopotype 2>/dev/null | head -20
+for pre in 0 1; do
+  for r in 1 2 3; do
+    echo "===== gist PRE_IPC=${pre} (run ${r})"
+    PRE_IPC=${pre} LD_PRELOAD="${PRELOAD}" timeout 300 python gist_repro.py 2>&1 | grep -v "^\s*$" | grep -vi warn
+    echo "exit ${PIPESTATUS[0]}"
+  done
+done
+
 for mode in base pre_ipc self_ipc post_resume_dummy scratch_first sync_after_open touch_before copy_twice recv_1gpu; do
   run "${mode}" MODE="${mode}"
 done

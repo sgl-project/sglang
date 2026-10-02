@@ -89,7 +89,6 @@ def receiver(q, done):
 
         rebuild, args = q.get()
         flat = rebuild(*args)
-        srcs = make_srcs(it)
         if MODE == "sync_after_open":
             torch.cuda.synchronize()
             time.sleep(1)
@@ -97,6 +96,8 @@ def receiver(q, done):
             flat.clone()
             torch.cuda.synchronize()
         copy_in(weights, flat)
+        # Only after the copy: GPU work between the IPC open and the copy can hide the bug.
+        srcs = make_srcs(it)
         report(f"iter {it}", weights, srcs)
         if MODE == "copy_twice" and it == 0:
             copy_in(weights, flat)

@@ -15,8 +15,12 @@ permissions:
 jobs:
   probe:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: linux-mi300-2gpu-sglang
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi300-2gpu-sglang, linux-mi300-8gpu-sglang]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
