@@ -120,6 +120,7 @@ from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    AbortWeightsFromDeltaReqInput,
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
@@ -132,8 +133,10 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CommitWeightsFromDeltaReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ContinueWeightsFromDeltaReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -149,6 +152,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
+    GetWeightsDeltaInfoReqInput,
+    GetWeightsDeltaStatusReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -161,6 +166,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PrepareWeightsFromDeltaReqInput,
     ProfileReq,
     PullWeightsReqInput,
     RegisterLoRAAdapterReqInput,
@@ -185,6 +191,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDeltaReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -1718,8 +1725,18 @@ class Scheduler(
             )
 
     def init_request_dispatcher(self):
+        from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaSchedulerControl
+
+        self.gpu_delta_control = GpuDeltaSchedulerControl(self)
         self._request_dispatcher = TypeBasedDispatcher(
             [
+                (GetWeightsDeltaInfoReqInput, self.gpu_delta_control.handle),
+                (PrepareWeightsFromDeltaReqInput, self.gpu_delta_control.handle),
+                (GetWeightsDeltaStatusReqInput, self.gpu_delta_control.handle),
+                (UpdateWeightsFromDeltaReqInput, self.gpu_delta_control.handle),
+                (CommitWeightsFromDeltaReqInput, self.gpu_delta_control.handle),
+                (AbortWeightsFromDeltaReqInput, self.gpu_delta_control.handle),
+                (ContinueWeightsFromDeltaReqInput, self.gpu_delta_control.handle),
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
@@ -2105,7 +2122,9 @@ class Scheduler(
                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
                 continue
 
-            output = self._request_dispatcher(recv_req)
+            output = self.gpu_delta_control.reject_conflicting(recv_req)
+            if output is None:
+                output = self._request_dispatcher(recv_req)
             if output is not None:
                 if self.rust_server is not None:
                     # Embedded Rust server: every control-request response goes
@@ -5596,6 +5615,12 @@ class Scheduler(
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
         self._engine_paused = True
+        try:
+            self.gpu_delta_control.before_pause(recv_req.mode)
+        except Exception:
+            # A failed reader fence must never proceed to cache reclamation.
+            logger.exception("GPU delta pause failed; engine remains paused")
+            return
 
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
@@ -5686,6 +5711,9 @@ class Scheduler(
         self.kv_events_publisher.publish_kv_events()
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        if not self.gpu_delta_control.may_resume(recv_req.delta_session_id):
+            logger.error("Refusing resume while a GPU delta session owns the model")
+            return
         if recv_req.torch_empty_cache:
             before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
             torch.cuda.empty_cache()

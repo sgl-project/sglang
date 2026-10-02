@@ -658,11 +658,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
     def _dispatch_to_scheduler(self, obj: Any) -> None:
+        from sglang.srt.weight_sync.gpu_delta_session import guard_tokenizer_dispatch
+
+        guard_tokenizer_dispatch(self, obj)
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
         sock_send(self.send_to_scheduler, obj)
 
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
+        from sglang.srt.weight_sync.gpu_delta_session import guard_tokenizer_dispatch
+
+        guard_tokenizer_dispatch(self, obj)
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
         await async_sock_send(self.send_to_scheduler, obj)
@@ -2232,6 +2238,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
+        if getattr(self, "_gpu_delta_session_id", None):
+            from sglang.srt.managers.io_struct import GetWeightsDeltaStatusReqInput
+
+            if obj.mode != "retract":
+                raise ValueError("GPU delta requires retract pause")
+            result = await self.gpu_delta_request(
+                GetWeightsDeltaStatusReqInput(
+                    session_id=self._gpu_delta_session_id,
+                )
+            )
+            if not result["success"] or any(
+                item["state"] not in {"PREPARED", "QUIESCED"}
+                for item in result["participants"]
+            ):
+                raise ValueError("all original ranks must be prepared before pause")
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
@@ -2247,6 +2268,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
+        if (
+            getattr(self, "_gpu_delta_session_id", None)
+            and obj.delta_session_id is None
+        ):
+            raise ValueError(
+                "GPU delta session requires a global commit certificate before resume"
+            )
+        if obj.delta_session_id is not None:
+            from sglang.srt.managers.io_struct import ContinueWeightsFromDeltaReqInput
+
+            if not obj.delta_commit_receipts:
+                raise ValueError(
+                    "GPU delta resume requires every engine's committed receipts"
+                )
+            result = await self.gpu_delta_request(
+                ContinueWeightsFromDeltaReqInput(
+                    session_id=obj.delta_session_id,
+                    receipts=obj.delta_commit_receipts,
+                )
+            )
+            if not result["success"]:
+                raise ValueError(result["message"] or "GPU delta resume rejected")
+            self._gpu_delta_session_id = None
+            self._update_weight_version_if_provided(
+                str(result["participants"][0]["target_version"])
+            )
+            async with self.is_pause_cond:
+                self.is_pause = False
+                self.is_pause_cond.notify_all()
+            return result
         async with self.is_pause_cond:
             self.is_pause = False
             await self._async_dispatch_to_scheduler(obj)

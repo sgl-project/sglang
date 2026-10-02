@@ -1863,6 +1863,8 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
     # inference resumes, with no race against active streams. Set to
     # False to skip the empty_cache call.
     torch_empty_cache: bool = True
+    delta_session_id: Optional[str] = None
+    delta_commit_receipts: Optional[List[Dict[str, Any]]] = None
 
 
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
@@ -1907,6 +1909,54 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     message: str
     # Number of paused requests during weight sync.
     num_paused_requests: int = 0
+
+
+class GetWeightsDeltaInfoReqInput(BaseReq, kw_only=True):
+    engine_id: str
+
+
+class PrepareWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+    session_id: str
+    engine_id: str
+    manifest_path: str
+    manifest_sha256: str
+    stream_id: str
+    base_version: int
+    target_version: int
+    plan_digest: str
+    participants: List[Dict[str, Any]]
+    cohort: List[Dict[str, Any]]
+    expected_engines: List[str]
+
+
+class GetWeightsDeltaStatusReqInput(BaseReq, kw_only=True):
+    session_id: str
+
+
+class UpdateWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+    session_id: str
+    participants: List[Dict[str, Any]]
+    receipts: List[Dict[str, Any]]
+
+
+class CommitWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+    session_id: str
+    receipts: List[Dict[str, Any]]
+
+
+class AbortWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+    session_id: str
+
+
+class ContinueWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+    session_id: str
+    receipts: List[Dict[str, Any]]
+
+
+class DeltaWeightsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    participant: Dict[str, Any]
 
 
 class PullWeightsReqInput(BaseReq, kw_only=True):
@@ -2086,7 +2136,8 @@ class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
 
 
 class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
@@ -2107,7 +2158,8 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
@@ -2117,7 +2169,8 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
