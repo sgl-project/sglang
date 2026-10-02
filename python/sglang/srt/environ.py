@@ -1762,6 +1762,9 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # Opt-in gfx950 TP4 decode indexer context partitioning. Keeps the index
+    # cache replicated; gathers Q and exchanges local top-k candidates.
+    SGLANG_MINIMAX_M3_INDEXER_CP = EnvBool(False)
     # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
     # main attention K/V keep kv_cache_dtype.
     SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)
