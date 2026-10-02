@@ -3,11 +3,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
+import signal
 import struct
 import threading
 import time
 import uuid
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -40,6 +43,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.nixl.peer_recovery import PeerRecovery
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_dsa_tail_transfer_blocks,
@@ -51,21 +55,27 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import run_with_deadline
+from sglang.srt.utils.common import check_pkg_version_at_least, run_with_deadline
 
 try:
     from nixl._bindings import (
         nixlBackendError,
         nixlCancelledError,
+        nixlNotFoundError,
         nixlRemoteDisconnectError,
     )
 
+    _NIXL_REMOTE_DISCONNECT_ERRORS = (nixlRemoteDisconnectError,)
+    _NIXL_NOT_FOUND_ERRORS = (nixlNotFoundError,)
     _NIXL_TRANSPORT_ERRORS = (
         nixlRemoteDisconnectError,
         nixlBackendError,
         nixlCancelledError,
+        nixlNotFoundError,
     )
 except ImportError:
+    _NIXL_REMOTE_DISCONNECT_ERRORS = ()
+    _NIXL_NOT_FOUND_ERRORS = ()
     _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
 
 logger = logging.getLogger(__name__)
@@ -424,6 +434,8 @@ class TransferStatus:
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
+    _peer_recovery: Optional[PeerRecovery] = None
+
     # The decode control socket multiplexes tagged messages, so the status
     # message is tagged too. It is new to NIXL, hence free to carry the reason.
     kv_status_msg_tag = b"KV_STATUS"
@@ -513,6 +525,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         logger.info(f"NIXL KVManager initialized with backend: {backend}")
 
+        self._init_peer_recovery(backend)
         self.register_buffer_to_engine()
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -569,6 +582,29 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _init_peer_recovery(self, backend):
+        self._peer_recovery = None
+        if not (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and backend == "UCX"
+            and envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_RECONNECT.get()
+            and check_pkg_version_at_least("nixl", "1.4.1")
+        ):
+            return
+        self._recovery_parent_pid = os.getppid()
+        self._peer_recovery = PeerRecovery(
+            agent=self.agent,
+            metadata=lambda peer: self.decode_kv_args_table[peer].agent_metadata,
+            rebuild=self._rebuild_peer_descriptors,
+            shutdown=self._shutdown_on_recovery_failure,
+        )
+
+    def _shutdown_on_recovery_failure(self, reason):
+        logger.error("NIXL transfers could not be retired; shutting down: %s", reason)
+        os.kill(self._recovery_parent_pid, signal.SIGQUIT)
+        # Parent diagnostics delay shutdown; stop source-page reuse immediately.
+        os._exit(1)
 
     def _init_staging_prefill_ctx(self):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -725,6 +761,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         before the barrier ran. A state that cannot be read counts as running,
         since it does not prove the write into the decode's pages is over.
         """
+        if self._peer_recovery is not None and self._peer_recovery.batch is not None:
+            return self._peer_recovery.batch.wait(
+                failure_seen=failure_seen,
+                timeout=NIXL_ERR_SETTLE_TIMEOUT_S,
+                poll_interval=NIXL_ERR_SETTLE_POLL_S,
+                disconnect_errors=_NIXL_REMOTE_DISCONNECT_ERRORS,
+                missing_errors=_NIXL_NOT_FOUND_ERRORS,
+            )
         deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S if failure_seen else None
         while True:
             all_settled = True
@@ -1238,6 +1282,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         room,
                     )
                     self._staging_outstanding.pop(room, None)
+                    if (
+                        self._peer_recovery is not None
+                        and self.enable_deferred_decode_kv_release
+                    ):
+                        self._maybe_ack_drained_abort(room)
                     continue
 
                 # Counted at dequeue, before the status check, so
@@ -1263,6 +1312,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         room,
                     )
                     self._staging_outstanding.pop(room, None)
+                    if (
+                        self._peer_recovery is not None
+                        and self.enable_deferred_decode_kv_release
+                    ):
+                        self._maybe_ack_drained_abort(room)
                     continue
 
                 # Lazily build a per-worker staging strategy bound to this
@@ -1277,6 +1331,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 self.update_status(room, KVPoll.Transferring)
 
                 reqs_to_be_processed = list(room_transfer_infos.values())
+                if self._peer_recovery is not None:
+                    self._peer_recovery.begin(
+                        req.agent_name
+                        for req in reqs_to_be_processed
+                        if not req.is_dummy
+                    )
                 # Note(kpham-sgl): Pack each DCP rank once into its fixed region.
                 # NIXL reads regions asynchronously; the chunk barrier prevents
                 # reuse until every transfer completes.
@@ -1488,6 +1548,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         handles.append(aux_xfer_handle)
 
                 if staging_deferred:
+                    # Earlier destination ranks may already have posted work.
+                    if self._peer_recovery is not None:
+                        _, failed = self._await_handles(handles, failure_seen=False)
+                        if failed:
+                            raise RuntimeError(
+                                f"NIXL deferred transfer failed room={room}"
+                            )
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
@@ -1557,6 +1624,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if not settle_timed_out:
                     notify, _ = self._await_handles(handles, failure_seen=True)
                 if notify:
+                    if self._peer_recovery is not None:
+                        # Recovery owns every posted handle, including one whose
+                        # post raised. Its barrier proved this chunk drained.
+                        self._staging_outstanding[room] -= 1
+                        if self._staging_outstanding[room] <= 0:
+                            self._staging_outstanding.pop(room, None)
+                        if self.enable_deferred_decode_kv_release:
+                            self._maybe_ack_drained_abort(room)
                     self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
                     # Every handle settled => the writes are done, but the
                     # normal-path decrement was never reached, so without this
@@ -1572,6 +1647,30 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # than telling it those pages are free.
                     self.record_failure(room, str(e))
                     self.update_status(room, KVPoll.Failed)
+
+            finally:
+                if self._peer_recovery is not None:
+                    self._peer_recovery.end()
+
+    def _post_transfer(self, handle, peer_name):
+        if self._peer_recovery is not None and self._peer_recovery.batch is not None:
+            return self._peer_recovery.batch.post(handle, peer_name)
+        return self.agent.transfer(handle)
+
+    def _rebuild_peer_descriptors(self, peer_name):
+        """Called with the peer locked and all its transfer handles retired."""
+        handle = self.prep_handles.pop(peer_name, None)
+        if handle is not None:
+            self.agent.release_dlist_handle(handle)
+        sliced = self.prep_handles_slice_dst.pop(peer_name, None)
+        if sliced is not None:
+            self.agent.release_dlist_handle(sliced[0])
+        peer = self.decode_kv_args_table[peer_name]
+        if peer.kv_xfer_segments is not None:
+            for segment in peer.kv_xfer_segments:
+                self.agent.release_dlist_handle(segment.dst_handle)
+            peer.kv_xfer_segments = None
+        self._prepare_payload_xfer(peer)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1633,18 +1732,28 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
         agent_name = decode_kv_args.agent_name
+        # Duplicate registration needs no native mutation. In particular, do
+        # not block the shared bootstrap thread behind a recovering peer.
         if agent_name in self.decode_kv_args_table:
-            logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
-        decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-            decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
+        lock = (
+            self._peer_recovery.lock(agent_name)
+            if self._peer_recovery is not None
+            else nullcontext()
         )
-        if decode_kv_args.requires_dcp_relayout:
-            self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
-        self.decode_kv_args_table[agent_name] = decode_kv_args
-        self.agent.add_remote_agent(decode_kv_args.agent_metadata)
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prepare_payload_xfer(decode_kv_args)
+        with lock:
+            if agent_name in self.decode_kv_args_table:
+                logger.info(f"Peer {agent_name} was already registered, ignoring.")
+                return
+            decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+                decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
+            )
+            if decode_kv_args.requires_dcp_relayout:
+                self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
+            self.agent.add_remote_agent(decode_kv_args.agent_metadata)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self._prepare_payload_xfer(decode_kv_args)
+            self.decode_kv_args_table[agent_name] = decode_kv_args
 
     def _send_kvcache_generic(
         self,
@@ -1703,7 +1812,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            state = self.agent.transfer(xfer_handle)
+            state = self._post_transfer(xfer_handle, peer_name)
             if state == "ERR":
                 raise Exception("KVSender failed to post prepped transfer")
             return xfer_handle
@@ -1840,7 +1949,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle, peer_name)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
@@ -2018,7 +2127,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create mixed prepped transfer")
-            state = self.agent.transfer(xfer_handle)
+            state = self._post_transfer(xfer_handle, peer_name)
             if state == "ERR":
                 raise Exception("KVSender failed to post mixed prepped transfer")
             handles.append(xfer_handle)
@@ -2065,7 +2174,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create prepped slice transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle, peer_name)
         if state == "ERR":
             raise Exception("KVSender failed to post prepped slice transfer")
         return xfer_handle
@@ -2177,7 +2286,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
                 f"size={per_rank_bytes})"
             )
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle, peer_name)
         if state == "ERR":
             raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
@@ -2312,7 +2421,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle, peer_name)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
@@ -2366,7 +2475,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create dsa_tail transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle, peer_name)
         if state == "ERR":
             raise Exception("KVSender failed to post dsa_tail transfer")
         return xfer_handle
@@ -2422,7 +2531,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle, peer_name)
         if state == "ERR":
             raise Exception("Failed to post Mamba state transfer")
         return xfer_handle
@@ -2552,7 +2661,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state slice transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle, peer_name)
         if state == "ERR":
             raise Exception("Failed to post Mamba state slice transfer")
         return xfer_handle
