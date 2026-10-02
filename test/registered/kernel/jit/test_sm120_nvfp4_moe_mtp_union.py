@@ -8,6 +8,7 @@ CUTLASS replay remains a separate numerical and quality integration gate.
 import unittest
 
 import torch
+
 from sglang.kernels.ops.gemm.sm120_nvfp4_moe_mtp_union import (
     nvfp4_moe_mtp_union as nvfp4_moe_mtp_mma,
 )

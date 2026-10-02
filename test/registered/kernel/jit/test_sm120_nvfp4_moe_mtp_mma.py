@@ -8,6 +8,7 @@ CUTLASS replay remains a separate numerical and quality integration gate.
 import unittest
 
 import torch
+
 from sglang.kernels.ops.gemm.sm120_nvfp4_moe_mtp_mma import nvfp4_moe_mtp_mma
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.test.ci.ci_register import register_cuda_ci
