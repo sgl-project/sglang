@@ -6,17 +6,28 @@ used to end that delay early: a threshold capped by the observed
 max_prefill_bs high-watermark (which a delayed pass feeds with the waiting
 queue), the one-shot ``skip_first_delayer`` bypass that belongs to the slot
 trigger, and the ``max_delay_passes`` bound that also belongs to it.
+
+Once the deadline is the normal end of a delay, every rank must reach it on the
+same pass: each rank starts its own timer, and ranks whose clocks straddle the
+deadline would otherwise build different batches.
 """
 
+import dataclasses
+import time
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
+
+import torch.distributed
+import torch.multiprocessing
 
 from sglang.srt.managers.prefill_delayer import PrefillDelayer, _State
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
 
 def _gather_on_one_rank(output, local, group=None):
@@ -150,6 +161,97 @@ class TestPrefillDelayerQueueTrigger(CustomTestCase):
             for _ in range(3)
         ]
         self.assertEqual(reasons, ["delay", "delay", "wait_timeout"])
+
+
+WORLD_SIZE = 4
+MAX_DELAY_MS = 1000.0
+
+# 100 running requests at ratio 0.5 wait for 50 queued; 10 are waiting and the
+# slot trigger stays off, so only the queue trigger can delay.
+RANK_NEGOTIATE_KWARGS = dict(
+    local_prefillable=True,
+    token_usage=0.9,
+    running_batch=100,
+    max_prefill_bs=80,
+    max_running_requests=1024,
+    waiting_queue_len=10,
+)
+DELAY = (False, "delay")
+RELEASE = (True, "wait_success")
+
+
+def _run_rank(rank, init_file, topology, scenarios):
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=Path(init_file).as_uri(),
+        rank=rank,
+        world_size=WORLD_SIZE,
+    )
+    try:
+        with published_topology(
+            ranks={"world_rank": rank},
+            enable_prefill_delayer=True,
+            prefill_delayer_queue_min_ratio=0.5,
+            prefill_delayer_max_delay_ms=MAX_DELAY_MS,
+            **topology,
+        ):
+            for expired_ranks, expected in scenarios:
+                delayer = PrefillDelayer(
+                    cpu_group=torch.distributed.group.WORLD,
+                    max_delay_passes=100,
+                    token_usage_low_watermark=None,
+                )
+                delayer.skip_first_delayer = False
+                first = delayer._negotiate_should_allow_prefill(**RANK_NEGOTIATE_KWARGS)
+                assert (first.output_allow, first.output_reason) == DELAY, first
+
+                # Age this rank's timer past the deadline, or keep it fresh.
+                age_s = 2 * MAX_DELAY_MS / 1000.0 if rank in expired_ranks else 0.0
+                delayer._curr_state = dataclasses.replace(
+                    delayer._curr_state, start_time=time.perf_counter() - age_s
+                )
+                out = delayer._negotiate_should_allow_prefill(**RANK_NEGOTIATE_KWARGS)
+
+                outcomes = [None] * WORLD_SIZE
+                torch.distributed.all_gather_object(
+                    outcomes, (out.output_allow, out.output_reason)
+                )
+                assert outcomes == [expected] * WORLD_SIZE, (
+                    f"expired ranks {sorted(expired_ranks)}: {outcomes}"
+                )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class TestPrefillDelayerQueueTimeoutRanks(CustomTestCase):
+    def _spawn(self, topology, scenarios):
+        with TemporaryDirectory() as directory:
+            torch.multiprocessing.spawn(
+                _run_rank,
+                args=(str(Path(directory) / "gloo-init"), topology, scenarios),
+                nprocs=WORLD_SIZE,
+                join=True,
+            )
+
+    def test_tp_ranks_follow_tp0_deadline(self):
+        self._spawn(
+            dict(tp_size=WORLD_SIZE),
+            [
+                ({WORLD_SIZE - 1}, DELAY),
+                ({0}, RELEASE),
+                (set(range(WORLD_SIZE)), RELEASE),
+            ],
+        )
+
+    def test_dp_attention_ranks_follow_each_group_leader(self):
+        # Two DP groups of two ranks; ranks 0 and 2 lead them.
+        self._spawn(
+            dict(tp_size=WORLD_SIZE, attn_dp_size=2),
+            [
+                ({1, 3}, DELAY),
+                ({2}, RELEASE),
+            ],
+        )
 
 
 if __name__ == "__main__":
