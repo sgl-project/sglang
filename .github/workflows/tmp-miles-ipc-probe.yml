@@ -1,0 +1,39 @@
+# TEMPORARY: probes the ROCm 10 / gfx942 first-IPC-copy corruption into resumed
+# torch_memory_saver memory on an MI300X runner. Lives only on branch tmp/miles-rocm10-ipc-probe.
+name: TMP Miles ROCm 10 IPC probe
+
+on:
+  push:
+    branches: [tmp/miles-rocm10-ipc-probe]
+
+env:
+  IMAGE: rocm/sgl-dev:miles-rocm10-mi30x-20261001
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: linux-mi300-2gpu-sglang
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${IMAGE}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Probe
+        run: docker exec ci_sglang bash /sglang-checkout/scripts/ci/amd/tmp_miles_ipc_probe/run.sh
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker exec ci_sglang chown -R "$(id -u):$(id -g)" /sglang-checkout || true
+          docker rm -f ci_sglang || true
