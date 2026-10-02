@@ -47,6 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -72,7 +73,7 @@ from sglang.srt.utils import (
     bind_or_assign,
     is_cuda,
     is_nvidia_cublas_version_ge_12_9,
-    make_layers,
+    make_pp_layers,
     next_power_of_2,
 )
 
@@ -650,7 +651,7 @@ class SarvamMoEMLAAttention(nn.Module):
 
         get_token_to_kv_pool().set_mla_kv_buffer(
             self.attn_mha,
-            forward_batch.out_cache_loc,
+            KVWriteLoc.for_batch(forward_batch),
             k_nope,
             k_pe,
         )
@@ -1111,7 +1112,7 @@ class SarvamMLAModel(nn.Module):
         else:
             self.embed_tokens = nn.Identity()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: SarvamMoEMLADecoderLayer(
                 config=config,
@@ -1120,8 +1121,6 @@ class SarvamMLAModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix="model.layers",
         )
 

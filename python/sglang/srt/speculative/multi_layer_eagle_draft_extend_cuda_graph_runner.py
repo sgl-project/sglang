@@ -156,8 +156,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Fields the parent's capture() reads:
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.tp_size
-        self.dp_size = get_parallel().dp_size
+        self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = get_exec().graph.disable_cuda_graph_padding
@@ -285,8 +284,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
 
         if self.require_mlp_tp_gather:
-            global_num_tokens_cpu = [num_tokens] * self.dp_size
-            global_num_tokens_for_logprob_cpu = [num_tokens] * self.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.num_dp_ranks
+            global_num_tokens_for_logprob_cpu = [num_tokens] * self.num_dp_ranks
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
             # DRAFT_EXTEND_V2 produces logits for all tokens, not bs (see mlp branch above)
@@ -333,6 +332,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
+            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -696,10 +696,12 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
-                    dp_size = runner.dp_size
-                    global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
+                    num_dp_ranks = runner.num_dp_ranks
+                    global_num_tokens_gpu = torch.zeros(
+                        (num_dp_ranks,), dtype=torch.int32
+                    )
                     global_num_tokens_for_logprob_gpu = torch.zeros(
-                        (dp_size,), dtype=torch.int32
+                        (num_dp_ranks,), dtype=torch.int32
                     )
                 else:
                     global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)

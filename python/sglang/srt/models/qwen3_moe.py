@@ -535,7 +535,6 @@ class Qwen3MoeAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -837,9 +836,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         self.layer_id = layer_id
-
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         # Qwen3MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
