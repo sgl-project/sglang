@@ -42,6 +42,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -52,6 +53,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_platform,
     get_server_args,
 )
 from sglang.srt.utils import get_available_gpu_memory
@@ -221,6 +223,15 @@ def _get_quantization_config(
 
             quant_config.is_dsv4_fp4_experts = is_deepseek_v4(model_config.hf_config)
             quant_config.dequant_fp4_to_fp8 = envs.SGLANG_DSV4_FP4_DEQUANT.get()
+            if (
+                quant_config.is_fp4_experts
+                and not quant_config.dequant_fp4_to_fp8
+                and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                and not get_platform().is_sm100
+            ):
+                raise ValueError(
+                    "flashinfer_trtllm_routed with MXFP4 experts requires SM100."
+                )
             # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
             nvfp4_meta = model_config.nvfp4_moe_meta
             if nvfp4_meta is not None:

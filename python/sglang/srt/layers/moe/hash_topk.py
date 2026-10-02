@@ -69,7 +69,12 @@ class HashTopK(nn.Module):
 
         self.num_experts = num_experts
         self.topk = topk
-        self.allow_routed_experts_capture = True
+        self.topk_config = TopKConfig(
+            top_k=topk,
+            num_fused_shared_experts=num_fused_shared_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            scoring_func=scoring_func,
+        )
         self.routed_scaling_factor = routed_scaling_factor
         self.num_fused_shared_experts = num_fused_shared_experts
         self.score_func = scoring_func
@@ -261,7 +266,7 @@ class HashTopK(nn.Module):
             topk_weights = topk_weights * self.routed_scaling_factor
 
         capture_routed_experts_if_allowed(
-            self.allow_routed_experts_capture,
+            self.topk_config,
             self.layer_id,
             topk_ids,
             num_token_non_padded,
@@ -301,11 +306,7 @@ class HashTopK(nn.Module):
                 topk_weights,
                 num_fused_shared_experts,
                 num_physical_routed_experts,
-                TopKConfig(
-                    top_k=self.topk,
-                    num_fused_shared_experts=num_fused_shared_experts,
-                    routed_scaling_factor=self.routed_scaling_factor,
-                ),
+                self.topk_config,
             )
         else:
             topk_ids = topk_ids_logical_to_physical(

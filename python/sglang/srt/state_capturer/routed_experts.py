@@ -172,7 +172,5 @@ def disable_routed_experts_capture_for_draft(model: Any) -> None:
     from sglang.srt.layers.moe.topk import TopK
 
     for module in model.modules():
-        if isinstance(module, TopK):
+        if isinstance(module, (TopK, HashTopK)):
             module.topk_config.allow_routed_experts_capture = False
-        elif isinstance(module, HashTopK):
-            module.allow_routed_experts_capture = False

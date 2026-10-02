@@ -389,8 +389,8 @@ class WeightUpdater:
     def _update_weights_from_flattened_bucket(
         self: WeightUpdater,
         flattened_tensor_bucket_dict,
-    ):
-        """Handle flattened bucket format for weight updates"""
+    ) -> None:
+        """Load a flattened bucket, raising if reconstruction or loading fails."""
         flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
         metadata = flattened_tensor_bucket_dict["metadata"]
 
@@ -415,8 +415,6 @@ class WeightUpdater:
 
         # Load the reconstructed tensors using the standard method
         self.get_model().load_weights(reconstructed_tensors)
-
-        return True, "Success"
 
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""

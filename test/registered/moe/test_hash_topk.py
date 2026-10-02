@@ -98,9 +98,9 @@ def test_hash_topk_captures_logical_expert_ids(monkeypatch):
     monkeypatch.setattr(
         hash_topk_module,
         "capture_routed_experts_if_allowed",
-        lambda allow_capture, layer_id, topk_ids, _num_token_non_padded=None: (
+        lambda config, layer_id, topk_ids, _num_token_non_padded=None: (
             FakeCapturer().capture(layer_id=layer_id, topk_indices=topk_ids)
-            if allow_capture
+            if config.allow_routed_experts_capture
             else None
         ),
     )
@@ -183,7 +183,9 @@ def test_hash_topk_capture_can_be_disabled(monkeypatch):
     monkeypatch.setattr(
         hash_topk_module,
         "capture_routed_experts_if_allowed",
-        lambda allow_capture, *_args: captured.append(True) if allow_capture else None,
+        lambda config, *_args: (
+            captured.append(True) if config.allow_routed_experts_capture else None
+        ),
     )
 
     topk = HashTopK(
@@ -193,7 +195,7 @@ def test_hash_topk_capture_can_be_disabled(monkeypatch):
         vocab_size=2,
         layer_id=0,
     )
-    topk.allow_routed_experts_capture = False
+    topk.topk_config.allow_routed_experts_capture = False
     with hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
         topk(
             hidden_states=torch.empty(1, 4),
@@ -216,7 +218,7 @@ def test_draft_hash_topk_capture_is_disabled():
 
     disable_routed_experts_capture_for_draft(model)
 
-    assert not topk.allow_routed_experts_capture
+    assert not topk.topk_config.allow_routed_experts_capture
 
 
 def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
