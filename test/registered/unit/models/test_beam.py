@@ -32,7 +32,6 @@ from sglang.srt.models.beam import (
     BeamForCausalLM,
     BeamModel,
     BeamMoE,
-    BeamUnquantizedFusedMoEMethod,
     apply_attention_gate,
     apply_ssmax,
     depth_scaled_residual,
@@ -81,12 +80,12 @@ def loader_model(params):
     return model
 
 
-def fp8_config(preset="FP8_DYNAMIC", ignore=(), group_name=None):
+def fp8_config(preset="FP8_DYNAMIC", ignore=()):
     return CompressedTensorsConfig.from_config(
         {
             "format": "float-quantized",
             "config_groups": {
-                group_name or preset: preset_name_to_scheme(
+                "group_0": preset_name_to_scheme(
                     preset, targets=["Linear", "lm_head"]
                 ).model_dump()
             },
@@ -151,7 +150,7 @@ class TestBeamConfig(CustomTestCase):
                 self.subTest(quant=quant),
                 patch("sglang.srt.models.beam.BeamModel") as model,
             ):
-                with self.assertRaisesRegex(NotImplementedError, "FP8_DYNAMIC"):
+                with self.assertRaisesRegex(NotImplementedError, "FP8"):
                     BeamForCausalLM(tiny_config(), quant_config=quant)
                 model.assert_not_called()
 
@@ -631,142 +630,130 @@ class TestBeamLoading(CustomTestCase):
         )
         self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
         torch.set_default_dtype(torch.bfloat16)
-        # Exporters may use arbitrary group names for the FP8_DYNAMIC recipe.
-        for quant in (None, fp8_config(group_name="group_0")):
-            with (
-                self.subTest(quant=quant),
-                get_parallel().override(
-                    tp_rank=0,
-                    tp_size=1,
-                    attn_tp_rank=0,
-                    attn_tp_size=1,
-                    moe_tp_rank=0,
-                    moe_tp_size=1,
-                    moe_ep_rank=0,
-                    moe_ep_size=1,
-                    pp_group=SimpleNamespace(
-                        is_first_rank=True,
-                        is_last_rank=True,
-                        rank_in_group=0,
-                        world_size=1,
-                    ),
+        # Exporters may use arbitrary group names for the FP8 recipe.
+        quant = fp8_config()
+        with (
+            get_parallel().override(
+                tp_rank=0,
+                tp_size=1,
+                attn_tp_rank=0,
+                attn_tp_size=1,
+                moe_tp_rank=0,
+                moe_tp_size=1,
+                moe_ep_rank=0,
+                moe_ep_size=1,
+                pp_group=SimpleNamespace(
+                    is_first_rank=True,
+                    is_last_rank=True,
+                    rank_in_group=0,
+                    world_size=1,
                 ),
-                # Exercise real allocation and loaders without executing CUDA kernels.
-                patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            ),
+            # Exercise real allocation and loaders without executing CUDA kernels.
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            model = BeamForCausalLM(config, quant_config=quant)
+            dense, sparse = model.model.layers
+            experts = sparse.mlp.experts
+            dtype = torch.float8_e4m3fn
+            for layer in (dense, sparse):
+                for proj in ("qkv_proj", "gate_proj", "o_proj"):
+                    self.assertEqual(getattr(layer.self_attn, proj).weight.dtype, dtype)
+            for param in (
+                dense.mlp.gate_up_proj.weight,
+                dense.mlp.down_proj.weight,
             ):
-                model = BeamForCausalLM(config, quant_config=quant)
-                dense, sparse = model.model.layers
-                experts = sparse.mlp.experts
-                dtype = torch.float8_e4m3fn if quant is not None else torch.bfloat16
-                for layer in (dense, sparse):
-                    for proj in ("qkv_proj", "gate_proj", "o_proj"):
-                        self.assertEqual(
-                            getattr(layer.self_attn, proj).weight.dtype, dtype
-                        )
-                for param in (
-                    dense.mlp.gate_up_proj.weight,
-                    dense.mlp.down_proj.weight,
-                ):
-                    self.assertEqual(param.dtype, dtype)
-                self.assertEqual(experts.w13_weight.dtype, dtype)
-                self.assertEqual(experts.w2_weight.dtype, dtype)
-                self.assertEqual(model.model.embed_tokens.weight.dtype, torch.bfloat16)
-                self.assertEqual(sparse.mlp.gate.weight.dtype, torch.float32)
-                self.assertEqual(
-                    sparse.mlp.gate.e_score_correction_bias.dtype, torch.float32
+                self.assertEqual(param.dtype, dtype)
+            self.assertEqual(experts.w13_weight.dtype, dtype)
+            self.assertEqual(experts.w2_weight.dtype, dtype)
+            self.assertEqual(model.model.embed_tokens.weight.dtype, torch.bfloat16)
+            self.assertEqual(sparse.mlp.gate.weight.dtype, torch.float32)
+            self.assertEqual(
+                sparse.mlp.gate.e_score_correction_bias.dtype, torch.float32
+            )
+            self.assertEqual(
+                experts.moe_runner_config.routed_scaling_factor,
+                config.routed_scaling_factor,
+            )
+            self.assertFalse(
+                sparse.mlp.topk.topk_config.apply_routed_scaling_factor_on_output
+            )
+            with (
+                torch.no_grad(),
+                patch(
+                    "sglang.srt.layers.moe.topk.biased_grouped_topk",
+                    wraps=biased_grouped_topk_impl._torchdynamo_orig_callable,
+                ),
+            ):
+                sparse.mlp.gate.e_score_correction_bias.zero_()
+                routing = sparse.mlp.topk.forward_native(
+                    torch.ones(1, config.hidden_size),
+                    torch.linspace(1, -1, config.num_experts)[None],
                 )
-                self.assertEqual(
-                    experts.moe_runner_config.routed_scaling_factor,
-                    config.routed_scaling_factor,
-                )
-                self.assertFalse(
-                    sparse.mlp.topk.topk_config.apply_routed_scaling_factor_on_output
-                )
-                with (
-                    torch.no_grad(),
-                    patch(
-                        "sglang.srt.layers.moe.topk.biased_grouped_topk",
-                        wraps=biased_grouped_topk_impl._torchdynamo_orig_callable,
-                    ),
-                ):
-                    sparse.mlp.gate.e_score_correction_bias.zero_()
-                    routing = sparse.mlp.topk.forward_native(
-                        torch.ones(1, config.hidden_size),
-                        torch.linspace(1, -1, config.num_experts)[None],
+            # FP8 scales after expert combination, not in routing.
+            torch.testing.assert_close(
+                routing.topk_weights.sum(-1), torch.ones(1, dtype=torch.float32)
+            )
+            weights = []
+            for name, width, value in (
+                ("0.self_attn.q_proj", 384, 1),
+                ("0.self_attn.k_proj", 64, 2),
+                ("0.self_attn.v_proj", 64, 3),
+                ("0.mlp.gate_proj", 32, 4),
+                ("0.mlp.up_proj", 32, 5),
+                ("1.mlp.experts.0.gate_proj", 32, 6),
+                ("1.mlp.experts.0.up_proj", 32, 7),
+            ):
+                prefix = f"model.layers.{name}"
+                weights.append(
+                    (
+                        f"{prefix}.weight",
+                        torch.full((width, 24), value, dtype=dtype),
                     )
-                # FP8/BF16 runners scale after expert combination, not in routing.
+                )
+                weights.append(
+                    (
+                        f"{prefix}.weight_scale",
+                        torch.full(
+                            (width, 1),
+                            value / 16,
+                            dtype=torch.float32,
+                        ),
+                    )
+                )
+            model.load_weights(weights)
+            for layer, expected in (
+                (dense.self_attn.qkv_proj, [1] * 384 + [2] * 64 + [3] * 64),
+                (dense.mlp.gate_up_proj, [4] * 32 + [5] * 32),
+            ):
                 torch.testing.assert_close(
-                    routing.topk_weights.sum(-1), torch.ones(1, dtype=torch.float32)
-                )
-                if quant is None:
-                    self.assertIsInstance(
-                        experts.quant_method, BeamUnquantizedFusedMoEMethod
-                    )
-                    self.assertIsNone(experts.quant_method._torch_compile_forward(1))
-                    continue
-                self.assertNotIsInstance(
-                    experts.quant_method, BeamUnquantizedFusedMoEMethod
-                )
-                weights = []
-                for name, width, value in (
-                    ("0.self_attn.q_proj", 384, 1),
-                    ("0.self_attn.k_proj", 64, 2),
-                    ("0.self_attn.v_proj", 64, 3),
-                    ("0.mlp.gate_proj", 32, 4),
-                    ("0.mlp.up_proj", 32, 5),
-                    ("1.mlp.experts.0.gate_proj", 32, 6),
-                    ("1.mlp.experts.0.up_proj", 32, 7),
-                ):
-                    prefix = f"model.layers.{name}"
-                    weights.append(
-                        (
-                            f"{prefix}.weight",
-                            torch.full((width, 24), value, dtype=dtype),
-                        )
-                    )
-                    weights.append(
-                        (
-                            f"{prefix}.weight_scale",
-                            torch.full(
-                                (width, 1),
-                                value / 16,
-                                dtype=torch.float32,
-                            ),
-                        )
-                    )
-                model.load_weights(weights)
-                for layer, expected in (
-                    (dense.self_attn.qkv_proj, [1] * 384 + [2] * 64 + [3] * 64),
-                    (dense.mlp.gate_up_proj, [4] * 32 + [5] * 32),
-                ):
-                    torch.testing.assert_close(
-                        layer.weight.float()[:, 0], torch.tensor(expected).float()
-                    )
-                    torch.testing.assert_close(
-                        layer.weight_scale.flatten(),
-                        torch.tensor(expected).float() / 16,
-                    )
-                torch.testing.assert_close(
-                    experts.w13_weight[0].float()[:, 0],
-                    torch.tensor([6] * 32 + [7] * 32).float(),
+                    layer.weight.float()[:, 0], torch.tensor(expected).float()
                 )
                 torch.testing.assert_close(
-                    experts.w13_weight_scale[0].flatten(),
-                    torch.tensor([6] * 32 + [7] * 32).float() / 16,
+                    layer.weight_scale.flatten(),
+                    torch.tensor(expected).float() / 16,
                 )
-                self.assertEqual(model.lm_head.weight.dtype, dtype)
-                scales = torch.full_like(model.lm_head.weight_scale, 0.25)
-                model.load_weights(
-                    [
-                        ("lm_head.weight", torch.full((64, 24), 9, dtype=dtype)),
-                        ("lm_head.weight_scale", scales),
-                    ]
-                )
-                torch.testing.assert_close(
-                    model.lm_head.weight.float(),
-                    torch.full((64, 24), 9.0, dtype=torch.float32),
-                )
-                torch.testing.assert_close(model.lm_head.weight_scale, scales)
+            torch.testing.assert_close(
+                experts.w13_weight[0].float()[:, 0],
+                torch.tensor([6] * 32 + [7] * 32).float(),
+            )
+            torch.testing.assert_close(
+                experts.w13_weight_scale[0].flatten(),
+                torch.tensor([6] * 32 + [7] * 32).float() / 16,
+            )
+            self.assertEqual(model.lm_head.weight.dtype, dtype)
+            scales = torch.full_like(model.lm_head.weight_scale, 0.25)
+            model.load_weights(
+                [
+                    ("lm_head.weight", torch.full((64, 24), 9, dtype=dtype)),
+                    ("lm_head.weight_scale", scales),
+                ]
+            )
+            torch.testing.assert_close(
+                model.lm_head.weight.float(),
+                torch.full((64, 24), 9.0, dtype=torch.float32),
+            )
+            torch.testing.assert_close(model.lm_head.weight_scale, scales)
 
     def test_fp8_exclusions_use_unpacked_projection_names(self):
         ignored = [

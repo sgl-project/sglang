@@ -160,7 +160,7 @@ class BeamMoE(nn.Module):
         backend = get_moe_runner_backend()
         supported_runners = {
             "bf16": ("auto", "triton"),
-            "fp8_dynamic": ("auto", "triton"),
+            "fp8": ("auto", "triton"),
             "nvfp4": ("flashinfer_trtllm",),
         }.get(get_beam_quantization(quant_config), ())
         if (
@@ -168,7 +168,7 @@ class BeamMoE(nn.Module):
             or not get_moe_a2a_backend().is_none()
         ):
             raise ValueError(
-                "Beam supports the auto or triton MoE runner for BF16/FP8_DYNAMIC "
+                "Beam supports the auto or triton MoE runner for BF16/FP8 "
                 "and flashinfer_trtllm for NVFP4, with no MoE all-to-all"
             )
         self.gate = ReplicatedLinear(
@@ -190,11 +190,10 @@ class BeamMoE(nn.Module):
             renormalize=True,
             scoring_func="sigmoid",
             correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=(
-                config.routed_scaling_factor if backend.is_flashinfer_trtllm() else None
-            ),
             output_format=(
-                None if backend.is_flashinfer_trtllm() else TopKOutputFormat.STANDARD
+                TopKOutputFormat.BYPASSED
+                if backend.is_flashinfer_trtllm()
+                else TopKOutputFormat.STANDARD
             ),
         )
         # Keep normalized routing coefficients in FP32. The runner applies the
@@ -513,11 +512,10 @@ def get_beam_quantization(quant_config: Optional[QuantizationConfig]) -> Optiona
                 and not weights.dynamic
                 and activations.strategy == "token"
                 and activations.dynamic is True
-                and (scheme.get("format") or quant_config.quant_format)
-                == "float-quantized"
+                and scheme.get("format") in (None, "float-quantized")
             ):
                 return None
-        return "fp8_dynamic" if quant_config.target_scheme_map else None
+        return "fp8" if quant_config.target_scheme_map else None
     if (
         isinstance(quant_config, ModelOptFp4Config)
         and quant_config.is_checkpoint_nvfp4_serialized
@@ -543,7 +541,7 @@ class BeamForCausalLM(nn.Module):
         super().__init__()
         if get_beam_quantization(quant_config) is None:
             raise NotImplementedError(
-                "Beam supports BF16, compressed-tensors FP8_DYNAMIC (per-channel "
+                "Beam supports BF16, compressed-tensors FP8 (per-channel "
                 "weights and dynamic per-token activations), or serialized W4A4 "
                 "NVFP4 from compressed-tensors or ModelOpt"
             )

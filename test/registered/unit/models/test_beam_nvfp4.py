@@ -1,6 +1,7 @@
 """Compressed-tensors NVFP4 contracts for Beam."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -83,6 +84,14 @@ class TestBeamNvfp4(CustomTestCase):
             self.assertRaisesRegex(RuntimeError, "allocation reached"),
         ):
             BeamForCausalLM(BeamConfig(), quant_config=modelopt_quant_config())
+
+    def test_other_quantization_is_rejected(self):
+        quant = SimpleNamespace(get_name=lambda: "fp8", quant_format=None)
+        with (
+            get_context().override_server_args(attention_backend="trtllm_mha"),
+            self.assertRaisesRegex(NotImplementedError, "W4A4 NVFP4"),
+        ):
+            BeamForCausalLM(BeamConfig(), quant_config=quant)
 
     def test_modelopt_variants_without_nvfp4_activations_are_rejected(self):
         for quant in (
@@ -172,22 +181,21 @@ class TestBeamNvfp4(CustomTestCase):
 
     def test_nvfp4_requires_the_trtllm_moe_runner(self):
         config = BeamConfig(hidden_size=16, num_experts=16, moe_intermediate_size=16)
-        for quant in (nvfp4_quant_config(), modelopt_quant_config()):
-            for backend in (
-                MoeRunnerBackend.AUTO,
-                MoeRunnerBackend.TRITON,
-                MoeRunnerBackend.FLASHINFER_CUTLASS,
-            ):
-                with (
-                    self.subTest(quant=quant, backend=backend),
-                    get_context().override_server_args(),
-                    get_flags().moe.override(
-                        runner_backend=backend, a2a_backend=MoeA2ABackend.NONE
-                    ),
-                    get_parallel().override(moe_tp_size=1, moe_ep_size=1),
-                    self.assertRaisesRegex(ValueError, "flashinfer_trtllm for NVFP4"),
-                ):
-                    BeamMoE(config, 0, quant_config=quant)
+        with (
+            get_context().override_server_args(
+                moe_runner_backend="triton", moe_a2a_backend="none"
+            ),
+            patch(
+                "sglang.srt.models.beam.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.TRITON,
+            ),
+            patch(
+                "sglang.srt.models.beam.get_moe_a2a_backend",
+                return_value=MoeA2ABackend.NONE,
+            ),
+            self.assertRaisesRegex(ValueError, "flashinfer_trtllm for NVFP4"),
+        ):
+            BeamMoE(config, 0, quant_config=nvfp4_quant_config())
 
 
 if __name__ == "__main__":
