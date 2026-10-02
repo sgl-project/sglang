@@ -24,7 +24,7 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-l
 @unittest.skipUnless(torch.cuda.is_available(), "Test requires CUDA")
 class TestDsaKpoolMultiPool(CustomTestCase):
     POOL_SIZE = 4
-    PAGE_SIZE = 64
+    PAGE_SIZE = 256
     SLOTS_PER_PAGE = 64
     NUM_DRAFT_TOKENS = 6
 
@@ -64,10 +64,11 @@ class TestDsaKpoolMultiPool(CustomTestCase):
             dtype=torch.int32,
             device="cuda",
         )
-        real_page_table[:num_draft_tokens, 0] = 2
-        real_page_table[:num_draft_tokens, 4] = 3
-        real_page_table[num_draft_tokens:, 0] = 5
-        real_page_table[num_draft_tokens:, 4] = 6
+        # Group heads are the first physical page of logical pages 2, 3, 5, 6.
+        real_page_table[:num_draft_tokens, 0] = 2 * self.POOL_SIZE
+        real_page_table[:num_draft_tokens, 4] = 3 * self.POOL_SIZE
+        real_page_table[num_draft_tokens:, 0] = 5 * self.POOL_SIZE
+        real_page_table[num_draft_tokens:, 4] = 6 * self.POOL_SIZE
 
         update_kpool_write_plan_cuda_graph(
             write_start=write_start,
