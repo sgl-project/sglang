@@ -126,6 +126,29 @@ where
 /// Python-backed server by JSON-encoding each value independently—including
 /// string values such as the request ID.
 fn grpc_meta_info(output: &FrontendOutput, public_id: &str) -> HashMap<String, String> {
+    if output.extras.is_none() {
+        let mut meta = HashMap::with_capacity(4);
+        meta.insert(
+            "id".into(),
+            serde_json::to_string(public_id).expect("string is JSON"),
+        );
+        meta.insert("prompt_tokens".into(), output.prompt_tokens.to_string());
+        meta.insert(
+            "completion_tokens".into(),
+            output.completion_tokens.to_string(),
+        );
+        // Preserve the JSON object's key order inside this string-valued field.
+        let finish_reason = output.finish_reason.as_ref().map_or_else(
+            || "null".to_owned(),
+            |reason| {
+                serde_json::to_value(reason)
+                    .expect("finish reason is JSON")
+                    .to_string()
+            },
+        );
+        meta.insert("finish_reason".into(), finish_reason);
+        return meta;
+    }
     let serde_json::Value::Object(meta_info) = meta_info_value(output, public_id) else {
         unreachable!("native meta_info is always a JSON object");
     };
@@ -195,6 +218,45 @@ mod tests {
 
         for (error, expected) in cases {
             assert_eq!(status(error).code(), expected);
+        }
+    }
+
+    #[test]
+    fn direct_metadata_matches_shared_formatter() {
+        use crate::message::response::ChunkExtras;
+        for id in ["simple", "quote\" slash\\ newline\n π"] {
+            for reason in [
+                serde_json::Value::Null,
+                serde_json::json!({"type":"stop","matched":"STOP"}),
+                serde_json::json!({"type":"length","length":3}),
+                serde_json::json!({"type":"abort","message":"oops","status_code":500,"err_type":null}),
+            ] {
+                for extras in [
+                    None,
+                    Some(Box::new(ChunkExtras {
+                        out_lp_val: vec![f32::NAN, -0.5],
+                        out_lp_idx: vec![1, 2],
+                        hidden_val: vec![1.0, 2.0],
+                        hidden_lens: vec![2],
+                        ..Default::default()
+                    })),
+                ] {
+                    let output = FrontendOutput {
+                        prompt_tokens: u32::MAX,
+                        completion_tokens: u64::MAX,
+                        finish_reason: serde_json::from_value(reason.clone()).unwrap(),
+                        extras,
+                        ..Default::default()
+                    };
+                    let reference: HashMap<String, String> = meta_info_value(&output, id)
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.to_string()))
+                        .collect();
+                    assert_eq!(grpc_meta_info(&output, id), reference);
+                }
+            }
         }
     }
 }
