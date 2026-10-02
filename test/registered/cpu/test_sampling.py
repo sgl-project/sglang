@@ -52,5 +52,18 @@ def test_murmur_hash32_cpu_shape_and_dtype(positions_dtype):
     assert actual.shape == (3, 128)
 
 
+def test_murmur_hash32_cpu_distinguishes_draft_step_column_domains():
+    vocab_size = 16
+    seed = torch.tensor([42], dtype=torch.uint64)
+    positions = torch.tensor([100], dtype=torch.int64)
+    step_zero_cols = torch.arange(vocab_size, dtype=torch.int64)
+    step_one_cols = step_zero_cols + vocab_size
+
+    step_zero = murmur_hash32(seed, positions, step_zero_cols)
+    step_one = murmur_hash32(seed, positions, step_one_cols)
+
+    assert not torch.equal(step_zero, step_one)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

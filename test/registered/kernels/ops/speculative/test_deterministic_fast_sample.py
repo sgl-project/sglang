@@ -40,12 +40,16 @@ class TestDeterministicFastSample(CustomTestCase):
         seeds = torch.tensor(self.seeds, device="cuda", dtype=torch.int64)
         positions = torch.tensor(self.positions, device="cuda", dtype=torch.int64)
 
-        # Warm Triton/PyTorch kernels before capture.
-        fast_sample(self.probs, sampling_seed=seeds, positions=positions)
+        # Warm Triton/PyTorch kernels before capture. Use a nonzero step so
+        # graph replay also covers the step-domain column offset.
+        fast_sample(self.probs, sampling_seed=seeds, positions=positions, draft_step=1)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             graph_p, graph_index = fast_sample(
-                self.probs, sampling_seed=seeds, positions=positions
+                self.probs,
+                sampling_seed=seeds,
+                positions=positions,
+                draft_step=1,
             )
 
         graph.replay()
@@ -61,7 +65,10 @@ class TestDeterministicFastSample(CustomTestCase):
         updated_p = graph_p.clone()
         updated_index = graph_index.clone()
         expected_p, expected_index = fast_sample(
-            self.probs, sampling_seed=seeds, positions=positions
+            self.probs,
+            sampling_seed=seeds,
+            positions=positions,
+            draft_step=1,
         )
         self.assertTrue(torch.equal(updated_p, expected_p))
         self.assertTrue(torch.equal(updated_index, expected_index))
@@ -109,6 +116,8 @@ class TestDeterministicFastSample(CustomTestCase):
         self.assertFalse(torch.equal(base, changed_seed))
         self.assertFalse(torch.equal(base, changed_position))
         self.assertFalse(torch.equal(base, changed_step))
+        # Adjacent request seeds must not alias adjacent draft-step streams.
+        self.assertFalse(torch.equal(changed_seed, changed_step))
 
     def test_seeded_samples_follow_categorical_distribution(self):
         num_samples = 100_000

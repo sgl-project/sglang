@@ -162,11 +162,25 @@ def fast_sample(
 
         from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 
-        # Addition is intentionally performed in signed int64 before the hash
-        # helper converts to uint64. It provides a separate random stream from
-        # target sampling and verify-side coins without changing their baselines.
-        salted_seed = sampling_seed + _DRAFT_GUMBEL_SEED_SALT + draft_step
-        col_indices = torch.arange(probs.shape[1], device=probs.device)
+        if draft_step < 0:
+            raise ValueError(f"draft_step must be non-negative, got {draft_step}")
+        vocab_size = probs.shape[1]
+        col_offset = draft_step * vocab_size
+        if col_offset + vocab_size > 2**32:
+            raise ValueError(
+                "draft_step and vocabulary size exceed the uint32 hash-key range: "
+                f"draft_step={draft_step}, vocab_size={vocab_size}"
+            )
+
+        # Encode (draft_step, token_id) in the uint32 column block instead of
+        # altering the request seed; step zero retains its established stream.
+        salted_seed = sampling_seed + _DRAFT_GUMBEL_SEED_SALT
+        col_indices = torch.arange(
+            col_offset,
+            col_offset + vocab_size,
+            dtype=torch.int64,
+            device=probs.device,
+        )
         hashed = murmur_hash32(
             salted_seed.to(torch.uint64), positions.to(torch.uint64), col_indices
         )

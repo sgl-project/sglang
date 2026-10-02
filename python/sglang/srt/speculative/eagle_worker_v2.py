@@ -1161,7 +1161,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 batch.sampling_info.temperatures,
                 batch.sampling_info.top_ks,
                 sampling_seed=batch.sampling_info.sampling_seed,
-                positions=batch.seq_lens,
+                positions=batch_result.new_seq_lens,
             )
         elif self.topk == 1 and _is_hip:
             ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
