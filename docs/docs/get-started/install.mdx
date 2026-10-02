@@ -19,7 +19,7 @@ Docker includes Python, SGLang, and its dependencies; no separate host Python in
 The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Use Linux with a supported NVIDIA GPU, a CUDA 13-compatible driver, [Docker Engine](https://docs.docker.com/engine/install/), and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Complete the Toolkit guide's Docker runtime configuration before starting a GPU container.
 
-SGLang images ship a CUDA 13 environment. CUDA 12 images (`-cu12` / `-cu129`) are no longer published; `lmsysorg/sglang:v0.5.21-cu129` is the last CUDA 12 tag.
+SGLang images ship a CUDA 13 environment. CUDA 12 images (`-cu12` / `-cu129`) are no longer published; `lmsysorg/sglang:v0.5.19-cu129` is the last CUDA 12 tag.
 
 **Pull the image**
 
@@ -115,7 +115,7 @@ Use Python 3.10 or higher in an activated Python environment, with CUDA dependen
 
 **Get the source**
 
-Clone a release tag. This example uses `v0.5.18`; choose another tag from [GitHub releases](https://github.com/sgl-project/sglang/releases) as needed:
+Clone a release tag (the example below pins one); choose another from [GitHub releases](https://github.com/sgl-project/sglang/releases) as needed:
 
 ```bash
 git clone -b v0.5.21 https://github.com/sgl-project/sglang.git
