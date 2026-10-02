@@ -871,7 +871,10 @@ jobs:
       # container pull plus dependency install costs ~2h before any test runs.
       # Ride along on the shard that is already warm. Runs after the diffusion
       # tests, and on failure too, so a diffusion regression cannot hide it.
-      # Skips the CUDA-only ltx2_vae_channels_last memory-format assertion.
+      # Skips the CUDA-only ltx2_vae_channels_last memory-format assertion, and
+      # the platform-agnostic survives_real_pytest_runner retry-loop test: its 9
+      # cases each re-import sglang 7 times (~130s per case on mi300, ~20 min
+      # total) and already run in the CUDA diffusion unit lane.
       - name: Run diffusion unit tests
         if: matrix.part == 0 && (success() || failure())
         timeout-minutes: 30
@@ -881,7 +884,7 @@ jobs:
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite unit \
-              -k "not ltx2_vae_channels_last" \
+              -k "not ltx2_vae_channels_last and not survives_real_pytest_runner" \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
       - name: Upload diffusion failure artifacts
