@@ -2479,20 +2479,19 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
         self.assertIs(a.full_v2p_page_table, a.full_attn_allocator.virtual_to_physical)
         self.assertIs(a.swa_v2p_page_table, a.swa_attn_allocator.virtual_to_physical)
 
-    def test_full_kernel_translate_matches_formula(self):
-        """With the per-page scale gone the two translates compute the same
-        id, so both must follow v2p[t // ps] * ps + t % ps."""
+    def test_full_translate_matches_formula(self):
         a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
         v2p = a.full_attn_allocator.virtual_to_physical
         expected = v2p[v // self.PS] * self.PS + v % self.PS
-        self.assertTrue(torch.equal(a.translate_kv_loc_for_kernel(v), expected))
         self.assertTrue(torch.equal(a.translate_kv_loc(v), expected))
 
-    def test_kernel_translate_accepts_an_int32_page_table(self):
-        """Regression: fa3 passes its own page table, which is int32 and 2-D, so
-        the gather must not require an int64 index."""
+    def test_translate_accepts_an_int32_page_table(self):
+        """fa3 translates its own page table, which is int32 and 2-D; a gather
+        that needs a 1-D int64 index would crash the scheduler there. Both page
+        sizes: at ps == 1 the index IS the caller's tensor, at ps > 1 it is
+        derived."""
         for ps in (1, 4):
             with self.subTest(page_size=ps):
                 self.PS = ps
@@ -2502,12 +2501,12 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
                 v2p = a.full_attn_allocator.virtual_to_physical
                 expected = v2p[v // ps] * ps + v % ps
                 page_table = v.to(torch.int32).view(2, -1)
-                got = a.translate_kv_loc_for_kernel(page_table)
+                got = a.translate_kv_loc(page_table)
                 self.assertEqual(got.shape, page_table.shape)
                 self.assertTrue(torch.equal(got.reshape(-1), expected))
                 # `out=` takes the same int32 index; the buffer stays int64.
                 dst = torch.empty(page_table.shape, dtype=torch.int64, device=_DEV)
-                a.translate_kv_loc_for_kernel(page_table, out=dst)
+                a.translate_kv_loc(page_table, out=dst)
                 self.assertTrue(torch.equal(dst.reshape(-1), expected))
 
     def test_swa_translate_matches_formula(self):
@@ -2542,7 +2541,7 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
             physical_pages.tolist(),
         )
 
-    def test_swa_kernel_tombstone_still_lands_on_sink(self):
+    def test_swa_tombstone_still_lands_on_sink(self):
         """A tombstoned page's ids (v2p == -1 -> -ps + offset, negative for
         every in-page offset) still land on the sink, never negative."""
         a = self._build()
@@ -2626,7 +2625,7 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
         # fits int32 (the canonical narrows on store).
         v2p = a.full_v2p_page_table
         want = v2p[v // self.PS] * self.PS + v % self.PS
-        got = a.translate_kv_loc_for_kernel(v)
+        got = a.translate_kv_loc(v)
         self.assertTrue(torch.equal(got, want), "kernel-facing formula broke at ps=64")
         self.assertTrue(bool((got < 2**31).all().item()))
 
@@ -3256,7 +3255,7 @@ class TestDcpWidening(unittest.TestCase):
                 self.assertTrue(
                     torch.equal(
                         written[owned],
-                        a.translate_kv_loc_for_kernel(ids[owned] // dcp_size),
+                        a.translate_kv_loc(ids[owned] // dcp_size),
                     )
                 )
                 # ...and the rest go to the sink the write kernels skip.
@@ -3603,6 +3602,52 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
                     dcp_rank=dcp_rank,
                     device="cpu",
                 )
+
+    def test_matches_reference_on_a_strided_view(self):
+        """A column slice of a wider page table is what the SWA read path hands
+        down under cuda graphs, so its ids must equal the flat reference's."""
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+
+        rows, cols, page_size = 3, 5, 4
+        v2p = torch.arange(32, dtype=torch.int64, device=_DEV)
+        backing = torch.full((rows, cols + 3), -1, dtype=torch.int64, device=_DEV)
+        view = backing[:, :cols]
+        view.copy_(torch.arange(rows * cols, dtype=torch.int64).reshape(rows, cols))
+        self.assertFalse(view.is_contiguous())
+
+        want = self._reference(view.reshape(-1).cpu(), v2p.cpu(), page_size, 1, 0)
+        got = write_loc_to_kernel_ids(loc=view, v2p=v2p, page_size=page_size)
+        self.assertEqual(got.shape, view.shape)
+        self.assertEqual(got.reshape(-1).tolist(), want)
+
+        # `out=` into a slice of a DIFFERENTLY strided backing: the ids land in
+        # the sliced columns and the rest of that buffer is left alone.
+        dst = torch.full((rows, cols + 7), -9, dtype=torch.int64, device=_DEV)
+        ret = write_loc_to_kernel_ids(
+            loc=view,
+            v2p=v2p,
+            page_size=page_size,
+            out=dst[:, :cols],
+        )
+        self.assertEqual(ret.data_ptr(), dst.data_ptr())
+        self.assertEqual(dst[:, :cols].reshape(-1).tolist(), want)
+        self.assertTrue(bool((dst[:, cols:] == -9).all()))
+
+    def test_out_width_needs_a_packed_loc(self):
+        """`out_width` addresses a packed lane range, so a strided loc would
+        write its tail zeros over live ids."""
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+
+        v2p = torch.arange(16, dtype=torch.int64, device=_DEV)
+        loc = torch.arange(12, dtype=torch.int64, device=_DEV)[::2]
+        with self.assertRaises(AssertionError):
+            write_loc_to_kernel_ids(
+                loc=loc,
+                v2p=v2p,
+                page_size=1,
+                out=torch.zeros(10, dtype=torch.int64, device=_DEV),
+                out_width=10,
+            )
 
 
 if __name__ == "__main__":

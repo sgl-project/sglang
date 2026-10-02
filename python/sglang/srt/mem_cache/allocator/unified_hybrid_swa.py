@@ -165,7 +165,7 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         # Full-attention transfers use virtual IDs. SWA transfers already use
         # kernel-facing IDs from translate_loc_from_full_to_swa.
         kvcache.full_kv_pool.host_transfer_translate = (
-            self.full_attn_allocator.translate_kv_loc_for_kernel
+            self.full_attn_allocator.translate_kv_loc
         )
 
         self.free_group = None
@@ -287,8 +287,8 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """SWA-layer read path: virtual TOKEN ids -> swa kernel-facing ids."""
-        return self.swa_attn_allocator.translate_kv_loc_for_kernel(kv_indices, out=out)
+        """SWA-layer read path: virtual TOKEN ids -> swa-physical TOKEN ids."""
+        return self.swa_attn_allocator.translate_kv_loc(kv_indices, out=out)
 
     @property
     def full_v2p_page_table(self) -> torch.Tensor:
@@ -316,14 +316,9 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Virtual TOKEN ids -> swa-sub-pool PHYSICAL token ids.
-
-        The SWA counterpart of the above. `translate_loc_from_full_to_swa`
-        cannot serve here: it returns KERNEL-FACING ids (the physical page
-        scaled by the sub-pool's per-page block count), which index the
-        per-layer views, whereas the SWA state component is registered as whole
-        page envelopes and addressed by physical page.
-        """
+        """Virtual TOKEN ids -> swa-sub-pool PHYSICAL token ids, for the PD
+        transfer engine: the same translate as `translate_loc_from_full_to_swa`,
+        on int64 ids."""
         return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
     def _move_gate_targets(self):
@@ -376,15 +371,6 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             feature="HiCache",
             lazy_compaction=self.lazy_compaction,
         )
-
-    def translate_kv_loc_for_kernel(
-        self,
-        loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
-        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
 
     def translate_write_loc_for_kernel(
         self,
