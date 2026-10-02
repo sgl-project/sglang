@@ -1390,10 +1390,16 @@ class OpenAIServingChat(OpenAIServingBase):
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
+                # By default only the named tool is rendered. With the switch every
+                # tool stays in the prompt, so a turn that names a tool still extends
+                # the prompt of the turns before it and reuses their prefix cache.
+                # The output constraint is built from tool_choice either way.
+                keep_tools = envs.SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS.get()
                 tools = [
                     item.model_dump()
                     for item in request.tools or []
-                    if item.function.name == request.tool_choice.function.name
+                    if keep_tools
+                    or item.function.name == request.tool_choice.function.name
                 ] or None
             elif request.tools:
                 tools = [item.model_dump() for item in request.tools]
