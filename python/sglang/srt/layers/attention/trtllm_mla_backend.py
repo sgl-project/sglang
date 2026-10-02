@@ -919,12 +919,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # ragged q avoids the FlashInfer fallback's whole-KV-pool conversion.
             use_varlen_absorbed = (
                 (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
-                and self.owns_varlen_absorbed_extend
-                and self.backend == "trtllm-gen"
-                and self._varlen_absorbed_arch_dtype_ok
+                and self._varlen_absorbed_workspace_buffer is not None
                 and forward_batch.spec_info is None
-                and not get_parallel().dcp_enabled
-                and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() is None
             )
             # Otherwise keep the paged fallback: forward_extend would run the MHA
             # ragged path on latent-shaped tensors.

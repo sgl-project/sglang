@@ -195,11 +195,10 @@ class TestVarlenAbsorbedWorkspaceAllocation(CustomTestCase):
 class TestVarlenAbsorbedMLARouting(CustomTestCase):
     _BACKEND = "sglang.srt.layers.attention.trtllm_mla_backend"
 
-    def _assert_paged_fallback(self, *, dcp_enabled, skip_softmax):
+    def test_missing_workspace_keeps_the_paged_fallback(self):
         backend = object.__new__(TRTLLMMLABackend)
-        backend.backend = "trtllm-gen"
         backend.disable_chunked_prefix_cache = False
-        backend._varlen_absorbed_arch_dtype_ok = True
+        backend._varlen_absorbed_workspace_buffer = None
         backend._kv_shard_pool = None
 
         forward_batch = SimpleNamespace(
@@ -214,15 +213,6 @@ class TestVarlenAbsorbedMLARouting(CustomTestCase):
         with (
             patch(f"{self._BACKEND}.is_in_tc_piecewise_cuda_graph", return_value=True),
             patch(f"{self._BACKEND}.is_in_breakable_cuda_graph", return_value=False),
-            patch(
-                f"{self._BACKEND}.get_parallel",
-                return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
-            ),
-            patch(
-                f"{self._BACKEND}.envs."
-                "SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get",
-                return_value=skip_softmax,
-            ),
             patch.object(
                 FlashInferMLAAttnBackend, "init_forward_metadata"
             ) as paged_fallback,
@@ -232,12 +222,6 @@ class TestVarlenAbsorbedMLARouting(CustomTestCase):
         paged_fallback.assert_called_once_with(forward_batch)
         self.assertTrue(backend.forward_prefill_metadata.fallback_to_flashinfer_impl)
         self.assertIsNone(backend.forward_prefill_metadata.block_kv_indices)
-
-    def test_dcp_keeps_the_paged_fallback(self):
-        self._assert_paged_fallback(dcp_enabled=True, skip_softmax=None)
-
-    def test_skip_softmax_keeps_the_paged_fallback(self):
-        self._assert_paged_fallback(dcp_enabled=False, skip_softmax=1.0)
 
 
 class TestVarlenAbsorbedMLADispatchContract(CustomTestCase):
