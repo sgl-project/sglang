@@ -23,9 +23,11 @@ What this port keeps and what it changes:
 - The workload is synthesized rather than replayed from the SemiAnalysis
   ``cc-traces-weka`` corpus, which is gated and reachable only through AIPerf's
   loader. ``sglang.test.agentic_bench_utils`` builds a corpus with the same
-  structure instead, and ``SGLANG_AGENTIC_TRACE_PATH`` replays a real one when
-  a runner has it. Absolute numbers therefore are not comparable against
-  AgentX's published results; run-over-run numbers here are.
+  structure instead -- a shared agent scaffold, a per-session repository
+  context, and per-turn tool output, sized so a session opens at ~39K tokens
+  and reaches ~68K by its eighth turn -- and ``SGLANG_AGENTIC_TRACE_PATH``
+  replays a real one when a runner has it. Absolute numbers therefore are not
+  comparable against AgentX's published results; run-over-run numbers here are.
 - The recipe pins ``SGLANG_SIMULATE_ACC_LEN=3.61``, which makes the server
   report a fixed acceptance length instead of running draft verification. That
   suits AgentX's projections and defeats a regression check, so this test runs
@@ -62,8 +64,12 @@ register_amd_ci(
 
 GLM_52_MXFP4_MODEL_PATH = os.environ.get("GLM52_MXFP4_MODEL_PATH", "amd/GLM-5.2-MXFP4")
 RESULT_DIR = "performance_results_glm52_fp4_agentic_mtp_mi35x"
-SERVER_LAUNCH_TIMEOUT = 7200
-BENCH_TIMEOUT = 5400
+# Generous enough to absorb a cold weight cache on the first run of a new
+# checkpoint; the job's own timeout is the real backstop.
+SERVER_LAUNCH_TIMEOUT = 5400
+# Each point replays two waves of conversations, so this is a hang detector
+# rather than a budget.
+BENCH_TIMEOUT_PER_POINT = 1800
 
 # The recipe sweeps [1, 2, 4, 8, 10, 12] and [1, 2, 4, 10]. Both are trimmed to
 # the endpoints and midpoints that carry the regression signal, since each
@@ -71,6 +77,9 @@ BENCH_TIMEOUT = 5400
 HICACHE_CONCURRENCIES = _parse_int_list_env("AGENTIC_HICACHE_CONCURRENCIES", "1,4,8,12")
 GPU_RESIDENT_CONCURRENCIES = _parse_int_list_env("AGENTIC_TP8_CONCURRENCIES", "1,4,10")
 
+# Defaults put ~39K tokens in each session's first turn and grow it to ~68K by
+# the eighth, which is the range where prefix reuse and the host tier decide
+# the result.
 TRACE_SPEC = AgenticTraceSpec()
 
 # Common to both arms, straight from the recipe.
@@ -165,8 +174,8 @@ class TestGLM52FP4AgenticMTPMI35x(unittest.TestCase):
             concurrencies=concurrencies,
             trace_spec=TRACE_SPEC,
             server_launch_timeout=SERVER_LAUNCH_TIMEOUT,
-            bench_timeout=BENCH_TIMEOUT,
-            env={**os.environ, **SERVER_ENV},
+            bench_timeout_per_point=BENCH_TIMEOUT_PER_POINT,
+            env=SERVER_ENV,
         )
 
         type(self).full_report += (
@@ -177,15 +186,13 @@ class TestGLM52FP4AgenticMTPMI35x(unittest.TestCase):
         )
 
         # A replay that dropped turns produces throughput numbers for a
-        # workload nobody ran, so treat any dropped turn as a failure rather
-        # than reporting the partial result.
+        # workload nobody ran, so fail rather than publish the partial result.
         for point in points:
-            expected_turns = point.conversations * TRACE_SPEC.turns_per_conversation
             self.assertEqual(
-                point.completed_turns,
-                expected_turns,
-                f"{variant} concurrency {point.concurrency}: completed "
-                f"{point.completed_turns}/{expected_turns} turns",
+                point.failed_turns,
+                0,
+                f"{variant} concurrency {point.concurrency}: "
+                f"{point.failed_turns} of {point.total_turns} turns failed",
             )
 
     def test_agentic_tp4_ep4_hicache(self):
