@@ -85,8 +85,9 @@ It uses three new timing repetitions and reuses the exact-source full GSM8K
 pair above, not a new accuracy score. Public-main native-first confirmation
 also passed: P50 TPOT 2.994267 to 2.934059 ms (-2.011%), output throughput
 +2.012%, with exact-source full GSM8K reused from the main pair. Both main
-and incremental C2 results are positive in both run orders. C1 reverse-order
-and remaining all-concurrency checks are in progress. Do not add gains from
+and incremental C2 results are positive in both run orders. Both forward sweeps
+and public-main C1 reverse are complete; incremental C1 reverse is still in
+progress. Do not add gains from
 different common sources or claim statistical significance.
 The preparation tree changes only formatting and reproduction support relative
 to the main measured runtime: Python AST is identical, C++/Triton unchanged.
@@ -105,8 +106,12 @@ with zero request errors and independently rescored raw responses. Every rank
 passed raw graph-engagement checks for both fused stages. P50 ITL changes were
 -3.216% and -1.671%, respectively; P50 TTFT changed -0.337% and -0.386%.
 These are medians of three per-repetition statistics, not pooled percentiles.
-C1 reverse-order confirmations remain in progress; no significance claim is
-made from these sequential, co-located pairs.
+The public-main candidate-first C1 confirmation measured P50 TPOT 2.311342 to
+2.234070 ms (-3.343%), P50 ITL -3.380%, output throughput +3.144%, and P50 TTFT
++0.407%. It passed the same three-repeat and all-rank raw trace gates, reusing
+the exact-source full GSM8K pair above. C1 decode gain holds in both orders;
+TTFT did not improve in this reverse pair. Incremental C1 reverse remains in
+progress. No significance claim is made from these sequential, co-located pairs.
 
 ### Completed public-main fallback checks
 
@@ -123,8 +128,8 @@ All four accuracy pairs had zero request errors. Hash-checked traces show graph
 replay on all four ranks but no horizontal-fusion launches in steady decode.
 These are native-fallback checks with no observed material regression, not
 evidence of a fusion speedup at these batch sizes. Tail batches can still enter
-the supported small-M path. The public-main forward sweep is complete; its C1
-reverse-order check and the incremental C1 reverse/C32 checks remain pending.
+the supported small-M path. Both forward sweeps and the public-main reverse
+checks are complete; only incremental C1 reverse remains pending.
 The historical sweep below cannot substitute for them.
 
 At C32 the candidate lost six correct answers (0.455 percentage points), close
@@ -162,6 +167,15 @@ Full GSM8K was 1285 to 1286/1319 with zero errors and independently rescored
 responses. Both arms exported 16 graph launches per rank with zero fused
 launches in steady decode. Warmup is excluded: the native 8.725238 ms sample
 was the warmup, not one of the three measured repetitions.
+
+The #42055 C32 fallback check measured P50 TPOT 13.479412 to 13.414535 ms
+(-0.481%), P50 ITL -0.073%, output throughput +1.033%, and P50 TTFT -0.148%.
+Full GSM8K was 1283 to 1281/1319 (-0.152 pp), zero errors, with independently
+rescored responses. Both arms passed all four raw steady-decode graph trace
+checks, with 16 graph launches per rank and zero fused launches. This measures
+fallback behavior, not attributable horizontal-fusion benefit at C32. The
+three candidate TPOT samples were 13.409515, 13.532335 and 13.414535 ms;
+the single sequential pair does not establish significance.
 
 ### Completed common-source folded-expert comparison
 

@@ -32,8 +32,8 @@ cases and graph microbenchmark in this public image. Its public CK submodule
 is `af9e1d1f1ae347c22feeb08fd2d42645075e0c5d`. The matched C2 pair completed
 full GSM8K (native 1284/fused 1287 of 1319, zero request errors) and three-repeat
 timing (median P50 TPOT 2.994574/2.923689 ms). The #42055 incremental pair also
-completed; see README.md. Remaining concurrency and reverse-order qualification
-are still in progress; these are not a claim that every PR gate is complete.
+completed; see README.md. Both forward sweeps are complete; incremental C1
+reverse remains in progress. This is not a claim that every PR gate is complete.
 
 Inside that container, make the pinned public dependency visible instead of
 silently using an image fork. No custom AITER changes are needed:
@@ -175,8 +175,8 @@ the HTTP client. Do not include this request in performance statistics.
 The staged probe below has completed at C1/C2/C4/C8. Do not extrapolate it to
 C16/C32: during qualification a C16 server stalled when the profiler restarted
 between prefill and decode. The single-start, steady-decode protocol below
-passed both arms at C16 and C32 on the public-main source, and C16 on the
-incremental #42055 source. Incremental C32 qualification remains pending.
+passed both arms at C16 and C32 on both public-main and incremental #42055
+sources.
 For readiness detection, `spec_verify_calls_total` is not a live per-step
 counter in the pinned source: it increments when a request finishes. It is
 suitable for the completed-request AL audit, not for triggering a profiler
@@ -231,7 +231,7 @@ all requests before enabling profiling, then wait for a full active batch,
 an empty queue and live sequence lengths beyond prefill. The pinned source
 reports full sequence lengths in `decode_sum_seq_lens`, not SWA cache lengths.
 The qualification harness validated this protocol at C16 and C32 on both
-public-main arms, and C16 on both incremental #42055 arms. This self-contained
+public-main and incremental #42055 arms. This self-contained
 command uses the same requests, trigger and profiler payload; its payload was
 also checked with CPU mocks. It is not a new timing measurement or a claim
 that this exact standalone snippet was used by the qualification jobs.
