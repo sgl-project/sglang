@@ -26,18 +26,6 @@ CLONE_RE = re.compile(
     r"( https://github\.com/sgl-project/sglang\.git)"
 )
 
-# Matches a version-pinned docker image such as `lmsysorg/sglang:v0.5.12`
-# (leaving any suffix like `-cu130`/`-runtime` untouched), capturing the
-# version in group 2. Mutable tags (`latest`, `dev`, ...) are not matched.
-# CUDA 12 tags (`-cu12*`) are historical, since CUDA 12 images are no longer
-# published, so they are never bumped.
-DOCKER_RE = re.compile(
-    r"(lmsysorg/sglang:)v(\d+\.\d+\.\d+(?:rc\d+|\.post\d+)?)\b(?![\w.]*-cu12)"
-)
-
-# All version references the bump keeps in sync, each with the version in group 2.
-VERSION_PATTERNS = [CLONE_RE, DOCKER_RE]
-
 
 def read_current_version(file_path: Path) -> str:
     """Read the pinned source-install version from a docs page."""
@@ -52,12 +40,7 @@ def read_current_version(file_path: Path) -> str:
 def stale_versions(file_path: Path, new_version: str) -> list:
     """Return any pinned versions in the file that differ from new_version."""
     content = file_path.read_text()
-    return [
-        m.group(2)
-        for pattern in VERSION_PATTERNS
-        for m in pattern.finditer(content)
-        if m.group(2) != new_version
-    ]
+    return [m.group(2) for m in CLONE_RE.finditer(content) if m.group(2) != new_version]
 
 
 def replace_version(file_path: Path, new_version: str) -> bool:
@@ -67,7 +50,6 @@ def replace_version(file_path: Path, new_version: str) -> bool:
 
     content = file_path.read_text()
     new_content = CLONE_RE.sub(rf"\g<1>v{new_version}\g<3>", content)
-    new_content = DOCKER_RE.sub(rf"\g<1>v{new_version}", new_content)
 
     if content == new_content:
         print(f"No changes needed in {file_path}")
