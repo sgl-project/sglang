@@ -49,7 +49,11 @@ def _combine_topk_swa_indices_kernel(
     gather_lens_ptr,
     compressed_base_ptr,
     swa_base_ptr,
+    swa_indices_ptr,
+    swa_indices_stride,
+    swa_lengths_ptr,
     top_k,
+    EXPLICIT_SWA: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
     PADDED_TOP_K: tl.constexpr,
@@ -77,7 +81,10 @@ def _combine_topk_swa_indices_kernel(
         # -1 entries inside the top-k span stay -1 (attention skips them).
         # top_k=0 disables the compressed portion for SWA-only layers.
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, top_k)
-        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+        if EXPLICIT_SWA:
+            swa_len = tl.load(swa_lengths_ptr + token_idx)
+        else:
+            swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
 
         combined_row = token_idx.to(tl.int64) * combined_indices_stride
         topk_row = token_idx.to(tl.int64) * topk_indices_stride
@@ -98,9 +105,18 @@ def _combine_topk_swa_indices_kernel(
         # Workspace SWA index: swa_base[r] + (gather_offset_in_buffer).
         # For positions [pos - swa_len + 1, pos], the buffer offsets are
         # [pos - swa_len + 1 - gather_start, pos - gather_start].
+        if EXPLICIT_SWA:
+            swa_indices = tl.load(
+                swa_indices_ptr + token_idx.to(tl.int64) * swa_indices_stride + offset,
+                mask=offset < swa_len,
+                other=-1,
+            )
+            swa_indices = tl.where(swa_indices >= 0, swa_base + swa_indices, -1)
+        else:
+            swa_indices = swa_base + offset + pos - swa_len + 1 - gather_start
         tl.store(
             combined_indices_ptr + combined_row + topk_len + offset,
-            swa_base + offset + pos - swa_len + 1 - gather_start,
+            swa_indices,
             mask=offset < swa_len,
         )
 
