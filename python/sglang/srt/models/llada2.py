@@ -80,7 +80,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_non_idle_and_non_empty,
     is_npu,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -303,9 +303,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             )
         # dispatcher
         if get_moe_a2a_backend().is_deepep():
-            # TODO: we will support tp < ep in the future
-            self.ep_size = get_parallel().tp_size
-
             self.deepep_dispatcher = DeepEPDispatcher(
                 group=get_parallel().tp_group.device_group,
                 router_topk=self.top_k,
@@ -432,7 +429,6 @@ class LLaDA2MoeAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_kv_heads = config.num_key_value_heads
-        self.dp_size = get_parallel().attn_dp_size
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
@@ -598,7 +594,6 @@ class LLaDA2MoeBlock(nn.Module):
         hidden_size = config.hidden_size
 
         self.input_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
-        self.dp_size = get_parallel().attn_dp_size
         self.attention = LLaDA2MoeAttention(
             config,
             layer_id,
@@ -608,8 +603,6 @@ class LLaDA2MoeBlock(nn.Module):
             alt_stream=alt_stream,
         )
         self.layer_id = layer_id
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.is_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id)
         is_previous_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id - 1)
@@ -716,7 +709,7 @@ class LLaDA2MoeModel(nn.Module):
 
         self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout)
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LLaDA2MoeBlock(
                 layer_id=idx,
@@ -725,8 +718,6 @@ class LLaDA2MoeModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:

@@ -100,7 +100,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     is_npu,
     is_xpu,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -1110,11 +1110,9 @@ class MiniMaxM2Model(nn.Module):
                 prefix=prefix,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             layer_fn,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
