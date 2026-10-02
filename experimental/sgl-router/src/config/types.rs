@@ -1,4 +1,5 @@
 use crate::config::sampling::SamplingOverrides;
+use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use std::num::NonZeroU32;
 
@@ -19,6 +20,8 @@ pub struct Config {
 pub struct ProxyConfig {
     /// Timeout for upstream response headers and body. Counts as a circuit-breaker failure.
     pub request_timeout_secs: u64,
+    /// Maximum silence between streamed upstream chunks before the stream fails.
+    pub stream_idle_timeout_secs: u64,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -29,6 +32,7 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
+            stream_idle_timeout_secs: 180,
         }
     }
 }
@@ -50,6 +54,33 @@ impl Default for InflightLoadConfig {
             stale_request_timeout_secs: default_stale_request_timeout_secs(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ChatRoutingKind {
+    #[default]
+    Legacy,
+    Reorg,
+}
+
+/// Encode backend accepted by `--tokenizer-backend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TokenizerBackend {
+    /// Hugging Face `tokenizers`.
+    #[default]
+    #[value(name = "hf")]
+    Hf,
+    /// `fastokens` BPE encoding with Hugging Face decoding.
+    #[value(name = "fast")]
+    Fast,
+}
+
+/// Router tokenizer encode settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenizerConfig {
+    pub backend: TokenizerBackend,
+    /// L1 prefix-tokenization cache budget in MiB; 0 disables the cache.
+    pub l1_cache_mb: usize,
 }
 
 /// Routing strategies accepted by `--policy`.
@@ -229,6 +260,8 @@ pub struct ServerConfig {
     pub shutdown_drain_secs: u64,
     /// Declared pod termination grace period; `None` uses the Kubernetes default for advisories.
     pub termination_grace_secs: Option<u64>,
+    /// `Authorization` for the router's own requests to workers, from `--worker-api-key`.
+    pub worker_auth: Option<HeaderValue>,
 }
 
 impl ServerConfig {
@@ -258,6 +291,7 @@ impl Default for ServerConfig {
             port: default_port(),
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
+            worker_auth: None,
         }
     }
 }
@@ -297,14 +331,18 @@ impl Default for ObservabilityConfig {
 pub struct ModelConfig {
     pub id: String,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
-    /// Resolved by [`crate::tokenizer::adapter::load`].
-    pub tokenizer_path: String,
+    /// Resolved by [`crate::tokenizer::adapter::load`]; `None` (`--no-tokenizer`) disables it.
+    pub tokenizer_path: Option<String>,
     /// Disable router-generated input IDs for this model; keep routing tokenization.
     /// Use when workers have rendering defaults or template stops the router cannot see.
     pub disable_input_ids_forwarding: bool,
+    /// Encode backend and L1 cache for router tokenization.
+    pub tokenizer: TokenizerConfig,
     pub policy: PolicyKind,
     /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
+    /// Send a DP rank as `X-Data-Parallel-Rank`; see [`crate::policies::dp_rank`].
+    pub dp_aware: bool,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
@@ -320,6 +358,8 @@ pub struct ModelConfig {
     pub eligibility: Option<EligibilityConfig>,
     /// Fleet sampling defaults and conflict behavior. See [`SamplingOverrides`].
     pub sampling_overrides: SamplingOverrides,
+    /// Worker `--default-chat-template-kwargs`, applied when rendering.
+    pub default_chat_template_kwargs: crate::tokenizer::chat_formatter::ChatTemplateKwargs,
 }
 
 /// External KV Indexer client settings.
@@ -389,13 +429,62 @@ pub enum CachePrefixProvider {
 }
 
 /// Per-model Cache-Aware configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     /// Prefix-match source for native Cache-Aware.
     pub prefix_provider: CachePrefixProvider,
     /// External Indexer configuration when `prefix_provider = indexer`.
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
+    /// Deadline for peer bootstrap, validated by `Config::validate`. Only
+    /// meaningful when a peer selector is set; see
+    /// [`K8sDiscoveryConfig::peer_selector`].
+    pub bootstrap_timeout_ms: u64,
+    /// Upper bound on the per-fetch timeout derived from `bootstrap_timeout_ms`;
+    /// see `snapshot_fetch_timeout`. Validated by `Config::validate`.
+    pub bootstrap_fetch_timeout_cap_ms: u64,
+    /// Hold `/readyz` at 503 when a sweep over a non-empty candidate set timed
+    /// out. Bounded at max(3x `bootstrap_timeout_ms`, 60s), after which the
+    /// replica serves cache-blind; nothing re-sweeps during the hold, so this
+    /// delays a failed seed's replica and a fleet-wide restart is a delay, not
+    /// an outage.
+    pub bootstrap_seed_required: bool,
 }
+
+impl Default for CacheAwareConfig {
+    fn default() -> Self {
+        Self {
+            prefix_provider: CachePrefixProvider::default(),
+            kv_indexer_endpoint: None,
+            bootstrap_timeout_ms: DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+            bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
+            bootstrap_seed_required: false,
+        }
+    }
+}
+
+/// Budget for the whole peer-bootstrap sweep: 10 minutes, room for several
+/// attempts at a fleet-sized snapshot (the producer's export build, the
+/// transfer and the graft). Readiness waits on it, so a pod's startup or
+/// readiness probe must tolerate a replica that stays unready this long.
+pub const DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 600_000;
+
+/// Default cap on one peer-snapshot fetch: past the producer's export build
+/// plus one gzipped transfer + decode of a warm fleet's snapshot body (tens of
+/// MB gzipped, hundreds inflated).
+/// Connect and read timeouts bound a hung peer; this bounds only a transfer
+/// that is progressing. Must agree with
+/// [`crate::state::kv_events::bootstrap::DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP`];
+/// a test pins the two.
+pub const DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 300_000;
+
+/// Floor for `--kv-bootstrap-fetch-timeout-cap-ms`; below it the cap would cut
+/// every fetch short of a body transfer. Equals `SNAPSHOT_FETCH_TIMEOUT_FLOOR`
+/// in `state::kv_events::index::sweep`; a test pins the two.
+pub const MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 30_000;
+
+/// Ceiling on `--kv-bootstrap-timeout-ms` (1 hour); past it, `Instant +
+/// Duration` can overflow and panic.
+pub const MAX_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 3_600_000;
 
 /// Default request header for sticky routing.
 pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
@@ -556,6 +645,17 @@ pub enum DiscoveryBackend {
     K8s(K8sDiscoveryConfig),
 }
 
+impl DiscoveryBackend {
+    /// The peer-bootstrap selector, which only the Kubernetes backend carries.
+    /// `Some` is what enables peer bootstrap.
+    pub fn peer_selector(&self) -> Option<&str> {
+        match self {
+            Self::K8s(k) => k.peer_selector.as_deref(),
+            Self::StaticUrls(_) => None,
+        }
+    }
+}
+
 /// Workers registered at startup. Roles, models, and bootstrap ports come from
 /// `/server_info`; topology changes require a restart.
 #[derive(Debug, Clone)]
@@ -570,6 +670,27 @@ pub struct K8sDiscoveryConfig {
     pub namespace: String,
     /// Resolved + validated selector mode (plain vs PD).
     pub mode: K8sDiscoveryMode,
+    /// Label selector matching the EndpointSlices of this router's OWN
+    /// Service, so a booting replica can find sibling replicas to pull a
+    /// cache-aware tree snapshot from.
+    ///
+    /// Matched against EndpointSlice labels, exactly like the worker
+    /// selectors: those are the Service's labels plus
+    /// `kubernetes.io/service-name`, never the pods' labels. A pod-template
+    /// label matches nothing, which reads as "no siblings" and boots every
+    /// replica cold; `kubernetes.io/service-name=<router-service>` is the
+    /// unambiguous choice.
+    ///
+    /// `None` disables peer bootstrap. Scoped to the same namespace as
+    /// `namespace` (so an empty `namespace` means every namespace), which is
+    /// why this lives here rather than on [`crate::config::CacheAwareConfig`].
+    ///
+    /// Requires the router's ServiceAccount to have `list`/`watch` on
+    /// EndpointSlices in that namespace.
+    pub peer_selector: Option<String>,
+    /// EndpointSlice label key whose value is a worker's PD version group.
+    /// Set only in PD mode.
+    pub version_group_label: Option<String>,
 }
 
 /// Validated selector mode. Plain selectors run server-side; PD selectors
@@ -627,7 +748,7 @@ pub enum ConfigError {
 }
 
 /// An empty selector matches every slice, which is invalid for a PD role.
-fn is_selector_empty(selector: &str) -> bool {
+pub(crate) fn is_selector_empty(selector: &str) -> bool {
     selector.split(',').all(|t| t.trim().is_empty())
 }
 

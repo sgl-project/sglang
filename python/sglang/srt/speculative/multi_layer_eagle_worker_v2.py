@@ -17,11 +17,10 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
@@ -46,7 +45,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import (
     get_device,
-    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -80,6 +78,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
     rotate_input_ids,
     stash_append_boundary_state_triton,
 )
+from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -99,7 +98,7 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import empty_context, fast_topk
+from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.profile_utils import build_step_span_name
 
@@ -121,7 +120,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -130,7 +128,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.draft_extend_attn_backend_list = []
@@ -171,8 +168,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 is_multi_layer_eagle=True,
@@ -193,9 +188,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             "InklingForConditionalGenerationMTP",
             "GigaChat35ForCausalLMNextN",
         ]
-        self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
-        )
+        # Retain the target's attention topology when swapping TP groups.
+        self.draft_owns_attention = False
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
@@ -224,7 +218,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(self.draft_runner_list[0].tp_group),
+            draft_tp_context(self.draft_owns_attention),
             speculative_moe_backend_context(),
         ):
             super().init_attention_backends()
@@ -232,7 +226,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(self.draft_runner_list[0].tp_group),
+            draft_tp_context(self.draft_owns_attention),
             speculative_moe_backend_context(),
         ):
             super().init_cuda_graphs()
@@ -364,9 +358,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def init_lm_head(self):
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        target_runner = self.target_worker.model_runner
         # Share the embedding and lm_head
         for i in range(self.speculative_num_steps):
+            embed, head = resolve_draft_embed_and_head(
+                target_model=target_runner.model,
+                draft_model=self.draft_runner_list[i].model,
+                model_path=target_runner.model_config.model_path,
+                revision=target_runner.model_config.revision,
+                load_config=target_runner.load_config,
+            )
             self.draft_runner_list[i].model.set_embed_and_head(embed, head)
 
     def init_attention_backend(self):
@@ -998,11 +999,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
+    def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
+        return [
+            (f"draft_step_{i}", r)
+            for i, r in enumerate(self.draft_worker.draft_runners)
+        ]
+
     def __init__(
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -1024,7 +1030,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self._draft_worker = MultiLayerEagleDraftWorker(
             server_args,
             gpu_id,
-            ps,
             nccl_port,
             target_worker,
         )

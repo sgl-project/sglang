@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.utils import is_hpu
 
 if is_hpu():
@@ -41,7 +42,7 @@ class HpuCommunicator:
         )
         # All-gather.
         htorch.core.mark_step()
-        dist.all_gather_into_tensor(output_tensor, x, group=self.group)
+        all_gather_single(output_tensor, x, group=self.group)
         # Reshape
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(

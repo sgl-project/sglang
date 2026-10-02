@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
+from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.vocab_parallel_embedding import (

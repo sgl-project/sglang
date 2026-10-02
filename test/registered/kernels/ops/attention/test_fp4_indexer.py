@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    fp4_index_logits_decode,
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )
@@ -318,6 +319,149 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     torch.testing.assert_close(q_fp4.view(torch.uint8), ref_fp4)
     torch.testing.assert_close(q_sf, ref_sf)
     torch.testing.assert_close(weights_out.squeeze(-1), weight.float() * weight_scale)
+
+
+def _make_logits_case(rows: int, heads: int, width: int, seed: int = 719):
+    """Use exact dyadic inputs to isolate logits/masking from FP32 dot order."""
+    torch.manual_seed(seed)
+    device = get_device()
+    q = (
+        torch.randint(-8, 9, (rows, heads, HEAD_DIM), device=device).to(torch.bfloat16)
+        / 8
+    )
+    weights = torch.randint(-8, 9, (rows, heads), device=device).to(torch.bfloat16) / 8
+    # Six adjacent verify rows share one request, with shuffled physical pages.
+    groups = (rows + 5) // 6
+    padded = max(PAGE_SIZE, (width + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE)
+    pages = torch.randperm(groups * padded // PAGE_SIZE, device=device)
+    locations = (
+        pages[:, None] * PAGE_SIZE + torch.arange(PAGE_SIZE, device=device)
+    ).flatten()
+    keys = (
+        torch.randint(-8, 9, (groups * padded, HEAD_DIM), device=device).to(
+            torch.bfloat16
+        )
+        / 8
+    )
+    table = torch.zeros(
+        groups * padded // PAGE_SIZE,
+        PAGE_SIZE * 68,
+        device=device,
+        dtype=torch.uint8,
+    )
+    store_fp4_index_k_cache(keys, table, locations, page_size=PAGE_SIZE, rne=True)
+    slots = locations.reshape(groups, padded)[
+        torch.arange(rows, device=device) // 6, :width
+    ].contiguous()
+    patterns = [0, 1, 63, 64, 65, max(0, width - 1), width]
+    lens = torch.tensor(
+        [min(width, patterns[i % len(patterns)]) for i in range(rows)],
+        device=device,
+        dtype=torch.int64,
+    )
+    lens[-1] = width
+    return q, weights, slots, lens, table
+
+
+def _reference_logits(q, weights, slots, lens, table):
+    """Independent E2M1/UE8M0 decoding with the prescribed BF16 rounds."""
+    rows, width = slots.shape
+    position = torch.arange(width, device=q.device)
+    # Invisible positions have no cache mapping contract.
+    safe_slots = torch.where(position[None, :] < lens[:, None], slots, 0)
+    page, offset = safe_slots // PAGE_SIZE, safe_slots % PAGE_SIZE
+    payload = table[
+        page[:, :, None],
+        offset[:, :, None] * 64 + torch.arange(64, device=q.device),
+    ]
+    codes = torch.stack((payload & 15, payload >> 4), dim=-1).flatten(-2).long()
+    levels = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=q.device)
+    values = levels[codes & 7]
+    values = torch.where((codes & 8) != 0, -values, values)
+    exponents = table[
+        page[:, :, None],
+        PAGE_SIZE * 64 + offset[:, :, None] * 4 + torch.arange(4, device=q.device),
+    ].int()
+    scales = torch.ldexp(
+        torch.ones_like(exponents, dtype=torch.float32), exponents - 127
+    )
+    keys = (values * scales.repeat_interleave(32, dim=-1)).to(torch.bfloat16)
+    scores = torch.bmm(q.double(), keys.double().transpose(1, 2)).to(torch.bfloat16)
+    products = (scores.double().clamp_min(0) * weights.double()[:, :, None]).to(
+        torch.bfloat16
+    )
+    logits = products.double().sum(dim=1).to(torch.bfloat16).float()
+    return logits.masked_fill(position[None, :] >= lens[:, None], -torch.inf)
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("rows", [1, 6, 13])
+@pytest.mark.parametrize("width", [0, 1, 63, 64, 65, 129])
+def test_fp4_logits_visibility_boundaries(heads, rows, width):
+    args = _make_logits_case(rows, heads, width)
+    actual = fp4_index_logits_decode(*args, PAGE_SIZE)
+    expected = _reference_logits(*args)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert actual.shape == (rows, width)
+    assert actual.dtype == torch.float32
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("rows", [1, 6])
+def test_fp4_logits_noncontiguous_queries_and_weights(heads, rows):
+    q, weights, slots, lens, table = _make_logits_case(rows, heads, 129)
+    q_storage = torch.empty(rows, heads, HEAD_DIM * 2, device=q.device, dtype=q.dtype)
+    q_view = q_storage[..., ::2]
+    q_view.copy_(q)
+    weight_storage = torch.empty(rows, heads * 2, device=q.device, dtype=weights.dtype)
+    weight_view = weight_storage[:, ::2]
+    weight_view.copy_(weights)
+    actual = fp4_index_logits_decode(q_view, weight_view, slots, lens, table, PAGE_SIZE)
+    expected = _reference_logits(q, weights, slots, lens, table)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    if rows == 1:
+        # A singleton batch can be contiguous even with an arbitrary batch stride.
+        q_view = q.as_strided(q.shape, (0, HEAD_DIM, 1))
+        assert q_view.is_contiguous()
+        actual = fp4_index_logits_decode(q_view, weights, slots, lens, table, PAGE_SIZE)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.skipif(_is_xpu, reason="CUDA graph replay requires a CUDA device")
+def test_fp4_logits_graph_replay_updates_visibility_and_mapping(heads):
+    args = _make_logits_case(13, heads, 193)
+    for _ in range(3):
+        fp4_index_logits_decode(*args, PAGE_SIZE)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fp4_index_logits_decode(*args, PAGE_SIZE)
+    q, weights, slots, lens, table = args
+    full_slots = slots.clone()
+    for step, visible in enumerate([193, 0, 1, 63, 64, 65, 129, 193]):
+        lens.copy_((visible - torch.arange(13, device=q.device) % 6).clamp_min(0))
+        slots.copy_(full_slots.roll(step, dims=1))
+        q.neg_()
+        weights.neg_()
+        table.copy_(table.roll(1, dims=0))
+        graph.replay()
+        expected = _reference_logits(*args)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        invalid = torch.arange(193, device=q.device)[None, :] >= lens[:, None]
+        assert torch.isneginf(actual[invalid]).all().item()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_fp4_logits_invisible_tiles_ignore_nonfinite_queries(value):
+    args = _make_logits_case(6, 32, 129)
+    q, weights, slots, lens, table = args
+    q.fill_(value)
+    weights.fill_(value)
+    lens.zero_()
+    slots.fill_(-1)
+    actual = fp4_index_logits_decode(*args, PAGE_SIZE)
+    assert torch.isneginf(actual).all().item()
 
 
 if __name__ == "__main__":
