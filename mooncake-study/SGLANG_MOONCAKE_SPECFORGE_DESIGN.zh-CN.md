@@ -621,6 +621,20 @@ DSpark 的 eager/graph 四组用例通过，服务退出后由新进程读回全
 
 PREPARED、publication 与 outbox 存在应用元数据中；不是 Mooncake 多 key 事务。manifest digest 对精确 UTF-8 bytes 计算，重试发送同一组 bytes，不重新排序 JSON 后复用旧摘要。
 
+单 rank 采集在 D2H 完成后调用 `RequestCaptureContext.prepare_snapshot()`，
+生成独占 Host 视图的 descriptor、checksum 和 manifest。准备阶段验证结构与覆盖，
+checksum 不能证明 token/mask、raw top-128、LSE 或 KV 内容符合训练协议。
+`SnapshotWriter.write()` 必须在第一次 REGISTERED 之前完整验证内容；线上路径
+不再同时在构造函数重复执行这次扫描。供直接消费者使用的 `build_snapshot()`
+和 `RequestCaptureContext.snapshot()` 仍返回经过完整校验的结果。
+
+writer 完成内容校验后，单 rank coordinator 再检查 context 仍为 SEALED、
+请求未失效、本地 lease 未到期且未超过采集时限，才允许登记对象。这个检查不能
+代替后续每个 Catalog 操作的 fencing，也不能撤销已发布样本。journal 恢复继续
+使用持久化 manifest、Store 内容和 Catalog 状态，不依赖已退出请求的回调。
+分布式 owner 准备与组装路径保持独立。`snapshot_built` 仅表示描述准备完成，
+不表示内容校验通过；阶段指标 `validation` 包含上述校验后状态检查。
+
 ### 8.4 故障窗口
 
 | 中断位置 | 恢复方式 |

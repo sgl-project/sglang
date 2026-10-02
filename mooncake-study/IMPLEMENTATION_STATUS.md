@@ -3696,6 +3696,52 @@ All 1,286 measured benchmark snapshots pass readback. All eight submitted jobs
 are terminal and successful; the resident H100 is idle-loaded with no additional
 GPU allocated. Ten Python files pass Black and I/F with no new full-Ruff warning.
 
+## Publication-Boundary Content Validation
+
+The live single-rank writer now prepares descriptors and owned Host views before
+performing full tensor validation once at publication, ahead of any Catalog
+object registration or Store call. Preparation retains shape/coverage checks
+and source hashing; a digest does not certify training semantics. The checked
+`build_snapshot()` and context `snapshot()` APIs still validate fully before
+returning. Distributed owner preparation, Store source checks, hard pinning,
+buffer quarantine, journal durability and recovery retain their contracts.
+
+After validation, a coordinator callback checks cancellation, sealed state,
+local lease deadline and maximum capture age before registration. Catalog
+fences remain authoritative for later operations. `snapshot_built` explicitly
+denotes descriptor preparation, and the `validation` stage includes this guard.
+
+All **103 regression methods** pass, including eight corrupt-payload cases and
+four cancellation/expiry cases in both direct and staged coordinators. Bad
+prepared payloads fail before registration, writes or journaling. Actual Qwen3
+inference covers AR/overlap/target-KV DSpark, graph replay, retraction and
+adaptive/latency recovery; P/D verifies eager and graph/overlap handoff failures
+and cancellation. All 11 submitted jobs are terminal and successful.
+
+Fresh before/after benchmarks use identical drivers and the pinned resident
+H100 runtime. A 64-request 512-input/128-output round reduces construction plus
+validation from **66.232 to 37.161 ms/sample (43.89%)**. READY samples rise from
+53 to 62, sample throughput from 3.360 to 4.048/s and serving throughput from
+4.057 to 4.179 requests/s. Capture-on still retains only 56.42%/57.96% of
+bracketing capture-off throughput, leaving the serving overhead gate open.
+
+Two 512-request 16-input/two-output rounds reduce construction plus validation
+from **6.713 to 4.411 ms/sample (34.29%)**. Samples increase from 598 to 664;
+sample throughput rises 11.62%, while serving throughput is nearly unchanged
+at 69.13 versus 69.49 requests/s. Short-request p99 TTFT is 61.97/60.95 ms before
+and 59.52/65.16 ms after. The prior 118-127 ms tail is not reproduced even by
+the unchanged timed baseline, so its cause remains unresolved. Higher admission
+also increases collection work; these are not constant-capture-rate comparisons.
+
+All **1,377 benchmark snapshots** pass post-exit readback. All six actual metrics
+scrapes agree with status, and measured stage counts match publications without
+errors, Catalog failures or quarantine. Only four production modules change.
+Six Python files pass Black and I/F with no new full-Ruff warnings; all 43 listed
+source files match the frozen tested tree. The resident H100 is idle-loaded again
+without another GPU allocation. See the
+[runbook](experiments/PUBLICATION_VALIDATION.md) and
+[source/log evidence](experiments/publication-validation.json).
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
@@ -3726,8 +3772,10 @@ GPU allocated. Ten Python files pass Black and I/F with no new full-Ruff warning
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to
    representative workloads and SLO thresholds, and complete dashboard runtime
    acceptance and rollout/rollback checks. Investigate the timing experiment's
-   short-request p99 TTFT increase; profile repeated construction/validation and
-   control/durability work without dropping publication checks. Per-model numerical/runtime validation and
+   short-request p99 TTFT increase, which the latest unchanged baseline did not
+   reproduce. After consolidating single-rank content validation, profile the
+   remaining capture and control/durability costs without dropping publication
+   checks. Per-model numerical/runtime validation and
    runtime identity coverage also need expansion beyond the tested combination.
 5. Integrate with the SpecForge-owned production Catalog and consumer when
    available. Test doubles do not prove retention, consumer checkpoint replay,

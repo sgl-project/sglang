@@ -996,6 +996,18 @@ class CaptureCoordinator:
                 self.disabled_reason = None
                 self.lease_wake.set()
 
+    def _check_publication(self, record):
+        # Full payload validation may outlive cancellation or the local lease.
+        with self.lock:
+            if record.invalid_reason or record.context.state != "SEALED":
+                raise ContractError("capture invalidated before publication")
+            now = time.monotonic()
+            if now >= record.deadline or (
+                record.started
+                and now - record.started > self.config.max_capture_seconds
+            ):
+                raise ContractError("capture expired before publication")
+
     def _writer_loop(self):
         # Match the CUDA worker's CPU budget in this thread's OpenMP context.
         torch.set_num_threads(1)
@@ -1041,7 +1053,7 @@ class CaptureCoordinator:
                 else:
                     manifest, tensors = self.writer.timings.call(
                         "snapshot_build",
-                        record.context.snapshot,
+                        record.context.prepare_snapshot,
                         dataset_id=record.lease.dataset_id,
                         sample_id=record.lease.sample_id,
                         generation_id=record.lease.generation_id,
@@ -1052,7 +1064,13 @@ class CaptureCoordinator:
                     )
                     self._count("snapshot_built")
                     self.writer.write(
-                        manifest, tensors, record.slot.manifest_buffer, record.lease
+                        manifest,
+                        tensors,
+                        record.slot.manifest_buffer,
+                        record.lease,
+                        check_current=lambda record=record: self._check_publication(
+                            record
+                        ),
                     )
                     self._count("ready")
                     logger.info(

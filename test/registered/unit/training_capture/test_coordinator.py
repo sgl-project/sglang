@@ -24,6 +24,7 @@ from sglang.srt.training_capture.mooncake_store import (
     MooncakeSnapshotStore,
     TransportError,
 )
+from sglang.srt.training_capture.protocol import validate_tensors
 from sglang.srt.training_capture.teacher import capture_teacher
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -106,6 +107,146 @@ class TestCaptureCoordinator(CustomTestCase):
         return self.metrics_registry.get_sample_value(
             "sglang:training_capture_" + name, {"model_name": "test", **labels}
         )
+
+    def sealed_request(self, name):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        req = self.request(name)
+        self.coordinator.before_forward([req])
+        record = req.training_capture_context
+        context = record.context
+        context.export_kv(self.coordinator.exporter, torch.tensor([7, 3]), end=2)
+        context.record_teacher(
+            capture_teacher(torch.arange(256).float()[None], 256), row=0, position=2
+        )
+        context.commit_token(position=2, token_id=10)
+        context.seal("length")
+        return req, record
+
+    def test_successful_sample_scans_contents_once_at_publication(self):
+        req, record = self.sealed_request("one-validation")
+        with (
+            patch(
+                "sglang.srt.training_capture.snapshot.validate_tensors",
+                side_effect=AssertionError("redundant builder validation"),
+            ),
+            patch(
+                "sglang.srt.training_capture.context.validate_tensors",
+                side_effect=AssertionError("redundant context validation"),
+            ),
+            patch(
+                "sglang.srt.training_capture.snapshot_writer.validate_tensors",
+                wraps=validate_tensors,
+            ) as validator,
+        ):
+            self.coordinator._detach(req, record)
+            published = self.catalog.wait_publications(1)
+            self.wait_until(lambda: record.state == "done")
+        self.assertEqual(validator.call_count, 1)
+        _, tensors = read_snapshot(self.store, published[0])
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10])
+        self.assertEqual(tensors["loss_mask"].tolist(), [0, 0, 1])
+
+    def test_corrupt_prepared_contents_never_register_or_write_objects(self):
+        for field in (
+            "loss_mask",
+            "token_ids",
+            "position_ids",
+            "teacher_topk_ids",
+            "teacher_topk_logits",
+            "teacher_logsumexp",
+            "kv_valid",
+            "target_k.3",
+        ):
+            with self.subTest(field=field):
+                req, record = self.sealed_request("corrupt-" + field)
+                tensor = record.slot.tensors[field]
+                if field == "loss_mask":
+                    tensor[0] = 1
+                elif field == "token_ids":
+                    tensor[0] = 999
+                elif field == "position_ids":
+                    tensor[0] = -1
+                elif field == "teacher_topk_ids":
+                    tensor[0, 1] = tensor[0, 0]
+                elif field == "teacher_topk_logits":
+                    tensor[0, 0] = -1e6
+                elif field == "teacher_logsumexp":
+                    tensor[0] -= 100
+                elif field == "kv_valid":
+                    tensor[0] = 0
+                else:
+                    tensor[0, 0, 0] = float("nan")
+                with patch.object(
+                    self.coordinator.catalog,
+                    "objects",
+                    wraps=self.coordinator.catalog.objects,
+                ) as registered:
+                    self.coordinator._detach(req, record)
+                    self.wait_until(lambda record=record: record.state == "done")
+                registered.assert_not_called()
+                self.assertFalse(self.sdk.put_keys)
+                self.assertFalse(self.catalog.publications)
+                self.assertFalse(
+                    self.coordinator.journal.has_pending(record.lease.capture_id)
+                )
+                self.assertEqual(
+                    self.catalog.captures[record.lease.capture_id]["state"], "FAILED"
+                )
+                self.assertFalse(self.store.quarantined)
+
+    def test_cancel_and_expiry_during_validation_prevent_registration(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        self.coordinator.stop.set()
+        self.coordinator.lease_thread.join(timeout=5)
+        self.assertFalse(self.coordinator.lease_thread.is_alive())
+        for invalidation in ("context", "record", "deadline", "capture_age"):
+            with self.subTest(invalidation=invalidation):
+                self.coordinator._reserve()
+                req, record = self.sealed_request("invalidated-" + invalidation)
+                entered, release = threading.Event(), threading.Event()
+
+                def blocked_validation(
+                    *args, entered=entered, release=release, **kwargs
+                ):
+                    validate_tensors(*args, **kwargs)
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("test did not release validation")
+
+                with (
+                    patch(
+                        "sglang.srt.training_capture.snapshot_writer.validate_tensors",
+                        side_effect=blocked_validation,
+                    ),
+                    patch.object(
+                        self.coordinator.catalog,
+                        "objects",
+                        wraps=self.coordinator.catalog.objects,
+                    ) as registered,
+                ):
+                    try:
+                        self.coordinator._detach(req, record)
+                        self.assertTrue(entered.wait(5))
+                        if invalidation == "context":
+                            record.context.abort("cancelled")
+                        elif invalidation == "record":
+                            record.invalid_reason = "cancelled"
+                        elif invalidation == "deadline":
+                            record.deadline = 0
+                        else:
+                            record.started = (
+                                time.monotonic()
+                                - self.coordinator.config.max_capture_seconds
+                                - 1
+                            )
+                    finally:
+                        release.set()
+                    self.wait_until(lambda record=record: record.state == "done")
+                    self.wait_until(lambda: self.coordinator.pool.stats()["free"] == 1)
+                registered.assert_not_called()
+                self.assertFalse(self.sdk.put_keys)
+                self.assertFalse(self.catalog.publications)
+                self.assertFalse(self.store.quarantined)
 
     def test_overlap_finalizes_previous_result_with_owned_lookahead_kv(self):
         from sglang.srt.managers.schedule_batch import FINISH_LENGTH
@@ -451,11 +592,11 @@ class TestCaptureCoordinator(CustomTestCase):
         entered, release = threading.Event(), threading.Event()
         original_write = self.coordinator.writer.write
 
-        def blocked_write(*args):
+        def blocked_write(*args, **kwargs):
             entered.set()
             if not release.wait(5):
                 raise TimeoutError("test did not release writer")
-            return original_write(*args)
+            return original_write(*args, **kwargs)
 
         with patch.object(self.coordinator.writer, "write", side_effect=blocked_write):
             try:

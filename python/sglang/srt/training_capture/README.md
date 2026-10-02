@@ -262,13 +262,20 @@ The dashboard plots scheduler quantiles/budgets separately from serving histogra
   shared with KV staging across all local slots. The aux owner alone allocates
   these buffers; CPU P/D handoff rows remain on Host. Seal flushes pending rows
   on their producer stream before publication; abort discards unpublished tails.
-- `build_snapshot` runs only after D2H completion. It retains the final partial
-  chunk and produces request-owned objects, including tokens and masks. It
-  never aliases or modifies a shared HiCache page.
+- `prepare_snapshot` runs only after D2H completion. It retains the final partial
+  chunk and describes request-owned views, including tokens and masks. It
+  never aliases or modifies a shared HiCache page. Shape/coverage checks and
+  byte digests do not certify tensor contents. `build_snapshot` adds full
+  content validation for direct consumers.
 - `SnapshotWriter` is synchronous and belongs on one background writer thread.
-  It registers object identities with the Catalog, writes tensors, seals, writes
-  the READY manifest, and publishes a metadata-only reference. The capture lease
-  must already exist; the caller owns admission, heartbeats and failure handling.
+  It fully validates the snapshot before registering object identities with the
+  Catalog, writing tensors, sealing, writing the READY manifest and publishing
+  a metadata-only reference. Validation is mandatory even for prepared views.
+  The capture lease must already exist; the caller owns admission, heartbeats
+  and failure handling. The single-rank coordinator supplies a `check_current`
+  callback, which rejects cancellation, local lease expiry or excessive capture
+  age after validation and before registration. Catalog fencing still governs
+  each subsequent operation and recovery.
 - `PublicationJournal` persists exact manifest bytes before sealing. On restart,
   `recover()` confirms the fence, prepared state and each stored tensor digest,
   retries the same manifest,
@@ -498,8 +505,11 @@ requires the same sequence digest from every owner. The digest is an internal
 partition field, not a new public manifest field; all producers must use the
 matching preparation/assembly interface.
 
-`snapshot()` remains the complete, unpartitioned context API. Partitioned
-contexts must use coordinated assembly. `abort` can invalidate collecting or
+`snapshot()` remains the fully validated, unpartitioned context API, with a
+sealed-state check after content validation. The single-rank background writer
+uses `prepare_snapshot()` followed by the writer's mandatory validation, avoiding
+a duplicate full payload scan. Partitioned contexts must use coordinated
+assembly; their preparation path is unchanged. `abort` can invalidate collecting or
 sealed contexts. Preparation rechecks cancellation after copy waits and descriptor
 construction before returning a result. This does not revoke already
 prepared descriptors, Store writes or published samples. The request coordinator
@@ -866,7 +876,9 @@ Counters aggregate observed lifecycle events, not mutually exclusive outcomes:
 `adaptive_sampled_out` is a subset of `sampled_out`; `capture_failed` and
 `writer_failed` can refer to the same request. `ready` counts direct successful
 writer publications in this process, excluding journal recovery and consumer
-acknowledgements. Do not infer exact dataset completeness from a rate ratio.
+acknowledgements. `snapshot_built` means descriptors and a manifest were prepared;
+it does not imply successful content validation or publication. Do not infer
+exact dataset completeness from a rate ratio.
 `writer_age_seconds` includes queue waiting, CUDA completion, serialization and
 Catalog work; it is not RDMA latency. `host_slots{state="filling"}` includes
 spare leases, whereas `occupied_fraction` excludes them. Host bytes report
@@ -882,6 +894,11 @@ The fixed stages are `queue_wait`, `copy_wait`, `snapshot_build`, `validation`,
 Measurements run in background writers and add no CUDA events/synchronization.
 Pending operations appear in `writer_age_seconds`; their stage duration is
 recorded only when they finish or raise. A zero count means no completed attempt.
+`snapshot_build` includes descriptor preparation and source hashing, while
+`validation` includes full writer validation and the optional current-request
+check. Direct checked snapshot APIs still validate before returning. See the
+[publication validation experiment](../../../../mooncake-study/experiments/PUBLICATION_VALIDATION.md)
+for the single-rank scan consolidation and its measured limits.
 
 These are host wall times including scheduling/GIL waits. `copy_wait` measures
 remaining completion wait, not total D2H time; `store_payload` includes adapter

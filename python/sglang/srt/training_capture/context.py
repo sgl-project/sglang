@@ -8,10 +8,15 @@ import torch
 from sglang.srt.training_capture.host_pool import HostSlot
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.kv_staging import KVStaging
-from sglang.srt.training_capture.protocol import ContractError, SequenceInfo, aux_specs
+from sglang.srt.training_capture.protocol import (
+    ContractError,
+    SequenceInfo,
+    aux_specs,
+    validate_tensors,
+)
 from sglang.srt.training_capture.snapshot import (
     SnapshotMetadata,
-    build_snapshot,
+    prepare_snapshot,
     prepare_snapshot_partition,
 )
 from sglang.srt.training_capture.teacher import TeacherRows
@@ -337,13 +342,21 @@ class RequestCaptureContext:
                 raise
 
     def snapshot(self, **metadata):
+        """Return a fully validated snapshot for direct consumers."""
+        result = self.prepare_snapshot(**metadata)
+        validate_tensors(*result)
+        self._sealed()
+        return result
+
+    def prepare_snapshot(self, **metadata):
+        """Prepare owned views for mandatory validation by SnapshotWriter."""
         if self.partition is not None:
             raise ContractError(
                 "partitioned requests require coordinated snapshot assembly"
             )
         self._sealed()
         self.wait_for_copies()
-        result = build_snapshot(
+        result = prepare_snapshot(
             SnapshotMetadata(sequence=self.sequence, **metadata),
             self.slot.tensors,
             valid_kv_tokens=self.kv_end,

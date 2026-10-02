@@ -60,7 +60,25 @@ def build_snapshot(
     *,
     valid_kv_tokens: int,
 ) -> tuple[Manifest, dict[str, torch.Tensor]]:
-    """Slicing preserves registered arena storage; nothing here extends its lease."""
+    """Prepare and fully validate a snapshot for callers that consume it directly."""
+    manifest, tensors = prepare_snapshot(
+        metadata, buffers, valid_kv_tokens=valid_kv_tokens
+    )
+    validate_tensors(manifest, tensors)
+    return manifest, tensors
+
+
+def prepare_snapshot(
+    metadata: SnapshotMetadata,
+    buffers: dict[str, torch.Tensor],
+    *,
+    valid_kv_tokens: int,
+) -> tuple[Manifest, dict[str, torch.Tensor]]:
+    """Describe completed Host views; the writer must validate their contents.
+
+    Slicing preserves registered arena storage; nothing here extends its lease.
+    Descriptor digests identify bytes but do not certify their training semantics.
+    """
     validate_kv_spec(metadata.kv)
     layout = plan_capture_layout(
         metadata.kv,
@@ -74,7 +92,6 @@ def build_snapshot(
         partition=layout.partition(OWNER),
     )
     manifest = assemble_snapshot(metadata, [part], layout=layout)
-    validate_tensors(manifest, tensors)
     return manifest, tensors
 
 

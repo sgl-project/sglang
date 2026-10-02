@@ -6,6 +6,7 @@ import base64
 import fcntl
 import os
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -189,9 +190,14 @@ class SnapshotWriter:
         tensors: dict[str, torch.Tensor],
         manifest_buffer: torch.Tensor,
         lease: CaptureLease,
+        *,
+        check_current: Callable[[], None] | None = None,
     ) -> dict:
         self._check_identity(manifest, lease)
-        self.timings.call("validation", validate_tensors, manifest, tensors)
+        with self.timings.measure("validation"):
+            validate_tensors(manifest, tensors)
+            if check_current is not None:
+                check_current()
         data = canonical_bytes(manifest)
         if len(data) > manifest_buffer.numel() or manifest_buffer.dtype != torch.uint8:
             raise ContractError("manifest exceeds reserved Host buffer")
