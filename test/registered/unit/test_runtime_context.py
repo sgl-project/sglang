@@ -2423,6 +2423,25 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
                 pass
         self.assertEqual([str(w.message) for w in seen], [])
 
+    def test_in_package_all_reduces_trace_under_fullgraph(self):
+        """The package's own all-reduces trace under fullgraph torch.compile."""
+        import torch
+
+        from sglang.srt.distributed import communication_op, parallel_state
+
+        group = SimpleNamespace(all_reduce=lambda x: x * 2)
+        with (
+            patch.object(parallel_state, "_ALREADY_WARNED", set()),
+            get_parallel().override(tp_group=group, attn_tp_group=group),
+        ):
+            for helper in (
+                communication_op.tensor_model_parallel_all_reduce,
+                communication_op.attention_tensor_model_parallel_all_reduce,
+            ):
+                with self.subTest(helper.__name__):
+                    compiled = torch.compile(helper, fullgraph=True, backend="eager")
+                    self.assertEqual(compiled(torch.ones(2)).tolist(), [2.0, 2.0])
+
     def test_the_guard_would_notice_a_caller(self):
         self.assertTrue(self._callers("get_self_pp_group"))
 

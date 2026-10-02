@@ -15,7 +15,6 @@
 
 from typing import Optional, Union
 
-import msgspec
 import torch
 
 from sglang.srt.layers.layer_boundary.layout import SumGroup, _sum_group
@@ -23,16 +22,22 @@ from sglang.srt.layers.layer_boundary.output import DeferredFinalize, UnreducedO
 from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
 
 
-class DeclaredSum(msgspec.Struct, frozen=True):
+# Per-forward values are plain classes, not msgspec.Struct;
+# Dynamo cannot build a Struct inside a compiled layer.
+class DeclaredSum:
     """A sum every output of this producer owes to its declared input edge."""
 
-    group: SumGroup
+    __slots__ = ("group",)
+
+    def __init__(self, group: SumGroup):
+        self.group = group
 
     def complete(self, value):
         return _sum_group(self.group).all_reduce(value)
 
 
-class Contribution(msgspec.Struct):
+# Also mutated per forward, which Dynamo cannot do to a msgspec.Struct.
+class Contribution:
     """Own a producer's output, residual update and outstanding completion.
 
     Fields:
@@ -45,9 +50,17 @@ class Contribution(msgspec.Struct):
     Completing owed work clears owed but does not apply the residual update.
     """
 
-    value: Optional[torch.Tensor]
-    update: ResidualUpdate
-    owed: Union[UnreducedOutput, DeclaredSum, DeferredFinalize, None] = None
+    __slots__ = ("value", "update", "owed")
+
+    def __init__(
+        self,
+        value: Optional[torch.Tensor],
+        update: ResidualUpdate,
+        owed: Union[UnreducedOutput, DeclaredSum, DeferredFinalize, None] = None,
+    ):
+        self.value = value
+        self.update = update
+        self.owed = owed
 
     def for_boundary(self):
         # These forms are private inputs to the existing fused-kernel adapters.
@@ -71,10 +84,13 @@ class Contribution(msgspec.Struct):
         self.owed = None
 
 
-class OwedOutput(msgspec.Struct, frozen=True):
+class OwedOutput:
     """Opaque model-facing handle. Only its boundary may read the contribution."""
 
-    contribution: Contribution
+    __slots__ = ("contribution",)
+
+    def __init__(self, contribution: Contribution):
+        self.contribution = contribution
 
 
 class ResidualStream:
@@ -201,8 +217,11 @@ class ResidualStream:
         elif isinstance(pending.owed, DeclaredSum):
             value = pending.owed.complete(pending.value.clone())
         elif isinstance(pending.owed, UnreducedOutput):
-            value = msgspec.structs.replace(
-                pending.owed, partial=pending.value.clone()
+            owed = pending.owed
+            value = UnreducedOutput(
+                pending.value.clone(),
+                group=owed.group,
+                reduce_to_dp_local=owed.reduce_to_dp_local,
             ).complete()
         else:
             raise NotImplementedError("a finalize handoff requires main-output capture")

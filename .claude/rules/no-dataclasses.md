@@ -21,3 +21,5 @@ class LoadSnapshot(msgspec.Struct):   # prefer frozen= and omit_defaults=; kw_on
   `python/sglang/srt/managers/load_snapshot.py`.
 - New code only. Existing `@dataclass` is grandfathered — migrate opportunistically
   while editing the file, not in drive-by sweeps.
+- Exception: values built or mutated inside a `torch.compile`d forward stay plain
+  `__slots__` classes; Dynamo cannot construct or mutate a `Struct`.

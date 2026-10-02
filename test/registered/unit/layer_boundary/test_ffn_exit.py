@@ -261,6 +261,40 @@ class TestFfnExit(CustomTestCase):
             )
         self.assertIsInstance(hidden_states, UnreducedOutput)
 
+    def test_compiles_without_graph_breaks(self):
+        """The exit and the output it leaves trace under fullgraph torch.compile."""
+        group = types.SimpleNamespace(all_reduce=lambda h: h * 3)
+        for fuse in (False, True):
+            with self.subTest(fuse=fuse):
+                communicator = stub_plan()
+                communicator.terminal = False
+                communicator.paths[BatchVariant.ORDINARY] = ordinary_steps(
+                    OutputContract(
+                        Layout(frozenset()),
+                        group=SumGroup.TP,
+                        may_defer_to_next=True,
+                    )
+                )
+                output = communicator.output
+                output._defers_sum = lambda fb, steps, **_: fuse
+                output._skips_sum_for_reduce_scatter = lambda steps, dp: False
+                output.ffn_reduction_group = lambda steps: group
+                output._complete_now = lambda h, r, **_: (h + 1, r)
+
+                def layer(hidden_states, residual):
+                    stream = ResidualStream(residual)
+                    with output.ffn_exit(None, stream=stream) as ffn_exit:
+                        if get_forward().fuse_mlp_allreduce:
+                            hidden_states = hidden_states * 2
+                    return stream.complete(ffn_exit.finish(hidden_states))
+
+                torch._dynamo.reset()
+                compiled = torch.compile(layer, backend="eager", fullgraph=True)
+                with patch_communicator("_batch_shards_over_cp", lambda fb: False):
+                    hidden_states = compiled(self.hidden_states, self.residual)
+                expected = self.hidden_states * 6 if fuse else self.hidden_states + 1
+                torch.testing.assert_close(hidden_states, expected)
+
 
 class TestReduceOutput(CustomTestCase):
     def setUp(self):
