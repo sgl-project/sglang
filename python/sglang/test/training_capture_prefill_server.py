@@ -10,6 +10,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
 from sglang.test.dspark_capture_observer import install_capture_observer
 
 _load_batch = PrefillCudaGraphRunner.load_batch
+_execute = PrefillCudaGraphRunner.execute
 _replays = itertools.count()
 
 
@@ -21,11 +22,22 @@ def load_batch(self, forward_batch, **kwargs):
         "padded_tokens": static.input_ids.numel(),
         "input_buffer": static.input_ids.data_ptr(),
         "request_slots": self._capture_req_slots if self._is_full_backend else None,
+        "capture_hidden_mode": self.capture_hidden_mode.name,
+        "runtime_hidden_mode": forward_batch.capture_hidden_mode.name,
     }
     return static
 
 
+def execute(self, forward_batch, **kwargs):
+    output = _execute(self, forward_batch, **kwargs)
+    forward_batch.training_capture_test_prefill_graph["output_hidden_states"] = (
+        output.hidden_states is not None
+    )
+    return output
+
+
 PrefillCudaGraphRunner.load_batch = load_batch
+PrefillCudaGraphRunner.execute = execute
 install_capture_observer()
 
 

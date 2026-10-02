@@ -9,6 +9,7 @@ from unittest.mock import patch
 import requests
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.test import test_utils
 from sglang.test.dspark_capture_observer import check_capture_snapshot
@@ -19,9 +20,19 @@ from sglang.test.training_capture_utils import read_snapshot
 class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
     """Reuse the real Store/HTTP Catalog fixture; serving is not disaggregated."""
 
-    def exercise_prefill(self, backend, *, overlap=True):
-        root = self.root / f"prefill-{backend}-{overlap}"
+    def exercise_prefill(self, backend, *, overlap=True, target_kv=False):
+        if target_kv and "prefill_seed" not in self.drafts:
+            # Bind the synthetic draft to the same live target implementation
+            # and attention backend, using a verified Store sample.
+            self.drafts["prefill_seed"] = self.exercise_prefill("full", overlap=False)
+        root = self.root / f"prefill-{backend}-{overlap}-{target_kv}"
         root.mkdir()
+        draft = None
+        if target_kv:
+            from sglang.test.dspark_target_kv_runtime import export_synthetic_kv_draft
+
+            draft = root / "synthetic-draft"
+            export_synthetic_kv_draft(self.model, draft, *self.drafts["prefill_seed"])
         config = {
             "dataset_id": "runtime-prefill-graph",
             "model_id": "Qwen/Qwen3-0.6B",
@@ -35,6 +46,7 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             "max_inflight_samples": 4,
             "max_host_bytes": 64 << 20,
             "kv_d2h_batch_tokens": 16,
+            "teacher_d2h_batch_tokens": 16,
             "max_device_bytes": 8 << 20,
             "storage_chunk_tokens": 64,
             "http_timeout_seconds": 2.0,
@@ -45,9 +57,13 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
         launch = test_utils._launch_server_process
 
         def observed_server(command, *args):
+            module = (
+                "sglang.test.dspark_target_kv_prefill_server"
+                if target_kv
+                else "sglang.test.training_capture_prefill_server"
+            )
             return launch(
-                [sys.executable, "-m", "sglang.test.training_capture_prefill_server"]
-                + command[2:],
+                [sys.executable, "-m", module] + command[2:],
                 *args,
             )
 
@@ -57,7 +73,11 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
         }
         if backend == "full":
             graph_config["prefill"]["full_prefill_max_req"] = 4
-        with patch.object(test_utils, "_launch_server_process", observed_server):
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+            envs.SGLANG_TEST_RETRACT.override(False),
+            patch.object(test_utils, "_launch_server_process", observed_server),
+        ):
             process = test_utils.popen_launch_server(
                 self.model,
                 url,
@@ -82,6 +102,18 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                     "128",
                     "--cuda-graph-config",
                     json.dumps(graph_config),
+                    *(
+                        [
+                            "--speculative-algorithm",
+                            "DSPARK",
+                            "--speculative-draft-model-path",
+                            str(draft),
+                            "--speculative-draft-attention-backend",
+                            "triton",
+                        ]
+                        if target_kv
+                        else []
+                    ),
                     *([] if overlap else ["--disable-overlap-schedule"]),
                 ],
             )
@@ -94,12 +126,15 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             response.raise_for_status()
             return response.json()["internal_states"][0]["training_capture"]
 
-        def generate(name, prompts, response_lengths):
+        def generate(name, prompts, response_lengths, *, bias=True):
             deadline = time.monotonic() + 20
             while state()["states"].get("available", 0) < len(prompts):
                 self.assertLess(time.monotonic(), deadline, state())
                 time.sleep(0.05)
-            rids = [f"{backend}-{overlap}-{name}-{i}" for i in range(len(prompts))]
+            rids = [
+                f"{backend}-{overlap}-{target_kv}-{name}-{i}"
+                for i in range(len(prompts))
+            ]
             response = requests.post(
                 url + "/generate",
                 json={
@@ -110,7 +145,7 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                             "temperature": 0,
                             "max_new_tokens": length,
                             "ignore_eos": True,
-                            "logit_bias": {"100": 100.0},
+                            **({"logit_bias": {"100": 100.0}} if bias else {}),
                         }
                         for length in response_lengths
                     ],
@@ -129,9 +164,14 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
 
         try:
             prompt = [100, 200, 300, 400] * 67 + [501, 502, 503]
-            generate("chunked", [prompt], [4])
+            response_length = 8 if target_kv else 4
+            generate("chunked", [prompt], [response_length])
             generate("cached-one-token", [prompt], [1])
-            generate("cached-extension", [prompt + list(range(600, 619))], [4])
+            generate(
+                "cached-extension",
+                [prompt + list(range(600, 619))],
+                [response_length],
+            )
             for iteration in range(2):
                 generate(
                     f"batch-{iteration}",
@@ -144,8 +184,10 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                         )
                         for i, length in enumerate([33, 37, 43])
                     ],
-                    [4, 3, 1],
+                    [response_length, response_length - 1, 1],
                 )
+            if target_kv:
+                generate("reject", [list(range(8000, 8013))], [6], bias=False)
             publications = self.catalog.wait_publications(
                 first_publication + len(expected)
             )[first_publication:]
@@ -157,12 +199,16 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
 
         references = [
             torch.load(path, weights_only=True)
-            for path in sorted((root / "capture-reference").glob("*.pt"))
+            for path in sorted(((draft or root) / "capture-reference").glob("*.pt"))
         ]
         prefill = [r for r in references if r["forward_mode"] == "EXTEND"]
         replay = [r for r in prefill if r["cuda_graph"]]
         self.assertTrue(replay, "no actual prefill graph replay")
         self.assertTrue(all(r["prefill_graph"] is not None for r in replay))
+        for item in replay:
+            self.assertEqual(item["prefill_graph"]["capture_hidden_mode"], "NULL")
+            self.assertEqual(item["prefill_graph"]["runtime_hidden_mode"], "NULL")
+            self.assertFalse(item["prefill_graph"]["output_hidden_states"])
         self.assertTrue(
             any(
                 r["prefill_graph"]["raw_tokens"] < r["prefill_graph"]["padded_tokens"]
@@ -182,11 +228,37 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
         self.assertTrue(any(not r["predictions"] for r in prefill))
         self.assertTrue(any(r["extend_prefix_length"] == 128 for r in prefill))
         self.assertTrue(any(r["extend_prefix_length"] == 256 for r in prefill))
-        self.assertTrue(
-            any(r["forward_mode"] == "DECODE" and r["cuda_graph"] for r in references)
-        )
+        if target_kv:
+            verify = [r for r in references if r["verify_width"] is not None]
+            self.assertTrue(any(r["cuda_graph"] for r in verify))
+            self.assertTrue(any(r["num_commit"] == r["verify_width"] for r in verify))
+            self.assertTrue(any(r["num_commit"] < r["verify_width"] for r in verify))
+            observations = [
+                json.loads(line)
+                for line in (draft / "observations.jsonl").read_text().splitlines()
+            ]
+            self.assertTrue(any(o["kind"] == "projection" for o in observations))
+            self.assertTrue(
+                any(
+                    o["kind"] == "target_verify" and o["cuda_graph"]
+                    for o in observations
+                )
+            )
+        else:
+            self.assertTrue(
+                any(
+                    r["forward_mode"] == "DECODE" and r["cuda_graph"]
+                    for r in references
+                )
+            )
         if overlap:
-            self.assertTrue(any(r["result_lag"] == 1 for r in references))
+            self.assertGreater(final_state["counters"].get("overlap_forwards", 0), 0)
+            if target_kv:
+                # A speculative step can forward several accepted tokens
+                # before the scheduler appends its preceding result.
+                self.assertTrue(any(r["result_lag"] > 0 for r in verify))
+            else:
+                self.assertTrue(any(r["result_lag"] == 1 for r in references))
         buffers = {}
         for r in replay:
             buffers.setdefault(r["prefill_graph"]["input_buffer"], set()).add(
@@ -200,14 +272,25 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
         self.addCleanup(reader.close)
         objects, tensor_bytes = 0, 0
         captured = {}
+        seed = None
         for publication in publications:
             manifest, tensors = read_snapshot(reader, publication)
             trace = manifest.provenance.trace_id
             self.assertNotIn(trace, captured)
             captured[trace] = tensors["token_ids"].tolist()
             check_capture_snapshot(
-                self, manifest, tensors, references, capture_mode="autoregressive"
+                self,
+                manifest,
+                tensors,
+                references,
+                capture_mode=(
+                    "speculative_accepted_target_path"
+                    if target_kv
+                    else "autoregressive"
+                ),
             )
+            if seed is None:
+                seed = manifest, tensors
             objects += len(manifest.objects)
             tensor_bytes += sum(obj.nbytes for obj in manifest.objects)
         self.assertEqual(captured, expected)
@@ -215,12 +298,25 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             json.dumps(
                 {
                     "prefill_capture": backend,
+                    "target_kv": target_kv,
                     "overlap": overlap,
                     "samples": len(captured),
                     "tensor_objects": objects,
                     "tensor_bytes": tensor_bytes,
                     "source_frames": len(references),
                     "prefill_replay_frames": len(replay),
+                    "verify_replay_frames": sum(
+                        r["verify_width"] is not None and r["cuda_graph"]
+                        for r in references
+                    ),
+                    "prefill_hidden_states": False,
+                    "verify_result_lags": sorted(
+                        {
+                            r["result_lag"]
+                            for r in references
+                            if r["verify_width"] is not None
+                        }
+                    ),
                     "graph_shapes": sorted(
                         {
                             (
@@ -241,3 +337,4 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             ),
             flush=True,
         )
+        return seed

@@ -414,10 +414,27 @@ torch.compile piecewise overlap，四组均同时开启 Full decode graph。
 原始分数来自实际线上 forward 的测试观测，不额外运行 target 补算。
 
 观测代码仅用于测试，会同步并复制完整 logits 到 CPU，不计入生产采集实现或性能验收。
-此结果限定单卡普通 AR 和 MHA，分布式/推测 prefill graph、MLA 专用前缀图、
+此结果限定单卡普通 AR 和 MHA，分布式 prefill graph、MLA 专用前缀图、
 mixed batch 和 Inductor 仍需分别验证。复现步骤与边界见
 [`experiments/PREFILL_CAPTURE.md`](experiments/PREFILL_CAPTURE.md)，原始结果见
 [`experiments/capture-prefill-graph.json`](experiments/capture-prefill-graph.json)。
+
+KV 输入版 DSpark 现已通过相同四组 prefill graph 配置的独立验收，并同时开启
+Full target-verify graph。prefill runner 按已解析的输入需求选择 hidden capture，
+该 checkpoint 默认使用 NULL；hidden 输入的 DFlash/DSpark target 仍使用 FULL，
+显式 server return mode 和 Breakable EAGLE 的选择逻辑有回归覆盖。
+
+四组共 40 个 speculative 样本通过服务退出后的精确读回，覆盖完整接受、拒绝、
+末尾裁剪、分块、前缀命中、padding、buffer 复用，以及 16-row teacher/KV D2H
+batching。测试直接检查实际 prefill replay 的 hidden output 为空，并独立核对
+target KV 到 draft KV 的投影。overlap 的 verify 记录包含领先尚未交付结果的
+3 个 token，不能套用普通 AR 固定领先 1 个 token 的假设。
+
+该新增范围仍限定单卡 Qwen3 MHA、静态 KV-input DSpark、FlashInfer target、
+Triton draft、TCP Store 和 Catalog test double。合成 draft 用于正确性测试，
+不证明训练质量；其他推测模式、分布式 prefill graph、RDMA 组合及性能仍需验证。
+复现与证据见 [`experiments/DSPARK_PREFILL_CAPTURE.md`](experiments/DSPARK_PREFILL_CAPTURE.md)
+和 [`experiments/dspark-prefill-capture.json`](experiments/dspark-prefill-capture.json)。
 
 ### 7.4 选层 KV 导出
 

@@ -12,7 +12,9 @@ python test/registered/storage/test_training_capture_prefill_graph.py -v -f
 The fixture starts a real TCP Store with a separate 256 MiB segment, an HTTP
 Catalog test double and one ordinary serving process at a time. The model runs
 BF16 with FlashInfer attention, selected KV layers 0/14/27, a 4096-token pool,
-128-token prefill chunks and 64-token storage chunks. It exercises these modes:
+128-token prefill chunks and 64-token storage chunks. The current fixture also
+enables 16-row teacher/KV D2H batching within an 8 MiB device budget. It exercises
+these modes:
 
 | Prefill Backend | Overlap | Decode Backend |
 | --- | --- | --- |
@@ -53,6 +55,8 @@ The observer copies full source logits to CPU only in the instrumented test serv
 not enabled in normal serving and its timing is not performance evidence.
 This lane covers Qwen3 MHA on one GPU, ordinary AR, FlashInfer and TCP Store.
 It does not certify MLA's distinct chunked-prefix graph topology, distributed
-prefill graphs, speculative prefill graphs, mixed prefill/decode batches,
+prefill graphs, mixed prefill/decode batches,
 production Catalog retention or serving SLOs. Cross-node RDMA evidence is
 recorded separately in `RDMA.md` and `PD_RDMA.md`.
+The separate KV-input DSpark lane is documented in
+[`DSPARK_PREFILL_CAPTURE.md`](DSPARK_PREFILL_CAPTURE.md).

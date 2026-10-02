@@ -37,7 +37,7 @@ it does not redefine the goal as the modules already implemented.
 | Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture matches a full target contract; deployed TP/PP model validation remains open |
 | Startup identity exchange | Bounded JSON over the existing CPU group, phase failure votes and final digest agreement | Real four-process Gloo TP2/PP2 and TP4/PP1 cases pass, including local failures, peer exit and finite waits; distributed request/resource coordination remains open |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
-| Prefill graph collection | Capture uses live request lengths after graph replay and owns compact teacher/KV buffers | Full synchronous/overlap, Breakable and default torch.compile piecewise pass token/request padding, chunked/cached prefixes, batch reuse and post-exit Store parity; distributed/speculative prefill graphs remain open |
+| Prefill graph collection | Capture uses live request lengths after graph replay and owns compact teacher/KV buffers; KV-input DSpark uses its resolved hidden-state requirement | AR and static target-KV DSpark pass Full synchronous/overlap, Breakable and default torch.compile piecewise with padding, chunked/cached prefixes, batch reuse and post-exit Store parity; distributed and other speculative prefill graphs remain open |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production checkpoint-manager integration and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
@@ -49,7 +49,7 @@ it does not redefine the goal as the modules already implemented.
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes colocated and P/D PP1 synchronous/overlap and eager/graph combinations, plus synchronous TP1/PP2 and TP2/PP2 eager/graph; P/D checks exact all-layer CPU restore and failed Catalog leases |
 | PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2, synchronous P2/D2 and P2/D1, matching TP2/PP2, and cross-node TP1 RDMA pass eager/graph source parity and failure exclusion; wider distributed RDMA remains open |
 | Pipeline draft serving | Synchronous static target-KV PP loop, per-stage graph activations, P/D queue agreement and cohort capture | Qwen3 TP1/PP2 and TP2/PP2 eager/graph colocated and P/D serving pass exact Mooncake readback and memory retraction; asynchronous PP and broader topologies remain open |
-| Deployment coverage | Partial | TP2/PP1, TP1/PP2 and matching TP2/PP2 AR P/D, TP confidence-scheduled DSpark, colocated and P/D static target-KV PP2 DSpark at TP1/TP2, asymmetric TP/PP AR PD, single-rank cross-node RDMA and single-GPU AR prefill graphs have runtime evidence below; additional models/topologies and workload SLO gates remain open |
+| Deployment coverage | Partial | TP2/PP1, TP1/PP2 and matching TP2/PP2 AR P/D, TP confidence-scheduled DSpark, colocated and P/D static target-KV PP2 DSpark at TP1/TP2, asymmetric TP/PP AR PD, single-rank cross-node RDMA and single-GPU AR/static target-KV DSpark prefill graphs have runtime evidence below; additional models/topologies and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
 `/gpfs/users/fuxuanwei-1/dspark-maas-lab/state`):
@@ -3384,10 +3384,57 @@ This validates local TCP and an HTTP Catalog test double. Production Catalog,
 trained draft quality, distributed teacher-batching runtime/throughput,
 cross-node RDMA for this option, and service SLOs remain open.
 
+## Target-KV DSpark Prefill Graphs
+
+The prefill runner previously forced `FULL` hidden capture for every DFlash
+family checkpoint. It now follows the resolved auxiliary-hidden requirement,
+so KV-input DSpark uses the configured server return mode (normally `NULL`).
+Hidden-input target checkpoints still use `FULL`; Breakable EAGLE target/draft
+selection and explicit server return modes retain constructor coverage. The
+before-fix regression reproduces nine failing subcases across all three
+prefill backends. The final seven-test file passes all 27 mode combinations;
+five chunked-prefix, six wrapper and two padding tests also pass, for 20 CPU
+tests total.
+
+The real runtime matrix passes four tests in 222.429s: Full synchronous, Full
+overlap, Breakable overlap and default `tc_compiler=eager` piecewise overlap.
+Every case runs Full target-verify graphs alongside prefill graphs, with
+FlashInfer target attention and a synthetic Triton KV-input draft. All 40
+speculative snapshots pass exact online selected-KV/raw-top-128 comparison,
+top-k ID and LSE checks, tokens/masks/positions/validity and complete Store
+readback after producer exit. One additional nine-sample AR run binds the
+synthetic draft's target contract. Actual prefill replay outputs have no hidden
+states. The projection observer independently checks target-KV encoding and
+per-layer draft KV writes. Accept/reject branches, terminal trimming, 128-token
+chunks, cached prefixes, token/request padding and reused graph buffers run
+with both teacher and KV batching set to 16.
+
+All four ordinary AR prefill regressions also pass in 148.444s, reading 36
+snapshots with the same production source. That run precedes the test-only
+speculative-lag correction and added summary field; its logged overlap counters
+also satisfy the added assertion. Initial overlap tests stopped at an incorrect
+AR-specific one-token-lead assertion; actual speculative frames show a
+three-token lead and the final tests require a positive speculative lead.
+An initial combined CPU invocation could not import `test.registered`; direct
+file invocations pass. Neither failed attempt is included in final totals.
+
+All 11 jobs are terminal. The original staged index is unchanged, and the
+resident H100 has resumed its 60% idle workload without active/queued experiments
+or remaining serving processes. New/touched test files pass Ruff; the production
+runner retains its existing import-order diagnostic and adds none. See
+[the runbook](experiments/DSPARK_PREFILL_CAPTURE.md) and
+[source/log/job evidence](experiments/dspark-prefill-capture.json).
+
+This is single-GPU Qwen3 MHA, static KV-input DSpark, real TCP Store and a
+Catalog test double. It does not validate distributed or other speculative
+prefill graphs, MLA-specific prefix graphs, mixed prefill/decode batches,
+Inductor, this combination over RDMA, trained-model quality or serving SLOs.
+
 ## Next Implementation
 
-1. Extend passing single-GPU AR prefill graph coverage to distributed/speculative
-   and mixed-batch execution. Extend distributed pressure beyond passing
+1. Extend passing single-GPU AR/static target-KV DSpark prefill graph coverage to
+   distributed, other speculative and mixed-batch execution. Extend distributed
+   pressure beyond passing
    colocated and P/D synchronous TP1/PP2 and TP2/PP2 DSpark to AR and asymmetric
    combined topologies. Broaden real-request coverage to speculative cache
    eviction, target weight replacement and
