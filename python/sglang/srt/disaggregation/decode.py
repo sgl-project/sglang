@@ -2676,7 +2676,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 or hicache_restore_status == HiCacheRestoreResult.FAILED
             ):
                 if (
-                    hicache_restore_status == HiCacheRestoreResult.PENDING
+                    envs.SGLANG_NIXL_HOST_STAGING_MB.get() > 0
+                    and hicache_restore_status == HiCacheRestoreResult.PENDING
                     and decode_req.hicache_load_consumer_index >= 0
                 ):
                     # A restore DMA still writes these pages. Wait for it here:
@@ -2686,17 +2687,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     counter.events[
                         decode_req.hicache_load_consumer_index
                     ].finish_event.synchronize()
-                receiver = decode_req.kv_receiver
-                if (
-                    self.enable_deferred_kv_release
-                    and receiver.kv_mgr.enable_deferred_decode_kv_release
-                    and not receiver.abort_notified
-                    and receiver.kv_mgr.request_status.get(receiver.bootstrap_room)
-                    != KVPoll.Failed
-                ):
-                    # Failed by a restore or another rank while this rank's
-                    # prefill may still write: fence it like a cancel.
-                    receiver.abort()
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"

@@ -3576,13 +3576,13 @@ class NixlKVReceiver(CommonKVReceiver):
         if self.kv_mgr.host_staging is not None:
             self.require_staging = True
 
-    def _send_abort_notification(self):
-        if self.kv_mgr.host_staging is not None and self.host_allowed is not None:
-            # Arm before sending: an immediate drain ack must not arrive unarmed.
-            # Without metadata the peer has no destination and nothing to fence
-            # (a prealloc abort): arming would leak, as no release clears it.
-            self.kv_mgr.register_deferred_abort_room(self.bootstrap_room)
-        super()._send_abort_notification()
+    def _send_abort_notification(self, *, force_arm: bool = False):
+        # HOST may have exposed destinations before init_time was set. Reuse
+        # the common arm-before-send path, including partial-publish failures.
+        super()._send_abort_notification(
+            force_arm=force_arm
+            or (self.kv_mgr.host_staging is not None and self.host_allowed is not None)
+        )
 
     def clear(self) -> None:
         handler = self.kv_mgr._staging_handler if self.kv_mgr.host_staging else None

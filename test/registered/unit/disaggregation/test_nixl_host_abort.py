@@ -385,30 +385,26 @@ class HostAbortTest(unittest.TestCase):
         m = rig.prefill
         stuck = m.agent.initialize_xfer("WRITE", [], [], "decode", b"37_aux")
         staged = h.H.HostWrite(1)  # Bounded by host_staging, not as native.
-        with (
-            patch.object(h.H, "POST_DEADLINE_S", 0),
-            patch.object(h.H, "WRITE_DEADLINE_S", 0),
-        ):
-            raised = []
+        # Age this batch only, not the global deadlines used by other workers.
+        started = time.monotonic() - h.H.POST_DEADLINE_S - h.H.WRITE_DEADLINE_S - 1
+        raised = []
 
-            def wait():  # Unbounded without the deadline: fail, don't hang.
-                try:
-                    m._await_handles(
-                        [stuck], failure_seen=False, started=time.monotonic()
-                    )
-                except h.FailStop as e:
-                    raised.append(str(e))
+        def wait():  # Unbounded without the deadline: fail, don't hang.
+            try:
+                m._await_handles([stuck], failure_seen=False, started=started)
+            except h.FailStop as e:
+                raised.append(str(e))
 
-            waiter = threading.Thread(target=wait, daemon=True)
-            waiter.start()
-            waiter.join(5)
-            self.assertTrue(raised and "writer deadline" in raised[0])
-            m._abandoned[h.ROOM] = [([staged], time.monotonic(), False)]
-            m._reap_abandoned()  # A staged part past it: left to host_staging.
-            self.assertIn(h.ROOM, m._abandoned)
-            m._abandoned[h.ROOM] = [([stuck], time.monotonic(), True)]
-            with self.assertRaisesRegex(h.FailStop, "past its deadline"):
-                m._reap_abandoned()
+        waiter = threading.Thread(target=wait, daemon=True)
+        waiter.start()
+        waiter.join(5)
+        self.assertTrue(raised and "writer deadline" in raised[0])
+        m._abandoned[h.ROOM] = [([staged], started, False)]
+        m._reap_abandoned()  # A staged part past it: left to host_staging.
+        self.assertIn(h.ROOM, m._abandoned)
+        m._abandoned[h.ROOM] = [([stuck], started, True)]
+        with self.assertRaisesRegex(h.FailStop, "past its deadline"):
+            m._reap_abandoned()
         m._abandoned.clear()
 
     def test_cancel_holds_the_room_until_the_drain_ack(self):
@@ -513,8 +509,9 @@ class HostAbortTest(unittest.TestCase):
         rig.req.hicache_restore_status = HiCacheRestoreResult.PENDING
         rig.queue.queue = [rig.req]
         rig.queue._deferred_releases = []
-        with patch.object(
-            rig.queue, "_poll_with_staging", return_value=[KVPoll.Failed]
+        with (
+            patch.object(rig.queue, "_poll_with_staging", return_value=[KVPoll.Failed]),
+            patch.object(envs.SGLANG_NIXL_HOST_STAGING_MB, "get", return_value=1),
         ):
             rig.queue.pop_transferred()
         finish.synchronize.assert_called_once()  # Restore DMA done before release.
