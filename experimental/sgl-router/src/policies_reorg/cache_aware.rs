@@ -20,7 +20,9 @@ use crate::config::AffinityConfig;
 use crate::policies::admission::{fleet_is_all_queued, queue_gate_admits, FreshLoadLookup};
 use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::ExternalPrefixSignal;
-use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle};
+use crate::state::kv_events::{
+    compute_block_hashes_bigram_with_salt, compute_block_hashes_with_salt, BlockSizeOracle,
+};
 use crate::state::load_monitor::engine_reported_load::{
     EngineReportedLoadSnapshot, EngineReportedLoadTable, EngineReportedSchedulingLoad,
 };
@@ -53,13 +55,19 @@ impl fmt::Debug for CacheSource {
 }
 
 impl CacheSource {
-    async fn lookup(&self, tokens: Option<&[u32]>) -> Result<Signal, PickError> {
+    async fn lookup(
+        &self,
+        tokens: Option<&[u32]>,
+        cache_salt: Option<&str>,
+    ) -> Result<Signal, PickError> {
         let Some(tokens) = tokens else {
             return Ok(None);
         };
         let (index, oracle) = match self {
             Self::Local(provider) => {
-                return Ok(provider.match_request_tokens(tokens).map(Arc::new))
+                return Ok(provider
+                    .match_request_tokens(tokens, cache_salt)
+                    .map(Arc::new))
             }
             Self::Remote { index, block_size } => (index, block_size),
         };
@@ -67,9 +75,9 @@ impl CacheSource {
             return Ok(None);
         };
         let hashes = if oracle.is_bigram() {
-            compute_block_hashes_bigram(tokens, block_size as usize)
+            compute_block_hashes_bigram_with_salt(tokens, block_size as usize, cache_salt)
         } else {
-            compute_block_hashes(tokens, block_size as usize)
+            compute_block_hashes_with_salt(tokens, block_size as usize, cache_salt)
         };
         let query_blocks = hashes.len();
         if query_blocks == 0 {
@@ -419,7 +427,7 @@ impl Policy for CacheAwarePolicy {
                     "cache-aware selection requires a plain or prefill group".into(),
                 ));
             }
-            let lookup = || self.source.lookup(request.token_ids);
+            let lookup = || self.source.lookup(request.token_ids, request.cache_salt);
             let signal = match request.prefix {
                 Some(memo) => memo
                     .cell(&self.source)

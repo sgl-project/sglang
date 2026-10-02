@@ -83,6 +83,14 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+For single-prompt chat and generate requests, cache lookups respect `cache_salt`
+using the engine's existing KV-event hash namespace. Missing, null, and empty
+salts select the unsalted namespace. This applies to both prefix sources,
+bigram models, prefix-cache scoring/filtering, and local DP-rank cache matching.
+Single-element salt arrays used by parallel sampling (`n > 1`) select the same
+namespace as the corresponding string. Multiple salts use the existing routing
+fallback; the engine validates the body.
+
 ### Peer bootstrap (Kubernetes)
 
 A replica that starts mid-fleet subscribes to each worker's KV topic

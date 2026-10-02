@@ -115,7 +115,9 @@ impl PreparedRequest {
         let mut rewrite = apply_sampling_overrides(ctx, &mut value)?;
         let text_ids = tokenize_text(ctx, &model, &value);
         // Routing sees `text` as the engine's ids, whether or not they are forwarded.
-        let routed = text_ids.as_ref().map(|ids| json!({ "input_ids": ids }));
+        let routed = text_ids
+            .as_ref()
+            .map(|ids| json!({ "input_ids": ids, "cache_salt": value.get("cache_salt") }));
         let routed = routed.as_ref().unwrap_or(&value);
         let tokens = request_tokens_for(&ctx.tokenizers, &model, routed);
         let batch = batch_prompt_tokens(routed);
@@ -210,6 +212,7 @@ impl PreparedRequest {
             .and_then(|prompts| prompts.into_iter().next())
             .map(|ids| RequestTokens {
                 ids,
+                cache_salt: None,
                 rendered_from_chat: false,
             });
         Ok(Self {
@@ -1522,6 +1525,7 @@ mod tests {
         ] {
             let tokens = rendered.map(|rendered_from_chat| RequestTokens {
                 ids: vec![1, 2, 3],
+                cache_salt: None,
                 rendered_from_chat,
             });
             assert_eq!(

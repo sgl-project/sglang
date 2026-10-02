@@ -59,6 +59,7 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     /// `request_input_tokens` only for a batch.
     pub request_sequence_tokens: u64,
     pub request_tokens: Option<&'a [u32]>,
+    pub cache_salt: Option<&'a str>,
     pub external_prefix: Option<&'a ExternalPrefixSignal>,
     /// Required whenever `policy.uses_shared_prefill_admission()`; the
     /// per-domain rung panics without it. `Policy::needs_load_snapshot`
@@ -275,6 +276,7 @@ impl<'a> Selector<'a> {
             .with_candidate_range_id(candidate_range_id)
             .with_input_tokens(inputs.request_input_tokens)
             .with_request_tokens(inputs.request_tokens)
+            .with_cache_salt(inputs.cache_salt)
             .with_external_prefix(inputs.external_prefix)
     }
 
@@ -835,6 +837,7 @@ mod tests {
             request_input_tokens,
             request_sequence_tokens: request_input_tokens,
             request_tokens: None,
+            cache_salt: None,
             external_prefix: None,
             load_snapshot,
             workers,

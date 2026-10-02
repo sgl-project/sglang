@@ -228,5 +228,271 @@
       3368460852864325515,
       1233425155141659070
     ]
+  },
+  {
+    "name": "namespace_None_bigram_False",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": null,
+    "bigram": false,
+    "expected_i64_hashes": [
+      120731552294108698,
+      1583431721211955135,
+      229366923252452603
+    ]
+  },
+  {
+    "name": "namespace_None_bigram_True",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": null,
+    "bigram": true,
+    "expected_i64_hashes": [
+      -6942321557922555399,
+      7024412243571715767,
+      -3343709198102970495
+    ]
+  },
+  {
+    "name": "namespace_''_bigram_False",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": "",
+    "bigram": false,
+    "expected_i64_hashes": [
+      120731552294108698,
+      1583431721211955135,
+      229366923252452603
+    ]
+  },
+  {
+    "name": "namespace_''_bigram_True",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": "",
+    "bigram": true,
+    "expected_i64_hashes": [
+      -6942321557922555399,
+      7024412243571715767,
+      -3343709198102970495
+    ]
+  },
+  {
+    "name": "namespace_'tenant-a'_bigram_False",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": "tenant-a",
+    "bigram": false,
+    "expected_i64_hashes": [
+      2232464699480153249,
+      -8060422355900816649,
+      4669241861600368022
+    ]
+  },
+  {
+    "name": "namespace_'tenant-a'_bigram_True",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": "tenant-a",
+    "bigram": true,
+    "expected_i64_hashes": [
+      -6647825010059435296,
+      2146720156064602760,
+      2096995447736154897
+    ]
+  },
+  {
+    "name": "namespace_'tenant-b'_bigram_False",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": "tenant-b",
+    "bigram": false,
+    "expected_i64_hashes": [
+      7603248485442655278,
+      -8987369552601838603,
+      -4650990773565742893
+    ]
+  },
+  {
+    "name": "namespace_'tenant-b'_bigram_True",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": "tenant-b",
+    "bigram": true,
+    "expected_i64_hashes": [
+      3510269118182816750,
+      4144213851531571504,
+      -7558049362657373688
+    ]
+  },
+  {
+    "name": "namespace_'\u79df\u6237-A'_bigram_False",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": "\u79df\u6237-A",
+    "bigram": false,
+    "expected_i64_hashes": [
+      7278222174749803514,
+      -4087870720026180917,
+      -9130803693221486186
+    ]
+  },
+  {
+    "name": "namespace_'\u79df\u6237-A'_bigram_True",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": "\u79df\u6237-A",
+    "bigram": true,
+    "expected_i64_hashes": [
+      2170110461517454188,
+      8306477111551332823,
+      9221193143187532997
+    ]
+  },
+  {
+    "name": "namespace_'a\\x00b'_bigram_False",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": "a\u0000b",
+    "bigram": false,
+    "expected_i64_hashes": [
+      -9004156408582927021,
+      8622710454935946052,
+      -8786878776036271322
+    ]
+  },
+  {
+    "name": "namespace_'a\\x00b'_bigram_True",
+    "tokens": [
+      0,
+      1,
+      4294967295,
+      3,
+      4,
+      5
+    ],
+    "block_size": 2,
+    "cache_salt": "a\u0000b",
+    "bigram": true,
+    "expected_i64_hashes": [
+      6510470040894959960,
+      -7270588600537812499,
+      -3908327767109864940
+    ]
+  },
+  {
+    "name": "salted_short_0_bigram_False",
+    "tokens": [],
+    "block_size": 1,
+    "cache_salt": "tenant-a",
+    "bigram": false,
+    "expected_i64_hashes": []
+  },
+  {
+    "name": "salted_short_0_bigram_True",
+    "tokens": [],
+    "block_size": 1,
+    "cache_salt": "tenant-a",
+    "bigram": true,
+    "expected_i64_hashes": []
+  },
+  {
+    "name": "salted_short_1_bigram_False",
+    "tokens": [
+      1
+    ],
+    "block_size": 1,
+    "cache_salt": "tenant-a",
+    "bigram": false,
+    "expected_i64_hashes": [
+      -2646080219873861990
+    ]
+  },
+  {
+    "name": "salted_short_1_bigram_True",
+    "tokens": [
+      1
+    ],
+    "block_size": 1,
+    "cache_salt": "tenant-a",
+    "bigram": true,
+    "expected_i64_hashes": []
   }
 ]
