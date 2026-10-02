@@ -82,6 +82,11 @@ pub(super) async fn select_workers(
     for bucket in buckets {
         match bucket.pick_engines(&ctx.registry, &bucket_request).await {
             Ok(picks) => {
+                if let (Some(provider), Some(signal)) =
+                    (&ctx.radix_tree_prefix_provider, prefix.local_signal())
+                {
+                    provider.record_route(&signal, &picks.prefill.engine.url);
+                }
                 // Dispatch only after this bucket supplies the entire plain or PD selection.
                 return Ok(SelectedWorkers {
                     prefill: picks.prefill.engine,

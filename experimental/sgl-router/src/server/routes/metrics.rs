@@ -307,6 +307,14 @@ fn render_kv_tiers(kv: &KvIndexMetrics, block_size: u32) -> String {
             kv.tally.replays(outcome),
         ));
     }
+    out.push_str(
+        "# HELP sgl_router_cache_pending_prefix_hits_total Prefix lookups where a prompt routed within --cache-pending-prefix-ttl-ms matched deeper than any KV-event-confirmed prefix.\n",
+    );
+    out.push_str("# TYPE sgl_router_cache_pending_prefix_hits_total counter\n");
+    out.push_str(&format!(
+        "sgl_router_cache_pending_prefix_hits_total {}\n",
+        kv.tree.pending().hits(),
+    ));
 
     out.push_str(
         "# HELP sgl_router_kv_tree_accounting_errors_total Times the tree's per-tier occupancy bookkeeping contradicted itself. Always 0 on a correct tree. Nonzero means sgl_router_kv_tree_blocks understates what the tree holds, and can drop a worker's series entirely — which the gauge's own HELP would have you read as a worker that publishes nothing.\n",
