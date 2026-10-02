@@ -31,12 +31,12 @@ if TYPE_CHECKING:
         DeepEPv2DispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
-        MSCCLPPExpertMajorLLCombineInput,
-        MSCCLPPExpertMajorLLDispatchOutput,
-        MSCCLPPLLCombineInput,
-        MSCCLPPLLDispatchOutput,
-        MSCCLPPRankMajorLLCombineInput,
-        MSCCLPPRankMajorLLDispatchOutput,
+        MSCCLPPExpertMajorLatencyCombineInput,
+        MSCCLPPExpertMajorLatencyDispatchOutput,
+        MSCCLPPLatencyCombineInput,
+        MSCCLPPLatencyDispatchOutput,
+        MSCCLPPRankMajorLatencyCombineInput,
+        MSCCLPPRankMajorLatencyDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -169,19 +169,19 @@ class DispatchOutputChecker:
     @staticmethod
     def format_is_mscclpp_latency(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[MSCCLPPLLDispatchOutput]:
+    ) -> TypeGuard[MSCCLPPLatencyDispatchOutput]:
         return dispatch_output.format.is_mscclpp_latency()
 
     @staticmethod
     def format_is_mscclpp_latency_expert_major(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[MSCCLPPExpertMajorLLDispatchOutput]:
+    ) -> TypeGuard[MSCCLPPExpertMajorLatencyDispatchOutput]:
         return dispatch_output.format.is_mscclpp_latency_expert_major()
 
     @staticmethod
     def format_is_mscclpp_latency_rank_major(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[MSCCLPPRankMajorLLDispatchOutput]:
+    ) -> TypeGuard[MSCCLPPRankMajorLatencyDispatchOutput]:
         return dispatch_output.format.is_mscclpp_latency_rank_major()
 
     def format_is_deepep_v2(
@@ -303,7 +303,7 @@ class CombineInputChecker:
     @staticmethod
     def format_is_mscclpp_latency(
         combine_input: CombineInput,
-    ) -> TypeGuard[MSCCLPPLLCombineInput]:
+    ) -> TypeGuard[MSCCLPPLatencyCombineInput]:
         return combine_input.format in [
             CombineInputFormat.MSCCLPP_LATENCY_EXPERT_MAJOR,
             CombineInputFormat.MSCCLPP_LATENCY_RANK_MAJOR,
@@ -312,13 +312,13 @@ class CombineInputChecker:
     @staticmethod
     def format_is_mscclpp_latency_expert_major(
         combine_input: CombineInput,
-    ) -> TypeGuard[MSCCLPPExpertMajorLLCombineInput]:
+    ) -> TypeGuard[MSCCLPPExpertMajorLatencyCombineInput]:
         return combine_input.format == CombineInputFormat.MSCCLPP_LATENCY_EXPERT_MAJOR
 
     @staticmethod
     def format_is_mscclpp_latency_rank_major(
         combine_input: CombineInput,
-    ) -> TypeGuard[MSCCLPPRankMajorLLCombineInput]:
+    ) -> TypeGuard[MSCCLPPRankMajorLatencyCombineInput]:
         return combine_input.format == CombineInputFormat.MSCCLPP_LATENCY_RANK_MAJOR
 
     def format_is_deepep_v2(

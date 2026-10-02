@@ -14,6 +14,10 @@ Expert-major compares:
 The expert-major baseline is primarily a correctness reference. Its PyTorch
 collective orchestration is not equivalent to MSCCL++'s fused all-to-all, so
 its latency is reported separately and is not an apples-to-apples comparison.
+
+Pass ``--balanced-routing`` to distribute aggregate top-k routes exactly evenly
+across every global expert. This is useful for separating communication and
+synchronization costs from router-induced expert load imbalance.
 """
 
 from __future__ import annotations
@@ -24,9 +28,9 @@ import json
 import os
 import statistics
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass
 from typing import Callable, Optional
 
+import msgspec
 import torch
 import torch.distributed as dist
 from torch.profiler import ProfilerActivity, profile
@@ -43,7 +47,12 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher.mscclpp import MSCCLPPDispatcher
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    MSCCLPPEPLayout,
+    MSCCLPPMode,
+)
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.test_utils import publish_build_topology
 
@@ -51,14 +60,14 @@ DTYPE = torch.bfloat16
 MSCCLPP_LL_HIDDEN_SIZES = (4096, 4352, 5120, 6656, 7168, 8192, 8704, 9216)
 
 
-@dataclass(frozen=True)
-class BenchmarkConfig:
+class BenchmarkConfig(msgspec.Struct, frozen=True):
     layout: str
     hidden_size: int
     intermediate_size: int
     tokens_per_rank: int
     num_experts: int
     top_k: int
+    balanced_routing: bool
     warmup_iters: int
     benchmark_iters: int
     seed: int
@@ -68,8 +77,7 @@ class BenchmarkConfig:
     local_world_size: int
 
 
-@dataclass(frozen=True)
-class Inputs:
+class Inputs(msgspec.Struct, frozen=True):
     hidden_states: torch.Tensor
     topk_output: StandardTopKOutput
 
@@ -86,11 +94,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokens-per-rank", type=int, default=128)
     parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument(
+        "--balanced-routing",
+        action="store_true",
+        help=(
+            "Generate deterministic top-k assignments with exactly equal aggregate "
+            "route counts per global expert. Requires world_size * tokens_per_rank "
+            "* top_k to be divisible by num_experts."
+        ),
+    )
     parser.add_argument("--warmup-iters", type=int, default=20)
     parser.add_argument("--benchmark-iters", type=int, default=100)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--atol", type=float, default=2e-2)
-    parser.add_argument("--rtol", type=float, default=2e-2)
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=2e-2,
+        help="Absolute tolerance for all correctness checks.",
+    )
+    parser.add_argument(
+        "--rtol",
+        type=float,
+        default=2e-2,
+        help="Relative tolerance for all correctness checks.",
+    )
     return parser.parse_args()
 
 
@@ -168,16 +195,60 @@ def make_inputs(config: BenchmarkConfig, rank: int, device: torch.device) -> Inp
         device=device,
         generator=generator,
     )
-    router_logits = torch.randn(
-        config.tokens_per_rank,
-        config.num_experts,
-        dtype=torch.float32,
-        device=device,
-        generator=generator,
-    )
-    selected_logits, topk_ids = torch.topk(
-        router_logits, config.top_k, dim=-1, sorted=True
-    )
+    if config.balanced_routing:
+        num_local_routes = config.tokens_per_rank * config.top_k
+        num_global_routes = config.world_size * num_local_routes
+        if num_global_routes % config.num_experts:
+            raise ValueError(
+                "--balanced-routing requires world_size * tokens_per_rank * top_k "
+                "to be divisible by num_experts; "
+                f"got {config.world_size} * {config.tokens_per_rank} * "
+                f"{config.top_k} routes for {config.num_experts} experts"
+            )
+
+        permutation_generator = torch.Generator(device=device)
+        permutation_generator.manual_seed(
+            config.seed + 20_000_033 + config.tokens_per_rank
+        )
+        expert_permutation = torch.randperm(
+            config.num_experts,
+            dtype=torch.int64,
+            device=device,
+            generator=permutation_generator,
+        )
+        global_route_offset = rank * num_local_routes
+        route_slots = (
+            torch.arange(num_local_routes, dtype=torch.int64, device=device)
+            + global_route_offset
+        ) % config.num_experts
+        topk_ids = expert_permutation[route_slots].view(
+            config.tokens_per_rank, config.top_k
+        )
+        selected_logits = torch.randn(
+            config.tokens_per_rank,
+            config.top_k,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+        router_logits = torch.full(
+            (config.tokens_per_rank, config.num_experts),
+            -torch.inf,
+            dtype=torch.float32,
+            device=device,
+        )
+        router_logits.scatter_(1, topk_ids, selected_logits)
+    else:
+        router_logits = torch.randn(
+            config.tokens_per_rank,
+            config.num_experts,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+        selected_logits, topk_ids = torch.topk(
+            router_logits, config.top_k, dim=-1, sorted=True
+        )
     topk_weights = torch.softmax(selected_logits, dim=-1, dtype=torch.float32)
     return Inputs(
         hidden_states=hidden_states,
@@ -187,6 +258,34 @@ def make_inputs(config: BenchmarkConfig, rank: int, device: torch.device) -> Inp
             router_logits,
         ),
     )
+
+
+def verify_balanced_routing(
+    inputs: Inputs,
+    config: BenchmarkConfig,
+    device: torch.device,
+) -> int:
+    topk_ids = inputs.topk_output.topk_ids.to(torch.int64)
+    counts = torch.bincount(topk_ids.flatten(), minlength=config.num_experts)
+    dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+    expected = topk_ids.numel() * config.world_size // config.num_experts
+    if not bool(torch.all(counts == expected)):
+        raise AssertionError(
+            "Balanced routing produced unequal global expert loads: "
+            f"min={counts.min().item()}, max={counts.max().item()}, "
+            f"expected={expected}"
+        )
+
+    sorted_ids = topk_ids.sort(dim=-1).values
+    has_duplicate = torch.tensor(
+        int(bool(torch.any(sorted_ids[:, 1:] == sorted_ids[:, :-1]))),
+        dtype=torch.int32,
+        device=device,
+    )
+    dist.all_reduce(has_duplicate, op=dist.ReduceOp.MAX)
+    if has_duplicate.item():
+        raise AssertionError("Balanced routing assigned a duplicate expert to a token")
+    return expected
 
 
 class FusedMoEPipeline:
@@ -236,8 +335,7 @@ def synchronize() -> None:
     dist.barrier()
 
 
-@dataclass(frozen=True)
-class PhaseLatencies:
+class PhaseLatencies(msgspec.Struct, frozen=True):
     """Wall-clock graph latency and profiled CUDA kernel time per phase."""
 
     total_us: float
@@ -492,7 +590,14 @@ def assert_close(
     dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
 
     close = torch.tensor(
-        int(torch.allclose(reference, candidate, atol=config.atol, rtol=config.rtol)),
+        int(
+            torch.allclose(
+                reference,
+                candidate,
+                atol=config.atol,
+                rtol=config.rtol,
+            )
+        ),
         dtype=torch.int32,
         device=reference.device,
     )
@@ -846,8 +951,7 @@ def run_expert_major(
             f"unclassified={unclassified_us:.2f} us)"
         )
         print(
-            "triton-all-to-all-reference: "
-            f"eager median latency={reference_us:.2f} us"
+            f"triton-all-to-all-reference: eager median latency={reference_us:.2f} us"
         )
         print(
             "Reference phase timing is omitted because its explicit PyTorch "
@@ -862,6 +966,13 @@ def main() -> None:
     args = parse_args()
     rank, world_size, local_world_size = initialize_distributed(args.tokens_per_rank)
     validate_args(args, world_size)
+    flags = get_flags().moe
+    flags.mscclpp_mode = MSCCLPPMode.LATENCY
+    flags.mscclpp_ep_layout = (
+        MSCCLPPEPLayout.RANK_MAJOR
+        if args.layout == "rank-major"
+        else MSCCLPPEPLayout.EXPERT_MAJOR
+    )
     config = BenchmarkConfig(
         **vars(args),
         world_size=world_size,
@@ -869,10 +980,19 @@ def main() -> None:
     )
     device = torch.device("cuda", torch.cuda.current_device())
     inputs = make_inputs(config, rank, device)
+    if config.balanced_routing:
+        routes_per_expert = verify_balanced_routing(inputs, config, device)
+        if rank == 0:
+            print(
+                "Balanced routing verified: "
+                f"{routes_per_expert} routes/global expert, "
+                "no duplicate top-k experts per token.",
+                flush=True,
+            )
 
     if rank == 0:
         print("Benchmark configuration:")
-        print(json.dumps(asdict(config), indent=2, sort_keys=True))
+        print(json.dumps(msgspec.to_builtins(config), indent=2, sort_keys=True))
         print(f"nodes={world_size // local_world_size}, dtype={DTYPE}")
         print(
             "Timing unit: microseconds; total is the graph-window average "

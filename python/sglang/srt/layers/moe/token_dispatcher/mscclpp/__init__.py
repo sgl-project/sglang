@@ -6,12 +6,12 @@ from .dispatcher import MSCCLPPDispatcher
 from .utils import (
     MSCCLPPCombineInputBase,
     MSCCLPPDispatchOutputBase,
-    MSCCLPPExpertMajorLLCombineInput,
-    MSCCLPPExpertMajorLLDispatchOutput,
-    MSCCLPPLLCombineInput,
-    MSCCLPPLLDispatchOutput,
-    MSCCLPPRankMajorLLCombineInput,
-    MSCCLPPRankMajorLLDispatchOutput,
+    MSCCLPPExpertMajorLatencyCombineInput,
+    MSCCLPPExpertMajorLatencyDispatchOutput,
+    MSCCLPPLatencyCombineInput,
+    MSCCLPPLatencyDispatchOutput,
+    MSCCLPPRankMajorLatencyCombineInput,
+    MSCCLPPRankMajorLatencyDispatchOutput,
 )
 
 __all__ = [
@@ -19,10 +19,10 @@ __all__ = [
     "MSCCLPPDispatcher",
     "MSCCLPPDispatchOutputBase",
     "MSCCLPPEPLayout",
-    "MSCCLPPExpertMajorLLCombineInput",
-    "MSCCLPPExpertMajorLLDispatchOutput",
-    "MSCCLPPLLCombineInput",
-    "MSCCLPPLLDispatchOutput",
-    "MSCCLPPRankMajorLLCombineInput",
-    "MSCCLPPRankMajorLLDispatchOutput",
+    "MSCCLPPExpertMajorLatencyCombineInput",
+    "MSCCLPPExpertMajorLatencyDispatchOutput",
+    "MSCCLPPLatencyCombineInput",
+    "MSCCLPPLatencyDispatchOutput",
+    "MSCCLPPRankMajorLatencyCombineInput",
+    "MSCCLPPRankMajorLatencyDispatchOutput",
 ]

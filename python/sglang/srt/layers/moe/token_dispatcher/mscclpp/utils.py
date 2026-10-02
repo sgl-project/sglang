@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import Optional
 
+import msgspec
 import torch
 
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -15,38 +14,35 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 
-@dataclass(frozen=True)
-class MSCCLPPDispatchOutputBase(ABC):
+class MSCCLPPDispatchOutputBase(msgspec.Struct, frozen=True):
     """Fields shared by all MSCCL++ dispatch layouts."""
 
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
 
     @property
-    @abstractmethod
     def format(self) -> DispatchOutputFormat:
-        pass
+        raise NotImplementedError
 
 
-@dataclass(frozen=True)
-class MSCCLPPCombineInputBase(ABC):
+class MSCCLPPCombineInputBase(msgspec.Struct, frozen=True):
     """Fields shared by all MSCCL++ combine layouts."""
 
     hidden_states: torch.Tensor
+    apply_router_weights: bool
 
     @property
-    @abstractmethod
     def format(self) -> CombineInputFormat:
-        pass
+        raise NotImplementedError
 
 
-@dataclass(frozen=True)
-class MSCCLPPLLDispatchOutput(MSCCLPPDispatchOutputBase, ABC):
+class MSCCLPPLatencyDispatchOutput(MSCCLPPDispatchOutputBase, frozen=True):
     """Base for MSCCL++ low-latency physical layouts."""
 
 
-@dataclass(frozen=True)
-class MSCCLPPExpertMajorLLDispatchOutput(MSCCLPPLLDispatchOutput):
+class MSCCLPPExpertMajorLatencyDispatchOutput(
+    MSCCLPPLatencyDispatchOutput, frozen=True
+):
     """Padded expert-major output consumed by the Triton runner.
 
     * ``hidden_states``      -> ``[num_local_experts, slots_per_expert, hidden]``
@@ -60,8 +56,7 @@ class MSCCLPPExpertMajorLLDispatchOutput(MSCCLPPLLDispatchOutput):
         return DispatchOutputFormat.MSCCLPP_LATENCY_EXPERT_MAJOR
 
 
-@dataclass(frozen=True)
-class MSCCLPPRankMajorLLDispatchOutput(MSCCLPPLLDispatchOutput):
+class MSCCLPPRankMajorLatencyDispatchOutput(MSCCLPPLatencyDispatchOutput, frozen=True):
     """Fixed-capacity rank-major output consumed by a compatible MoE runner."""
 
     topk_output: StandardTopKOutput
@@ -73,22 +68,21 @@ class MSCCLPPRankMajorLLDispatchOutput(MSCCLPPLLDispatchOutput):
         return DispatchOutputFormat.MSCCLPP_LATENCY_RANK_MAJOR
 
 
-@dataclass(frozen=True)
-class MSCCLPPLLCombineInput(MSCCLPPCombineInputBase, ABC):
+class MSCCLPPLatencyCombineInput(MSCCLPPCombineInputBase, frozen=True):
     """Base for MSCCL++ low-latency combine layouts."""
 
 
-@dataclass(frozen=True)
-class MSCCLPPExpertMajorLLCombineInput(MSCCLPPLLCombineInput):
+class MSCCLPPExpertMajorLatencyCombineInput(MSCCLPPLatencyCombineInput, frozen=True):
     """Expert-major output consumed by handle-driven combine."""
+
+    apply_router_weights: bool = True
 
     @property
     def format(self) -> CombineInputFormat:
         return CombineInputFormat.MSCCLPP_LATENCY_EXPERT_MAJOR
 
 
-@dataclass(frozen=True)
-class MSCCLPPRankMajorLLCombineInput(MSCCLPPLLCombineInput):
+class MSCCLPPRankMajorLatencyCombineInput(MSCCLPPLatencyCombineInput, frozen=True):
     """Rank-major registered output consumed by handle-driven combine."""
 
     apply_router_weights: bool = False

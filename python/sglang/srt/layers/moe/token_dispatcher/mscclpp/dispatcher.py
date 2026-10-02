@@ -16,10 +16,8 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from .utils import (
     MSCCLPPCombineInputBase,
     MSCCLPPDispatchOutputBase,
-    MSCCLPPExpertMajorLLCombineInput,
-    MSCCLPPExpertMajorLLDispatchOutput,
-    MSCCLPPRankMajorLLCombineInput,
-    MSCCLPPRankMajorLLDispatchOutput,
+    MSCCLPPExpertMajorLatencyDispatchOutput,
+    MSCCLPPRankMajorLatencyDispatchOutput,
 )
 
 if TYPE_CHECKING:
@@ -45,7 +43,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
 
     * :meth:`dispatch` runs ``MoECommunicator.dispatch`` to scatter each token to
       the ranks owning its top-k experts and returns an
-      :class:`MSCCLPPLLDispatchOutput`. Triton uses padded expert-major output;
+      :class:`MSCCLPPLatencyDispatchOutput`. Triton uses padded expert-major output;
       FlashInfer CUTLASS uses the communicator's fixed rank-major buffers.
     * :meth:`combine` runs ``MoECommunicator.combine`` to reduce the per-slot
       expert outputs back to each source token.
@@ -340,7 +338,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             assert dispatch_out.layout.num_tokens_per_rank is not None
             assert dispatch_out.combine_input_buffer is not None
             active_rows = self.num_ranks * active_capacity
-            return MSCCLPPRankMajorLLDispatchOutput(
+            return MSCCLPPRankMajorLatencyDispatchOutput(
                 hidden_states=dispatch_out.tokens[:active_rows],
                 hidden_states_scale=hidden_states_scale,
                 topk_output=StandardTopKOutput(
@@ -355,7 +353,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         masked_m = dispatch_out.layout.num_tokens_per_expert
         assert isinstance(masked_m, torch.Tensor)
 
-        return MSCCLPPExpertMajorLLDispatchOutput(
+        return MSCCLPPExpertMajorLatencyDispatchOutput(
             hidden_states=dispatch_out.tokens,
             hidden_states_scale=hidden_states_scale,
             masked_m=masked_m,
@@ -366,30 +364,11 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             "MSCCL++ low-latency combine called before dispatch"
         )
 
-        # The handle carries the layout-specific routing and scatter metadata.
-        if self.enable_direct_send:
-            if not isinstance(combine_input, MSCCLPPRankMajorLLCombineInput):
-                raise TypeError("MSCCL++ direct send requires rank-major combine input")
-            combined_x = self._moe_comm.combine(
-                combine_input.hidden_states,
-                self._combine_handle,
-                apply_router_weights=combine_input.apply_router_weights,
-            )
-        else:
-            if (
-                isinstance(combine_input, MSCCLPPRankMajorLLCombineInput)
-                and combine_input.apply_router_weights
-            ):
-                raise ValueError(
-                    "rank-local-reduce outputs already include router weights"
-                )
-            combined_x = self._moe_comm.combine(
-                combine_input.hidden_states,
-                self._combine_handle,
-                apply_router_weights=isinstance(
-                    combine_input, MSCCLPPExpertMajorLLCombineInput
-                ),
-            )
+        combined_x = self._moe_comm.combine(
+            combine_input.hidden_states,
+            self._combine_handle,
+            apply_router_weights=combine_input.apply_router_weights,
+        )
 
         self._combine_handle = None
         return combined_x

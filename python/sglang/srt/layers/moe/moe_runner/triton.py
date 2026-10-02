@@ -20,8 +20,8 @@ from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
-        MSCCLPPExpertMajorLLCombineInput,
-        MSCCLPPExpertMajorLLDispatchOutput,
+        MSCCLPPExpertMajorLatencyCombineInput,
+        MSCCLPPExpertMajorLatencyDispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
@@ -345,7 +345,7 @@ def post_permute_triton_to_standard(
 
 @register_pre_permute("mscclpp_latency_expert_major", "triton")
 def pre_permute_mscclpp_latency_expert_major_to_triton(
-    dispatch_output: MSCCLPPExpertMajorLLDispatchOutput,
+    dispatch_output: MSCCLPPExpertMajorLatencyDispatchOutput,
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
@@ -459,7 +459,7 @@ def post_permute_triton_to_mscclpp_latency_expert_major(
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> MSCCLPPExpertMajorLLCombineInput:
+) -> MSCCLPPExpertMajorLatencyCombineInput:
     """Package the Triton runner output for the MSCCL++ EP latency combine.
 
     The kernel produced a flat [num_local_experts * slots_per_expert, hidden]
@@ -472,7 +472,7 @@ def post_permute_triton_to_mscclpp_latency_expert_major(
     here.
     """
     from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
-        MSCCLPPExpertMajorLLCombineInput,
+        MSCCLPPExpertMajorLatencyCombineInput,
     )
 
     num_local_experts, slots_per_expert, hidden_dim = running_state[
@@ -482,6 +482,6 @@ def post_permute_triton_to_mscclpp_latency_expert_major(
         num_local_experts, slots_per_expert, hidden_dim
     )
 
-    return MSCCLPPExpertMajorLLCombineInput(
+    return MSCCLPPExpertMajorLatencyCombineInput(
         hidden_states=masked_output,
     )

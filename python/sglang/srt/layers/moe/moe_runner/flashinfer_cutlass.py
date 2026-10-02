@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
@@ -23,8 +24,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
     MoeRunnerCore,
-    RunnerInput,
-    RunnerOutput,
     register_fused_func,
     register_post_permute,
     register_pre_permute,
@@ -40,8 +39,8 @@ if TYPE_CHECKING:
         FlashinferDispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
-        MSCCLPPRankMajorLLCombineInput,
-        MSCCLPPRankMajorLLDispatchOutput,
+        MSCCLPPRankMajorLatencyCombineInput,
+        MSCCLPPRankMajorLatencyDispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
@@ -166,8 +165,7 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     padded_hidden: Optional[int] = None
 
 
-@dataclass
-class FlashInferCutlassRunnerInput(RunnerInput):
+class FlashInferCutlassRunnerInput(msgspec.Struct, frozen=True):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_output: TopKOutput
@@ -179,8 +177,7 @@ class FlashInferCutlassRunnerInput(RunnerInput):
         return MoeRunnerBackend.FLASHINFER_CUTLASS
 
 
-@dataclass
-class FlashInferCutlassRunnerOutput(RunnerOutput):
+class FlashInferCutlassRunnerOutput(msgspec.Struct, frozen=True):
     hidden_states: torch.Tensor
 
     @property
@@ -409,7 +406,7 @@ class FlashInferCutlassRunnerCore(MoeRunnerCore):
 
 @register_pre_permute("mscclpp_latency_rank_major", "flashinfer_cutlass")
 def pre_permute_mscclpp_latency_rank_major_to_flashinfer_cutlass(
-    dispatch_output: MSCCLPPRankMajorLLDispatchOutput,
+    dispatch_output: MSCCLPPRankMajorLatencyDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
@@ -439,13 +436,13 @@ def post_permute_flashinfer_cutlass_to_mscclpp_latency_rank_major(
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> MSCCLPPRankMajorLLCombineInput:
+) -> MSCCLPPRankMajorLatencyCombineInput:
     del quant_info, runner_config, running_state
     from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
-        MSCCLPPRankMajorLLCombineInput,
+        MSCCLPPRankMajorLatencyCombineInput,
     )
 
-    return MSCCLPPRankMajorLLCombineInput(
+    return MSCCLPPRankMajorLatencyCombineInput(
         hidden_states=runner_output.hidden_states,
     )
 
