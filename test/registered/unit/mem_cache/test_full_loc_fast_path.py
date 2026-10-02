@@ -170,7 +170,7 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
         return pool
 
     def test_tombstoned_id_lands_on_sink(self):
-        for ps, mult in ((1, 1), (4, 1), (4, 6)):
+        for ps, mult in ((1, 1), (4, 1)):
             v2p = torch.tensor([0, -1, 2], dtype=torch.int64)
             pool = self._make_bare_pool(ps, v2p, multiplier=mult)
             # Virtual ids covering the tombstoned page (index 1) and a live one.
@@ -297,7 +297,6 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
         pool = object.__new__(MLATokenToKVPool)
         pool.size = 64
         pool.page_size = 1
-        pool.kernel_page_blocks = 1
         pool.start_layer = 0
         pool.dtype = torch.float16
         pool.store_dtype = torch.float16
