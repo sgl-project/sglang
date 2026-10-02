@@ -20,6 +20,7 @@ from sglang.srt.platforms.device_mixin import (
 )
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
+from sglang.srt.platforms.ppu import PPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -218,6 +219,49 @@ class TestCudaDeviceMixin(CustomTestCase):
         mock_np_seed.assert_called_once_with(123)
         mock_torch_seed.assert_called_once_with(123)
         mock_cuda_seed.assert_called_once_with(123)
+
+
+class TestPpuDeviceMixin(CustomTestCase):
+    """Tests for PPU device operation defaults (CUDA-compatible surface)."""
+
+    def test_ppu_identity_overrides_cuda_identity(self):
+        base = PPUSRTPlatform()
+        self.assertEqual(base._enum, PlatformEnum.PPU)
+        self.assertEqual(base.device_name, "ppu")
+        # device_type stays "cuda" — torch.device("cuda") is the only valid
+        # device-type string for PPU devices in PyTorch.
+        self.assertEqual(base.device_type, "cuda")
+        # PPU overrides is_cuda() to True: it exposes CUDA-compatible APIs.
+        self.assertTrue(base.is_cuda())
+        self.assertTrue(base.is_ppu())
+        self.assertTrue(base.is_cuda_alike())
+
+    def test_ppu_srt_platform_capabilities(self):
+        base = PPUSRTPlatform()
+        self.assertTrue(base.support_cuda_graph())
+        self.assertTrue(base.support_piecewise_cuda_graph())
+
+    @patch("torch.cuda.get_device_capability", return_value=(8, 9))
+    def test_ppu_supports_fp8_at_sm89(self, mock_get_device_capability):
+        base = PPUSRTPlatform()
+        self.assertTrue(base.supports_fp8())
+
+    @patch("torch.cuda.get_device_capability", return_value=(8, 0))
+    def test_ppu_supports_fp8_below_sm89(self, mock_get_device_capability):
+        base = PPUSRTPlatform()
+        self.assertFalse(base.supports_fp8())
+
+    @patch("torch.cuda.get_device_name", return_value="ZW810E")
+    def test_get_jit_cuda_arch_suffix_810_devices(self, mock_get_device_name):
+        # PPU 810/810e devices require the "sm80a" arch variant for JIT
+        # compilation.
+        base = PPUSRTPlatform()
+        self.assertEqual(base.get_jit_cuda_arch_suffix(), "a")
+
+    @patch("torch.cuda.get_device_name", return_value="PPU 2900")
+    def test_get_jit_cuda_arch_suffix_non_810_devices(self, mock_get_device_name):
+        base = PPUSRTPlatform()
+        self.assertEqual(base.get_jit_cuda_arch_suffix(), "")
 
 
 class TestXpuDeviceMixin(CustomTestCase):

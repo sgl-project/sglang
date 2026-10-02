@@ -112,6 +112,19 @@ class SRTPlatform(DeviceMixin):
         return None
 
     # ------------------------------------------------------------------
+    # JIT compilation hooks
+    # ------------------------------------------------------------------
+
+    def get_jit_cuda_arch_suffix(self) -> str:
+        """Return an optional suffix appended to the CUDA arch string during JIT
+        compilation (e.g. ``"a"`` yields ``"sm80a"`` instead of ``"sm80"``).
+
+        Most platforms return ``""`` (no suffix).  Override for hardware that
+        requires a non-standard arch variant identifier.
+        """
+        return ""
+
+    # ------------------------------------------------------------------
     # Capability flags (safe conservative defaults)
     # ------------------------------------------------------------------
 

@@ -158,7 +158,7 @@ def is_cuda():
 
 @lru_cache(maxsize=1)
 def is_cuda_alike():
-    return is_cuda() or is_hip()
+    return is_cuda() or is_hip() or is_ppu()
 
 
 @lru_cache(maxsize=1)
@@ -232,6 +232,11 @@ def is_musa() -> bool:
 @lru_cache(maxsize=1)
 def is_mps() -> bool:
     return torch.backends.mps.is_available()
+
+
+@lru_cache(maxsize=1)
+def is_ppu() -> bool:
+    return torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:

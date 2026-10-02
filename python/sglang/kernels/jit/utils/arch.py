@@ -17,6 +17,7 @@ from sglang.kernels.jit.utils.common import (
     cache_once,
     is_hip_runtime,
     is_musa_runtime,
+    is_ppu_runtime,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,11 +104,15 @@ def _init_jit_cuda_arch_once():
     # JIT builds target the exact local GPU, so the arch-specific target is
     # always correct on Hopper+ and unlocks arch-only instructions (redux.f32).
     # HIP/MUSA capability numbers aren't CUDA SM versions and stay unsuffixed.
-    suffix = (
-        ""
-        if (is_hip_runtime() or is_musa_runtime())
-        else _cuda_arch_suffix(major, minor)
-    )
+    if is_hip_runtime() or is_musa_runtime():
+        suffix = ""
+    elif is_ppu_runtime():
+        from sglang.srt.platforms import current_platform
+
+        suffix = current_platform.get_jit_cuda_arch_suffix()
+    else:
+        suffix = _cuda_arch_suffix(major, minor)
+
     _CUDA_ARCH = ArchInfo(major, minor, suffix)
 
 

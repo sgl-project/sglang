@@ -52,6 +52,7 @@ class PlatformEnum(enum.Enum):
     NPU = enum.auto()
     TPU = enum.auto()
     MPS = enum.auto()
+    PPU = enum.auto()
     OOT = enum.auto()  # Out-of-tree (external plugin)
     UNSPECIFIED = enum.auto()
 
@@ -134,12 +135,16 @@ class DeviceMixin:
     def is_mps(self) -> bool:
         return self._enum == PlatformEnum.MPS
 
+    def is_ppu(self) -> bool:
+        return self._enum == PlatformEnum.PPU
+
     def is_cuda_alike(self) -> bool:
-        """True for CUDA, ROCm, or MUSA (all expose CUDA-like APIs)."""
+        """True for CUDA, ROCm, MUSA, or PPU (all expose CUDA-like APIs)."""
         return self._enum in (
             PlatformEnum.CUDA,
             PlatformEnum.ROCM,
             PlatformEnum.MUSA,
+            PlatformEnum.PPU,
         )
 
     def is_out_of_tree(self) -> bool:

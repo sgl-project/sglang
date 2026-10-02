@@ -1,0 +1,29 @@
+---
+title: "PPU Platform"
+metatags:
+    description: "Run SGLang on PPU devices."
+---
+
+This document describes how run SGLang on PPUs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
+
+## Install SGLang
+
+You can install SGLang using one of the methods below.
+
+### Install from Source
+
+```bash
+# Use the default branch
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+
+# Compile sgl-kernel
+pip install --upgrade pip
+cd python/sglang/kernels/aot
+python setup_ppu.py install
+
+# Install sglang python package
+cd ../../../..
+rm -f python/pyproject.toml && mv python/pyproject_ppu.toml python/pyproject.toml
+pip install -e python --extra-index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+```
