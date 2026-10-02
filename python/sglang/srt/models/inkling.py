@@ -1826,6 +1826,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
     """
 
     fall_back_to_pt_during_load = False
+    mtp_layer_id_is_depth = True
 
     def __init__(
         self,

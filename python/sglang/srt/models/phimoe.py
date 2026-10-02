@@ -188,7 +188,6 @@ class PhiMoE(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.tp_size = get_parallel().tp_size
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -200,6 +199,7 @@ class PhiMoE(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=False,
             custom_routing_function=phimoe_routing_function,
         )

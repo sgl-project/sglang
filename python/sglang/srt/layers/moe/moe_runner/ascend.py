@@ -28,11 +28,29 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
 )
 
 
-def _uses_fused_gmm1(kernel) -> bool:
+def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     """Whether gmm1 runs matmul+swiglu+requant fused (no separate activation)."""
+    # The fused gmm1 kernel (npu_grouped_matmul_swiglu_quant_v2) applies plain
+    # SiLU with no clamp. Models whose activation is SiLU-with-clamp
+    # (swiglu_limit, e.g. DSV4) must keep the unfused path so the clamp is
+    # applied (NPUSwigluMxfp8Quant / NPUSwigluStepAndMul below).
+    has_clamp = config.swiglu_limit is not None and config.swiglu_limit > 0
+
+    if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
+        return False
+    if has_clamp:
+        # MXFP8 has no unfused gmm1 path at all, so a swiglu_limit
+        # checkpoint cannot be served by it.
+        if isinstance(kernel, NPUMXFP8MoEMethod):
+            raise NotImplementedError(
+                "NPUMXFP8MoEMethod has no unfused gmm1 path, and the fused "
+                "gmm1 kernel applies SiLU without clamp — a swiglu_limit "
+                "checkpoint cannot be served by this method."
+            )
+        return False  # W4A8MXFP4: fall back to unfused to preserve the clamp
     if isinstance(kernel, NPUMXFP8MoEMethod):
         return True
-    return isinstance(kernel, NPUW4A8MXFP4MoEMethod) and kernel.use_fused_gmm1
+    return kernel.use_fused_gmm1
 
 
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -102,7 +120,7 @@ class AscendRunnerCore(MoeRunnerCore):
 
         kernel = config.layer.w2_kernel
 
-        if _uses_fused_gmm1(kernel):
+        if _uses_fused_gmm1(kernel, config):
             # Fused methods (MXFP8; MXFP4 W4A8 via use_fused_gmm1) fold
             # gate/up + swiglu + requant into gmm1, so there is no separate
             # activation step — run() skips it. Left None on purpose so that
@@ -201,7 +219,7 @@ class AscendRunnerCore(MoeRunnerCore):
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if _uses_fused_gmm1(w13_kernel):
+        if _uses_fused_gmm1(w13_kernel, self.config):
             # --- w13 projection + activation, fused into one kernel ---
             # The fused gmm1 returns activations already requantised for gmm2,
             # so there is no separate activation step to run.

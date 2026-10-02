@@ -24,19 +24,20 @@ def _load_native_hash_module() -> Any:
         )
 
     try:
-        from torch.utils.cpp_extension import load
+        from sglang.srt.utils.cpp_extension_loader import (
+            load_extension_with_recovery,
+        )
 
         abs_path = os.path.dirname(os.path.abspath(__file__))
         extra_cflags = ["-O3", "-std=c++17", "-DNDEBUG"]
         if _cpu_supports_avx2():
             extra_cflags.append("-mavx2")
-        return load(
+        return load_extension_with_recovery(
             name="hicache_hash_cpp",
             sources=[f"{abs_path}/hash_binding.cpp"],
             extra_cflags=extra_cflags,
             extra_ldflags=["-lcrypto"],
             with_cuda=False,
-            verbose=False,
         )
     except Exception as exc:
         raise RuntimeError("Failed to load HiCache native hash extension") from exc

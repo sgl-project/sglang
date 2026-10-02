@@ -183,10 +183,10 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         `kv.req_pool_idx`, `reset_for_retract` nulled `kv.mamba_pool_idx`, the
         decode metadata buffer lives on `DecodeRequest` rather than `Req`, and
         `add()` itself clears `retraction_mb_id`. Retiring it here would strand
-        the host pages `release_req` allocated, which only `retraction_restore`
-        or `retraction_discard` free.
+        the host pages `release_req` allocated, which only `restore_kv_cache`
+        or `discard_kv_cache_backup` free.
 
-        `backup=None` is the short-sequence case: `retraction_backup()` returns
+        `backup=None` is the short-sequence case: `backup_kv_cache()` returns
         early for `seqlen <= 1` without setting it, so the resource predicate
         alone says "unadmitted" and only the flag keeps the request safe.
         """

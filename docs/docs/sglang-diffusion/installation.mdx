@@ -4,73 +4,94 @@ description: Run SGLang's built-in diffusion engine with Docker, or install the 
 ---
 SGLang Diffusion is SGLang's built-in image and video generation engine. It ships in the same [repository](https://github.com/sgl-project/sglang) and **`sglang` Python package**, using `sglang generate` and `sglang serve`.
 
-Docker is recommended for Linux GPU deployments. The official NVIDIA images include the standard diffusion dependencies; no additional `pip install` is needed. For Python installation, use `sglang[diffusion]`: `[diffusion]` adds optional dependencies to the same package, not a separate engine. See the [cookbook](/cookbook/diffusion/intro) for model-specific dependencies and optional backends.
+Docker is the recommended setup for Linux GPU deployments. The official NVIDIA images include SGLang, its diffusion dependencies, and the optimized kernel stack; no separate Python installation or `pip install` inside the container is needed for the standard diffusion runtime. Optional backends and model-specific dependencies are documented in the [cookbook](/cookbook/diffusion/intro).
+
+For Python installation, use `sglang[diffusion]`: `[diffusion]` adds optional dependencies to the same package, not a separate engine.
 
 ## Install on NVIDIA GPUs
-
-These instructions target Linux with NVIDIA GPUs. For the driver, CUDA, and Python requirements, see [SGLang installation](/docs/get-started/install). Docker includes Python; no host Python installation is required. Choose one installation method below; other platforms have dedicated instructions further down this page.
 
 <Tabs>
 <Tab title="Docker (recommended)" id="method-3-using-docker">
 
-Follow the shared [Docker setup](/docs/get-started/install#method-3-using-docker) to install the NVIDIA Container Toolkit and start an SGLang container. Use the latest stable image for released models, or a nightly image containing the required changes for unreleased models. Pin a release tag or image digest for reproducible deployments.
+Use Linux with a supported NVIDIA GPU, a driver compatible with the image's CUDA version, [Docker Engine](https://docs.docker.com/engine/install/), and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Configure Docker's GPU runtime before continuing. See the [SGLang installation guide](/docs/get-started/install) for current CUDA requirements.
 
-Inside the container, run [generation or serving commands](/docs/sglang-diffusion#quick-start) directly. Use `--host 0.0.0.0 --port 30000` when serving through the published container port. Mount an output directory to retain generated files after removing the container, and mount any local input media or checkpoints before using their container paths in requests.
+The example uses the latest stable release. For reproducible deployments, replace `latest` with a release tag or image digest from [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang/tags). For models or features not yet released, choose a [nightly image](https://hub.docker.com/r/lmsysorg/sglang/tags?name=nightly) containing the required changes, or install from source.
+
+```bash
+docker pull lmsysorg/sglang:latest
+```
+
+Start a container with persistent model and output directories. The working directory is `/outputs`, so generated files remain in the host's `outputs` directory after the container exits. The server port is published only on the host's loopback interface.
+
+```bash
+mkdir -p "$HOME/.cache/huggingface" "$PWD/outputs"
+docker run --rm -it --gpus all \
+  --ipc=host \
+  -p 127.0.0.1:30000:30000 \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -v "$PWD/outputs:/outputs" \
+  -w /outputs \
+  lmsysorg/sglang:latest bash
+```
+
+For gated or private models, export your [Hugging Face token](https://huggingface.co/docs/hub/en/security-tokens) as `HF_TOKEN` on the host and add `--env HF_TOKEN` before the image name. Mount any local input media or checkpoints into the container and use their container paths in requests.
+
+Run the commands in [Generate or serve](#generate-or-serve) inside this container. For development tools and source changes, see the [development environment guide](/docs/developer_guide/development_guide_using_docker#setup-docker-container).
 
 </Tab>
 <Tab title="pip / uv" id="method-1-with-pip-or-uv">
 
-If SGLang is already installed, run the same installation command in that environment to add the diffusion dependencies.
+Use this option for an existing Python environment. Follow the [Python and CUDA prerequisites](/docs/get-started/install), then install the diffusion extra in a virtual environment:
 
-Use uv for faster installation:
-
-```bash Command
-pip install --upgrade pip
+```bash
 pip install uv
+uv venv --python 3.12
+source .venv/bin/activate
 uv pip install "sglang[diffusion]" --prerelease=allow
 ```
 
-With pip, use:
-
-```bash
-pip install "sglang[diffusion]" --pre
-```
+With pip, use `pip install "sglang[diffusion]" --pre` in your activated environment.
 
 </Tab>
 <Tab title="From source" id="method-2-from-source">
 
-Clone the SGLang repository and install its Python package with the diffusion extra:
+Use source installation to develop SGLang or try changes that are not in a published image. Follow the [Python and CUDA prerequisites](/docs/get-started/install). The commands below install the current `main`; check out a release tag or commit before installation when you need a fixed revision.
 
-```bash Command
-# Clone the SGLang repository
+```bash
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-
-# Install the Python packages
-pip install --upgrade pip
-pip install -e "python[diffusion]"
+pip install uv
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e "python[diffusion]" --prerelease=allow
 ```
-
-Or replace the pip installation command with `uv pip install -e "python[diffusion]" --prerelease=allow`.
 
 The diffusion implementation lives in [`python/sglang/multimodal_gen`](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen).
 
 </Tab>
 </Tabs>
 
-## AMD GPUs (ROCm)
+## Generate or serve
 
-For AMD Instinct GPUs (e.g., MI300X), use a ROCm-enabled Docker image from [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang). The tag below is an example for ROCm 7.0 on MI300X and may lag the latest release tag:
+Run these commands inside the container or your activated Python environment. For a one-off image:
 
-```bash Command
-docker run --device=/dev/kfd --device=/dev/dri --ipc=host \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  --env HF_TOKEN=<secret> \
-  lmsysorg/sglang:v0.5.5.post2-rocm700-mi30x \
-  sglang generate --model-path black-forest-labs/FLUX.1-dev --prompt "A logo With Bold Large text: SGL Diffusion" --save-output
+```bash
+sglang generate --model-path Qwen/Qwen-Image \
+  --prompt "A beautiful sunset over the mountains" \
+  --save-output
 ```
 
-For detailed ROCm system configuration and installation from source, see [AMD GPUs](/docs/hardware-platforms/amd_gpu).
+Alternatively, start an HTTP server. Binding to `0.0.0.0` makes the published container port reachable from the host:
+
+```bash
+sglang serve --model-path Qwen/Qwen-Image --host 0.0.0.0 --port 30000
+```
+
+Choose a model and GPU configuration from the [cookbook](/cookbook/diffusion/intro). See the [OpenAI-compatible API](/docs/sglang-diffusion/api/openai_api) to send requests.
+
+## AMD GPUs (ROCm)
+
+Docker is also recommended for AMD GPUs. Use a ROCm image matched to your GPU and host driver, not the NVIDIA `latest` image. Follow [AMD GPUs](/docs/hardware-platforms/amd_gpu) for the current image tags, device passthrough flags, and source installation options.
 
 ## Moore Threads GPUs (MUSA)
 
@@ -104,9 +125,9 @@ sglang generate --model-path black-forest-labs/FLUX.1-dev \
     --save-output
 ```
 
-## Apple Silicon (MPS)
+## Platform-Specific: Apple MPS
 
-For Apple MPS, follow the instructions below to install from source. If the source tree still requires the alternate platform `pyproject` fallback, keep a backup of the default file before switching:
+For Apple MPS, install natively on macOS using the source instructions below; the Linux Docker image is not an MPS runtime. If the source tree still requires the alternate platform `pyproject` fallback, keep a backup of the default file before switching:
 
 ```bash Command
 # Install ffmpeg

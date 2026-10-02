@@ -1,10 +1,15 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
+    EndWeightUpdateReqInput,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
+    _WeightUpdateSession,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -96,17 +101,56 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         )
 
 
-class TestRecordWeightVersionAfterUpdate(CustomTestCase):
-    def _updater(
-        self, target_result, draft_result=None, method="update_weights_from_disk"
+def _runner(result=(True, "ok")):
+    runner = Mock()
+    for method in (
+        "update_weights_from_disk",
+        "update_weights_from_tensor",
+        "update_weights_from_ipc",
+        "load_weights_from_distributed",
     ):
+        getattr(runner.weight_updater, method).return_value = result
+    return runner
+
+
+def _request(**fields):
+    return SimpleNamespace(
+        **{
+            "weight_version": "v2",
+            "flush_cache": True,
+            "torch_empty_cache": False,
+            "model_path": "m",
+            "recapture_cuda_graph": False,
+            "load_format": None,
+            "selector": "all",
+            "names": ["model.layers.0.weight"],
+            "dtypes": ["float32"],
+            "shapes": [[1]],
+            "group_name": "g",
+            "serialized_named_tensors": [b""],
+            **fields,
+        }
+    )
+
+
+class _WeightUpdaterManagerTestBase(CustomTestCase):
+    def setUp(self):
+        patcher = patch("torch.distributed.barrier")
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.recorded = []
-        return SchedulerWeightUpdaterManager(
-            tp_worker=SimpleNamespace(**{method: lambda recv_req: target_result}),
+
+    def _manager(self, target, draft=None, *, session=True):
+        manager = SchedulerWeightUpdaterManager(
+            tp_worker=SimpleNamespace(
+                model_runner=target,
+                weight_update_runners=lambda: [("target", target)],
+                deserialize_own_rank=lambda payloads: [],
+            ),
             draft_worker=(
                 None
-                if draft_result is None
-                else SimpleNamespace(**{method: lambda recv_req: draft_result})
+                if draft is None
+                else SimpleNamespace(weight_update_runners=lambda: [("draft", draft)])
             ),
             tp_cpu_group=None,
             memory_saver_adapter=None,
@@ -118,103 +162,188 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
                 )
             ),
         )
+        if session:
+            # update_weights_from_* require an open session
+            manager._session = _WeightUpdateSession(selector="all")
+        return manager
 
-    def _request(self, **fields):
-        return SimpleNamespace(
-            weight_version="v2",
-            flush_cache=True,
-            torch_empty_cache=False,
-            **fields,
-        )
 
+class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
     def test_successful_update_records_the_version(self):
         """A refit that reports success advances the scheduler-side version."""
-        updater = self._updater(target_result=(True, "ok"))
-
-        output = updater.update_weights_from_disk(self._request())
+        output = self._manager(_runner()).update_weights_from_disk(_request())
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_failed_update_does_not_record_the_version(self):
         """A refit that fails must leave the version alone, or later tokens are mislabelled."""
-        updater = self._updater(target_result=(False, "boom"))
-
-        output = updater.update_weights_from_disk(self._request())
+        output = self._manager(_runner((False, "boom"))).update_weights_from_disk(
+            _request()
+        )
 
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
     def test_draft_failure_does_not_record_the_version(self):
         """The target succeeding is not enough: a failed draft refit leaves the engine mixed."""
-        updater = self._updater(
-            target_result=(True, "ok"), draft_result=(False, "draft boom")
-        )
+        manager = self._manager(_runner(), draft=_runner((False, "draft boom")))
 
-        output = updater.update_weights_from_disk(self._request())
+        output = manager.update_weights_from_disk(_request())
 
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
     def test_successful_distributed_update_records_the_version(self):
         """The distributed refit is the path an RL trainer actually drives, so it must record too."""
-        updater = self._updater(
-            target_result=(True, "ok"), method="update_weights_from_distributed"
-        )
-
-        output = updater.update_weights_from_distributed(self._request())
+        output = self._manager(_runner()).update_weights_from_distributed(_request())
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_failed_distributed_update_does_not_record_the_version(self):
         """A failed distributed refit leaves the version alone, exactly like the disk path."""
-        updater = self._updater(
-            target_result=(False, "boom"), method="update_weights_from_distributed"
-        )
-
-        output = updater.update_weights_from_distributed(self._request())
+        output = self._manager(
+            _runner((False, "boom"))
+        ).update_weights_from_distributed(_request())
 
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
     def test_successful_tensor_update_records_the_version(self):
         """The tensor refit records the version once the load reports success."""
-        updater = self._updater(
-            target_result=(True, "ok"), method="update_weights_from_tensor"
-        )
-
-        with patch("torch.distributed.barrier"):
-            output = updater.update_weights_from_tensor(
-                self._request(disable_draft_model=True)
-            )
+        output = self._manager(_runner()).update_weights_from_tensor(_request())
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_successful_ipc_update_records_the_version(self):
         """The checkpoint-engine IPC refit records the version like every other path."""
-        updater = self._updater(
-            target_result=(True, "ok"), method="update_weights_from_ipc"
-        )
-
-        with patch("torch.distributed.barrier"):
-            output = updater.update_weights_from_ipc(self._request())
+        output = self._manager(_runner()).update_weights_from_ipc(_request())
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_failed_ipc_update_does_not_record_the_version(self):
         """The IPC path branches on success separately from the cache flush, so failure must record nothing."""
-        updater = self._updater(
-            target_result=(False, "boom"), method="update_weights_from_ipc"
+        output = self._manager(_runner((False, "boom"))).update_weights_from_ipc(
+            _request()
         )
-
-        with patch("torch.distributed.barrier"):
-            output = updater.update_weights_from_ipc(self._request())
 
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
+
+
+class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
+    def test_distributed_update_receives_once_on_target_loads_into_each(self):
+        """A draft runner that received its own broadcast would deadlock the update group."""
+        target, draft = _runner(), _runner()
+        weights = target.weight_updater.receive_weights_from_distributed.return_value
+        req = _request()
+
+        output = self._manager(target, draft).update_weights_from_distributed(req)
+
+        self.assertTrue(output.success)
+        target.weight_updater.receive_weights_from_distributed.assert_called_once_with(
+            names=req.names,
+            dtypes=req.dtypes,
+            shapes=req.shapes,
+            group_name=req.group_name,
+            load_format=req.load_format,
+        )
+        target.weight_updater.load_weights_from_distributed.assert_called_once_with(
+            weights
+        )
+        draft.weight_updater.load_weights_from_distributed.assert_called_once_with(
+            weights
+        )
+        draft.weight_updater.receive_weights_from_distributed.assert_not_called()
+
+    def test_distributed_update_target_only_selector_skips_draft(self):
+        """selector="target" must not load into the draft."""
+        target, draft = _runner(), _runner()
+
+        output = self._manager(target, draft).update_weights_from_distributed(
+            _request(selector="target")
+        )
+
+        self.assertTrue(output.success)
+        target.weight_updater.load_weights_from_distributed.assert_called_once()
+        draft.weight_updater.load_weights_from_distributed.assert_not_called()
+
+    def test_end_runs_post_load_on_both_when_load_was_bypassed(self):
+        """A P2P/RDMA session never calls load_weights, so end must run post_load_weights."""
+        target, draft = _runner(), _runner()
+        manager = self._manager(target, draft)
+
+        output = manager.end_weight_update(EndWeightUpdateReqInput())
+
+        self.assertTrue(output.success)
+        for runner in (target, draft):
+            runner.weight_updater.end_weight_update.assert_called_once_with(
+                run_post_load=True
+            )
+        self.assertIsNone(manager._session)
+
+    def test_end_skips_post_load_on_both_when_weights_loaded(self):
+        """load_weights already ran post_load_weights; running it twice would double-apply."""
+        target, draft = _runner(), _runner()
+        manager = self._manager(target, draft)
+        manager._session = _WeightUpdateSession(selector="all", loaded_weights=True)
+
+        manager.end_weight_update(EndWeightUpdateReqInput())
+
+        for runner in (target, draft):
+            runner.weight_updater.end_weight_update.assert_called_once_with(
+                run_post_load=False
+            )
+
+    def test_session_selector_confines_begin_and_end_to_selected_runners(self):
+        """end finalizing a runner begin never restored would repack unrestored weights."""
+        target, draft = _runner(), _runner()
+        manager = self._manager(target, draft, session=False)
+
+        manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
+        manager.end_weight_update(EndWeightUpdateReqInput())
+
+        target.weight_updater.begin_weight_update.assert_not_called()
+        target.weight_updater.end_weight_update.assert_not_called()
+        draft.weight_updater.begin_weight_update.assert_called_once_with()
+        draft.weight_updater.end_weight_update.assert_called_once()
+
+    def test_begin_rejects_reentry(self):
+        """A second begin would leave the first session's runners unfinalized."""
+        target = _runner()
+
+        output = self._manager(target).begin_weight_update(BeginWeightUpdateReqInput())
+
+        self.assertFalse(output.success)
+        self.assertIn("already open", output.message)
+        target.weight_updater.begin_weight_update.assert_not_called()
+
+    def test_end_without_session_is_rejected(self):
+        """Finalizing runners begin never restored would repack weights twice."""
+        target = _runner()
+
+        output = self._manager(target, session=False).end_weight_update(
+            EndWeightUpdateReqInput()
+        )
+
+        self.assertFalse(output.success)
+        self.assertIn("begin_weight_update", output.message)
+        target.weight_updater.end_weight_update.assert_not_called()
+
+    def test_update_without_session_is_rejected_without_loading(self):
+        """A caller that skips begin gets an error back instead of crashing the scheduler."""
+        target = _runner()
+
+        output = self._manager(target, session=False).update_weights_from_distributed(
+            _request()
+        )
+
+        self.assertFalse(output.success)
+        self.assertIn("begin_weight_update", output.message)
+        target.weight_updater.receive_weights_from_distributed.assert_not_called()
 
 
 if __name__ == "__main__":
