@@ -382,9 +382,3 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             max_seqlen_k=max_seqlen_k,
             flashmla_metadata=flashmla_metadata,
         )
-
-
-# Backward-compat alias
-DeepseekSparseAttnBackendMTPPrecomputeMixin = (
-    DeepseekSparseAttnBackendMTPPrecomputeMixin
-)

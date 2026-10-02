@@ -50,13 +50,14 @@ on:
         type: boolean
         default: false
       skip_pr_test_health_check:
-        description: "Skip PR test health check fast-fail (e.g. for release branch cuts)"
+        description: "Skip PR test health check fail-fast (e.g. for release branch cuts)"
         required: false
         type: boolean
         default: false
 
 concurrency:
-  group: pr-test-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
+  # Keys on the PR number: two forks can share a head_ref and would cancel each other.
+  group: pr-test-extra-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
@@ -159,92 +160,32 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     # No `secrets: inherit`: this hosted CPU job has no secret consumer.
 
-  # =============================================== extra-a (1-/2-gpu) ===============================================
-  extra-a-test-1-gpu-small:
+  # =============================================== extra-a / extra-b ===============================================
+  # `name:` keeps the job names wait-for-jobs and check-pr-test-health match on.
+  extra-test:
+    name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { stage: extra-a, runner_config: 1-gpu-small, timeout_per_file: '' }
+          - { stage: extra-a, runner_config: 1-gpu-large, timeout_per_file: '1800' }
+          - { stage: extra-a, runner_config: 2-gpu-large, timeout_per_file: '' }
+          - { stage: extra-b, runner_config: 4-gpu-h100, timeout_per_file: '3600' }
+          - { stage: extra-b, runner_config: 4-gpu-b200, timeout_per_file: '1800' }
+          - { stage: extra-b, runner_config: 8-gpu-h200, timeout_per_file: '' }
+          - { stage: extra-b, runner_config: 8-gpu-b300, timeout_per_file: '3600' }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: extra-a-test-1-gpu-small
-      runner_config: 1-gpu-small
+      self_name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
+      runner_config: ${{ matrix.runner_config }}
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '60'
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
-    secrets: inherit
-
-  extra-a-test-1-gpu-large:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: extra-a-test-1-gpu-large
-      runner_config: 1-gpu-large
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '60'
-      timeout_per_file: '1800'
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
-    secrets: inherit
-
-  extra-a-test-2-gpu-large:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: extra-a-test-2-gpu-large
-      runner_config: 2-gpu-large
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '60'
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
-    secrets: inherit
-
-  # =============================================== extra-b (4-/8-gpu) ===============================================
-  extra-b-test-4-gpu-h100:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: extra-b-test-4-gpu-h100
-      runner_config: 4-gpu-h100
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '60'
-      timeout_per_file: '3600'
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
-    secrets: inherit
-
-  extra-b-test-4-gpu-b200:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: extra-b-test-4-gpu-b200
-      runner_config: 4-gpu-b200
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '60'
-      timeout_per_file: '1800'
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
-    secrets: inherit
-
-  extra-b-test-8-gpu-h200:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: extra-b-test-8-gpu-h200
-      runner_config: 8-gpu-h200
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '60'
+      timeout_per_file: ${{ matrix.timeout_per_file }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
@@ -260,14 +201,16 @@ jobs:
         sgl-kernel-build-wheels,
         rust-ext-build,
         simulator-test-cpu,
-        extra-a-test-1-gpu-small,
-        extra-a-test-1-gpu-large,
-        extra-a-test-2-gpu-large,
-        extra-b-test-4-gpu-h100,
-        extra-b-test-4-gpu-b200,
-        extra-b-test-8-gpu-h200,
+        extra-test,
       ]
-    if: always()
+    # Without this guard an unrelated label starts a run that finishes green with
+    # nothing executed, over the real failure; `skipped` is what pr-states.yml reads.
+    if: |
+      always() &&
+      (github.event_name != 'pull_request' ||
+       github.event.action != 'labeled' ||
+       github.event.label.name == 'run-ci' ||
+       github.event.label.name == 'run-ci-extra')
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
@@ -297,10 +240,14 @@ jobs:
   # there (initial completion) and pull_request_target (push / label).
   notify-pr-states:
     needs: [pr-test-extra-finish]
+    # Same guard; pr-states.yml subscribes to labeled/unlabeled itself, so nothing is lost.
     if: |
       always() &&
       github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action != 'labeled' ||
+       github.event.label.name == 'run-ci' ||
+       github.event.label.name == 'run-ci-extra')
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch pr-states refresh

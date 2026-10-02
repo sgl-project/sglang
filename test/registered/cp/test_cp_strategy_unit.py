@@ -135,6 +135,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner.has_mha_companion_layers = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [2048, 2304]
+        runner.max_context_size = None
         runner.max_num_tokens = 2304
         runner.enable_cp_bcg_capture = True
         return runner
@@ -613,6 +614,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         swa_loc = torch.arange(5) + 16
         forward_batch = SimpleNamespace(
             out_cache_loc=cache_loc,
+            out_cache_loc_is_physical=False,
             encoder_out_cache_loc=torch.arange(3) + 32,
         )
         layer = SimpleNamespace(

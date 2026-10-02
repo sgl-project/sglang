@@ -1,14 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod active_load;
 pub mod admission;
 pub mod buckets;
 pub mod cache_aware;
 pub mod decode;
-pub mod engine_load;
+pub mod dp_rank;
 pub mod factory;
-pub mod kv_events;
 pub mod load_based;
 pub mod power_of_two;
 pub mod prefix_provider;
@@ -16,14 +14,15 @@ pub mod random;
 pub mod registry;
 pub mod round_robin;
 pub mod scoring;
+pub mod selection;
 pub mod session_aware;
 pub mod sticky;
 
 use crate::discovery::ModelId;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
-use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
 use dashmap::DashMap;
@@ -33,8 +32,9 @@ use std::sync::Arc;
 pub struct RequestTokens {
     /// The prompt token ids.
     pub ids: Vec<u32>,
-    /// Whether the token ids are safe to forward as engine `input_ids`.
-    pub engine_equivalent: bool,
+    /// Whether the IDs came from rendered chat messages.
+    /// Forwarding also requires the request safety guard.
+    pub rendered_from_chat: bool,
 }
 
 /// External indexer answer prepared by the async ingress path for the
@@ -44,28 +44,46 @@ pub struct ExternalPrefixSignal {
     pub query_blocks: usize,
 }
 
-/// Tokenizes a request for routing. Chat-encoder tokens are engine-equivalent;
-/// raw prompt tokens are used only for routing.
+/// Whether the caller pre-tokenized the prompt (`input_ids` present and not
+/// null). Such a request is never re-rendered: its ids drive routing and the
+/// body is forwarded untouched, malformed values included, for the engine to
+/// validate.
+pub fn has_caller_input_ids(value: &serde_json::Value) -> bool {
+    value.get("input_ids").is_some_and(|v| !v.is_null())
+}
+
+/// Tokenizes a request for routing. Caller `input_ids` win; chat-rendered
+/// tokens may also be forwarded to the engine (the chat route decides); raw
+/// prompt tokens are routing-only.
 pub fn request_tokens_for(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
-    if tokenizers.has_chat_encoder(&model_id.0) {
-        if let Some(messages) = value.get("messages").filter(|m| m.is_array()) {
-            if let Some(ids) = tokenizers.encode_chat(&model_id.0, messages) {
-                return Some(RequestTokens {
-                    ids,
-                    engine_equivalent: true,
-                });
-            }
+    if has_caller_input_ids(value) {
+        // A flat u32 array (empty included) supplies routing tokens; anything
+        // else yields none, leaving validation to the engine.
+        let ids = serde::Deserialize::deserialize(&value["input_ids"]).ok()?;
+        return Some(RequestTokens {
+            ids,
+            rendered_from_chat: false,
+        });
+    }
+    if tokenizers.has_chat_formatter(&model_id.0)
+        && value.get("messages").is_some_and(|m| m.is_array())
+    {
+        if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
+            return Some(RequestTokens {
+                ids,
+                rendered_from_chat: true,
+            });
         }
     }
     let text = extract_prompt_text_from_value(value)?;
     let ids = tokenize_text(tokenizers, model_id, &text)?;
     Some(RequestTokens {
         ids,
-        engine_equivalent: false,
+        rendered_from_chat: false,
     })
 }
 
@@ -156,7 +174,7 @@ pub struct SelectionContext<'a> {
     input_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
-    load_snapshot: Option<&'a EngineLoadSnapshot>,
+    load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
     affinity_lookup_enabled: bool,
     affinity_assignment_enabled: bool,
@@ -234,7 +252,7 @@ impl<'a> SelectionContext<'a> {
     }
 
     /// Attaches the engine load snapshot captured at request ingress.
-    pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineLoadSnapshot) -> Self {
+    pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineReportedLoadSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
         self
     }
@@ -295,7 +313,7 @@ impl<'a> SelectionContext<'a> {
         self.external_prefix
     }
 
-    pub fn load_snapshot(&self) -> Option<&EngineLoadSnapshot> {
+    pub fn load_snapshot(&self) -> Option<&EngineReportedLoadSnapshot> {
         self.load_snapshot
     }
 
@@ -331,6 +349,11 @@ pub struct CacheCandidate {
     pub worker: Arc<Worker>,
     pub matched_prefix_tokens: u64,
     pub uncached_tokens: u64,
+    /// Matched prefix length in blocks, as reported by the prefix signal.
+    /// Selection reads `matched_prefix_tokens`; the block count exists for
+    /// observability (the diverted-overlap histogram reads against the
+    /// tree/indexer block domain).
+    pub matched_prefix_blocks: u32,
     /// Domain containing this candidate.
     pub candidate_range_id: String,
     /// Optional pending prefill limit checked against `E`.
@@ -346,6 +369,18 @@ pub struct CacheCandidateProposal {
     pub pressure_abs_threshold_tokens: u64,
     pub pressure_abs_threshold_ms: Option<f64>,
     pub pressure_rel_threshold: f64,
+    /// Queue gate: a candidate whose engine reports at least this many
+    /// waiting requests cannot win on cache affinity. `None` disables the
+    /// gate. See [`crate::config::AffinityConfig::worker_queue_limit`].
+    pub worker_queue_limit: Option<u64>,
+    /// Saturation pin: when no candidate survives the gate and hard
+    /// admission, at least one was queue-gate-rejected, and no worker in
+    /// the routable fleet has a fresh queue reading strictly below this
+    /// floor, the request pins to the least-pressured rejected prefix
+    /// owner instead of diverting — the diversion cannot dodge a wait and
+    /// would forfeit the matched prefix. `None` disables the pin. See
+    /// [`crate::config::AffinityConfig::saturation_queue_floor`].
+    pub saturation_queue_floor: Option<u64>,
 }
 
 /// Prefill proposal returned as either a pair or a Cache-Aware candidate set.
@@ -492,14 +527,10 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     }
 
     /// Whether this policy's routing decision needs request tokens (i.e.
-    /// it routes by prompt prefix). Ingress tokenization itself is no longer
-    /// gated on this — that is a model property (`has_chat_encoder`) decided at
-    /// ingress via [`request_tokens_for`]. This flag is the EXTRA gate that
-    /// keeps the cache-aware policy's RAW-prompt routing path alive: a
-    /// cache-aware model with no chat encoder still wants its `/v1/completions`
-    /// /`text` prompt tokenized for tree matching, which `has_chat_encoder`
-    /// alone would not trigger. Default `false` for load-only and sticky
-    /// routes; only the cache-aware policy overrides it.
+    /// it routes by prompt prefix). This keeps routing tokenization active when
+    /// generated input-ID forwarding is disabled or no chat formatter exists.
+    /// Models with forwarding enabled also tokenize independently of this flag.
+    /// Default `false` for load-only and sticky routes.
     fn needs_request_tokens(&self) -> bool {
         false
     }
@@ -542,6 +573,13 @@ impl PolicyRegistry {
         self.by_model.get(model).map(|p| p.clone())
     }
 
+    /// Whether any registered policy reads request tokens; startup rejects this under `--no-tokenizer`.
+    pub fn needs_request_tokens(&self) -> bool {
+        self.by_model
+            .iter()
+            .any(|entry| entry.value().needs_request_tokens())
+    }
+
     /// Attaches metrics to each registered policy.
     pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
         for entry in self.by_model.iter() {
@@ -559,10 +597,12 @@ mod tests {
         resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
-    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
+    use crate::state::load_monitor::engine_reported_load::{
+        EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
+    };
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -584,7 +624,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("model".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 
@@ -660,6 +700,7 @@ mod tests {
                 worker: Arc::clone(&hot),
                 matched_prefix_tokens: 75,
                 uncached_tokens: 25,
+                matched_prefix_blocks: 3,
                 candidate_range_id: "global".into(),
                 max_pending_prefill_tokens: None,
             }],
@@ -770,8 +811,15 @@ mod tests {
                 },
             ),
         ]);
-        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 32, &loads)
-            .expect("the admitted backup must become Final P");
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            32,
+            &loads,
+            None,
+            2,
+        )
+        .expect("the admitted backup must become Final P");
         assert_eq!(decision.selected.id, backup.id);
         policy.commit_prefill_selection(&ctx, proposal.kind, &decision.selected);
 
@@ -1181,15 +1229,15 @@ mod tests {
         assert!(proposal.backup.is_some());
     }
 
-    fn snapshot(entries: &[(&Arc<Worker>, TestEngineLoad)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_native_cache_workers(
+    fn snapshot(entries: &[(&Arc<Worker>, TestEngineLoad)]) -> EngineReportedLoadSnapshot {
+        EngineReportedLoadSnapshot::from_native_cache_workers(
             1,
             entries
                 .iter()
                 .map(|(worker, aggregate)| {
                     (
                         worker.url.clone(),
-                        NativeCacheWorkerLoad {
+                        EngineReportedSchedulingLoad {
                             num_running_reqs: aggregate.num_running_reqs,
                             num_waiting_reqs: aggregate.num_waiting_reqs,
                             num_waiting_uncached_tokens: aggregate
@@ -1260,6 +1308,7 @@ mod tests {
             worker: Arc::clone(worker),
             matched_prefix_tokens,
             uncached_tokens,
+            matched_prefix_blocks: 0,
             candidate_range_id: "global".into(),
             max_pending_prefill_tokens,
         }
@@ -1296,7 +1345,7 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+        let decision = resolve_cache_candidates(&proposal, 100, &loads, &[])
             .decision
             .expect("a later admitted cache match must survive");
 
@@ -1344,7 +1393,7 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+        let decision = resolve_cache_candidates(&proposal, 100, &loads, &[])
             .decision
             .expect("all admitted candidates must participate in the tournament");
 
@@ -1370,7 +1419,7 @@ mod tests {
             },
         )]);
         assert!(
-            resolve_cache_candidates(&proposal, 100, &pending_allows)
+            resolve_cache_candidates(&proposal, 100, &pending_allows, &[])
                 .decision
                 .is_some(),
             "pending admission must project E=20, not L=100"
@@ -1386,7 +1435,7 @@ mod tests {
             },
         )]);
         assert!(
-            resolve_cache_candidates(&proposal, 100, &kv_rejects)
+            resolve_cache_candidates(&proposal, 100, &kv_rejects, &[])
                 .decision
                 .is_none(),
             "KV safety must conservatively project the complete input L=100"
@@ -1424,7 +1473,7 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+        let decision = resolve_cache_candidates(&proposal, 100, &loads, &[])
             .decision
             .unwrap();
         assert_eq!(decision.selected.id, congested.id);
@@ -1461,7 +1510,7 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+        let decision = resolve_cache_candidates(&proposal, 100, &loads, &[])
             .decision
             .unwrap();
         assert_eq!(
@@ -1514,7 +1563,7 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+        let decision = resolve_cache_candidates(&proposal, 100, &loads, &[])
             .decision
             .unwrap();
         assert_eq!(
@@ -1563,7 +1612,7 @@ mod tests {
         let range = CandidateRange::global(&workers);
         let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
 
-        let decision = resolve_prefill(&range, &proposal, 32, &snapshot)
+        let decision = resolve_prefill(&range, &proposal, 32, &snapshot, None, 2)
             .expect("an admitted backup must be selected");
 
         assert_eq!(decision.selected.id, backup.id);
@@ -1574,13 +1623,15 @@ mod tests {
     fn missing_engine_snapshot_does_not_hard_reject_a_registry_healthy_primary() {
         let primary = worker("primary");
         let workers = vec![Arc::clone(&primary)];
-        let snapshot = EngineLoadSnapshot::default();
+        let snapshot = EngineReportedLoadSnapshot::default();
 
         let decision = resolve_prefill(
             &CandidateRange::global(&workers),
             &SelectionProposal::primary(Arc::clone(&primary)),
             1_000_000,
             &snapshot,
+            None,
+            2,
         )
         .expect("disabled reporting must preserve the healthy registry candidate");
 
@@ -1613,8 +1664,15 @@ mod tests {
         ]);
         let proposal = SelectionProposal::with_backup(primary, backup);
 
-        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 80, &snapshot)
-            .expect("both candidates fit capacity");
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            80,
+            &snapshot,
+            None,
+            2,
+        )
+        .expect("both candidates fit capacity");
 
         assert_eq!(decision.reason, DecisionReason::Primary);
     }
@@ -1657,8 +1715,15 @@ mod tests {
         ]);
         let proposal = SelectionProposal::with_backup(primary, backup);
 
-        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 32, &snapshot)
-            .expect("an admitted range fallback must be selected");
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            32,
+            &snapshot,
+            None,
+            2,
+        )
+        .expect("an admitted range fallback must be selected");
 
         assert_eq!(decision.selected.id, fallback.id);
         assert_eq!(decision.reason, DecisionReason::RangeFallback);

@@ -744,12 +744,19 @@ _B_DESC_CACHE_MAX = 64
 _B_DESC_CACHE: OrderedDict[tuple, TensorDescriptor] = OrderedDict()
 
 
+def clear_b_tma_desc_cache() -> None:
+    """Drop all cached B TensorDescriptors, releasing the weights they pin."""
+    _B_DESC_CACHE.clear()
+
+
 def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
     """
     Cache TensorDescriptor for constant weight B.
-    Keyed by storage ptr + shape/stride/dtype + tile shape.
+    Keyed by tensor identity + storage ptr + shape/stride/dtype + tile shape.
     """
     key = (
+        # offload can rebind a Parameter while another tensor reuses its address
+        id(B),
         int(B.data_ptr()),
         tuple(B.shape),
         tuple(B.stride()),

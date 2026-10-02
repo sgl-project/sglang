@@ -66,8 +66,8 @@ pub enum FinishReason {
     /// This arm is why the outer enum is untagged: a finish reason added Python-side
     /// must not fail the header decode, which rejects the whole frame — every
     /// request in the batch, not just the one that carried it.
-    // Keep the native frame compact even when HTTP/rendering dependencies turn
-    // on serde_json's large `preserve_order` map representation.
+    // Keep the scheduler response compact even when HTTP/rendering dependencies
+    // turn on serde_json's large `preserve_order` map representation.
     Unknown(Box<serde_json::Map<String, serde_json::Value>>),
 }
 
@@ -97,9 +97,9 @@ impl FinishReason {
         }
     }
 
-    /// `Some((status, message))` when this is an abort carrying a `status_code` —
-    /// a scheduler-side request error the API surfaces as that HTTP status instead
-    /// of as a normal completion. A plain abort (no code) reads as `None`.
+    /// `Some((status, message))` when this is an abort carrying the scheduler's
+    /// legacy HTTP status — a request failure the frontend boundary converts
+    /// into a semantic error event. A plain abort (no code) reads as `None`.
     pub fn abort_status(&self) -> Option<(u16, &str)> {
         match self {
             FinishReason::Known(FinishKind::Abort(a)) => Some((
@@ -128,9 +128,9 @@ mod tests {
         Some((code, message.to_string()))
     }
 
-    /// The classifier both API paths use: a validation abort yields its
-    /// `(code, message)` (the streaming path turns this into an SSE error event
-    /// instead of a normal `Done` frame); anything else yields `None`.
+    /// The classifier the frontend boundary uses: a validation abort yields its
+    /// `(code, message)` so it can become a semantic failure event; anything
+    /// else yields `None`.
     #[test]
     fn abort_status_extracts_code_and_message() {
         let (code, msg) = abort_status(&fr(serde_json::json!({
