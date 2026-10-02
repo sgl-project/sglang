@@ -367,9 +367,12 @@ the special tokens SGLang adds (BOS per `add_bos_token` for Llama-, Gemma- and
 Cohere-class tokenizers, otherwise the `tokenizer.json` post-processor's), and
 forwards it as `input_ids`. The engine skips tokenizing and routing sees its exact
 tokens. Multimodal requests keep `text`, since the engine expands placeholders
-from it, and `--disable-input-ids-forwarding` keeps it for every request. A batch
-goes to one worker: load counts every prompt and each of its `n` samples, while
-bucket and context limits bound the longest prompt plus its own `max_new_tokens`.
+from it, and `--disable-input-ids-forwarding` keeps it for every request. So does
+a model whose `tokenizer.json` normalizer transformers replaces on load (legacy
+SentencePiece Llama files, bge-m3), as the router cannot reproduce its tokens. A
+batch goes to one worker: load counts every prompt and each of its `n` samples,
+while bucket and context limits bound the longest prompt plus its own
+`max_new_tokens`.
 
 Otherwise the body passes through, plus PD bootstrap fields and a minted `rid`
 for a single prompt that has none. `--override-sampling-params` does not apply:

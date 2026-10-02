@@ -53,9 +53,30 @@ const BOS_FLAG_CLASSES: [&str; 7] = [
     "CohereTokenizerFast",
 ];
 
+/// Whether SGLang keeps tokenizer.json's normalizer: transformers v5 rebuilds these
+/// classes with its own, and `_fix_v5_tokenizer_components` restores only the pre-tokenizer.
+fn engine_keeps_normalizer(class: &str, normalizer: &serde_json::Value) -> bool {
+    let steps = match &normalizer["normalizers"] {
+        serde_json::Value::Array(steps) => steps.as_slice(),
+        _ if normalizer.is_null() => &[],
+        _ => std::slice::from_ref(normalizer),
+    };
+    let gemma =
+        serde_json::json!({"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"});
+    match class.trim_end_matches("Fast") {
+        "LlamaTokenizer" => steps.is_empty(),
+        "XLMRobertaTokenizer" => steps.iter().all(|step| step["type"] == "Precompiled"),
+        "GemmaTokenizer" => *steps == [gemma],
+        // Rewritten for infilling; unverified.
+        "CodeLlamaTokenizer" => false,
+        _ => true,
+    }
+}
+
 /// Token ids SGLang's `tokenizer(text)` puts around a prompt and [`encode`]
 /// leaves out: BOS per `add_bos_token` (default true) for [`BOS_FLAG_CLASSES`],
-/// else the tokenizer.json post-processor's. Tiktoken models add none.
+/// else the tokenizer.json post-processor's. Tiktoken models add none. Errs when
+/// the router cannot reproduce the engine's tokens.
 pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<(Vec<u32>, Vec<u32>)> {
     let path = resolve(source)?;
     if !path.ends_with(".json") {
@@ -65,6 +86,12 @@ pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<(Vec<u32>, Vec
     // A failed download leaves the special tokens unknown, so /generate keeps text.
     files.ensure_downloaded("tokenizer_config.json")?;
     let config = files.json("tokenizer_config.json")?.unwrap_or_default();
+    let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let class = config["tokenizer_class"].as_str().unwrap_or_default();
+    anyhow::ensure!(
+        engine_keeps_normalizer(class, &file["normalizer"]),
+        "transformers replaces the {class} normalizer"
+    );
     let plain = create_tokenizer_from_file(&path)?;
     let ids = |t: &dyn traits::Tokenizer, text: &str| -> Result<Vec<u32>> {
         Ok(t.encode(text)?.token_ids().to_vec())
@@ -472,7 +499,26 @@ mod model_files_tests {
 #[cfg(test)]
 mod prompt_affix_tests {
     use super::{prompt_affixes, ModelFiles};
+    use anyhow::Result;
     use serde_json::{json, Value};
+
+    /// `prompt_affixes` of the tiny tokenizer with `normalizer`, next to `config`.
+    fn affixes(
+        normalizer: Value,
+        post_processor: Value,
+        config: Value,
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        let mut data: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/tiny_tokenizer.json")).unwrap();
+        data["normalizer"] = normalizer;
+        data["post_processor"] = post_processor;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, data.to_string()).unwrap();
+        std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
+        let path = path.to_str().unwrap();
+        prompt_affixes(path, &ModelFiles::open(path))
+    }
 
     #[test]
     fn matches_the_engines_special_tokens() {
@@ -484,28 +530,36 @@ mod prompt_affix_tests {
         let mut no_bos = llama.clone();
         no_bos["add_bos_token"] = false.into();
         for (post_processor, config, prefix) in [
-            (Value::Null, None, vec![]),
-            (template.clone(), None, vec![256]),
+            (Value::Null, json!({}), vec![]),
+            (template.clone(), json!({}), vec![256]),
             // SGLang adds BOS by `add_bos_token`, ignoring the post-processor.
-            (Value::Null, Some(llama), vec![256]),
-            (template, Some(no_bos), vec![]),
+            (Value::Null, llama, vec![256]),
+            (template, no_bos, vec![]),
         ] {
-            let mut data: Value =
-                serde_json::from_str(include_str!("../../tests/fixtures/tiny_tokenizer.json"))
-                    .unwrap();
-            data["post_processor"] = post_processor;
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("tokenizer.json");
-            std::fs::write(&path, data.to_string()).unwrap();
-            if let Some(config) = config {
-                std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string())
-                    .unwrap();
-            }
-            let path = path.to_str().unwrap();
-            assert_eq!(
-                prompt_affixes(path, &ModelFiles::open(path)).unwrap(),
-                (prefix, vec![])
-            );
+            let affixes = affixes(Value::Null, post_processor, config).unwrap();
+            assert_eq!(affixes, (prefix, vec![]));
+        }
+    }
+
+    #[test]
+    fn refuses_normalizers_the_engine_replaces() {
+        let legacy = json!({"type": "Sequence", "normalizers": [
+            {"type": "Prepend", "prepend": "\u{2581}"},
+            {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"}]});
+        let collapse = json!({"type": "Replace", "pattern": {"Regex": " {2,}"}, "content": " "});
+        for (class, normalizer, kept) in [
+            ("LlamaTokenizerFast", legacy.clone(), false),
+            ("PreTrainedTokenizerFast", legacy, true),
+            ("XLMRobertaTokenizer", collapse, false),
+            (
+                "GemmaTokenizer",
+                json!({"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"}),
+                true,
+            ),
+        ] {
+            let config = json!({"tokenizer_class": class, "add_bos_token": false});
+            let affixes = affixes(normalizer, Value::Null, config);
+            assert_eq!(affixes.is_ok(), kept, "{class}");
         }
     }
 }

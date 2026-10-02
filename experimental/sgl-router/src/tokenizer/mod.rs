@@ -94,7 +94,7 @@ impl TokenizerRegistry {
         me.prompt_affixes = adapter::prompt_affixes(tokenizer_path, &files)
             .map_err(|e| {
                 tracing::warn!(model = %m.id, error = %format!("{e:#}"),
-                    "cannot match the engine's special tokens; /generate forwards text")
+                    "cannot reproduce the engine's tokens; /generate forwards text")
             })
             .ok();
         match ChatFormatter::load_from(&m.id, &files) {
