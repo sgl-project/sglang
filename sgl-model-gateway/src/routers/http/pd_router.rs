@@ -531,7 +531,6 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
@@ -573,7 +572,6 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(response_headers),
-                prefill,
                 decode,
             )
         } else {
@@ -658,10 +656,9 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+        let prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
+        // Streaming decode load is guarded in create_streaming_response, where the
+        // guard is tied to the response body instead of to this function's return.
         let _decode_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
 
@@ -772,6 +769,10 @@ impl PDRouter {
             return response;
         }
 
+        // The prefill server answers only after it has finished the request, so its
+        // status is the signal that the prefill worker no longer holds this request.
+        drop(prefill_guard);
+
         // Prefill ok: take decode's result, awaiting it if still pending.
         let decode_result = match decode_early {
             Some(dr) => dr,
@@ -823,7 +824,7 @@ impl PDRouter {
                     }
 
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, decode)
                         .await;
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
@@ -874,7 +875,6 @@ impl PDRouter {
                         prefill_logprobs,
                         context.return_logprob,
                         Some(response_headers),
-                        prefill,
                         decode,
                     )
                 } else {
@@ -1106,7 +1106,6 @@ impl PDRouter {
         Ok(available_workers[selected_idx].clone())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create_streaming_response(
         &self,
         stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
@@ -1114,7 +1113,6 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         use crate::core::AttachedBody;
@@ -1204,10 +1202,7 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
+        let decode_guard = WorkerLoadGuard::new(decode, headers.as_ref());
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
@@ -1216,7 +1211,7 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        AttachedBody::wrap_response(response, guards)
+        AttachedBody::wrap_response(response, decode_guard)
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -2046,30 +2041,286 @@ mod tests {
                 None,
                 false,
                 None,
-                prefill_ref.clone(),
                 decode_ref.clone(),
             );
 
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
+            // The decode guard is attached to the response body; the prefill
+            // worker is not counted by the streaming response at all.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             tx.send(bytes::Bytes::from("test data")).unwrap();
 
             sleep(Duration::from_millis(10)).await;
 
-            // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
+            // Decode load still 1 while response body exists
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             drop(tx);
 
-            // Response (and its body with guards) dropped here
+            // Response (and its body with the decode guard) dropped here
             drop(response);
         }
 
-        // Guards dropped when response dropped
+        // Guard dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    async fn spawn_test_server(app: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// Prefill server that announces each arriving request and answers it only
+    /// after `release` is signalled.
+    async fn spawn_gated_prefill_server(
+        arrived: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> std::net::SocketAddr {
+        let app = axum::Router::new().route(
+            "/v1/completions",
+            axum::routing::post(move || {
+                let arrived = arrived.clone();
+                let release = release.clone();
+                async move {
+                    arrived.notify_one();
+                    release.notified().await;
+                    axum::Json(json!({"text": "prefill", "meta_info": {}}))
+                }
+            }),
+        );
+
+        spawn_test_server(app).await
+    }
+
+    /// Waits for the worker's load to reach `expected`, so that a slow runner
+    /// delays the check instead of failing it.
+    async fn wait_for_load(worker: &Arc<dyn Worker>, expected: usize, what: &str) {
+        let reached = async {
+            while worker.load() != expected {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+
+        if tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+            .await
+            .is_err()
+        {
+            panic!("{}: load is {}, expected {}", what, worker.load(), expected);
+        }
+    }
+
+    fn spawn_pd_dispatch(
+        router: Arc<PDRouter>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+        is_stream: bool,
+    ) -> tokio::task::JoinHandle<Response> {
+        let context = PDRequestContext {
+            route: "/v1/completions",
+            batch_size: None,
+            is_stream,
+            return_logprob: false,
+            request_text: None,
+            model_id: None,
+            headers: None,
+        };
+
+        tokio::spawn(async move {
+            router
+                .execute_dual_dispatch_internal(
+                    None,
+                    json!({"prompt": "hello", "stream": is_stream}),
+                    context,
+                    prefill,
+                    decode,
+                    Instant::now(),
+                )
+                .await
+        })
+    }
+
+    fn pd_load_test_workers(
+        prefill_addr: std::net::SocketAddr,
+        decode_addr: std::net::SocketAddr,
+    ) -> (Arc<dyn Worker>, Arc<dyn Worker>) {
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            format!("http://{}", prefill_addr),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            format!("http://{}", decode_addr),
+            WorkerType::Decode,
+            true,
+        ));
+
+        (prefill, decode)
+    }
+
+    #[tokio::test]
+    async fn test_streaming_prefill_load_released_when_prefill_responds() {
+        use std::time::Duration;
+
+        use tokio::{sync::Notify, time::timeout};
+
+        let prefill_arrived = Arc::new(Notify::new());
+        let prefill_release = Arc::new(Notify::new());
+        let decode_release = Arc::new(Notify::new());
+        let decode_finish = Arc::new(Notify::new());
+
+        let prefill_addr =
+            spawn_gated_prefill_server(prefill_arrived.clone(), prefill_release.clone()).await;
+
+        let release = decode_release.clone();
+        let finish = decode_finish.clone();
+        let decode_app = axum::Router::new().route(
+            "/v1/completions",
+            axum::routing::post(move || {
+                let release = release.clone();
+                let finish = finish.clone();
+                async move {
+                    release.notified().await;
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    tokio::spawn(async move {
+                        let _ = tx.send(Ok::<_, std::io::Error>(bytes::Bytes::from(
+                            "data: {\"text\": \"a\"}\n\n",
+                        )));
+                        finish.notified().await;
+                        let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                    });
+                    Body::from_stream(UnboundedReceiverStream::new(rx))
+                }
+            }),
+        );
+        let decode_addr = spawn_test_server(decode_app).await;
+
+        let router = Arc::new(create_test_pd_router());
+        let (prefill, decode) = pd_load_test_workers(prefill_addr, decode_addr);
+
+        let dispatch = spawn_pd_dispatch(router.clone(), prefill.clone(), decode.clone(), true);
+
+        timeout(Duration::from_secs(5), prefill_arrived.notified())
+            .await
+            .expect("prefill server should receive the request");
+
+        wait_for_load(
+            &prefill,
+            1,
+            "prefill counts the request while the prefill server has not answered yet",
+        )
+        .await;
+
+        prefill_release.notify_one();
+
+        wait_for_load(
+            &prefill,
+            0,
+            "prefill stops counting the request as soon as the prefill server answered, \
+             without waiting for the decode server",
+        )
+        .await;
+        assert_eq!(
+            decode.load(),
+            0,
+            "a streaming request reaches the decode worker's load only once its response starts"
+        );
+
+        decode_release.notify_one();
+        let response = timeout(Duration::from_secs(5), dispatch)
+            .await
+            .expect("dispatch should return once the decode server answered")
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(
+            decode.load(),
+            1,
+            "decode counts the request until the response body is dropped"
+        );
+
+        decode_finish.notify_one();
+        drop(response);
+
+        wait_for_load(&prefill, 0, "prefill after the response was dropped").await;
+        wait_for_load(&decode, 0, "decode after the response was dropped").await;
+    }
+
+    #[tokio::test]
+    async fn test_non_streaming_prefill_load_released_when_prefill_responds() {
+        use std::time::Duration;
+
+        use tokio::{sync::Notify, time::timeout};
+
+        let prefill_arrived = Arc::new(Notify::new());
+        let prefill_release = Arc::new(Notify::new());
+        let decode_release = Arc::new(Notify::new());
+
+        let prefill_addr =
+            spawn_gated_prefill_server(prefill_arrived.clone(), prefill_release.clone()).await;
+
+        let release = decode_release.clone();
+        let decode_app = axum::Router::new().route(
+            "/v1/completions",
+            axum::routing::post(move || {
+                let release = release.clone();
+                async move {
+                    release.notified().await;
+                    axum::Json(json!({"text": "decoded", "meta_info": {}}))
+                }
+            }),
+        );
+        let decode_addr = spawn_test_server(decode_app).await;
+
+        let router = Arc::new(create_test_pd_router());
+        let (prefill, decode) = pd_load_test_workers(prefill_addr, decode_addr);
+
+        let dispatch = spawn_pd_dispatch(router.clone(), prefill.clone(), decode.clone(), false);
+
+        timeout(Duration::from_secs(5), prefill_arrived.notified())
+            .await
+            .expect("prefill server should receive the request");
+
+        wait_for_load(
+            &prefill,
+            1,
+            "prefill counts the request while the prefill server has not answered yet",
+        )
+        .await;
+        assert_eq!(decode.load(), 1);
+
+        prefill_release.notify_one();
+
+        wait_for_load(
+            &prefill,
+            0,
+            "prefill stops counting the request as soon as the prefill server answered, \
+             while the decode server is still generating",
+        )
+        .await;
+        assert_eq!(
+            decode.load(),
+            1,
+            "decode counts the request until it has answered"
+        );
+
+        decode_release.notify_one();
+        let response = timeout(Duration::from_secs(5), dispatch)
+            .await
+            .expect("dispatch should return once the decode server answered")
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        wait_for_load(&prefill, 0, "prefill after the dispatch returned").await;
+        wait_for_load(&decode, 0, "decode after the dispatch returned").await;
     }
 }
