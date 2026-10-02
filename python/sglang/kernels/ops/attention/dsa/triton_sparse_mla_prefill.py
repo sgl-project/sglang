@@ -197,7 +197,7 @@ def _union_dedup(idx_main, G):
         G=G,
         # log2(K) + 1 halvings: the last one resolves a one-element interval.
         LOG_K=K.bit_length(),
-        num_warps=16 if G == 4 else 8,  # swept on H20 at K=2048
+        num_warps=16 if G == 4 else 8,  # swept on SM90 at K=2048
     )
     return uidx, ubits, ulen
 

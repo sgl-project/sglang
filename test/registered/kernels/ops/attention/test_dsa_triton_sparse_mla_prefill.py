@@ -123,7 +123,7 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
 
     def test_large_head_count_steps_down_instead_of_oom(self):
         # An oversized tile makes the first candidate fail on every GPU (on the
-        # CI H100's 228 KB the tuned tile simply fits and nothing would step
+        # CI GPU's 228 KB the tuned tile simply fits and nothing would step
         # down), and the cache is cleared so an earlier test's fit cannot be
         # moved to the front. The recorded fit must not be the requested tile.
         _FIT_TILE.clear()
