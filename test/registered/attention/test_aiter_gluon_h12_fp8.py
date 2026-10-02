@@ -351,7 +351,7 @@ class TestMlaDcpAsmDecode(CustomTestCase):
         layer.logit_cap = 0.0
         return layer
 
-    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_decode_fwd")
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_decode_fwd", create=True)
     @mock.patch("sglang.srt.layers.attention.aiter_backend.scaled_fp8_quant")
     def test_asm_quantizes_gathered_q_and_returns_lse(self, mock_quant, mock_mla):
         from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
