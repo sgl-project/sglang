@@ -100,6 +100,65 @@ fn report(
     );
 }
 
+#[tokio::test]
+async fn equal_prefixes_use_one_score_basis_before_bounding_candidates() {
+    let engines = [engine("a", 0), engine("b", 0), engine("c", 0)];
+    let table = EngineReportedLoadTable::new();
+    for (i, (pending, rate)) in [(10, Some(100)), (30, Some(3000)), (20, None)]
+        .into_iter()
+        .enumerate()
+    {
+        if rate.is_some() {
+            report(&table, &engines[i], 1, pending, Instant::now());
+        }
+        table.set(
+            &engines[i].url,
+            0,
+            LoadStat {
+                num_running_reqs: 1,
+                num_waiting_reqs: 1,
+                num_tokens: 10,
+                max_total_num_tokens: 100,
+                native_cache: Some(NativeCacheRankLoad {
+                    num_waiting_uncached_tokens: pending,
+                    num_total_tokens: 10,
+                    max_running_requests: 100,
+                    total_prefill_uncached_tokens: rate.unwrap_or(0),
+                    total_prefill_busy_us: 1_000_000,
+                }),
+            },
+            Instant::now(),
+        );
+    }
+    let policy = CacheAwarePolicy::new(
+        local(&[(&engines[0], 8), (&engines[1], 8), (&engines[2], 8)]),
+        table,
+        AffinityConfig {
+            cache_candidate_min_workers: 1,
+            cache_candidate_max_workers: 1,
+            pressure_guard: false,
+            ..config()
+        },
+    )
+    .unwrap();
+    let model = ModelId("m".into());
+    // All three participate in scoring before the cap. B's shorter queue
+    // time cannot beat A's smaller token backlog while C lacks an estimate.
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let pool = order.map(|i| Arc::clone(&engines[i]));
+        let pick = policy.pick(&pool, &request(&model)).await.unwrap();
+        assert!(Arc::ptr_eq(&pick.engine, &engines[0]));
+        assert_eq!(pick.reason, "cache_candidate");
+    }
+}
+
 #[derive(Debug)]
 struct Reject {
     id: &'static str,
