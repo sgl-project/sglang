@@ -194,8 +194,13 @@ class _EncodeCase(CustomTestCase):
         self.addCleanup(setattr, ppe, "_parallel_ok", ppe._parallel_ok)
         ppe._parallel_ok = True
 
+    def _set_min_chars(self, value):
+        override = envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(value)
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
+
     def _no_min_chars(self):
-        self.enterContext(envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(0))
+        self._set_min_chars(0)
 
     def _assert_matches_encode(self, tokenizer, text, kwargs_variants=_ALL_KWARGS):
         for encode_kwargs in kwargs_variants:
@@ -539,9 +544,7 @@ class TestGatesAndArgumentAllowlist(_EncodeCase):
         super().setUp()
         # Pinned rather than inherited: the ambient environment may carry its
         # own threshold, and the default is 32 KiB of text per case.
-        self.enterContext(
-            envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(self.threshold)
-        )
+        self._set_min_chars(self.threshold)
         self.tokenizer = _tokenizer()
         self.text = "the quick brown fox jumps over the lazy dog\n" * 200
         self.assertGreater(len(self.text), self.threshold)
