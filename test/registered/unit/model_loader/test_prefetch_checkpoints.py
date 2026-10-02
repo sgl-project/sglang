@@ -316,6 +316,9 @@ class TestPrefetchCheckpoints(CustomTestCase):
                 test_case.assertEqual(name, "weight")
                 return torch.tensor([1.0])
 
+            def close(self):
+                events.append("buffer_close")
+
         class FakeLoader:
             def __init__(self, group, device, nogds):
                 test_case.assertIsInstance(group, FakeGroup)
@@ -356,7 +359,105 @@ class TestPrefetchCheckpoints(CustomTestCase):
             )
 
         torch.testing.assert_close(loaded[0][1], torch.tensor([1.0]))
-        self.assertEqual(events, ["close", "drop:model.safetensors"])
+        self.assertEqual(events, ["buffer_close", "close", "drop:model.safetensors"])
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_fastsafetensors_closes_buffer_when_iteration_stops_early(self, _):
+        events = []
+
+        class FakeGroup:
+            def rank(self):
+                return 0
+
+            def size(self):
+                return 1
+
+        class FakeBuffer:
+            key_to_rank_lidx = {"weight": (0, 0), "other": (0, 1)}
+
+            def get_tensor(self, name):
+                return torch.tensor([1.0])
+
+            def close(self):
+                events.append("buffer_close")
+
+        class FakeLoader:
+            def __init__(self, group, device, nogds):
+                pass
+
+            def add_filenames(self, rank_file_map):
+                pass
+
+            def copy_files_to_device(self):
+                return FakeBuffer()
+
+            def close(self):
+                events.append("loader_close")
+
+        with (
+            patch("sglang.srt.model_loader.weight_utils.SingleGroup", FakeGroup),
+            patch(
+                "sglang.srt.model_loader.weight_utils.SafeTensorsFileLoader",
+                FakeLoader,
+            ),
+        ):
+            weights = fastsafetensors_weights_iterator(["model.safetensors"])
+            next(weights)
+            weights.close()
+
+        self.assertEqual(events, ["buffer_close", "loader_close"])
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_fastsafetensors_closes_both_resources_on_error(self, _):
+        events = []
+
+        class FakeGroup:
+            def rank(self):
+                return 0
+
+            def size(self):
+                return 1
+
+        class FakeBuffer:
+            key_to_rank_lidx = {"weight": (0, 0)}
+
+            def get_tensor(self, name):
+                raise ValueError("tensor read failed")
+
+            def close(self):
+                events.append("buffer_close")
+                if close_fails:
+                    raise RuntimeError("buffer close failed")
+
+        class FakeLoader:
+            def __init__(self, group, device, nogds):
+                pass
+
+            def add_filenames(self, rank_file_map):
+                pass
+
+            def copy_files_to_device(self):
+                return FakeBuffer()
+
+            def close(self):
+                events.append("loader_close")
+
+        with (
+            patch("sglang.srt.model_loader.weight_utils.SingleGroup", FakeGroup),
+            patch(
+                "sglang.srt.model_loader.weight_utils.SafeTensorsFileLoader",
+                FakeLoader,
+            ),
+        ):
+            for close_fails, error_type, expected_error in (
+                (False, ValueError, "tensor read failed"),
+                (True, RuntimeError, "buffer close failed"),
+            ):
+                with self.subTest(close_fails=close_fails):
+                    events.clear()
+                    with self.assertRaisesRegex(error_type, expected_error):
+                        list(fastsafetensors_weights_iterator(["model.safetensors"]))
+                    self.assertEqual(events, ["buffer_close", "loader_close"])
 
 
 class TestPrefetchDispatch(CustomTestCase):
