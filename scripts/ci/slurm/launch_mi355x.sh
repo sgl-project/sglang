@@ -1499,17 +1499,29 @@ fi
 # Keep only the devices whose port is ACTIVE on EVERY allocated node -- the
 # same set on both ends, so no transfer has to cross rails -- and patch that
 # list into the generated server scripts before anything is launched.
+#
+# If that leaves fewer devices than the recipe asked for, top the list back up
+# with other rdma* ports that are ACTIVE on every node. The 1p1d recipes name
+# rdma0..3, and a node can lose exactly those: on 2026-10-02 g02 had only
+# rdma4..7 up (its rdma0..3 had come back as unrenamed rocep* devices, DOWN),
+# so every pair that included it had no usable recipe port at all. A port off
+# the recipe's list may sit further from the GPU, but it works; a dead one
+# does not.
 source "$WORKDIR/ib_check.sh"
 if [[ "$CLUSTER" == "spur" && -n "$IB_RECIPE" ]]; then
-  IFS=',' read -ra _ib_live <<< "$IB_RECIPE"
-  # __ok__ separates "the step ran" from a flaky srun dispatch, as in
-  # container_state(); sysfs reads e.g. "4: ACTIVE" or "1: DOWN".
-  _ib_probe='for d in "$@"; do s=$(cat "/sys/class/infiniband/$d/ports/1/state" 2>/dev/null); echo "$d ${s:-missing}"; done; echo __ok__'
+  IFS=',' read -ra _ib_want <<< "$IB_RECIPE"
+  _ib_live=("${_ib_want[@]}")
+  _ib_spare=()       # non-recipe rdma* ports ACTIVE on every node checked so far
+  _ib_spare_init=0
+  # Every port on the node, not just the recipe's, so there is something to
+  # fall back to. __ok__ separates "the step ran" from a flaky srun dispatch,
+  # as in container_state(); sysfs reads e.g. "4: ACTIVE" or "1: DOWN".
+  _ib_probe='for p in /sys/class/infiniband/*/ports/1/state; do [ -e "$p" ] || continue; d=${p#/sys/class/infiniband/}; echo "${d%%/*} $(cat "$p" 2>/dev/null)"; done; echo __ok__'
   _ib_unchecked=()
   for n in "${NODES[@]}"; do
     _ib_out=""
     for _try in 1 2 3; do
-      _ib_out="$(srun_local_or_step "$n" bash -c "$_ib_probe" _ "${_ib_live[@]}" 2>/dev/null | tr -d '\r')"
+      _ib_out="$(srun_local_or_step "$n" bash -c "$_ib_probe" 2>/dev/null | tr -d '\r')"
       [[ "$_ib_out" == *__ok__* ]] && break
       _ib_out=""
       sleep 2
@@ -1524,20 +1536,44 @@ if [[ "$CLUSTER" == "spur" && -n "$IB_RECIPE" ]]; then
       if grep -qxE "$d [0-9]+: ACTIVE" <<< "$_ib_out"; then
         _ib_keep+=("$d")
       else
-        echo "[drive] $n: dropping $d ($(grep -m1 "^$d " <<< "$_ib_out" | cut -d' ' -f2-))" >&2
+        _st="$(grep -m1 "^$d " <<< "$_ib_out" | cut -d' ' -f2-)"
+        echo "[drive] $n: dropping $d (${_st:-missing})" >&2
       fi
     done
     _ib_live=("${_ib_keep[@]}")
+    mapfile -t _ib_active < <(sed -nE 's/^(rdma[0-9]+) [0-9]+: ACTIVE$/\1/p' <<< "$_ib_out")
+    if (( ! _ib_spare_init )); then
+      _ib_spare=()
+      for d in "${_ib_active[@]}"; do
+        [[ ",$IB_RECIPE," == *",$d,"* ]] || _ib_spare+=("$d")
+      done
+      _ib_spare_init=1
+    else
+      _ib_keep=()
+      for d in "${_ib_spare[@]}"; do
+        printf '%s\n' "${_ib_active[@]}" | grep -qx "$d" && _ib_keep+=("$d")
+      done
+      _ib_spare=("${_ib_keep[@]}")
+    fi
   done
+  _ib_added=()
+  if (( ${#_ib_live[@]} < ${#_ib_want[@]} && ${#_ib_spare[@]} )); then
+    mapfile -t _ib_spare < <(printf '%s\n' "${_ib_spare[@]}" | sort -V)
+    for d in "${_ib_spare[@]}"; do
+      (( ${#_ib_live[@]} < ${#_ib_want[@]} )) || break
+      _ib_live+=("$d"); _ib_added+=("$d")
+    done
+  fi
   IB_LIVE="$(IFS=,; echo "${_ib_live[*]}")"
   if [[ -z "$IB_LIVE" ]]; then
-    echo "ERROR: none of $IB_RECIPE is PORT_ACTIVE on all of: ${NODES[*]}" >&2
+    echo "ERROR: no rdma port is PORT_ACTIVE on all of: ${NODES[*]}" >&2
     exit 1
   fi
   _ib_note=""
-  (( ${#_ib_unchecked[@]} )) && _ib_note=" (unchecked: ${_ib_unchecked[*]})"
+  (( ${#_ib_added[@]} )) && _ib_note=" (off-recipe fallback: ${_ib_added[*]})"
+  (( ${#_ib_unchecked[@]} )) && _ib_note="$_ib_note (unchecked: ${_ib_unchecked[*]})"
   if [[ "$IB_LIVE" != "$IB_RECIPE" ]]; then
-    echo "[drive] RDMA devices narrowed to ports active on all nodes: $IB_RECIPE -> $IB_LIVE$_ib_note"
+    echo "[drive] RDMA devices changed to ports active on all nodes: $IB_RECIPE -> $IB_LIVE$_ib_note"
     # The list appears only as a whole flag/env value, after a space or "=".
     for f in prefill.sh decode.sh prefill_entry.sh decode_entry.sh; do
       sed -i -E "s/(^|[ =])$IB_RECIPE( |$)/\1$IB_LIVE\2/g" "$WORKDIR/$f"
