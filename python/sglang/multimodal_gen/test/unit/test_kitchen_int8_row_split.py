@@ -4,7 +4,9 @@
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.layers.quantization import kitchen_int8
+from sglang.multimodal_gen.runtime.layers.quantization import (
+    convrot_int8_comfy_kitchen as kitchen_int8,
+)
 
 
 @pytest.mark.parametrize(

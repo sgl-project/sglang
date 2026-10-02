@@ -7,9 +7,11 @@ import statistics
 
 import torch
 
-from sglang.multimodal_gen.runtime.layers.quantization import kitchen_int8
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization import (
+    convrot_int8_comfy_kitchen as kitchen_int8,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 
 
@@ -23,8 +25,10 @@ def main():
     if min(args.rows, args.input_features, args.output_features, args.repeats) <= 0:
         parser.error("All dimensions and repeats must be positive")
     torch.manual_seed(12)
-    method = kitchen_int8.KitchenInt8LinearMethod(
-        KitchenInt8Config(), group_size=256, is_checkpoint_serialized=True
+    method = kitchen_int8.ConvRotInt8ComfyKitchenLinearMethod(
+        ConvRotInt8Config(backend="comfy_kitchen"),
+        group_size=256,
+        is_checkpoint_serialized=True,
     )
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(
