@@ -22,6 +22,14 @@ pub(super) async fn select_workers(
     headers: &HeaderMap,
 ) -> Result<SelectedWorkers, ApiError> {
     let input_tokens = request.sequence_token_count as u64;
+    if request
+        .output_tokens
+        .is_some_and(|output| input_tokens.checked_add(output).is_none())
+    {
+        return Err(ApiError::BadRequest(
+            "input and output token counts overflow".into(),
+        ));
+    }
     let expected_peak_tokens = request.expected_peak_sequence_tokens;
 
     let ttft_ms = if resolver.ttft_slo != SloPreference::Disabled {

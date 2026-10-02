@@ -183,10 +183,9 @@ model, KV-event publisher, HTTP/2 support and DP size. An engine launched with
 
 ### Fleet-wide sampling contract
 
-`--override-sampling-params` fixes the sampling configuration for every
-chat-completions client of this router, independently of what the engine's own
-defaults happen to be (native [`/generate`](#native-generate) passes its
-`sampling_params` through, as the engine does):
+`--override-sampling-params` fixes the sampling configuration for every client
+of this router, independently of what the engine's own defaults happen to be
+(on native [`/generate`](#native-generate), in each prompt's `sampling_params`):
 
 ```bash
 sgl-router \
@@ -369,16 +368,16 @@ forwards it as `input_ids`. The engine skips tokenizing and routing sees its exa
 tokens. Multimodal requests keep `text`, since the engine expands placeholders
 from it, and `--disable-input-ids-forwarding` keeps it for every request. So does
 a model whose `tokenizer.json` normalizer transformers replaces on load (legacy
-SentencePiece Llama files, bge-m3), as the router cannot reproduce its tokens. A
-batch goes to one worker: load counts every prompt and each of its `n` samples,
-while bucket and context limits bound the longest prompt plus its own
-`max_new_tokens`.
+SentencePiece Llama files, bge-m3), or whose `tokenizer_config.json` the router
+cannot read, as the router cannot reproduce its tokens. A batch goes to one
+worker: load counts every prompt and each of its `n` samples, while bucket and
+context limits bound the longest prompt plus its own `max_new_tokens`.
 
-Otherwise the body passes through, plus PD bootstrap fields and a minted `rid`
-for a single prompt that has none. `--override-sampling-params` does not apply:
-`sampling_params` pass through. Under `--dp-aware` each worker's body also
-carries the chosen `routed_dp_rank`; a PD batch or `n > 1` request leaves the
-prefill rank to the engine, which gives item `i` the bootstrap room `room + i`.
+Otherwise the body passes through, plus PD bootstrap fields, a minted `rid` for
+a single prompt that has none, and `--override-sampling-params` defaults. Under
+`--dp-aware` each worker's body also carries the chosen `routed_dp_rank`; a PD
+batch or `n > 1` request leaves the prefill rank to the engine, which gives item
+`i` the bootstrap room `room + i`.
 
 ## DeepSeek V4
 

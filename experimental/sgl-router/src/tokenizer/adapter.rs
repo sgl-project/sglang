@@ -83,9 +83,11 @@ pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<(Vec<u32>, Vec
         return Ok(Default::default());
     }
     // Through `files`, which downloads it: a cold HF cache holds only tokenizer.json.
-    // A failed download leaves the special tokens unknown, so /generate keeps text.
+    // A missing or failed download leaves the special tokens unknown, so /generate keeps text.
     files.ensure_downloaded("tokenizer_config.json")?;
-    let config = files.json("tokenizer_config.json")?.unwrap_or_default();
+    let config = files
+        .json("tokenizer_config.json")?
+        .context("no tokenizer_config.json beside the tokenizer")?;
     let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     let class = config["tokenizer_class"].as_str().unwrap_or_default();
     anyhow::ensure!(
@@ -96,15 +98,17 @@ pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<(Vec<u32>, Vec
     let ids = |t: &dyn traits::Tokenizer, text: &str| -> Result<Vec<u32>> {
         Ok(t.encode(text)?.token_ids().to_vec())
     };
-    if BOS_FLAG_CLASSES.contains(&config["tokenizer_class"].as_str().unwrap_or_default()) {
+    if BOS_FLAG_CLASSES.contains(&class) {
         let bos = &config["bos_token"];
         let bos = bos.as_str().or(bos["content"].as_str());
-        let prefix = match bos.filter(|_| config["add_bos_token"].as_bool().unwrap_or(true)) {
-            Some(bos) => match ids(plain.as_ref(), bos)?.as_slice() {
+        let prefix = if config["add_bos_token"].as_bool().unwrap_or(true) {
+            let bos = bos.context("add_bos_token is set without a bos_token")?;
+            match ids(plain.as_ref(), bos)?.as_slice() {
                 [id] => vec![*id],
                 _ => anyhow::bail!("bos_token {bos:?} is not a single token"),
-            },
-            None => Vec::new(),
+            }
+        } else {
+            Vec::new()
         };
         return Ok((prefix, Vec::new()));
     }
@@ -116,6 +120,7 @@ pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<(Vec<u32>, Vec
         "a",
     )?;
     let bare = ids(plain.as_ref(), "a")?;
+    anyhow::ensure!(!bare.is_empty(), "the tokenizer drops the probe text");
     let start = full
         .windows(bare.len())
         .position(|window| window == bare)
@@ -502,7 +507,7 @@ mod prompt_affix_tests {
     use anyhow::Result;
     use serde_json::{json, Value};
 
-    /// `prompt_affixes` of the tiny tokenizer with `normalizer`, next to `config`.
+    /// `prompt_affixes` of the tiny tokenizer with `normalizer`, next to `config` unless null.
     fn affixes(
         normalizer: Value,
         post_processor: Value,
@@ -515,7 +520,9 @@ mod prompt_affix_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokenizer.json");
         std::fs::write(&path, data.to_string()).unwrap();
-        std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
+        if !config.is_null() {
+            std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
+        }
         let path = path.to_str().unwrap();
         prompt_affixes(path, &ModelFiles::open(path))
     }
@@ -538,6 +545,11 @@ mod prompt_affix_tests {
         ] {
             let affixes = affixes(Value::Null, post_processor, config).unwrap();
             assert_eq!(affixes, (prefix, vec![]));
+        }
+        // Without the config or its BOS, the engine's special tokens are unknown.
+        let unknown_bos = json!({"tokenizer_class": "LlamaTokenizerFast"});
+        for config in [Value::Null, unknown_bos] {
+            assert!(affixes(Value::Null, Value::Null, config).is_err());
         }
     }
 

@@ -111,6 +111,7 @@ impl PreparedRequest {
             Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
         let stream =
             Option::<bool>::deserialize(&value["stream"]).map_err(|_| invalid_request())?;
+        let mut rewrite = apply_sampling_overrides(ctx, &mut value)?;
         let text_ids = tokenize_text(ctx, &model, &value);
         // Routing sees `text` as the engine's ids, whether or not they are forwarded.
         let routed = text_ids.as_ref().map(|ids| json!({ "input_ids": ids }));
@@ -121,6 +122,9 @@ impl PreparedRequest {
             let fields = value.as_object_mut().expect("parsed as an object");
             fields.remove("text");
             fields.insert("input_ids".into(), input_ids);
+            rewrite = true;
+        }
+        if rewrite {
             body = serde_json::to_vec(&value)
                 .map_err(|error| ApiError::Internal(error.into()))?
                 .into();
@@ -223,13 +227,40 @@ fn tokenize_text(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Val
     }
     let encode = |text: &Value| ctx.tokenizers.encode_prompt(&model.0, text.as_str()?);
     match &value["text"] {
-        Value::Array(texts) => texts
+        // An empty batch stays text; as `input_ids: []` it would read as one empty prompt.
+        Value::Array(texts) if !texts.is_empty() => texts
             .iter()
             .map(encode)
             .collect::<Option<Vec<_>>>()
             .map(Value::from),
         text => encode(text).map(Value::from),
     }
+}
+
+/// Apply `--override-sampling-params` to each prompt's `sampling_params`, as chat
+/// does to its top-level fields; `true` when a default was added.
+fn apply_sampling_overrides(ctx: &AppContext, value: &mut Value) -> Result<bool, ApiError> {
+    let overrides = &ctx.config.model.sampling_overrides;
+    if overrides.params.is_empty() {
+        return Ok(false);
+    }
+    let params = &mut value["sampling_params"];
+    if params.is_null() {
+        *params = json!({});
+    }
+    let items: Vec<&mut Value> = match params {
+        Value::Array(items) => items.iter_mut().collect(),
+        params => vec![params],
+    };
+    let mut added = false;
+    for params in items {
+        let fields = RoutingFields::deserialize(&*params).map_err(|_| invalid_request())?;
+        for (field, default) in resolve_sampling_defaults(overrides, &fields, &ctx.metrics)? {
+            params[field.wire_name()] = default.into();
+            added = true;
+        }
+    }
+    Ok(added)
 }
 
 /// Whether `text` may reach the engine as `input_ids`: not when its processor expands
@@ -966,6 +997,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokenizer.json");
         std::fs::write(&path, tokenizer.to_string()).unwrap();
+        std::fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
         let mut ctx = AppContext::stub();
         ctx.config.model.tokenizer_path = Some(path.to_str().unwrap().into());
         ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
@@ -1038,6 +1070,8 @@ mod tests {
         let batch = prepare_generate(json!({"text": ["hi", "hi"]}));
         assert_eq!(body(&batch)["input_ids"], json!([ids, ids]));
         assert_eq!(batch.input_token_count, 2 * ids.len());
+        let empty = prepare_generate(json!({"text": []}));
+        assert_eq!(body(&empty), json!({"text": []}));
         // The processor expands multimodal placeholders from the text itself.
         let image = prepare_generate(json!({"text": "hi", "image_data": "a.png"}));
         assert_eq!(body(&image)["text"], "hi");
