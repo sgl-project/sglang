@@ -116,7 +116,7 @@ class MockReq:
     def finished(self):
         return self.finished_reason is not None
 
-    def _refresh_fill_ids(self):
+    def refresh_fill_ids(self):
         pass
 
     def owned_kv_len(self):
