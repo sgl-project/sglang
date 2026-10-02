@@ -480,7 +480,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
-        # Unified pool: capture-stable buffer for the kernel-facing KV write loc, filled
+        # Unified pool: capture-stable buffer for the physical KV write loc, filled
         # out-of-graph in init_forward_metadata_out_graph so the in-graph
         # set_mla_kv_buffer captures no translate.
         if self.kv_index_translator.is_translating:
@@ -1151,7 +1151,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q: torch.Tensor,
         q_rope: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Decode: scatter the KV row at ``loc`` (already kernel-facing) and
+        """Decode: scatter the KV row at ``loc`` (already physical) and
         build the [q_nope | q_rope] fmha query in one kernel launch (saves one
         launch per MLA layer and keeps the PDL chain intact).
 
@@ -1340,7 +1340,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                         layer, self._kv_write_loc(forward_batch), k, k_rope
                     )
             else:
-                # eager (or static pool): out_cache_loc is kernel-facing.
+                # eager (or static pool): out_cache_loc is physical.
                 if (
                     merge_query
                     and self._fused_set_kv_concat_q

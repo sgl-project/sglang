@@ -127,7 +127,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.available_size(),
         )
 
-        # HiCache indexes the full sub-pool's per-layer views with kernel-facing IDs.
+        # HiCache indexes the full sub-pool's per-layer views with physical IDs.
         kvcache.full_kv_pool.host_transfer_translate = (
             self.full_attn_allocator.translate_kv_loc
         )
@@ -273,15 +273,15 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Page-level physical->virtual table of the full sub-pool."""
         return self.full_attn_allocator.physical_to_virtual
 
-    def translate_write_loc_for_kernel(
+    def translate_write_loc(
         self,
         loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
-        """Widened virtual WRITE loc -> DENSE id; see the sub-allocator's copy."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(
+        """Widened virtual WRITE loc -> physical id; see the sub-allocator's copy."""
+        return self.full_attn_allocator.translate_write_loc(
             loc, out=out, out_width=out_width
         )
 
@@ -289,7 +289,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
         """Virtual TOKEN ids -> PHYSICAL token ids for the PD transfer engine.
-        PHYSICAL, not kernel-facing: the transfer registers page ENVELOPES (see
+        The transfer registers page ENVELOPES and addresses them by PHYSICAL id (see
         `UnifiedMLATokenToKVPool.get_contiguous_buf_infos`)."""
         # Defensive: `_validate_unified_memory_dcp` rejects this pairing at
         # argument validation, so reaching it means a config path got past that.

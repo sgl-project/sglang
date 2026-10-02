@@ -14,11 +14,11 @@
 """GPU parity of the per-layer-view `UnifiedMLATokenToKVPool` against the stock
 `MLATokenToKVPool` on real K3 MLA geometry (L=24, D=512+64).
 
-The unified pool receives kernel-facing locs (kernel_id(t) = (t//ps)*(ps*L) +
-t%ps) where the reference pool receives raw token ids; every (layer, token)
-cell must hold identical bytes afterwards. The TMA JIT fast path (n_loc >= 768)
-flattens the buffer via `.view(shape[0], -1)`, which is legal only because the
-per-layer views are contiguous.
+Both pools receive the same token ids: under the token-major views a token's
+physical id is its own id, so the unified pool needs no re-numbering. Every
+(layer, token) cell must hold identical bytes afterwards. The TMA JIT fast path
+(n_loc >= 768) flattens the buffer via `.view(shape[0], -1)`, which only needs
+each row to be contiguous, as it is in a per-layer view.
 """
 
 import types
@@ -43,7 +43,7 @@ _DTYPE = torch.bfloat16
 
 
 def _kernel_id(t: torch.Tensor, ps: int) -> torch.Tensor:
-    return t  # token-major views: the kernel id is the physical token id
+    return t  # token-major views: the physical id is the token id
 
 
 def _marked(loc: torch.Tensor):

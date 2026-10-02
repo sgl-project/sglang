@@ -493,7 +493,7 @@ class TestFusedFp8WriteGate(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "the fused translate is Triton")
-class TestFusedWriteLocTranslateCuda(CustomTestCase):
+class TestTranslateTokenIdsCuda(CustomTestCase):
     """The fused write-loc translate must agree with its own CPU branch.
 
     The two implementations must not drift: Triton truncates division toward
@@ -503,7 +503,7 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
     """
 
     def test_cuda_matches_the_cpu_branch(self):
-        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 
         for page_size in (1, 64):
             span = page_size * 4
@@ -526,8 +526,8 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
                     dcp_size=dcp_size,
                     dcp_rank=dcp_rank,
                 )
-                cpu = write_loc_to_kernel_ids(loc=loc, v2p=v2p, **kw)
-                gpu = write_loc_to_kernel_ids(loc=loc.cuda(), v2p=v2p.cuda(), **kw)
+                cpu = translate_token_ids(loc=loc, v2p=v2p, **kw)
+                gpu = translate_token_ids(loc=loc.cuda(), v2p=v2p.cuda(), **kw)
                 self.assertEqual(
                     cpu.tolist(),
                     gpu.cpu().tolist(),
@@ -542,32 +542,30 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
         captured write kernel consumes the full buffer, so an uncleared tail
         scatters pad rows into live KV pages.
         """
-        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 
         v2p = torch.tensor([2, 5, 1, 3, 4], dtype=torch.int64, device="cuda")
         loc = torch.tensor([0, 64, 128], dtype=torch.int64, device="cuda")
         width = 8
         # Poison the whole buffer so an unwritten or uncleared cell is visible.
         buf = torch.full((width,), -999, dtype=torch.int64, device="cuda")
-        write_loc_to_kernel_ids(
-            loc=loc, v2p=v2p, page_size=64, out=buf, out_width=width
-        )
+        translate_token_ids(loc=loc, v2p=v2p, page_size=64, out=buf, out_width=width)
         self.assertEqual(buf[:3].tolist(), [2 * 64, 5 * 64, 1 * 64])
         self.assertEqual(buf[3:].tolist(), [0] * (width - 3))
 
         # And it must agree with the narrow call on the live prefix.
-        narrow = write_loc_to_kernel_ids(loc=loc, v2p=v2p, page_size=64)
+        narrow = translate_token_ids(loc=loc, v2p=v2p, page_size=64)
         self.assertEqual(narrow.tolist(), buf[:3].tolist())
 
     def test_out_is_written_in_place(self):
         # The captured decode path hands in a capture-stable buffer; rebinding
         # instead of filling it would leave the graph on a stale pointer.
-        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 
         v2p = torch.tensor([2, 5, -1, 3], dtype=torch.int64, device="cuda")
         loc = torch.tensor([0, 64, 128, 192], dtype=torch.int64, device="cuda")
         dst = torch.full_like(loc, -7)
-        ret = write_loc_to_kernel_ids(loc=loc, v2p=v2p, page_size=64, out=dst)
+        ret = translate_token_ids(loc=loc, v2p=v2p, page_size=64, out=dst)
         self.assertIs(ret, dst)
         self.assertEqual(dst.tolist(), [2 * 64, 5 * 64, 0, 3 * 64])
 

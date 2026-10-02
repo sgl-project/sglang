@@ -545,7 +545,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     assert cfg.speculative_algorithm in (None, "DSPARK"), (
         "--enable-unified-memory only supports --speculative-algorithm "
         "DSPARK (chain draft); other speculative algorithms are not yet "
-        "audited for the unified pool's virtual/kernel-facing loc translation. Got "
+        "audited for the unified pool's virtual-to-physical loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
     if cfg.speculative_algorithm == "DSPARK":
@@ -565,7 +565,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             f"attention backends {sorted(spec_allowed)} for both prefill "
             f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
             "not translate speculative verify indices to the unified "
-            "pool's kernel-facing space yet."
+            "pool's physical ids yet."
         )
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "

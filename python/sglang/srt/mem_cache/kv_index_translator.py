@@ -42,7 +42,7 @@ uses its rows as-is, and one that wants flat per-token ids rebuilds them as
 
     token_id = entry * entry_page_size + pos % entry_page_size
 
-WRITES, IN TWO PHASES. The full-side write loc is rebound to kernel-facing
+WRITES, IN TWO PHASES. The full-side write loc is rebound to physical
 ids at ForwardBatch construction - the earliest consumer can snapshot it
 right after. The sliding-window write loc is derived at the same moment as
 read table, into the same index table.
@@ -92,7 +92,7 @@ class KVIndexTable(msgspec.Struct, frozen=True):
     row_ids: torch.Tensor  # which row belongs to batch lane b
     row_stride: int  # stride between rows of `ids`, in elements
     entry_page_size: int  # what one entry covers: 1 = a token, N = a page of N
-    is_translated: bool  # entries are already kernel-facing ids
+    is_translated: bool  # entries are already physical ids
     sliding_window_ids: Optional[torch.Tensor]  # SWA models: the parallel swa array
 
 
@@ -129,7 +129,7 @@ class KVIndexTranslator:
             # are collapsed by the DCP index kernels, `out_cache_loc` still
             # carries the owner rule in `loc % dcp_size`. Identity with the read
             # translate when dcp_size == 1.
-            self._translate_write_full = alloc.translate_write_loc_for_kernel
+            self._translate_write_full = alloc.translate_write_loc
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
             self.defer_read_translate = get_parallel().attn_dcp_size > 1
@@ -179,7 +179,7 @@ class KVIndexTranslator:
 
     @property
     def reads_are_translated(self) -> bool:
-        """Whether a read this translator fills comes out kernel-facing. False
+        """Whether a read this translator fills comes out physical. False
         on a non-unified pool, and under DCP, where the ids stay VIRTUAL for
         ``translate_dcp_read_ids`` to finish."""
         return self.is_translating and not self.defer_read_translate
@@ -506,7 +506,7 @@ class KVIndexTranslator:
         return self.is_translating or get_parallel().attn_dcp_size > 1
 
     def translate_dcp_read_ids(self, widened_ids: torch.Tensor) -> torch.Tensor:
-        """Widened logical READ ids -> kernel-facing ids, for either pool.
+        """Widened logical READ ids -> physical ids, for either pool.
 
         The one hook every DCP read-index production site calls; on a static
         pool `widened // dcp_size` IS the whole virtual->physical translation.
@@ -519,7 +519,7 @@ class KVIndexTranslator:
     def translate_full_attn_ids(
         self, kv_indices: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Virtual token ids -> kernel-facing full-attention ids (the identity
+        """Virtual token ids -> physical full-attention ids (the identity
         when no translation is needed, so callers never branch)."""
         if not self.is_translating:
             assert out is None, "passthrough translate takes no out="

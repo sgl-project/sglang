@@ -1747,8 +1747,8 @@ class KVWriteLoc:
 
     All location info lives here (in the attention metadata), NOT in the pool:
     - ``loc``: the generic per-token write location (``out_cache_loc``).
-      KERNEL-FACING on every pool: physical by allocation on non-unified
-      pools, rebound at ForwardBatch construction (``rebind_write_loc``) on
+      PHYSICAL on every pool: by allocation on non-unified pools,
+      rebound at ForwardBatch construction (``rebind_write_loc``) on
       the unified pool.
     - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
       otherwise); under the unified pool the translator derives it from the
@@ -4349,7 +4349,7 @@ class HybridLinearKVPool(KVCache):
         dst_dtype: Optional[torch.dtype] = None,
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
-        # Read door -- same kernel-facing contract as the write door: `loc` is
+        # Read door -- same physical-id contract as the write door: `loc` is
         # a read-index tensor already translated at its production site
         # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices); the
         # pool never translates.

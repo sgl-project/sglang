@@ -11,13 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""``write_loc_to_kernel_ids`` must walk `loc` and `out` by their own strides.
+"""``translate_token_ids`` must walk `loc` and `out` by their own strides.
 The SWA read path hands it a column slice of a capture-stable page table, whose
 row stride is the whole buffer width; flat addressing reads the wrong ids there
 without any error. Only this test enters the Triton kernel -- the CPU reference
 never does.
 
-    python -m pytest test/registered/kernels/ops/memory/test_write_loc_to_kernel_ids_strided.py -v
+    python -m pytest test/registered/kernels/ops/memory/test_translate_token_ids_strided.py -v
 """
 
 import itertools
@@ -25,14 +25,14 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-class TestWriteLocToKernelIdsStrided(unittest.TestCase):
+class TestTranslateTokenIdsStrided(unittest.TestCase):
     ROWS, COLS, PAD = 6, 13, 11
 
     def _v2p(self, num_pages):
@@ -64,7 +64,7 @@ class TestWriteLocToKernelIdsStrided(unittest.TestCase):
         return locs.reshape(self.ROWS, self.COLS).to(dtype), num_pages
 
     def _run(self, loc, v2p, page_size, out=None):
-        return write_loc_to_kernel_ids(loc=loc, v2p=v2p, page_size=page_size, out=out)
+        return translate_token_ids(loc=loc, v2p=v2p, page_size=page_size, out=out)
 
     def test_a_column_slice_reads_the_same_ids_as_its_contiguous_copy(self):
         for page_size, dtype in itertools.product((1, 64), (torch.int64, torch.int32)):

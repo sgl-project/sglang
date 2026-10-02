@@ -339,7 +339,7 @@ class TestBuildInto(unittest.TestCase):
 
 
 class TestPoolOwnership(unittest.TestCase):
-    """A runner only gets the kernel-facing id space when the pool IT reads and
+    """A runner only gets the physical id space when the pool IT reads and
     writes is the one the allocator's ids address.
 
     Guarded shape: a runner handed a SHARED allocator while owning a SEPARATE
@@ -612,7 +612,7 @@ class TestWriteLoc(CustomTestCase):
             keep = virt.clone()
             fb = _FakeForwardBatch(out_cache_loc=virt)
             src.rebind_write_loc(fb)
-            # Full side: rebound to a FRESH kernel-facing tensor; the
+            # Full side: rebound to a FRESH physical tensor; the
             # ScheduleBatch's aliased virtual tensor is untouched.
             self.assertIsNot(fb.out_cache_loc, virt)
             self.assertTrue(torch.equal(fb.out_cache_loc, want_full))
@@ -747,7 +747,7 @@ class TestWriteLoc(CustomTestCase):
             self.assertTrue(torch.equal(got, want_swa))
 
     def test_pad_lanes_derive_to_sink(self):
-        """The DP pad appends zeros, and kernel-facing 0 is the reserved
+        """The DP pad appends zeros, and physical 0 is the reserved
         padding slot in every id space, so pad lanes derive to swa slot 0 with
         no `num_live` bookkeeping."""
         src, _, rows, seq_lens, _, want_full, want_swa = self._built(n=3)

@@ -14,7 +14,7 @@
 """`--enable-unified-memory` and PREFILL cuda-graph capture.
 
 Capture is wired: the captured batch reads `out_cache_loc` out of the registry
-slot, refilled before each replay from the already-rebound kernel-facing loc,
+slot, refilled before each replay from the already-rebound physical loc,
 and the read tables are refilled out-of-graph from the live v2p. So BREAKABLE
 (the CUDA default) and TC_PIECEWISE must be left alone -- an earlier gate
 disabled every prefill backend outright, which cost every unified run its
