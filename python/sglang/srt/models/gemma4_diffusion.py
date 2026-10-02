@@ -29,6 +29,7 @@ from sglang.kernels.ops.layernorm.rmsnorm_fanout import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -252,10 +253,21 @@ class DiffusionGemmaSelfConditioning(nn.Module):
             prefix=add_prefix("down_proj", prefix),
         )
         self.act_fn = GeluAndMul()
+        self.dual_gemm = DualGemm(
+            self.gate_up_proj,
+            self.down_proj,
+            config.hidden_size,
+            activation="gelu_tanh",
+        )
 
     def forward(self, inputs_embeds, signal):
-        gate_up, _ = self.gate_up_proj(self.pre_norm(signal))
-        h, _ = self.down_proj(self.act_fn(gate_up))
+        signal = self.pre_norm(signal, quant_linear=self.gate_up_proj)
+        if self.dual_gemm.can_run(signal, self.gate_up_proj):
+            h = self.dual_gemm(signal, self.gate_up_proj)
+        else:
+            gate_up, _ = self.gate_up_proj(signal)
+            h = self.act_fn(gate_up)
+        h, _ = self.down_proj(h)
         return self.post_norm(inputs_embeds + h)
 
 
@@ -333,7 +345,9 @@ class DiffusionGemmaDecoderLayer(nn.Module):
 
     def forward(self, positions, hidden_states, forward_batch):
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(
+            hidden_states, quant_linear=self.self_attn.qkv_proj
+        )
         hidden_states = self.self_attn(positions, hidden_states, forward_batch)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states

@@ -1,10 +1,10 @@
-"""Blackwell dual GEMM and SwiGLU fusion.
+"""Blackwell dual GEMM and gated-activation fusion.
 
 The operator computes::
 
     gate = gemm(x, gate_weight)
     up = gemm(x, up_weight)
-    activation = silu(gate) * up
+    activation = activation_fn(gate) * up
 
 BF16 and FP16 inputs return ``activation`` in the input dtype. FP8 inputs add
 static or dynamic, per-tensor or per-token quantization and return
@@ -69,6 +69,12 @@ class DualGemmQuantMode(IntEnum):
     @property
     def is_per_token(self) -> bool:
         return self in (self.STATIC_PER_TOKEN, self.DYNAMIC_PER_TOKEN)
+
+
+class DualGemmActivationType(IntEnum):
+    SILU = 0
+    GELU = 1
+    GELU_TANH = 2
 
 
 # (CTA features, MMA token columns, K tile, pipeline stages, use two-CTA MMA).
@@ -312,6 +318,7 @@ class BlackwellDualGemmKernel:
         element_type,
         quantize_output: bool,
         quant_mode: DualGemmQuantMode,
+        activation_type: DualGemmActivationType,
         cta_features: int,
         cta_tokens: int,
         cta_reduction: int,
@@ -322,6 +329,7 @@ class BlackwellDualGemmKernel:
         self.intermediate_size = intermediate_size
         self.quantize_output = quantize_output
         self.quant_mode = quant_mode
+        self.gated_activation = activation_type
         self.dynamic_quant = quantize_output and quant_mode.is_dynamic
         self.per_token_quant = quantize_output and quant_mode.is_per_token
         self.cta_m = cta_features
@@ -630,19 +638,37 @@ class BlackwellDualGemmKernel:
         cute.arch.mbarrier_arrive(tmem_ready)
 
     @cute.experimental.jit
-    def silu_and_mul(
+    def activate_and_mul(
         self,
         gate: cutlass.Float32,
         up: cutlass.Float32,
     ):
-        """Apply the SwiGLU activation and round to the activation dtype."""
-        return (
-            gate
-            * cute.arch.rcp_approx(
+        """Apply the selected gated activation and round to its output dtype."""
+        if cutlass.const_expr(self.gated_activation == DualGemmActivationType.SILU):
+            activated = gate * cute.arch.rcp_approx(
                 cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True)
             )
-            * up
-        ).to(self.activation_type)
+        elif cutlass.const_expr(self.gated_activation == DualGemmActivationType.GELU):
+            activated = (
+                cutlass.Float32(0.5)
+                * gate
+                * (
+                    cutlass.Float32(1.0)
+                    + cute.math.erf(
+                        gate * cutlass.Float32(0.7071067811865476), fastmath=True
+                    )
+                )
+            )
+        else:
+            gelu_inner = cutlass.Float32(0.7978845608028654) * (
+                gate + cutlass.Float32(0.044715) * gate * gate * gate
+            )
+            activated = (
+                cutlass.Float32(0.5)
+                * gate
+                * (cutlass.Float32(1.0) + cute.math.tanh(gelu_inner, fastmath=True))
+            )
+        return (activated * up).to(self.activation_type)
 
     @cute.experimental.jit
     def activation_epilogue(
@@ -662,7 +688,7 @@ class BlackwellDualGemmKernel:
         completion_counter: cute.Tensor,
         shared_scale: cute.Tensor,
     ):
-        """All warps: apply SwiGLU, then store or quantize the result."""
+        """All warps: apply the gated activation, then store or quantize it."""
         cute.arch.sync_threads()
 
         if cutlass.const_expr(not self.dynamic_quant and self.num_tokens <= 8):
@@ -698,7 +724,7 @@ class BlackwellDualGemmKernel:
                         cutlass.Float32
                     )
                     static_up = static_up.to(self.activation_type).to(cutlass.Float32)
-                    static_activation = self.silu_and_mul(static_gate, static_up)
+                    static_activation = self.activate_and_mul(static_gate, static_up)
 
                     if cutlass.const_expr(not self.quantize_output):
                         output[static_feature, static_token, 0] = static_activation
@@ -771,10 +797,10 @@ class BlackwellDualGemmKernel:
                         up_value *= input_scale * up_scale
 
                     # Match the unfused operator chain: projection outputs
-                    # round before SwiGLU consumes them.
+                    # round before the gated activation consumes them.
                     gate_value = gate_value.to(self.activation_type).to(cutlass.Float32)
                     up_value = up_value.to(self.activation_type).to(cutlass.Float32)
-                    activation = self.silu_and_mul(gate_value, up_value)
+                    activation = self.activate_and_mul(gate_value, up_value)
                     activations[token_round, feature_group] = activation
 
                     if cutlass.const_expr(self.dynamic_quant):
@@ -1314,6 +1340,7 @@ def _dual_gemm_swiglu_fp8_run(
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
     quant_mode: int = int(DualGemmQuantMode.DYNAMIC_PER_TOKEN),
+    activation_type: int = int(DualGemmActivationType.SILU),
     tactic: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not is_sm100_supported():
@@ -1323,6 +1350,7 @@ def _dual_gemm_swiglu_fp8_run(
         x, gate_up_weight, x_scale, gate_up_weight_scale, output_scale
     )
     quant_mode = DualGemmQuantMode(quant_mode)
+    activation_type = DualGemmActivationType(activation_type)
     if not quant_mode.is_quantized:
         raise ValueError("UNQUANT is not valid for the FP8 dual GEMM")
     dynamic_quant = quant_mode.is_dynamic
@@ -1419,6 +1447,7 @@ def _dual_gemm_swiglu_fp8_run(
         intermediate_size,
         num_tokens,
         per_token_quant,
+        activation_type,
         tactic,
         tuple(x_scale.shape),
         tuple(gate_up_weight_scale.shape),
@@ -1446,6 +1475,7 @@ def _dual_gemm_swiglu_fp8_run(
             element_type=cutlass.Float8E4M3FN,
             quantize_output=True,
             quant_mode=quant_mode,
+            activation_type=activation_type,
             cta_features=cta_features,
             cta_tokens=cta_tokens,
             cta_reduction=cta_reduction,
@@ -1463,6 +1493,7 @@ def _dual_gemm_swiglu_fp8_run(
 def _dual_gemm_swiglu_run(
     x: torch.Tensor,
     gate_up_weight: torch.Tensor,
+    activation_type: int = int(DualGemmActivationType.SILU),
     tactic: int = -1,
 ) -> torch.Tensor:
     if not is_sm100_supported():
@@ -1471,6 +1502,7 @@ def _dual_gemm_swiglu_run(
     num_tokens, hidden_size, intermediate_size = _validate_float16_inputs(
         x, gate_up_weight
     )
+    activation_type = DualGemmActivationType(activation_type)
     multiprocessor_count = torch.cuda.get_device_properties(
         x.device
     ).multi_processor_count
@@ -1510,6 +1542,7 @@ def _dual_gemm_swiglu_run(
         hidden_size,
         intermediate_size,
         num_tokens,
+        activation_type,
         tactic,
     )
     output_cute = _cute_tensor_dynamic(output_3d)
@@ -1535,6 +1568,7 @@ def _dual_gemm_swiglu_run(
             element_type=element_type,
             quantize_output=False,
             quant_mode=DualGemmQuantMode.UNQUANT,
+            activation_type=activation_type,
             cta_features=cta_features,
             cta_tokens=cta_tokens,
             cta_reduction=cta_reduction,
@@ -1551,6 +1585,7 @@ def _dual_gemm_swiglu_run(
 def _dual_gemm_swiglu_fake(
     x: torch.Tensor,
     gate_up_weight: torch.Tensor,
+    activation_type: int = int(DualGemmActivationType.SILU),
     tactic: int = -1,
 ) -> torch.Tensor:
     return torch.empty(
@@ -1567,6 +1602,7 @@ def _dual_gemm_swiglu_fp8_fake(
     gate_up_weight_scale,
     output_scale=None,
     quant_mode=int(DualGemmQuantMode.DYNAMIC_PER_TOKEN),
+    activation_type=int(DualGemmActivationType.SILU),
     tactic=-1,
 ):
     intermediate_size = gate_up_weight.shape[0] // 2
@@ -1650,18 +1686,22 @@ def can_use_dual_gemm(
 def dual_gemm_swiglu(
     x: torch.Tensor,
     gate_up_weight: torch.Tensor,
+    activation_type: DualGemmActivationType = DualGemmActivationType.SILU,
 ) -> torch.Tensor:
-    """Run BF16/FP16 gate/up projections followed by SwiGLU."""
-    return _dual_gemm_swiglu_with_tactic(x, gate_up_weight, -1)
+    """Run BF16/FP16 gate/up projections followed by a gated activation."""
+    return _dual_gemm_swiglu_with_tactic(x, gate_up_weight, activation_type, -1)
 
 
 def _dual_gemm_swiglu_with_tactic(
     x: torch.Tensor,
     gate_up_weight: torch.Tensor,
+    activation_type: DualGemmActivationType,
     tactic: int,
 ) -> torch.Tensor:
     """Testing/tuning entry point; production callers use the auto picker."""
-    return torch.ops.sglang.cutedsl_dual_gemm_swiglu(x, gate_up_weight, tactic)
+    return torch.ops.sglang.cutedsl_dual_gemm_swiglu(
+        x, gate_up_weight, int(activation_type), tactic
+    )
 
 
 @debug_kernel_api
@@ -1672,8 +1712,9 @@ def dual_gemm_swiglu_fp8(
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
     quant_mode: DualGemmQuantMode = DualGemmQuantMode.DYNAMIC_PER_TOKEN,
+    activation_type: DualGemmActivationType = DualGemmActivationType.SILU,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run FP8 gate/up projections, SwiGLU, and static or dynamic FP8 quant.
+    """Run FP8 gate/up projections, gated activation, and FP8 quantization.
 
     ``quant_mode`` independently selects static versus dynamic and per-tensor
     versus per-token scaling. Static modes require ``output_scale``; dynamic
@@ -1688,6 +1729,7 @@ def dual_gemm_swiglu_fp8(
         gate_up_weight_scale,
         output_scale,
         quant_mode,
+        activation_type,
         -1,
     )
 
@@ -1699,6 +1741,7 @@ def _dual_gemm_swiglu_fp8_with_tactic(
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor],
     quant_mode: DualGemmQuantMode,
+    activation_type: DualGemmActivationType,
     tactic: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Testing/tuning entry point; production callers use the auto picker."""
@@ -1709,5 +1752,6 @@ def _dual_gemm_swiglu_fp8_with_tactic(
         gate_up_weight_scale,
         output_scale,
         int(quant_mode),
+        int(activation_type),
         tactic,
     )

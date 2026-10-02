@@ -1,5 +1,7 @@
 """Reusable model-layer integration for the small-batch dual GEMM kernel."""
 
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -8,7 +10,10 @@ from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
-    from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
+    from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
+        DualGemmActivationType,
+        DualGemmQuantMode,
+    )
     from sglang.srt.layers.linear import (
         MergedColumnParallelLinear,
         RowParallelLinear,
@@ -20,13 +25,16 @@ class DualGemm:
 
     def __init__(
         self,
-        gate_up_proj: "MergedColumnParallelLinear",
-        down_proj: "RowParallelLinear",
+        gate_up_proj: MergedColumnParallelLinear,
+        down_proj: RowParallelLinear,
         hidden_size: int,
+        activation: str,
     ) -> None:
         self.down_proj = down_proj
         self.tp_size = get_parallel().tp_size
         self.max_tokens = 0
+        self.activation_type: Optional[DualGemmActivationType] = None
+        self.activation = activation
         self.mode = self._select_mode(gate_up_proj, hidden_size)
 
     def _select_mode(
@@ -39,10 +47,18 @@ class DualGemm:
 
         from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
             MAX_DUAL_GEMM_DECODE_TOKENS,
+            DualGemmActivationType,
             DualGemmQuantMode,
             can_use_dual_gemm,
         )
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        try:
+            self.activation_type = DualGemmActivationType[self.activation.upper()]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported dual GEMM activation: {self.activation}"
+            ) from exc
 
         gate_up_method = gate_up_proj.quant_method
         if isinstance(gate_up_method, UnquantizedLinearMethod):
@@ -112,7 +128,9 @@ class DualGemm:
         if not self.mode.is_quantized:
             from sglang.kernels.ops.gemm import dual_gemm_swiglu
 
-            return dual_gemm_swiglu(x, gate_up_proj.weight)
+            return dual_gemm_swiglu(
+                x, gate_up_proj.weight, activation_type=self.activation_type
+            )
 
         from sglang.kernels.ops.gemm import dual_gemm_swiglu_fp8
 
@@ -136,6 +154,7 @@ class DualGemm:
             gate_up_proj.weight_scale,
             self.down_proj.input_scale,
             quant_mode=self.mode,
+            activation_type=self.activation_type,
         )
         # The down projection consumes this tuple without quantizing again. The
         # original dtype controls its output type.
