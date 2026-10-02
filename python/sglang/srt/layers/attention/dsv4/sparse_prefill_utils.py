@@ -134,8 +134,7 @@ def combine_topk_swa_indices(
     query_start_loc can include a cross-chunk offset; query_pos is absolute.
     compressed_base and swa_base address the flat workspace. SWA-only layers use
     topk == 0, but compress_ratio must still be positive.
-    When supplied, swa_indices/swa_lengths replace the positional SWA window;
-    indices are relative to swa_base and retain RequestWindow's replay floor.
+    Optional SWA indices are relative to swa_base and preserve replay floors.
 
     Returns int32 indices [num_tokens, padded_topk_swa] and per-token scanned-prefix
     lengths, including -1 entries skipped by attention. Width is padded to 128.
@@ -329,7 +328,6 @@ class SparsePrefillChunkCache:
     # Compressed caches keyed by compress ratio: c128 (every block, combined once
     # per chunk) and the top-k ratios (combined per layer).
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
-    # RequestWindow indices address a shared history+chunk workspace directly.
     swa_indices: Optional[torch.Tensor] = None
     swa_lengths: Optional[torch.Tensor] = None
 
@@ -372,15 +370,12 @@ class SparsePrefillChunkCache:
             )
             swa_indices = swa_lengths = None
         else:
-            # Keep workspace row numbering, including masked history slots.
-            # No req_to_token/full_to_swa translation applies to this storage.
             swa_token_ids = torch.arange(
                 request_window_layout.size, dtype=torch.int32, device=device
             )
             swa_first_pos = torch.zeros_like(seq_lens)
             swa_gather_lens = torch.zeros_like(seq_lens)
-            # Every request addresses the same workspace, so each SWA base is 0
-            # (or n_compressed after rebasing), not a per-request gather offset.
+            # RequestWindow indices already address the shared workspace.
             swa_offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
             swa_indices = request_window_layout.indices
             swa_lengths = request_window_layout.lengths

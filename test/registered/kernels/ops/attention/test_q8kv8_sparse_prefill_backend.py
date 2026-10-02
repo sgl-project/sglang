@@ -783,7 +783,6 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         backend.forward_metadata.late_layer_tail = SimpleNamespace(
             extend_seq_lens=lengths, extend_seq_lens_cpu=lens
         )
-        # The current query rows are the tail, not the original longer extend.
         batch.extend_seq_lens = lengths + 100
         batch.extend_seq_lens_cpu = [n + 100 for n in lens]
     group = torch.repeat_interleave(torch.arange(2, device=device), lengths.long())
@@ -824,7 +823,6 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         combined, combined_lens = cache.c0_combined_indices, cache.c0_combined_lens
         n_compressed = 0
         extra_lens = torch.zeros_like(extra_lens)
-    # Check exact metadata, including floor masks and cross-request offsets.
     for i in [0, lens[0] - 1, lens[0], pos.numel() - 1]:
         c = int(extra_lens[i])
         w = int(layout.lengths[i])
@@ -834,7 +832,6 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         torch.testing.assert_close(
             combined[i, c : c + w], layout.indices[i, :w] + n_compressed
         )
-    # No optimized scheduler metadata: compare against the original paged path.
     kwargs = {}
     if ratio:
         kwargs.update(

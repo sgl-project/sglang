@@ -2384,8 +2384,7 @@ class DeepseekV4AttnBackend(
     ) -> SparsePrefillChunkCache:
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
-        # Paged gathering cannot read the unwritten history before a decoder
-        # tail. RequestWindow carries explicit indices respecting that floor.
+        # Decoder tails require explicit SWA indices to exclude unwritten history.
         tail = self.forward_metadata.late_layer_tail
         request_layout = core_attn_metadata.request_window_layout
         assert tail is None or request_layout is not None
@@ -3397,8 +3396,7 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
-            # Paged decoder tails stay dense; RequestWindow's explicit indices
-            # preserve their window floor. Its sparse gather does not yet cover CP.
+            # RequestWindow sparse gathering does not support CP yet.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not get_platform().is_sm120
