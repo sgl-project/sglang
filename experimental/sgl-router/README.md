@@ -362,22 +362,20 @@ model, so requests go to the one this router serves. Worker selection
 (`--chat-routing`, `--policy`), PD dispatch, and abort-on-disconnect are shared
 with chat completions.
 
-There is no chat template to render, so whenever a tokenizer is loaded the
-router tokenizes under any policy: it reads caller `input_ids` as sent, or
-tokenizes a single `text` prompt. A batch (`text` list or nested `input_ids`)
-routes on load, and the whole batch goes to one worker. Load counts every
-prompt in it, while bucket limits apply to its longest one. `text` is tokenized
-without special tokens, while the engine adds them, so for a tokenizer that
-prepends BOS only `input_ids` requests match cached prefixes.
+With a tokenizer loaded, the router tokenizes `text` (a string or a list) with
+the special tokens SGLang adds (BOS per `add_bos_token` for Llama-, Gemma- and
+Cohere-class tokenizers, otherwise the `tokenizer.json` post-processor's), and
+forwards it as `input_ids`. The engine skips tokenizing and routing sees its exact
+tokens. Multimodal requests keep `text`, since the engine expands placeholders
+from it, and `--disable-input-ids-forwarding` keeps it for every request. A batch
+goes to one worker: load counts every prompt, while bucket and context limits
+bound the longest prompt plus its own `max_new_tokens`.
 
-The body is forwarded as sent, plus PD bootstrap fields and, for a single prompt
-whose caller sent none, a minted `rid`. The router does not forward its own
-`input_ids` here, and `--override-sampling-params` does not apply: `/generate`
-nests sampling parameters under `sampling_params`, which pass through untouched.
-Under `--dp-aware`, the chosen rank is also written as `routed_dp_rank` into each
-worker's body, since the native endpoint ignores `X-Data-Parallel-Rank`. A PD
-batch or `n > 1` request leaves the prefill rank to the engine, which gives item
-`i` the bootstrap room `room + i`.
+Otherwise the body passes through, plus PD bootstrap fields and a minted `rid`
+for a single prompt that has none. `--override-sampling-params` does not apply:
+`sampling_params` pass through. Under `--dp-aware` each worker's body also
+carries the chosen `routed_dp_rank`; a PD batch or `n > 1` request leaves the
+prefill rank to the engine, which gives item `i` the bootstrap room `room + i`.
 
 ## DeepSeek V4
 

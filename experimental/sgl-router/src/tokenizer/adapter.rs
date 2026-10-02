@@ -3,8 +3,9 @@
 
 use anyhow::{Context, Result};
 use dynamo_tokenizers::{
-    create_tokenizer_from_file, traits, traits::DecodeResult, CacheTokenUsage, CachedTokenizer,
-    FastTokenizer, Tokenizer,
+    create_tokenizer_from_file, create_tokenizer_from_file_with_options, traits,
+    traits::DecodeResult, CacheTokenUsage, CachedTokenizer, FastTokenizer, Tokenizer,
+    TokenizerOptions,
 };
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -25,14 +26,75 @@ pub fn load_with(
     source: &str,
     cfg: TokenizerConfig,
 ) -> Result<(Arc<Tokenizer>, Arc<TokenizerStats>)> {
+    let path = resolve(source)?;
+    build(&path, cfg).with_context(|| format!("load tokenizer for {source}"))
+}
+
+/// Local tokenizer file for a path or an HF repo id.
+fn resolve(source: &str) -> Result<String> {
     if Path::new(source).is_file() || looks_like_path(source) {
-        return build(source, cfg).with_context(|| format!("load tokenizer from {source}"));
+        return Ok(source.to_owned());
     }
-    let downloaded = download_tokenizer(source)?;
-    let path = downloaded
-        .to_str()
-        .context("downloaded tokenizer path is not valid UTF-8")?;
-    build(path, cfg).with_context(|| format!("load downloaded tokenizer for {source}"))
+    download_tokenizer(source)?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("downloaded tokenizer path is not valid UTF-8"))
+}
+
+/// Tokenizer classes whose BOS SGLang restores from `add_bos_token`
+/// (`_fix_v5_add_bos_eos_token`), rebuilding their post-processor without EOS.
+const BOS_FLAG_CLASSES: [&str; 7] = [
+    "LlamaTokenizer",
+    "LlamaTokenizerFast",
+    "CodeLlamaTokenizer",
+    "CodeLlamaTokenizerFast",
+    "GemmaTokenizer",
+    "GemmaTokenizerFast",
+    "CohereTokenizerFast",
+];
+
+/// Token ids SGLang's `tokenizer(text)` puts around a prompt and [`encode`]
+/// leaves out: BOS per `add_bos_token` (default true) for [`BOS_FLAG_CLASSES`],
+/// else the tokenizer.json post-processor's. Tiktoken models add none.
+pub fn prompt_affixes(source: &str) -> Result<(Vec<u32>, Vec<u32>)> {
+    let path = resolve(source)?;
+    if !path.ends_with(".json") {
+        return Ok(Default::default());
+    }
+    let config: serde_json::Value = Path::new(&path)
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("tokenizer_config.json")).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let plain = create_tokenizer_from_file(&path)?;
+    let ids = |t: &dyn traits::Tokenizer, text: &str| -> Result<Vec<u32>> {
+        Ok(t.encode(text)?.token_ids().to_vec())
+    };
+    if BOS_FLAG_CLASSES.contains(&config["tokenizer_class"].as_str().unwrap_or_default()) {
+        let bos = &config["bos_token"];
+        let bos = bos.as_str().or(bos["content"].as_str());
+        let prefix = match bos.filter(|_| config["add_bos_token"].as_bool().unwrap_or(true)) {
+            Some(bos) => match ids(plain.as_ref(), bos)?.as_slice() {
+                [id] => vec![*id],
+                _ => anyhow::bail!("bos_token {bos:?} is not a single token"),
+            },
+            None => Vec::new(),
+        };
+        return Ok((prefix, Vec::new()));
+    }
+    let options = TokenizerOptions {
+        add_special_tokens: true,
+    };
+    let full = ids(
+        create_tokenizer_from_file_with_options(&path, options)?.as_ref(),
+        "a",
+    )?;
+    let bare = ids(plain.as_ref(), "a")?;
+    let start = full
+        .windows(bare.len())
+        .position(|window| window == bare)
+        .context("the post-processor rewrites the prompt")?;
+    Ok((full[..start].to_vec(), full[start + bare.len()..].to_vec()))
 }
 
 fn build(path: &str, cfg: TokenizerConfig) -> Result<(Arc<Tokenizer>, Arc<TokenizerStats>)> {
@@ -391,6 +453,46 @@ mod model_files_tests {
         let files = ModelFiles::open(tokenizer.to_str().unwrap());
         let error = files.json("config.json").unwrap_err();
         assert!(error.to_string().contains("config.json"));
+    }
+}
+
+#[cfg(test)]
+mod prompt_affix_tests {
+    use super::prompt_affixes;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn matches_the_engines_special_tokens() {
+        let template = json!({"type": "TemplateProcessing", "pair": [], "single": [
+            {"SpecialToken": {"id": "<|endoftext|>", "type_id": 0}},
+            {"Sequence": {"id": "A", "type_id": 0}}],
+            "special_tokens": {"<|endoftext|>": {"id": "<|endoftext|>", "ids": [256], "tokens": ["<|endoftext|>"]}}});
+        let llama = json!({"tokenizer_class": "LlamaTokenizerFast", "bos_token": "<|endoftext|>"});
+        let mut no_bos = llama.clone();
+        no_bos["add_bos_token"] = false.into();
+        for (post_processor, config, prefix) in [
+            (Value::Null, None, vec![]),
+            (template.clone(), None, vec![256]),
+            // SGLang adds BOS by `add_bos_token`, ignoring the post-processor.
+            (Value::Null, Some(llama), vec![256]),
+            (template, Some(no_bos), vec![]),
+        ] {
+            let mut data: Value =
+                serde_json::from_str(include_str!("../../tests/fixtures/tiny_tokenizer.json"))
+                    .unwrap();
+            data["post_processor"] = post_processor;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokenizer.json");
+            std::fs::write(&path, data.to_string()).unwrap();
+            if let Some(config) = config {
+                std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string())
+                    .unwrap();
+            }
+            assert_eq!(
+                prompt_affixes(path.to_str().unwrap()).unwrap(),
+                (prefix, vec![])
+            );
+        }
     }
 }
 

@@ -79,42 +79,22 @@ pub async fn generate(
 
 /// A model's routing state, resolved before the request is prepared.
 enum ModelRouting<'a> {
-    Legacy {
-        policy: Arc<dyn Policy>,
-        resolver: PdPoolResolver,
-        candidates: Vec<Arc<Worker>>,
-    },
+    Legacy(Arc<dyn Policy>),
     Reorg(&'a BucketResolver),
 }
 
 impl<'a> ModelRouting<'a> {
     fn lookup(ctx: &'a AppContext, model: &ModelId) -> Result<Self, ApiError> {
-        let not_found = || ApiError::ModelNotFound(model.0.clone());
-        match &ctx.chat_routing {
-            ChatRouting::Legacy => {
-                let policy = ctx.policies.get(model).ok_or_else(not_found)?;
-                // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
-                let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
-                let candidates = resolver
-                    .prefill_candidates(model)
-                    .map_err(|error| pool_error(error, model))?;
-                Ok(Self::Legacy {
-                    policy,
-                    resolver,
-                    candidates,
-                })
-            }
-            ChatRouting::Reorg(resolvers) => {
-                resolvers.get(model).map(Self::Reorg).ok_or_else(not_found)
-            }
-        }
+        let routing = match &ctx.chat_routing {
+            ChatRouting::Legacy => ctx.policies.get(model).map(Self::Legacy),
+            ChatRouting::Reorg(resolvers) => resolvers.get(model).map(Self::Reorg),
+        };
+        routing.ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))
     }
 
     fn needs_request_tokens(&self, ctx: &AppContext) -> bool {
         match self {
-            Self::Legacy { policy, .. } => {
-                policy.needs_request_tokens() || ctx.config.model.dp_aware
-            }
+            Self::Legacy(policy) => policy.needs_request_tokens() || ctx.config.model.dp_aware,
             // The same predicate gates `--no-tokenizer` at startup,
             // so a load-only bucket skips the body parse.
             Self::Reorg(resolver) => resolver.needs_request_tokens(),
@@ -129,11 +109,22 @@ impl<'a> ModelRouting<'a> {
         headers: &HeaderMap,
     ) -> Result<SelectedWorkers, ApiError> {
         match self {
-            Self::Legacy {
-                policy,
-                resolver,
-                candidates,
-            } => select_workers(ctx, request, headers, policy.as_ref(), candidates, resolver).await,
+            Self::Legacy(policy) => {
+                // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
+                let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
+                let candidates = resolver
+                    .prefill_candidates(&request.model)
+                    .map_err(|error| pool_error(error, &request.model))?;
+                select_workers(
+                    ctx,
+                    request,
+                    headers,
+                    policy.as_ref(),
+                    &candidates,
+                    &resolver,
+                )
+                .await
+            }
             Self::Reorg(resolver) => reorg::select_workers(ctx, resolver, request, headers).await,
         }
     }
@@ -332,11 +323,8 @@ fn pick_decode_worker(
         decode_workers: &candidates,
         request_input_tokens: request.input_token_count as u64,
         request_sequence_tokens: request.sequence_token_count as u64,
-        requested_max_output_tokens: request.max_output_tokens,
-        // Preserve the legacy path's saturating projection on overflow.
-        expected_peak_sequence_tokens: request
-            .expected_peak_sequence_tokens()
-            .unwrap_or(Some(u64::MAX)),
+        requested_max_output_tokens: request.output_tokens,
+        expected_peak_sequence_tokens: request.expected_peak_sequence_tokens,
         ttft_slo_ms: routing.ttft_slo_ms,
         tps_slo: routing.tps_slo,
         load_snapshot: routing.load_snapshot.as_ref(),

@@ -20,25 +20,30 @@ use serde_json::{json, Number, Value};
 const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
-pub(super) const GENERATE_PATH: &str = "/generate";
+const GENERATE_PATH: &str = "/generate";
 
 /// Validated routing inputs and the original body, ready for worker selection.
+///
+/// A `/generate` batch runs each prompt as its own engine request: the input and
+/// output counts sum over prompts, while the sequence counts bound the longest.
 pub(super) struct PreparedRequest {
     /// Engine endpoint the request is forwarded to.
     pub(super) path: &'static str,
     pub(super) model: ModelId,
     pub(super) streaming: bool,
-    pub(super) max_output_tokens: Option<u64>,
+    /// Output budget, for decode KV; unknown if any prompt leaves it unset.
+    pub(super) output_tokens: Option<u64>,
     pub(super) body: Bytes,
     pub(super) tokens: Option<RequestTokens>,
     /// Token count for routing/load accounting; estimated from body size when unavailable.
     pub(super) input_token_count: usize,
-    /// The longest single prompt, for bucket and context checks; differs from
-    /// `input_token_count` only for a `/generate` batch.
+    /// The longest prompt, for bucket and context checks.
     pub(super) sequence_token_count: usize,
+    /// The longest prompt plus its own output budget.
+    pub(super) expected_peak_sequence_tokens: Option<u64>,
     caller_set_rid: bool,
     pub(super) fans_out: bool,
-    /// `None` for `/generate`, which never carries router tokens and books no forwarding outcome.
+    /// `None` for `/generate`, whose tokens replace `text` during preparation.
     forwarding_scope: Option<ForwardingScope>,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
@@ -75,13 +80,16 @@ impl PreparedRequest {
             .as_ref()
             .and_then(|parsed_body| request_tokens_for(&ctx.tokenizers, &model, parsed_body));
         let input_tokens = input_token_count(tokens.as_ref(), &body);
+        let output_tokens = fields.requested_max_output_tokens();
         Ok(Self {
             path: CHAT_PATH,
             model,
             streaming: fields.stream.unwrap_or(false),
-            max_output_tokens: fields.requested_max_output_tokens(),
+            output_tokens,
             input_token_count: input_tokens,
             sequence_token_count: input_tokens,
+            expected_peak_sequence_tokens: output_tokens
+                .map(|output| (input_tokens as u64).saturating_add(output)),
             body,
             tokens,
             caller_set_rid: fields.caller_set_rid,
@@ -92,80 +100,65 @@ impl PreparedRequest {
         })
     }
 
-    /// No chat template: routing tokens are caller `input_ids` or a single `text`,
-    /// tokenized whenever a tokenizer is loaded. A batch routes on load.
+    /// The engine's `GenerateReqInput`. With a tokenizer loaded, `text` becomes
+    /// `input_ids` here, so the engine skips tokenizing and routing sees its tokens.
     pub(super) fn generate(
         ctx: &AppContext,
         model: ModelId,
-        body: Bytes,
+        mut body: Bytes,
     ) -> Result<Self, ApiError> {
-        let value = Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
+        let mut value =
+            Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
         let stream =
             Option::<bool>::deserialize(&value["stream"]).map_err(|_| invalid_request())?;
+        if let Some(input_ids) = tokenize_text(ctx, &model, &value) {
+            let fields = value.as_object_mut().expect("parsed as an object");
+            fields.remove("text");
+            fields.insert("input_ids".into(), input_ids);
+            body = serde_json::to_vec(&value)
+                .map_err(|error| ApiError::Internal(error.into()))?
+                .into();
+        }
         let tokens = request_tokens_for(&ctx.tokenizers, &model, &value);
-        // Each batch item is its own engine request: load counts them all,
-        // while buckets and context checks see the longest one.
-        let (input_tokens, sequence_tokens) = match batch_prompt_tokens(&value) {
-            Some(items) => (
-                items.iter().sum::<usize>().max(1),
-                items.into_iter().max().unwrap_or(1),
-            ),
-            None => {
-                let tokens = value["input_embeds"]
-                    .as_array()
-                    .filter(|_| value["text"].is_null() && value["input_ids"].is_null())
-                    .map(|rows| rows.len().max(1))
-                    .unwrap_or_else(|| input_token_count(tokens.as_ref(), &body));
-                (tokens, tokens)
-            }
+        let batch = batch_prompt_tokens(&value);
+        let fans_out = batch.is_some() || parallel_samples(&value) > 1;
+        let lengths = batch.unwrap_or_else(|| {
+            let embeds = input_embeds(&value).map(|rows| rows.len().max(1));
+            vec![embeds.unwrap_or_else(|| input_token_count(tokens.as_ref(), &body))]
+        });
+        let outputs: Option<Vec<u64>> = match &value["sampling_params"] {
+            Value::Array(params) if params.len() == lengths.len() => params
+                .iter()
+                .map(|params| params["max_new_tokens"].as_u64())
+                .collect(),
+            Value::Array(_) => None, // The engine rejects the mismatch.
+            params => params["max_new_tokens"]
+                .as_u64()
+                .map(|output| vec![output; lengths.len()]),
         };
+        let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
         Ok(Self {
             path: GENERATE_PATH,
             model,
             streaming: stream.unwrap_or(false),
-            max_output_tokens: max_new_tokens(&value["sampling_params"]),
-            input_token_count: input_tokens,
+            output_tokens: outputs
+                .as_ref()
+                .map(|outputs| outputs.iter().fold(0, |sum: u64, &o| sum.saturating_add(o))),
+            input_token_count: lengths.iter().sum::<usize>().max(1),
             sequence_token_count: sequence_tokens,
+            expected_peak_sequence_tokens: outputs.map(|outputs| {
+                let peaks = lengths.iter().zip(outputs);
+                let peaks = peaks.map(|(&input, output)| (input as u64).saturating_add(output));
+                peaks.max().unwrap_or(sequence_tokens as u64)
+            }),
             body,
             tokens,
             caller_set_rid: !value["rid"].is_null(),
-            fans_out: generate_fans_out(&value),
+            fans_out,
             forwarding_scope: None,
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
         })
-    }
-
-    /// Context limits bound each prompt together with its own output budget.
-    pub(super) fn expected_peak_sequence_tokens(&self) -> Result<Option<u64>, ApiError> {
-        let Some(output) = self.max_output_tokens else {
-            return Ok(None);
-        };
-        let peak = |input: usize, output: u64| {
-            (input as u64).checked_add(output).ok_or_else(|| {
-                ApiError::BadRequest("input and output token counts overflow".into())
-            })
-        };
-        if self.path == GENERATE_PATH {
-            let value = self.parsed_body.as_ref().expect("generate body is parsed");
-            if let (Some(lengths), Some(params)) = (
-                batch_prompt_tokens(value),
-                value["sampling_params"].as_array(),
-            ) {
-                if lengths.len() != params.len() {
-                    return Ok(None); // Leave invalid batch cardinality to the engine.
-                }
-                let mut longest = 0;
-                for (input, params) in lengths.into_iter().zip(params) {
-                    let Some(output) = params["max_new_tokens"].as_u64() else {
-                        return Ok(None);
-                    };
-                    longest = longest.max(peak(input, output)?);
-                }
-                return Ok(Some(longest));
-            }
-        }
-        peak(self.sequence_token_count, output).map(Some)
     }
 
     pub(super) fn engine_rid(&self) -> Option<String> {
@@ -213,23 +206,42 @@ impl PreparedRequest {
     }
 }
 
-/// The largest `max_new_tokens` across a batch; `None` when any item leaves the
-/// engine default, which the router cannot see.
-fn max_new_tokens(sampling_params: &Value) -> Option<u64> {
-    let max_new_tokens = |params: &Value| params.get("max_new_tokens")?.as_u64();
-    match sampling_params {
-        Value::Array(batch) => batch
+/// `text` as engine-equivalent `input_ids` of the same shape. `None` leaves the
+/// text to the engine: caller inputs win, its processor expands multimodal
+/// placeholders from the text, and `--disable-input-ids-forwarding` opts out.
+fn tokenize_text(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Value> {
+    let engine_inputs = [
+        "input_ids",
+        "input_embeds",
+        "image_data",
+        "video_data",
+        "audio_data",
+    ];
+    if ctx.config.model.disable_input_ids_forwarding
+        || engine_inputs.iter().any(|key| !value[key].is_null())
+    {
+        return None;
+    }
+    let encode = |text: &Value| ctx.tokenizers.encode_prompt(&model.0, text.as_str()?);
+    match &value["text"] {
+        Value::Array(texts) => texts
             .iter()
-            .map(max_new_tokens)
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .max(),
-        params => max_new_tokens(params),
+            .map(encode)
+            .collect::<Option<Vec<_>>>()
+            .map(Value::from),
+        text => encode(text).map(Value::from),
     }
 }
 
-/// Per-prompt token counts of a `/generate` batch: exact for nested `input_ids`
-/// or `input_embeds`, estimated for a `text` list. `None` for a single prompt.
+/// `input_embeds`, which the engine reads only without `text` and `input_ids`.
+fn input_embeds(value: &Value) -> Option<&Vec<Value>> {
+    value["input_embeds"]
+        .as_array()
+        .filter(|_| value["text"].is_null() && value["input_ids"].is_null())
+}
+
+/// Per-prompt token counts of a batch: exact for nested `input_ids` or
+/// `input_embeds`, estimated for a `text` list. `None` for a single prompt.
 fn batch_prompt_tokens(value: &Value) -> Option<Vec<usize>> {
     if let Some(texts) = value["text"].as_array() {
         let estimate = |text: &Value| estimate_prefill_tokens(text.as_str().map_or(0, str::len));
@@ -239,10 +251,7 @@ fn batch_prompt_tokens(value: &Value) -> Option<Vec<usize>> {
         .as_array()
         .filter(|rows| rows.first().is_some_and(Value::is_array))
         .or_else(|| {
-            value["input_embeds"]
-                .as_array()
-                .filter(|_| value["text"].is_null() && value["input_ids"].is_null())
-                .filter(|rows| rows.first().is_some_and(|row| row[0].is_array()))
+            input_embeds(value).filter(|rows| rows.first().is_some_and(|r| r[0].is_array()))
         })?;
     Some(
         rows.iter()
@@ -251,20 +260,16 @@ fn batch_prompt_tokens(value: &Value) -> Option<Vec<usize>> {
     )
 }
 
-/// The engine splits a batch (`text` list, nested `input_ids` or `input_embeds`)
-/// or `n > 1` into one request per item.
-fn generate_fans_out(value: &Value) -> bool {
+/// Samples per prompt; beam search returns its `n` from one request.
+fn parallel_samples(value: &Value) -> u64 {
     let params = match &value["sampling_params"] {
         Value::Array(batch) => batch.first().unwrap_or(&Value::Null),
         params => params,
     };
-    value["text"].is_array()
-        || value["input_ids"][0].is_array()
-        || value["input_embeds"][0][0].is_array()
-        || params
-            .get("n")
-            .and_then(Value::as_u64)
-            .is_some_and(|n| n > 1)
+    match params["beam_width"].as_u64() {
+        Some(width) if width > 1 => 1,
+        _ => params["n"].as_u64().unwrap_or(1),
+    }
 }
 
 /// Routing and sampling fields retained by the lightweight request parser.
@@ -585,61 +590,32 @@ pub(super) struct BootstrapFields {
     pub(super) room: u64,
 }
 
-/// Append before the closing brace so injected values win over explicit nulls.
-fn append_top_level_fields(
-    body: &Bytes,
-    sampling_defaults: &[(SamplingField, Number)],
-    rid: Option<&str>,
-) -> Option<Bytes> {
-    use std::io::Write as _;
-
+/// Append JSON-encoded `fields` before the closing brace, so they win over
+/// earlier values of the same keys.
+pub(super) fn append_fields(body: &Bytes, fields: &[(&str, String)]) -> Option<Bytes> {
     let open = body.iter().position(|&b| b == b'{')?;
     let close = body.iter().rposition(|&b| b == b'}')?;
     if close <= open {
         return None;
     }
-    let has_members = body[open + 1..close]
+    let mut wrote_any = body[open + 1..close]
         .iter()
         .any(|b| !b.is_ascii_whitespace());
-    let rid_budget = rid.map_or(0, |rid| rid.len() + ",\"rid\":\"\"".len());
-    let mut output = Vec::with_capacity(body.len() + 24 * sampling_defaults.len() + rid_budget + 1);
+    let budget: usize = fields
+        .iter()
+        .map(|(key, value)| key.len() + value.len() + 4)
+        .sum();
+    let mut output = Vec::with_capacity(body.len() + budget);
     output.extend_from_slice(&body[..close]);
-    let mut wrote_any = has_members;
-    for (field, value) in sampling_defaults {
+    for (key, value) in fields {
         if wrote_any {
             output.push(b',');
         }
-        write!(output, "\"{}\":{}", field.wire_name(), value).ok()?;
+        output.extend_from_slice(format!("\"{key}\":{value}").as_bytes());
         wrote_any = true;
-    }
-    if let Some(rid) = rid {
-        if wrote_any {
-            output.push(b',');
-        }
-        output.extend_from_slice(b"\"rid\":");
-        serde_json::to_writer(&mut output, rid).ok()?;
     }
     output.extend_from_slice(&body[close..]);
     Some(Bytes::from(output))
-}
-
-/// Native `/generate` ignores `X-Data-Parallel-Rank` and reads the rank from the
-/// body; appended last so it wins over a caller's `routed_dp_rank`.
-pub(super) fn with_routed_dp_rank(body: &Bytes, rank: u32) -> Bytes {
-    let Some(close) = body.iter().rposition(|&b| b == b'}') else {
-        return body.clone();
-    };
-    let empty = body[..close]
-        .iter()
-        .rfind(|b| !b.is_ascii_whitespace())
-        .is_some_and(|&b| b == b'{');
-    let mut output = body[..close].to_vec();
-    if !empty {
-        output.push(b',');
-    }
-    output.extend_from_slice(format!("\"routed_dp_rank\":{rank}").as_bytes());
-    output.extend_from_slice(&body[close..]);
-    Bytes::from(output)
 }
 
 /// Preserve original bytes where possible; reuse parsed JSON for token or bootstrap injection.
@@ -657,7 +633,12 @@ fn build_outgoing_body(
         return Ok(body.clone());
     }
     if !needs_parse {
-        if let Some(spliced) = append_top_level_fields(body, sampling_defaults, rid) {
+        let defaults = sampling_defaults
+            .iter()
+            .map(|(field, value)| (field.wire_name(), value.to_string()));
+        let rid = rid.map(|rid| ("rid", Value::from(rid).to_string()));
+        let fields: Vec<_> = defaults.chain(rid).collect();
+        if let Some(spliced) = append_fields(body, &fields) {
             return Ok(spliced);
         }
     }
@@ -949,6 +930,7 @@ fn invalid_request() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer::TokenizerRegistry;
     use std::sync::Arc;
 
     #[test]
@@ -965,85 +947,81 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generate_reads_batches_and_max_new_tokens() {
-        let prepare = |body: Value| {
-            let ctx = AppContext::stub();
-            let body = Bytes::from(body.to_string());
-            PreparedRequest::generate(&ctx, ModelId("stub-model".into()), body).unwrap()
-        };
-        let single = prepare(json!({"text": "hi", "sampling_params": {"max_new_tokens": 8}}));
-        assert!(!single.fans_out);
-        assert_eq!(single.max_output_tokens, Some(8));
-        for batch in [
-            json!({"text": ["a", "b"], "sampling_params": [{"max_new_tokens": 8}, {"max_new_tokens": 32}]}),
-            json!({"input_ids": [[1], [2]], "sampling_params": {"max_new_tokens": 32}}),
-            json!({"input_embeds": [[[0.5]], [[0.5]]], "sampling_params": {"max_new_tokens": 32}}),
-            json!({"text": "a", "sampling_params": {"n": 2, "max_new_tokens": 32}}),
-        ] {
-            let batch = prepare(batch);
-            assert!(batch.fans_out);
-            assert_eq!(batch.max_output_tokens, Some(32));
-        }
-        // The second item runs to the engine default, so the batch bound is unknown.
-        let mixed =
-            prepare(json!({"text": ["a", "b"], "sampling_params": [{"max_new_tokens": 16}, {}]}));
-        assert_eq!(mixed.max_output_tokens, None);
-        assert_eq!(mixed.expected_peak_sequence_tokens().unwrap(), None);
-        // The engine ignores embeddings when token IDs are also supplied.
-        for embeds in [
-            json!(vec![vec![0.5; 4]; 100]),
-            json!([vec![vec![0.5; 4]; 100]]),
-        ] {
-            let single = prepare(json!({"input_ids": [1], "input_embeds": embeds}));
-            assert_eq!(
-                (single.input_token_count, single.sequence_token_count),
-                (1, 1)
-            );
-        }
+    /// A `/generate` request prepared with the tiny test tokenizer loaded.
+    fn prepare_generate(body: Value) -> PreparedRequest {
+        let mut ctx = AppContext::stub();
+        ctx.config.model.tokenizer_path = Some("tests/fixtures/tiny_tokenizer.json".into());
+        ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+        let body = Bytes::from(body.to_string());
+        PreparedRequest::generate(&ctx, ModelId("stub-model".into()), body).unwrap()
     }
 
     #[test]
-    fn generate_batch_counts_load_in_total_and_buckets_per_prompt() {
-        let ctx = AppContext::stub();
-        for body in [
-            json!({"input_ids": [[1], [2, 3, 4]]}),
-            json!({"input_embeds": [vec![vec![0.5; 4]; 1], vec![vec![0.5; 4]; 3]]}),
-        ] {
-            let body = Bytes::from(body.to_string());
-            let batch =
-                PreparedRequest::generate(&ctx, ModelId("stub-model".into()), body).unwrap();
-            assert_eq!(
-                (batch.input_token_count, batch.sequence_token_count),
-                (4, 3)
-            );
-        }
-    }
-
-    #[test]
-    fn routed_dp_rank_is_appended_last() {
-        for (body, expected) in [
+    fn generate_counts_batches_per_prompt() {
+        // (fans out, (input total, longest prompt, output total, longest peak))
+        for (body, fans_out, counts) in [
             (
-                r#"{"text":"hi","routed_dp_rank":0}"#,
-                r#"{"text":"hi","routed_dp_rank":0,"routed_dp_rank":3}"#,
+                json!({"input_ids": [1, 2], "sampling_params": {"max_new_tokens": 8}}),
+                false,
+                (2, 2, Some(8), Some(10)),
             ),
-            ("{ }", r#"{ "routed_dp_rank":3}"#),
+            (
+                json!({"input_ids": [[1], [2, 3, 4]], "sampling_params": [{"max_new_tokens": 9}, {"max_new_tokens": 1}]}),
+                true,
+                (4, 3, Some(10), Some(10)),
+            ),
+            (
+                json!({"input_embeds": [[[0.5]], [[0.5], [0.5], [0.5]]], "sampling_params": {"max_new_tokens": 2}}),
+                true,
+                (4, 3, Some(4), Some(5)),
+            ),
+            // The engine default bounds the second prompt, unseen by the router.
+            (
+                json!({"input_ids": [[1], [2]], "sampling_params": [{"max_new_tokens": 8}, {}]}),
+                true,
+                (2, 1, None, None),
+            ),
+            (
+                json!({"input_ids": [1], "sampling_params": {"n": 2}}),
+                true,
+                (1, 1, None, None),
+            ),
+            (
+                json!({"input_ids": [1], "sampling_params": {"n": 2, "beam_width": 2}}),
+                false,
+                (1, 1, None, None),
+            ),
+            // The engine ignores embeddings next to token IDs.
+            (
+                json!({"input_ids": [1], "input_embeds": [[[0.5]], [[0.5]]]}),
+                false,
+                (1, 1, None, None),
+            ),
         ] {
-            assert_eq!(with_routed_dp_rank(&Bytes::from(body), 3), expected);
+            let r = prepare_generate(body);
+            let actual = (
+                r.input_token_count,
+                r.sequence_token_count,
+                r.output_tokens,
+                r.expected_peak_sequence_tokens,
+            );
+            assert_eq!((r.fans_out, actual), (fans_out, counts));
         }
     }
 
     #[test]
-    fn generate_forwards_its_body_without_a_chat_forwarding_outcome() {
-        let ctx = AppContext::stub();
-        let body = Bytes::from_static(br#"{"text":"hi","sampling_params":{"temperature":0}}"#);
-        let request =
-            PreparedRequest::generate(&ctx, ModelId("stub-model".into()), body.clone()).unwrap();
-        assert_eq!(request.into_outgoing_body(&ctx, None, None).unwrap(), body);
-        assert!(!ctx
-            .metrics
-            .render()
-            .contains("sgl_router_input_ids_forwarding_total{"));
+    fn generate_forwards_text_as_input_ids() {
+        let body =
+            |request: &PreparedRequest| serde_json::from_slice::<Value>(&request.body).unwrap();
+        let single = prepare_generate(json!({"text": "hi", "stream": true}));
+        let ids = single.tokens.as_ref().unwrap().ids.clone();
+        assert_eq!(body(&single), json!({"stream": true, "input_ids": ids}));
+        let batch = prepare_generate(json!({"text": ["hi", "hi"]}));
+        assert_eq!(body(&batch)["input_ids"], json!([ids, ids]));
+        assert_eq!(batch.input_token_count, 2 * ids.len());
+        // The processor expands multimodal placeholders from the text itself.
+        let image = prepare_generate(json!({"text": "hi", "image_data": "a.png"}));
+        assert_eq!(body(&image)["text"], "hi");
     }
 
     #[test]

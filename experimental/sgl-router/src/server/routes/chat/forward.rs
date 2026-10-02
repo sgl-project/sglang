@@ -5,8 +5,7 @@
 
 use super::nonempty_header;
 use super::preparation::{
-    generate_room_id, generate_room_id_for_rank, with_routed_dp_rank, BootstrapFields,
-    PreparedRequest, GENERATE_PATH,
+    append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
 use crate::discovery::WorkerMode;
 use crate::policies::dp_rank::select_dp_rank;
@@ -112,13 +111,8 @@ pub(super) async fn forward_request(
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
-    let prefill_body = if unpin_prefill {
-        without_dp_rank(&body)?
-    } else {
-        body.clone()
-    };
     let (prefill_headers, prefill_body) =
-        with_dp_rank(headers.clone(), &prefill_body, path, prefill_rank);
+        with_dp_rank(dp_aware, headers.clone(), &body, prefill_rank);
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -146,7 +140,7 @@ pub(super) async fn forward_request(
                     .register(decode.id.clone(), decode.url.clone(), 0, 1),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
-            let (decode_headers, decode_body) = with_dp_rank(headers, &body, path, decode_rank);
+            let (decode_headers, decode_body) = with_dp_rank(dp_aware, headers, &body, decode_rank);
             (
                 decode,
                 decode_headers,
@@ -237,38 +231,27 @@ fn prompt_dp_rank(
     select_dp_rank(worker, key, &prefix_depths)
 }
 
-/// Pins `rank` in the header, and also in the body for native `/generate`,
-/// which ignores the header.
+/// Under `--dp-aware` the router owns the rank: the header pins it for chat, and
+/// the body, which `/generate` reads instead, carries it or null to unpin.
 fn with_dp_rank(
+    dp_aware: bool,
     mut headers: HeaderMap,
     body: &Bytes,
-    path: &str,
     rank: Option<u32>,
 ) -> (HeaderMap, Bytes) {
-    let Some(rank) = rank else {
+    if !dp_aware {
         return (headers, body.clone());
-    };
-    headers.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(rank));
-    let body = if path == GENERATE_PATH {
-        with_routed_dp_rank(body, rank)
-    } else {
-        body.clone()
-    };
-    (headers, body)
-}
-
-/// Let the engine route each PD batch item by its own bootstrap room.
-fn without_dp_rank(body: &Bytes) -> Result<Bytes, ApiError> {
-    let mut fields: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(body).map_err(|error| ApiError::Internal(error.into()))?;
-    let routed = fields.remove("routed_dp_rank");
-    let legacy = fields.remove("data_parallel_rank");
-    if routed.is_none() && legacy.is_none() {
-        return Ok(body.clone());
     }
-    serde_json::to_vec(&fields)
-        .map(Bytes::from)
-        .map_err(|error| ApiError::Internal(error.into()))
+    if let Some(rank) = rank {
+        headers.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(rank));
+    }
+    let rank = rank.map_or_else(|| "null".to_owned(), |rank| rank.to_string());
+    let fields = [
+        ("routed_dp_rank", rank),
+        ("data_parallel_rank", "null".into()),
+    ];
+    let body = append_fields(body, &fields).unwrap_or_else(|| body.clone());
+    (headers, body)
 }
 
 fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {

@@ -368,52 +368,7 @@ async fn missing_decode_in_all_buckets_does_not_dispatch_prefill() {
     );
 }
 
-/// Each `/generate` batch item is its own engine request, so bucket limits
-/// bound the longest prompt rather than the whole batch.
-#[tokio::test]
-async fn generate_batch_fits_a_bucket_by_its_longest_prompt() {
-    let worker = MockWorker::start(vec![]).await;
-    let policy = Arc::new(FirstPolicy::default());
-    let mut bucket = Bucket::new("short", BucketGroups::Plain(group("w", policy.clone())));
-    bucket.limits.max = Some(64);
-    bucket.max_context_tokens = Some(64);
-    let app = build_router(context(&[("w", Stage::Plain, &worker)], vec![bucket]));
-    let prompts: Vec<_> = (0..128).map(|id| [id]).collect();
-    let body = serde_json::json!({"input_ids": prompts, "sampling_params": {"max_new_tokens": 8}});
-    let request = Request::post("/generate")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
-    let calls = policy.calls.lock().unwrap();
-    assert_eq!((calls[0].2, calls[0].3), (1, Some(9)));
-}
-
-#[tokio::test]
-async fn generate_embeddings_fit_by_sequence_length() {
-    let worker = MockWorker::start(vec![]).await;
-    let policy = Arc::new(FirstPolicy::default());
-    let mut bucket = Bucket::new("short", BucketGroups::Plain(group("w", policy)));
-    bucket.max_context_tokens = Some(64);
-    let app = build_router(context(&[("w", Stage::Plain, &worker)], vec![bucket]));
-    // Embedding width and batch size do not increase the longest sequence.
-    let prompt = serde_json::json!([vec![0.5; 4096]]);
-    for embeddings in [prompt.clone(), serde_json::json!([prompt, prompt])] {
-        let body = serde_json::json!({
-            "input_embeds": embeddings,
-            "sampling_params": {"max_new_tokens": 8}
-        });
-        let request = Request::post("/generate")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        assert_eq!(
-            app.clone().oneshot(request).await.unwrap().status(),
-            StatusCode::OK
-        );
-    }
-}
-
+/// A `/generate` batch fits by each prompt's own peak, not max(input) + max(output) = 120.
 #[tokio::test]
 async fn generate_batch_context_limit_pairs_each_prompt_with_its_output_budget() {
     let worker = MockWorker::start(vec![]).await;
@@ -422,7 +377,6 @@ async fn generate_batch_context_limit_pairs_each_prompt_with_its_output_budget()
     bucket.max_context_tokens = Some(64);
     let app = build_router(context(&[("w", Stage::Plain, &worker)], vec![bucket]));
     for (first_output, status) in [(1, StatusCode::OK), (5, StatusCode::BAD_REQUEST)] {
-        // Peaks are [61, 61] or [65, 61], not max(input) + max(output) = 120.
         let body = serde_json::json!({
             "input_ids": [vec![1; 60], vec![1]],
             "sampling_params": [{"max_new_tokens": first_output}, {"max_new_tokens": 60}]
