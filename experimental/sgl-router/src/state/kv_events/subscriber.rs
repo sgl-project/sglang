@@ -1,23 +1,17 @@
-//! Per-worker, per-DP-rank ZMQ subscriber for SGLang's `ZmqEventPublisher`.
+//! Per-worker, per-DP-rank ZMQ subscriber for SGLang's `ZmqEventPublisher`
+//! (`python/sglang/srt/utils/event_publisher.py`); KV events come from
+//! `disaggregation/kv_events.py`, load from `managers/scheduler_components/load_publisher.py`.
 //!
-//! This module owns the I/O plumbing between SGLang workers (which publish on
-//! a PUB socket via `python/sglang/srt/utils/event_publisher.py` —
-//! KV-cache events from `disaggregation/kv_events.py`, load gauges from
-//! `managers/scheduler_components/load_publisher.py`) and the in-memory state
-//! consumed by [`super::index::KvEventIndex`]. Each `(worker_url, dp_rank)`
-//! pair gets its own SUB socket on its own tokio task, decodes msgpack frames
-//! by [`SubKind`] (KV batches via [`super::wire`], load via
-//! [`crate::state::load_monitor::engine_reported_load`]), and forwards [`WorkerEvent`]s to a
-//! shared mpsc channel.
+//! Each `(worker_url, dp_rank)` gets its own SUB socket and tokio task,
+//! which forwards decoded [`WorkerEvent`]s to one shared mpsc channel.
 //!
 //! # Wire format (3-frame multipart)
 //!
-//! Frames published by SGLang:
-//! 1. `topic_bytes` — empty by default, present even when empty.
-//! 2. `seq_bytes` — 8-byte big-endian signed `i64`, dense per publisher. The
-//!    `-1` sentinel (`ZmqEventPublisher.END_SEQ`) ends a replay; seen on the
-//!    PUB stream it becomes a [`WorkerEvent::PublisherReset`].
-//! 3. `payload` — msgpack-encoded [`KvEventBatch`].
+//! 1. `topic`: empty by default, present even when empty.
+//! 2. `seq`: 8-byte big-endian `i64`, dense per publisher. The `-1` sentinel
+//!    (`ZmqEventPublisher.END_SEQ`) ends a replay; on the PUB stream it becomes
+//!    a [`WorkerEvent::PublisherReset`].
+//! 3. `payload`: msgpack-encoded [`KvEventBatch`].
 //!
 //! # Sequence repair
 //!
@@ -26,38 +20,21 @@
 //! replay ROUTER when `/server_info` advertises one; live frames wait in the
 //! SUB socket meanwhile, so the pump always sees this rank in order.
 //!
-//! # Endpoint construction
+//! # Endpoints
 //!
-//! Each call to [`KvEventSubscriberRegistry::add_worker`] takes an
-//! [`EventConfig`] describing where the worker publishes:
-//! `tcp://{cfg.host}:{cfg.port_base + dp_rank}` per rank in
-//! `0..cfg.dp_size`. The host comes from the worker's `/server_info`
-//! introspection in production (so wildcard bind hosts resolve to the
-//! gateway-routable address) or from the worker URL as a fallback.
+//! Rank `r` connects to `tcp://{cfg.host}:{cfg.port_base + r}`. `cfg.host` comes from
+//! `/server_info` (else the worker URL), so a wildcard bind host resolves to a routable one.
 //!
 //! # Reconnect
 //!
-//! `zeromq::SubSocket::connect` already spawns a background reconnection
-//! task that re-sends our subscriptions on every reconnect, so we do not
-//! need an outer reconnect loop. The initial `connect` + `subscribe` retries
-//! with capped backoff until it succeeds or is cancelled, and
-//! [`RECV_ERROR_CEILING`] consecutive `recv()` errors rebuild the socket.
+//! `zeromq::SubSocket` reconnects and resubscribes on its own, so there is no outer loop;
+//! only [`RECV_ERROR_CEILING`] consecutive `recv()` errors rebuild the socket.
 //!
-//! # Ordering
+//! # Ordering and backpressure
 //!
-//! Events for one `(worker, dp_rank)` flow through one task and use one
-//! mpsc sender — order is preserved per-worker. Order across DP ranks (or
-//! across workers) is **not** preserved; downstream consumers must not
-//! depend on it.
-//!
-//! # Backpressure
-//!
-//! The per-worker task `await`s `tx.send()` and will not consume new ZMQ
-//! messages while the channel is full. ZMQ's HWM (configured by the
-//! publisher) takes effect upstream — events are dropped at the publisher,
-//! not buffered in the subscriber. Tune the `tx` channel buffer to absorb
-//! expected event-batch bursts. Backpressure is per-worker: a slow consumer
-//! for one worker stalls only that worker's events, not others.
+//! Order is preserved per `(worker, dp_rank)`, never across ranks or workers.
+//! Each task awaits `tx.send()`, so a full channel stalls only that rank,
+//! and the backlog is dropped at the publisher's ZMQ HWM rather than buffered here.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,10 +71,8 @@ const END_SEQ_SENTINEL: i64 = -1;
 /// How long live batches may wait behind one gap replay; arbitrary.
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Which topic a subscriber task listens on, and therefore what kind of
-/// [`WorkerEvent`] it produces. KV-cache events feed the hash tree (with
-/// sequence-ordered dedup); load snapshots feed the engine-load table (a
-/// gauge — no sequence semantics).
+/// Which topic a subscriber task listens on: KV-cache events (sequence-ordered)
+/// or load snapshots (a gauge with no sequence semantics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubKind {
     /// Cache-delta topic (`BlockStored` / `BlockRemoved` / `AllBlocksCleared`).
@@ -107,36 +82,27 @@ pub enum SubKind {
 }
 
 /// Message forwarded from a per-worker subscriber task to the pump.
-///
-/// The variants partition by subscriber [`SubKind`]: `Batch` and
-/// `PublisherReset` come only from a `SubKind::Kv` subscriber and carry the
-/// cache stream's sequence/replay semantics; `Load` comes only from a
-/// `SubKind::Load` subscriber and is a seqless gauge. A given subscriber
-/// never emits both families.
+/// Kv subscribers emit only `Batch` and `PublisherReset`; Load subscribers emit only `Load`.
 #[derive(Debug)]
 pub enum WorkerEvent {
     /// A normal decoded event batch.
     Batch {
         /// Identity of the SGLang worker (DP rank) that produced this batch.
         worker: KvWorkerId,
-        /// 8-byte big-endian sequence number from the publisher's monotonic
-        /// counter. Useful for replay / gap detection downstream.
+        /// The publisher's per-rank sequence number.
         seq: i64,
         /// Decoded batch payload.
         batch: KvEventBatch,
     },
-    /// A runtime load snapshot from the load topic. Carries no sequence
-    /// number: load is a gauge, applied last-value-wins with no dedup.
+    /// A load snapshot; a gauge applied last-value-wins, so it carries no seq.
     Load {
         /// Identity of the SGLang worker (DP rank) that produced this load.
         worker: KvWorkerId,
         /// Latest load snapshot for this `(worker, dp_rank)`.
         load: LoadStat,
     },
-    /// The publisher emitted its `END_SEQ` (-1) sentinel, signalling
-    /// shutdown. A re-connecting publisher will restart its sequence
-    /// counter from 0; the pump uses this to reset the cursor so those
-    /// fresh events are not filtered as out-of-order.
+    /// The publisher shut down or restarted (`END_SEQ`, or a regressed seq);
+    /// the pump resets this rank's cursor so the new counter is not filtered as stale.
     PublisherReset { worker: KvWorkerId },
 }
 
@@ -160,23 +126,12 @@ struct SubscriberHandle {
 /// Shared inner state for [`KvEventSubscriberRegistry`].
 struct Inner {
     tx: mpsc::Sender<WorkerEvent>,
-    /// Keyed by `(worker_url, dp_rank)`. Behind a `tokio::sync::Mutex`
-    /// because [`KvEventSubscriberRegistry::remove_worker`] and
-    /// [`KvEventSubscriberRegistry::shutdown`] await join handles while
-    /// holding the lock conceptually — we drop the lock before awaiting,
-    /// but using a tokio mutex avoids accidental blocking-mutex misuse if
-    /// the implementation evolves.
+    /// Keyed by `(worker_url, dp_rank)`.
     handles: Mutex<HashMap<KvWorkerId, SubscriberHandle>>,
 }
 
-/// Owns one ZMQ SUB connection per `(worker_url, dp_rank)`. Forwards
-/// decoded batches to a tokio mpsc channel supplied at construction time.
-///
-/// A registry is single-kind: a [`SubKind::Kv`] registry subscribes to the
-/// cache topic and emits [`WorkerEvent::Batch`]; a [`SubKind::Load`] registry
-/// subscribes to the load topic and emits [`WorkerEvent::Load`]. The index
-/// runs one of each, both feeding the same pump channel, so KV and load
-/// subscribers for the same worker never collide in the handle map.
+/// Owns one ZMQ SUB connection per `(worker_url, dp_rank)` for a single [`SubKind`].
+/// The index runs one KV and one load registry, both feeding the same pump channel.
 pub struct KvEventSubscriberRegistry {
     inner: Arc<Inner>,
     kind: SubKind,
@@ -184,8 +139,7 @@ pub struct KvEventSubscriberRegistry {
 }
 
 impl KvEventSubscriberRegistry {
-    /// Build an empty KV-cache registry. `tx` is where decoded events flow
-    /// out; the channel buffer capacity is the caller's choice.
+    /// Build an empty KV-cache registry that sends decoded events to `tx`.
     pub fn new(tx: mpsc::Sender<WorkerEvent>) -> Self {
         Self::with_kind(tx, SubKind::Kv)
     }
@@ -208,27 +162,12 @@ impl KvEventSubscriberRegistry {
         self
     }
 
-    /// Open one SUB connection per `dp_rank` in `0..cfg.dp_size`,
-    /// connecting to `tcp://{cfg.host}:{cfg.port_base + dp_rank}`. Spawns
-    /// background tasks. Idempotent: a second `add_worker` for the same
-    /// `(worker_url, dp_rank)` pair is a no-op.
-    ///
-    /// `worker_url` is the HTTP URL the gateway uses for routing (e.g.,
-    /// `"http://10.0.0.1:30000"`). It serves as the keying identity in the
-    /// registry but the actual ZMQ endpoint comes from `cfg` — the policy
-    /// layer is expected to have learned `cfg` from the worker's
-    /// `/server_info` introspection (or filled it from a global fallback).
-    ///
-    /// # Errors
-    ///
-    /// If `cfg.port_base + dp_rank` overflows `u16`, that rank is skipped
-    /// with a `warn!` log and the remaining ranks proceed.
+    /// Spawn one subscriber per rank in `0..cfg.dp_size`, skipping registered ranks
+    /// and ranks whose port overflows `u16`. `worker_url` only keys the registry;
+    /// the ZMQ endpoints come from `cfg`.
     pub async fn add_worker(&self, worker_url: &str, cfg: &EventConfig) {
-        // (port_base, topic) depend on this registry's kind. KV uses the cache
-        // socket + configured topic; Load uses its own advertised socket +
-        // topic. Refuse an incomplete load descriptor rather than subscribe-all:
-        // the load wire is a distinct contract and a future mixed-use socket
-        // must not feed unrelated payloads into the load decoder.
+        // Skip an incomplete load descriptor rather than subscribe to everything:
+        // unrelated payloads must never reach the load decoder.
         let (port_base, topic) = match self.kind {
             SubKind::Kv => (cfg.port_base, cfg.topic.clone()),
             SubKind::Load => match (&cfg.load_port_base, &cfg.load_topic) {
@@ -309,8 +248,7 @@ impl KvEventSubscriberRegistry {
         };
         for h in drained {
             h.cancel.cancel();
-            // A panicked task surfaces here; we log and continue so one
-            // poisoned subscriber cannot stall the registry.
+            // Log a panicked task and continue, so one subscriber cannot stall the rest.
             if let Err(e) = h.join.await {
                 warn!(
                     worker_url = %worker_url,
@@ -321,15 +259,8 @@ impl KvEventSubscriberRegistry {
         }
     }
 
-    /// Sync cancellation: triggers every per-worker token without awaiting
-    /// the join handles. Use this when you cannot `.await` (e.g., from
-    /// `Drop`). After calling this, the subscriber tasks will exit on their
-    /// next yield point. Subscriptions and ZMQ sockets are released by
-    /// tokio task cleanup.
-    ///
-    /// If `try_lock` fails, the registry is mid-mutation elsewhere
-    /// (`shutdown`, `add_worker`, `remove_worker`); the cancel is
-    /// redundant in that case so we drop the call.
+    /// Fire every cancel token without awaiting the tasks, for callers that cannot `.await`
+    /// (e.g. `Drop`). A no-op while another registry call holds the lock.
     pub fn cancel_all(&self) {
         if let Ok(handles) = self.inner.handles.try_lock() {
             for h in handles.values() {
@@ -338,8 +269,7 @@ impl KvEventSubscriberRegistry {
         }
     }
 
-    /// Cancel everything and await shutdown. Caller is responsible for
-    /// draining any remaining events on the receiver side.
+    /// Cancel every subscriber and await it; the caller drains the receiver.
     pub async fn shutdown(&self) {
         let drained: Vec<(KvWorkerId, SubscriberHandle)> = {
             let mut handles = self.inner.handles.lock().await;
@@ -365,8 +295,6 @@ struct Endpoints {
     replay: Option<String>,
 }
 
-/// Spawn the background task that owns one SUB socket and forwards
-/// decoded batches.
 fn spawn_subscriber_task(
     id: KvWorkerId,
     endpoints: Endpoints,
@@ -436,9 +364,6 @@ async fn run_subscriber(
                         };
                         for event in events {
                             if tx.send(event).await.is_err() {
-                                // The pump (or the entire index) is gone.
-                                // This is unexpected mid-stream; warn so
-                                // operators see it.
                                 warn!(
                                     worker_url = %id.url,
                                     dp_rank = id.dp_rank,
@@ -468,8 +393,7 @@ async fn run_subscriber(
                             errors_in_a_row = 0;
                             continue;
                         }
-                        // SubSocket auto-reconnects internally; transient
-                        // errors should resume once a new peer attaches.
+                        // SubSocket reconnects on its own; transient errors clear on reattach.
                         warn!(
                             worker_url = %id.url,
                             dp_rank = id.dp_rank,
@@ -672,10 +596,7 @@ async fn fetch_replay(endpoint: &str, from: i64) -> anyhow::Result<Vec<(i64, KvE
     }
 }
 
-/// Validate, parse, and decode a single 3-frame multipart ZMQ message.
-/// Returns `None` (with logging) for any non-event input (bad frame
-/// count, sentinel sequence, or msgpack decode error). `kind` selects
-/// whether to emit a KV [`WorkerEvent::Batch`] or a [`WorkerEvent::Load`].
+/// Decode one 3-frame message as a `kind` event; malformed input is logged and dropped.
 fn decode_message(id: &KvWorkerId, msg: ZmqMessage, kind: SubKind) -> Option<WorkerEvent> {
     if msg.len() != 3 {
         warn!(
@@ -687,15 +608,10 @@ fn decode_message(id: &KvWorkerId, msg: ZmqMessage, kind: SubKind) -> Option<Wor
         return None;
     }
 
-    // Frame 0 is the topic; we don't use it. Frame 1 is the BE i64 seq;
-    // frame 2 is the msgpack payload. The `len() == 3` guard above means
-    // these indices are always valid, but `?` cleanly bails out if a
-    // future change drops the guard.
+    // Frame 0 is the topic, already filtered by the SUB subscription.
     let seq_frame = msg.get(1)?;
     let payload = msg.get(2)?;
 
-    // Decode the 8-byte BE seq. Frames smaller or larger than 8 bytes
-    // mean a malformed publisher; log and drop.
     let seq_bytes: [u8; 8] = match seq_frame.as_ref().try_into() {
         Ok(b) => b,
         Err(_) => {
@@ -725,9 +641,7 @@ fn decode_message(id: &KvWorkerId, msg: ZmqMessage, kind: SubKind) -> Option<Wor
         }
     }
 
-    // Decode by kind: the cache topic carries `KvEventBatch`es, the load
-    // topic carries bare `LoadStat` snapshots — two independent wire formats
-    // on two independent sockets.
+    // The load topic carries a bare `LoadStat`, not a `KvEventBatch` envelope.
     match kind {
         SubKind::Kv => {
             let batch = match decode_event_batch(payload.as_ref()) {
@@ -784,11 +698,7 @@ fn decode_message(id: &KvWorkerId, msg: ZmqMessage, kind: SubKind) -> Option<Wor
     }
 }
 
-/// Pull the host out of a routing URL like `http://10.0.0.1:30000` or
-/// `https://[::1]:30000`. Falls back to `None` for inputs the `url` crate
-/// cannot parse.
-///
-/// Test-only helper for fabricating [`EventConfig`]s from a worker URL.
+/// Host of a routing URL like `http://10.0.0.1:30000`, for building test [`EventConfig`]s.
 #[cfg(test)]
 fn extract_host(worker_url: &str) -> Option<String> {
     let parsed = url::Url::parse(worker_url).ok()?;
@@ -796,9 +706,7 @@ fn extract_host(worker_url: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — bind real PUB sockets to ephemeral ports and confirm the
-// subscriber wires data through correctly. All tests are localhost-only and
-// use OS-assigned ports so they can run in parallel without conflict.
+// Tests bind real PUB sockets on OS-assigned localhost ports, so they run in parallel.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -817,8 +725,7 @@ mod tests {
         use super::*;
         use rmp::encode as mp;
 
-        /// Bind a PUB socket to an OS-assigned localhost port and return
-        /// `(socket, port)`.
+        /// Bind a PUB socket to an OS-assigned localhost port.
         pub async fn make_pub_bound() -> (PubSocket, u16) {
             let mut sock = PubSocket::new();
             let endpoint = sock
@@ -832,9 +739,7 @@ mod tests {
             (sock, port)
         }
 
-        /// Build a minimal [`EventConfig`] for test fixtures: take the host
-        /// from `worker_url` (matches the pre-discovery behavior) and fill
-        /// the rest with reasonable defaults.
+        /// A minimal [`EventConfig`] whose host comes from `worker_url`.
         pub fn cfg_for(worker_url: &str, port_base: u16, dp_size: u32) -> EventConfig {
             EventConfig {
                 host: extract_host(worker_url).unwrap_or_else(|| "127.0.0.1".to_string()),
@@ -849,8 +754,7 @@ mod tests {
             }
         }
 
-        /// Encode a minimal AllBlocksCleared batch with the given ts and
-        /// optional dp_rank, in the same array layout msgspec emits.
+        /// An `AllBlocksCleared` batch in msgspec's array layout.
         pub fn encode_all_blocks_cleared_batch(ts: f64, attn_dp_rank: Option<u32>) -> Vec<u8> {
             let mut buf = Vec::new();
             // Outer batch array: [ts, [event], dp_rank?]
@@ -871,11 +775,7 @@ mod tests {
             buf
         }
 
-        /// Encode a LoadStat batch `[ts, [["LoadStat", running, waiting,
-        /// num_tokens, max_total]], dp_rank?]` in msgspec's array layout.
-        /// Encode a bare LoadStat msgpack array `["LoadStat", running, waiting,
-        /// num_tokens, max_total, attn_dp_rank]` — the payload on the load
-        /// socket (no EventBatch envelope).
+        /// A bare `LoadStat` array, the load socket's payload (no `EventBatch` envelope).
         pub fn encode_load_stat(
             running: u64,
             waiting: u64,
@@ -894,8 +794,7 @@ mod tests {
             buf
         }
 
-        /// Build a 3-frame multipart with topic="", the given seq (BE i64),
-        /// and the given payload bytes.
+        /// A 3-frame message with an empty topic.
         pub fn build_multipart(seq: i64, payload: Vec<u8>) -> ZmqMessage {
             build_multipart_with_topic(b"", seq, payload)
         }
@@ -913,8 +812,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
-        /// Destructure a `WorkerEvent::Batch`, panicking on any other
-        /// variant. Keeps test assertions terse.
+        /// Unwrap a `WorkerEvent::Batch`, panicking on any other variant.
         pub fn expect_batch(ev: WorkerEvent) -> (KvWorkerId, i64, KvEventBatch) {
             match ev {
                 WorkerEvent::Batch { worker, seq, batch } => (worker, seq, batch),
@@ -964,26 +862,8 @@ mod tests {
         assert!(shutdown_done.is_ok(), "shutdown should return promptly");
     }
 
-    /// When the worker advertises a non-empty topic in
-    /// `EventConfig.topic`, the SUB socket must filter on that prefix:
-    /// only messages whose first frame *starts with* the topic bytes
-    /// reach our pump. ZMQ-level filtering is the only way the
-    /// configured topic affects routing — `decode_message` discards
-    /// frame 0 regardless — so a SUB socket that ignores `cfg.topic`
-    /// and subscribes to `""` lets every message on the endpoint
-    /// through, including events from unrelated publishers that
-    /// happen to share the host:port (e.g. a colocated worker
-    /// running a different model on the same machine).
-    ///
-    /// Scenario: subscribe to topic "match". Publish two messages on
-    /// the same PUB socket: topic=`match` first, then topic=`other`.
-    /// The matched message must be delivered AND the unmatched one
-    /// must not. We publish matched-first so the negative assertion
-    /// is the load-bearing check: a broken SUB filter that subscribes
-    /// to `""` (the pre-fix behavior) delivers BOTH messages in send
-    /// order, so the seq=22 assertion would still pass but the
-    /// stray-recv assertion would catch it. This removes a dependency
-    /// on PUB→SUB delivery ordering as the discriminator.
+    /// `cfg.topic` must filter at the SUB socket, since `decode_message` ignores frame 0.
+    /// The match is sent first, so only the no-stray check catches a `""` subscription.
     #[tokio::test]
     async fn subscriber_filters_by_configured_topic() {
         let (mut pub_sock, port) = helpers::make_pub_bound().await;
@@ -997,8 +877,6 @@ mod tests {
         registry.add_worker(worker_url, &cfg).await;
         helpers::settle().await;
 
-        // Publish matched first, then `other`. A leaky `""` subscription
-        // delivers both in order; the topic filter must drop the second.
         let payload_matched = helpers::encode_all_blocks_cleared_batch(1.0, Some(0));
         let payload_other = helpers::encode_all_blocks_cleared_batch(2.0, Some(0));
         pub_sock
@@ -1025,9 +903,6 @@ mod tests {
         let (_, seq, _) = helpers::expect_batch(event);
         assert_eq!(seq, 22, "matched message must arrive; got seq={seq}");
 
-        // The load-bearing assertion: no second message in 200ms. A
-        // SUB subscribed to `""` would have delivered the `other`
-        // message by now; the topic filter must drop it.
         let stray = timeout(Duration::from_millis(200), rx.recv()).await;
         assert!(
             stray.is_err(),
@@ -1038,10 +913,7 @@ mod tests {
         registry.shutdown().await;
     }
 
-    /// The #34608 load stream has its own advertised topic. It must use that
-    /// filter too: accepting every frame on the socket would make a future
-    /// colocated publisher influence routing through a coincidentally
-    /// decodable payload.
+    /// Without the filter, a colocated publisher's decodable payload could sway routing.
     #[tokio::test]
     async fn load_subscriber_filters_by_advertised_topic() {
         let (mut pub_sock, port) = helpers::make_pub_bound().await;
@@ -1094,15 +966,7 @@ mod tests {
         let (mut pub0, p0) = helpers::make_pub_bound().await;
         let (mut pub1, p1) = helpers::make_pub_bound().await;
         let (mut pub2, p2) = helpers::make_pub_bound().await;
-        // We need contiguous ports for `base_port + dp_rank` to land on
-        // each PUB socket. OS-assigned ports won't be contiguous, so we
-        // bind one PUB socket per dp_rank with the same `worker_url` but
-        // call `add_worker` three times with `dp_size=1` and the right
-        // base_port for each. The registry does not require contiguous
-        // ports per call — but `add_worker` itself does, since it
-        // constructs `base_port + rank`. Workaround: use distinct
-        // `worker_url`s so each call's dp_rank=0 maps to its own port,
-        // and assert via the URL field.
+        // OS-assigned ports are not contiguous, so give each socket its own URL with dp_size=1.
         let url0 = "http://127.0.0.1:30000";
         let url1 = "http://127.0.0.1:30001";
         let url2 = "http://127.0.0.1:30002";
@@ -1153,20 +1017,15 @@ mod tests {
         registry.shutdown().await;
     }
 
-    /// True per-DP fan-out behind a single worker URL: bind 3 PUB
-    /// sockets on contiguous ports and subscribe with `dp_size=3`.
+    /// Fan-out behind one worker URL, on 3 contiguous ports.
     #[tokio::test]
     async fn dp_size_three_per_worker() {
-        // Pick a single base port and keep retrying until the next two
-        // ports are also free, so `base_port + 1` and `base_port + 2`
-        // really resolve to our PUB sockets.
+        // Retry until `base_port + 1` and `base_port + 2` are free too.
         let mut attempt = 0;
         let (pub0, pub1, pub2, base_port) = loop {
             attempt += 1;
             assert!(attempt < 256, "could not find 3 contiguous free ports");
 
-            // Bind PUB at OS-assigned port to learn what's free, then try
-            // to bind the next two ports explicitly.
             let mut p0 = PubSocket::new();
             let ep0 = p0.bind("tcp://127.0.0.1:0").await.unwrap();
             let base = match ep0 {
@@ -1237,11 +1096,7 @@ mod tests {
         registry.shutdown().await;
     }
 
-    /// 8-rank multi-publisher fan-out: a worker that publishes to 8
-    /// contiguous ZMQ ports (one per DP rank) must produce 8 distinct
-    /// SUB connections and forward every rank's event. The 3-rank
-    /// test above pins basic fan-out; this one exercises the wider
-    /// fan-out shape that real multi-DP workers exhibit.
+    /// Fan-out across 8 contiguous ports, the width of real multi-DP workers.
     #[tokio::test]
     async fn dp_size_eight_per_worker() {
         const N: usize = 8;
@@ -1258,9 +1113,6 @@ mod tests {
                 Endpoint::Tcp(_, p) => p,
                 _ => unreachable!(),
             };
-            // Ensure `base + N - 1` fits in u16 *and* we can bind every
-            // contiguous port. Retry on the rare overflow case at the
-            // high end of the ephemeral range.
             if u32::from(base) + (N as u32) > u32::from(u16::MAX) {
                 continue;
             }
@@ -1327,8 +1179,7 @@ mod tests {
         registry.shutdown().await;
     }
 
-    /// Bad msgpack payload is logged and dropped; subsequent valid event
-    /// still arrives.
+    /// A bad msgpack payload is dropped without blocking the next event.
     #[tokio::test]
     async fn decoding_error_tolerated() {
         let (mut pub_sock, port) = helpers::make_pub_bound().await;
@@ -1407,9 +1258,7 @@ mod tests {
         registry.shutdown().await;
     }
 
-    /// END_SEQ sentinel (-1) is forwarded as a `PublisherReset` so the
-    /// downstream pump can clear its cursor; a subsequent valid event
-    /// still arrives as a normal `Batch`.
+    /// END_SEQ surfaces as `PublisherReset`, and the stream continues after it.
     #[tokio::test]
     async fn sequence_number_sentinel_propagates_as_reset() {
         let (mut pub_sock, port) = helpers::make_pub_bound().await;
@@ -1452,8 +1301,7 @@ mod tests {
         registry.shutdown().await;
     }
 
-    /// `remove_worker` cancels the task; further publishes are not
-    /// received.
+    /// Publishes after `remove_worker` are not received.
     #[tokio::test]
     async fn remove_worker_cancels() {
         let (mut pub_sock, port) = helpers::make_pub_bound().await;
@@ -1500,8 +1348,6 @@ mod tests {
         );
     }
 
-    /// Calling `add_worker` twice for the same `(url, dp_rank)` pair
-    /// must not double-spawn.
     #[tokio::test]
     async fn add_worker_idempotent() {
         let (_pub_sock, port) = helpers::make_pub_bound().await;
@@ -1529,10 +1375,6 @@ mod tests {
         registry.shutdown().await;
     }
 
-    /// `cancel_all` signals every per-worker token without awaiting; a
-    /// subsequent `shutdown` must still complete cleanly. This pins the
-    /// contract for any future `Drop` impl that needs a sync cancel path
-    /// (e.g. when the registry is dropped without an explicit `shutdown`).
     #[tokio::test]
     async fn cancel_all_then_shutdown_is_clean() {
         let (_pub_sock, port) = helpers::make_pub_bound().await;
@@ -1550,8 +1392,6 @@ mod tests {
         // Sync cancel — must not block, must not panic.
         registry.cancel_all();
 
-        // shutdown should still join cleanly even though the per-worker
-        // tokens were already fired by cancel_all.
         let done = timeout(Duration::from_millis(500), registry.shutdown()).await;
         assert!(done.is_ok(), "shutdown after cancel_all must not hang");
     }
@@ -1572,8 +1412,6 @@ mod tests {
         assert!(extract_host("not a url").is_none());
     }
 
-    /// Direct unit test of [`decode_message`] — exercises sentinel and
-    /// bad-frame paths without involving sockets.
     #[test]
     fn decode_message_unit() {
         let id = KvWorkerId {
@@ -1585,9 +1423,7 @@ mod tests {
         let one_frame = ZmqMessage::from(Bytes::from_static(b"only"));
         assert!(decode_message(&id, one_frame, SubKind::Kv).is_none());
 
-        // Sentinel seq = -1 now surfaces as PublisherReset (not None) so
-        // the downstream pump can clear its cursor before a reconnecting
-        // publisher restarts from seq=1.
+        // END_SEQ surfaces as PublisherReset so the pump can clear its cursor.
         let sentinel = helpers::build_multipart(-1, b"ignored".to_vec());
         let reset = decode_message(&id, sentinel, SubKind::Kv).expect("END_SEQ forwards");
         assert!(matches!(reset, WorkerEvent::PublisherReset { .. }));
@@ -1611,8 +1447,6 @@ mod tests {
         assert_eq!(worker, id);
     }
 
-    /// A `SubKind::Load` subscriber decodes a bare LoadStat frame into
-    /// `WorkerEvent::Load`, and drops the END_SEQ sentinel (no cursor state).
     #[test]
     fn decode_message_load_kind() {
         let id = KvWorkerId {
@@ -1640,16 +1474,8 @@ mod tests {
         }
     }
 
-    /// Restart-resume contract: after a worker is removed and then re-added
-    /// to the same endpoint, the new subscriber must connect and forward
-    /// fresh events.  Confirms that `remove_worker` releases the SUB socket
-    /// cleanly enough that a same-endpoint reconnect succeeds within the
-    /// settle window, without leaking the previous task's state.
-    ///
-    /// Events published while the worker is detached are lost (ZMQ PUB/SUB
-    /// is fire-and-forget; no replay). Downstream cursor recovery happens
-    /// at the [`super::index::KvEventIndex`] layer, which clears the cursor
-    /// on `remove_worker` so the re-added worker's seq=1 is not filtered.
+    /// A worker re-added at its old endpoint after `remove_worker` gets fresh events;
+    /// batches sent while detached are lost, and `KvEventIndex` clears the cursor on removal.
     #[tokio::test]
     async fn restart_after_remove_picks_up_new_events() {
         let (mut pub_sock, port) = helpers::make_pub_bound().await;
@@ -1677,9 +1503,7 @@ mod tests {
         // Detach the subscriber while the publisher keeps going.
         registry.remove_worker(worker_url).await;
 
-        // This batch is sent while no subscriber is attached; it must be
-        // dropped (ZMQ PUB without a connected SUB is fire-and-forget) and
-        // must not poison the next subscriber's view.
+        // Sent while detached: PUB drops it, and it must not reach the next subscriber.
         let payload_b = helpers::encode_all_blocks_cleared_batch(2.0, Some(0));
         pub_sock
             .send(helpers::build_multipart(2, payload_b))

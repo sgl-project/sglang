@@ -1,111 +1,53 @@
 //! Hash-keyed radix tree for KV-cache event indexing.
 //!
-//! Each non-root node represents one block hash (`i64`). A node's children
-//! are keyed by the *next* block hash in a chain, so a path from the root
-//! down to depth `n` represents a chain of `n` block hashes. Every node
-//! tracks the [`KvWorkerId`]s that hold the chain ending at that node, and
-//! on which storage [`Tiers`] each of them holds it.
+//! Each non-root node is one block hash (`i64`), with children keyed by the next
+//! hash in the chain; each node records which [`KvWorkerId`]s hold the chain
+//! ending there, and on which [`Tiers`]. Fed by SGLang `BlockStored` /
+//! `BlockRemoved` / `AllBlocksCleared` events ([`super::wire`]),
+//! queried via [`HashTree::match_prefix`].
 //!
-//! The tree is fed by `BlockStored` / `BlockRemoved` / `AllBlocksCleared`
-//! events from SGLang workers (decoded by [`super::wire`]) and is queried
-//! via [`HashTree::match_prefix`] to find which workers already hold the
-//! longest prefix of an incoming request's block-hash chain.
+//! # Concurrency
 //!
-//! # Concurrency: sharded so the event-write path stops blocking matches
+//! The tree is split into [`N_SHARDS`] [`TreeState`]s keyed by the chain's root
+//! hash, so the event pump's per-event write lock blocks only one shard's reads.
+//! [`FxHashMap`] on block hashes is safe not because they are unguessable
+//! (they are unsalted SHA256, [`super::hash`]) but because planting one costs a
+//! real inference request; worker-keyed maps keep SipHash.
 //!
-//! WHY this is sharded: the routing hot path (`prefix_depths` /
-//! `match_prefix`) takes a read lock while the ZMQ KV-event pump takes a
-//! write lock per event per worker. Under one process-wide lock every
-//! write blocked every concurrent match. The tree is therefore split into
-//! [`N_SHARDS`] independent [`TreeState`]s, each behind its own
-//! [`parking_lot::RwLock`], keyed by the chain's ROOT block hash — a radix
-//! chain lives entirely inside one shard, so a routing read takes exactly
-//! one shard's lock and reads on other roots proceed in parallel. The
-//! integer-keyed maps (`children`, `by_hash`, `nodes` — block hashes and
-//! node ids) use [`FxHashMap`] / [`FxHashSet`]; worker-keyed maps keep
-//! std's SipHash.
-//!
-//! Dropping SipHash there is safe, but NOT because the keys are
-//! unguessable: block hashes are unsalted SHA256 over token blocks
-//! ([`super::hash`]), so a client holding the tokenizer computes them
-//! offline, and steering one into a chosen FxHash bucket is a search over
-//! digests, not an inversion. What makes it safe is the cost of PLANTING
-//! one: a hash reaches these maps only when an engine actually caches that
-//! block and publishes `BlockStored`, so each colliding key costs a real
-//! inference request. Node ids are minted internally and never
-//! client-influenced.
-//!
-//! [`HashTree::route_insert`] / [`HashTree::route_match`] resolve a
-//! `Some(parent_hash)` across shards so a continuation lands in the shard
-//! already holding its chain; `remove` / `clear_worker` / `evict_lru` fan
-//! out over every shard, and the node cap `evict_lru` applies is global.
-//!
-//! Those cross-shard passes never hold all shards at once, so a second
-//! writer landing between a scan and the write it feeds can re-root a
-//! chain under the chosen SHARD's sentinel rather than
-//! `shard_of(block_hashes[0])` — where `match_prefix(None, …)` can never
-//! reach it again. There genuinely are two writers: the pump, and
-//! `KvEventIndex::remove_worker` on the service-discovery task. So
-//! [`HashTree::writer`] serialises them. Readers never take it.
-//!
-//! Which leaves a reader's own scan able to go stale the same way, so
-//! [`HashTree::descend_match_shard`] re-checks the parent it resolved under
-//! the descent's own lock and falls back to `shard_of(block_hashes[0])` —
-//! never to the nominated shard's sentinel, which would match nothing.
+//! [`HashTree::route_insert`] / [`HashTree::route_match`] resolve a parent hash
+//! across shards; `remove` / `clear_worker` / `evict_lru` fan out, and the
+//! node cap is global. A writer landing between such a scan and its write could
+//! re-root a chain where `match_prefix(None, ..)` never finds it, so
+//! [`HashTree::writer`] serialises the two writers (the pump and
+//! `KvEventIndex::remove_worker`); readers never take it.
+//! [`HashTree::descend_match_shard`] re-checks its resolved parent instead,
+//! falling back to `shard_of(block_hashes[0])`.
 //!
 //! # Reverse index
 //!
-//! `BlockRemoved` events carry only `block_hashes` and no parent context,
-//! so without an index from `block_hash → set of nodes carrying that hash`
-//! we'd have to walk the whole tree. We maintain that reverse index per
-//! shard as [`TreeState::by_hash`]. The same hash can legitimately appear
-//! at multiple positions (e.g. as the last block of one chain and as the
-//! second block of another) within a shard, so each entry is a *set* of
-//! node IDs.
+//! `BlockRemoved` carries no parent, so [`TreeState::by_hash`] maps a hash to the
+//! *set* of nodes carrying it; one hash can sit at several positions in a shard.
 //!
 //! # Pruning
 //!
-//! When a worker is dropped from a node and the node has no remaining
-//! workers AND no children, we detach it from its parent and remove it
-//! from the reverse index. Pruning cascades upward iteratively (chains
-//! can be deep — the recursive form would risk stack-overflow for
-//! pathological inputs). Pruning is shard-local: a chain never crosses a
-//! shard boundary.
+//! A node with no workers and no children is detached, cascading upward
+//! iteratively since chains can be deep. A chain never crosses a shard.
 //!
 //! # Storage tiers
 //!
-//! An engine running a hierarchical cache holds a block on device and, once
-//! it has been backed up, on host pinned memory (or a storage backend) as
-//! well. It publishes every tier transition as its own event, tagged with a
-//! `medium`: a host-tier `BlockStored` when the backup lands, a device-tier
-//! `BlockRemoved` when the device copy is evicted, a host-tier `BlockRemoved`
-//! when the host copy goes.
+//! A hierarchical-cache engine publishes each tier transition as its own event
+//! tagged with a `medium`. Write-through publishes the host store before the
+//! device eviction, write-back the inverse, so neither order may be assumed:
+//! a removal clears only its own tier, and a later store re-adds the chain.
 //!
-//! The two orderings differ by write policy, and neither may be assumed.
-//! Under write-through the pending D2H copy holds a lock ref, so the host
-//! store is published before the device eviction. Under write-back
-//! `_detach_backuped` publishes the device removal as soon as host slots are
-//! reserved and the host store follows only when the copy lands — the
-//! inverse. The tree therefore has to converge either way, and it does: a
-//! removal clears only its own tier, and a later store re-adds the chain.
+//! A worker owns a block while it holds it on ANY tier, because a device
+//! eviction that leaves a host copy still lets the worker load the prefix back
+//! cheaply. [`MatchResult::tiers`] reports the tier per owner;
+//! [`HashTree::prefix_depths`] is tier-blind by design.
 //!
-//! WHY the tree keeps the tiers apart instead of treating any `BlockRemoved`
-//! as "the worker lost the block": a device eviction that leaves a host copy
-//! behind does not end the worker's ability to serve the prefix — it loads
-//! the copy back at memory speed instead of recomputing it. Dropping the
-//! worker on that event makes every prefix unroutable after one device
-//! turnover, even though the fleet still holds it for the whole host
-//! retention horizon, and the repeat request lands on a random worker that
-//! then prefills it cold. Ownership here is "any tier", which is what makes
-//! the prefix routable again. [`MatchResult::tiers`] reports which tier each
-//! owner holds it on so a policy can price a load-back against an in-place
-//! hit; no policy consumes it yet — the routing path reads
-//! [`HashTree::prefix_depths`], which is tier-blind by design.
-//!
-//! Untagged events keep their pre-tiering meaning: an untagged store is a
-//! device store, an untagged remove clears every tier. A store tagged with a
-//! `medium` this build cannot rank is dropped rather than filed under a
-//! guess, while a removal tagged with one clears every tier. See [`Tiers`].
+//! An untagged store is a device store and an untagged remove clears every tier.
+//! A store with an unrankable `medium` is dropped, a removal with one clears
+//! every tier. See [`Tiers`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -123,9 +65,8 @@ mod snapshot;
 pub(super) use snapshot::ShapeViolation;
 pub use snapshot::{RestoreError, SnapshotNode};
 
-/// Number of independent tree shards. A power of two so `shard_of` selects
-/// with a shift, not a modulo; large enough that distinct chains rarely
-/// collide, small enough that a per-shard `RwLock` + arena is free.
+/// A power of two so `shard_of` selects with a shift; large enough that chains
+/// rarely collide, small enough that a per-shard lock and arena are free.
 const N_SHARDS: usize = 32;
 
 // `shard_of` shifts by `64 - log2(N_SHARDS)` and indexes `shards`, both
@@ -146,13 +87,10 @@ fn shard_of(root_hash: i64) -> usize {
     (mixed >> (64 - N_SHARDS.trailing_zeros())) as usize
 }
 
-/// Process-wide monotonic epoch used to derive cheap millisecond-resolution
-/// timestamps for [`Node::last_used`]. Initialised lazily on first use.
+/// Epoch for the cheap millisecond timestamps in [`Node::last_used`].
 static PROCESS_EPOCH: OnceLock<Instant> = OnceLock::new();
 
-/// Milliseconds elapsed since [`PROCESS_EPOCH`]. Truncates from `u128` to
-/// `u64`; with `u64` ms we have ~584 million years of headroom which is
-/// fine.
+/// Milliseconds since [`PROCESS_EPOCH`]; the `u64` truncation is safe.
 fn now_millis() -> u64 {
     PROCESS_EPOCH
         .get_or_init(Instant::now)
@@ -160,26 +98,13 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Identifier for a worker endpoint, refined by DP-attention rank.
+/// A worker endpoint refined by DP-attention rank: each rank publishes its own
+/// event stream over a disjoint slice of the KV cache.
+/// Distinct from the registry's UUID [`crate::core::worker_registry::WorkerId`].
 ///
-/// Workers running with multiple DP-attention ranks emit independent event
-/// streams (one per rank), and each rank holds a disjoint slice of the KV
-/// cache. We therefore track them as separate cache-holders.
-///
-/// The name is intentionally namespaced (`KvWorkerId`) to avoid collision
-/// with [`crate::core::worker_registry::WorkerId`], which is a UUID-string
-/// identity used by the worker registry.
-///
-/// # Provenance
-///
-/// Instances should only be minted by the kv_events module itself
-/// (subscriber registry → pump → tree) so the `url` always comes from
-/// the worker registry's authoritative URL. External callers can read
-/// the fields and use them to query the tree, but constructing fresh
-/// IDs from arbitrary URLs would let routing logic resolve to
-/// non-registered endpoints. Use [`KvWorkerId::new`] when constructing
-/// from a tested path; do not assemble struct literals from
-/// user-controlled input.
+/// Mint only inside kv_events, so `url` is always the registry's URL;
+/// an id built from user input would let routing resolve to an unregistered
+/// endpoint.
 #[derive(Clone, Eq, Hash, PartialEq, Debug)]
 pub struct KvWorkerId {
     pub url: String,
@@ -187,19 +112,14 @@ pub struct KvWorkerId {
 }
 
 impl KvWorkerId {
-    /// Explicit constructor — preferred over struct-literal syntax so
-    /// future tightening of provenance has a single chokepoint.
+    /// Prefer over a struct literal, so provenance has a single chokepoint.
     pub fn new(url: String, dp_rank: u32) -> Self {
         Self { url, dp_rank }
     }
 }
 
-/// The storage tiers on which one worker holds one block — a bitset, because
-/// a backed-up block sits on device AND host at once (module docs, "Storage
-/// tiers").
-///
-/// A worker owns a block, and is a routing candidate for it, while ANY bit is
-/// set.
+/// Bitset of the tiers on which one worker holds one block, since a backed-up
+/// block sits on device and host at once. Any set bit makes it a routing owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Tiers(u8);
 
@@ -212,22 +132,16 @@ impl Tiers {
     /// L3 local SSD / NVMe: `medium = "DISK"`.
     pub const DISK: Tiers = Tiers(1 << 2);
     /// L4 shared / remote pool, e.g. Mooncake: `medium = "EXTERNAL"`.
-    ///
-    /// Separate from [`Self::DISK`] rather than folded into one "storage" bit
-    /// because the engine treats them as distinct tiers
-    /// (`StorageMedium` in `python/sglang/srt/disaggregation/kv_events.py`).
-    /// Sharing a bit would make an L3 eviction erase the router's knowledge of
-    /// an L4 copy on a fleet running both.
+    /// Its own bit because the engine's `StorageMedium` keeps L3 and L4 apart;
+    /// sharing one would let an L3 eviction erase an L4 copy.
     pub const EXTERNAL: Tiers = Tiers(1 << 3);
     /// Every tier — what an untagged `BlockRemoved` clears.
     pub const ALL: Tiers = Self::DEVICE
         .union(Self::HOST)
         .union(Self::DISK)
         .union(Self::EXTERNAL);
-    /// Every tier with its metric label, in bit order. [`TierCounts`] is
-    /// indexed by position in this table, and the order is preference order:
-    /// a device copy is served in place, a host copy by load-back from host
-    /// memory, local disk slower still, a remote pool slower again.
+    /// Every tier with its metric label; [`TierCounts`] is indexed by position.
+    /// Bit order is also preference order, cheapest load-back first.
     pub const SLOTS: [(Tiers, &'static str); TIER_SLOT_COUNT] = [
         (Self::DEVICE, "device"),
         (Self::HOST, "host"),
@@ -235,11 +149,9 @@ impl Tiers {
         (Self::EXTERNAL, "external"),
     ];
 
-    /// The `StorageMedium` strings SGLang puts on the wire
-    /// (`python/sglang/srt/disaggregation/kv_events.py`) and the tier each
-    /// lands on. The single source for both the tree's ranking and the event
-    /// tally's medium labels, so a medium the tree ranks can never be one the
-    /// tally reports as unknown.
+    /// SGLang's wire `StorageMedium` strings
+    /// (`python/sglang/srt/disaggregation/kv_events.py`) and their tiers;
+    /// the single source for both the tree's ranking and the tally's labels.
     pub const WIRE_MEDIA: [(&'static str, Tiers); 4] = [
         ("GPU", Self::DEVICE),
         ("CPU_PINNED", Self::HOST),
@@ -247,18 +159,10 @@ impl Tiers {
         ("EXTERNAL", Self::EXTERNAL),
     ];
 
-    /// The tiers a `BlockStored` tagged `medium` lands on. Untagged reads as
-    /// device, which is what the event meant before tiers existed. An unknown
-    /// tag lands on NO tier: the store is dropped rather than filed under a
-    /// guess.
-    ///
-    /// Filing it on device would turn every store on a future medium into a
-    /// device hit. Filing it on an "unranked" catch-all tier is no better — it
-    /// makes the worker a routing candidate for a tier whose cost this build
-    /// cannot price, and a load-back the router assumes is cheap may be a
-    /// remote fetch dearer than recomputing the prefix elsewhere. Dropping
-    /// costs at most one cold prefill and is visible: the event still counts
-    /// on the tally's `unknown` medium row, and the string is logged once.
+    /// The tiers a `BlockStored` tagged `medium` lands on; untagged is device.
+    /// An unknown tag lands on none, so the store is dropped: guessing a tier
+    /// could price a remote fetch as cheap, while dropping costs one cold
+    /// prefill and still shows on the tally's `unknown` row.
     pub fn for_store(medium: Option<&str>) -> Tiers {
         match medium {
             None => Self::DEVICE,
@@ -268,15 +172,8 @@ impl Tiers {
 
     /// The tiers a `BlockRemoved` tagged `medium` clears: its own, or every
     /// tier when the tag is absent or unrecognised.
-    ///
-    /// Deliberately asymmetric with [`Self::for_store`], which drops an
-    /// unknown tag instead of widening it. A removal is the one direction
-    /// where guessing wide is safe and guessing narrow is not: over-removal
-    /// costs at most one cold prefill, while a permanently stale owner is the
-    /// one failure a routing index must never manufacture. An engine that
-    /// stores under a `medium` this build knows but frees the block under one
-    /// it does not would otherwise strand that bit until the worker is
-    /// dropped entirely.
+    /// Unlike [`Self::for_store`] it guesses wide, because over-removal costs
+    /// one cold prefill while a permanently stale owner must never happen.
     pub fn for_remove(medium: Option<&str>) -> Tiers {
         medium.and_then(Self::known).unwrap_or(Self::ALL)
     }
@@ -315,34 +212,20 @@ impl Tiers {
         Tiers(self.0 & !other.0)
     }
 
-    /// The bits set in either. `const` so the tier tables can be built from
-    /// the individual tiers rather than from raw bit arithmetic.
+    /// The bits set in either; `const` so the tier tables can use it.
     pub const fn union(self, other: Tiers) -> Tiers {
         Tiers(self.0 | other.0)
     }
 
-    /// Raw bits, for the one place a tier set crosses a process boundary:
-    /// [`SnapshotNode::tiers`].
+    /// Raw bits; a tier set crosses a process boundary only in [`SnapshotNode::tiers`].
     pub const fn bits(self) -> u8 {
         self.0
     }
 
     /// Read a [`SnapshotNode::tiers`] entry back, keeping only the tiers this
-    /// build ranks.
-    ///
-    /// Follows [`Self::for_store`]'s rule, not [`Self::for_remove`]'s, because
-    /// a restore *is* a store: a bit this build does not know is dropped, and
-    /// an entry naming only unknown bits comes back empty so
-    /// [`HashTree::restore_snapshot`] skips that carrier entirely. The two
-    /// alternatives are both worse than one cold prefill — folding an unknown
-    /// bit onto device turns a future tier's carrier into a preferred device
-    /// owner here, and widening to [`Self::ALL`] invents holdings the
-    /// producer never claimed.
-    ///
-    /// Zero reads as empty for the same reason. It cannot come from a
-    /// same-build producer (every exported carrier holds at least one bit),
-    /// so it is either a malformed producer or a carrier that holds only
-    /// tiers this build has no name for.
+    /// build ranks. A restore is a store, so like [`Self::for_store`] unknown
+    /// bits are dropped; an empty result (including zero) makes
+    /// [`HashTree::restore_snapshot`] skip that carrier.
     pub const fn from_bits(bits: u8) -> Tiers {
         Tiers(bits & Self::ALL.0)
     }
@@ -351,17 +234,9 @@ impl Tiers {
 /// Number of entries in [`Tiers::SLOTS`].
 pub const TIER_SLOT_COUNT: usize = 4;
 
-// The three tier tables have to stay in step, and nothing about adding a
-// `pub const` tier would otherwise force it:
-//
-// * a bit missing from `ALL` is a bit an untagged `BlockRemoved` never
-//   clears — a permanently stale owner, the one failure `for_remove` exists
-//   to prevent;
-// * a bit missing from `SLOTS` is never counted by `tally_tiers` nor
-//   decremented by `account_remove`, so the tier is invisible in
-//   `sgl_router_kv_tree_blocks` — this bug class, one tier later. The
-//   `debug_recount_occupancy` oracle cannot catch it either, because it
-//   walks the same `SLOTS`.
+// Keeps the three tier tables in step when a tier is added: a bit missing from
+// `ALL` is never cleared by an untagged remove (a stale owner), and one missing
+// from `SLOTS` is invisible to the occupancy metric and its debug recount.
 const _: () = {
     let mut union = Tiers(0);
     let mut i = 0;
@@ -396,11 +271,8 @@ fn tally_tiers(counts: &mut TierCounts, bits: Tiers) {
     }
 }
 
-/// Add `tiers` to `worker`'s hold in `carriers`, creating the entry on first
-/// sight, and return the bits that were newly set. One lookup on the re-store
-/// path — under a hierarchical cache the host backup of a chain the worker
-/// already holds on device, the common case — and two on first sight. Never
-/// leaves an entry with no bits, which [`TreeState::remove`] relies on.
+/// Add `tiers` to `worker`'s hold and return the newly set bits.
+/// Never leaves an entry with no bits, which [`TreeState::remove`] relies on.
 fn add_tiers(
     carriers: &mut HashMap<KvWorkerId, Tiers>,
     worker: &KvWorkerId,
@@ -419,28 +291,20 @@ fn add_tiers(
     }
 }
 
-/// Result of [`HashTree::match_prefix`]. `Default` is the no-match result:
-/// zero depth, no carriers on any tier.
+/// Result of [`HashTree::match_prefix`]; `Default` is the no-match result.
 #[derive(Debug, Clone, Default)]
 pub struct MatchResult {
-    /// Number of leading block hashes from the input slice that matched a
-    /// path from the root.
+    /// Leading input hashes that matched a path from the root.
     pub matched_blocks: usize,
-    /// Every worker holding the deepest matched node, and the tiers it holds
-    /// it on. A worker without the device bit serves the prefix by loading it
-    /// back from a lower tier — cheaper than a cold prefill, dearer than
-    /// serving in place — which is the ordering a policy would prefer on.
-    /// Empty when `matched_blocks == 0`.
-    ///
-    /// The single carrier list: [`Self::workers`] and [`Self::device_workers`]
-    /// are derived from it, so no two views of one match can disagree.
+    /// Every worker holding the deepest matched node, with its tiers; empty when
+    /// `matched_blocks == 0`. A worker without the device bit must load back.
+    /// The single carrier list, so the derived views can never disagree.
     pub tiers: HashMap<KvWorkerId, Tiers>,
 }
 
 impl MatchResult {
-    /// Whether `worker` holds the deepest matched node on any tier.
-    /// Prefer this to `workers().contains(…)`, which clones every carrier
-    /// (each one a `String` allocation) to answer a membership question.
+    /// Whether `worker` holds the deepest matched node on any tier;
+    /// unlike `workers().contains(..)` it clones no carrier.
     pub fn holds(&self, worker: &KvWorkerId) -> bool {
         self.tiers.contains_key(worker)
     }
@@ -450,8 +314,7 @@ impl MatchResult {
         self.tiers.keys().cloned().collect()
     }
 
-    /// The subset of [`Self::workers`] holding the deepest matched node on
-    /// device.
+    /// The subset of [`Self::workers`] holding it on device.
     pub fn device_workers(&self) -> HashSet<KvWorkerId> {
         self.tiers
             .iter()
@@ -461,44 +324,23 @@ impl MatchResult {
     }
 }
 
-/// Internal stable handle to a tree node.
-///
-/// We use an arena (`FxHashMap<NodeId, Node>`) instead of `Arc<RwLock<Node>>`
-/// + `Weak` because:
-/// 1. We need to enumerate every node (e.g. for `clear_worker` and
-///    `evict_lru`); a flat map is direct and cheap.
-/// 2. The reverse index needs a *stable* key per node — `Weak` would force
-///    upgrades on every lookup and complicate prune semantics.
-///
-/// Node ids are unique *within a shard* only; the shard a node lives in is
-/// implied by the chain root, never stored.
+/// Stable arena key for a node, so whole-tree passes can enumerate nodes and
+/// the reverse index has a stable key. Unique within a shard only.
 type NodeId = u64;
 
-/// A single tree node. Non-root nodes are keyed by their `block_hash`
-/// (which is shared across siblings only insofar as the reverse index
-/// records every position); within a single parent's children map there is
-/// at most one child per `block_hash`.
-///
-/// `last_used` is an [`AtomicU64`] of milliseconds since [`PROCESS_EPOCH`].
-/// Storing it atomically lets the match path mutate it under a *read* lock
-/// on [`TreeState`], which is essential because matching is on the routing
-/// hot path. `Relaxed` ordering is sufficient: eviction only needs
-/// approximate freshness, and ties at the millisecond boundary tie-break
-/// by [`NodeId`].
+/// One tree node. `last_used` (ms since [`PROCESS_EPOCH`]) is atomic so the
+/// match path can bump it under a read lock; `Relaxed` suffices because
+/// eviction needs only approximate freshness, with ties broken by [`NodeId`].
 #[derive(Debug)]
 struct Node {
     block_hash: i64,
-    /// Hash of the parent block on the chain that produced this node, or
-    /// `None` if this node hangs directly off the root sentinel.
-    /// Stored for diagnostic / chain-reconstruction only — the actual
-    /// parent pointer lives in [`Node::parent`]. Tests and future
-    /// inspectors read this; suppress dead-code warning in non-test builds.
+    /// The parent hash the producing event named, kept even on a root-attached
+    /// chain; diagnostic only (read by tests), the real link is [`Node::parent`].
     #[allow(dead_code)]
     parent_block_hash: Option<i64>,
     /// `None` only for the root sentinel.
     parent: Option<NodeId>,
-    /// Carriers of the chain ending here, each with the tiers it holds the
-    /// block on. A carrier is dropped the moment its last tier bit clears;
+    /// Carriers of the chain ending here, with their tiers;
     /// an entry with empty tiers never exists (see [`TreeState::insert`]).
     workers: HashMap<KvWorkerId, Tiers>,
     /// Children keyed by next-block hash.
@@ -519,51 +361,33 @@ impl Node {
     }
 }
 
-/// Where one `insert` hangs its chain. The two halves are separate because a
-/// root-attach still records the hash: [`TreeState::resolve_parent`]'s case 4
-/// keeps `parent_block_hash` on the chain's first node so a later
-/// `BlockStored` for that parent can relink it through the reverse index, and
-/// [`HashTree::route_insert`] has to force a root-attach in a shard that may
-/// hold a local copy of the hash. Collapsing them back into one `Option`
-/// silently drops that breadcrumb.
+/// Where one `insert` hangs its chain. Two fields because a forced root-attach
+/// ([`HashTree::route_insert`]) must still record the parent hash as a
+/// breadcrumb; one `Option` would silently drop it.
 #[derive(Clone, Copy, Debug)]
 struct ParentLink {
-    /// Fed to [`TreeState::resolve_parent`]. `None` roots the chain whatever
-    /// the shard's own reverse index holds.
+    /// Fed to [`TreeState::resolve_parent`]; `None` forces a root-attach.
     attach: Option<i64>,
     /// Recorded as the first node's `parent_block_hash`.
     breadcrumb: Option<i64>,
 }
 
-/// Inner mutable state of one shard. Cross-method invariants:
+/// One shard's state. Invariants:
 ///
-/// * `nodes[ROOT_ID]` is always present and is the only node with
-///   `parent == None`.
-/// * For every non-root node `n`: `nodes[n.parent].children[&n.block_hash]
-///   == n`'s id (i.e., parent's child pointer round-trips).
-/// * `by_hash[h]` contains the id of every non-root node `n` with
-///   `n.block_hash == h`. Root is never in `by_hash`.
-/// * Pruning runs after every worker-removal that empties a node: prune
-///   detaches from parent, removes from `by_hash`, and recurses upward.
-///
-/// Node ids are unique within this shard only; two shards may both mint
-/// id 1.
+/// * `nodes[ROOT_ID]` always exists and is the only node with no parent.
+/// * Every non-root node's parent maps its `block_hash` back to it.
+/// * `by_hash[h]` holds every non-root node with hash `h`, never the root.
+/// * A node emptied of workers and children is pruned at once.
 #[derive(Debug)]
 struct TreeState {
     nodes: FxHashMap<NodeId, Node>,
     by_hash: FxHashMap<i64, FxHashSet<NodeId>>,
     next_id: NodeId,
-    /// Nodes each carrier holds, per tier. Booked at every site where a
-    /// carrier's tier bits on a node change (`account_add` /
-    /// `account_remove`), so a scrape reads it without walking the tree. A
-    /// carrier holding nothing has no row.
+    /// Nodes each carrier holds, per tier, so a scrape need not walk the tree;
+    /// a carrier holding nothing has no row.
     occupancy: HashMap<KvWorkerId, TierCounts>,
-    /// Times the occupancy bookkeeping contradicted itself, by reason. Both
-    /// reasons mean the same class of bug — bits added without being booked —
-    /// but the symptom the operator sees is a worker's
-    /// `sgl_router_kv_tree_blocks` rows vanishing while it still holds nodes,
-    /// which the metric's own HELP text says means "this worker publishes
-    /// nothing". A counter is the only thing separating those.
+    /// Times occupancy bookkeeping contradicted itself, by reason; the only
+    /// signal telling a booking bug apart from a worker that publishes nothing.
     accounting_errors: [u64; ACCOUNTING_REASONS.len()],
 }
 
@@ -573,9 +397,8 @@ const REASON_MISSING_ROW: usize = 0;
 const REASON_UNDERFLOW: usize = 1;
 
 const ROOT_ID: NodeId = 0;
-/// Sentinel block_hash for the root. Real workers can in principle emit
-/// `i64::MIN`, but the root is never looked up via `by_hash` so collisions
-/// don't matter.
+/// Sentinel block_hash for the root; a real `i64::MIN` cannot collide with it
+/// because the root is never looked up via `by_hash`.
 const ROOT_HASH_SENTINEL: i64 = i64::MIN;
 
 impl TreeState {
@@ -607,8 +430,7 @@ impl TreeState {
         id
     }
 
-    /// Book `delta` nodes-per-tier newly held by `worker` — one row lookup
-    /// for a whole chain, which is how `insert` uses it.
+    /// Book `delta` nodes-per-tier newly held by `worker`, one lookup per chain.
     fn account_add(&mut self, worker: &KvWorkerId, delta: TierCounts) {
         if delta.iter().all(|&c| c == 0) {
             return;
@@ -632,14 +454,9 @@ impl TreeState {
         self.account_remove_counts(worker, delta);
     }
 
-    /// Book `delta` nodes-per-tier `worker` no longer holds, dropping the
-    /// carrier's row once it holds nothing.
-    ///
-    /// Takes a whole-carrier delta rather than one node's bits so
-    /// `clear_worker` can book a fleet-sized tree in ONE call: booking per
-    /// node would emit one `error!` per node on the failure path below, which
-    /// is hundreds of thousands of lines written while holding the tree's
-    /// write lock — every routing decision blocked behind a log flood.
+    /// Book `delta` nodes-per-tier `worker` no longer holds, dropping its row at
+    /// zero. Takes a whole-carrier delta so `clear_worker` logs a failure once,
+    /// not once per node while holding the write lock.
     fn account_remove_counts(&mut self, worker: &KvWorkerId, delta: TierCounts) {
         if delta.iter().all(|&c| c == 0) {
             return;
@@ -659,11 +476,8 @@ impl TreeState {
             *acc = acc.saturating_sub(d);
         }
         if underflowed {
-            // Saturating so a release can never wrap the gauge — but then the
-            // all-zero test below would drop a row for a carrier that still
-            // holds nodes, and a missing series reads as "this worker
-            // publishes nothing". Count it so a release build is not blind;
-            // assert so a debug run stops at the release that exposed it.
+            // Saturating can drop the row of a carrier that still holds nodes,
+            // so count it in release builds and stop debug runs here.
             self.accounting_errors[REASON_UNDERFLOW] += 1;
             debug_assert!(
                 false,
@@ -675,13 +489,8 @@ impl TreeState {
         }
     }
 
-    /// Insert a brand-new child under `parent_id` and wire up the reverse
-    /// index. Caller is responsible for ensuring `parent_id`'s child slot
-    /// for `block_hash` is empty (else this overwrites it).
-    ///
-    /// Returns `None` if `parent_id` does not exist — an invariant
-    /// violation. The pump runs in a long-lived task; panicking here would
-    /// take down the entire cache-aware path, so we log and bail.
+    /// Insert a new child under `parent_id`, overwriting any existing slot.
+    /// A missing parent logs and returns `None`: a panic would kill the pump.
     fn create_child(
         &mut self,
         parent_id: NodeId,
@@ -707,9 +516,8 @@ impl TreeState {
         Some(id)
     }
 
-    /// The child of `parent_id` keyed by `block_hash`, created with
-    /// `parent_block_hash` as its breadcrumb when absent. `None` only when
-    /// `parent_id` itself is missing — see [`Self::create_child`].
+    /// The child of `parent_id` keyed by `block_hash`, created when absent.
+    /// `None` only when `parent_id` itself is missing.
     fn child_or_create(
         &mut self,
         parent_id: NodeId,
@@ -723,27 +531,10 @@ impl TreeState {
         existing.or_else(|| self.create_child(parent_id, block_hash, parent_block_hash))
     }
 
-    /// Pick the parent node id for an incoming `BlockStored` event, given
-    /// that this shard is already known to own (or be the fallback for)
-    /// the chain.
-    ///
-    /// Resolution order:
-    /// 1. `parent_hash == None` → root.
-    /// 2. There's exactly one node carrying `parent_hash` → use it.
-    /// 3. Multiple candidates: prefer one already containing `worker`.
-    /// 4. None contain the worker: log at debug, fall back to root. The
-    ///    new chain still carries `parent_hash` on its first node so that
-    ///    if the parent's `BlockStored` arrives later we can reconstruct
-    ///    the link via the reverse index.
-    ///
-    /// Takes only [`ParentLink::attach`]; case 4's breadcrumb is applied by
-    /// the caller, which is why a forced root-attach can still record the
-    /// hash. [`HashTree::route_insert`] has already made this decision
-    /// globally: case 1 and the ambiguous-with-no-owner fallback arrive as
-    /// `None`, a `parent_hash` no shard carries arrives unchanged and lands
-    /// on case 4 here, and cases 2 / 3 arrive pointing into this shard. The
-    /// remaining root fallback is defence against a routing/local
-    /// disagreement.
+    /// Pick the parent node for a `BlockStored` in this shard: the sole node
+    /// carrying `parent_hash`, else one `worker` already holds, else the root.
+    /// [`HashTree::route_insert`] has already decided globally, so the root
+    /// fallback here only guards a routing/local disagreement.
     fn resolve_parent(&self, worker: &KvWorkerId, parent_hash: Option<i64>) -> NodeId {
         let Some(parent_hash) = parent_hash else {
             return ROOT_ID;
@@ -780,10 +571,8 @@ impl TreeState {
         ROOT_ID
     }
 
-    /// Mark every node along `block_hashes` as held by `worker` on `tiers`,
-    /// adding to whatever tiers it already holds there. Empty `tiers` is a
-    /// no-op: a carrier entry with no tier would be an owner of nothing, and
-    /// `remove` relies on "no bits ⇒ no entry" to know when to prune.
+    /// Add `tiers` to `worker`'s hold along `block_hashes`. Empty `tiers` is a
+    /// no-op, since `remove` prunes on "no bits means no entry".
     fn insert(
         &mut self,
         worker: &KvWorkerId,
@@ -800,10 +589,8 @@ impl TreeState {
         // Occupancy is booked once for the whole chain, not per block.
         let mut delta = TierCounts::default();
         for &h in block_hashes {
-            // `break`, not `return`: the tier bits are already written into
-            // the nodes visited so far, so bailing without reaching
-            // `account_add` below would leave the occupancy gauge permanently
-            // short by exactly those blocks.
+            // `break`, not `return`: the nodes visited so far still need
+            // booking in `account_add` below.
             let Some(child_id) = self.child_or_create(current, h, prev_hash) else {
                 break;
             };
@@ -824,19 +611,16 @@ impl TreeState {
         self.account_add(worker, delta);
     }
 
-    /// Whether this shard's reverse index carries any of `block_hashes`, so
-    /// [`HashTree::remove_tiered`] can skip it under a read lock instead of
-    /// write-locking it to find there was nothing to do.
+    /// Whether this shard carries any of `block_hashes`, so a removal can skip
+    /// it under a read lock.
     fn carries_any(&self, block_hashes: &[i64]) -> bool {
         block_hashes.iter().any(|h| self.by_hash.contains_key(h))
     }
 
-    /// Clear `tiers` from `worker`'s hold on every node carrying any hash in
-    /// `block_hashes`. The worker leaves a node once no tier bit remains, and
-    /// a node that becomes empty + childless is pruned.
+    /// Clear `tiers` from `worker`'s hold on every node carrying any of
+    /// `block_hashes`, pruning nodes left empty and childless.
     fn remove(&mut self, worker: &KvWorkerId, block_hashes: &[i64], tiers: Tiers) {
-        // Collect all node ids to touch (fixed snapshot — avoids iterator
-        // invalidation when pruning mutates `by_hash`).
+        // Snapshot the ids first: pruning mutates `by_hash`.
         let mut targets: Vec<NodeId> = Vec::new();
         for h in block_hashes {
             if let Some(set) = self.by_hash.get(h) {
@@ -844,8 +628,7 @@ impl TreeState {
             }
         }
         for id in targets {
-            // Node may already be gone if a previous prune in this batch
-            // cascaded through it — skip silently.
+            // An earlier prune in this batch may already have removed it.
             let (prunable, released) = match self.nodes.get_mut(&id) {
                 Some(node) => {
                     let mut released = Tiers::default();
@@ -879,8 +662,7 @@ impl TreeState {
             .filter(|&id| id != ROOT_ID)
             .collect();
         let mut prune_candidates: Vec<NodeId> = Vec::new();
-        // Accumulated over every node, then booked once — see
-        // `account_remove_counts`.
+        // Booked once for every node; see `account_remove_counts`.
         let mut delta = TierCounts::default();
         for id in ids {
             let removed = self.nodes.get_mut(&id).and_then(|node| {
@@ -897,16 +679,14 @@ impl TreeState {
         }
         self.account_remove_counts(worker, delta);
         for id in prune_candidates {
-            // Re-check: cascading prune from a sibling may have already
-            // removed this id.
+            // A sibling's cascading prune may already have removed it.
             if self.nodes.contains_key(&id) {
                 self.prune_cascade(id);
             }
         }
     }
 
-    /// Detach `start` and walk up, pruning every ancestor that becomes
-    /// empty + childless. Iterative — chains can be long.
+    /// Prune `start` and every ancestor it empties; iterative, since chains can be long.
     fn prune_cascade(&mut self, start: NodeId) {
         let mut cursor = start;
         loop {
@@ -963,26 +743,14 @@ impl TreeState {
         }
     }
 
-    /// Read-only match path. Takes `&self` (not `&mut self`) so the public
-    /// [`HashTree::match_prefix`] can hold only a read lock — matching is
-    /// the routing hot path and write-locking it would serialise all
-    /// routing decisions across tokio worker threads. `last_used` is an
-    /// [`AtomicU64`] specifically so the touch-on-descend can happen
-    /// through a shared reference.
-    ///
-    /// Note the asymmetry with [`TreeState::resolve_parent`] (used by
-    /// `insert`): that function disambiguates a multi-candidate
-    /// `parent_hash` by preferring a worker-owned node. This function has
-    /// no worker context to do the same, so multiple candidates fall back
-    /// to root. The asymmetry is intentional for v1; the public doc on
-    /// [`HashTree::match_prefix`] documents the policy for callers.
+    /// Takes `&self` so routing holds only a read lock. Unlike
+    /// [`TreeState::resolve_parent`] it has no worker context,
+    /// so an ambiguous `parent_hash` falls back to root.
     fn match_prefix(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> MatchResult {
         if block_hashes.is_empty() {
             return MatchResult::default();
         }
-        // Determine starting node: root, or the unique node carrying
-        // `parent_hash`. Multiple matches: bail to root (caller should
-        // have a single canonical context).
+        // Start at the unique node carrying `parent_hash`, else the root.
         let start = match parent_hash {
             None => ROOT_ID,
             Some(p) => match self.by_hash.get(&p) {
@@ -1001,8 +769,7 @@ impl TreeState {
                 .and_then(|n| n.children.get(&h).copied());
             match next {
                 Some(child_id) => {
-                    // Touch as we descend. Atomic store under a shared
-                    // borrow — no &mut needed.
+                    // Touch as we descend; atomic, so no `&mut` needed.
                     if let Some(child) = self.nodes.get(&child_id) {
                         child.last_used.store(now, Ordering::Relaxed);
                     }
@@ -1012,9 +779,8 @@ impl TreeState {
                 None => break,
             }
         }
-        // `current` is the deepest matched node once anything matched; with
-        // nothing matched it is still `start`, whose carriers belong to the
-        // caller-supplied parent and must not be reported.
+        // With nothing matched `current` is still `start`,
+        // whose carriers belong to the caller's parent and must not be reported.
         let tiers: HashMap<KvWorkerId, Tiers> = (matched > 0)
             .then(|| self.nodes.get(&current))
             .flatten()
@@ -1027,10 +793,8 @@ impl TreeState {
     }
 
     /// Contiguous prefix depth for every worker on the chain, in one descent.
-    /// `insert` marks a worker at every node it descends, so "holds the first
-    /// `d` blocks" means present at each of levels `1..=d`. A worker is frozen
-    /// at the first level that omits it, so a `remove`d interior node stops the
-    /// count at the hole instead of counting past it.
+    /// A worker is frozen at the first level that omits it,
+    /// so a removed interior node stops the count at the hole.
     fn prefix_depths(
         &self,
         parent_hash: Option<i64>,
@@ -1039,8 +803,7 @@ impl TreeState {
         if block_hashes.is_empty() {
             return HashMap::new();
         }
-        // Same start resolution as `match_prefix`: an ambiguous `parent_hash`
-        // has no worker context to disambiguate, so fall back to root.
+        // Same start resolution as `match_prefix`.
         let start = match parent_hash {
             None => ROOT_ID,
             Some(p) => match self.by_hash.get(&p) {
@@ -1069,10 +832,8 @@ impl TreeState {
             current = child_id;
             reached += 1;
             if reached == 1 {
-                // Absent here means never in `alive`: a tail held without
-                // block 0 is reported as holding nothing. Presence is "on any
-                // tier" — a worker whose device copy was evicted but whose
-                // host backup remains still holds the level.
+                // A tail held without block 0 counts as nothing,
+                // and presence on any tier holds the level.
                 alive = child.workers.keys().collect();
             } else {
                 let mut still = Vec::with_capacity(alive.len());
@@ -1102,9 +863,8 @@ impl TreeState {
         self.nodes.len().saturating_sub(1)
     }
 
-    /// Drop already-empty (no-worker, no-child) leaves in this shard. These
-    /// hang around only because of pruning races — they're free wins.
-    /// Returns the number of nodes dropped (including cascade ancestors).
+    /// Drop already-empty leaves left by pruning races, returning the number of
+    /// nodes dropped including cascaded ancestors.
     fn drop_empty_leaves(&mut self) -> usize {
         let count_before = self.nodes.len();
         let empty_leaves: Vec<NodeId> = self
@@ -1126,10 +886,8 @@ impl TreeState {
         count_before - self.nodes.len()
     }
 
-    /// Timestamp + shard-local id of the LRU leaf, for global eviction
-    /// ordering; `None` if the shard has no leaves. Millisecond ties break
-    /// by `NodeId`, and `last_used` is read `Relaxed` — approximate
-    /// freshness is fine for eviction.
+    /// Timestamp and shard-local id of the LRU leaf, for global eviction
+    /// ordering; millisecond ties break by `NodeId`.
     fn lru_leaf(&self) -> Option<(u64, NodeId)> {
         let mut oldest: Option<(u64, NodeId)> = None;
         for (&id, n) in &self.nodes {
@@ -1146,14 +904,9 @@ impl TreeState {
         oldest
     }
 
-    /// Force-evict the leaf with shard-local id `victim` and cascade-prune.
-    /// Returns the number of nodes removed, or 0 if the node is gone or is
-    /// no longer a leaf (raced away between selection and eviction).
-    ///
-    /// Eviction intentionally evicts, so the carriers are dropped even though
-    /// they still hold the block. They are drained rather than cleared so each
-    /// one's tiers can be released through `account_remove`, keeping the
-    /// occupancy gauge in step, and so the cascade precondition holds.
+    /// Force-evict leaf `victim` and cascade-prune, returning the nodes removed;
+    /// 0 if it raced away. Carriers are drained through `account_remove`
+    /// so occupancy stays in step even though they still hold the block.
     fn evict_leaf(&mut self, victim: NodeId) -> usize {
         let is_leaf = self
             .nodes
@@ -1176,16 +929,13 @@ impl TreeState {
     }
 }
 
-/// Public hash-keyed radix tree. Cheap to clone an [`Arc`] of; the
-/// underlying state is `Send + Sync`. Split into [`N_SHARDS`] independent
-/// [`TreeState`]s keyed by chain root, with writers serialised by
-/// [`Self::writer`] — see the module docs for both.
+/// Public hash-keyed radix tree, `Send + Sync` and shared behind an [`Arc`].
+/// See the module docs for sharding and [`Self::writer`].
 #[derive(Debug)]
 pub struct HashTree {
     shards: Vec<RwLock<TreeState>>,
-    /// Held for the whole of every mutation, so a multi-shard write and the
-    /// cross-shard scan that chose its target are atomic against the other
-    /// writer. Readers never take it.
+    /// Held for every whole mutation, so a cross-shard scan and the write it
+    /// feeds are atomic against the other writer. Readers never take it.
     writer: Mutex<()>,
     /// Route-time predictions, kept apart from the event-driven shards.
     pending: PendingPrefixes,
@@ -1214,27 +964,13 @@ impl HashTree {
         &self.pending
     }
 
-    /// Resolve an `insert`'s `parent_hash` over the COMPLETE carrier set and
-    /// return the shard to write in plus the [`ParentLink`] to write with,
-    /// mirroring [`TreeState::resolve_parent`]:
-    /// 1. `None` → root shard, nothing to attach to or record.
-    /// 2. No shard carries it → root shard, attach `Some(p)`. No shard can
-    ///    re-derive a parent from a hash none of them holds, so this lands on
-    ///    `resolve_parent`'s case 4 and root-attaches there.
-    /// 3. Exactly one node carries it → that shard, attach `Some(p)`.
-    /// 4. Several do → a `worker`-owned carrier's shard attaching `Some(p)`
-    ///    ("owned" = held on ANY tier); none owned → root shard, attach
-    ///    `None`.
+    /// Resolve an `insert`'s `parent_hash` over every shard's carriers, like
+    /// [`TreeState::resolve_parent`] but globally, returning the target shard
+    /// and [`ParentLink`]. `block_hashes` must be non-empty.
     ///
-    /// Case 4's `attach: None` is load-bearing: a shard that happens to hold
-    /// one local copy of `parent_hash` would otherwise re-derive a parent
-    /// from its partial reverse index and attach under a node the global
-    /// decision rejected. The breadcrumb stays `Some(p)` throughout, because
-    /// forcing the attach point is not a reason to forget which parent the
-    /// engine named — the unsharded tree recorded it in every one of these
-    /// cases.
-    ///
-    /// `block_hashes` is non-empty (the caller early-returns on empty).
+    /// An ambiguous parent with no `worker`-owned carrier must attach `None`:
+    /// a shard holding one local copy would otherwise attach under a node the
+    /// global decision rejected. The breadcrumb stays `Some(p)` regardless.
     fn route_insert(
         &self,
         worker: &KvWorkerId,
@@ -1260,11 +996,8 @@ impl HashTree {
             let Some(ids) = st.by_hash.get(&p) else {
                 continue;
             };
-            // A prune drops the key with its last id, so an empty set should
-            // not exist. Not depending on that: it would count as no carrier
-            // yet still nominate this shard, and the write would root the
-            // chain under a sentinel that is not `shard_of(block_hashes[0])`
-            // — unreachable from `match_prefix(None, ..)` from then on.
+            // An empty set should not exist, but would nominate this shard
+            // and root the chain where `match_prefix(None, ..)` cannot reach it.
             if ids.is_empty() {
                 continue;
             }
@@ -1282,8 +1015,7 @@ impl HashTree {
         }
         let breadcrumb = Some(p);
         match total_carriers {
-            // Nothing carries `p`, so no shard can resolve it to a node; it
-            // root-attaches inside the shard, on `resolve_parent`'s case 4.
+            // No shard can resolve `p`, so it root-attaches inside the shard.
             0 => (
                 root_shard,
                 ParentLink {
@@ -1318,16 +1050,9 @@ impl HashTree {
         }
     }
 
-    /// Resolve the match path's start point across shards and return
-    /// `(shard, effective_parent_hash)`. Only a UNIQUE carrier of `p` is
-    /// honored; zero or several fall back to the root shard with `None`,
-    /// for the reason [`Self::route_insert`] gives. The hot path passes
-    /// `None` and never scatters. `block_hashes` is non-empty (the caller
-    /// early-returns on empty).
-    ///
-    /// The result holds only for as long as no shard lock is dropped, so it
-    /// is advisory: [`Self::descend_match_shard`] re-checks it under the
-    /// descent's own lock.
+    /// Resolve the match start across shards as `(shard, effective_parent)`;
+    /// only a unique carrier of `p` is honored, else the root shard and `None`.
+    /// Advisory once the locks drop; [`Self::descend_match_shard`] re-checks it.
     fn route_match(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> (usize, Option<i64>) {
         let root_shard = shard_of(block_hashes[0]);
         let Some(p) = parent_hash else {
@@ -1352,22 +1077,10 @@ impl HashTree {
 
     /// Descend the shard that can answer for `parent_hash`, re-checking
     /// [`Self::route_match`]'s resolution under the descent's own read lock.
-    ///
-    /// The scan and the descent are separate lock scopes and readers never
-    /// take [`Self::writer`], so a write in between can prune `p` or give it
-    /// a second carrier in the chosen shard. The in-shard start resolution
-    /// would then fall back to THAT shard's sentinel — but the chain hangs
-    /// off `shard_of(block_hashes[0])`'s, so the descent matches nothing and
-    /// a caller passing `Some(p)` silently gets `matched_blocks == 0` where
-    /// the unsharded tree returns the real match. Re-checking makes the
-    /// resolution and the descent atomic, and a stale one falls back to the
-    /// chain's own root shard — which is what "fall back to root" means once
-    /// the tree is sharded, and what the ambiguous case already does.
-    ///
-    /// A carrier appearing in a DIFFERENT shard is not re-checked: that
-    /// costs a second cross-shard scan to turn a real match into a root
-    /// fall-back. `block_hashes` is non-empty (callers early-return on
-    /// empty).
+    /// A write in between can prune `p`, and falling back to that shard's
+    /// sentinel would match nothing; a stale resolution falls back to
+    /// `shard_of(block_hashes[0])` instead. A carrier newly in another shard
+    /// is not re-checked.
     fn descend_match_shard<R>(
         &self,
         parent_hash: Option<i64>,
@@ -1378,10 +1091,8 @@ impl HashTree {
         self.descend_routed(idx, effective_parent, block_hashes, descend)
     }
 
-    /// The half of [`Self::descend_match_shard`] that runs after the scan,
-    /// split out so a test can hand it a resolution that has already gone
-    /// stale — the state a racing writer leaves behind, which no sequential
-    /// call can reach.
+    /// The post-scan half of [`Self::descend_match_shard`], split out so a test
+    /// can hand it a stale resolution that only a racing writer can produce.
     fn descend_routed<R>(
         &self,
         idx: usize,
@@ -1398,19 +1109,13 @@ impl HashTree {
         descend(&self.shards[shard_of(block_hashes[0])].read(), None)
     }
 
-    /// Apply an untagged `BlockStored` event: a device store. See
-    /// [`Self::insert_tiered`].
+    /// Apply an untagged `BlockStored` event: a device store.
     pub fn insert(&self, worker: &KvWorkerId, parent_hash: Option<i64>, block_hashes: &[i64]) {
         self.insert_tiered(worker, parent_hash, block_hashes, Tiers::DEVICE);
     }
 
-    /// Apply a `BlockStored` event on `tiers` (from its `medium`, via
-    /// [`Tiers::for_store`]).
-    ///
-    /// Walks from `parent_hash`'s node (or root) and descends along
-    /// `block_hashes`, marking every visited node as held by `worker` on
-    /// `tiers` in addition to any tier it already holds there. Empty
-    /// `block_hashes` or empty `tiers` is a no-op.
+    /// Apply a `BlockStored` event on `tiers` (from [`Tiers::for_store`]),
+    /// adding them to `worker`'s hold along the chain. Empty input is a no-op.
     pub fn insert_tiered(
         &self,
         worker: &KvWorkerId,
@@ -1421,9 +1126,8 @@ impl HashTree {
         if block_hashes.is_empty() || tiers.is_empty() {
             return;
         }
-        // The scan and the write it feeds must be one critical section: a
-        // prune in between re-roots the chain under the chosen shard's
-        // sentinel and orphans it.
+        // The scan and the write it feeds must be one critical section;
+        // a prune in between would orphan the chain.
         let _writer = self.writer.lock();
         let (idx, parent) = self.route_insert(worker, parent_hash, block_hashes);
         self.shards[idx]
@@ -1431,33 +1135,18 @@ impl HashTree {
             .insert(worker, parent, block_hashes, tiers);
     }
 
-    /// Apply an untagged `BlockRemoved` event: the worker loses the blocks on
-    /// every tier. See [`Self::remove_tiered`].
+    /// Apply an untagged `BlockRemoved` event: the worker loses every tier.
     pub fn remove(&self, worker: &KvWorkerId, block_hashes: &[i64]) {
         self.remove_tiered(worker, block_hashes, Tiers::ALL);
     }
 
-    /// Apply a `BlockRemoved` event for `tiers` (from its `medium`, via
-    /// [`Tiers::for_remove`]).
+    /// Apply a `BlockRemoved` event for `tiers` (from [`Tiers::for_remove`]).
+    /// The worker stays an owner while it holds any other tier.
     ///
-    /// For every node carrying any hash in `block_hashes`, clear `tiers`
-    /// from `worker`'s hold on it. The worker stays an owner of the node
-    /// while it holds the block on any other tier — a device eviction after a
-    /// host backup leaves the worker a host-tier owner. Once no tier remains
-    /// the worker is dropped, and nodes that become empty AND childless are
-    /// pruned (cascading upward).
-    ///
-    /// Removing the worker from a node does NOT remove the node if other
-    /// workers still hold it.
-    ///
-    /// A removed hash can be a chain root in one shard and an interior block
-    /// elsewhere, so this fans out. A shard carrying none of the hashes is
-    /// skipped under a READ lock — write-locking all [`N_SHARDS`] per
-    /// `BlockRemoved` would block every routing match, the exact cost the
-    /// sharding removes. Safe because [`Self::writer`] is held.
+    /// Fans out, since a hash can sit in several shards; a shard carrying none
+    /// is skipped under a read lock, safe because [`Self::writer`] is held.
     pub fn remove_tiered(&self, worker: &KvWorkerId, block_hashes: &[i64], tiers: Tiers) {
-        // Empty `tiers` clears nothing, so the fan-out below would take the
-        // writer mutex and write-lock every carrying shard to do no work.
+        // Empty `tiers` would write-lock every carrying shard for nothing.
         if block_hashes.is_empty() || tiers.is_empty() {
             return;
         }
@@ -1470,11 +1159,8 @@ impl HashTree {
         }
     }
 
-    /// Apply an `AllBlocksCleared` event for `worker`.
-    ///
-    /// Fans out: a worker can hold chains in many shards. Also the
-    /// scale-down path (`KvEventIndex::remove_worker`), which runs off the
-    /// pump task — hence [`Self::writer`].
+    /// Apply an `AllBlocksCleared` event for `worker`. Also the scale-down path,
+    /// which runs off the pump task, hence [`Self::writer`].
     pub fn clear_worker(&self, worker: &KvWorkerId) {
         let _writer = self.writer.lock();
         for shard in &self.shards {
@@ -1482,27 +1168,12 @@ impl HashTree {
         }
     }
 
-    /// Find the longest path from the root that matches a prefix of
-    /// `block_hashes`, optionally starting from the node carrying
-    /// `parent_hash`.
+    /// Longest match of a prefix of `block_hashes`, from the root or from the
+    /// node carrying `parent_hash`. Touches `last_used` along the path,
+    /// keeping it hot for [`HashTree::evict_lru`], under one shard's read lock.
     ///
-    /// Returns the deepest matched node's worker set and how many blocks
-    /// matched.
-    ///
-    /// As a side-effect, touches `last_used` on every node visited along
-    /// the match — so frequently-matched paths are kept hot for
-    /// [`HashTree::evict_lru`]. The touch is an atomic `Relaxed` store, so
-    /// this method only needs a read lock on a single shard and many
-    /// threads can match concurrently across shards.
-    ///
-    /// # Ambiguous `parent_hash`
-    /// If `parent_hash == Some(p)` and `p` is carried by multiple nodes
-    /// (the "same hash in two chains" case), this method cannot
-    /// disambiguate and falls back to matching from the root. Callers
-    /// that need a specific chain should split the request or call with
-    /// `parent_hash = None`. (`insert` resolves the same ambiguity by
-    /// preferring a worker-owned candidate; `match_prefix` has no worker
-    /// context, so the asymmetry is intentional.)
+    /// A `parent_hash` carried by several nodes cannot be disambiguated
+    /// without a worker, so matching falls back to the root.
     pub fn match_prefix(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> MatchResult {
         if block_hashes.is_empty() {
             return MatchResult::default();
@@ -1513,9 +1184,7 @@ impl HashTree {
     }
 
     /// How many leading blocks of `block_hashes` each worker holds
-    /// contiguously, in one descent under one shard's read lock.
-    /// [`Self::match_prefix`] names only the deepest matched node's holders,
-    /// so it cannot answer this. Absent = none.
+    /// contiguously, in one descent; an absent worker holds none.
     pub fn prefix_depths(
         &self,
         parent_hash: Option<i64>,
@@ -1529,26 +1198,20 @@ impl HashTree {
         })
     }
 
-    /// Number of non-root nodes across all shards, summed under a per-shard
-    /// read lock — a point-in-time sum, not one consistent instant. The
-    /// input a [`HashTree::evict_lru`] cap check takes, and what a size
-    /// gauge would read.
+    /// Number of non-root nodes across all shards, summed shard by shard,
+    /// so not one consistent instant.
     pub fn node_count(&self) -> usize {
         self.shards.iter().map(|s| s.read().node_count()).sum()
     }
 
-    /// Distinct block-hash keys in the reverse index, summed across shards
-    /// (one hash can appear in several — one chain's root, another's
-    /// interior). Exposed for invariant tests: nonzero here with
-    /// `node_count() == 0` means a prune path leaked `by_hash`.
+    /// Reverse-index keys summed across shards, for invariant tests:
+    /// nonzero with `node_count() == 0` means a prune leaked `by_hash`.
     pub fn reverse_index_size(&self) -> usize {
         self.shards.iter().map(|s| s.read().by_hash.len()).sum()
     }
 
-    /// Times the occupancy bookkeeping contradicted itself, by
-    /// [`ACCOUNTING_REASONS`], summed across shards. Always zero on a correct
-    /// tree; rendered so a release build, where the debug assertion is
-    /// compiled out, still says so out loud.
+    /// Occupancy bookkeeping contradictions by [`ACCOUNTING_REASONS`]; zero on a
+    /// correct tree, and visible in release builds where the assertion is off.
     pub fn accounting_errors(&self) -> [u64; ACCOUNTING_REASONS.len()] {
         let mut total = [0u64; ACCOUNTING_REASONS.len()];
         for shard in &self.shards {
@@ -1559,16 +1222,9 @@ impl HashTree {
         total
     }
 
-    /// Nodes each carrier holds on each tier, summed across shards and sorted
-    /// by carrier. Rendered as `sgl_router_kv_tree_blocks`; against the
-    /// engine's own per-tier occupancy for the same pod it is the tree's
-    /// coverage of that tier — the number that says whether a tier the engine
-    /// holds is visible to routing at all (module docs, "Storage tiers").
-    ///
-    /// Read off the per-shard accounting rather than walked, so a scrape costs
-    /// one read lock per shard plus a merge over carriers. Like
-    /// [`Self::node_count`], a point-in-time aggregate rather than one
-    /// consistent instant. A carrier holding nothing has no row.
+    /// Nodes each carrier holds per tier, summed across shards and sorted by
+    /// carrier, as rendered in `sgl_router_kv_tree_blocks`. Read off the
+    /// per-shard accounting, so not one consistent instant.
     pub fn tier_occupancy(&self) -> Vec<(KvWorkerId, TierCounts)> {
         let mut total: HashMap<KvWorkerId, TierCounts> = HashMap::new();
         for shard in &self.shards {
@@ -1584,21 +1240,10 @@ impl HashTree {
         rows
     }
 
-    /// Evict least-recently-used nodes until `node_count() <= max_size`
-    /// across the whole tree: first the already-empty leaves in every
-    /// shard, then the globally-oldest leaf one at a time. Returns the
-    /// total nodes pruned, cascade ancestors included.
-    ///
-    /// The LRU is global, not a per-shard quota, which would evict hot
-    /// entries in a busy shard while idle shards sat under theirs.
-    /// Selection takes the per-shard locks one at a time, so
-    /// [`Self::writer`] is held throughout — otherwise a concurrent
-    /// inserter makes the cap a target rather than a postcondition.
-    ///
-    /// Nothing outside the tests calls this yet, so the cap is available
-    /// rather than enforced: today the tree is bounded only by the fleet's
-    /// own `BlockRemoved` turnover. Whoever wires it up runs it off the hot
-    /// path — it holds [`Self::writer`] for the whole sweep.
+    /// Evict LRU leaves, globally across shards, until `node_count() <= max_size`;
+    /// returns the nodes pruned. Holds [`Self::writer`] throughout, so the cap is
+    /// a postcondition; keep it off the hot path.
+    /// Only tests call it, so the tree is bounded by `BlockRemoved` turnover alone.
     pub fn evict_lru(&self, max_size: usize) -> usize {
         let _writer = self.writer.lock();
         let mut remaining = self.node_count();
@@ -1607,8 +1252,7 @@ impl HashTree {
         }
         let mut pruned = 0usize;
 
-        // Phase 1: free empty leaves everywhere. `remaining` tracks the
-        // global count so the between-shard cap check costs no extra scan.
+        // Free already-empty leaves first; `remaining` tracks the global count.
         for shard in &self.shards {
             let dropped = shard.write().drop_empty_leaves();
             pruned += dropped;
@@ -1618,14 +1262,12 @@ impl HashTree {
             }
         }
 
-        // Phase 2: evict the globally-oldest leaf one at a time. Bound the
-        // loop by the total node count so a degenerate tree can't spin.
+        // Then evict the globally-oldest leaf, bounded so a degenerate tree cannot spin.
         let mut iters = 0usize;
         let max_iters = remaining.saturating_add(1);
         while remaining > max_size && iters < max_iters {
             iters += 1;
-            // Oldest leaf globally; (ts, node id, shard) makes it
-            // deterministic under ties.
+            // Oldest leaf globally; (ts, node id, shard) breaks ties deterministically.
             let mut target: Option<(u64, NodeId, usize)> = None;
             for (idx, shard) in self.shards.iter().enumerate() {
                 if let Some((ts, id)) = shard.read().lru_leaf() {
@@ -1642,8 +1284,7 @@ impl HashTree {
             };
             let dropped = self.shards[idx].write().evict_leaf(victim);
             if dropped == 0 {
-                // The chosen leaf is no longer a leaf. Re-scan on the next
-                // iteration rather than spin on a stale pick.
+                // No longer a leaf; re-scan rather than spin on a stale pick.
                 continue;
             }
             pruned += dropped;
@@ -1653,16 +1294,12 @@ impl HashTree {
     }
 }
 
-// Whitebox test helpers: the in-module tests assert on internal structure
-// (reverse-index membership, `parent_block_hash` chaining), which now sits
-// behind a per-shard layout.
+// Whitebox helpers for the in-module tests, which assert on per-shard structure.
 
 #[cfg(test)]
 impl HashTree {
-    /// Whether every carrier on every node in every shard holds at least
-    /// one tier. `remove` and `prune_cascade` rely on "no bits ⇒ no entry";
-    /// a violation means a node can never be pruned and a worker never
-    /// dropped.
+    /// Whether every carrier on every node holds at least one tier;
+    /// otherwise a node can never be pruned nor a worker dropped.
     fn debug_no_empty_carrier(&self) -> bool {
         self.shards.iter().all(|s| {
             s.read()
@@ -1672,9 +1309,8 @@ impl HashTree {
         })
     }
 
-    /// Whether every chain root lives in `shard_of` its own block hash —
-    /// the invariant `match_prefix(None, …)` rests on, since it looks only
-    /// in `shard_of(block_hashes[0])`.
+    /// Whether every chain root lives in `shard_of` its own hash,
+    /// the only shard `match_prefix(None, ..)` looks in.
     fn debug_roots_in_own_shard(&self) -> bool {
         self.shards.iter().enumerate().all(|(idx, s)| {
             s.read().nodes[&ROOT_ID]
@@ -1724,16 +1360,9 @@ impl HashTree {
         found.expect("debug_parent_block_hash: hash not present")
     }
 
-    /// Recompute [`Self::tier_occupancy`] by walking every node in every
-    /// shard — the oracle the incrementally maintained counters are checked
-    /// against.
-    ///
-    /// Its ceiling: it shares `tally_tiers` and [`Tiers::SLOTS`] with the code
-    /// it checks, so it proves only that incremental booking agrees with a
-    /// full walk. It is blind by construction to WHICH tier is right — a
-    /// SLOTS/bit mismatch would mis-tally identically on both sides. The
-    /// example-based tier tests and the compile-time coupling asserts own
-    /// that half.
+    /// Recompute [`Self::tier_occupancy`] by a full walk. It shares
+    /// [`Tiers::SLOTS`] with the code it checks, so it cannot catch a wrong
+    /// tier; the example tests and compile-time asserts own that.
     fn debug_recount_occupancy(&self) -> Vec<(KvWorkerId, TierCounts)> {
         let mut total: HashMap<KvWorkerId, TierCounts> = HashMap::new();
         for shard in &self.shards {
@@ -1779,9 +1408,8 @@ mod tests {
     use super::test_support::{worker, workers};
     use super::*;
 
-    /// One descent answers for every worker at its *own* depth, where
-    /// `match_prefix` names only whoever sits at the deepest matched node.
-    /// Also pins that a `remove`d interior block stops the count at the hole.
+    /// Unlike `match_prefix`, which names only the deepest node's holders;
+    /// a removed interior block stops the count at the hole.
     #[test]
     fn prefix_depths_answers_every_worker_at_its_own_depth() {
         let chain = [1i64, 2, 3, 4];
@@ -1821,11 +1449,8 @@ mod tests {
         assert!(m2.workers().is_empty());
     }
 
-    /// The write-back sequence the engine publishes for a backed-up block:
-    /// device store, host store once the D2H copy lands, then a DEVICE-tagged
-    /// removal when the device copy is evicted. The worker still holds the
-    /// block on host, so it must stay an owner — just no longer a device one.
-    /// Only the host-tagged removal ends ownership.
+    /// The engine's sequence for a backed-up block: device store, host store,
+    /// device removal. Only the host removal ends ownership.
     #[test]
     fn device_eviction_after_host_backup_keeps_the_worker_as_host_owner() {
         let tree = HashTree::new();
@@ -1856,11 +1481,8 @@ mod tests {
         assert_eq!(m.matched_blocks, 2, "last tier gone: node pruned");
     }
 
-    /// The routing path reads `prefix_depths`, not `match_prefix`, so the
-    /// tier fix has to show up there: a chain whose device copy was evicted
-    /// after a host backup still scores at its full depth. The untagged
-    /// removal is the control — it clears every tier and the depth collapses,
-    /// which is what the tier-blind tree did for the tagged case too.
+    /// Routing reads `prefix_depths`, so a host backup must keep the full depth
+    /// there; the untagged removal is the control that clears every tier.
     #[test]
     fn prefix_depths_survive_a_device_eviction_with_a_host_backup() {
         let tree = HashTree::new();
@@ -1868,11 +1490,8 @@ mod tests {
         tree.insert_tiered(&a, None, &[1, 2, 3], Tiers::for_store(Some("GPU")));
         tree.insert_tiered(&a, None, &[1, 2, 3], Tiers::for_store(Some("CPU_PINNED")));
 
-        // Block 1 included on purpose. `prefix_depths` SEEDS its live set from
-        // level 1 and narrows from there, so evicting only from block 2 onward
-        // would leave that seed exercised against device-held state alone — and
-        // a seed narrowed to device owners would send every host-only worker to
-        // depth 0, restoring this bug with the suite still green.
+        // Block 1 included on purpose: `prefix_depths` seeds its live set there,
+        // and a seed narrowed to device owners must fail this test.
         tree.remove_tiered(&a, &[1, 2, 3], Tiers::for_remove(Some("GPU")));
         assert_eq!(
             tree.prefix_depths(None, &[1, 2, 3]).get(&a).copied(),
@@ -1888,9 +1507,8 @@ mod tests {
         );
     }
 
-    /// Untagged events keep the pre-tiering contract: a bare `BlockStored` is
-    /// a device store, a bare `BlockRemoved` clears every tier at once. A
-    /// publisher that never tags must see exactly the behaviour it always had.
+    /// A bare `BlockStored` is a device store, a bare `BlockRemoved` clears
+    /// every tier.
     #[test]
     fn untagged_events_keep_the_legacy_meaning() {
         let tree = HashTree::new();
@@ -1909,11 +1527,8 @@ mod tests {
         assert_eq!(tree.match_prefix(None, &[1, 2]).matched_blocks, 1);
     }
 
-    /// An unknown medium is asymmetric on purpose: the store is dropped (no
-    /// tier at all), while a removal tagged with it clears every tier. Filing
-    /// the store under a guess would make the worker a routing candidate on a
-    /// tier this build cannot price; narrowing the removal to a bit that was
-    /// never set would leave a stale owner forever.
+    /// Asymmetric on purpose: see [`Tiers::for_store`] and
+    /// [`Tiers::for_remove`].
     #[test]
     fn unknown_medium_drops_the_store_and_removes_everything() {
         assert_eq!(Tiers::for_store(Some("NVLINK_PEER")), Tiers::default());
@@ -1947,9 +1562,8 @@ mod tests {
         );
     }
 
-    /// Tiers are per (node, worker): a device removal by one worker must not
-    /// touch another worker's hold on the same node, and a node whose
-    /// carriers differ by tier reports the device subset exactly.
+    /// One worker's device removal must not touch another's hold on the node,
+    /// and the device subset is reported exactly.
     #[test]
     fn tiers_are_tracked_per_worker() {
         let tree = HashTree::new();
@@ -1968,8 +1582,8 @@ mod tests {
         assert!(m.device_workers().is_empty());
     }
 
-    /// A store on no tier must not create a carrier: `remove` relies on
-    /// "no bits ⇒ no entry" to know when a node is prunable.
+    /// A store on no tier must not create a carrier,
+    /// since `remove` prunes on "no bits means no entry".
     #[test]
     fn empty_tier_insert_is_noop() {
         let tree = HashTree::new();
@@ -1978,10 +1592,8 @@ mod tests {
         assert_eq!(tree.node_count(), 0);
     }
 
-    /// The per-tier occupancy is maintained incrementally at every mutation
-    /// site, so it is checked against a full recount after a sequence that
-    /// exercises all of them: tiered stores, partial and full removals,
-    /// `clear_worker`, and LRU eviction.
+    /// Occupancy is booked incrementally at every mutation site,
+    /// so each kind of mutation is checked against a full recount.
     #[test]
     fn tier_occupancy_matches_a_full_recount_after_mixed_mutations() {
         let tree = HashTree::new();
@@ -2014,8 +1626,7 @@ mod tests {
             "a store on an unrankable medium is booked nowhere because it is              never applied",
         );
 
-        // Partial removal (device only) on a node held on both tiers, then a
-        // removal that clears the last tier and prunes.
+        // A device-only removal on a two-tier node, then one that prunes.
         tree.remove_tiered(&a, &[2], Tiers::DEVICE);
         tree.remove_tiered(&a, &[4], Tiers::ALL);
         assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
@@ -2031,10 +1642,8 @@ mod tests {
         );
     }
 
-    /// `DISK` (L3) and `EXTERNAL` (L4) are distinct tiers in the engine's own
-    /// `StorageMedium`, so they must not share a bit: on a fleet running both,
-    /// folding them would make an L3 eviction erase the router's knowledge of
-    /// the L4 copy.
+    /// The engine's `StorageMedium` keeps L3 and L4 apart, so an L3 eviction
+    /// must not erase the L4 copy.
     #[test]
     fn disk_and_external_are_independent_tiers() {
         let tree = HashTree::new();
@@ -2053,16 +1662,9 @@ mod tests {
         assert_eq!(tree.match_prefix(None, &[1]).matched_blocks, 0);
     }
 
-    /// Three invariants every mutation site has to preserve — the shape that
-    /// rots under a later refactor — asserted after EVERY step of a
-    /// deterministic random walk over every operation and every medium:
-    ///
-    /// * `tier_occupancy()` equals a full node-walk recount, now summed over
-    ///   shards rather than read off one map.
-    /// * No carrier entry with empty tiers exists, which `remove` and
-    ///   `prune_cascade` rely on to know when a node is prunable.
-    /// * Every chain root sits in `shard_of` its own hash — the only reason
-    ///   `match_prefix(None, ..)` can find it by looking in one shard.
+    /// After every step of a deterministic walk over every operation and medium:
+    /// occupancy equals a recount, no carrier has empty tiers,
+    /// and every chain root sits in `shard_of` its own hash.
     #[test]
     fn tree_invariants_hold_under_a_random_walk() {
         // xorshift64*, so the walk is reproducible without a dev-dependency.
@@ -2102,8 +1704,7 @@ mod tests {
                 let hashes: Vec<i64> = (0..1 + rng.below(4))
                     .map(|_| rng.below(12) as i64)
                     .collect();
-                // Sometimes anchor to a hash that may or may not be in the
-                // tree, to exercise `resolve_parent`'s fallbacks.
+                // Sometimes anchor to a maybe-absent hash, to exercise the fallbacks.
                 let parent = (rng.below(4) == 0).then(|| rng.below(12) as i64);
 
                 match rng.below(16) {
@@ -2133,11 +1734,8 @@ mod tests {
         }
     }
 
-    /// `AllBlocksCleared` is the pod-restart / scale-down path
-    /// (`remove_worker` clears every rank), so it must drop a carrier
-    /// regardless of which tiers it held — a hold on any lower tier is still
-    /// a hold. Asserted at the tree, not only through the rendered metric, so
-    /// a metrics refactor cannot take the coverage with it.
+    /// `AllBlocksCleared` is also the scale-down path, so it must drop a carrier
+    /// whatever tiers it held.
     #[test]
     fn clear_worker_drops_carriers_on_every_tier() {
         let tree = HashTree::new();
@@ -2161,12 +1759,8 @@ mod tests {
         assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
     }
 
-    /// `resolve_parent` disambiguates a shared hash by preferring a candidate
-    /// the worker already holds — on ANY tier. Narrowing that to device owners
-    /// would re-anchor a continuation at the root once the worker's device
-    /// copy was evicted, fragmenting the very prefix the host tier still
-    /// serves. The shape is a shared system prompt whose block hash also
-    /// appears in another chain.
+    /// An ambiguous parent prefers a candidate the worker holds on ANY tier;
+    /// device-only would re-root a continuation the host tier still serves.
     #[test]
     fn ambiguous_parent_resolves_through_a_host_only_hold() {
         let tree = HashTree::new();
@@ -2254,14 +1848,10 @@ mod tests {
         // Sanity.
         assert_eq!(tree.node_count(), 3);
 
-        // Remove A from the node carrying hash=2. Per spec: that node loses
-        // A; descendants are NOT recursively touched, but `match_prefix`
-        // returns the deepest matched *node*'s worker set. Node 2 still
-        // exists (it has child 3), but its worker set is now empty.
+        // Node 2 loses A but survives (it has child 3); descendants are untouched.
         tree.remove(&a, &[2]);
 
-        // Node 2 still in tree (has child 3).
-        // Match length 2 lands on node 2 (workers empty), so workers={}.
+        // Match length 2 lands on node 2, whose worker set is now empty.
         let m = tree.match_prefix(None, &[1, 2]);
         assert_eq!(m.matched_blocks, 2);
         assert!(m.workers().is_empty());
@@ -2293,8 +1883,7 @@ mod tests {
         assert_eq!(m.matched_blocks, 2);
         assert_eq!(m.workers(), workers(&[&b]));
 
-        // [1,2] now has only B (A was the only other holder of node 2;
-        // wait — actually A held 1 and 2 too. But B also holds 1 and 2.)
+        // B still holds 1 and 2.
         let m = tree.match_prefix(None, &[1, 2]);
         assert_eq!(m.matched_blocks, 2);
         assert_eq!(m.workers(), workers(&[&b]));
@@ -2312,7 +1901,6 @@ mod tests {
 
         tree.clear_worker(&a);
         // Whole chain prunes; only the root sentinel remains.
-        // node_count() returns *non-root* count, so it should be 0.
         assert_eq!(tree.node_count(), 0);
         // Reverse index for these hashes should be empty.
         assert!(!tree.debug_has_hash(1));
@@ -2351,8 +1939,7 @@ mod tests {
         // Hash 5 is carried by 2 distinct nodes, summed across shards.
         assert_eq!(tree.debug_hash_node_count(5), 2);
 
-        // BlockRemoved [5] should remove A from BOTH nodes-carrying-5.
-        // Both nodes are leaves, so both prune.
+        // Removing [5] clears both nodes carrying it; both are leaves, so both prune.
         tree.remove(&a, &[5]);
         // Remaining nodes: 1 and 2 (still hold A).
         assert_eq!(tree.node_count(), 2);
@@ -2364,13 +1951,10 @@ mod tests {
         assert_eq!(m.workers(), workers(&[&a]));
     }
 
-    /// Two chains whose ROOT hashes collide into the SAME shard stay fully
-    /// independent. Every other multi-root test spreads roots across
-    /// shards; this pins the colliding case.
+    /// The only multi-root test whose roots share a shard.
     #[test]
     fn colliding_roots_in_same_shard_stay_independent() {
-        // Guarded so a change to N_SHARDS / SHARD_MIX fails loudly rather
-        // than silently making the test a no-op.
+        // Guarded so a change to N_SHARDS / SHARD_MIX cannot silently void the test.
         assert_eq!(
             shard_of(1),
             shard_of(22),
@@ -2427,8 +2011,7 @@ mod tests {
         let tree = HashTree::new();
         let a = worker("http://a", 0);
         let b = worker("http://b", 0);
-        // Two nodes both end up carrying hash=5 (same trick as the
-        // "same hash in two chains" test).
+        // Two nodes both carry hash=5.
         tree.insert(&a, None, &[1, 5]);
         tree.insert(&b, None, &[2, 5]);
         // A continues from its 5.
@@ -2454,8 +2037,7 @@ mod tests {
         // Two nodes carry hash=5, neither is owned by C.
         tree.insert(&a, None, &[1, 5]);
         tree.insert(&b, None, &[2, 5]);
-        // C tries to extend with parent_hash=5; resolution should fall
-        // back to root with the new chain rooted at hash=9.
+        // C extends from parent_hash=5, which falls back to root.
         tree.insert(&c, Some(5), &[9]);
 
         // C is reachable as a fresh root child at hash=9.
@@ -2464,11 +2046,8 @@ mod tests {
         assert_eq!(m.workers(), workers(&[&c]));
     }
 
-    /// A `parent_hash` no shard carries root-attaches, but the chain's first
-    /// node keeps the hash so a later `BlockStored` for the parent can be
-    /// linked back through the reverse index (`resolve_parent`, case 4).
-    /// Resolving the parent globally must not drop that breadcrumb on the
-    /// way into the shard.
+    /// A `parent_hash` no shard carries root-attaches, but global resolution
+    /// must not drop it as the first node's breadcrumb.
     #[test]
     fn unknown_parent_hash_root_attaches_but_keeps_the_breadcrumb() {
         let tree = HashTree::new();
@@ -2485,10 +2064,7 @@ mod tests {
         );
     }
 
-    /// The forced root-attach of an unowned-ambiguous `parent_hash` must not
-    /// cost the chain its breadcrumb: the unsharded tree recorded the hash on
-    /// the first node whether or not `resolve_parent` fell back to root, and a
-    /// later `BlockStored` for that parent relinks through it.
+    /// The forced root-attach of an unowned-ambiguous parent keeps its breadcrumb.
     #[test]
     fn ambiguous_unowned_parent_root_attaches_but_keeps_the_breadcrumb() {
         let tree = HashTree::new();
@@ -2512,14 +2088,11 @@ mod tests {
         );
     }
 
-    /// Regression: an unowned-ambiguous `parent_hash` must attach the new
-    /// chain at ROOT even when its first hash routes to a shard that
-    /// locally carries `parent_hash` in exactly one node — the case where a
-    /// naive per-shard resolve attaches under that node instead.
+    /// Regression: an unowned-ambiguous parent roots the chain even in a shard
+    /// that locally carries `parent_hash` exactly once.
     #[test]
     fn unowned_ambiguous_parent_force_roots_even_on_carrier_shard() {
-        // Guard the premise; a change to the shard count / mix needs new
-        // constants, not a silently weakened test.
+        // Guard the premise; a new shard count or mix needs new constants.
         assert_ne!(
             shard_of(1),
             shard_of(2),
@@ -2538,8 +2111,7 @@ mod tests {
         tree.insert(&a, None, &[1, 5]); // node-5 in shard_of(1)
         tree.insert(&b, None, &[2, 5]); // node-5 in shard_of(2)
 
-        // C owns neither node-5, so the two carriers of 5 force a
-        // root-attach: 1009 becomes a fresh root child, not a child of 1->5.
+        // C owns neither node-5, so 1009 must become a fresh root child.
         tree.insert(&c, Some(5), &[1009]);
 
         let m = tree.match_prefix(None, &[1009]);
@@ -2557,24 +2129,16 @@ mod tests {
         );
     }
 
-    /// Regression: [`HashTree::route_match`] drops each shard's read lock
-    /// before the descent takes one, and readers never take
-    /// [`HashTree::writer`], so its resolution can go stale. A parent pruned
-    /// in that window leaves the shard's own start resolution falling back to
-    /// the NOMINATED shard's sentinel — which carries none of the chain, so
-    /// `matched_blocks` comes back 0 where the unsharded tree returns the
-    /// real match. The fall-back has to be the chain's own root shard.
-    ///
-    /// Driven through [`HashTree::descend_routed`] with a hand-made stale
-    /// pair: sequentially, `route_match` and the re-check always agree.
+    /// Regression: a parent pruned between [`HashTree::route_match`] and the
+    /// descent must fall back to the chain's root shard, not the nominated one.
+    /// Uses a hand-made stale pair, since sequential calls always agree.
     #[test]
     fn a_pruned_parent_falls_back_to_the_chains_root_shard() {
         let tree = HashTree::new();
         let a = worker("http://a", 0);
         let chain = [1i64, 2, 3];
-        // Negative so it cannot collide with the chain; stepped until it
-        // lands off the chain's shard, which is what makes descending the
-        // nominated shard observably wrong.
+        // Negative so it cannot collide with the chain,
+        // and off the chain's shard so a wrong descent is observable.
         let mut p = -7i64;
         while shard_of(p) == shard_of(chain[0]) {
             p -= 1;
@@ -2622,18 +2186,15 @@ mod tests {
         );
     }
 
-    /// The other shape of the same staleness: `p` gains a second carrier in
-    /// the nominated shard between the scan and the descent. Ambiguity there
-    /// means the shard starts from its own sentinel, so the fall-back must
-    /// again be the chain's root shard rather than that shard's root.
+    /// The same staleness when `p` gains a second carrier in the nominated
+    /// shard between the scan and the descent.
     #[test]
     fn a_parent_that_gained_a_carrier_falls_back_to_the_chains_root_shard() {
         let tree = HashTree::new();
         let a = worker("http://a", 0);
         let chain = [1i64, 2, 3];
         let p = -7i64;
-        // Two chain roots sharing ONE shard, and not the chain's: the second
-        // carrier has to land in the shard the scan already nominated.
+        // Two roots sharing one shard that is not the chain's.
         let mut h1 = 4i64;
         while shard_of(h1) == shard_of(chain[0]) {
             h1 += 1;
@@ -2676,12 +2237,8 @@ mod tests {
         assert_eq!(m.workers(), workers(&[&a]));
     }
 
-    /// Two concurrent writers must not be able to orphan a chain. A prune
-    /// from `KvEventIndex::remove_worker`'s task landing between `insert`'s
-    /// shard scan and its write leaves the insert re-rooting the chain under
-    /// the CHOSEN SHARD's sentinel — not `shard_of(block_hashes[0])`, so
-    /// `match_prefix(None, …)` can never reach it again. Fails without
-    /// [`HashTree::writer`].
+    /// A prune landing between `insert`'s shard scan and its write must not
+    /// re-root the chain in the wrong shard. Fails without [`HashTree::writer`].
     #[test]
     fn concurrent_writers_never_orphan_a_chain() {
         use std::sync::atomic::AtomicBool;
@@ -2690,8 +2247,7 @@ mod tests {
         let tree = Arc::new(HashTree::new());
         let a = worker("http://a", 0);
         let b = worker("http://b", 0);
-        // `h0` must route to a different shard than the chain root `r`, so
-        // a wrongly-rooted continuation is observable.
+        // `h0` is off `r`'s shard, so a wrongly-rooted continuation is observable.
         let (r, p) = (1i64, 5i64);
         let mut h0 = 2i64;
         while shard_of(h0) == shard_of(r) {
@@ -2755,9 +2311,7 @@ mod tests {
         assert_eq!(tree.node_count(), 50);
 
         let evicted = tree.evict_lru(10);
-        // Each leaf hangs directly off root, so cascade-pruning never
-        // cascades past the leaf itself: count must equal exactly the
-        // number of nodes we needed to drop.
+        // Each leaf hangs off root, so no prune cascades past it.
         assert_eq!(evicted, 40, "expected to evict exactly 40, got {evicted}");
         assert_eq!(
             tree.node_count(),
@@ -2784,8 +2338,7 @@ mod tests {
         let a = worker("http://a", 0);
         // First chain: oldest.
         tree.insert(&a, None, &[100, 101, 102]);
-        // Tiny sleep to force last_used differentiation at millisecond
-        // resolution. The 2ms gap is generous vs. the 1ms tick.
+        // Exceed the 1ms resolution of last_used.
         std::thread::sleep(std::time::Duration::from_millis(2));
         // Second chain: newer.
         tree.insert(&a, None, &[200, 201, 202]);
@@ -2794,10 +2347,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let _ = tree.match_prefix(None, &[200, 201, 202]);
 
-        // Force eviction down to 3 nodes; the older chain should go first.
-        // The leaf 102 is the LRU; pruning it cascades up through 101 and
-        // 100 (each becomes empty + childless), so a single victim drops
-        // the whole older chain — exactly 3 nodes evicted.
+        // Leaf 102 is the LRU, and pruning it cascades through the older chain.
         let evicted = tree.evict_lru(3);
         assert_eq!(evicted, 3, "expected to evict exactly 3, got {evicted}");
         assert_eq!(tree.node_count(), 3);
@@ -2812,16 +2362,13 @@ mod tests {
     fn batched_block_stored_chains_correctly() {
         let tree = HashTree::new();
         let a = worker("http://a", 0);
-        // BlockStored carrying multiple hashes: each chains off its
-        // predecessor, and parent_hash applies to the FIRST.
+        // Each hash chains off its predecessor; parent_hash applies to the first.
         tree.insert(&a, None, &[10, 20, 30]);
 
         let m = tree.match_prefix(None, &[10, 20, 30]);
         assert_eq!(m.matched_blocks, 3);
         assert_eq!(m.workers(), workers(&[&a]));
 
-        // Confirm parent_block_hash chain: node carrying 30 should record
-        // parent_block_hash = Some(20), 20 -> Some(10), 10 -> None.
         assert_eq!(tree.debug_parent_block_hash(30), Some(20));
         assert_eq!(tree.debug_parent_block_hash(20), Some(10));
         assert_eq!(tree.debug_parent_block_hash(10), None);
@@ -2845,8 +2392,7 @@ mod tests {
         assert_eq!(m.workers(), workers(&[&b]));
     }
 
-    /// Distinct chain roots spread over several shards, yet every chain
-    /// still matches in full — the routing invariant sharding relies on.
+    /// Roots spread over several shards, and every chain still matches in full.
     #[test]
     fn distinct_roots_spread_across_shards() {
         let tree = HashTree::new();

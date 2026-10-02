@@ -1,29 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Lifecycle bundle for the KV-event index.
+//! Lifecycle bundle for the KV-event index: the [`HashTree`], the engine-reported load table,
+//! the KV and load [`KvEventSubscriberRegistry`]s, and the pump that applies their events.
 //!
-//! Couples the three submodules that are independent in their own right but
-//! always operate together in production:
-//!
-//! - [`HashTree`] — the cache-aware routing index keyed by SGLang block hash.
-//! - [`EngineReportedLoadTable`] — engine-reported per-worker load.
-//! - Two [`KvEventSubscriberRegistry`]s — one per `(worker_url, dp_rank)` on
-//!   the cache topic, one on the load topic.
-//! - A pump task that drains [`WorkerEvent`]s and applies KV batches to the
-//!   tree and `Load` snapshots to the engine-load table.
-//!
-//! `add_worker` / `remove_worker` are driven from the worker manager on every
-//! `DiscoveryEvent::Added` / `DiscoveryEvent::Removed`.
-//!
-//! # Race avoidance
-//!
-//! The pump runs independently of the lifecycle calls, so an event can sit in
-//! the mpsc buffer while `remove_worker` is in progress. To prevent stale
-//! events from re-inserting tree state for a worker that was just torn down,
-//! [`KvEventIndex`] maintains a `live_workers` set; entries are removed
-//! **before** the subscriber tasks are joined, and the pump filters every
-//! event through this set before mutating the tree.
+//! `remove_worker` drops ranks from `live_workers` before joining their subscribers,
+//! and the pump filters every event through that set,
+//! so an event still buffered for a torn-down worker cannot re-insert tree state.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -72,90 +55,48 @@ mod tests;
 
 pub use producer::SnapshotBody;
 
-/// Channel buffer between the subscriber registry and the pump task.
-///
-/// Bounded so a misbehaving publisher cannot exhaust memory.  Realistic
-/// per-worker event rates are < 1 kHz; a 1024-deep buffer absorbs a
-/// half-second burst at 2 kHz before back-pressuring the SUB sockets.
+/// Bounded so a misbehaving publisher cannot exhaust memory;
+/// 1024 absorbs a half-second 2 kHz burst before back-pressuring the SUB sockets.
 const EVENT_CHANNEL_BUFFER: usize = 1024;
 
-/// Per-rank cap on batches held back while that rank is
-/// [`BootstrapState::Pending`].
-///
-/// A rank that overflows this cannot be spliced (see `fail_rank`), so the
-/// cap trades a small amount of memory for the chance to bootstrap at all.
-/// Sized to match `EVENT_CHANNEL_BUFFER`: if the pump is that far behind, the
-/// snapshot is not arriving in time anyway.
+/// Per-rank cap on batches held while [`BootstrapState::Pending`]; overflow abandons bootstrap.
+/// Matches `EVENT_CHANNEL_BUFFER`: a pump that far behind will not get the snapshot in time.
 const PENDING_BATCH_LIMIT: usize = 1024;
 
-/// Depth of the obligation queue feeding the coordinator, sized well past a
-/// fleet's worker count. Overflow falls back as [`KvEventIndex::enqueue_bootstrap`]
-/// describes.
+/// Sized well past a fleet's worker count;
+/// overflow falls back as [`KvEventIndex::enqueue_bootstrap`] describes.
 const BOOTSTRAP_QUEUE_DEPTH: usize = 1024;
 
-/// Sequence number of the FIRST batch a publisher ever emits.
-///
-/// SGLang's `ZmqEventPublisher` numbers batches from `itertools.count()`, and it
-/// is constructed once per scheduler process, alongside an empty radix cache. A
-/// `Pending` rank whose first held batch carries this number has therefore
-/// received its publisher's stream from the beginning: no block exists on that
-/// engine that the held batches do not describe, so no sibling can hand over
-/// anything the rank lacks, and the rank is resolved on the spot rather than
-/// swept for. See `resolve_from_origin`.
-///
-/// Only an exact match on the FIRST held batch counts. A first batch at 1
-/// means batch 0 was missed — ZMQ's slow-joiner window drops whatever is
-/// published before the SUB filter reaches the publisher — and that batch may
-/// have stored blocks, so the rank keeps waiting for a snapshot. A batch 0
-/// arriving later is a publisher restart instead; see the regression arms in
-/// `pump_loop`.
+/// Seq of a publisher's first batch: SGLang's `ZmqEventPublisher` counts from 0 and is built
+/// once per scheduler alongside an empty radix cache, so a `Pending` rank whose FIRST held
+/// batch is 0 has seen every block and needs no snapshot (see `resolve_from_origin`).
+/// A first batch of 1 means ZMQ's slow-joiner window dropped batch 0, so the rank still waits;
+/// a batch 0 arriving later is a publisher restart (see `pump_loop`).
 const STREAM_ORIGIN_SEQ: i64 = 0;
 
-/// Control-plane messages for the pump task.
-///
-/// Tree mutation MUST stay on the single writer (see the single-writer property
-/// in [`super::tree`]), so the bootstrap task never touches the tree itself —
-/// it fetches and vets a snapshot, then hands it to the pump through this
-/// channel.
+/// Control-plane messages for the pump, the tree's single writer (see [`super::tree`]);
+/// the bootstrap task only fetches and vets snapshots, never writes the tree.
 #[derive(Debug)]
 enum PumpControl {
-    /// Graft a vetted snapshot, seed cursors, then release each rank's held
-    /// batches.
-    ///
-    /// `obligations` is the set this message discharges: every rank named here
-    /// leaves `Pending` when this is handled, whether or not the snapshot covered
-    /// it. Deriving the set from the snapshot instead would leave a rank the peer
-    /// never mentioned buffering forever.
-    ///
-    /// Each entry carries the incarnation it was registered under, so a task
-    /// still in flight for a worker that has since been removed and re-added
-    /// cannot graft onto the new incarnation.
+    /// Graft a vetted snapshot, seed cursors, then release each rank's held batches.
+    /// Every rank in `obligations` leaves `Pending` whether or not the snapshot covered it;
+    /// each carries its registered incarnation, so a stale task cannot graft onto a re-add.
     ApplySnapshot {
         obligations: Vec<(KvWorkerId, u64)>,
         vetted: Box<VettedSnapshot>,
     },
-    /// Stop holding batches for `ranks`: release what is buffered and mark
-    /// them [`BootstrapState::Failed`]. Sent when no peer could supply a
-    /// snapshot, or when the bootstrap deadline fires.
+    /// Release the ranks' held batches and mark them [`BootstrapState::Failed`];
+    /// sent when no peer can supply a snapshot or the bootstrap deadline fires.
     AbandonBootstrap { obligations: Vec<(KvWorkerId, u64)> },
-    /// A worker was removed: drop everything the pump keeps for these ranks —
-    /// held batches, pending splice proofs, tree carriers and cursors — so a
-    /// re-added worker's fresh publisher inherits none of it.
-    ///
-    /// `done` fires once teardown has run, so nothing of these ranks survives
-    /// `remove_worker`.
+    /// Drop everything the pump keeps for removed ranks (held batches, splice proofs,
+    /// tree carriers, cursors); `done` fires once that teardown has run.
     ForgetRanks {
         ranks: Vec<KvWorkerId>,
         done: Option<oneshot::Sender<()>>,
     },
-    /// Result of asking the fleet whether a rank's publisher moved past the
-    /// watermark of a snapshot whose splice was never proven locally.
-    ///
-    /// The probe runs off-pump because it does network I/O; the verdict comes
-    /// back here so the tree write stays on the single writer.
-    ///
-    /// `epoch` and `watermark` name the graft the verdict is about; see
-    /// [`PendingProof::watermark`].
+    /// Off-pump probe verdict on whether a rank's publisher moved past the watermark
+    /// of a graft whose splice was never proven locally;
+    /// `epoch` and `watermark` name that graft (see [`PendingProof::watermark`]).
     SpliceProbe {
         rank: KvWorkerId,
         epoch: u64,
@@ -164,20 +105,15 @@ enum PumpControl {
     },
 }
 
-/// Per-worker bookkeeping kept inside [`KvEventIndex`] so `remove_worker`
-/// knows which DP ranks were actually subscribed (not the advertised
-/// `dp_size`, which may overflow `u16` and skip ranks).
+/// The DP ranks actually subscribed, which `remove_worker` clears;
+/// not the advertised `dp_size`, whose ports may overflow `u16`.
 #[derive(Debug, Clone)]
 struct WorkerEntry {
-    /// DP ranks that were successfully spawned for this worker. Used by
-    /// `remove_worker` to know which `(url, dp_rank)` cursors and tree
-    /// states to clear.
     dp_ranks: Vec<u32>,
 }
 
-/// Ranks whose socket port is representable for a publisher range. This is
-/// shared by lifecycle bookkeeping and the subscriber registry contract so an
-/// expected load rank always has a corresponding SUB socket.
+/// Ranks whose port fits in `u16`; shared with the subscriber registry
+/// so every expected load rank has a SUB socket.
 fn subscribable_ranks(port_base: u16, dp_size: u32) -> Vec<u32> {
     let port_base = u32::from(port_base);
     (0..dp_size)
@@ -185,9 +121,8 @@ fn subscribable_ranks(port_base: u16, dp_size: u32) -> Vec<u32> {
         .collect()
 }
 
-/// The read-only handles the `/metrics` scrape pulls the KV storage-tier
-/// series from. Narrower than an [`KvEventIndex`] handle on purpose: a route
-/// has no business calling `add_worker` / `remove_worker` / `shutdown`.
+/// Read-only handles for the `/metrics` KV storage-tier series,
+/// narrower than [`KvEventIndex`] so a route cannot call lifecycle methods.
 #[derive(Clone)]
 pub struct KvIndexMetrics {
     pub(crate) tree: Arc<HashTree>,
@@ -204,50 +139,32 @@ impl KvIndexMetrics {
 /// holding; a peer's export must be newer to splice.
 struct ObligationBatch {
     obligations: Vec<(KvWorkerId, u64)>,
-    /// Folded into [`PendingSweep::freshness_floor`], which the sweep asks with.
-    ///
-    /// [`PendingSweep::freshness_floor`]: coordinator::PendingSweep::freshness_floor
+    /// Folded into `coordinator::PendingSweep::freshness_floor`, which the sweep asks with.
     holding_since: Instant,
     /// Whether this batch may ride a sweep already in flight.
     late_join: LateJoin,
 }
 
-/// What a batch accepts when it arrives while a sweep is already in flight.
-///
-/// The sweep asked for freshness on behalf of the ranks it started with, so a
-/// batch that arrives afterwards may be delivered against an export predating
-/// its own `holding_since` — which the pump then resolves [`RankOutcome::Gap`].
-/// Whether that is acceptable depends on what the batch has left to spend.
+/// Whether a batch may ride a sweep already in flight, whose export may predate the
+/// batch's `holding_since` and so resolve [`RankOutcome::Gap`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LateJoin {
-    /// Ride the in-flight sweep's snapshot regardless.
-    ///
-    /// Used by discovery, whose workers land during the first fetch; a rank
-    /// that gaps this way still has its one retry.
+    /// Ride it regardless; used by discovery,
+    /// whose workers land during the first fetch and still have their one gap retry.
     Permitted,
-    /// Wait for a sweep that asks on this batch's behalf.
-    ///
-    /// Used by a gap retry, for which riding along is equivalent to dropping
-    /// it: `gap_retried` caps it at one, and a snapshot taken before the rank
-    /// resumed holding re-gaps by construction. Deferring costs one loop
-    /// iteration, since the coordinator re-enters `take_pending` as soon as it
-    /// has delivered.
+    /// Wait for a sweep that asks on this batch's behalf; used by a gap retry,
+    /// which `gap_retried` caps at one and which an older snapshot re-gaps by construction.
     Refused,
 }
 
-/// Bundle of `HashTree` + `KvEventSubscriberRegistry` + pump task.
-///
-/// Construct one instance per router process and hand it to the worker
-/// manager as `Option<Arc<KvEventIndex>>` — `None` disables the cache-aware
-/// routing path entirely.
+/// One per router process, held by the worker manager as `Option<Arc<KvEventIndex>>`;
+/// `None` disables cache-aware routing.
 pub struct KvEventIndex {
     tree: Arc<HashTree>,
     maintain_tree: bool,
     subscribers: Arc<KvEventSubscriberRegistry>,
-    /// Second registry subscribing to the load topic (one per worker rank),
-    /// feeding `LoadStat` snapshots into `engine_reported_load`. Shares the pump
-    /// channel with `subscribers`; keyed independently so KV and load
-    /// subscribers for the same worker don't collide.
+    /// Load-topic subscribers feeding `engine_reported_load`; shares the pump channel
+    /// but is keyed separately so KV and load subscribers for a worker don't collide.
     load_subscribers: Arc<KvEventSubscriberRegistry>,
     /// Engine-reported per-worker load, written by the pump from
     /// `WorkerEvent::Load` and captured at request ingress.
@@ -256,17 +173,11 @@ pub struct KvEventIndex {
     pump_cancel: CancellationToken,
     workers: Mutex<HashMap<String, WorkerEntry>>,
     http: reqwest::Client,
-    /// Set of currently-attached `(worker_url, dp_rank)` pairs. The pump
-    /// drops any event whose `worker` is not in this set, so a batch
-    /// queued by a subscriber that was torn down by `remove_worker` does
-    /// not re-pollute the tree after `clear_worker` ran.
+    /// Attached `(worker_url, dp_rank)` pairs; the pump drops events for any other,
+    /// so a batch queued before `remove_worker` cannot re-pollute the tree.
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
-    /// Per-`(worker_url, dp_rank)` last-applied sequence number. The
-    /// subscriber forwards every batch with no de-dup; this map filters
-    /// any batch whose `seq` is not strictly greater than the previously
-    /// applied one. Cleared on `remove_worker` because a re-added worker
-    /// may legitimately have a fresh publisher whose sequence numbers
-    /// restart from 0.
+    /// Last-applied seq per rank, filtering the subscriber's un-deduplicated stream;
+    /// cleared on `remove_worker` since a re-added worker's publisher restarts from 0.
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     /// Applied events by kind and storage medium, for the `/metrics` scrape.
     /// Written only by the pump.
@@ -278,20 +189,16 @@ pub struct KvEventIndex {
     /// Control channel into the pump, so snapshot grafting happens on the
     /// single writer rather than in the bootstrap task.
     ctrl_tx: mpsc::Sender<PumpControl>,
-    /// Client for snapshot fetches. Not `http`: its 2s total timeout suits
-    /// `/server_info` but cannot fit a multi-megabyte body, and every large
-    /// snapshot would be booked `unreachable`.
+    /// Not `http`, whose 2s total timeout cannot fit a multi-megabyte snapshot
+    /// and would book every large one `unreachable`.
     snapshot_http: reqwest::Client,
     /// Obligations waiting for the coordinator to fold them into the sweep that
     /// is in flight, or to start one. See [`bootstrap_coordinator`].
     bootstrap_tx: mpsc::Sender<ObligationBatch>,
     /// Last built snapshot; see [`KvEventIndex::peer_snapshot_body`].
     snapshot_cache: Arc<AsyncMutex<Option<CachedSnapshot>>>,
-    /// Worker-sourced `page_size` shared with prefix providers.
-    /// `add_worker` calls `try_set(cfg.block_size)` so the first worker
-    /// establishes the value; subsequent workers that disagree are
-    /// rejected (logged + not subscribed). Prefix providers read it at routing
-    /// time to size their `compute_block_hashes` calls.
+    /// Worker-sourced `page_size` shared with prefix providers;
+    /// the first worker sets it and `add_worker` rejects any worker that disagrees.
     block_size_oracle: Arc<BlockSizeOracle>,
 }
 
@@ -311,11 +218,7 @@ impl KvEventIndex {
         Self::new_with_http_and_oracle(http, BlockSizeOracle::new())
     }
 
-    /// Constructor that lets the caller supply a pre-shared
-    /// [`BlockSizeOracle`]. Production wires this from `AppContext` so
-    /// the same oracle the index seeds is available to prefix providers.
-    /// Tests use this to pre-populate the
-    /// oracle and exercise the mismatch-rejection path.
+    /// Takes a pre-shared [`BlockSizeOracle`] so prefix providers see the one this index seeds.
     pub fn new_with_http_and_oracle(
         http: reqwest::Client,
         block_size_oracle: Arc<BlockSizeOracle>,
@@ -337,9 +240,8 @@ impl KvEventIndex {
         Self::new_with_mode(http, block_size_oracle, bootstrap, true)
     }
 
-    /// Discovers worker hash metadata only: seeds the shared [`BlockSizeOracle`]
-    /// but neither subscribes to KV events nor maintains the local tree, because
-    /// an external Indexer is the routing signal.
+    /// Metadata-only: seeds the [`BlockSizeOracle`] without KV subscriptions or a local tree,
+    /// because an external Indexer is the routing signal.
     pub fn new_metadata_only_with_http_and_oracle(
         http: reqwest::Client,
         block_size_oracle: Arc<BlockSizeOracle>,
@@ -358,13 +260,9 @@ impl KvEventIndex {
         bootstrap: Arc<BootstrapTracker>,
         maintain_tree: bool,
     ) -> Arc<Self> {
-        // Connect and read timeouts cut a gone or stalled peer; the total
-        // bounds a progressing transfer to a fraction of the deadline so the
-        // sweep can reach another candidate (see `snapshot_fetch_timeout`).
+        // Connect/read timeouts cut a dead peer; the total caps a slow transfer
+        // so the sweep can still reach another candidate (see `snapshot_fetch_timeout`).
         let per_fetch = snapshot_fetch_timeout(bootstrap.timeout(), bootstrap.fetch_cap());
-        // A short `--kv-bootstrap-timeout-ms` can derive a per-fetch bound
-        // below the floor that the cap cannot lift; warn once so the operator
-        // raises the deadline.
         if bootstrap.enabled() && per_fetch < SNAPSHOT_FETCH_TIMEOUT_FLOOR {
             warn!(
                 per_fetch_ms = per_fetch.as_millis(),
@@ -384,18 +282,11 @@ impl KvEventIndex {
             .connect_timeout(SNAPSHOT_FETCH_CONNECT_TIMEOUT)
             .read_timeout(SNAPSHOT_FETCH_READ_TIMEOUT)
             .timeout(per_fetch)
-            // A sibling router never redirects this route, so a redirect is
-            // either a misconfigured peer or a hostile one steering the fetch
-            // — and its multi-gigabyte buffering budget — at an arbitrary
-            // in-cluster URL. Refuse to follow: the 3xx lands as
-            // `FetchAnswer::NoBody` and the peer is just not a source.
+            // A sibling router never redirects this route; following a 3xx would let a bad peer
+            // aim a multi-gigabyte fetch anywhere, so it lands as `FetchAnswer::NoBody`.
             .redirect(reqwest::redirect::Policy::none())
-            // No fallback to the introspection client: it follows redirects,
-            // which would silently reopen the hole the policy above closes
-            // (and its total timeout cannot fit a large snapshot anyway).
-            // Every option set here is an infallible setter — `build()` only
-            // fails when the TLS backend cannot initialize, and `new()`
-            // already treats that as fatal for the introspection client.
+            // No fallback to the introspection client, which follows redirects;
+            // `build()` fails only if TLS cannot initialize, which `new()` already treats as fatal.
             .build()
             .expect("snapshot http client builds: no fallible builder options are set");
         let tree = Arc::new(HashTree::new());
@@ -461,9 +352,7 @@ impl KvEventIndex {
         index
     }
 
-    /// Shared handle to the bootstrap tracker. `/readyz` reads it to decide
-    /// whether initial bootstrap has settled; the metrics surface reads it for
-    /// the per-rank state gauge.
+    /// Shared handle to the bootstrap tracker, which also gates `/readyz`.
     pub fn bootstrap(&self) -> Arc<BootstrapTracker> {
         Arc::clone(&self.bootstrap)
     }
@@ -473,22 +362,13 @@ impl KvEventIndex {
         Arc::clone(&self.block_size_oracle)
     }
 
-    /// Clone the underlying tree handle for cache-aware selection and
-    /// metrics. The pump is the sole writer; callers should treat the
-    /// returned handle as read-only.
+    /// Read-only by contract: the pump is the tree's sole writer.
     pub fn tree(&self) -> Arc<HashTree> {
         self.tree.clone()
     }
 
-    /// Handles for the `/metrics` storage-tier series, or `None` when this
-    /// router does not maintain a local tree.
-    ///
-    /// In metadata-only mode (an external Indexer is the routing signal) no KV
-    /// subscription is opened, so every tier series would be a structural
-    /// zero — while their own HELP text tells the operator to read a zero
-    /// `CPU_PINNED` row as "the tier stream is not reaching the router". That
-    /// is a different fault with a different fix, so emit nothing rather than
-    /// a confidently wrong zero.
+    /// Handles for the `/metrics` storage-tier series, or `None` without a local tree,
+    /// where every series would be a zero that its HELP text reads as a broken tier stream.
     pub fn metrics_source(&self) -> Option<KvIndexMetrics> {
         self.maintain_tree.then(|| KvIndexMetrics {
             tree: Arc::clone(&self.tree),
@@ -501,24 +381,15 @@ impl KvEventIndex {
         Arc::clone(&self.peers)
     }
 
-    /// Shared accessor for the engine-load table. Load values are written solely by the pump
-    /// (from `LoadStat` events); `add_worker` / `remove_worker` here manage
-    /// the expected set and per-worker eviction.
+    /// Engine-load table; the pump writes values,
+    /// while `add_worker` / `remove_worker` manage expected ranks and eviction.
     pub fn engine_reported_load(&self) -> Arc<EngineReportedLoadTable> {
         Arc::clone(&self.engine_reported_load)
     }
 
-    /// Register a worker. If `preresolved` is `Some`, the caller has
-    /// already fetched `/server_info` (worker manager path) and we skip
-    /// the internal HTTP round-trip; otherwise (standalone callers,
-    /// e.g. integration tests) we fall back to `fetch_event_config`.
-    ///
-    /// Opens one ZMQ SUB per advertised DP rank for each usable stream. In
-    /// metadata-only mode KV subscriptions remain disabled, but the separate
-    /// #34608 load stream is still attached when its full descriptor exists.
-    /// If the worker is not publishing KV events (older SGLang, opt-out
-    /// config), this is a logged no-op — the worker still routes via the
-    /// non-cache-aware policies.
+    /// Register a worker, opening one ZMQ SUB per DP rank on each advertised stream;
+    /// `preresolved` skips the `/server_info` fetch. Metadata-only mode still attaches
+    /// the load stream, and a worker that publishes nothing is a logged no-op.
     pub async fn add_worker(&self, worker_url: &str, preresolved: Option<EventConfig>) {
         let cfg: EventConfig = match preresolved {
             Some(c) => c,
@@ -541,12 +412,8 @@ impl KvEventIndex {
                 }
             },
         };
-        // Reconcile this worker's `page_size` with the oracle BEFORE
-        // any subscriber state is created. The first worker establishes
-        // the value; later workers must agree. A mismatch means the
-        // router and at least one engine would compute different block
-        // hashes for the same prompt, silently destroying cache-aware
-        // routing quality — reject loudly instead.
+        // Before any subscriber state exists: a worker with another `page_size` would hash
+        // the same prompt to different blocks, silently breaking cache-aware routing.
         if let Err(err) = self.block_size_oracle.try_set(cfg.block_size) {
             warn!(
                 worker_url = %worker_url,
@@ -558,9 +425,8 @@ impl KvEventIndex {
             );
             return;
         }
-        // Establish the bigram flag alongside block_size. EAGLE-family workers
-        // hash KV blocks over token bigrams, so the policy must use the bigram
-        // hasher for its query hashes to match the worker's stored hashes.
+        // EAGLE-family workers hash KV blocks over token bigrams,
+        // so query hashes must use the bigram hasher to match.
         self.block_size_oracle.set_bigram(cfg.is_bigram);
         let kv_dp_ranks = if self.maintain_tree {
             subscribable_ranks(cfg.port_base, cfg.dp_size)
@@ -625,15 +491,10 @@ impl KvEventIndex {
                 });
             }
         }
-        // Register for bootstrap BEFORE the subscriber starts too, so the very
-        // first batch is held back rather than applied ahead of the snapshot.
-        // Ordering matters in the other direction as well: the subscription
-        // must be live before the snapshot is fetched, so no delta can fall
-        // into the gap between the peer's export and our first received batch.
-        //
-        // KV ranks only. A load-only rank publishes no KV stream, so there is
-        // nothing to hold and no watermark to splice against; registering it
-        // would leave an obligation no snapshot can ever discharge.
+        // Register for bootstrap before subscribing, so the first batch is held, not applied
+        // ahead of the snapshot; the subscription must in turn be live before the fetch,
+        // so no delta falls between the peer's export and our first batch.
+        // KV ranks only: a load-only rank's obligation could never be discharged.
         let bootstrap_ranks: Vec<KvWorkerId> = kv_dp_ranks
             .iter()
             .map(|&rank| KvWorkerId::new(worker_url.to_string(), rank))
@@ -649,14 +510,9 @@ impl KvEventIndex {
             self.subscribers.add_worker(worker_url, &cfg).await;
         }
         if !bootstrap_obligations.is_empty() {
-            // Stamped HERE, after `subscribers.add_worker` — not at `register`.
-            // A peer's export has to beat the subscription, and anything earlier
-            // would let the sweep accept a snapshot taken during the subscribe
-            // window, which is precisely the hole the watermark check would then
-            // reject as `Gap`. `subscribers.add_worker` only spawns the SUB
-            // tasks, though: the connect completes asynchronously, so an export
-            // taken between this stamp and the connect can still gap, and the
-            // splice check is what catches it.
+            // Stamped after subscribing, so the sweep rejects exports from the subscribe window.
+            // The SUB connect completes asynchronously, so an export just after this stamp
+            // can still gap; the splice check catches that.
             let batch = ObligationBatch {
                 obligations: bootstrap_obligations,
                 holding_since: Instant::now(),
@@ -677,20 +533,15 @@ impl KvEventIndex {
         }
     }
 
-    /// Whether this worker's ranks enter the bootstrap state machine. Keyed on
-    /// configured, not settled, so a late worker still gets an obligation; and
-    /// independent of visible peers, because registering arms the deadline.
+    /// Keyed on configured rather than settled, so a late worker still gets an obligation,
+    /// and independent of visible peers, because registering arms the deadline.
     fn peer_bootstrap_enabled(&self) -> bool {
         self.bootstrap.enabled()
     }
 
-    /// Register the ranks a sweep should run for, returning their obligations.
-    ///
-    /// Only ranks the tracker does not already hold yield one:
-    /// `reconcile_unresolved_workers` re-calls `add_worker` for a worker it
-    /// already knows, and a rank that is `Pending` already has a sweep while a
-    /// terminal one has nothing left to fetch. A rank `remove_worker` forgot
-    /// registers as a new incarnation.
+    /// Obligations only for ranks the tracker does not hold, since `add_worker` can re-run
+    /// for a known worker: a `Pending` rank already has a sweep, a terminal one has nothing
+    /// to fetch. A rank `remove_worker` forgot registers as a new incarnation.
     fn register_for_bootstrap(&self, ranks: &[KvWorkerId]) -> Vec<(KvWorkerId, u64)> {
         if !self.peer_bootstrap_enabled() {
             return Vec::new();
@@ -698,12 +549,7 @@ impl KvEventIndex {
         self.bootstrap.register(ranks)
     }
 
-    /// Tear down a worker's subscribers and clear it from the tree.
-    /// Idempotent: a remove for a worker that was never added is a no-op.
-    ///
-    /// The live-worker entries are dropped **before** the subscriber join,
-    /// so any event still buffered in the mpsc by the time the pump
-    /// reaches it is dropped instead of re-inserted into the tree.
+    /// Tear down a worker's subscribers and tree state; a no-op for an unknown worker.
     pub async fn remove_worker(&self, worker_url: &str) {
         let Some(entry) = self.workers.lock().remove(worker_url) else {
             return;
@@ -716,31 +562,20 @@ impl KvEventIndex {
                 dp_rank,
             })
             .collect();
-        // 1. Mark every rank dead. Any pump-queued events arriving after
-        //    this point will be filtered.
+        // Before the subscriber join, so events still buffered are filtered by the pump.
         {
             let mut live = self.live_workers.lock();
             for id in &ids {
                 live.remove(id);
             }
         }
-        // 2. Cancel and join the per-rank subscriber tasks (KV + load). No
-        //    further events for these ranks will be queued after this returns.
         self.subscribers.remove_worker(worker_url).await;
         self.load_subscribers.remove_worker(worker_url).await;
-        // 3. Drop the worker's engine load and each rank's bootstrap state, so
-        //    a rank that never finished cannot hold the readiness gate open.
-        //    Any event already in the mpsc buffer at this point will be
-        //    filtered by the live-set check inside the pump.
+        // So a rank that never finished bootstrap cannot hold the readiness gate open.
         self.engine_reported_load.forget_worker(worker_url);
         self.bootstrap.forget(&ids);
-        // 4. Hand the per-rank teardown to the pump: `held`,
-        //    `awaiting_splice_proof`, the tree carriers, and the cursor. Doing
-        //    the tree/cursor half here would race a graft already past its
-        //    gates (see the `ForgetRanks` arm).
-        //
-        //    `bootstrap.forget` above must precede this send: it is what makes
-        //    an in-flight ApplySnapshot for these ranks a no-op.
+        // The pump clears the tree and cursor: doing it here would race a graft past its gates.
+        // `bootstrap.forget` must precede this send; it makes an in-flight ApplySnapshot a no-op.
         let (done_tx, done_rx) = oneshot::channel();
         let queued = self
             .ctrl_tx
@@ -753,9 +588,8 @@ impl KvEventIndex {
         // Wait, so a worker that flaps straight back cannot have its fresh
         // state wiped by this forget.
         if !queued || done_rx.await.is_err() {
-            // Only reachable once the pump has exited, i.e. during shutdown.
-            // Clean up inline so the state does not outlive the worker in that
-            // case; there is no writer left to race.
+            // Only reachable once the pump has exited during shutdown,
+            // so there is no writer left to race this inline cleanup.
             debug!("kv-events: pump is gone; tearing down worker state inline");
             let mut cursors = self.cursors.lock();
             for id in &ids {
@@ -765,27 +599,20 @@ impl KvEventIndex {
         }
     }
 
-    /// Number of worker URLs the index is currently subscribed to. The
-    /// count includes workers whose `/server_info` resolved but excludes
-    /// any whose discovery returned `Ok(None)` (worker reachable but not
-    /// publishing) or `Err` (transient discovery failure). Exposed for
-    /// tests + future metrics; not part of the routing hot path.
+    /// Subscribed worker URLs, excluding any whose discovery failed or found no publisher.
     pub fn known_worker_count(&self) -> usize {
         self.workers.lock().len()
     }
 
-    /// Shut down the pump task. Cancels the subscriber registry first so no
-    /// further events are queued, then cancels the pump so any buffered
-    /// events are discarded and the task exits promptly.
+    /// Stop the subscribers first so nothing more is queued,
+    /// then cancel the pump, discarding buffered events.
     pub async fn shutdown(&self) {
         self.subscribers.shutdown().await;
         self.load_subscribers.shutdown().await;
         self.pump_cancel.cancel();
         let handle = self.pump.lock().take();
         if let Some(h) = handle {
-            // 2s ceiling guards against a pathological tokio runtime
-            // teardown; under normal operation the pump exits within one
-            // poll of `pump_cancel.cancelled()`.
+            // Guards a pathological runtime teardown; the pump normally exits within one poll.
             match tokio::time::timeout(Duration::from_secs(2), h).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => warn!(error = %e, "kv-events pump task did not join cleanly"),
@@ -803,36 +630,20 @@ struct PumpDeps {
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
     bootstrap: Arc<BootstrapTracker>,
-    /// Peer set and client for the splice probe; see `spawn_splice_probe`. The
-    /// pump does not fetch snapshots for bootstrap itself — only this one
-    /// question, about state it already grafted.
+    /// For the splice probe only; the pump never fetches bootstrap snapshots itself.
     peers: Arc<PeerRegistry>,
     snapshot_http: reqwest::Client,
     /// Obligation queue, so a gap-discarded rank can be handed back for another
     /// sweep instead of staying cold with budget unspent.
     bootstrap_tx: mpsc::Sender<ObligationBatch>,
-    /// Loopback into this pump's own control channel, so a probe answer arrives
-    /// on the single writer like every other tree mutation.
-    ///
-    /// Weak so the pump does not keep its own control channel open: the channel
-    /// still closes when every external sender is gone, which is what the
-    /// `ctrl_open` latch in `pump_loop` exists to observe. A probe upgrades it
-    /// for the duration of its pass.
+    /// Loopback for probe verdicts; weak so the pump does not keep its own channel open,
+    /// which must still close (for `ctrl_open`) once every external sender is gone.
     ctrl_tx: mpsc::WeakSender<PumpControl>,
 }
 
-/// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
-/// to the engine-load table. Out-of-order (seq ≤ last_applied) and stale
-/// (worker not in `live_workers`) KV batches are skipped; `Load` is a gauge
-/// with no seq. `PublisherReset` events clear the cursor so a publisher
-/// restarting from seq=0 (after sending END_SEQ) is not filtered. Without
-/// that event, a regression is still read as a restart where it is
-/// unambiguous: any backwards step in a Pending rank's received sequence, and
-/// a batch 0 behind any cursor — both replace the rank's state with the new
-/// stream rather than being skipped.
-///
-/// Also the sole writer of tree state, including snapshot grafts arriving as
-/// [`PumpControl`]; see the single-writer property in [`super::tree`].
+/// Sole writer of tree state, snapshot grafts included (see [`super::tree`]).
+/// A restart without `PublisherReset` is detected where unambiguous:
+/// any regression while `Pending`, or a batch 0 behind any cursor.
 async fn pump_loop(
     deps: PumpDeps,
     cancel: CancellationToken,
@@ -863,14 +674,9 @@ async fn pump_loop(
     // Batches held back while their rank is `Pending`. Pump-local: the pump is
     // the only task that touches it, so no lock is needed.
     let mut held: HashMap<KvWorkerId, VecDeque<(i64, KvEventBatch)>> = HashMap::new();
-    // Ranks grafted from a snapshot whose continuity with the live stream is
-    // not yet provable, mapped to the watermark and when the wait started.
-    //
-    // WHY deferred: a snapshot can be grafted before the rank's first live
-    // batch has even arrived, so there is nothing to compare the watermark
-    // against yet. The check runs on whichever batch turns up first — held or
-    // live — and the entry is consumed by that one check, or by the sweep below
-    // if no batch ever arrives.
+    // Grafted ranks whose continuity with the live stream is unproven. A graft can precede
+    // any batch, so the check runs on the first held or live batch,
+    // or in the sweep below if none arrives.
     let mut awaiting_splice_proof: HashMap<KvWorkerId, PendingProof> = HashMap::new();
     let mut proof_sweep = tokio::time::interval(SPLICE_PROOF_SWEEP_INTERVAL);
     proof_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -935,12 +741,8 @@ async fn pump_loop(
                         watermark,
                         verdict,
                     }) => {
-                        // The rank may have proven itself, been forgotten,
-                        // been re-registered, or been re-grafted by a gap retry
-                        // while the probe was in flight. The epoch rules out
-                        // another incarnation; the watermark rules out another
-                        // graft of this one, which a retry makes under the same
-                        // epoch.
+                        // The epoch rules out another incarnation; the watermark,
+                        // a gap retry's re-graft under the same epoch.
                         let proof = match awaiting_splice_proof.get_mut(&rank) {
                             Some(proof)
                                 if proof.watermark == watermark
@@ -974,10 +776,8 @@ async fn pump_loop(
                                 awaiting_splice_proof.remove(&rank);
                                 bootstrap.record_rank_outcome(RankOutcome::Warm);
                             }
-                            // No witness. Keep the rank warm and ask again — but
-                            // not forever: a fleet that never answers (a
-                            // single-replica deployment, say) would otherwise
-                            // leave the verdict unresolved and the probe looping.
+                            // No witness: stay warm and re-ask, up to a cap,
+                            // since a single-replica fleet can never answer.
                             SpliceVerdict::Unknown => {
                                 proof.unknown_probes += 1;
                                 debug!(
@@ -1009,19 +809,12 @@ async fn pump_loop(
                 }
                 continue;
             }
-            // Ranks whose splice proof never arrived. Placed in the select rather
-            // than keyed off event arrival BECAUSE the failure mode is the absence
-            // of events: a rank that goes quiet right after a graft is exactly the
-            // one that would otherwise never be checked.
+            // Timer-driven, not event-driven: a rank that goes quiet right after a graft
+            // would otherwise never be checked.
             _ = proof_sweep.tick(), if !awaiting_splice_proof.is_empty() => {
-                // Do NOT discard on silence alone. Reaching the deferred path
-                // means nothing arrived between subscribing and grafting, and
-                // the subscriber is live before the snapshot is fetched — so
-                // silence is far more often "this rank published nothing" than
-                // "we lost a delta". Discarding on a timer would throw away a
-                // healthy warm tree on every quiet fleet, which is the exact
-                // regression this feature exists to prevent. Ask the fleet
-                // instead, and act only on positive evidence.
+                // Never discard on silence alone: the subscriber was live before the fetch,
+                // so a quiet rank most likely published nothing. Probe the fleet instead,
+                // and act only on positive evidence.
                 let now = Instant::now();
                 let mut targets = Vec::new();
                 for (rank, proof) in awaiting_splice_proof
@@ -1041,9 +834,7 @@ async fn pump_loop(
                         epoch,
                     });
                 }
-                // One pass for every due rank: a single cursor table per peer
-                // answers all of them, so asking per rank would multiply the
-                // fleet's work by the number of idle ranks.
+                // One probe for all due ranks: a peer's single cursor table answers every one.
                 if !targets.is_empty() {
                     if let Some(ctrl_tx) = ctrl_tx.upgrade() {
                         spawn_splice_probe(
@@ -1065,10 +856,8 @@ async fn pump_loop(
             }
         };
 
-        // Filter events from workers that are no longer attached. This is
-        // load-bearing: `remove_worker` clears the live set BEFORE joining
-        // the subscriber task, so any event still buffered when the pump
-        // reaches it would otherwise re-pollute the tree.
+        // Load-bearing: `remove_worker` clears the live set before joining subscribers,
+        // so a still-buffered event from a detached worker must not reach the tree.
         let worker = ev.worker();
         if !live_workers.lock().contains(worker) {
             debug!(
@@ -1080,15 +869,12 @@ async fn pump_loop(
 
         match ev {
             WorkerEvent::Load { worker, load } => {
-                // Gauge: last value wins, no sequence/dedup. The live-worker
-                // filter above already dropped load from detached workers.
+                // Gauge: last value wins, no sequence or dedup.
                 engine_reported_load.set(&worker.url, worker.dp_rank, load, Instant::now());
             }
             WorkerEvent::PublisherReset { worker } => {
-                // A reset means the engine restarted with an empty cache and
-                // renumbers from 0: any splice proof, grafted state or held
-                // batch describes a cache that no longer exists, so drop all of
-                // it and relearn from the new stream.
+                // The engine restarted with an empty cache and renumbers from 0,
+                // so every proof, graft and held batch for this rank is dead.
                 if awaiting_splice_proof.remove(&worker).is_some() {
                     bootstrap.record_rank_outcome(RankOutcome::PublisherReset);
                 }
@@ -1126,35 +912,24 @@ async fn pump_loop(
                 seq,
                 mut batch,
             } => {
-                // A rank still awaiting its snapshot holds its batches: applying
-                // them first would put live deltas *under* the snapshot, where a
-                // stale `BlockStored` from the peer could resurrect a block this
-                // rank has already evicted.
+                // A `Pending` rank holds its batches: applied under the snapshot, a stale peer
+                // `BlockStored` could resurrect a block this rank already evicted.
                 if bootstrap.enabled()
                     && bootstrap.state_of(&worker) == Some(BootstrapState::Pending)
                 {
                     let last_held = held.get(&worker).and_then(|q| q.back()).map(|(s, _)| *s);
-                    // The last seq this rank RECEIVED: the held queue's tail, or
-                    // with nothing held, its cursor. A Pending rank's cursor is
-                    // a raw arrival seq, never a graft watermark: a graft moves
-                    // the rank out of Pending, every path that discards one
-                    // clears the cursor it seeded, and a fresh incarnation
-                    // starts with none, because its `ForgetRanks` is queued on
-                    // the control channel, which the pump drains first.
+                    // Last seq RECEIVED. A Pending rank's cursor is never a graft watermark:
+                    // a graft leaves Pending, discarding one clears its cursor,
+                    // and a fresh incarnation's `ForgetRanks` is drained first.
                     let last_received = last_held.or_else(|| cursors.lock().get(&worker).copied());
                     if last_held.is_none() && seq == STREAM_ORIGIN_SEQ {
                         // Nothing to wait on a peer for: this stream starts at
                         // its publisher's origin.
                         resolve_from_origin(&pump_state, &mut held, &worker);
                     } else if last_received.is_some_and(|last| seq < last) {
-                        // Received order is raw arrival order — no watermark is
-                        // seeded into it — and PUB/SUB neither reorders nor
-                        // replays, so a regression in it is the publisher
-                        // renumbering: the engine restarted in place without an
-                        // `END_SEQ`. Anything queued is a dead stream. Holding
-                        // on would graft a snapshot whose old-numbering watermark
-                        // then filters the entire new stream, with no gap ever
-                        // detected — dead state served warm, live updates lost.
+                        // PUB/SUB neither reorders nor replays, so a regression means the
+                        // publisher restarted without `END_SEQ`; a graft with the old watermark
+                        // would filter the whole new stream and serve dead state as warm.
                         warn!(
                             worker = ?worker,
                             last_received_seq = last_received,
@@ -1176,11 +951,8 @@ async fn pump_loop(
                             );
                         }
                     } else if held.get(&worker).map_or(0, VecDeque::len) >= PENDING_BATCH_LIMIT {
-                        // Dropping from the middle of the stream would leave a
-                        // hole the snapshot cannot be spliced across, so give up
-                        // on bootstrapping this rank and let it run live. The
-                        // queue itself is intact (nothing was dropped to reach
-                        // the cap), so it is replayed rather than discarded.
+                        // Dropping mid-stream would leave an unspliceable hole, so run live;
+                        // the intact queue is replayed rather than discarded.
                         warn!(
                             worker = ?worker,
                             limit = PENDING_BATCH_LIMIT,
@@ -1195,10 +967,8 @@ async fn pump_loop(
                             RankOutcome::Overflow,
                         );
                     } else {
-                        // The cap counts batches, not bytes, and `token_ids` is
-                        // the unbounded part of a batch (one entry per prompt
-                        // token) that `apply_batch` never reads. Shed it so a
-                        // long-context fleet cannot hold gigabytes at boot.
+                        // The cap counts batches, not bytes; `token_ids` grows per prompt token
+                        // and `apply_batch` never reads it, so shed it.
                         for event in &mut batch.events {
                             if let KvCacheEvent::BlockStored(b) = event {
                                 b.token_ids = Vec::new();
@@ -1216,21 +986,10 @@ async fn pump_loop(
                     // Falls through: the rank is no longer Pending, so this
                     // batch is applied directly below.
                 } else if seq == STREAM_ORIGIN_SEQ && cursors.lock().contains_key(&worker) {
-                    // The resolved-rank counterpart of the regression above,
-                    // narrowed to batch 0. Here the comparison is against the
-                    // CURSOR, which a graft may have seeded ahead of anything
-                    // received, so `seq <= cursor` in general means "already
-                    // reflected" and stays filtered by `apply_batch`. Batch 0 is
-                    // the exception: any cursor means batch 0 is already
-                    // reflected, so another one is a restarted publisher —
-                    // whose whole stream the old cursor would otherwise filter
-                    // until it overtook it. (Were it a redelivery at cursor 0,
-                    // clearing and re-applying batch 0 rebuilds the same state,
-                    // since batch 0 is all such a cursor reflects. Were it a
-                    // graft the pump took before this rank's first batch, the
-                    // stream from its origin rebuilds what the graft held.) The gap
-                    // check below cannot see this: it flags forward holes, and
-                    // a regressed seq passes it as proof of continuity.
+                    // A graft may seed the cursor ahead of anything received, so `seq <= cursor`
+                    // usually means already reflected; but any cursor reflects batch 0,
+                    // so another batch 0 is a restarted publisher (replaying from origin is
+                    // also safe for a redelivery). The gap check flags only forward holes.
                     warn!(
                         worker = ?worker,
                         "kv-events pump: batch 0 behind a later cursor; replacing this rank's \
@@ -1245,8 +1004,7 @@ async fn pump_loop(
                     tree.clear_worker(&worker);
                     cursors.lock().remove(&worker);
                 }
-                // First batch after a graft proves — or disproves — that the
-                // snapshot joins up with this rank's live stream.
+                // The first batch after a graft proves or disproves its splice.
                 let proof = if awaiting_splice_proof.is_empty() {
                     None
                 } else {
@@ -1269,9 +1027,7 @@ async fn pump_loop(
                         resolve_gap(&pump_state, &mut held, &worker);
                         continue;
                     } else {
-                        // The deferred check passed: this rank's grafted state is
-                        // now proven continuous with its live stream, which is the
-                        // point at which it counts as warm.
+                        // Proven continuous with its live stream, so the rank now counts as warm.
                         bootstrap.record_rank_outcome(RankOutcome::Warm);
                     }
                 }
@@ -1293,11 +1049,8 @@ struct PumpState<'a> {
     bootstrap_tx: &'a mpsc::Sender<ObligationBatch>,
 }
 
-/// Apply one batch, honouring the cursor's out-of-order filter.
-///
-/// This is the single place tree deltas are written, whether the batch came
-/// straight off the wire or out of a bootstrap hold-back queue — which is what
-/// makes cursor seeding sufficient to reconcile a snapshot with the live stream.
+/// The only writer of tree deltas, for live and held batches alike,
+/// which is why seeding the cursor suffices to reconcile a snapshot with the live stream.
 fn apply_batch(
     tree: &HashTree,
     cursors: &Mutex<HashMap<KvWorkerId, i64>>,
@@ -1319,11 +1072,9 @@ fn apply_batch(
             );
             return;
         }
-        // The publisher's seq is dense, so a jump is exactly the batches ZMQ
-        // dropped at its high-water mark. A removal clears only its own tier,
-        // so losing a block's last removal leaves the worker owning it until
-        // the next AllBlocksCleared or teardown; only the sequence shows that
-        // happened. The operator-visible signature is tree coverage above 1.
+        // Seq is dense, so a jump is exactly the batches ZMQ dropped at its high-water mark.
+        // A lost removal leaves the worker owning that block until AllBlocksCleared or teardown,
+        // visible to operators only as tree coverage above 1.
         let lost = (seq - p - 1) as u64;
         if lost > 0 {
             tally.record_lost_batches(lost);
@@ -1338,10 +1089,8 @@ fn apply_batch(
     }
     for event in &batch.events {
         match event {
-            // The `medium` tag decides which tier a store lands on and which
-            // tier a removal clears, so a device eviction leaves a worker that
-            // still holds the block on host as an owner — see the tree's
-            // "Storage tiers" docs.
+            // `medium` picks the tier a store fills and a removal clears, so a device eviction
+            // keeps a worker holding the block on host as owner (see "Storage tiers" in the tree).
             KvCacheEvent::BlockStored(b) => {
                 tally.record(
                     EventKind::BlockStored,
