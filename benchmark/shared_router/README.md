@@ -1,9 +1,10 @@
 # DeepSeek V4.1 shared expert and router fusion
 
 This opt-in AMD optimization combines the shared MLP and router into two GPU
-launches for small DSpark verification batches. The current public-main port
-is undergoing qualification. Current evidence and historical results are
-separated below; incomplete sweep and reverse-order checks remain explicit.
+launches for small DSpark verification batches. Local qualification completed
+on the pinned public-main port and incrementally over #42055: both full sweeps,
+C1/C2 reverse-order checks, real-acceptance accuracy and raw graph attribution.
+This is not public CI or upstream approval. Historical results remain separate.
 
 ## Motivation and implementation
 
@@ -86,9 +87,8 @@ pair above, not a new accuracy score. Public-main native-first confirmation
 also passed: P50 TPOT 2.994267 to 2.934059 ms (-2.011%), output throughput
 +2.012%, with exact-source full GSM8K reused from the main pair. Both main
 and incremental C2 results are positive in both run orders. Both forward sweeps
-and public-main C1 reverse are complete; incremental C1 reverse is still in
-progress. Do not add gains from
-different common sources or claim statistical significance.
+and all C1/C2 reverse-order checks are complete. Do not add gains from different
+common sources or claim statistical significance.
 The preparation tree changes only formatting and reproduction support relative
 to the main measured runtime: Python AST is identical, C++/Triton unchanged.
 
@@ -110,8 +110,17 @@ The public-main candidate-first C1 confirmation measured P50 TPOT 2.311342 to
 2.234070 ms (-3.343%), P50 ITL -3.380%, output throughput +3.144%, and P50 TTFT
 +0.407%. It passed the same three-repeat and all-rank raw trace gates, reusing
 the exact-source full GSM8K pair above. C1 decode gain holds in both orders;
-TTFT did not improve in this reverse pair. Incremental C1 reverse remains in
-progress. No significance claim is made from these sequential, co-located pairs.
+TTFT did not improve in this reverse pair.
+
+Incremental C1 candidate-first confirmation also passed: P50 TPOT 2.261824 to
+2.223770 ms (-1.682%), P50 ITL -1.705%, output throughput +1.574%, and P50 TTFT
++0.391%. Its three native TPOT samples were 2.261824, 2.263488 and 2.259249 ms;
+candidate samples were 2.221193, 2.225961 and 2.223770 ms. Both fused stages
+replayed 320 times on each rank in the untimed candidate trace; the native
+trace had zero fused launches. Exact-source full accuracy is reused, not newly
+measured by this perf-only run. Incremental C1 gain holds in both orders, but
+TTFT did not improve in the reverse pair. No significance claim is made from
+these sequential, co-located pairs.
 
 ### Completed public-main fallback checks
 
@@ -128,9 +137,8 @@ All four accuracy pairs had zero request errors. Hash-checked traces show graph
 replay on all four ranks but no horizontal-fusion launches in steady decode.
 These are native-fallback checks with no observed material regression, not
 evidence of a fusion speedup at these batch sizes. Tail batches can still enter
-the supported small-M path. Both forward sweeps and the public-main reverse
-checks are complete; only incremental C1 reverse remains pending.
-The historical sweep below cannot substitute for them.
+the supported small-M path. Both forward sweeps and both sources' C1/C2 reverse
+checks are complete. The historical sweep below is separate evidence.
 
 At C32 the candidate lost six correct answers (0.455 percentage points), close
 to the local 0.5 pp loss limit. Passing that gate does not establish equivalent
@@ -228,22 +236,22 @@ questions. Baseline/candidate correct counts were 1287/1285, 1286/1281,
 1283/1282, 1284/1284, 1283/1285 and 1286/1285 at C1/2/4/8/16/32. All passed the
 local 0.5-percentage-point loss tolerance; that tolerance is not an upstream
 standard or proof of numerical equivalence. Synthetic outputs are never used
-as accuracy evidence. Current-main all-concurrency accuracy is now complete;
-remaining incremental and reverse-order qualification is listed above.
+as accuracy evidence. Current-main and incremental all-concurrency accuracy
+and reverse-order qualification are complete as reported above.
 
-## Prior art and qualification still required
+## Prior art and review limits
 
 - [AITER 5321](https://github.com/ROCm/aiter/pull/5321) and
   [AITER 4504](https://github.com/ROCm/aiter/pull/4504) explore Kimi shared/router
   projection fusion. This draft does not claim invention of horizontal fusion.
 - [SGLang 42055](https://github.com/sgl-project/sglang/pull/42055) optimizes the
-  same activation-quantization boundaries. The C2 incremental result is above;
-  remaining concurrency and reverse-order checks are still required.
+  same activation-quantization boundaries. The incremental sweep and C1/C2
+  reverse-order results are above.
 - [SGLang 42011](https://github.com/sgl-project/sglang/pull/42011) optimizes an
   alternative shared expert folded into routed MoE; it is not simply additive.
 
-Before submission: complete all-concurrency and reverse-order qualification
-and attach raw evidence, including the faster folded alternative. Public full-model
-C2 reproduction and per-rank startup/memory logs are available; process peak
-memory remains unmeasured. Real-checkpoint cases and registered fallback tests
-are in place; their scope is described above.
+Local full-model qualification, including the faster folded alternative, is
+complete. Preserve the raw evidence when sharing the PR. Reproduction commands
+use public dependencies; per-rank startup/memory logs are retained. Process
+peak memory remains unmeasured. Public CI, maintainer review and upstream
+acceptance have not occurred. Test scope and numerical limits remain as above.

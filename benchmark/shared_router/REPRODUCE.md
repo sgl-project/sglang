@@ -3,8 +3,9 @@
 These commands compare the same SGLang source with horizontal fusion disabled
 and enabled. They preserve TP4/EP1, DSpark block 5 and the 8K/1K workload.
 Accuracy uses real acceptance; performance uses synthetic acceptance length
-3.51. Never score synthetic outputs. Full qualification of this public-main
-port is still in progress; these commands are not a claim of completed results.
+3.51. Never score synthetic outputs. Local qualification completed on the pinned
+public-main and incremental #42055 sources; see README.md for measured revisions,
+full sweeps, reverse-order checks and limitations. Public CI has not been run.
 
 ## Environment and dependencies
 
@@ -32,8 +33,8 @@ cases and graph microbenchmark in this public image. Its public CK submodule
 is `af9e1d1f1ae347c22feeb08fd2d42645075e0c5d`. The matched C2 pair completed
 full GSM8K (native 1284/fused 1287 of 1319, zero request errors) and three-repeat
 timing (median P50 TPOT 2.994574/2.923689 ms). The #42055 incremental pair also
-completed; see README.md. Both forward sweeps are complete; incremental C1
-reverse remains in progress. This is not a claim that every PR gate is complete.
+completed; see README.md. Both forward sweeps and C1/C2 reverse-order checks are
+complete. This does not establish performance or accuracy on untested workloads.
 
 Inside that container, make the pinned public dependency visible instead of
 silently using an image fork. No custom AITER changes are needed:
