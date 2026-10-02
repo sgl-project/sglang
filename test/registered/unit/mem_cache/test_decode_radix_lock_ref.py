@@ -60,7 +60,7 @@ from sglang.test.test_utils import CustomTestCase
 
 
 def _make_cache_with_pools(page_size=1):
-    """Create a RadixCache with mock pools sufficient for checkpoint / checkpoint."""
+    """Create a RadixCache with mock pools sufficient for checkpoint and release_kv_cache."""
     mock_allocator = MagicMock()
     mock_allocator.device = torch.device("cpu")
     mock_allocator.page_size = page_size
