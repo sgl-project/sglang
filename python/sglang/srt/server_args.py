@@ -9001,9 +9001,21 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.disable_overlap_schedule and self.speculative_algorithm in (
+                None,
+                "DSPARK",
+            ), "Pipeline parallelism requires non-overlap AR or target-KV DSPARK"
+            if self.speculative_algorithm == "DSPARK":
+                assert (
+                    self.disaggregation_mode == "null"
+                    and self.dp_size == 1
+                    and self.attn_cp_size == 1
+                    and self.dcp_size == 1
+                    and not self.enable_dp_attention
+                    and not self.enable_hierarchical_cache
+                    and not self.enable_lmcache
+                    and not self.enable_flexkv
+                ), "Pipeline DSPARK requires DP1/CP1, colocated serving and device KV cache"
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "

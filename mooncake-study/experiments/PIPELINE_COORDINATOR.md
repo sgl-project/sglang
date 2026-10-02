@@ -2,8 +2,10 @@
 
 The coordinator consumes an already agreed static target-KV batch and orders
 projection, proposal agreement, target activation transport, final acceptance
-and local commit. It is a component for a future PP scheduler path; the current
-scheduler does not instantiate it and all public PP speculative gates remain.
+and local commit. The colocated synchronous PP scheduler now instantiates it;
+see [the serving runbook](PIPELINE_SERVING.md) for real-model integration and
+current capability limits. The evidence in this file describes the isolated
+coordinator prerequisite.
 
 Run the complete unit files:
 
@@ -91,9 +93,9 @@ execute the new coordinator. They check target-KV drafts on D alone and on P/D,
 and hidden-input static/cap-accept/compact paths with eager and graph/overlap
 execution. Snapshot readback uses independent online KV/logit observations.
 
-Full PP model initialization, scheduler admission and request-state consensus,
-cancellation/retraction, P/D readiness, actual PP speculative capture, source-KV
-NCCL projection and latency/throughput validation remain required. Boundary
+The separate serving test now covers TP1/PP2 model initialization, scheduling,
+cancellation/retraction, actual PP capture and source-KV NCCL projection.
+P/D readiness and latency/throughput validation remain required. Boundary
 fences cannot recover a crashed process, failed device communication or a rank
 stranded inside an internal model/injector collective. Process-group failure
 handling and restart still apply. The synchronous ordering, metadata validation

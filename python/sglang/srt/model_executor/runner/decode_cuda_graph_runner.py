@@ -1181,6 +1181,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            # Verify metadata can be planned before the preceding PP stage has
+            # produced its activations. Refresh them when execution receives them.
+            if pp_proxy_tensors is not None:
+                for name, value in pp_proxy_tensors.tensors.items():
+                    if value is not None:
+                        self.buffers.pp_proxy_tensors[name][: value.shape[0]].copy_(
+                            value
+                        )
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
@@ -1359,7 +1367,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            return PPProxyTensors(
+                {k: v[: self.raw_num_token] for k, v in output.tensors.items()}
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

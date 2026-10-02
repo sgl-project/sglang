@@ -43,9 +43,10 @@ it does not redefine the goal as the modules already implemented.
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes synchronous/overlap and eager/graph combinations; retired captures fail once, released slots are reused, fresh admission and exact post-exit Store reads pass; distributed pressure and SLOs remain open |
-| DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes in all four synchronous/overlap and eager/graph combinations; failed captures are excluded and fresh capture admission recovers |
+| DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes in all four PP1 synchronous/overlap and eager/graph combinations, plus synchronous PP2 eager/graph; failed captures are excluded and fresh capture admission recovers |
 | PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2 and cross-node TP1 RDMA pass eager and graph/overlap, source parity and failure exclusion; pipeline speculation and wider distributed RDMA remain open |
-| Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark, TP/PP AR PD, TP1/TP2 target-KV DSpark PD, single-rank cross-node RDMA and single-GPU AR prefill graphs have runtime evidence below; combined topologies, pipeline speculation and workload SLO gates remain open |
+| Pipeline draft serving | Synchronous static target-KV PP loop, per-stage graph activations and cohort capture | Qwen3 TP1/PP2 eager/graph, mixed batches, grammar, prefix reuse, cancellation, automatic retraction and exact Mooncake readback pass; asynchronous PP, PP speculative P/D and broader topologies remain open |
+| Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark, colocated static target-KV PP2 DSpark, TP/PP AR PD, TP1/TP2 target-KV DSpark PD, single-rank cross-node RDMA and single-GPU AR prefill graphs have runtime evidence below; combined topologies, PP speculative P/D and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
 `/gpfs/users/fuxuanwei-1/dspark-maas-lab/state`):
@@ -2989,17 +2990,85 @@ distributed timeout/restart handling still applies. See
 [the runbook](experiments/PIPELINE_COORDINATOR.md) and
 [retained evidence](experiments/pipeline-dspark-coordinator.json).
 
+## Real Colocated Pipeline DSpark Serving
+
+The scheduler now dispatches colocated PP DSpark to a synchronous loop using
+`DSparkPPCoordinator`. Requests are relayed before handlers or projection enter
+world collectives. Ordinary batch planning and result processing remain in use;
+the coordinator executes under scheduler field isolation, including agreed idle
+turns. Slot-zero PP batch references support cancellation and idle inspection.
+Queue/running timeouts broadcast the request IDs selected by world rank zero.
+Existing grammar readiness and minimum PP KV-capacity synchronization are reused.
+
+Public startup accepts static target-KV PP with DP1/CP1 and device KV cache.
+PP P/D, hidden-input, confidence-scheduled and overlap execution remain rejected.
+HiCache, LMCache and FlexKV require additional readiness coordination and are
+also rejected on this path. It keeps one batch outstanding, with no asynchronous
+PP microbatch concurrency.
+
+Real graph execution exposed and fixed three production issues: hidden/residual
+PP buffers were allocated by request count instead of verify-token count; graph
+outputs were sliced by batch size; and preplanned verification could replay
+stale predecessor activations. Both dummy and regular buffers now use token
+capacity, output uses the actual token count, and execution refreshes received
+activations even after early metadata preparation. Frame validation rejects
+incorrect token counts before transport. Request signatures also normalize
+production `array.array` token histories before canonical hashing.
+
+The final complete two-H100 Qwen3-0.6B TP1/PP2 serving file passed **two tests in
+163.495 seconds**, covering eager and decode CUDA graph modes. Each mode checks
+greedy output against AR, prefix hits, mixed acceptance, grammar, stochastic
+sampling with penalties and stop tokens. It then cancels a live stream and
+forces natural 512-token KV pool exhaustion using four disjoint 208-token paths.
+Both modes report two retractions, finish all four 192-token replies, rebuild
+draft context on both stages and recover fresh capture admission. Each mode
+checks **10 snapshots** and rereads them after the producer exits.
+
+The shared-buffer regression, real PP2 AR P/D, passed **two tests in 138.518
+seconds** with **10 snapshots**. Resident PP1 target-KV P/D passed **four tests in
+327.133 seconds**; hidden-input static/cap-accept/compact P/D passed **six tests
+in 390.540 seconds**. Those two suites checked **60 snapshots**. All real runtime
+tests use actual Mooncake TCP Store and the Catalog test double. KV and top-128
+values are exact against independent online observations; logsumexp uses 1e-6
+relative/absolute tolerance. Tokens, vocabulary IDs, masks, positions, valid KV
+ranges and failed-capture exclusion are checked.
+
+Whole-file configuration, timeout, scheduler-loop, graph-buffer, runner, worker
+phase, target-KV, draft-path and Gloo tests also pass. The coordinator fixture
+checks TP2/PP2 and TP1/PP4 with 15 failure scenarios, including invalid activation
+rows. The final server-args suite has 145 tests including the new PP gates.
+Its initial remote-model-config failure was resolved by pointing the unchanged
+test fixture constant to the same locally available Qwen2.5-1.5B-Instruct config.
+Final evidence totals **270 tests and 90 checked snapshots**.
+
+The evidence retains earlier failures, their causes and log hashes. All 29
+recorded source hashes match the GPU checkout. Black passes for all 22 changed
+Python files. Ruff reports the same 566 preexisting diagnostics and no additions.
+The final production-only edit after PP1 regressions was the FlexKV startup gate;
+final configuration and both PP2 runtime suites ran that revision. The temporary
+two-H100 job was deleted after checking for live model/test/Store processes,
+and pod absence was verified. The resident H100 returned to its idle workload
+with no active/queued experiment. The original checkout's staged index is unchanged.
+
+This implements real colocated PP serving and collection, not trained-draft
+quality, production Catalog retention, PP speculative P/D, real-model TP2/PP2,
+host-tier cache integration, cross-node pipeline RDMA or performance acceptance.
+See [the runtime contract](TARGET_KV_DRAFT.md#synchronous-pipeline-serving),
+[the reproduction runbook](experiments/PIPELINE_SERVING.md) and
+[retained evidence](experiments/pipeline-dspark-serving.json).
+
 ## Next Implementation
 
 1. Extend passing single-GPU AR prefill graph coverage to distributed/speculative
-   and mixed-batch execution. Extend automatic AR/DSpark retraction evidence to
-   distributed pressure. Broaden real-request coverage to speculative cache eviction, target weight replacement and
+   and mixed-batch execution. Extend distributed pressure beyond passing
+   synchronous PP2 DSpark to AR and combined topologies. Broaden real-request coverage to speculative cache eviction, target weight replacement and
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
 3. Extend P9's real TP2/PP1 and TP1/PP2 Qwen3 capture validation to combined
    TP2/PP2, replicated heads, distributed cancellation/backpressure and additional
-   model identities. Complete pipeline speculative collection, extend real
+   model identities. Extend passing colocated static PP speculative collection
+   to P/D and broader topologies, extend real
    speculative PD topology coverage and cross-node distributed RDMA. Both the
    separate Store RDMA lane and single-rank cross-node P/D RDMA lane have passed
    AR/DSpark eager/graph correctness tests.

@@ -1627,12 +1627,26 @@ class Scheduler(
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
         if timeout_s <= 0:
             return
-        if running_batch.is_empty():
+        pp_dspark = getattr(self, "dspark_pp_coordinator", None) is not None
+        if running_batch.is_empty() and not pp_dspark:
             return
 
         deadline = time.perf_counter() - timeout_s
+        expired = (
+            self._pp_dspark_timeout_ids(
+                running_batch.reqs, "forward_entry_time", timeout_s, running=True
+            )
+            if pp_dspark
+            else None
+        )
         for req in running_batch.reqs:
-            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+            timed_out = (
+                req.rid in expired
+                if expired is not None
+                else not req.finished()
+                and 0 < req.time_stats.forward_entry_time < deadline
+            )
+            if timed_out:
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
@@ -2846,9 +2860,16 @@ class Scheduler(
 
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
+        expired = (
+            self._pp_dspark_timeout_ids(
+                self.waiting_queue, "wait_queue_entry_time", timeout_s
+            )
+            if getattr(self, "dspark_pp_coordinator", None) is not None
+            else None
+        )
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
-            if 0 < entry_time < deadline:
+            if req.rid in expired if expired is not None else 0 < entry_time < deadline:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
@@ -3788,7 +3809,12 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    coordinator = getattr(self, "dspark_pp_coordinator", None)
+                    batch_result = (
+                        coordinator.run_batch(batch)
+                        if coordinator is not None
+                        else self.model_worker.forward_batch_generation(batch)
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -4938,7 +4964,10 @@ def dispatch_event_loop(scheduler: Scheduler):
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
         elif server_args.pp_size > 1:
-            scheduler.event_loop_pp()
+            if scheduler.spec_algorithm.is_dspark():
+                scheduler.event_loop_pp_dspark()
+            else:
+                scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
         elif scheduler.enable_overlap:

@@ -42,6 +42,59 @@ _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
 
 
+class TestPipelineDSparkArgs(CustomTestCase):
+    def args(self, **overrides):
+        return ServerArgs(
+            **(
+                {
+                    "model_path": "dummy",
+                    "served_model_name": "dummy",
+                    "pp_size": 2,
+                    "disable_overlap_schedule": True,
+                    "speculative_algorithm": "DSPARK",
+                    "chunked_prefill_size": 128,
+                    "page_size": 1,
+                }
+                | overrides
+            )
+        )
+
+    def test_colocated_pipeline_allows_ar_and_dspark(self):
+        for algorithm in (None, "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                self.args(speculative_algorithm=algorithm).check_server_args()
+
+    def test_pipeline_rejects_overlap_and_other_drafts(self):
+        for changes in (
+            {"disable_overlap_schedule": False},
+            {"speculative_algorithm": "DFLASH"},
+            {"speculative_algorithm": "EAGLE"},
+        ):
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(AssertionError, "Pipeline parallelism requires"),
+            ):
+                self.args(**changes).check_server_args()
+
+    def test_pipeline_dspark_rejects_uncoordinated_readiness(self):
+        for changes in (
+            {"disaggregation_mode": "prefill"},
+            {"disaggregation_mode": "decode"},
+            {"dp_size": 2},
+            {"attn_cp_size": 2},
+            {"dcp_size": 2},
+            {"enable_dp_attention": True},
+            {"enable_hierarchical_cache": True},
+            {"enable_lmcache": True},
+            {"enable_flexkv": True},
+        ):
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(AssertionError, "Pipeline DSPARK requires"),
+            ):
+                self.args(**changes).check_server_args()
+
+
 class TestPrepareServerArgs(CustomTestCase):
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")

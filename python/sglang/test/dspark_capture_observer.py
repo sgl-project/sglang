@@ -94,8 +94,16 @@ def observe(
             assert len(history) >= start
             verify_tokens = forward_batch.input_ids[region].tolist()
             tokens = history[:start] + verify_tokens
-            predictions = list(range(start + 1, start + count + 1))
-            logits = logits_output.next_token_logits[region]
+            predictions = (
+                list(range(start + 1, start + count + 1))
+                if logits_output is not None
+                else []
+            )
+            logits = (
+                logits_output.next_token_logits[region]
+                if logits_output is not None
+                else None
+            )
         # Read all raw vocabulary scores. The test computes its own top-k and
         # row alignment from final output tokens, without using capture tickets.
         reference = {

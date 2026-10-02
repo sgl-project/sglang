@@ -118,7 +118,7 @@ class TestCaptureConfiguration(CustomTestCase):
                     finally:
                         setattr(self.args, name, previous)
 
-    def test_tp_static_dspark_does_not_enable_pipeline_speculation(self):
+    def test_colocated_dspark_accepts_pipeline_capture(self):
         for tp, pp in ((2, 1), (1, 2), (2, 2)):
             with self.subTest(tp=tp, pp=pp):
                 self.args.tp_size, self.args.pp_size = tp, pp
@@ -130,13 +130,7 @@ class TestCaptureConfiguration(CustomTestCase):
                         envs.SGLANG_RAGGED_VERIFY_MODE, "get", return_value="static"
                     ),
                 ):
-                    if pp == 1:
-                        validate_capture_server_args(self.args)
-                    else:
-                        with self.assertRaisesRegex(
-                            ValueError, "pipeline speculative capture"
-                        ):
-                            validate_capture_server_args(self.args)
+                    validate_capture_server_args(self.args)
 
     def test_dspark_verify_modes_still_reject_simulated_acceptance(self):
         self.args.speculative_algorithm = "DSPARK"

@@ -89,12 +89,16 @@ def read_snapshot(store, publication):
     return manifest, packed
 
 
-def exercise_capture_abort(test, *, url, rid, prompt, max_new_tokens):
+def exercise_capture_abort(
+    test, *, url, rid, prompt, max_new_tokens, distributed=False
+):
     """Cancel a live stream and require a fenced failure without publication."""
     state = requests.get(url + "/server_info", timeout=10).json()["internal_states"][0][
         "training_capture"
     ]
     previous_admitted = state["counters"].get("admitted", 0)
+    previous_cancelled = state.get("request_router", {}).get("cancelled", 0)
+    reason = "cohort_failed" if distributed else "request_aborted_or_retracted"
     with test.catalog.condition:
         previous_publications = len(test.catalog.publications)
         previous_failures = {
@@ -138,7 +142,7 @@ def exercise_capture_abort(test, *, url, rid, prompt, max_new_tokens):
                 lambda: any(
                     capture_id not in previous_failures
                     and record["state"] == "FAILED"
-                    and record.get("reason") == "request_aborted_or_retracted"
+                    and record.get("reason") == reason
                     for capture_id, record in test.catalog.captures.items()
                 ),
                 timeout=20,
@@ -156,9 +160,14 @@ def exercise_capture_abort(test, *, url, rid, prompt, max_new_tokens):
         test.assertLess(time.monotonic(), deadline, state)
         time.sleep(0.05)
     test.assertEqual(state["counters"].get("admitted", 0), previous_admitted + 1)
-    test.assertGreater(
-        state["counters"].get("failed_request_aborted_or_retracted", 0), 0
-    )
+    if distributed:
+        test.assertGreater(
+            state["request_router"].get("cancelled", 0), previous_cancelled
+        )
+    else:
+        test.assertGreater(
+            state["counters"].get("failed_request_aborted_or_retracted", 0), 0
+        )
     test.assertEqual(state["host_pool"]["quarantined"], 0)
     return state
 

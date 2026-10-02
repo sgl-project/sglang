@@ -1,0 +1,955 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-02",
+  "base_commit": "c53f1a7bf7a9dc5dea11a88c6f054a5f298ab59d",
+  "feature": "Real colocated static target-KV DSpark pipeline scheduling, CUDA graph activation correctness and distributed Mooncake capture",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "resident_node": "node064",
+    "resident_gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "temporary_job": "job-29e160821431-20261002091131",
+    "temporary_node": "node071",
+    "temporary_gpus": [
+      "GPU-7dc47845-2810-8101-7c87-dfc12d2bfbd3",
+      "GPU-7f16324c-fde5-ce5e-0ee0-81cc3c5872f4"
+    ],
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "versions": {
+      "python": "3.12.3",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "sglang-kernel": "0.4.6.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "temporary_environment_adjustment": "Removed incompatible flashinfer-cubin 0.6.12 and flashinfer-jit-cache 0.6.12+cu130 from the temporary pod system Python. Shared venv and resident packages were unchanged."
+  },
+  "implementation": [
+    "Dispatch colocated PP DSPARK to a synchronous loop that relays requests before handlers/collectives, uses ordinary batch planning and result processing, and coordinates idle turns.",
+    "Mirror active PP batch slots for cancellation and idle checks; broadcast expired request IDs selected by world rank zero.",
+    "Execute DSparkPPCoordinator under scheduler forward isolation and retain local capture tickets and common next-draft state.",
+    "Allow static target-KV PP serving with DP1/CP1 and device KV cache. Reject PP disaggregation, hidden-input drafts, confidence verify, overlap, HiCache, LMCache and FlexKV.",
+    "Allocate PP hidden/residual graph buffers by verify-token capacity, slice output to actual token count and refresh predecessor activations after early verify planning.",
+    "Normalize production array.array request tokens before signature hashing and reject activation frames with incorrect token counts before transport.",
+    "Reuse distributed owner-local snapshot writing and Catalog cohort publication; no Mooncake API or training tensor schema changes."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/arg_groups/speculative_hook.py": "a8433618257f6d4511a6772b48ad8cc7923105c232773d5f3e13ee5f666aabfe",
+    "python/sglang/srt/managers/scheduler.py": "6f5c83271eb5b9a443724d44ef13d49f8fb3b3a13f14171a516cf6a60fcfe26e",
+    "python/sglang/srt/managers/scheduler_pp_mixin.py": "1cfda7e52f71184b649112c059c51627165bc0abe1178682aa687f08f1eb5483",
+    "python/sglang/srt/model_executor/runner/base_runner.py": "83c400ccf5d15ba5032e919b6ac99c2cd4469a0fdbe48431f6a22aa6ec1e9eac",
+    "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": "e281c70c563ec0a3e4fbca7d012286b3566bafdde568146248b3b3f133c87954",
+    "python/sglang/srt/model_executor/runner_utils/buffers.py": "7f81f621ac9ca29037ad3a489e392a47c8384ee01734e6a31a5307567e09a5f8",
+    "python/sglang/srt/server_args.py": "8360ecf02f939c441d21195ef31c17c70edb086ec75b1d03e4b5e03b0e3add08",
+    "python/sglang/srt/speculative/dspark_components/dspark_pp_coordinator.py": "21cff352f7ad2ef291da6c9b02ba50802e8add2fad80b59c3dec8607dbbe320b",
+    "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": "582a413411a3e1c8705a158333e47c00b5a6ec70c2b159ba87dff3cb45a50cd1",
+    "python/sglang/srt/training_capture/config.py": "c0cd4f053aad06645e67271f06818a60a9f486c75ac56c27cf5e725a4f367cf2",
+    "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3",
+    "python/sglang/test/dspark_capture_pressure.py": "cff55aef11cd44792417c24b518f9cc8c1688db0abd90ab15eda15f772801bc1",
+    "python/sglang/test/dspark_pp_coordinator_utils.py": "1d5fa0850eb732a4901f712344574cd6418bececaf9d73fe5e57e2f7dab959d6",
+    "python/sglang/test/dspark_target_kv_server.py": "4bf0856cc4516dc49a8034378280ef46cf71838ae7e817a07fa1ebbe1de8757b",
+    "python/sglang/test/training_capture_utils.py": "80601e4c429c531411722fce31b5fba881f66f3ed4ed69670496f6c449d5da98",
+    "test/registered/spec/dspark/test_dspark_draft_path_default.py": "c3c023a8e5d0236df469c41c0b9968d2684e322e06a342730b6c853c325eb902",
+    "test/registered/storage/test_training_capture_dspark_pp.py": "30ba3a6ca87cfe65e8e1e9ecbf1b157b0b02a7ee619b6a80fcbe26e58aecd343",
+    "test/registered/storage/test_training_capture_pd_dspark.py": "2842b2114bdc99cea4cc3fd1621f3b516178b25f46499ced899f6d79f9d19668",
+    "test/registered/storage/test_training_capture_pd_dspark_hidden.py": "f439c71f93b63154ac3e3463a894d2a0137fda79a1668518f9aeb7ad8fa0a1fa",
+    "test/registered/storage/test_training_capture_pd_pp.py": "011e33796a42a5dbe62c4e60b1731c7c76dedd541d43bd9b54c456a332f59933",
+    "test/registered/unit/managers/test_scheduler_timeouts.py": "97e5e5d45d809d41389fbd5e4fbb519282f5042360c6319d67c4f3a4a57a934b",
+    "test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py": "932c368d881f21787686e84140eb074062fdae9da0a3fd17473de2d6c1f29e43",
+    "test/registered/unit/server_args/test_server_args.py": "16b961d041896b729b05fd1425a6434f2c3c32bd2f11f1d575cdf303312e7e26",
+    "test/registered/unit/spec/test_draft_per_runner_config.py": "c64ca23966d308bb190fe53c996178fe7a5476a81bcc8941a0b69c40b2171ede",
+    "test/registered/unit/spec/test_dspark_execution_phases.py": "9d6cd66e15eef11639607da298aa09c2e6969e6e1cb2223063fefbc20e71031b",
+    "test/registered/unit/spec/test_dspark_pp_coordinator.py": "4250fd29e1b87b49b184c89290aa4344db7fb3677e2f605763b5e1528bb1e334",
+    "test/registered/unit/spec/test_dspark_pp_scheduler.py": "362f40f2f3d81142a365f2449ab13747b17d3671000b8d32655ed8b6297fab60",
+    "test/registered/unit/spec/test_dspark_target_kv.py": "495892314e73931e1ebafebd18cf1ceb5c882da51d3b7a9b838086264a8d19ee",
+    "test/registered/unit/training_capture/test_config.py": "490dee11c4b195a2187c4bcb46f6f0ce4c8f9a0dc68478b1488f8ad31e66fbba"
+  },
+  "gpu_source_hashes_match": true,
+  "source_sync_note": "Production sources stayed fixed during PP1 P/D regressions. Abort/pressure test-helper changes during those runs were not called by the P/D suites. After both P/D suites finished, the only production edit added the FlexKV startup rejection. Final 145-test server-args, PP2 AR P/D and PP2 DSpark files ran with that final gate. Runtime model/capture code used by the earlier unit and PP1 suites was unchanged.",
+  "tests": [
+    {
+      "file": "test/registered/unit/training_capture/test_config.py",
+      "job_id": "01790903507094848089-9410d6c107f1",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790903518.8211513,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790903507094848089-9410d6c107f1.log",
+      "tests": 8,
+      "seconds": 0.01,
+      "log_sha256": "fbed81ca7c928d6dd805618f3126f73ece8cf139d291f5ca4ab95580a71d3802"
+    },
+    {
+      "file": "test/registered/unit/managers/test_scheduler_timeouts.py",
+      "job_id": "01790903682879643303-b891126d2281",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790903696.0748818,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790903682879643303-b891126d2281.log",
+      "tests": 10,
+      "seconds": 0.004,
+      "log_sha256": "cf2650c93716be9ec7861d175e7ef11176dbd16a6d39c450e8504ea6a6ccfaa6"
+    },
+    {
+      "file": "test/registered/unit/spec/test_dspark_pp_scheduler.py",
+      "job_id": "01790903976915311094-8a91bddd6a54",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790903990.5157018,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790903976915311094-8a91bddd6a54.log",
+      "tests": 3,
+      "seconds": 0.88,
+      "log_sha256": "5854812ae2a370467c8203ce73e68646ed3a96557a7615b8620820cfe8bbb1f5"
+    },
+    {
+      "file": "test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py",
+      "job_id": "01790904097663043140-c0ded2d0ba33",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790904109.6638002,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790904097663043140-c0ded2d0ba33.log",
+      "tests": 37,
+      "seconds": 2.679,
+      "log_sha256": "a4cd50dc71fa7c87f80032b3511da4ef24017aac514824e88e52cbdb6463f69a"
+    },
+    {
+      "file": "test/registered/unit/spec/test_dspark_pp_coordinator.py",
+      "job_id": "01790904616607580647-fd58f878503d",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790904656.9454858,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790904616607580647-fd58f878503d.log",
+      "tests": 2,
+      "seconds": 26.985,
+      "log_sha256": "e6ceecc01caea3a64411273741a2f0c282772c96c90a79e80f8d6dfdcdc3030b"
+    },
+    {
+      "file": "test/registered/unit/spec/test_draft_per_runner_config.py",
+      "job_id": "01790904817891568396-35809591fc7e",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790904916.3975356,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790904817891568396-35809591fc7e.log",
+      "tests": 14,
+      "seconds": 0.075,
+      "log_sha256": "6476d003d962ff8c977d8f3a2df11ee237b56d8172db01679672dfc5d92d8097"
+    },
+    {
+      "file": "test/registered/spec/dspark/test_dspark_draft_path_default.py",
+      "job_id": "01790904672163586958-f57432b9b53b",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790904684.383548,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790904672163586958-f57432b9b53b.log",
+      "tests": 5,
+      "seconds": 0.553,
+      "log_sha256": "658a87e94e9119b337ec62cb863e007c0bebc1d130ce07da33edbd5f6b91511a"
+    },
+    {
+      "file": "test/registered/unit/server_args/test_server_args.py",
+      "job_id": "01790906027915643772-b3d300352939",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790906043.277114,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790906027915643772-b3d300352939.log",
+      "tests": 145,
+      "seconds": 3.106,
+      "log_sha256": "62fffa17565c5464decf4a3a9b0a5df4e17e2ab48a94250377011619f5a0588b"
+    },
+    {
+      "file": "test/registered/unit/spec/test_dspark_execution_phases.py",
+      "job_id": "01790904966331718012-9b885f1fc97f",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790904993.9577913,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790904966331718012-9b885f1fc97f.log",
+      "tests": 9,
+      "seconds": 0.017,
+      "log_sha256": "77862d4f7daa6f5476bfe4aecbc3f225c897bd557d4eb493df83bb394270a6da"
+    },
+    {
+      "file": "test/registered/unit/spec/test_dspark_target_kv.py",
+      "job_id": "01790904966678691693-9b7529493373",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790905006.7443743,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790904966678691693-9b7529493373.log",
+      "tests": 23,
+      "seconds": 1.55,
+      "log_sha256": "bc4f5ef21b35c08fbb94ff1e5ce53bde9f9ef7777d3c0f9cb0474dd996209135"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark.py",
+      "job_id": "01790905085423349862-dd7b1f17b3b1",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790905424.3452659,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790905085423349862-dd7b1f17b3b1.log",
+      "tests": 4,
+      "seconds": 327.133,
+      "log_sha256": "9bf22a81241a7bb7876439151024a055553255ff5ae47d119719133dccb6007b"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark_hidden.py",
+      "job_id": "01790905085771692493-7b03b2afd477",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790905826.1664028,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790905085771692493-7b03b2afd477.log",
+      "tests": 6,
+      "seconds": 390.54,
+      "log_sha256": "9416aafc6b42a15335dedb60c5022199d01bf215f97b8b1f108d3d1e25554bd2"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_dspark_pp.py",
+      "tests": 2,
+      "seconds": 163.495,
+      "outcome": "completed",
+      "returncode": 0,
+      "exec_session_id": 96251,
+      "temporary_job": "job-29e160821431-20261002091131",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-final-20261002.log",
+      "log_sha256": "4fe23bdd5e8c2e60b156b9ae1a7dbdb4e29bd0e034bf22c19a460c832bd85dd9"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_pp.py",
+      "tests": 2,
+      "seconds": 138.518,
+      "outcome": "completed",
+      "returncode": 0,
+      "exec_session_id": 21813,
+      "temporary_job": "job-29e160821431-20261002091131",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-ar-regression-20261002.log",
+      "log_sha256": "bb79c73f5b6abf2ced960891ee07be2ad7df1b710b37e142ec82f3c5ad832a17"
+    }
+  ],
+  "total_final_tests": 270,
+  "server_args_environment": "The initial whole-file attempt could not fetch the remote Qwen/Qwen2.5-1.5B-Instruct config. Final run used runpy on the unchanged complete file with sglang.test.test_utils.DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN bound to /gpfs/models/huggingface.co/Qwen/Qwen2.5-1.5B-Instruct. All 145 tests passed.",
+  "pipeline_serving_cases": [
+    {
+      "pp_size": 2,
+      "cuda_graph": true,
+      "checked_snapshots": 10,
+      "aborted": true
+    },
+    {
+      "pp_size": 2,
+      "cuda_graph": false,
+      "checked_snapshots": 10,
+      "aborted": true
+    }
+  ],
+  "pipeline_pressure_cases": [
+    {
+      "cuda_graph": true,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-True-False-2",
+        "pressure-True-False-3"
+      ],
+      "ready_samples": 3,
+      "rebuilt_contexts": [
+        {
+          "kind": "context",
+          "rid": "pressure-True-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 125,
+          "prefix_end": 125,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-True-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 144,
+          "prefix_end": 144,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-True-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 125,
+          "prefix_end": 125,
+          "pp_rank": 1,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-True-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 144,
+          "prefix_end": 144,
+          "pp_rank": 1,
+          "tp_rank": 0
+        }
+      ],
+      "capture_after": {
+        "counters": {
+          "admitted": 13,
+          "eager_forwards": 11,
+          "speculative_verify_forwards": 83,
+          "cuda_graph_forwards": 83,
+          "speculative_commits_copied": 196,
+          "sealed": 10,
+          "failed_running_request_aborted": 1,
+          "failed_request_aborted_or_retracted": 2,
+          "ready": 0
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "reservations": 4,
+        "states": {
+          "available": 4,
+          "writing": 0,
+          "pending_publication": 0
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 4194304,
+          "device_allocated_bytes": 262144,
+          "device_limit_bytes": 8388608,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        },
+        "cohort_writer": {
+          "ready": true,
+          "stopping": false,
+          "error": null,
+          "recovery_error": null,
+          "pending": 0,
+          "states": {},
+          "counters": {
+            "submitted": 13,
+            "stored": 10,
+            "failed": 3
+          },
+          "oldest_seconds": 0
+        },
+        "request_router": {
+          "considered": 14,
+          "excluded": 1,
+          "selected": 13,
+          "attached": 13,
+          "bound": 13,
+          "cancelled": 1
+        }
+      }
+    },
+    {
+      "cuda_graph": false,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-False-False-2",
+        "pressure-False-False-3"
+      ],
+      "ready_samples": 3,
+      "rebuilt_contexts": [
+        {
+          "kind": "context",
+          "rid": "pressure-False-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 125,
+          "prefix_end": 125,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-False-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 144,
+          "prefix_end": 144,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-False-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 125,
+          "prefix_end": 125,
+          "pp_rank": 1,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-False-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 144,
+          "prefix_end": 144,
+          "pp_rank": 1,
+          "tp_rank": 0
+        }
+      ],
+      "capture_after": {
+        "counters": {
+          "admitted": 13,
+          "eager_forwards": 94,
+          "speculative_verify_forwards": 83,
+          "speculative_commits_copied": 196,
+          "sealed": 10,
+          "failed_running_request_aborted": 1,
+          "failed_request_aborted_or_retracted": 2,
+          "ready": 0
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "reservations": 4,
+        "states": {
+          "available": 4,
+          "writing": 0,
+          "pending_publication": 0
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 4194304,
+          "device_allocated_bytes": 262144,
+          "device_limit_bytes": 8388608,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        },
+        "cohort_writer": {
+          "ready": true,
+          "stopping": false,
+          "error": null,
+          "recovery_error": null,
+          "pending": 0,
+          "states": {},
+          "counters": {
+            "submitted": 13,
+            "stored": 10,
+            "failed": 3
+          },
+          "oldest_seconds": 0
+        },
+        "request_router": {
+          "considered": 14,
+          "excluded": 1,
+          "selected": 13,
+          "attached": 13,
+          "bound": 13,
+          "cancelled": 1
+        }
+      }
+    }
+  ],
+  "real_model_pd_cases": [
+    {
+      "decode_pp": 2,
+      "decode_tp": 1,
+      "draft_kind": null,
+      "prefill_draft": false,
+      "prefill_pp": 2,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "checked_snapshots": 5,
+      "capture_counters": {
+        "admitted": 8,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 6,
+        "ready": 0,
+        "sealed": 5
+      }
+    },
+    {
+      "decode_pp": 2,
+      "decode_tp": 1,
+      "draft_kind": null,
+      "prefill_draft": false,
+      "prefill_pp": 2,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "checked_snapshots": 5,
+      "capture_counters": {
+        "admitted": 8,
+        "cuda_graph_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 6,
+        "ready": 0,
+        "sealed": 5
+      }
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "checked_snapshots": 6,
+      "capture_counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      }
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "checked_snapshots": 6,
+      "capture_counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      }
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "checked_snapshots": 6,
+      "capture_counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      }
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "checked_snapshots": 6,
+      "capture_counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      }
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "cap-accept",
+      "replay": false,
+      "checked_snapshots": 6,
+      "capture_counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 14,
+        "speculative_verify_forwards": 13,
+        "writer_started": 9
+      }
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "cap-accept",
+      "replay": true,
+      "checked_snapshots": 6,
+      "capture_counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 16,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 16,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 18,
+        "speculative_verify_forwards": 16,
+        "writer_started": 9
+      }
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "compact",
+      "replay": false,
+      "checked_snapshots": 6,
+      "capture_counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 14,
+        "speculative_verify_forwards": 13,
+        "writer_started": 9
+      }
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "compact",
+      "replay": true,
+      "checked_snapshots": 6,
+      "capture_counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 16,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 16,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 18,
+        "speculative_verify_forwards": 16,
+        "writer_started": 9
+      }
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "checked_snapshots": 6,
+      "capture_counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      }
+    },
+    {
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "checked_snapshots": 6,
+      "capture_counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      }
+    }
+  ],
+  "exact_snapshot_checks": 90,
+  "snapshot_validation": {
+    "kv": "Exact against independent online physical KV observations on every selected owner stage.",
+    "teacher": "Top-128 values exactly match independently observed raw logits at stored vocabulary IDs and the independent top-k values. Full-vocabulary logsumexp uses rtol=atol=1e-6.",
+    "alignment": "Token IDs, positions, prompt/response loss mask, teacher positions and kv_valid checked against final output and committed forward rows.",
+    "lifecycle": "Failed aborted/retracted captures cannot publish. All successful PP serving samples read again after producer exit while the Store remains alive."
+  },
+  "fixture_scope": {
+    "target": "Actual Qwen3-0.6B with TP1/PP2 for new serving tests; TP1/PP1 and TP1/PP2 P/D regressions.",
+    "draft": "Synthetic target-KV checkpoint exported from an AR seed capture; no trained-model quality claim.",
+    "model_transport": "Real two-H100 NCCL between pipeline stages.",
+    "store": "Actual Mooncake SDK/master over TCP with required hard pin.",
+    "catalog": "Repository Catalog test double, not SpecForge production Catalog.",
+    "gloo": "Four-process coordinator TP2/PP2 and TP1/PP4 fixture, including 15 coordinated failure cases; deterministic model boundaries."
+  },
+  "earlier_runs": [
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-initial-20261002.log",
+      "log_sha256": "5ec4afbe64cb04f122f18d66a5f5cc43986afb99cdd4ece8e262edfeded8deff",
+      "tests": 1,
+      "seconds": 91.88,
+      "outcome": "failed",
+      "reason": "Legacy speculative argument hook still rejected PP>1; removed the redundant gate."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-startup-20261002.log",
+      "log_sha256": "d2392f9f1b90d65a19ca4cf020c8be126476c20c820278f7ab23f19a2d1d31aa",
+      "tests": 1,
+      "seconds": 77.192,
+      "outcome": "failed",
+      "reason": "PP dummy/graph activation capacity used batch rows instead of verify-token rows."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-graph-buffers-20261002.log",
+      "log_sha256": "271d78cc00e27b8f8777ef89e281595c59d492196795e7ea8b1f2ed0dd059b4f",
+      "tests": 1,
+      "seconds": 67.068,
+      "outcome": "failed",
+      "reason": "Dummy buffers were fixed but DecodeInputBuffers still used request capacity."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-decode-buffers-20261002.log",
+      "log_sha256": "8835d94fc90034cc8241223fd52d6b98be69391f16686c75a4ab2cb5b0a5048e",
+      "tests": 1,
+      "seconds": 101.796,
+      "outcome": "failed",
+      "reason": "Production array.array input IDs were not supported by canonical signature encoding."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-token-history-20261002.log",
+      "log_sha256": "6fea503cf962db62be23fb0ac7efc1c7caa76ee544a9963dc3b62d62663e65e0",
+      "tests": 1,
+      "seconds": 80.549,
+      "outcome": "failed",
+      "reason": "Graph request completed with incorrect tokens; PP activation slicing and refresh needed investigation."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-activation-rows-20261002.log",
+      "log_sha256": "ec7552d1b57ffae2359676ddfb255b6ddb54233e87097a189d923f7cc407c2b0",
+      "tests": 1,
+      "seconds": 83.427,
+      "outcome": "failed",
+      "reason": "New activation validation referred to verify_ids instead of verify_ids_2d."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-verify-rows-20261002.log",
+      "log_sha256": "386fbb0e47c8830928089ced6541563743ab81fe5a614fd5fb77e2489f4320d1",
+      "tests": 1,
+      "seconds": 76.997,
+      "outcome": "failed",
+      "reason": "Correct slicing alone did not fix graph output; preplanned replay still used stale activations."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-preplanned-20261002.log",
+      "log_sha256": "edf2851ec6f75b89d3ea4d039d7f59d4fc9e636f508461edab4fc70235f8d25c",
+      "tests": 1,
+      "seconds": 162.002,
+      "outcome": "failed",
+      "reason": "Runtime parity passed; stop-token fixture incorrectly set ignore_eos=true."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-stop-20261002.log",
+      "log_sha256": "e1d6296c5efd176aa8c780a2d9c8a7dcbfdc64f02e2ce5922a9715d742329d34",
+      "tests": 1,
+      "seconds": 100.62,
+      "outcome": "failed",
+      "reason": "Seven normal snapshots passed; abort fixture expected a PP1 reason rather than cohort_failed."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-cohort-20261002.log",
+      "log_sha256": "a4b62bfc6421dfa90b24ec5d8120f7b317f5390300bce7e7443543de3ab45b2e",
+      "tests": 1,
+      "seconds": 84.228,
+      "outcome": "failed",
+      "reason": "Serving pressure completed; fixture checked PP1 ready instead of distributed stored and Catalog publication."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/pp-serving-pressure-20261002.log",
+      "log_sha256": "ce15d69824e5da772fa1451a9b196ad28bf171210aba44df05a778c55ac834ac",
+      "tests": 2,
+      "seconds": 174.835,
+      "outcome": "passed",
+      "reason": "Complete eager/graph suite passed before adding the FlexKV configuration rejection."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790904672466150545-8d7407745f8e.log",
+      "log_sha256": "59a4c0a3a49c7ad6093301d0e9f7bc58b34df3d6a432cdd86e0a9eaf4e491416",
+      "tests": 133,
+      "seconds": 207.722,
+      "outcome": "failed",
+      "reason": "Whole server-args suite could not fetch remote model config; reran with the same Qwen2.5-1.5B-Instruct local config."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790904492687685716-f3875f6ed9c2.log",
+      "log_sha256": "d1b7e8471d508cb4a9308d32f6adbb5780569c1ff78e63d16533984463b04c7e",
+      "tests": 1,
+      "seconds": 13.289,
+      "outcome": "failed",
+      "reason": "Gloo test exposed the verify_ids versus verify_ids_2d typo; corrected before final distributed tests."
+    }
+  ],
+  "static_checks": {
+    "black_files": 22,
+    "black": "passed",
+    "ruff_baseline_diagnostics": 566,
+    "ruff_current_diagnostics": 566,
+    "ruff_added_diagnostics": 0,
+    "ruff_removed_diagnostics": 0,
+    "diff_check": "passed"
+  },
+  "cleanup": {
+    "temporary_job_deleted": true,
+    "temporary_pod_absence_verified": true,
+    "temporary_live_model_test_store_processes_before_delete": 0,
+    "resident_mode": "idle_load",
+    "resident_duty_cycle": 0.6,
+    "resident_active_job": null,
+    "resident_queued": 0,
+    "resident_live_model_test_store_processes": 0,
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "remaining": [
+    "PP speculative P/D request readiness, first-teacher handoff and failure handling.",
+    "Combined real-model TP2/PP2, replicated-head cases and additional model identities.",
+    "Distributed speculative prefill graphs and asynchronous PP microbatch concurrency.",
+    "Host-tier cache integration and cross-node pipeline RDMA.",
+    "Production-exported/trained checkpoints and draft training quality.",
+    "SpecForge-owned production Catalog/consumer retention and replay.",
+    "Capture overhead, representative load/SLO validation, rollout and rollback acceptance."
+  ]
+}

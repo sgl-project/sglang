@@ -182,12 +182,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._target_kv_contract = read_target_kv_draft_contract(
             self.draft_model_runner.model_config.hf_config
         )
+        if ps.pp_size > 1 and self._target_kv_contract is None:
+            raise ValueError("Pipeline DSpark requires a target-KV draft checkpoint")
         self._capture_hidden_mode = CaptureHiddenMode.FULL
         if self._target_kv_contract is not None:
             parallel = get_parallel()
             if (
-                parallel.pp_size != 1
-                or parallel.dp_size != 1
+                parallel.dp_size != 1
                 or (
                     get_disagg().disaggregation_mode != "null"
                     and get_disagg().disaggregation_transfer_backend != "mooncake"
@@ -195,7 +196,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 or get_lora().enable_lora
             ):
                 raise ValueError(
-                    "target-KV DSpark currently requires PP=DP=1, "
+                    "target-KV DSpark currently requires DP=1, "
                     "Mooncake for disaggregation and no LoRA"
                 )
             self._capture_hidden_mode = CaptureHiddenMode.NULL
@@ -268,6 +269,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             server_args=self.server_args,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
         )
+        if ps.pp_size > 1 and (
+            self._verify_planner.mode_value != "static" or self.carries_confidence
+        ):
+            raise ValueError(
+                "Pipeline DSpark requires static verify without confidence"
+            )
         if (
             server_args.enable_dp_attention
             and not self._draft_is_moe

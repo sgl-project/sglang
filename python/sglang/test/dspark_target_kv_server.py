@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.distributed import (
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -22,6 +24,9 @@ from sglang.test.dspark_capture_observer import install_capture_observer
 
 def record(model, event):
     path = Path(model.config.test_observation_path)
+    event["pp_rank"] = get_pipeline_model_parallel_rank()
+    if get_pipeline_model_parallel_world_size() > 1:
+        path = path.with_name(f"{path.stem}-pp{event['pp_rank']}{path.suffix}")
     event["tp_rank"] = get_tensor_model_parallel_rank()
     if get_tensor_model_parallel_world_size() > 1:
         path = path.with_name(f"{path.stem}-tp{event['tp_rank']}{path.suffix}")
@@ -177,7 +182,7 @@ def observed_context(self, batch):
 
 def observed_target_verify(self, **kwargs):
     result = original_target_verify(self, **kwargs)
-    assert result.logits_output.hidden_states is None
+    assert result.logits_output is None or result.logits_output.hidden_states is None
     record(
         self.kv_injector.draft_model,
         {"kind": "target_verify", "cuda_graph": result.can_run_cuda_graph},

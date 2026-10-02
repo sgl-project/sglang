@@ -67,6 +67,63 @@ class PPBatchMetadata:
 
 class SchedulerPPMixin:
     @DynamicGradMode()
+    def event_loop_pp_dspark(self: Scheduler):
+        """Complete a target-KV speculative step on every stage before scheduling."""
+        from sglang.srt.speculative.dspark_components.dspark_pp_coordinator import (
+            DSparkPPCoordinator,
+        )
+
+        self.init_pp_loop_state()
+        self.dspark_pp_coordinator = DSparkPPCoordinator(
+            worker=self.model_worker,
+            world_group=self.world_group,
+            pp_group=self.pp_group,
+            tp_group=self.tp_group,
+        )
+        while not self.gracefully_exit:
+            self.running_mbs[0] = self.running_batch
+            self.mbs[0] = self.last_batch
+            recv_reqs = self.request_receiver.recv_requests()
+            # Request handlers and projection can enter world collectives. Relay
+            # before either, so later stages are not still waiting for requests.
+            if not self.pp_group.is_last_rank:
+                self._pp_send_pyobj_to_next_stage(recv_reqs)
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+            plan = self.get_next_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            self.cur_batch_for_debug = batch
+            self.running_mbs[0] = self.running_batch
+            self.mbs[0] = batch
+            if batch:
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
+            else:
+                self.dspark_pp_coordinator.run_batch(None)
+                self._sched_idled = True
+                self.on_idle()
+            self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.invariant_checker.self_check_during_busy()
+
+    def _pp_dspark_timeout_ids(self, reqs, field, timeout_s, *, running=False):
+        """Use one clock and one request timeline for timeout decisions."""
+        expired = None
+        if self.world_group.is_first_rank:
+            deadline = time.perf_counter() - timeout_s
+            expired = [
+                req.rid
+                for req in reqs
+                if (not running or not req.finished())
+                and 0 < getattr(req.time_stats, field) < deadline
+            ]
+        return set(self.world_group.broadcast_object(expired, src=0))
+
+    @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
         A scheduler loop for pipeline parallelism.

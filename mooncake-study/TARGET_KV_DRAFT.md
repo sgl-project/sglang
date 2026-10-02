@@ -146,12 +146,15 @@ checkpoint variant; changing the target also requires a matching draft contract.
 
 ## Runtime Scope
 
-Current capability gates allow TP and require PP=DP=1, dense
-unquantized NHD target/draft pools, no LoRA, and standard RoPE. Disaggregated
-serving requires the Mooncake backend. Synchronous
-scheduling and normal overlap are supported. Target identity binding currently
+Current capability gates allow TP and require DP=1, dense
+unquantized NHD target/draft pools, no LoRA, and standard RoPE. PP1 supports
+synchronous scheduling and normal overlap; disaggregated serving requires the
+Mooncake backend. PP>1 supports colocated static target-KV serving through the
+synchronous pipeline loop below, with DP1/CP1 and device KV cache. Hidden-input,
+confidence-scheduled, overlap and disaggregated PP speculation remain rejected.
+Target identity binding currently
 supports Qwen3, Qwen2 and Llama text models; real-model evidence currently covers
-Qwen3-0.6B at TP1 and TP2 only. Static verify
+Qwen3-0.6B at TP1/PP1, TP2/PP1 and TP1/PP2. Static verify
 supports ordinary execution and decode/verify CUDA graphs. Target hidden-state
 capture is disabled for both ordinary execution and graph construction.
 
@@ -169,8 +172,8 @@ directly to the Store without gathering through the capture control group.
 ### Pipeline Source Assembly Prerequisite
 
 The injector can bind PP-sharded target KV and assemble the selected layers.
-This is a dependency for future pipeline speculation; the serving gates above
-remain in place. For DP=1, binding uses the complete PP-major/TP-minor CPU world
+The synchronous pipeline loop uses this assembly after all target stages finish
+their forward pass. For DP=1, binding uses the complete PP-major/TP-minor CPU world
 group to agree on target identity, layer ownership, draft contract and weights.
 Stages without selected layers participate in startup and receive assembled KV.
 
@@ -194,15 +197,14 @@ incremental writes. It also checks coordinated rejection of a target binding
 failure, an invalid draft pool and a mismatched checkpoint digest, followed by
 a valid binding. Target artifact inspection is replaced by explicit rank
 contracts in this test; the startup protocol and tensor collectives are real.
-This does not verify source-KV assembly over multi-GPU NCCL or PP speculative
-serving. The result relay, worker phases and shared modules described below
-provide separate dependencies. Their scheduler integration, proposal/activation
-ordering and request-state alignment remain required before enabling PP.
+That isolated test does not verify source-KV assembly over multi-GPU NCCL or PP
+speculative serving. The real-model pipeline test described below supplies
+separate TP1/PP2 NCCL and serving evidence.
 See [the reproduction commands](experiments/PIPELINE_KV.md).
 
 ### Pipeline Execution Phases Prerequisite
 
-`DSparkWorkerV2` exposes stage operations for a future PP scheduler. Its existing
+`DSparkWorkerV2` exposes stage operations used by the PP coordinator. Its existing
 single-stage entry point calls them in order, preserving the ordinary serving
 path:
 
@@ -239,10 +241,9 @@ acceptance against its request/step identity before calling this trusted worker
 API. Neither projection nor commit may be inserted before forwarding a PP frame
 that another participating rank is waiting for.
 
-The serving gates remain closed. Wiring the PP loop to these phases, synchronizing
-request scheduling and validating actual multi-GPU speculative serving remain
-required. The coordinator below aligns proposals and executes these phases for
-an already agreed batch. Shared modules have a separate startup operation. See
+The coordinator below aligns proposals and executes these phases for an already
+agreed batch supplied by the synchronous PP loop. Shared modules have a separate
+startup operation. See
 [the phase test runbook](experiments/PIPELINE_PHASES.md).
 
 ### Pipeline Result Relay Prerequisite
@@ -276,8 +277,9 @@ exercise actual PP dictionary transport and the spec-v2 token resolver with
 deterministic result tensors. They do not execute a PP DSpark target/draft model.
 The worker phases above must be scheduled separately: running a cross-stage KV
 collective inside a stage's forward before it sends activation would strand
-later stages. The coordinator below provides this ordering for an agreed batch;
-its scheduler integration remains pending and PP speculative gates stay closed. See
+later stages. The synchronous scheduler uses the coordinator below for this
+ordering and result distribution; it does not use the asynchronous result relay
+for speculative batch execution. P/D PP integration remains open. See
 [the result-channel runbook](experiments/PIPELINE_RESULT.md).
 
 ### Pipeline Shared Modules Prerequisite
@@ -316,9 +318,9 @@ Native-module tests exercise TP2/PP2 and TP1/PP4 with real Gloo collectives and
 TP1/PP2 with two-H100 NCCL broadcasts. They verify embedding output and draft
 head logits, tied/untied values, vocabulary padding and coordinated failures.
 The runner tests check factory arguments and real buffer allocation. These are
-not full PP draft-model initialization or speculative serving tests. Integrating
-the coordinator below with the PP scheduler, cancellation/recovery and complete
-model/graph initialization still needs runtime validation. See
+not full PP draft-model initialization or speculative serving tests. The separate
+pipeline serving test below now validates TP1/PP2 initialization, cancellation,
+retraction and decode graphs with real model execution. See
 [the shared-module runbook](experiments/PIPELINE_MODULES.md).
 
 ### Pipeline Stage Coordinator Prerequisite
@@ -365,13 +367,53 @@ the call. The synchronous implementation adds CPU/device synchronization and
 reconstructs a full draft prefix when cached states diverge; no performance SLO
 is claimed.
 
-The scheduler does not yet instantiate this coordinator. Public PP speculative
-gates remain closed. Its Gloo/NCCL tests use production worker phase methods and
+The synchronous PP scheduler now instantiates this coordinator. Its isolated
+Gloo/NCCL tests use production worker phase methods and
 transport with deterministic target/proposal/acceptance/projection boundaries;
 they do not load a full pipeline draft or execute a real source-KV encoder.
-Scheduler admission, cancellation/retraction, P/D readiness, complete model/graph
-initialization and real PP speculative capture remain required. See
+Real colocated serving has separate coverage below; P/D PP integration remains
+required. See
 [the coordinator runbook](experiments/PIPELINE_COORDINATOR.md).
+
+### Synchronous Pipeline Serving
+
+For colocated PP DSpark, dispatch selects `event_loop_pp_dspark`. The loop relays
+requests to the next stage before processing controls or entering any collective.
+It then uses the ordinary request/batch planner and runs one complete coordinated
+batch inside scheduler field isolation. All ranks enter idle coordination too.
+Slot-zero PP batch references track the live batches for cancellation and idle
+checks. Pause keeps receiving controls; resume continues the existing batch.
+
+Running and queue deadlines use IDs selected by world rank zero and broadcast to
+every rank. Local clocks cannot independently expire different requests. Existing
+grammar readiness propagation and PP minimum KV-capacity agreement remain in
+use. The coordinator rejects divergent batch signatures before model execution;
+it does not recover arbitrary scheduler divergence.
+
+Decode graph PP activation buffers use token capacity, including every verify
+token per request. Graph output is sliced to the unpadded token count. Verify
+metadata can be prepared before predecessor activations exist, so execution
+refreshes those activations in the captured backing buffers even when metadata
+does not need another initialization. Outgoing frames must contain exactly the
+step's token count. This avoids stale activation replay and truncated verify
+windows.
+
+Capture remains owner-local: each stage copies only selected layers it owns,
+the final stage records raw teacher scores, and the cohort writer publishes a
+complete manifest through Catalog. No snapshot schema or Mooncake API change is
+needed. Aborted/retracted captures fail their cohort; a retracted serving request
+can continue with rebuilt draft context, but its retired capture cannot publish.
+
+The real Qwen3-0.6B TP1/PP2 test covers chunked prefill, prefix hits, mixed batches,
+sampling penalties, grammar, stop tokens, cancellation and natural 512-token KV
+pool pressure in eager and decode graph modes. It independently checks selected
+KV, raw top-128 values/IDs, logsumexp, masks and positions after Mooncake readback,
+including readback after serving exits. The synthetic draft checks mechanics,
+not training quality. This loop keeps one batch outstanding; asynchronous PP
+microbatch depth does not introduce concurrency here. P/D PP speculation,
+combined real-model TP2/PP2, host-tier cache integration, other model families and
+performance SLO validation remain open. See
+[the serving runbook](experiments/PIPELINE_SERVING.md).
 
 ### Disaggregated Context
 
@@ -437,9 +479,10 @@ Mooncake writer and Catalog producer protocol are reused. The manifest records
 `capture_mode=speculative_accepted_target_path`; its tensor contract is unchanged.
 The collector supports static, cap-accept and compact verification. The target-KV
 v1 checkpoint described above remains static-only; confidence-scheduled modes
-use the existing hidden-input draft and confidence head. Simulated acceptance,
-pipeline speculation and other speculative algorithms remain rejected by the
-capture capability gate.
+use the existing hidden-input draft and confidence head. Colocated static
+target-KV PP capture uses the synchronous pipeline path above. Simulated
+acceptance, disaggregated PP speculation and other speculative algorithms remain
+rejected by the capture capability gate.
 
 `TargetVerifyExecutor` calls `CaptureCoordinator.after_verify_forward` immediately
 after the target forward, before grammar, penalties, bias or rejection sampling.

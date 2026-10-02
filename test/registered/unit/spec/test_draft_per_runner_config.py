@@ -9,6 +9,7 @@ one constructor each — so they travel as arguments to the runner that owns the
 """
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -268,15 +269,104 @@ class TestDraftPerRunnerConfig(CustomTestCase):
                 )
                 runner = SimpleNamespace()
                 BaseRunner.__init__(runner, mr)
-                buffers = BaseRunner._alloc_dummy_decode_buffers(runner, max_bs=2)
+                buffers = BaseRunner._alloc_dummy_decode_buffers(
+                    runner, max_bs=2, num_tokens_per_req=4
+                )
                 self.assertEqual(runner.pp_size, local_pp_size)
                 if local_pp_size == 1:
                     self.assertIsNone(buffers.pp_proxy_tensors)
                 else:
                     self.assertEqual(
-                        buffers.pp_proxy_tensors["hidden_states"].shape, (2, 8)
+                        buffers.pp_proxy_tensors["hidden_states"].shape, (8, 8)
                     )
+                    self.assertEqual(buffers.pp_proxy_tensors["residual"].shape, (8, 8))
                 self.assertEqual(server_args.pp_size, 4)
+
+    def test_pipeline_graph_result_keeps_verify_rows_without_padding(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardMode,
+            PPProxyTensors,
+        )
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        output = PPProxyTensors(
+            {
+                "hidden_states": torch.arange(128).reshape(16, 8),
+                "residual": torch.arange(128, 256).reshape(16, 8),
+            }
+        )
+        for raw_tokens in (8, 12):
+            runner = SimpleNamespace(
+                model_runner=SimpleNamespace(device_timer=None),
+                attn_backend=None,
+                _war_read_done_record=lambda *args: None,
+                load_batch=lambda *args: None,
+                backend=SimpleNamespace(
+                    replay_session=nullcontext,
+                    replay=lambda *args: output,
+                ),
+                _replay_graph_key=object(),
+                bs=4,
+                raw_num_token=raw_tokens,
+            )
+            with envs.SGLANG_LOG_DECODE_GRAPH_KEY.override(False):
+                result = DecodeCudaGraphRunner.execute(
+                    runner, SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+                )
+            for name, value in result.tensors.items():
+                torch.testing.assert_close(value, output.tensors[name][:raw_tokens])
+
+    def test_preplanned_verify_refreshes_pipeline_activations(self):
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        buffers = SimpleNamespace(
+            input_ids=torch.zeros(16, dtype=torch.int64),
+            positions=torch.zeros(16, dtype=torch.int64),
+            pp_proxy_tensors={
+                "hidden_states": torch.zeros(16, 8),
+                "residual": torch.zeros(16, 8),
+            },
+        )
+        runner = SimpleNamespace(
+            buffers=buffers,
+            raw_num_token=12,
+            bs=4,
+            captured_req_width=4,
+            ragged_verify_mode=False,
+            enable_pdmux=False,
+            deepep_adapter=SimpleNamespace(replay=lambda: None),
+            model_runner=SimpleNamespace(
+                spec_algorithm=SimpleNamespace(is_dflash_family=lambda: True),
+                is_draft_worker=False,
+            ),
+            _capture_graph_size=lambda **kwargs: kwargs["bs"],
+            _resolve_lora_variant=lambda fb: None,
+            _make_graph_key=lambda *args: args,
+        )
+        batch = SimpleNamespace(
+            needs_forward_metadata_init=lambda: False,
+            input_ids=torch.arange(12),
+            positions=torch.arange(12) + 20,
+        )
+        for step in (1, 2):
+            proxy = PPProxyTensors(
+                {
+                    name: torch.full((12, 8), float(step + index))
+                    for index, name in enumerate(buffers.pp_proxy_tensors)
+                }
+            )
+            DecodeCudaGraphRunner.load_batch(runner, batch, proxy)
+            for name, value in proxy.tensors.items():
+                torch.testing.assert_close(buffers.pp_proxy_tensors[name][:12], value)
+                self.assertTrue(torch.all(buffers.pp_proxy_tensors[name][12:] == 0))
+        torch.testing.assert_close(buffers.input_ids[:12], batch.input_ids)
+        torch.testing.assert_close(buffers.positions[:12], batch.positions)
 
 
 if __name__ == "__main__":

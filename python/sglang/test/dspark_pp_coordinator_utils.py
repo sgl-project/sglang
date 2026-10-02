@@ -3,6 +3,7 @@
 import multiprocessing as mp
 import tempfile
 import time
+from array import array
 from contextlib import ExitStack, nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
@@ -80,7 +81,7 @@ def fixture(world, tp, pp, device, *, failure=None, sampling=False):
             SimpleNamespace(
                 rid=f"request-{i}",
                 kv_committed_len=n,
-                origin_input_ids=list(range(n)),
+                origin_input_ids=array("I", range(n)),
                 output_ids=[10 * (i + 1)],
                 dspark_projected_context=ProjectedContextState("fixture:0", n),
             )
@@ -118,6 +119,8 @@ def fixture(world, tp, pp, device, *, failure=None, sampling=False):
             expected = inputs.float()[:, None].repeat(1, 2) + stage * (stage + 1) / 2
             torch.testing.assert_close(hidden, expected, rtol=0, atol=0)
         hidden = hidden + stage + 1
+        if failure == "activation_rows" and stage == 0:
+            hidden = hidden[:1]
         state.inputs = inputs.clone()
         state.forward_done = True
         state.events.append("forward")
@@ -411,6 +414,7 @@ def run_cases(world, tp, pp, device):
             "anchor",
             "proposal_token",
             "forward",
+            "activation_rows",
             "frame",
             "accepted_token",
             "accepted_length",

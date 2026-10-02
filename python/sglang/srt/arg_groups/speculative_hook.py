@@ -303,11 +303,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {server_args.speculative_moe_a2a_backend!r})."
             )
 
-    if server_args.pp_size != 1:
-        raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
-        )
-
     if server_args.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):
             server_args.speculative_draft_model_path = server_args.model_path

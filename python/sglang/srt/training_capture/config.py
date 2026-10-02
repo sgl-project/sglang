@@ -171,7 +171,8 @@ def validate_capture_server_args(args) -> None:
         or args.dcp_size != 1
         or args.enable_dp_attention,
         "pipeline speculative capture": args.speculative_algorithm is not None
-        and args.pp_size != 1,
+        and args.pp_size != 1
+        and args.disaggregation_mode != "null",
         "speculative algorithm": args.speculative_algorithm not in (None, "DSPARK"),
         "simulated speculative acceptance": args.speculative_algorithm is not None
         and envs.SGLANG_SIMULATE_ACC_LEN.get() > 0,

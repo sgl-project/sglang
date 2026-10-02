@@ -118,7 +118,7 @@ class DSparkPPCoordinator:
                 req.rid,
                 req.kv_committed_len,
                 len(req.output_ids),
-                _token_digest((req.origin_input_ids, req.output_ids)),
+                _token_digest((list(req.origin_input_ids), list(req.output_ids))),
             )
             for req in batch.reqs
         )
@@ -246,6 +246,9 @@ class DSparkPPCoordinator:
 
     def _forward(self, batch, step, signature):
         proxy, result = None, None
+        num_tokens = (
+            batch.input_ids.numel() if step is None else step.verify_ids_2d.numel()
+        )
         for stage in range(self.pp.world_size):
 
             def forward_stage(stage=stage, proxy=proxy):
@@ -289,6 +292,10 @@ class DSparkPPCoordinator:
                         value is not None and not isinstance(value, torch.Tensor)
                     ):
                         raise ValueError("invalid DSpark PP activation field")
+                    if value is not None and (
+                        value.ndim < 1 or value.shape[0] != num_tokens
+                    ):
+                        raise ValueError("DSpark PP activation token count differs")
                     packet[f"activation:{name}"] = (
                         value.contiguous() if value is not None else None
                     )

@@ -12,7 +12,7 @@ from sglang.test.dspark_capture_observer import check_capture_snapshot
 
 
 def exercise_dspark_capture_pressure(
-    test, *, url, directory, cuda_graph, enable_overlap
+    test, *, url, directory, cuda_graph, enable_overlap, pp_size=1
 ):
     def state():
         response = requests.get(url + "/server_info", timeout=10)
@@ -31,12 +31,18 @@ def exercise_dspark_capture_pressure(
     def retraction_metric():
         response = requests.get(url + "/metrics", timeout=10)
         response.raise_for_status()
-        return sum(
-            sample.value
-            for family in text_string_to_metric_families(response.text)
-            for sample in family.samples
-            if sample.name == "sglang:num_retracted_requests_total"
-        )
+        values = {rank: 0 for rank in range(pp_size)}
+        for family in text_string_to_metric_families(response.text):
+            for sample in family.samples:
+                if sample.name == "sglang:num_retracted_requests_total":
+                    rank = int(sample.labels.get("pp_rank", 0))
+                    values[rank] += sample.value
+        return values
+
+    def completed_count(current):
+        if pp_size > 1:
+            return current["cohort_writer"]["counters"].get("stored", 0)
+        return current["counters"].get("ready", 0)
 
     before = wait_available(4)
     metric_before = retraction_metric()
@@ -75,10 +81,11 @@ def exercise_dspark_capture_pressure(
     test.assertTrue(retired, "workload did not trigger automatic retraction")
     test.assertTrue(successful, "no captured request survived memory pressure")
     after = wait_available(4)
-    test.assertEqual(retraction_metric() - metric_before, num_retractions)
+    metric_after = retraction_metric()
+    for rank in range(pp_size):
+        test.assertEqual(metric_after[rank] - metric_before[rank], num_retractions)
     for counter, expected in (
         ("admitted", 4),
-        ("ready", len(successful)),
         ("failed_request_aborted_or_retracted", len(retired)),
     ):
         test.assertEqual(
@@ -86,7 +93,9 @@ def exercise_dspark_capture_pressure(
             expected,
             after,
         )
+    test.assertEqual(completed_count(after) - completed_count(before), len(successful))
     test.assertEqual(after["host_pool"]["quarantined"], 0)
+    test.catalog.wait_publications(first_publication + len(successful), timeout=30)
     test.assertEqual(
         len(test.catalog.publications), first_publication + len(successful)
     )
@@ -113,13 +122,12 @@ def exercise_dspark_capture_pressure(
     final = wait_available(4)
     test.assertEqual(final["host_pool"]["quarantined"], 0)
     test.assertEqual(final["counters"]["admitted"] - before["counters"]["admitted"], 5)
-    test.assertEqual(
-        final["counters"]["ready"] - before["counters"]["ready"], len(successful)
-    )
+    test.assertEqual(completed_count(final) - completed_count(before), len(successful))
 
     observations = [
         json.loads(line)
-        for line in (directory / "observations.jsonl").read_text().splitlines()
+        for path in sorted(directory.glob("observations*.jsonl"))
+        for line in path.read_text().splitlines()
     ]
     rebuilt = [
         item
@@ -130,13 +138,18 @@ def exercise_dspark_capture_pressure(
         and item["previous_end"] is None
     ]
     test.assertEqual({item["rid"] for item in rebuilt}, retired)
+    for rank in range(pp_size):
+        test.assertEqual(
+            {item["rid"] for item in rebuilt if item.get("pp_rank", 0) == rank},
+            retired,
+        )
     for item in rebuilt:
         test.assertEqual(item["projected_end"], item["prefix_end"])
         test.assertGreaterEqual(item["projected_end"], 16)
 
     references = [
         torch.load(path, weights_only=True)
-        for path in sorted((directory / "capture-reference").glob("*.pt"))
+        for path in sorted((directory / "capture-reference").rglob("*.pt"))
     ]
     by_trace = {
         hashlib.sha256(rid.encode()).hexdigest(): tokens
