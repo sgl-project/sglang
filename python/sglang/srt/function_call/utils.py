@@ -68,6 +68,24 @@ _PREFIX_RULES: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     (("dict",), "object"),
 )
 
+_INTEGER_JSON_SCHEMA_KEYWORDS = (
+    "maxContains",
+    "maxItems",
+    "maxLength",
+    "maxProperties",
+    "minContains",
+    "minItems",
+    "minLength",
+    "minProperties",
+)
+_NUMBER_JSON_SCHEMA_KEYWORDS = (
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "maximum",
+    "minimum",
+    "multipleOf",
+)
+
 
 def _matches_type_prefix(base: str, prefixes: Tuple[str, ...]) -> bool:
     for p in prefixes:
@@ -110,16 +128,30 @@ def _normalize_type_list(raw_items: List[Any]) -> List[Any]:
     return normalized_items
 
 
+def _normalize_numeric_constraint(raw: Any, *, integer: bool) -> Any:
+    if not isinstance(raw, str):
+        return raw
+    try:
+        parsed = orjson.loads(raw)
+    except orjson.JSONDecodeError:
+        return raw
+    if isinstance(parsed, bool):
+        return raw
+    if integer:
+        return parsed if isinstance(parsed, int) else raw
+    return parsed if isinstance(parsed, (int, float)) else raw
+
+
 def normalize_json_schema_types(schema: Any) -> None:
     """
-    Walk a JSON Schema in place and rewrite non-standard ``"type"`` values
-    (e.g. ``"varchar"``, ``"enum"``, ``"int"``) to their standard JSON Schema
-    equivalents.
+    Walk a JSON Schema in place and normalize common generator output:
+    non-standard ``"type"`` values (e.g. ``"varchar"``, ``"enum"``, ``"int"``)
+    and numeric constraint values serialized as JSON strings.
 
     Acts as a compatibility layer for tool ``parameters`` schemas exported
     from database / ORM tooling, which often uses DB type names rather than
-    JSON Schema types. Unknown types are left untouched so that downstream
-    validation can still surface genuine errors.
+    JSON Schema types. Unknown types and non-numeric constraints are left
+    untouched so that downstream validation can still surface genuine errors.
 
     Mutates the input dict in place; the rewritten schema is also what gets
     rendered into the model prompt, so e.g. a user-supplied ``"varchar"``
@@ -139,6 +171,13 @@ def normalize_json_schema_types(schema: Any) -> None:
             schema["type"] = _normalize_single_type(t)
         elif isinstance(t, list):
             schema["type"] = _normalize_type_list(t)
+
+    for key in _INTEGER_JSON_SCHEMA_KEYWORDS:
+        if key in schema:
+            schema[key] = _normalize_numeric_constraint(schema[key], integer=True)
+    for key in _NUMBER_JSON_SCHEMA_KEYWORDS:
+        if key in schema:
+            schema[key] = _normalize_numeric_constraint(schema[key], integer=False)
 
     for key in (
         "properties",
