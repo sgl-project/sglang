@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use crate::message::detok::DetokMsg;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
+use crate::message::request::OutputMode;
 use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink, SinkError};
 use crate::message::types::TokenIds;
 use crate::tokenizer_manager::wiring::AbortSource;
@@ -80,9 +81,12 @@ pub enum DetokenizerBackend {
 }
 
 impl DetokenizerBackend {
-    /// Mint a per-request decoder, or `None` in skip mode (the shard passes the
-    /// token ids through untouched instead of decoding text).
-    fn new_decoder(&self) -> Option<Box<dyn StreamDecoder>> {
+    /// Mint a per-request decoder only when text is required and a tokenizer
+    /// is available. Token-only output still uses the normal stop-token trim.
+    fn new_decoder(&self, output_mode: OutputMode) -> Option<Box<dyn StreamDecoder>> {
+        if output_mode == OutputMode::TokenIds {
+            return None;
+        }
         match self {
             // NOTE: the stream is seeded with an empty prompt context, which is
             // correct for the common case. Seeding with the prompt's trailing
@@ -191,6 +195,7 @@ impl Runnable for DetokenizerWorker {
                     rid,
                     sink,
                     decode_logprob_text,
+                    output_mode,
                     no_stop_trim,
                 } => {
                     table.insert(
@@ -199,7 +204,7 @@ impl Runnable for DetokenizerWorker {
                             sink,
                             decode_logprob_text,
                             no_stop_trim,
-                            decoder: self.backend.new_decoder(),
+                            decoder: self.backend.new_decoder(output_mode),
                             // Registered == handed to the scheduler == Queued.
                             fsm: RequestState::Queued,
                         },
@@ -335,7 +340,7 @@ fn handle_chunk(
                 return;
             }
         },
-        // skip_tokenizer_init: no decode; the token ids pass through in `ev`.
+        // Token-only output or skip_tokenizer_init: keep the token ids in `ev`.
         None => String::new(),
     };
     // Stop STRING: trim it (and anything after) from the decoded delta's tail.
@@ -679,5 +684,66 @@ mod tests {
         let fr = serde_json::json!({ "type": "length", "length": 3 });
         let out = final_chunk(false, fr, vec![1, 2, 3]);
         assert_eq!(out.token_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn output_mode_controls_text_without_changing_tokens_or_logprobs() {
+        let tokenizer = dynamo_tokenizers::Tokenizer::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/tokenizer_manager/testdata/wordlevel.json"
+        ))
+        .unwrap();
+        let backend = DetokenizerBackend::Dynamo(tokenizer);
+        for mode in [OutputMode::TextAndTokenIds, OutputMode::TokenIds] {
+            let decoder = backend.new_decoder(mode);
+            assert_eq!(decoder.is_some(), mode == OutputMode::TextAndTokenIds);
+            let (tx, mut rx) = mpsc::channel(4);
+            let mut table = HashMap::from([(
+                Rid::from("mode"),
+                DetokState {
+                    sink: ResponseSink::Local(tx),
+                    decode_logprob_text: true,
+                    no_stop_trim: false,
+                    decoder,
+                    fsm: RequestState::Queued,
+                },
+            )]);
+            let (abort, abort_rx) = flume::unbounded();
+            handle_chunk(
+                &mut table,
+                ChunkEvent {
+                    rid: Rid::from("mode"),
+                    token_ids: vec![1, 2],
+                    finish_reason: Some(
+                        serde_json::from_value(serde_json::json!({"type":"stop","matched":2}))
+                            .unwrap(),
+                    ),
+                    extras: Some(Box::new(crate::message::response::ChunkExtras {
+                        out_lp_val: vec![-0.5],
+                        out_lp_idx: vec![1],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                &backend,
+                &abort,
+            );
+            let ResponseItem::Done(output) = rx.try_recv().unwrap() else {
+                panic!("missing terminal output")
+            };
+            assert_eq!(output.token_ids, vec![1]);
+            assert_eq!(output.completion_tokens, 2);
+            assert_eq!(
+                output.text,
+                if mode == OutputMode::TokenIds {
+                    ""
+                } else {
+                    "hello"
+                }
+            );
+            assert_eq!(output.extras.unwrap().out_lp_txt, vec!["hello"]);
+            assert!(table.is_empty());
+            assert!(abort_rx.try_recv().is_err());
+        }
     }
 }

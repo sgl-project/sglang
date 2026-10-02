@@ -537,6 +537,7 @@ impl GenerateBody {
                 audio_data,
                 processor_extensions,
             )| GenerateRequest {
+                output_mode: OutputMode::default(),
                 rid,
                 text,
                 input_ids,
@@ -690,12 +691,22 @@ pub enum RequestKind {
     Detokenize { token_ids: TokenIds },
 }
 
+/// Output required by the frontend adapter; independent of the input format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutputMode {
+    #[default]
+    TextAndTokenIds,
+    TokenIds,
+}
+
 /// A single in-flight generation request (one item after adapter fan-out),
 /// serialized to the scheduler wire once tokenized (see `to_header_msgpack`). Not a
 /// wire type — built by frontend adapters, never (de)serialized; `input_ids` is
 /// supplied by an adapter or filled by the Tokenizer stage.
 #[derive(Debug, Default)]
 pub struct GenerateRequest {
+    /// Adapter output requirement; never serialized to the scheduler.
+    pub output_mode: OutputMode,
     /// This item's final rid: the client's (normalized per item by `into_requests`) or a
     /// uuid minted there when none was sent. A [`Rid`], not a `String`: the wire
     /// forms stay textual (`GenerateBody` on the way in, `TokenizedGenerateReqInput`
@@ -993,11 +1004,16 @@ mod tests {
         let (ps, is_batch) = requests(r#"{"input_ids": [1, 2, 3]}"#).unwrap();
         assert!(!is_batch);
         assert_eq!(ps[0].input_ids, Some(vec![1, 2, 3]));
+        assert_eq!(ps[0].output_mode, OutputMode::TextAndTokenIds);
 
         let (ps, is_batch) = requests(r#"{"input_ids": [[1, 2], [3]]}"#).unwrap();
         assert!(is_batch);
         assert_eq!(ps.len(), 2);
         assert_eq!(ps[1].input_ids, Some(vec![3]));
+        assert!(
+            ps.iter()
+                .all(|p| p.output_mode == OutputMode::TextAndTokenIds)
+        );
     }
 
     #[test]
