@@ -27,6 +27,8 @@ use serde::Serialize;
 #[derive(Clone, Debug)]
 pub struct RustServerServerArgs {
     pub http_addr: SocketAddr,
+    /// The gRPC transport's listen address; `None` keeps it disabled.
+    pub grpc_addr: Option<SocketAddr>,
     pub http_api_worker_num: usize,
     pub to_scheduler_cap: usize,
     pub from_scheduler_cap: usize,
@@ -40,6 +42,7 @@ impl Default for RustServerServerArgs {
     fn default() -> Self {
         Self {
             http_addr: "127.0.0.1:30000".parse().unwrap(),
+            grpc_addr: None,
             http_api_worker_num: 2,
             to_scheduler_cap: 8192,
             from_scheduler_cap: 8192,
@@ -98,6 +101,9 @@ pub struct ServerArgs {
     /// HTTP bind address (see [`Self::bind`]).
     pub host: String,
     pub port: u16,
+    /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
+    /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
+    pub grpc_port: Option<u16>,
     /// Log levels driving the access log — uvicorn runs at
     /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
     pub log_level: String,
@@ -165,6 +171,7 @@ impl ServerArgs {
         weight_version,
         host,
         port,
+        grpc_port,
         log_level,
         log_level_http,
         chat_template,
@@ -197,6 +204,7 @@ impl ServerArgs {
         weight_version: Option<String>,
         host: String,
         port: u16,
+        grpc_port: Option<u16>,
         log_level: String,
         log_level_http: Option<String>,
         chat_template: Option<String>,
@@ -227,6 +235,7 @@ impl ServerArgs {
             weight_version,
             host,
             port,
+            grpc_port,
             log_level,
             log_level_http,
             chat_template,
@@ -265,6 +274,7 @@ impl Default for ServerArgs {
             weight_version: None,
             host: "127.0.0.1".into(),
             port: 30000,
+            grpc_port: None,
             log_level: "info".into(),
             log_level_http: None,
             chat_template: None,
@@ -550,6 +560,17 @@ impl ServerArgs {
         if self.served_model_name.is_empty() {
             return Err("empty 'served_model_name' in server_args".into());
         }
+        if let Some(grpc_port) = self.grpc_port {
+            if grpc_port == 0 {
+                return Err("'grpc_port' must be between 1 and 65535".into());
+            }
+            if grpc_port == self.port {
+                return Err(format!(
+                    "'grpc_port' ({grpc_port}) must differ from 'port' ({})",
+                    self.port
+                ));
+            }
+        }
         if let Some(preferred) = &self.preferred_sampling_params {
             super::sampling::SamplingParamsInput::from_preferred(&preferred.0)
                 .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
@@ -655,6 +676,36 @@ mod tests {
             ..Default::default()
         };
         assert!(sa.validate().is_ok());
+    }
+
+    #[test]
+    fn grpc_is_disabled_by_default_and_rejects_invalid_ports() {
+        assert!(ServerArgs::default().grpc_port.is_none());
+        assert!(RustServerServerArgs::default().grpc_addr.is_none());
+
+        let base = ServerArgs {
+            served_model_name: "m".into(),
+            ..Default::default()
+        };
+        assert!(base.validate().is_ok());
+        assert!(
+            ServerArgs {
+                grpc_port: Some(0),
+                ..base.clone()
+            }
+            .validate()
+            .unwrap_err()
+            .contains("between 1 and 65535")
+        );
+        assert!(
+            ServerArgs {
+                grpc_port: Some(base.port),
+                ..base
+            }
+            .validate()
+            .unwrap_err()
+            .contains("must differ")
+        );
     }
 
     /// `--log-level-http` overrides `--log-level` for the access log; unset or

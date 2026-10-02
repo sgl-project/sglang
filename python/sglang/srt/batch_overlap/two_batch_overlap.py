@@ -19,7 +19,7 @@ from sglang.srt.layers.layer_boundary import (
     tbo_split_moves,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.layers.layer_boundary.residual.access import finish_layer_stack
+from sglang.srt.layers.layer_boundary.residual.access import export_output
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -698,6 +698,7 @@ class TboForwardBatchPreparer:
             output_dict["out_cache_loc_virtual"] = batch.out_cache_loc_virtual[
                 start_token_index:end_token_index
             ]
+        output_dict["out_cache_loc_is_physical"] = batch.out_cache_loc_is_physical
 
         attention_tp_size = get_parallel().attn_tp_size
         _tbo_padded_len = (
@@ -954,9 +955,9 @@ def model_forward_stages(
     if not enable_tbo:
         return execute_operations(inputs, strategy.operations)["hidden_states"]
 
-    stream = residual_batch.current(forward_batch)
+    stream = residual_batch.stream_of(forward_batch)
     pending = stream.pending
-    hidden_states, residual = stream.finish(hidden_states)
+    hidden_states, residual = stream.export(hidden_states)
     inputs["hidden_states"] = hidden_states
     parts = _model_forward_tbo_split_inputs(
         **inputs,
@@ -964,7 +965,7 @@ def model_forward_stages(
         layer_input_rows=layers[0].attn_boundary.incoming_residual_rows,
     )
     for part in parts:
-        part["hidden_states"], child_stream = ResidualStream.arrive(
+        part["hidden_states"], child_stream = ResidualStream.from_handoff(
             part["hidden_states"],
             part.pop("residual"),
             pending.update if pending is not None else None,
@@ -987,7 +988,7 @@ def model_forward_stages(
             delta_stages=[0, strategy.tbo_delta_stages],
         )
     for output in outputs:
-        output["residual"] = residual_batch.current(output["forward_batch"])
+        output["residual"] = residual_batch.stream_of(output["forward_batch"])
     hidden_states, forward_batch.residual_stream = _model_forward_tbo_merge_outputs(
         *outputs, original_len
     )
@@ -1110,7 +1111,7 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
             assert pending_a.update is pending_b.update
             update = pending_a.update
     for output in (output_a, output_b):
-        output["hidden_states"], output["residual"] = finish_layer_stack(
+        output["hidden_states"], output["residual"] = export_output(
             output["hidden_states"], output["residual"], output["forward_batch"]
         )
 
@@ -1133,7 +1134,7 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
 
     hidden, residual = _handle_key("hidden_states"), _handle_key("residual")
     return (
-        ResidualStream.arrive(hidden, residual, update)
+        ResidualStream.from_handoff(hidden, residual, update)
         if has_stream
         else (hidden, residual)
     )
