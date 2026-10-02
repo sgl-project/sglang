@@ -312,3 +312,29 @@ async fn unset_flag_forwards_the_body_untouched() {
     assert_eq!(body.get("top_k"), None);
     assert_eq!(body.get("n"), None);
 }
+
+/// `/generate` nests the same parameters per prompt under `sampling_params`.
+#[tokio::test]
+async fn generate_applies_the_contract_to_each_prompts_sampling_params() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone(), &["--override-sampling-params", OVERRIDES]);
+    let send = |body: Value| {
+        let req = Request::post("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        build_router(ctx.clone()).oneshot(req)
+    };
+    let batch = json!({"text": ["a", "b"], "sampling_params": [{}, {"top_k": 1000}]});
+    assert_eq!(send(batch).await.unwrap().status(), StatusCode::OK);
+    let params = &captured(&mock).unwrap()["sampling_params"];
+    assert_eq!(
+        (&params[0]["top_k"], &params[1]["temperature"]),
+        (&json!(1000), &json!(1))
+    );
+    let conflict = json!({"text": "a", "sampling_params": {"temperature": 0.7}});
+    assert_eq!(
+        send(conflict).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+}
