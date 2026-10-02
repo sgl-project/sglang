@@ -632,6 +632,16 @@ class PDCaptureRuntimeBase(CustomTestCase):
                         frame["prefill_graph"]["capture_hidden_mode"], "NULL"
                     )
                     self.assertFalse(frame["prefill_graph"]["output_hidden_states"])
+                    if frame["pp_rank"] < prefill_pp - 1:
+                        self.assertEqual(
+                            frame["prefill_graph"]["output_kind"], "PPProxyTensors"
+                        )
+                        rows = frame["prefill_graph"]["pipeline_output_rows"]
+                        self.assertTrue(rows)
+                        self.assertEqual(
+                            set(rows.values()),
+                            {frame["prefill_graph"]["raw_tokens"]},
+                        )
                 self.assertTrue(
                     any(
                         r["prefill_graph"]["raw_tokens"]
@@ -827,8 +837,19 @@ class PDCaptureRuntimeBase(CustomTestCase):
                     == trace
                     and frame.get("pd_role") == "prefill"
                 ]
-                self.assertTrue(
-                    any(r["cuda_graph"] and r["predictions"] for r in frames), fault
+                self.assertEqual(
+                    {(r["tp_rank"], r["pp_rank"]) for r in frames if r["cuda_graph"]},
+                    {(tp, pp) for tp in range(prefill_tp) for pp in range(prefill_pp)},
+                    fault,
+                )
+                self.assertEqual(
+                    {
+                        (r["tp_rank"], r["pp_rank"])
+                        for r in frames
+                        if r["cuda_graph"] and r["predictions"]
+                    },
+                    {(tp, prefill_pp - 1) for tp in range(prefill_tp)},
+                    fault,
                 )
         reader = MooncakeSnapshotStore.connect(self.store_setup)
         self.addCleanup(reader.close)

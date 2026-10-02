@@ -32,12 +32,12 @@ it does not redefine the goal as the modules already implemented.
 | Teacher D2H batching | Optional bounded aux-owner staging shares the existing device budget with KV | Source reuse, cross-stream tail fencing, CPU P/D handoff and real AR/DSpark/P/D pass; decode transfer work falls, but no serving throughput improvement is established |
 | Mooncake adapter | Required hard pin, registered raw buffers, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including complete reads after producer exit; production retention remains open |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
-| Partition publication | Owner-local writes and fenced all-owner publication receipts | Two independent writer processes publish logical head shards through real TCP Store; distributed inference admission and scheduler integration remain open |
-| Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact CUDA source-reuse checks and independent Store writers pass; distributed coordination remains open |
-| Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture matches a full target contract; deployed TP/PP model validation remains open |
-| Startup identity exchange | Bounded JSON over the existing CPU group, phase failure votes and final digest agreement | Real four-process Gloo TP2/PP2 and TP4/PP1 cases pass, including local failures, peer exit and finite waits; distributed request/resource coordination remains open |
+| Partition publication | Owner-local writes and fenced all-owner publication receipts | Independent writers and real TP2/PP1, TP1/PP2 and TP2/PP2 serving/P/D tests publish complete snapshots through TCP Store; production retention and saturated load remain open |
+| Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact source-reuse checks and distributed serving publication pass; replicated-head runtime coverage still needs expansion |
+| Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture and real Qwen3 TP2/PP1, TP1/PP2 and TP2/PP2 binding pass; additional deployed models remain open |
+| Startup identity exchange | Bounded JSON over the existing CPU group, phase failure votes and final digest agreement | Four-process Gloo failure/finite-wait tests and real distributed identity, resource readiness and activation pass; broader deployment combinations remain open |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
-| Prefill graph collection | Live request lengths, owned teacher/KV staging, resolved hidden capture, stable PP activations and P/D teacher handoff | AR and static target-KV DSpark pass Full, Breakable and default torch.compile piecewise on PP2 synchronous, TP2 overlap, single GPU and TP1/PP1 P/D, with eager output comparison and post-exit Store parity; mixed TP/PP, distributed P/D and other speculative prefill graphs remain open |
+| Prefill graph collection | Live request lengths, owned teacher/KV staging, resolved hidden capture, stable PP activations and P/D teacher handoff | AR and static target-KV DSpark pass Full, Breakable and default torch.compile piecewise in colocated and P/D single-rank, TP2 overlap and PP2 synchronous serving, with eager output comparison and post-exit Store parity; mixed TP/PP, asymmetric P/D and other speculative prefill graphs remain open |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production checkpoint-manager integration and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
@@ -3520,10 +3520,44 @@ All six jobs are terminal, the resident H100 resumed idle load, and no extra GPU
 was allocated. Four changed/new Python files pass Black and full Ruff checks;
 the original staged index remains unchanged.
 
+## Distributed P/D Prefill Graphs
+
+Matching TP1/PP2 P/D groups pass six tests in 761.683s; matching TP2/PP1 groups
+pass six in 634.442s. Each matrix covers AR and static target-KV DSpark with P
+Full, Breakable and default-eager torch.compile piecewise prefill, while D uses
+Full decode/verify graphs. PP remains synchronous and TP uses overlap. DSpark
+loads a synthetic draft on both roles; D rebuilds context from transferred KV.
+
+Every P rank must replay for successful requests and missing/stale/abort probes.
+Only the final P stage supplies teacher rows. Intermediate PP outputs must be
+trimmed to live token count before transport. These checks extend the existing
+source parity, eager token comparison, padding, prefix hit, buffer reuse, empty
+hidden-output and D-no-prefill assertions. The shared helper's single-rank path
+retains the same checks, with stricter fault-rank completeness.
+
+Each topology produces 60 graph samples and ten independent eager baseline
+samples. All 140 complete snapshots pass online source comparison and post-exit
+Store readback. Contract seeds are excluded. Every ten-sample run has thirteen
+admissions, ten seals, two failed handoffs and one aborted capture. Rank-local
+PP0 READY counters remain zero because the last-stage auxiliary owner publishes;
+Catalog records and Store reads prove global publication.
+
+The two jobs used one frozen source and passed without failed preliminary runs.
+Three Python files pass Black and full Ruff checks. The producer README's stale
+closed-P/D/PP statements are corrected against current factory/configuration
+code. The temporary two-H100 allocation is deleted and its pod is absent; the
+resident GPU remains idle-loaded. See [the runbook](experiments/DISTRIBUTED_PD_PREFILL_CAPTURE.md)
+and [retained evidence](experiments/distributed-pd-prefill-capture.json).
+
+This is Qwen3-0.6B BF16, FlashInfer target, Triton draft, same-node P/D, real TCP
+transfer/Store and an HTTP Catalog test double. Mixed TP/PP prefill, asymmetric
+P/D prefill, asynchronous PP, other models, Inductor, RDMA combinations, trained
+quality and serving SLOs remain separate validation requirements.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
-   coverage to mixed TP/PP, distributed P/D, other speculative and mixed-batch execution. Extend distributed
+   coverage to mixed TP/PP, asymmetric P/D, other speculative and mixed-batch execution. Extend distributed
    pressure beyond passing
    colocated and P/D synchronous TP1/PP2 and TP2/PP2 DSpark to AR and asymmetric
    combined topologies. Broaden real-request coverage to speculative cache

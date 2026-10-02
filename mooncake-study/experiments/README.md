@@ -30,6 +30,9 @@ in [Remote RDMA Store Validation](RDMA.md).
 [P/D Prefill Graph Capture](PD_PREFILL_CAPTURE.md) covers the independent P/D
 workers' Full, Breakable and piecewise graph paths for AR and static target-KV
 DSpark, with raw source comparison and post-exit Store reads on the resident GPU.
+[Distributed P/D Prefill Graph Capture](DISTRIBUTED_PD_PREFILL_CAPTURE.md)
+extends those checks to matching TP2 overlap and PP2 synchronous groups, including
+every-rank replay, intermediate output trimming and distributed failure exclusion.
 
 ```bash
 LAB=/gpfs/users/fuxuanwei-1/dspark-maas-lab

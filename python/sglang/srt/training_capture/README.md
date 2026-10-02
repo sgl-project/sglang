@@ -38,13 +38,16 @@ An example for an unquantized Qwen3-0.6B target with layers 0, 14 and 27:
 Synchronous and normal overlap scheduling are supported for ordinary AR and
 DSpark verification. Ordinary AR can use TP/PP with DP=1;
 the complete worker group must participate in capture startup. Real-model
-numerical validation currently covers Qwen3-0.6B on two H100s with TP2/PP1 and
-TP1/PP2, including chunked prefill, prefix reuse, decode CUDA Graphs and TP
+numerical validation currently covers Qwen3-0.6B at TP2/PP1, TP1/PP2 and
+TP2/PP2, including chunked prefill, prefix reuse, decode CUDA Graphs and TP
 overlap scheduling. Other topologies and model families still require deployment
 validation. PP uses SGLang's non-overlap pipeline scheduler.
-DSpark capture supports TP with PP=DP=1. Qwen3-0.6B with a synthetic
-target-KV draft is verified at TP2, including eager and graph/overlap execution,
-prefix reuse, full acceptance, rejection and mixed acceptance lengths in a batch.
+DSpark capture supports TP and synchronous PP with DP=1. Pipeline execution
+requires a static target-KV draft; hidden-input and confidence-scheduled drafts
+remain limited to PP=1. Qwen3-0.6B with a synthetic target-KV draft is verified
+at TP2/PP1, TP1/PP2 and TP2/PP2, including eager/graph execution, prefix reuse,
+full acceptance, rejection and mixed acceptance lengths in a batch. Overlap
+is verified at PP=1; pipeline serving remains synchronous.
 Each rank writes its own captured KV heads to the Store. An independent reader
 reconstructs the global tensors after producer exit; the snapshot path does not
 gather KV payloads through its control group.
@@ -61,12 +64,29 @@ currently falls back to eager for ragged target verification. These tests use
 synthetic draft weights and synchronous source observations, so they establish
 data correctness, not draft quality or latency/SLO acceptance.
 The configuration is checked before weights load; unsupported DP/context
-parallelism, pipeline speculation, other speculative algorithms,
-PD, mixed-chunk, LoRA, quantized or embedding execution is rejected. Model/pool
+parallelism, non-DSpark speculative algorithms, non-Mooncake or optimistic PD,
+mixed-chunk, LoRA, quantized or embedding execution is rejected. Model/pool
 binding additionally requires a local safetensors target, local tokenizer
 artifacts, standard unscaled RoPE, full attention, and dense unquantized NHD
 BF16/FP16 KV. Initial codecs recognize Qwen3, Qwen2 and Llama implementations;
 recognition is not a substitute for per-model numerical verification.
+
+P/D capture requires compatible capture configuration on both roles and the
+Mooncake disaggregation backend. D owns admission, the complete target-KV
+snapshot and Store publication. P receives the fenced capture context before
+its forward and transfers the first raw teacher row with the accepted first
+token. D exports the received target prefix and later decode/verify data;
+neither role reruns target prefill to reconstruct missing teacher data. Missing
+or stale handoffs fail capture while serving continues.
+
+AR P/D supports matching and asymmetric TP, subject to the global target
+contract. Mooncake permits matching P/D PP sizes or reduction to D PP1; PP
+expansion is unsupported. Static target-KV DSpark is verified in matching TP2,
+matching TP1/PP2, reduced PP2-to-PP1 and matching TP2/PP2 deployments. P may omit
+the KV-input draft because D reconstructs draft context from transferred target
+KV. See the current [implementation status](../../../../mooncake-study/IMPLEMENTATION_STATUS.md)
+for graph/backend, topology and transport evidence. These tests do not certify
+unlisted deployment combinations, trained draft quality or serving SLOs.
 
 Keep model files immutable during loading and serving. Weight/tokenizer file
 digests and actual attention geometry, K norm, RoPE and output transforms bind
@@ -101,6 +121,9 @@ registered slot drops capture admission without delaying inference. A request
 abort/retract fails the entire attempt; no partial READY sample is published.
 Counters, Host slot states and the capture disable reason are exposed as
 `training_capture` in SGLang's existing internal-state response.
+These counters are rank-local. In PP, the READY publication counter belongs to
+the auxiliary owner on the last stage; PP0 reporting zero READY does not imply
+that no global snapshot was published.
 
 ### Adaptive Admission
 
@@ -311,11 +334,13 @@ order with a compatible protocol and a valid Gloo group.
 The serving worker now supplies its existing world CPU group and actual rank
 coordinates to `CaptureCoordinator.create`. Enabled capture loads configuration
 inside the binding callback; configuration errors therefore participate in the
-startup vote. Disabled capture returns before invoking the protocol. The current
-request coordinator still rejects distributed capture after identity agreement,
-and the server's TP/PP/DP gates remain closed. Distributed request admission,
-failure decisions, snapshot descriptor exchange, global teacher scores and
-distributed scheduling remain separate work.
+startup vote. Disabled capture returns before invoking the protocol. For snapshot
+publishers, the factory prepares single-rank or cohort collection and coordinates
+resource readiness across distributed ranks.
+Distributed admission, failure propagation, descriptor exchange and owner-local
+publication use the cohort path described below. P/D prefill uses the same global
+identity but only participates in the fenced first-teacher handoff; D owns the
+snapshot resources. DP/context parallelism remains unsupported.
 
 ### Resource Readiness
 

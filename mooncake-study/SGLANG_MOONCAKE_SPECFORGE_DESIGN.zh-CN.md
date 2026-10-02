@@ -471,6 +471,23 @@ top128/ID/LSE、token、mask、位置和末尾有效性；两端退出后由新 
 [`experiments/PD_PREFILL_CAPTURE.md`](experiments/PD_PREFILL_CAPTURE.md) 和
 [`experiments/pd-prefill-capture.json`](experiments/pd-prefill-capture.json)。
 
+分布式 P/D prefill 进一步覆盖两端匹配的 TP2/PP1 overlap 和 TP1/PP2 同步。
+每种拓扑均通过 AR、静态 target-KV DSpark 与 Full/Breakable/tc_piecewise
+的六项组合。成功请求和 missing/stale/abort 探针都必须在每个 P rank 上实际
+回放，只有 P 最后一级提供 teacher；PP 中间输出的所有 tensor 行数必须等于
+真实 token 数。D 仍不额外执行 target prefill。
+
+两种拓扑共验证 120 个 graph 样本和 20 个 eager 基线样本，生成 token 与
+各自基线一致，所有 140 个完整快照均通过线上源数据对照及服务退出后的 Store
+读回。PP0 的本地 READY 计数可以为零，因为最后一级 auxiliary owner 才发布
+全局 manifest；发布成功以 Catalog 记录与真实对象读回共同确认。
+
+该验证仍是同节点 TCP transfer/Store、Qwen3-0.6B BF16、合成 draft 和测试
+Catalog，不覆盖混合 TP/PP prefill、非对称 P/D prefill、跨节点 RDMA 组合或
+生产性能。临时两卡实例在验收后释放。复现和证据见
+[`experiments/DISTRIBUTED_PD_PREFILL_CAPTURE.md`](experiments/DISTRIBUTED_PD_PREFILL_CAPTURE.md)
+与 [`experiments/distributed-pd-prefill-capture.json`](experiments/distributed-pd-prefill-capture.json)。
+
 ### 7.4 选层 KV 导出
 
 `SelectedLayerKVExporter` 接收 request logical positions 到物理 slot 的映射，以及当前 target KV pool。它只导出 contract 中明确选择的层和有效位置。

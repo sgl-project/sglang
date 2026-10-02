@@ -1,0 +1,1393 @@
+{
+  "schema_version": 1,
+  "experiment": "distributed_pd_prefill_graph_training_capture",
+  "date_utc": "2026-10-02",
+  "baseline_commit": "c03c042003484d1520ef52c380ac4b5e0b402fd3",
+  "branch": "codex/dspark-maas-capture",
+  "runtime_lock": {
+    "path": "mooncake-study/experiments/h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84",
+    "metadata_versions": {
+      "python": "3.12.3",
+      "torch": "2.13.0",
+      "flashinfer-python": "0.6.17",
+      "sglang-kernel": "0.4.6.post1",
+      "transformers": "5.12.1",
+      "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+    },
+    "container_setup": "Removed optional inherited FlashInfer cubin/JIT-cache 0.6.12 distributions in the temporary container, as required by the locked 0.6.17 overlay."
+  },
+  "allocations": {
+    "temporary": {
+      "job": "job-b007965cfe99-20261002180015",
+      "pod": "job-b007965cfe99-20261002180015-master-0",
+      "node": "node199",
+      "gpu_uuids": [
+        "GPU-9a2310f8-4162-b824-638e-95729f284b28",
+        "GPU-ba8dcfbf-4408-a5f3-86bb-310df1785097"
+      ],
+      "image": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+      "state_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-prefill",
+      "final_worker_status": {
+        "worker_id": "fb203c72026840a381a0931d79079026",
+        "hostname": "job-b007965cfe99-20261002180015-master-0",
+        "pid": 1,
+        "mode": "idle",
+        "heartbeat_unix": 1790936929.6252472,
+        "idle_pid": null,
+        "active_job": null,
+        "active_pid": null,
+        "queued": 0,
+        "paused": false,
+        "heartbeat_age_seconds": 0.4647364616394043
+      },
+      "gpu_process_list_empty_before_delete": true,
+      "deletion": {
+        "api_code": 0,
+        "request_id": "ReqID-20261002-182913-8354-d494",
+        "pod_absent": true
+      }
+    },
+    "resident": {
+      "job": "job-fe1ce1dcdea6-20261001023258",
+      "retained": true,
+      "final_status": {
+        "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+        "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+        "pid": 1,
+        "mode": "idle_load",
+        "heartbeat_unix": 1790937264.2314222,
+        "idle_pid": 62153,
+        "active_job": null,
+        "active_pid": null,
+        "queued": 0,
+        "paused": false,
+        "heartbeat_age_seconds": 0.02491474151611328
+      }
+    }
+  },
+  "scope": {
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "dtype": "bfloat16",
+    "target_attention": "flashinfer",
+    "draft_attention": "triton",
+    "draft": "synthetic untrained static target-KV DSpark on P and D",
+    "piecewise_compiler": "eager",
+    "piecewise_input_address_assertions": true,
+    "topologies": [
+      {
+        "prefill_tp": 1,
+        "prefill_pp": 2,
+        "decode_tp": 1,
+        "decode_pp": 2,
+        "overlap": false
+      },
+      {
+        "prefill_tp": 2,
+        "prefill_pp": 1,
+        "decode_tp": 2,
+        "decode_pp": 1,
+        "overlap": true
+      }
+    ],
+    "eager_baselines_overlap": false,
+    "placement": "same-node independent P/D groups sharing two H100s",
+    "prefill_backends": [
+      "full",
+      "breakable",
+      "tc_piecewise"
+    ],
+    "decode_verify_backend": "full",
+    "transfer_protocol": "tcp",
+    "store_protocol": "tcp",
+    "catalog": "HTTP test double",
+    "selected_layers": [
+      0,
+      14,
+      27
+    ],
+    "kv_pool_tokens": 4096,
+    "prefill_chunk_tokens": 128,
+    "graph_token_buckets": [
+      16,
+      32,
+      64,
+      128
+    ],
+    "kv_d2h_batch_tokens": 16,
+    "teacher_d2h_batch_tokens": 16,
+    "max_device_bytes": 8388608
+  },
+  "acceptance_totals": {
+    "runtime_test_methods": 12,
+    "graph_samples": 120,
+    "eager_baseline_samples": 20,
+    "complete_post_exit_snapshots": 140,
+    "successful_replay_source_frames": 192,
+    "terminal_jobs": 2,
+    "successful_jobs": 2,
+    "failed_jobs": 0,
+    "excluded": "The two synthetic-draft contract seeds are not counted as validated post-exit snapshots."
+  },
+  "notes": [
+    "Every graph-backed fault probe must replay on every P rank and supply teacher rows on each TP rank of the last P stage.",
+    "Every intermediate PP graph output tensor must have the live token count before pipeline transfer.",
+    "D target model entry rejects extra target prefill; allowed modes are DECODE, TARGET_VERIFY and IDLE.",
+    "PP0 READY is a rank-local zero; last-stage auxiliary ownership and Catalog/Store checks establish global publication.",
+    "The first PP startup compiled FlashInfer kernels while health probes waited; the same task continued and passed without restart.",
+    "Both matrices used one immutable source copy; final documentation was updated after execution. Production capture code was unchanged."
+  ],
+  "verification": {
+    "black": "Three changed/new Python files pass black --check.",
+    "ruff": "Three changed/new Python files pass full ruff check.",
+    "whitespace": "git diff --check passes.",
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "worker_environment": {
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "timeout_seconds": 1800,
+    "env": {
+      "PYTHONPATH": "<source_root>/python",
+      "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "OMP_NUM_THREADS": "1",
+      "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+    }
+  },
+  "not_established": [
+    "mixed TP/PP prefill graphs",
+    "asymmetric P/D prefill graphs",
+    "asynchronous PP",
+    "other models or speculative modes",
+    "Inductor",
+    "cross-node RDMA with this prefill combination",
+    "production Catalog retention",
+    "trained draft quality",
+    "serving SLOs"
+  ],
+  "jobs": [
+    {
+      "name": "pipeline_v1",
+      "id": "01790935465667982065-36e3b0845c81",
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-prefill-v1",
+      "test_command": "python test/registered/storage/test_training_capture_pd_pipeline_prefill_graph.py -f",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-prefill/logs/01790935465667982065-36e3b0845c81.log",
+      "log_sha256": "f39d6d6aea425866a8fd1f965c9bea17cd8e8c7f6cd453274ef82b9f1ea7b801",
+      "test_summary": [
+        "Ran 6 tests in 761.683s",
+        "OK"
+      ],
+      "cases": [
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "stored": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "eager_forwards": 31,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "pd_handoff_committed": 11,
+              "ready": 0,
+              "sealed": 10
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 3,
+            "states": {
+              "available": 3,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 2,
+          "decode_tp": 1,
+          "draft_kind": null,
+          "enable_overlap": false,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "disabled",
+          "prefill_draft": false,
+          "prefill_pp": 2,
+          "prefill_replay_frames": 0,
+          "prefill_tp": 1,
+          "ragged_mode": "static",
+          "replay": false
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "stored": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 31,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "pd_handoff_committed": 11,
+              "ready": 0,
+              "sealed": 10
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 3,
+            "states": {
+              "available": 3,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 2,
+          "decode_tp": 1,
+          "draft_kind": null,
+          "enable_overlap": false,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "breakable",
+          "prefill_draft": false,
+          "prefill_pp": 2,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 1,
+          "ragged_mode": "static",
+          "replay": true
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "stored": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 31,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "pd_handoff_committed": 11,
+              "ready": 0,
+              "sealed": 10
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 3,
+            "states": {
+              "available": 3,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 2,
+          "decode_tp": 1,
+          "draft_kind": null,
+          "enable_overlap": false,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "full",
+          "prefill_draft": false,
+          "prefill_pp": 2,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 1,
+          "ragged_mode": "static",
+          "replay": true
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "stored": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 31,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "pd_handoff_committed": 11,
+              "ready": 0,
+              "sealed": 10
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 2,
+          "decode_tp": 1,
+          "draft_kind": null,
+          "enable_overlap": false,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "tc_piecewise",
+          "prefill_draft": false,
+          "prefill_pp": 2,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 1,
+          "ragged_mode": "static",
+          "replay": true
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "stored": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 18,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "pd_handoff_committed": 11,
+              "ready": 0,
+              "sealed": 10,
+              "speculative_commits_copied": 20,
+              "speculative_verify_forwards": 18
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 2,
+          "decode_tp": 1,
+          "draft_kind": "target_kv",
+          "enable_overlap": false,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "breakable",
+          "prefill_draft": true,
+          "prefill_pp": 2,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 1,
+          "ragged_mode": "static",
+          "replay": true
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "stored": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 18,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "pd_handoff_committed": 11,
+              "ready": 0,
+              "sealed": 10,
+              "speculative_commits_copied": 20,
+              "speculative_verify_forwards": 18
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 2,
+          "decode_tp": 1,
+          "draft_kind": "target_kv",
+          "enable_overlap": false,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "full",
+          "prefill_draft": true,
+          "prefill_pp": 2,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 1,
+          "ragged_mode": "static",
+          "replay": true
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "stored": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 18,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "pd_handoff_committed": 11,
+              "ready": 0,
+              "sealed": 10,
+              "speculative_commits_copied": 20,
+              "speculative_verify_forwards": 18
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 4194304,
+              "device_allocated_bytes": 262144,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 2,
+          "decode_tp": 1,
+          "draft_kind": "target_kv",
+          "enable_overlap": false,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "tc_piecewise",
+          "prefill_draft": true,
+          "prefill_pp": 2,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 1,
+          "ragged_mode": "static",
+          "replay": true
+        }
+      ],
+      "result": {
+        "job_id": "01790935465667982065-36e3b0845c81",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790936249.284736,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-prefill/logs/01790935465667982065-36e3b0845c81.log"
+      },
+      "result_sha256": "f2fe93744a65447b49105aaef1b3f561cc9762d421006c77bc74b4d2a4ba16c2"
+    },
+    {
+      "name": "tensor_v1",
+      "id": "01790935466021197194-70d27231f6e8",
+      "source_root": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-prefill-v1",
+      "test_command": "python test/registered/storage/test_training_capture_pd_tensor_prefill_graph.py -f",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-prefill/logs/01790935466021197194-70d27231f6e8.log",
+      "log_sha256": "83b466e3a2c7343d50163a1132ece09950541f05b844a5a4ce7d6fb60e497268",
+      "test_summary": [
+        "Ran 6 tests in 634.442s",
+        "OK"
+      ],
+      "cases": [
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "published": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "eager_forwards": 31,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "pd_handoff_committed": 11,
+              "ready": 10,
+              "sealed": 10
+            },
+            "disabled_reason": null,
+            "enable_overlap": false,
+            "host_pool": {
+              "allocated_bytes": 11556864,
+              "device_allocated_bytes": 459008,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 2,
+          "draft_kind": null,
+          "enable_overlap": false,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "disabled",
+          "prefill_draft": false,
+          "prefill_pp": 1,
+          "prefill_replay_frames": 0,
+          "prefill_tp": 2,
+          "ragged_mode": "static",
+          "replay": false
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "published": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 38,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "overlap_forwards": 38,
+              "pd_handoff_committed": 11,
+              "ready": 10,
+              "sealed": 10
+            },
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "host_pool": {
+              "allocated_bytes": 11556864,
+              "device_allocated_bytes": 459008,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 3,
+            "states": {
+              "available": 3,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 2,
+          "draft_kind": null,
+          "enable_overlap": null,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "breakable",
+          "prefill_draft": false,
+          "prefill_pp": 1,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 2,
+          "ragged_mode": "static",
+          "replay": true
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "published": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 38,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "overlap_forwards": 38,
+              "pd_handoff_committed": 11,
+              "ready": 10,
+              "sealed": 10
+            },
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "host_pool": {
+              "allocated_bytes": 11556864,
+              "device_allocated_bytes": 459008,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 3,
+            "states": {
+              "available": 3,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 2,
+          "draft_kind": null,
+          "enable_overlap": null,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "full",
+          "prefill_draft": false,
+          "prefill_pp": 1,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 2,
+          "ragged_mode": "static",
+          "replay": true
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "published": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 38,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "overlap_forwards": 38,
+              "pd_handoff_committed": 11,
+              "ready": 10,
+              "sealed": 10
+            },
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "host_pool": {
+              "allocated_bytes": 11556864,
+              "device_allocated_bytes": 459008,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 3,
+            "states": {
+              "available": 3,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 2,
+          "draft_kind": null,
+          "enable_overlap": null,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "tc_piecewise",
+          "prefill_draft": false,
+          "prefill_pp": 1,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 2,
+          "ragged_mode": "static",
+          "replay": true
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "published": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 25,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "overlap_forwards": 25,
+              "pd_handoff_committed": 11,
+              "ready": 10,
+              "sealed": 10,
+              "speculative_commits_copied": 29,
+              "speculative_verify_forwards": 25
+            },
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "host_pool": {
+              "allocated_bytes": 11556864,
+              "device_allocated_bytes": 459008,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 2,
+          "draft_kind": "target_kv",
+          "enable_overlap": null,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "breakable",
+          "prefill_draft": true,
+          "prefill_pp": 1,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 2,
+          "ragged_mode": "static",
+          "replay": true
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "published": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 25,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "overlap_forwards": 25,
+              "pd_handoff_committed": 11,
+              "ready": 10,
+              "sealed": 10,
+              "speculative_commits_copied": 29,
+              "speculative_verify_forwards": 25
+            },
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "host_pool": {
+              "allocated_bytes": 11556864,
+              "device_allocated_bytes": 459008,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 2,
+          "draft_kind": "target_kv",
+          "enable_overlap": null,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "full",
+          "prefill_draft": true,
+          "prefill_pp": 1,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 2,
+          "ragged_mode": "static",
+          "replay": true
+        },
+        {
+          "capture": {
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "cooldown_remaining_seconds": 0,
+              "decreases": 0,
+              "effective_ratio": 1,
+              "failures": 0,
+              "latency": null,
+              "occupied_fraction": 0,
+              "pauses": 0,
+              "reason": "configured",
+              "recoveries": 0,
+              "target_ratio": 1,
+              "writer_age_seconds": 0
+            },
+            "cohort_writer": {
+              "counters": {
+                "failed": 3,
+                "published": 10,
+                "submitted": 13
+              },
+              "error": null,
+              "oldest_seconds": 0,
+              "pending": 0,
+              "ready": true,
+              "recovery_error": null,
+              "states": {},
+              "stopping": false
+            },
+            "counters": {
+              "admitted": 13,
+              "cuda_graph_forwards": 25,
+              "failed_pd_handoff_failed": 2,
+              "failed_running_request_aborted": 1,
+              "overlap_forwards": 25,
+              "pd_handoff_committed": 11,
+              "ready": 10,
+              "sealed": 10,
+              "speculative_commits_copied": 29,
+              "speculative_verify_forwards": 25
+            },
+            "disabled_reason": null,
+            "enable_overlap": true,
+            "host_pool": {
+              "allocated_bytes": 11556864,
+              "device_allocated_bytes": 459008,
+              "device_limit_bytes": 8388608,
+              "filling": 4,
+              "free": 0,
+              "quarantined": 0
+            },
+            "occupied_fraction": 0,
+            "queued": 0,
+            "request_router": {
+              "attached": 13,
+              "bound": 13,
+              "cancelled": 1,
+              "considered": 14,
+              "excluded": 1,
+              "selected": 13
+            },
+            "reservations": 4,
+            "states": {
+              "available": 4,
+              "pending_publication": 0,
+              "writing": 0
+            },
+            "writer_age_seconds": 0
+          },
+          "decode_pp": 1,
+          "decode_tp": 2,
+          "draft_kind": "target_kv",
+          "enable_overlap": null,
+          "post_exit_snapshots": 10,
+          "prefill_backend": "tc_piecewise",
+          "prefill_draft": true,
+          "prefill_pp": 1,
+          "prefill_replay_frames": 16,
+          "prefill_tp": 2,
+          "ragged_mode": "static",
+          "replay": true
+        }
+      ],
+      "result": {
+        "job_id": "01790935466021197194-70d27231f6e8",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790936895.050376,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-distributed-prefill/logs/01790935466021197194-70d27231f6e8.log"
+      },
+      "result_sha256": "b9bb3c6e118e698d2c81e7ddfe18da3f5d16c92c42e82df498e88bf9894ff6e0"
+    }
+  ],
+  "source_hashes": {
+    "/gpfs/user/fuxuanwei/sglang/mooncake-study/implementation/sglang": {
+      "python/sglang/test/pd_capture_runtime.py": "ddee6e187186af801f553db1a703709d2f7d9241aa1fb60aa4acd19b31eaef62",
+      "python/sglang/test/pd_capture_server.py": "9787493bba282776148e2223f0fa9565de6c2ab44569ed4c5e368686d8d74dc0",
+      "python/sglang/test/pd_prefill_capture_server.py": "21a8a6f4b98a9bee4d4dde005442e662c30370fcf268d35e810f35b86a1e73ab",
+      "python/sglang/test/training_capture_prefill_server.py": "9d1e9d60f8ee2659ea948a171aaecf4ed0ccfc1264f8a8fcbd1170baa688bdd5",
+      "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3",
+      "test/registered/storage/test_training_capture_pd_prefill_graph.py": "7d2abd8b229d3bb4d279ed29f6c0dc2a15d635ca170058c3de155f6fa52a6fb9",
+      "test/registered/storage/test_training_capture_pd.py": "24cd1594e9938a52a21948bb5d02f4c70f926d35b10c741f548caa7b3626ae7b",
+      "test/registered/storage/test_training_capture_pd_dspark.py": "2842b2114bdc99cea4cc3fd1621f3b516178b25f46499ced899f6d79f9d19668",
+      "test/registered/storage/test_training_capture_pd_dspark_pressure.py": "67fac24f5af2ad93ccc15b3b3553f0119976bb02e05ac4873d8f692219a53504",
+      "test/registered/storage/test_training_capture_pd_tensor_prefill_graph.py": "c449386f5a99b79f4b758b6d13787fca0432aad35deed542d64729981964410a",
+      "test/registered/storage/test_training_capture_pd_pipeline_prefill_graph.py": "7db12d1278d7b5542a69743c21c131a010612ddc2d051e9d4ba1883e762e581c"
+    },
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-distributed-prefill-v1": {
+      "python/sglang/test/pd_capture_runtime.py": "ddee6e187186af801f553db1a703709d2f7d9241aa1fb60aa4acd19b31eaef62",
+      "python/sglang/test/pd_capture_server.py": "9787493bba282776148e2223f0fa9565de6c2ab44569ed4c5e368686d8d74dc0",
+      "python/sglang/test/pd_prefill_capture_server.py": "21a8a6f4b98a9bee4d4dde005442e662c30370fcf268d35e810f35b86a1e73ab",
+      "python/sglang/test/training_capture_prefill_server.py": "9d1e9d60f8ee2659ea948a171aaecf4ed0ccfc1264f8a8fcbd1170baa688bdd5",
+      "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3",
+      "test/registered/storage/test_training_capture_pd_prefill_graph.py": "7d2abd8b229d3bb4d279ed29f6c0dc2a15d635ca170058c3de155f6fa52a6fb9",
+      "test/registered/storage/test_training_capture_pd.py": "24cd1594e9938a52a21948bb5d02f4c70f926d35b10c741f548caa7b3626ae7b",
+      "test/registered/storage/test_training_capture_pd_dspark.py": "2842b2114bdc99cea4cc3fd1621f3b516178b25f46499ced899f6d79f9d19668",
+      "test/registered/storage/test_training_capture_pd_dspark_pressure.py": "67fac24f5af2ad93ccc15b3b3553f0119976bb02e05ac4873d8f692219a53504",
+      "test/registered/storage/test_training_capture_pd_tensor_prefill_graph.py": "c449386f5a99b79f4b758b6d13787fca0432aad35deed542d64729981964410a",
+      "test/registered/storage/test_training_capture_pd_pipeline_prefill_graph.py": "7db12d1278d7b5542a69743c21c131a010612ddc2d051e9d4ba1883e762e581c"
+    }
+  }
+}
