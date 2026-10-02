@@ -103,6 +103,23 @@ def _ple_table_is_fp8(
     return False
 
 
+def _ple_table_is_nvfp4(
+    config: Qwen4ExpTextConfig,
+    quant_config: Optional[QuantizationConfig],
+    prefix: str,
+) -> bool:
+    """NVFP4 packed PLE shards: declared by config (lab QAD packages store
+    U8-packed e2m1 rows, e4m3 block scales, and one fp32 global scale)."""
+    if config.ple_embedding_dtype == "nvfp4":
+        return True
+    if quant_config is None:
+        return False
+    return (
+        isinstance(quant_config, ModelOptMixedPrecisionConfig)
+        and quant_config.resolve_quant_algo(prefix) == "NVFP4"
+    )
+
+
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     if forward_batch._original_forward_mode is not None:
         return forward_batch._original_forward_mode
@@ -538,10 +555,55 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 output_dtype=torch.bfloat16,
                 use_attn_tp_group=self.use_attn_tp_ngram,
             )
-        # weight_scale stays a real device tensor.
-        ngram_embedding.register_buffer(
-            "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
-        )
+        # NVFP4-packed PLE tables (lab QAD packages): the VocabParallelEmbedding
+        # above is only used for its shard metadata; replace its bf16 weight
+        # with the packed uint8 codes / e4m3 block scales / fp32 global scale.
+        # Rows are e2m1-decoded at gather time (device or pinned host).
+        if _ple_table_is_nvfp4(config, quant_config, ngram_prefix):
+            if not offload_embedding:
+                raise NotImplementedError(
+                    "NVFP4-packed PLE tables are served from the offload table "
+                    "only; pass --ple-offload-embedding."
+                )
+            # Only metadata lives here (same contract as bf16/fp8 tables): the
+            # multi-GB packed tensors stay on meta until the host table takes
+            # over. Rows are this rank's TP shard, as in the bf16/fp8 path: the
+            # loader writes local offsets within it and the gather reads only
+            # local_idx < tp_vocab_end - tp_vocab_start.
+            local_rows = ngram_embedding.num_embeddings_per_partition
+            with torch.device("meta"):
+                ngram_embedding.weight = nn.Parameter(
+                    torch.empty(
+                        local_rows,
+                        self.head_dim_per_ngram // 2,
+                        dtype=torch.uint8,
+                    ),
+                    requires_grad=False,
+                )
+                ngram_embedding.weight.input_dim = 0
+                ngram_embedding.weight.output_dim = None
+                ngram_embedding.register_buffer(
+                    "weight_scale",
+                    torch.empty(
+                        local_rows,
+                        self.head_dim_per_ngram // 16,
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    persistent=False,
+                )
+            # The global scale is one fp32 value; keep it real on the device.
+            ngram_embedding.register_buffer(
+                "weight_scale_2",
+                torch.ones(1, dtype=torch.float32),
+                persistent=False,
+            )
+            ngram_embedding._ple_nvfp4 = True
+        else:
+            # weight_scale stays a real device tensor: bf16 tables carry a
+            # scalar ones, fp8 tables load their real scale over it.
+            ngram_embedding.register_buffer(
+                "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
+            )
         if offload_embedding:
             ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 ngram_embedding,
@@ -600,8 +662,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         lookup_ids, semantic_tokens = self._prepare_embedding_lookup(
             ngram_ids, forward_batch, physical_tokens
         )
+        # NVFP4 rows are e2m1-decoded (block + global scales applied) by the
+        # pinned-host gather itself; every other table stores a real scale.
         embeddings = self.ngram_embedding(lookup_ids)
-        embeddings = embeddings * self.ngram_embedding.weight_scale
+        if not getattr(self.ngram_embedding, "_ple_nvfp4", False):
+            embeddings = embeddings * self.ngram_embedding.weight_scale
         return self._finish_embedding_lookup(
             embeddings, semantic_tokens, forward_batch, physical_tokens
         )
@@ -793,6 +858,61 @@ def _gather_ple_embedding_from_pinned_kernel(
     )
 
 
+@triton.jit
+def _gather_ple_nvfp4_embedding_kernel(
+    codes_ptr,
+    scale_ptr,
+    global_scale_ptr,
+    ids_ptr,
+    output_ptr,
+    embedding_dim,
+    tp_vocab_start,
+    tp_vocab_end,
+    BLOCK_D: tl.constexpr,
+):
+    """Gather + decode one NVFP4-packed PLE row (e2m1 * e4m3 block * fp32
+    global scale) into bf16; ids outside this TP shard decode to zero."""
+    row_id = tl.program_id(0)
+    global_idx = tl.load(ids_ptr + row_id)
+    in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
+    local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < embedding_dim
+    # Host-side calls pass raw data_ptr() integers; retype both pointers.
+    codes_ptr = codes_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+    scale_ptr = scale_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    packed = tl.load(
+        codes_ptr + local_idx * (embedding_dim // 2) + offsets // 2,
+        mask=mask,
+        other=0,
+    )
+    codes = (packed >> ((offsets % 2) * 4)) & 0xF
+    # e2m1: 1 sign bit (0x8), 2 exponent bits, 1 mantissa bit. Subnormal
+    # (exp==0) = 0.5 * mant; normal = 2^(exp-1) * (1 + 0.5 * mant).
+    exp = (codes >> 1) & 0x3
+    mant = codes & 1
+    magnitude = tl.where(
+        exp == 0,
+        mant.to(tl.float32) * 0.5,
+        tl.exp2(exp.to(tl.float32) - 1.0) * (1.0 + mant.to(tl.float32) * 0.5),
+    )
+    # Sign lives in bit 3; magnitude codes 0-7 are positive, 8-15 negative
+    # (matches the e2m1 reference LUT: sign * 2^(exp-1) * (1 + 0.5*mant)).
+    values = tl.where(codes < 8, magnitude, -magnitude)
+    block_scales = tl.load(
+        scale_ptr + local_idx * (embedding_dim // 16) + offsets // 16,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    global_scale = tl.load(global_scale_ptr).to(tl.float32)
+    decoded = (values * block_scales * global_scale).to(tl.bfloat16)
+    tl.store(
+        output_ptr + row_id * embedding_dim + offsets,
+        tl.where(in_range, decoded, 0.0),
+        mask=mask,
+    )
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """PLE table read directly from host memory (pinned, or a file-backed mmap).
 
@@ -829,14 +949,19 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         table_dir: Optional[str] = None,
     ) -> None:
         nn.Module.__init__(self)
+        self._ple_nvfp4 = getattr(embedding, "_ple_nvfp4", False)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
                 "PLE embedding offload requires an unquantized embedding table"
             )
-        if embedding.weight.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        nvfp4_weight = self._ple_nvfp4 and embedding.weight.dtype == torch.uint8
+        if not nvfp4_weight and embedding.weight.dtype not in (
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+        ):
             raise TypeError(
-                "PLE embedding offload requires bfloat16 or fp8 weights, got "
-                f"{embedding.weight.dtype}"
+                "PLE embedding offload requires bfloat16, fp8, or NVFP4-packed "
+                f"weights, got {embedding.weight.dtype}"
             )
         if embedding.num_added_embeddings:
             raise NotImplementedError(
@@ -870,9 +995,32 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader
         self.register_parameter("weight", cpu_weight)
-        # The scale is tiny; keep it with the model instead of offloading it
-        # with the table.
-        self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
+        if self._ple_nvfp4:
+            # The block scales travel with the packed codes (the gather reads
+            # both); only the fp32 global scale stays on the device.
+            source_scale = embedding.weight_scale
+            host_scale = allocate_ple_host_table(
+                shape=source_scale.shape,
+                dtype=source_scale.dtype,
+                backend=backend,
+                table_dir=table_dir,
+                tag=(
+                    f"scale-rows{self.shard_indices.org_vocab_start_index}"
+                    f"-{self.shard_indices.org_vocab_end_index}"
+                ),
+            )
+            cpu_scale = nn.Parameter(host_scale, requires_grad=False)
+            cpu_scale.weight_loader = self.weight_scale_loader
+            self.register_parameter("weight_scale", cpu_scale)
+            self.register_buffer(
+                "weight_scale_2", embedding.weight_scale_2, persistent=True
+            )
+        else:
+            # The scale is tiny; keep it with the model instead of offloading
+            # it with the table.
+            self.register_buffer(
+                "weight_scale", embedding.weight_scale, persistent=True
+            )
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
@@ -914,17 +1062,44 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
-            _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
-                flat_ids,
-                output,
-                embedding_dim=self.embedding_dim,
-                tp_vocab_start=self.shard_indices.org_vocab_start_index,
-                tp_vocab_end=self.shard_indices.org_vocab_end_index,
-                is_fp8=self.weight.dtype == torch.float8_e4m3fn,
-                BLOCK_D=self._block_d,
-            )
+            if self._ple_nvfp4:
+                # The scales are a host table; the fp32 global scale sits on
+                # the device next to the output so the kernel reads it there.
+                weight_scale_2 = self.weight_scale_2
+                if weight_scale_2.device != input_ids.device:
+                    weight_scale_2 = weight_scale_2.to(input_ids.device)
+                    self.weight_scale_2 = weight_scale_2
+                _gather_ple_nvfp4_embedding_kernel[(flat_ids.numel(),)](
+                    self.weight.data_ptr(),
+                    self.weight_scale.data_ptr(),
+                    weight_scale_2,
+                    flat_ids,
+                    output,
+                    embedding_dim=self.embedding_dim,
+                    tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                    tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                    BLOCK_D=self._block_d,
+                )
+            else:
+                _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+                    self.weight.data_ptr(),
+                    flat_ids,
+                    output,
+                    embedding_dim=self.embedding_dim,
+                    tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                    tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                    is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                    BLOCK_D=self._block_d,
+                )
         return output
+
+    def weight_scale_loader(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        """Load sharded NVFP4 block scales; rows outside this TP shard were
+        already dropped when the shard was copied into the local rows."""
+        assert param is self.weight_scale
+        param.data.copy_(loaded_weight.to(param.dtype))
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
@@ -1226,7 +1401,9 @@ class Qwen4ExpPLELayer(nn.Module):
         embeddings, semantic_tokens, physical_tokens = self._prefetch_state
         torch.cuda.current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
-        embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
+        # NVFP4 rows were decoded (block + global scales) inside the gather.
+        if not getattr(self.ple_embedding.ngram_embedding, "_ple_nvfp4", False):
+            embeddings = embeddings * (self.ple_embedding.ngram_embedding.weight_scale)
         embeddings = self.ple_embedding._finish_embedding_lookup(
             embeddings,
             semantic_tokens,
@@ -1917,6 +2094,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_weight: torch.Tensor,
         buffers: dict,
         loaded_buffers: Set[str],
+        ple_modules: dict,
     ) -> bool:
         if ".ple.ple_embedding." not in name:
             return False
@@ -1924,6 +2102,26 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if buffer_name.startswith("hashstats_"):
             return True
         if buffer_name == "token_lookup":
+            return True
+        if buffer_name == "weight_scale_2":
+            # NVFP4 PLE global scale: a single fp32 value on the ngram
+            # embedding (PinnedHost keeps it as a device buffer).
+            ple_mod = ple_modules.get(name[: name.rindex(".ngram_embedding.")])
+            scale = (
+                getattr(ple_mod.ngram_embedding, "weight_scale_2", None)
+                if ple_mod is not None
+                else None
+            )
+            if scale is None:
+                return False
+            value = loaded_weight.item()
+            if not (math.isfinite(value) and value > 0):
+                raise ValueError(
+                    "NVFP4 PLE checkpoint requires a finite positive global "
+                    f"scale, got {value} in {name}"
+                )
+            scale.fill_(value)
+            loaded_buffers.add(name)
             return True
         if buffer_name not in {
             "layer_multipliers",
@@ -1990,6 +2188,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "_k_scale",
             ".v_scale",
             "_v_scale",
+            ".weight_scale",
+            ".weight_scale_2",
             ".weight_scale_inv",
             "_weight_scale_inv",
             ".input_scale_inv",
@@ -2020,19 +2220,24 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return True
 
         def copy_ple_rows_to_tp_embedding(
-            emb, loaded_weight: torch.Tensor, row_start: int, row_end: int
+            emb,
+            loaded_weight: torch.Tensor,
+            row_start: int,
+            row_end: int,
+            param_name: str = "weight",
         ) -> None:
             tp_start = emb.shard_indices.org_vocab_start_index
             tp_end = emb.shard_indices.org_vocab_end_index
             ov_start = max(row_start, tp_start)
             ov_end = min(row_end, tp_end)
             if ov_start < ov_end:
+                target = getattr(emb, param_name)
                 local_start = ov_start - tp_start
                 src_start = ov_start - row_start
                 n_rows = ov_end - ov_start
-                emb.weight.data[local_start : local_start + n_rows].copy_(
+                target.data[local_start : local_start + n_rows].copy_(
                     loaded_weight[src_start : src_start + n_rows].to(
-                        device=emb.weight.device, dtype=emb.weight.dtype
+                        device=target.data.device, dtype=target.data.dtype
                     )
                 )
 
@@ -2041,17 +2246,55 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 return False
             import re
 
-            match = re.search(r"\.ngram_embedding\.shard_(\d+)\.weight$", name)
+            # NVFP4 packages also shard the e4m3 block scales (`shard_N.
+            # weight_scale`); bf16/fp8 tables ship weight only.
+            match = re.search(
+                r"\.ngram_embedding\.shard_(\d+)\.(weight|weight_scale)$", name
+            )
             if not match:
                 return False
             shard_idx = int(match.group(1))
+            suffix = match.group(2)
             mod_prefix = name[: name.index(".ngram_embedding.shard_")]
             ple_mod = ple_modules.get(mod_prefix)
             if ple_mod is None:
                 return False
             emb = ple_mod.ngram_embedding
+            nvfp4 = getattr(emb, "_ple_nvfp4", False)
+            if nvfp4:
+                if suffix == "weight":
+                    if loaded_weight.dtype != torch.uint8:
+                        raise ValueError(
+                            f"NVFP4 PLE shard {shard_idx} weight requires "
+                            f"torch.uint8, got {loaded_weight.dtype}"
+                        )
+                    if loaded_weight.shape[1] != emb.weight.shape[1]:
+                        raise ValueError(
+                            f"Shape mismatch for PLE embedding shard "
+                            f"{shard_idx} weight: expected "
+                            f"(*, {emb.weight.shape[1]}), got "
+                            f"{tuple(loaded_weight.shape)}"
+                        )
+                else:
+                    scale_param = emb.weight_scale
+                    if (
+                        loaded_weight.dtype,
+                        loaded_weight.shape[1],
+                    ) != (scale_param.dtype, scale_param.shape[1]):
+                        raise ValueError(
+                            f"Shape or dtype mismatch for PLE embedding shard "
+                            f"{shard_idx} weight_scale: expected "
+                            f"(*, {scale_param.shape[1]}) "
+                            f"{scale_param.dtype}, got "
+                            f"{tuple(loaded_weight.shape)} {loaded_weight.dtype}"
+                        )
+            elif suffix == "weight_scale":
+                # A non-NVFP4 table has no sharded scales; let the generic
+                # path skip the stale key (it would hit ignore_suffixes).
+                return False
             if (
-                loaded_weight.dtype == torch.float8_e4m3fn
+                suffix == "weight"
+                and loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn
             ):
                 if isinstance(emb, Qwen4ExpPinnedHostEmbedding):
@@ -2097,8 +2340,16 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             shard_start = shard_idx * shard_size
             actual_rows = loaded_weight.shape[0]
             shard_end = shard_start + actual_rows
-            copy_ple_rows_to_tp_embedding(emb, loaded_weight, shard_start, shard_end)
-            loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+            copy_ple_rows_to_tp_embedding(
+                emb,
+                loaded_weight,
+                shard_start,
+                shard_end,
+                param_name="weight_scale"
+                if (nvfp4 and suffix == "weight_scale")
+                else "weight",
+            )
+            loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.{suffix}")
             return True
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -2146,7 +2397,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
 
             if self._load_qwen4_exp_ple_buffer(
-                name, loaded_weight, buffers, loaded_buffers
+                name, loaded_weight, buffers, loaded_buffers, ple_modules
             ):
                 continue
             if load_qwen4_exp_ple_shard(name, loaded_weight):

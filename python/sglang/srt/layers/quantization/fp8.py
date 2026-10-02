@@ -763,6 +763,8 @@ class Fp8LinearMethod(LinearMethodBase):
         elif self.use_mxfp8:
             # MXFP8 (e4m3fn + UE8M0) must NOT be fnuz-normalized; check before
             # the fnuz branch since is_fp8_fnuz() is also True on gfx942.
+            if self._dequantize_mxfp8_small_shape_to_bf16(layer):
+                return
             if not self.is_checkpoint_fp8_serialized:
                 self._quantize_mxfp8_weights(layer)
                 return
@@ -1015,6 +1017,39 @@ class Fp8LinearMethod(LinearMethodBase):
         self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
 
+    def _dequantize_mxfp8_small_shape_to_bf16(self, layer: Module) -> bool:
+        """Run an MXFP8 layer whose GEMM shape is too small as a bf16 GEMM.
+
+        Every MXFP8 dense backend requires ``n >= 128`` and ``k >= 128`` and
+        raises on the first forward otherwise. Weights below that are
+        dequantized once at load time instead; :meth:`apply` then skips the
+        MXFP8 path entirely. Returns whether the layer was handled here.
+        """
+        n, k = layer.weight.shape
+        if n >= 128 and k >= 128:
+            return False
+        logger.warning_once(
+            "MXFP8 dense kernels need n >= 128 and k >= 128; smaller MXFP8 "
+            "layers run as a bf16 linear instead of an MXFP8 GEMM."
+        )
+        if self.is_checkpoint_fp8_serialized:
+            from sglang.srt.layers.quantization.mxfp8_block_convert import (
+                dequant_mxfp8_2d_to_bf16,
+            )
+
+            layer.weight = Parameter(
+                dequant_mxfp8_2d_to_bf16(
+                    layer.weight.data, layer.weight_scale_inv.data
+                ),
+                requires_grad=False,
+            )
+            # UE8M0 scales are folded into the bf16 weight.
+            layer.weight_scale_inv = None
+        # Online MXFP8 keeps the bf16 checkpoint weight, so skipping the
+        # quantization is the same fallback as dequantizing a serialized one.
+        layer.dequantized_bf16 = True
+        return True
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
@@ -1156,6 +1191,12 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(layer, "dequantized_bf16", False):
+            # This MXFP8 layer's shape is below the dense kernels' minimum
+            # (n >= 128 and k >= 128); see
+            # _dequantize_mxfp8_small_shape_to_bf16.
+            return F.linear(x, layer.weight, bias)
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
