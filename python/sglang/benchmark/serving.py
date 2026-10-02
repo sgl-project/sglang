@@ -695,7 +695,7 @@ async def async_request_sglang_generate(
         output = RequestFuncOutput.init_new(request_func_input)
 
         generated_text = ""
-        output_len = request_func_input.output_len
+        output_len = 0
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
@@ -741,9 +741,16 @@ async def async_request_sglang_generate(
                                 )
 
                             if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
                                 generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
+                            completion_tokens = _meta_info.get(
+                                "completion_tokens", last_output_len
+                            )
+                            # Tokens can decode to empty text (special tokens or
+                            # an incomplete byte sequence). Count token progress;
+                            # a repeated final usage frame adds no ITL sample.
+                            if completion_tokens > last_output_len:
+                                timestamp = time.perf_counter()
+                                output_len = completion_tokens
 
                                 # First token
                                 if ttft == 0.0:
@@ -753,8 +760,6 @@ async def async_request_sglang_generate(
                                 # Decoding phase
                                 else:
                                     num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
                                     chunk_gap = timestamp - most_recent_timestamp
                                     adjust_itl = chunk_gap / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)

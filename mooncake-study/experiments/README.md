@@ -27,6 +27,10 @@ stopped and reaped before test execution, then resumed afterward. Distributed
 experiments use separately allocated jobs; the two-node Store lane is described
 in [Remote RDMA Store Validation](RDMA.md).
 
+[D2H Policy And Request Latency](D2H_LATENCY.md) documents token-based native
+streaming timing and the opt-in join between request latency and validated
+Mooncake publications for comparing direct and staged transfers.
+
 [Host-Known Teacher Row Selection](TEACHER_SELECTION.md) covers contiguous
 teacher-row views, independent compact output ownership, and microbenchmark and
 serving comparisons against the index-upload/gather path.

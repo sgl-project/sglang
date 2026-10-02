@@ -3943,6 +3943,36 @@ remain recorded. All ten jobs are terminal; the resident H100 resumes idle load
 without an extra allocation. See the [runbook](experiments/TEACHER_SELECTION.md)
 and [source/log evidence](experiments/teacher-selection.json).
 
+## Token Timing And D2H Policy Comparison
+
+The native benchmark now records completion-token progress even when decoded
+text is empty. Repeated usage frames add no ITL, empty trailers preserve earlier
+text, and zero-token responses no longer claim the requested output length.
+The capture benchmark's opt-in `--request-details` binds request timings to
+validated Mooncake publication identities after producer exit, checks native
+aggregate agreement and reports published/not-published latency distributions.
+The final collector retains the identity set for independent JSON replay.
+
+Four unchanged capture policies complete **12,288 timed requests** and **400
+post-exit snapshot validations** on the resident H100. Direct, KV16, teacher16
+and combined16 average **75.25, 77.29, 75.56 and 77.79 requests/s** respectively.
+Against their own off brackets the mean throughput fractions are **83.92%,
+83.43%, 81.49% and 84.45%**. Tail improvements are inconsistent, off-bracket
+throughput drift reaches 9.45%, and two rounds do not establish significance.
+The default transfer policies remain unchanged.
+
+All enabled phases publish 50 complete samples with identical payload sizes;
+eight Prometheus scrapes match status without capture failure, quarantine or
+writer stage error. **10 final unit methods pass.** A separate final-collector
+run validates 64 additional snapshots, and an offline replay reproduces all
+three phase summaries from saved request files and publication identities
+without inference. All eleven jobs are terminal and the resident H100 resumes
+idle load. An initial request-detail
+failure exposed the previous text-gated client bug; a second intermediate run
+failed on the shared filesystem quota and has no usable report. Historical
+latency numbers above remain uncorrected. The [runbook](experiments/D2H_LATENCY.md)
+and [evidence index](experiments/d2h-latency.json) record the measurement scope.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
@@ -3979,8 +4009,10 @@ and [source/log evidence](experiments/teacher-selection.json).
    short-request p99 TTFT increase, which the latest unchanged baseline did not
    reproduce. After consolidating single-rank content validation and reducing
    teacher LSE and contiguous row-selection overhead, profile the remaining capture
-   and control/durability costs and investigate the latest first-round TPOT tail
-   without dropping publication checks. Per-model numerical/runtime validation and
+   and control/durability costs. The new token-based timing and publication join
+   reproduce off-phase TTFT/TPOT stalls and mixed-publication slow batches; locate
+   their server operations without dropping publication checks. Existing D2H
+   staging comparisons do not justify changing the defaults. Per-model numerical/runtime validation and
    runtime identity coverage also need expansion beyond the tested combination.
 5. Integrate with the SpecForge-owned production Catalog and consumer when
    available. Test doubles do not prove retention, consumer checkpoint replay,

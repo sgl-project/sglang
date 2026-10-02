@@ -53,6 +53,11 @@ draft quality, production Catalog retention, RDMA or a production SLO.
 
 ## Serving Results
 
+These historical measurements use the earlier text-gated native benchmark
+client. A later [request-level measurement](D2H_LATENCY.md) found that empty
+decoded text could suppress token timing. The original numbers below remain
+unchanged; they are not corrected latency estimates.
+
 The baseline is `44645fea3b7ebe44a240e96a052b61e7d6be0269`, frozen at
 `$LAB/sglang-teacher-selection-before`; candidate serving uses
 `$LAB/sglang-teacher-selection-v2`. Only teacher selection and its AR/P-prefill

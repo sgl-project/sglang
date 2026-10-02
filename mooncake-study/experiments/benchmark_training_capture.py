@@ -204,7 +204,7 @@ def capture_config(args, directory, address, catalog, ratio):
 
 
 def benchmark_command(args, url, path):
-    return [
+    command = [
         sys.executable,
         "-m",
         "sglang.benchmark.serving",
@@ -240,6 +240,10 @@ def benchmark_command(args, url, path):
         "--output-file",
         str(path),
     ]
+    if getattr(args, "request_details", False):
+        command[2] = "sglang.test.training_capture_benchmark_client"
+        command += ["--capture-request-records", str(path.parent / "requests.json")]
+    return command
 
 
 def measure(args, url, directory):
@@ -306,7 +310,7 @@ def measure(args, url, directory):
     }
 
 
-def validate_publications(reader, publications, args):
+def validate_publications(reader, publications, args, *, trace_ids=None):
     totals = Counter()
     for publication in publications:
         data = reader.get_tensor(
@@ -323,6 +327,11 @@ def validate_publications(reader, publications, args):
             for obj in manifest.objects
         }
         validate_tensors(manifest, tensors)
+        if trace_ids is not None:
+            trace_id = manifest.provenance.trace_id
+            if trace_id is None or trace_id in trace_ids:
+                raise RuntimeError("Published benchmark trace IDs must be unique")
+            trace_ids.add(trace_id)
         if (manifest.sequence.prompt_length, manifest.sequence.response_length) != (
             args.input_len,
             args.output_len,
@@ -400,7 +409,47 @@ def run_phase(args, directory, ratio):
         finally:
             if process is not None:
                 stop_process(process)
-        result["readback"] = validate_publications(reader, publications, args)
+        trace_ids = set()
+        result["readback"] = validate_publications(
+            reader,
+            publications,
+            args,
+            trace_ids=trace_ids if args.request_details else None,
+        )
+        if args.request_details:
+            from sglang.test.training_capture_benchmark_client import summarize_requests
+
+            details_path = directory / "requests.json"
+            details = json.loads(details_path.read_text())
+            if details["schema_version"] != 1 or details["status"] != "completed":
+                raise RuntimeError("Request latency recording did not complete")
+            summary = summarize_requests(
+                details["requests"],
+                trace_ids,
+                count=args.num_prompts,
+                output_len=args.output_len,
+            )
+            for field in (
+                "mean_ttft_ms",
+                "p99_ttft_ms",
+                "mean_tpot_ms",
+                "p99_tpot_ms",
+                "p99_e2e_latency_ms",
+            ):
+                if not math.isclose(
+                    summary["groups"]["all"][field],
+                    result["serving"][field],
+                    rel_tol=1e-9,
+                    abs_tol=1e-6,
+                ):
+                    raise RuntimeError(
+                        f"Request details disagree with native metric {field}"
+                    )
+            result["request_details"] = {
+                "path": str(details_path),
+                "sha256": hashlib.sha256(details_path.read_bytes()).hexdigest(),
+                **summary,
+            }
         admitted = result["capture_counter_delta"].get("admitted", 0)
         ready = result["capture_counter_delta"].get("ready", 0)
         if len(publications) != ready or catalog_errors:
@@ -476,6 +525,7 @@ def main():
     parser.add_argument("--device-mib", type=int, default=0)
     parser.add_argument("--segment-mib", type=int, default=2048)
     parser.add_argument("--phase-timeout", type=int, default=600)
+    parser.add_argument("--request-details", action="store_true")
     args = parser.parse_args()
     if not Path(args.model_path).is_dir():
         parser.error("Use a local model directory")
@@ -518,6 +568,17 @@ def main():
             )
         },
         "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "request_client_source_sha256": (
+            {
+                path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+                for path in (
+                    "python/sglang/benchmark/serving.py",
+                    "python/sglang/test/training_capture_benchmark_client.py",
+                )
+            }
+            if args.request_details
+            else None
+        ),
         "config": vars(args) | {"output_dir": str(args.output_dir)},
         "versions": {
             name: importlib.metadata.version(name)
@@ -536,6 +597,7 @@ def main():
             "decode_cuda_graphs": True,
             "prefill_cuda_graphs": False,
             "client": "existing sglang.benchmark.serving, streaming native /generate",
+            "request_details": args.request_details,
             "workload": "seeded fixed-length random-ids, closed-loop concurrency, not production traffic",
             "timing": "Client timing excludes warmup, server launch, readback and post-response writer drain",
             "payload_bytes": "Validated manifest tensor sizes; not D2H or wire byte counters",

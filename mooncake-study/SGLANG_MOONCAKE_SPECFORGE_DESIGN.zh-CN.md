@@ -1440,6 +1440,14 @@ draft 自身调用共享 lm_head 是允许的，测试要区分 draft logits 与
 
 先测 capture=off 基线，再对相同输入分布测 0.1%、1%、目标采集率。报告 TTFT/TPOT、吞吐、GPU kernel overhead、D2H/RDMA bytes 和完整样本率。
 
+性能实验可启用 `benchmark_training_capture.py --request-details`，在原生
+streaming 客户端内记录每请求时延，并在 producer 退出、Store 内容校验通过后，
+按 manifest 的 `provenance.trace_id` 关联已发布样本。客户端按 completion token
+计数推进 TTFT/ITL，避免空文本 token 漏计；TPOT 保持原生的
+`(E2E - TTFT) / (output_tokens - 1)` 口径。分组统计必须与原生聚合指标一致，
+但已采集/未采集分组本身不证明因果关系，同一 serving batch 可能共享采集开销。
+详见 [D2H 与请求时延实验](experiments/D2H_LATENCY.md)。
+
 SLO 阈值由实际服务基线制定，未测之前不给出“低于某个百分比”的承诺。上线 gate 同时要求完整性、服务 SLO 和缓存消费可持续，不只看训练 loss 下降。
 
 模型比较至少包含 hidden-input DSpark 基线、新 KV 输入版的 CE/TV、各 block 位置准确率、真实接受长度及端到端加速。KV 表示不同于 hidden，能省数据生成计算不代表训练效果自动相等。
