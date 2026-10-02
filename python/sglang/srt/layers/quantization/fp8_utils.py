@@ -1404,6 +1404,14 @@ def aiter_w8a8_block_fp8_linear(
 
     n, k = weight.shape
 
+    # decode-sized M on gfx950: the 1x128 activation quant fused into the GEMM
+    if _use_aiter_bpreshuffle_gfx95 and input_scale is None and bias is None:
+        from sglang.kernels.ops.gemm import smallm_fp8_blockscale_gfx950 as smallm
+
+        if smallm.smallm_fp8_bs_supported(input_2d, weight, weight_scale):
+            out = smallm.smallm_fp8_bs_linear(input_2d, weight, weight_scale)
+            return out.view(*output_shape)
+
     if _use_aiter_bpreshuffle_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
     elif _use_aiter_gfx95:
