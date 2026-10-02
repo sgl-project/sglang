@@ -73,11 +73,30 @@ fn engine_keeps_normalizer(class: &str, normalizer: &serde_json::Value) -> bool 
     }
 }
 
-/// Token ids SGLang's `tokenizer(text)` puts around a prompt and [`encode`]
-/// leaves out: BOS per `add_bos_token` (default true) for [`BOS_FLAG_CLASSES`],
-/// else the tokenizer.json post-processor's. Tiktoken models add none. Errs when
-/// the router cannot reproduce the engine's tokens.
-pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<(Vec<u32>, Vec<u32>)> {
+/// Special tokens SGLang's `tokenizer(text)` puts around a prompt and [`encode`] leaves out.
+#[derive(Debug, Default, PartialEq)]
+pub struct PromptAffixes {
+    pub prefix: Vec<u32>,
+    pub suffix: Vec<u32>,
+    /// EOS that SGLang appends to an EmbeddingGemma prompt not already ending in it.
+    pub eos: Option<u32>,
+}
+
+impl PromptAffixes {
+    /// [`encode`]'s `ids` as the engine tokenizes the same text.
+    pub fn apply(&self, ids: &[u32]) -> Vec<u32> {
+        let mut ids = [self.prefix.as_slice(), ids, &self.suffix].concat();
+        if let Some(eos) = self.eos.filter(|&eos| ids.last() != Some(&eos)) {
+            ids.push(eos);
+        }
+        ids
+    }
+}
+
+/// BOS per `add_bos_token` (default true) for [`BOS_FLAG_CLASSES`], else the
+/// tokenizer.json post-processor's, and EmbeddingGemma's EOS. Tiktoken models add
+/// none. Errs when the router cannot reproduce the engine's tokens.
+pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<PromptAffixes> {
     let path = resolve(source)?;
     if !path.ends_with(".json") {
         return Ok(Default::default());
@@ -98,19 +117,34 @@ pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<(Vec<u32>, Vec
     let ids = |t: &dyn traits::Tokenizer, text: &str| -> Result<Vec<u32>> {
         Ok(t.encode(text)?.token_ids().to_vec())
     };
-    if BOS_FLAG_CLASSES.contains(&class) {
-        let bos = &config["bos_token"];
-        let bos = bos.as_str().or(bos["content"].as_str());
-        let prefix = if config["add_bos_token"].as_bool().unwrap_or(true) {
-            let bos = bos.context("add_bos_token is set without a bos_token")?;
-            match ids(plain.as_ref(), bos)?.as_slice() {
-                [id] => vec![*id],
-                _ => anyhow::bail!("bos_token {bos:?} is not a single token"),
-            }
-        } else {
-            Vec::new()
+    let special = |key: &str| -> Result<Option<u32>> {
+        let Some(token) = config[key].as_str().or(config[key]["content"].as_str()) else {
+            return Ok(None);
         };
-        return Ok((prefix, Vec::new()));
+        match ids(plain.as_ref(), token)?.as_slice() {
+            [id] => Ok(Some(*id)),
+            _ => anyhow::bail!("{key} {token:?} is not a single token"),
+        }
+    };
+    // SGLang's `is_embedding_gemma`, whose `_tokenize_texts` ends each prompt with EOS.
+    files.ensure_downloaded("config.json")?;
+    let model = files.json("config.json")?.unwrap_or_default();
+    let embedding_gemma =
+        model["model_type"] == "gemma3_text" && model["use_bidirectional_attention"] == true;
+    let eos = embedding_gemma
+        .then(|| special("eos_token")?.context("EmbeddingGemma declares no eos_token"))
+        .transpose()?;
+    if BOS_FLAG_CLASSES.contains(&class) {
+        let add_bos = config["add_bos_token"].as_bool().unwrap_or(true);
+        let bos = add_bos
+            .then(|| special("bos_token")?.context("add_bos_token is set without a bos_token"))
+            .transpose()?;
+        let prefix = bos.into_iter().collect();
+        return Ok(PromptAffixes {
+            prefix,
+            suffix: Vec::new(),
+            eos,
+        });
     }
     let options = TokenizerOptions {
         add_special_tokens: true,
@@ -125,7 +159,12 @@ pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<(Vec<u32>, Vec
         .windows(bare.len())
         .position(|window| window == bare)
         .context("the post-processor rewrites the prompt")?;
-    Ok((full[..start].to_vec(), full[start + bare.len()..].to_vec()))
+    let (prefix, suffix) = (full[..start].to_vec(), full[start + bare.len()..].to_vec());
+    Ok(PromptAffixes {
+        prefix,
+        suffix,
+        eos,
+    })
 }
 
 fn build(path: &str, cfg: TokenizerConfig) -> Result<(Arc<Tokenizer>, Arc<TokenizerStats>)> {
@@ -503,16 +542,18 @@ mod model_files_tests {
 
 #[cfg(test)]
 mod prompt_affix_tests {
-    use super::{prompt_affixes, ModelFiles};
+    use super::{prompt_affixes, ModelFiles, PromptAffixes};
     use anyhow::Result;
     use serde_json::{json, Value};
 
-    /// `prompt_affixes` of the tiny tokenizer with `normalizer`, next to `config` unless null.
+    /// `prompt_affixes` of the tiny tokenizer with `normalizer`, next to `config`
+    /// (unless null) and the `model` config.
     fn affixes(
         normalizer: Value,
         post_processor: Value,
         config: Value,
-    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        model: Value,
+    ) -> Result<PromptAffixes> {
         let mut data: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/tiny_tokenizer.json")).unwrap();
         data["normalizer"] = normalizer;
@@ -523,6 +564,7 @@ mod prompt_affix_tests {
         if !config.is_null() {
             std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
         }
+        std::fs::write(dir.path().join("config.json"), model.to_string()).unwrap();
         let path = path.to_str().unwrap();
         prompt_affixes(path, &ModelFiles::open(path))
     }
@@ -536,20 +578,33 @@ mod prompt_affix_tests {
         let llama = json!({"tokenizer_class": "LlamaTokenizerFast", "bos_token": "<|endoftext|>"});
         let mut no_bos = llama.clone();
         no_bos["add_bos_token"] = false.into();
-        for (post_processor, config, prefix) in [
-            (Value::Null, json!({}), vec![]),
-            (template.clone(), json!({}), vec![256]),
+        let embedding_gemma =
+            json!({"model_type": "gemma3_text", "use_bidirectional_attention": true});
+        let eos = json!({"eos_token": {"content": "<|endoftext|>"}});
+        assert!(affixes(Value::Null, Value::Null, json!({}), embedding_gemma.clone()).is_err());
+        for (post_processor, config, model, prefix, eos) in [
+            (Value::Null, json!({}), json!({}), vec![], None),
+            (template.clone(), json!({}), json!({}), vec![256], None),
             // SGLang adds BOS by `add_bos_token`, ignoring the post-processor.
-            (Value::Null, llama, vec![256]),
-            (template, no_bos, vec![]),
+            (Value::Null, llama, json!({}), vec![256], None),
+            (template, no_bos, json!({}), vec![], None),
+            (Value::Null, eos, embedding_gemma, vec![], Some(256)),
         ] {
-            let affixes = affixes(Value::Null, post_processor, config).unwrap();
-            assert_eq!(affixes, (prefix, vec![]));
+            let affixes = affixes(Value::Null, post_processor, config, model).unwrap();
+            let suffix = vec![];
+            assert_eq!(
+                affixes,
+                PromptAffixes {
+                    prefix,
+                    suffix,
+                    eos
+                }
+            );
         }
         // Without the config or its BOS, the engine's special tokens are unknown.
         let unknown_bos = json!({"tokenizer_class": "LlamaTokenizerFast"});
         for config in [Value::Null, unknown_bos] {
-            assert!(affixes(Value::Null, Value::Null, config).is_err());
+            assert!(affixes(Value::Null, Value::Null, config, json!({})).is_err());
         }
     }
 
@@ -570,9 +625,21 @@ mod prompt_affix_tests {
             ),
         ] {
             let config = json!({"tokenizer_class": class, "add_bos_token": false});
-            let affixes = affixes(normalizer, Value::Null, config);
+            let affixes = affixes(normalizer, Value::Null, config, json!({}));
             assert_eq!(affixes.is_ok(), kept, "{class}");
         }
+    }
+
+    #[test]
+    fn embedding_gemma_eos_ends_the_prompt_once() {
+        let affixes = PromptAffixes {
+            eos: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            (affixes.apply(&[7]), affixes.apply(&[7, 1])),
+            (vec![7, 1], vec![7, 1])
+        );
     }
 }
 

@@ -65,7 +65,7 @@ pub struct TokenizerRegistry {
     /// Resolved encode backend and L1 cache counters of the served model's tokenizer.
     stats: Arc<stats::TokenizerStats>,
     /// Special tokens the engine adds around a raw prompt; `None` if unknown.
-    prompt_affixes: Option<(Vec<u32>, Vec<u32>)>,
+    prompt_affixes: Option<adapter::PromptAffixes>,
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -94,7 +94,8 @@ impl TokenizerRegistry {
         me.prompt_affixes = adapter::prompt_affixes(tokenizer_path, &files)
             .map_err(|e| {
                 tracing::warn!(model = %m.id, error = %format!("{e:#}"),
-                    "cannot reproduce the engine's tokens; /generate forwards text")
+                    "cannot reproduce the engine's tokens; /generate and /v1/embeddings \
+                     forward text")
             })
             .ok();
         match ChatFormatter::load_from(&m.id, &files) {
@@ -147,7 +148,7 @@ impl TokenizerRegistry {
 
     /// Encode a raw prompt as the engine's `tokenizer(text)` does, special tokens included.
     pub fn encode_prompt(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
-        let (prefix, suffix) = self.prompt_affixes.as_ref()?;
+        let affixes = self.prompt_affixes.as_ref()?;
         let tokenizer = self.get(model_id)?;
         // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
         let ids = if self.stats.backend() == stats::EncodeBackend::Tiktoken {
@@ -156,7 +157,7 @@ impl TokenizerRegistry {
             adapter::encode(&tokenizer, text)
         }
         .ok()?;
-        (!ids.is_empty()).then(|| [prefix.as_slice(), &ids, suffix].concat())
+        (!ids.is_empty()).then(|| affixes.apply(&ids))
     }
 
     /// Whether this model has a chat formatter (and thus the chat-aware

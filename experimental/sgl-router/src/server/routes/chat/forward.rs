@@ -61,7 +61,7 @@ pub(super) async fn forward_request(
     }
     // Only the router chooses DP ranks; a client-supplied rank is never forwarded.
     headers.remove(X_DATA_PARALLEL_RANK);
-    let dp_aware = ctx.config.model.dp_aware;
+    let dp_aware = ctx.config.model.dp_aware && request.accepts_dp_rank();
     // The engine gives fan-out item i the room `room + i`, so in PD decode looks
     // for each item on a different prefill rank; one pinned rank would break that.
     let unpin_prefill = dp_aware && decode.is_some() && request.fans_out;

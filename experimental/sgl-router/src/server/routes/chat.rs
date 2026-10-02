@@ -24,7 +24,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, SelectedWorkers};
-use preparation::{parse_routing_fields, PreparedRequest};
+use preparation::{parse_embedding_request, parse_routing_fields, PreparedRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -73,6 +73,27 @@ pub async fn generate(
     let model = ModelId(ctx.config.model.id.clone());
     let routing = ModelRouting::lookup(&ctx, &model)?;
     let request = PreparedRequest::generate(&ctx, model, body)?;
+    let workers = routing.select_workers(&ctx, &request, &headers).await?;
+    forward_request(&ctx, request, workers, headers, start).await
+}
+
+/// OpenAI `/v1/embeddings`, forwarded to the engine's with the same request and response.
+pub async fn embeddings(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let start = Instant::now();
+    let (model, value) = parse_embedding_request(&body)?;
+    let routing = ModelRouting::lookup(&ctx, &model)?;
+    // Prefill and decode engines serve generation; embeddings need plain workers.
+    let registered = ctx.registry.workers_for(&model);
+    if registered.iter().any(|w| w.mode() != WorkerMode::Plain) {
+        return Err(ApiError::BadRequest(
+            "embeddings are not served by prefill-decode workers".into(),
+        ));
+    }
+    let request = PreparedRequest::embeddings(&ctx, model, body, value)?;
     let workers = routing.select_workers(&ctx, &request, &headers).await?;
     forward_request(&ctx, request, workers, headers, start).await
 }
