@@ -787,6 +787,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_device_data_ptrs: Optional[set[int]] = None,
+        dst_item_lens: list[int] | None = None,
+        bootstrap_room: Optional[int] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -838,6 +840,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     len(dst_data_ptrs),
                     allow_positional_fallback=self.pp_size == 1,
                 )
+                if dst_item_lens is not None:
+                    for i, j in pairs:
+                        if item_lens[i] != dst_item_lens[j]:
+                            assert bootstrap_room is not None
+                            failure_reason = (
+                                f"{state_type} item length mismatch for paired "
+                                f"entries src[{i}]={item_lens[i]} "
+                                f"dst[{j}]={dst_item_lens[j]}"
+                            )
+                            logger.error(failure_reason)
+                            self.conclude_failure(
+                                bootstrap_room=bootstrap_room,
+                                failure_reason=failure_reason,
+                            )
+                            return -1
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
                 ]
@@ -847,6 +864,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_data_ptrs, dst_data_ptrs, state_type
                     )
                 )
+                if dst_item_lens is not None:
+                    _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                        item_lens, dst_item_lens, state_type
+                    )
+                    for layer_id in range(layers_current_pp_stage):
+                        if item_lens[layer_id] != mapped_dst_lens[layer_id]:
+                            assert bootstrap_room is not None
+                            failure_reason = (
+                                f"{state_type} item length mismatch for positional "
+                                f"entry {layer_id}: prefill={item_lens[layer_id]} "
+                                f"decode={mapped_dst_lens[layer_id]}"
+                            )
+                            logger.error(failure_reason)
+                            self.conclude_failure(
+                                bootstrap_room=bootstrap_room,
+                                failure_reason=failure_reason,
+                            )
+                            return -1
                 layers_params = [
                     (
                         src_kv_ptrs[layer_id],
@@ -1861,9 +1896,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         ),
                         src_layer_ids=src_state_layer_ids,
                         dst_layer_ids=dst_state_layer_ids,
+                        dst_item_lens=dst_item_lens,
+                        bootstrap_room=req.room,
                     )
                     or rc
                 )
+                if self.request_status.get(req.room, KVPoll.Failed) == KVPoll.Failed:
+                    return rc
             elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
                 # Compacted layer lists require equal TP and PP=1 on both peers.
                 if self.pp_size is not None and self.pp_size > 1:
@@ -2339,6 +2378,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if (
+                                    self.request_status.get(
+                                        kv_chunk.room, KVPoll.Failed
+                                    )
+                                    == KVPoll.Failed
+                                ):
+                                    break
                                 if state_rc != 0:
                                     with self.session_lock:
                                         self.session_failures[
