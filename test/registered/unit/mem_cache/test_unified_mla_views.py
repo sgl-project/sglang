@@ -312,7 +312,7 @@ class _FakeKVCache:
 
 
 class TestTranslateKvLocForKernel(unittest.TestCase):
-    def _build(self, ps=1, n_full_tokens=64, multiplier=None):
+    def _build(self, ps=1, n_full_tokens=64):
         pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
         full_alloc = MultiEndedAllocator(
             kvcache=_FakeKVCache(pool.max_slots("full")),
@@ -321,7 +321,6 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
             device=_DEV,
             is_id_owner=True,
             page_size=ps,
-            kernel_page_multiplier=multiplier,
         )
         mamba_alloc = MultiEndedAllocator(
             kvcache=_FakeKVCache(pool.max_slots("mamba")),
@@ -366,12 +365,6 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
             x = v.clone()
             alloc.translate_kv_loc_for_kernel(x, out=x)
             self.assertTrue(torch.all(x == no_out))
-
-    def test_multiplier_is_pinned_to_one(self):
-        self.assertEqual(self._build(ps=1).kernel_page_multiplier, 1)
-        self.assertEqual(self._build(ps=1, multiplier=1).kernel_page_multiplier, 1)
-        with self.assertRaises(AssertionError):
-            self._build(ps=1, multiplier=_L)
 
 
 class _RecordingHybridPool:

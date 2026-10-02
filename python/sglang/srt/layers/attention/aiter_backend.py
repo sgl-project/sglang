@@ -2309,7 +2309,6 @@ class AiterAttnBackend(AttentionBackend):
             v2p,
             self.req_to_token.stride(0),
             q_len * num_cols,
-            translator.full_page_multiplier,
             PHYSICAL_PAGE_SIZE=1,
             DCP_SIZE=self.dcp_world_size,
             DCP_RANK=get_parallel().attn_dcp_rank,
