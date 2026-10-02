@@ -13,7 +13,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel, get_spec
 
 
 @lru_cache(None)
@@ -34,14 +34,13 @@ def _fusion_comm(ca):
 
 def prepare_qwen4_decode_comm(mlp):
     parallel = get_parallel()
-    server_args = get_server_args()
     if (
         parallel.tp_size != 4
         or parallel.attn_dp_size != 1
         or parallel.moe_ep_size != 1
-        or server_args.enable_lora
-        or server_args.speculative_algorithm is not None
-        or server_args.enable_two_batch_overlap
+        or get_lora().enable_lora
+        or get_spec().speculative_algorithm is not None
+        or get_exec().overlap.enable_two_batch_overlap
         or not getattr(mlp, "supports_deferred_finalize", False)
         or getattr(mlp, "num_experts", None) != 512
         or mlp.experts.w13_weight.dtype != torch.bfloat16
