@@ -54,6 +54,7 @@ def _jit_topk_v2_module():
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
         ("topk_plan", f"{kernel}::plan"),
+        ("topk_transform_kpool", f"{kernel}::transform_kpool"),
     ]
     if is_hip_runtime():
         # transform_packed only exists under USE_ROCM, see topk_v2.cuh
@@ -153,7 +154,12 @@ def topk_transform_paged_torch(
 _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
-def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = -1) -> torch.Tensor:
+def plan_topk_v2(
+    seq_lens: torch.Tensor,
+    static_threshold: int = -1,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
     NOTE: every entry of ``seq_lens`` must be NON-NEGATIVE.
@@ -161,10 +167,16 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = -1) -> torch.Te
     :param static_threshold: If a batch item has `seq_len` > `static_threshold`,
                              prefer the cluster implementation.
                              Negative number means internal heuristic.
+    :param out: ``(bs + 1, 2)`` int32 buffer to write the plan into; entries the
+                plan does not write keep their contents.
     """
     module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
-    metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+    metadata = (
+        seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+        if out is None
+        else out
+    )
     module.topk_plan(seq_lens, metadata, static_threshold)
     return metadata
 
@@ -278,6 +290,54 @@ def topk_transform_paged_v2(
         page_size,
         metadata,
         out_raw_indices,
+    )
+
+
+def topk_transform_kpool_v2(
+    scores: torch.Tensor,
+    pool_lens: torch.Tensor,
+    out: torch.Tensor,
+    pool_size: int,
+    metadata: torch.Tensor,
+    *,
+    token_seq_lens: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+    out_offsets: Optional[torch.Tensor] = None,
+) -> None:
+    """Fused top-k + k-pool expansion for the GLM k-pool indexer (top-k v2 kernel).
+
+    ``scores[b, g]`` scores pool ``g`` (tokens ``[g * pool_size, (g + 1) * pool_size)``).
+    Row ``b`` selects the ``topk`` best pools among its first ``pool_lens[b]``, with
+    ``topk = (out.shape[1] - tail) // pool_size`` and ``tail = pool_size - 1`` when
+    ``token_seq_lens`` is given (else 0), and writes their tokens, followed by the
+    ``token_seq_lens[b] % pool_size`` tokens of the open tail pool, into ``out``.
+    Tokens map through ``page_table`` (``page_size`` tokens per entry) when given,
+    else get ``out_offsets[b]`` added (0 when absent); the rest of the row is ``-1``.
+    Pool order is arbitrary. Same output contract as ``fast_kpool_topk_transform_fused``.
+
+    All tensors must share a GPU. ``scores`` is float32 with a 16-byte-aligned
+    data pointer, contiguous columns, and width and row stride divisible by 4.
+    Lengths, page tables, offsets and ``out`` are int32; ``out`` has contiguous columns.
+    ``pool_size`` is a power of two greater than 1; ``page_size`` is a power of two.
+    Page tables and offsets are mutually exclusive.
+
+    ``pool_lens`` must be nonnegative; ``metadata`` must come from
+    :func:`plan_topk_v2` over the same values, with shape ``(scores.shape[0] + 1, 2)``.
+    Kernels read the plan before their PDL wait, so finish planning before launch.
+    Either synchronize after planning or launch a non-PDL logits producer first.
+    The producer must run on the same stream between planning and this call.
+    """
+    _jit_topk_v2_module().topk_transform_kpool(
+        scores,
+        pool_lens,
+        token_seq_lens,
+        page_table,
+        out_offsets,
+        out,
+        page_size,
+        pool_size,
+        metadata,
     )
 
 
