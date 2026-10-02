@@ -22,7 +22,10 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import (
+    get_model,
+    get_parallel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1120,7 +1123,6 @@ class MiMoV2AudioConfig:
 
 
 def _remap_audio_tokenizer_state_dict(state_dict: dict) -> dict:
-    from sglang.srt.runtime_context import get_parallel
 
     tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank

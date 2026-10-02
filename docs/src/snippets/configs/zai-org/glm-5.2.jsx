@@ -17,6 +17,7 @@ export const config = {
     { id: "fp8", label: "FP8" },
     { id: "bf16", label: "BF16" },
     { id: "nvfp4", label: "NVFP4" },
+    { id: "mxfp4", label: "MXFP4" },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -32,6 +33,7 @@ export const config = {
     "default|fp8": "zai-org/GLM-5.2-FP8",
     "default|bf16": "zai-org/GLM-5.2",
     "default|nvfp4": "nvidia/GLM-5.2-NVFP4",
+    "default|mxfp4": "amd/GLM-5.2-MXFP4",
   },
 
   placeholders: {
@@ -61,12 +63,12 @@ export const config = {
   --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
       aime25_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 64000 \\
@@ -95,6 +97,7 @@ sgl-eval run aime25 \\
     gb300: "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
     mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
+    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260923",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
   },
@@ -111,7 +114,7 @@ sgl-eval run aime25 \\
     // CP sizes auto-gate in the engine to the runtime derivation
     // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
     // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
-    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // currently fails the runtime's attn_dp_size == 1 assert but is allowed here
     // with a warning (combined support is planned upstream).
     // Strategy knob: interleave (ex round-robin-split) is the layout verified
     // here and the default; zigzag (ex in-seq-split) is exposed as an
@@ -175,13 +178,22 @@ sgl-eval run aime25 \\
         { id: "mtp-516", label: "EAGLE / MTP 5-1-6 (low-latency)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 5",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6"],
-          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
-          disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+          disable: [
+            { when: { hw: ["mi300x", "mi325x"] },
+              reason: "MTP/EAGLE speculative decoding is not yet validated for GLM-5.2 on MI300X or MI325X." },
+            { when: { hw: ["mi355x"], quant: ["fp8", "bf16", "nvfp4"] },
+              reason: "The five-step MI355X recipe is validated only with amd/GLM-5.2-MXFP4." },
+          ] },
         { id: "mtp-112", label: "EAGLE / MTP 1-1-2 (balanced)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
           disable: { hw: ["mi355x", "mi325x", "mi300x"] },
           disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+        { id: "mtp-314", label: "EAGLE / MTP 3-1-4 (agentic · MI355X MXFP4)",
+          flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
+          enable: { hw: ["mi355x"], quant: ["mxfp4"] },
+          enableReason: "Validated on MI355X gfx950 with amd/GLM-5.2-MXFP4 (InferenceX AgentX sweep, GSM8K em_strict 0.971). num-steps=3 stays within the validated gfx950 spec-decode build envelope (≤3). Pair with SGLANG_SIMULATE_ACC_LEN=2.99 for benchmarking (golden AL from golden_al_distribution/glm5.2_mtp.yaml, thinking_on, num_speculative_tokens=3)." },
       ],
     },
 
@@ -268,8 +280,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -291,8 +302,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--max-running-requests 256",
@@ -327,8 +337,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -350,8 +359,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--max-running-requests 256",
@@ -389,8 +397,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -413,8 +420,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
@@ -450,8 +456,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -471,8 +476,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--max-running-requests 256",
@@ -716,8 +720,7 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--quantization modelopt_fp4",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
         // verify overhead of a long draft outweighs the accept-length gain.
         "--speculative-algorithm EAGLE",
@@ -740,8 +743,7 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--quantization modelopt_fp4",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.92",
         "--max-running-requests 512",
@@ -763,10 +765,8 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
-        "--kv-cache-dtype fp8_e4m3",
-        "--bf16-gemm-backend cutedsl",
         "--max-running-requests 16",
-        "--cuda-graph-max-bs 16",
+        "--cuda-graph-max-bs-decode 16",
         "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -779,8 +779,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--quantization modelopt_fp4",
         // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
         // verify overhead of a long draft outweighs the accept-length gain.
@@ -806,8 +805,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--quantization modelopt_fp4",
         "--max-running-requests 1024",
         "--chunked-prefill-size 8192",
@@ -819,22 +817,40 @@ sgl-eval run aime25 \\
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [],
+      env: [
+        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1",
+        "SGLANG_ENABLE_THINKING=1",
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+        "SGLANG_HICACHE_DEBUG_LOG=1",
+        "SGLANG_HICACHE_DEBUG_SAMPLE_RATE=16384",
+        "SGLANG_MOE_NVFP4_DISPATCH=1",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 5",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 6",
-        "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.85",
         "--kv-cache-dtype fp8_e4m3",
-        "--bf16-gemm-backend cutedsl",
-        "--max-running-requests 16",
-        "--cuda-graph-max-bs 16",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--fp4-gemm-backend flashinfer_trtllm",
+        "--disable-shared-experts-fusion",
+        "--flashinfer-allreduce-fusion-backend auto",
+        // MTP 4-1-5 and HiCache (write_back, --hicache-size 135) match the InferenceX
+        // GB300 AgentX low-concurrency recipe (SemiAnalysisAI/InferenceX#3178).
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 4",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 5",
+        "--chunked-prefill-size 8192",
         "--max-prefill-tokens 8192",
+        "--mem-fraction-static 0.8",
+        "--max-running-requests 16",
+        "--cuda-graph-max-bs-decode 16",
+        "--enable-hierarchical-cache",
+        "--hicache-size 135",
+        "--hicache-write-policy write_back",
+        "--hicache-io-backend direct",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -842,13 +858,19 @@ sgl-eval run aime25 \\
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [],
+      env: [
+        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1",
+        "SGLANG_ENABLE_THINKING=1",
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+        "SGLANG_HICACHE_DEBUG_LOG=1",
+        "SGLANG_HICACHE_DEBUG_SAMPLE_RATE=16384",
+        "SGLANG_MOE_NVFP4_DISPATCH=1",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
         // verify overhead of a long draft outweighs the accept-length gain.
         "--speculative-algorithm EAGLE",
@@ -865,13 +887,19 @@ sgl-eval run aime25 \\
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: [],
+      env: [
+        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1",
+        "SGLANG_ENABLE_THINKING=1",
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+        "SGLANG_HICACHE_DEBUG_LOG=1",
+        "SGLANG_HICACHE_DEBUG_SAMPLE_RATE=16384",
+        "SGLANG_MOE_NVFP4_DISPATCH=1",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.92",
         "--max-running-requests 512",
@@ -923,7 +951,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -940,7 +968,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -974,7 +1002,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -991,9 +1019,120 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // AMD MI355X + MXFP4 — amd/GLM-5.2-MXFP4 (Quark). TP4: the 4-bit MoE
+    // weights fit a 4-GPU slice, mirroring the amd/GLM-5.1-MXFP4 MI355X recipe (same DSA
+    // architecture family) — --trust-remote-code (Quark custom quant config)
+    // and --kv-cache-dtype fp8_e4m3 both come from that precedent. Pinned to a
+    // newer image (v0.5.20, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
+    // mi355x cells. Low-Latency uses validated TP8/EP1; High-Throughput uses
+    // validated TP4/EP4. Both use five-step MTP from InferenceX PR #2900.
+    // DSA backend: triton (SGLang's ROCm default).
+    // ====================================================================
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--ep-size 1",
+        "--kv-cache-dtype fp8_e4m3",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--kv-cache-dtype fp8_e4m3",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
+        "--chunked-prefill-size 32768",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 128",
+        "--max-running-requests 80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep-size 4",
+        "--kv-cache-dtype fp8_e4m3",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--enable-hierarchical-cache",
+        "--hicache-ratio 1.0",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 256",
+        "--max-running-requests 256",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // MI355X + MXFP4 + MTP (mtp-314): validated AgentX recipe.
+    // steps=3 stays within the gfx950 spec-decode build envelope (≤3).
+    // mem-fraction-static 0.80: headroom for MTP draft buffer on top of
+    // 4-bit MoE weights + KV cache (matches InferenceX AgentX harness conc≤16).
+    // For benchmarking: set SGLANG_SIMULATE_ACC_LEN=2.99,
+    // SGLANG_SIMULATE_ACC_METHOD=match-expected,
+    // SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token
+    // (golden AL: golden_al_distribution/glm5.2_mtp.yaml, thinking_on, num_speculative_tokens=3).
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "mtp-314", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--kv-cache-dtype fp8_e4m3",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.80",
+        "--cuda-graph-max-bs-decode 160",
+        "--max-running-requests 160",
+        "--watchdog-timeout 1800",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1025,7 +1164,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1042,7 +1181,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1076,7 +1215,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1093,7 +1232,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1127,7 +1266,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1144,7 +1283,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",

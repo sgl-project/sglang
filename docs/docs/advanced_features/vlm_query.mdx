@@ -89,7 +89,7 @@ Using a HuggingFace processor to preprocess text and images, and passing the `pr
 ```python Example
 from transformers import AutoProcessor
 
-processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+processor = AutoProcessor.from_pretrained(model_path)
 processor_output = processor(
     images=[image], text=conv.get_prompt(), return_tensors="pt"
 )
@@ -110,7 +110,7 @@ You can pre-calculate image features to avoid repeated visual encoding processes
 from transformers import AutoProcessor
 from transformers import Qwen2_5_VLForConditionalGeneration
 
-processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+processor = AutoProcessor.from_pretrained(model_path)
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path).eval()
 vision = model.model.visual.cuda()
 ```
@@ -192,7 +192,7 @@ Using HuggingFace processor to preprocess data can reduce computational overhead
 ```python Example
 from transformers import AutoProcessor
 
-processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+processor = AutoProcessor.from_pretrained(model_path)
 processor_output = processor(
     images=[image], text=conv.get_prompt(), return_tensors="pt"
 )
@@ -211,7 +211,7 @@ print(out)
 from transformers import AutoProcessor
 from transformers import Llama4ForConditionalGeneration
 
-processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+processor = AutoProcessor.from_pretrained(model_path)
 model = Llama4ForConditionalGeneration.from_pretrained(
     model_path, torch_dtype="auto"
 ).eval()

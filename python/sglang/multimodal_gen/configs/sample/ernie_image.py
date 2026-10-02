@@ -13,3 +13,7 @@ class ErnieImageSamplingParams(SamplingParams):
     guidance_scale: float = 5.0
     num_inference_steps: int = 50
     use_pe: bool = True
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset({"use_pe"})

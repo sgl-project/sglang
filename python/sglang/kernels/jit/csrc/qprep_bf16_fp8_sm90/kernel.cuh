@@ -59,6 +59,8 @@ limitations under the License.
 #include <cuda_bf16.h>
 #include <type_traits>
 
+namespace sglang {
+
 namespace qprep_sm90 {
 
 using namespace cute;
@@ -514,3 +516,5 @@ void run_qprep_bf16_fp8_sm90(const QprepBf16Fp8Sm90Params& params) {
 }
 
 }  // namespace qprep_sm90
+
+}  // namespace sglang

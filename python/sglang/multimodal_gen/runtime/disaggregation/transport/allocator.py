@@ -93,20 +93,6 @@ class BuddyAllocator:
                 "free_blocks_by_size": free_blocks_by_order,
             }
 
-    def count_free_slots(self, slot_size: int) -> int:
-        """Count how many allocations of the given size can fit."""
-        if slot_size <= 0:
-            return 0
-        alloc_size = max(self._next_power_of_2(slot_size), self._min_block_size)
-
-        with self._lock:
-            count = 0
-            for order in range(self._size_to_order(alloc_size), self._max_order + 1):
-                for _ in self._free_lists[order]:
-                    block_size = self._min_block_size << order
-                    count += block_size // alloc_size
-            return count
-
     # --- Internal (caller must hold self._lock) ---
 
     def _allocate_locked(self, target_order: int, request_id: str | None) -> int | None:

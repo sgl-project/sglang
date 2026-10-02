@@ -274,6 +274,33 @@ def _value_format(
 ) -> Format:
     if loose_string and json_type == "string":
         return AnyTextFormat()
+    # XGrammar 0.2.1 miscompiles a one-sided negative integer lower bound:
+    # {"type": "integer", "minimum": -N} accepts the incomplete value "-"
+    # and rejects every valid negative integer. Splitting the range at zero
+    # avoids that converter bug without weakening the schema.
+    if (
+        json_type == "integer"
+        and isinstance(schema, dict)
+        and "maximum" not in schema
+        and "exclusiveMaximum" not in schema
+        and "multipleOf" not in schema
+    ):
+        lower_bounds = []
+        minimum = schema.get("minimum")
+        if isinstance(minimum, int) and not isinstance(minimum, bool):
+            lower_bounds.append(minimum)
+        exclusive_minimum = schema.get("exclusiveMinimum")
+        if isinstance(exclusive_minimum, int) and not isinstance(
+            exclusive_minimum, bool
+        ):
+            lower_bounds.append(exclusive_minimum + 1)
+        if lower_bounds and max(lower_bounds) < 0:
+            negative = dict(schema)
+            negative["maximum"] = -1
+            nonnegative = dict(schema)
+            nonnegative.pop("exclusiveMinimum", None)
+            nonnegative["minimum"] = 0
+            schema = {"anyOf": [negative, nonnegative]}
     return JSONSchemaFormat(
         json_schema=schema,
         style="qwen_xml" if json_type == "string" else "json",
@@ -484,9 +511,7 @@ def _single_xtml_type(
 def _nonempty_argument_format(key: str, xtml_type: str) -> Format:
     # A token-based end keeps the first close token out of both content formats.
     argument = TagFormat(
-        begin=(
-            f'<|open|>argument key="{_escape_attr(key)}" ' f'type="{xtml_type}"<|sep|>'
-        ),
+        begin=(f'<|open|>argument key="{_escape_attr(key)}" type="{xtml_type}"<|sep|>'),
         content=SequenceFormat(elements=[ExcludeTokenFormat(), AnyTokensFormat()]),
         end=TokenFormat(token=_CLOSE_TOKEN),
     )

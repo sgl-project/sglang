@@ -11,7 +11,7 @@
 #include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
-#include <sgl_kernel/warp.cuh>   // For warp::copy_bytes, elect_one_lane, inclusive_sum
+#include <sgl_kernel/warp.cuh>   // For warp::inclusive_sum, reduce_sum, reduce_max
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
@@ -44,10 +44,6 @@ SGL_DEVICE float situ_activate(float g, float u, float beta, float inv_beta, flo
 
 }  // namespace kimi_k3
 
-}  // namespace sglang
-
-namespace {
-
 // SiTU (SoftCap-GLU) activation:
 //   gate_out = beta * tanh(gate / beta) * sigmoid(gate)
 //   up_out   = linear_beta * tanh(up / linear_beta)
@@ -68,11 +64,13 @@ struct SituAndMulParams {
   uint32_t stride_in_vecs;  // input row stride in vector units (2*D/vec if dense)
 };
 
-template <typename T, bool kHasLinearBeta, bool kUsePDL>
+template <typename TIn, typename TOut, bool kHasLinearBeta, bool kUsePDL>
 __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams params) {
   using namespace device;
-  constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
-  using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;
+  constexpr auto kWidest = sizeof(TIn) > sizeof(TOut) ? sizeof(TIn) : sizeof(TOut);
+  constexpr auto kVecSize = kMaxVecBytes / kWidest;
+  using vec_t = AlignedVector<TIn, kVecSize>;
+  using out_vec_t = AlignedVector<TOut, kVecSize>;
 
   const auto num_vecs = params.hidden_dim / kVecSize;  // per token
   const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -98,24 +96,24 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
   const float linear_beta = params.linear_beta;
   const float inv_linear_beta = params.inv_linear_beta;
 
-  vec_t out;
+  out_vec_t out;
 #pragma unroll
   for (int i = 0; i < kVecSize; ++i) {
     const float g = cast<fp32_t>(gate[i]);
     const float u = cast<fp32_t>(up[i]);
 
-    out[i] =
-        cast<T>(sglang::kimi_k3::situ_activate<kHasLinearBeta>(g, u, beta, inv_beta, linear_beta, inv_linear_beta));
+    out[i] = cast<TOut>(kimi_k3::situ_activate<kHasLinearBeta>(g, u, beta, inv_beta, linear_beta, inv_linear_beta));
   }
 
-  store_as<vec_t>(params.out, out, output_offset);
+  store_as<out_vec_t>(params.out, out, output_offset);
 }
 
 // Host launcher
 
-template <typename T, bool kUsePDL>
+template <typename TIn, typename TOut, bool kUsePDL>
 struct SituAndMulKernel {
-  static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
+  static constexpr auto kWidest = sizeof(TIn) > sizeof(TOut) ? sizeof(TIn) : sizeof(TOut);
+  static constexpr auto kVecSize = device::kMaxVecBytes / kWidest;
   static constexpr auto kBlockSize = 256u;
 
   static void
@@ -133,11 +131,11 @@ struct SituAndMulKernel {
     device_.set_options<kDLCUDA>();
 
     TensorMatcher({N, D_out})  //
-        .with_dtype<T>()
+        .with_dtype<TOut>()
         .with_device(device_)
         .verify(out);
     TensorMatcher({N, D_in})  //
-        .with_dtype<T>()
+        .with_dtype<TIn>()
         .with_device(device_)
         .with_strides({-1, 1})
         .verify(input);
@@ -171,9 +169,11 @@ struct SituAndMulKernel {
     };
 
     if (has_linear_beta) {
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(situ_and_mul_kernel<T, true, kUsePDL>, params);
+      LaunchKernel(num_blocks, kBlockSize, device)
+          .enable_pdl(kUsePDL)(situ_and_mul_kernel<TIn, TOut, true, kUsePDL>, params);
     } else {
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(situ_and_mul_kernel<T, false, kUsePDL>, params);
+      LaunchKernel(num_blocks, kBlockSize, device)
+          .enable_pdl(kUsePDL)(situ_and_mul_kernel<TIn, TOut, false, kUsePDL>, params);
     }
   }
 };
@@ -218,8 +218,8 @@ situ_and_mul(DType2 gate, DType2 up, float beta, float inv_beta, float linear_be
   const auto [g0, g1] = cast<fp32x2_t>(gate);
   const auto [u0, u1] = cast<fp32x2_t>(up);
   // kHasLinearBeta=true: this path always softcaps the up operand, as before.
-  const float val0 = sglang::kimi_k3::situ_activate<true>(g0, u0, beta, inv_beta, linear_beta, inv_linear_beta);
-  const float val1 = sglang::kimi_k3::situ_activate<true>(g1, u1, beta, inv_beta, linear_beta, inv_linear_beta);
+  const float val0 = kimi_k3::situ_activate<true>(g0, u0, beta, inv_beta, linear_beta, inv_linear_beta);
+  const float val1 = kimi_k3::situ_activate<true>(g1, u1, beta, inv_beta, linear_beta, inv_linear_beta);
   if constexpr (kPrecise) {
     return {val0, val1};
   } else {
@@ -247,7 +247,7 @@ SGL_DEVICE CTAWork get_work(const SituMulQuantVarlenParams& params) {
   const uint32_t val = tx < params.num_experts ? params.masked_m[tx] : 0u;
 
   // Per-warp inclusive scan of masked_m.
-  const uint32_t warp_inclusive = device::warp::inclusive_sum(lane_id, val);
+  const uint32_t warp_inclusive = device::warp::inclusive_sum(val, lane_id);
   const uint32_t warp_exclusive = warp_inclusive - val;
 
   // Write each warp total.
@@ -449,4 +449,4 @@ struct SituAndMulMaskedPostQuantKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

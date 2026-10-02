@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a3", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-1-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
@@ -29,7 +29,6 @@ os.environ["ASCEND_USE_FIA"] = "true"
 
 
 class TestAscendTp1Bf16(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
@@ -71,7 +70,7 @@ class TestAscendTp1Bf16(CustomTestCase):
                             num_questions=1319,
                             max_new_tokens=512,
                             parallel=32,
-                            host=f"http://{self.url.hostname}",
+                            host=self.url.hostname,
                             port=int(self.url.port),
                         )
 

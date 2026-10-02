@@ -53,23 +53,6 @@ The quantization and limited context length (`--dtype half --context-length 8192
 
 After launching the engine, refer to [Chat completions](../basic_usage/openai_api_completions#usage) to test the usability.
 * * * * *
-Running quantization with TorchAO
--------------------------------------
-TorchAO is suggested to NVIDIA Jetson Orin.
-```bash Command
-python -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --device cuda \
-    --dtype bfloat16 \
-    --attention-backend flashinfer \
-    --mem-fraction-static 0.8 \
-    --context-length 8192 \
-    --torchao-config int4wo-128
-```
-This enables TorchAO's int4 weight-only quantization with a 128-group size. The usage of `--torchao-config int4wo-128` is also for memory efficiency.
-
-
-* * * * *
 Structured output with XGrammar
 -------------------------------
 Please refer to [SGLang doc structured output](../advanced_features/structured_outputs).

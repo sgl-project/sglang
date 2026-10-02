@@ -133,14 +133,15 @@ def _amx_process_weight_after_loading(
     device = devices.pop()
 
     if transpose_dims:
-        assert len(weight_names) == len(
-            transpose_dims
-        ), "len(weight_names) should be equal to len(transpose_dims)"
+        assert len(weight_names) == len(transpose_dims), (
+            "len(weight_names) should be equal to len(transpose_dims)"
+        )
 
     module.use_intel_amx_backend = (
         device == torch.device("cpu") and cpu_has_amx_support()
     )
 
+    is_conv_weight = False
     if qweight_packed_method is None:
         for i, weight_name in enumerate(weight_names):
             weight_tensor = getattr(module, weight_name)

@@ -26,15 +26,42 @@ sglang/kernels/
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
 `diffusion`, `elementwise`, `embeddings`, `gemm`, `grammar`, `kv_canary`,
-`kvcache`, `layernorm`, `lplb`, `mamba`, `memory`, `moe`, `quantization`,
+`kvcache`, `layernorm`, `lplb`, `mamba`, `memory`, `mm`, `moe`, `quantization`,
 `sampling`, `speculative`.
+
+Place model-specific implementations and tuning data inside the corresponding
+logical operator group, rather than creating a model-specific top-level group
+under `ops/`.
 
 As of the RFC #29630 finale (#32072) the legacy `sglang.jit_kernel` package has
 been **removed**: its shared build/runtime infra moved to `sglang.kernels.jit`
 and each JIT-backed operator into its group as
-`sglang.kernels.ops.<group>._jit_<op>`. Tests and benchmarks live under
+`sglang.kernels.ops.<group>.<op>` (the old `_jit_` filename prefix was removed
+in #32148). Tests and benchmarks live under
 `test/registered/kernels/` (`ops/<group>/` for tests, `benchmark/<group>/` for
-benchmarks); shared test helpers are in `sglang.test.kernels`.
+benchmarks); shared test helpers are in `sglang.test.kernels`. Standalone scripts
+that are not CI-registered belong in `test/manual/kernels/`, outside the shipped
+operator package. Keep vendored upstream trees under their existing maintenance
+policy.
+
+Classify the public computation, not the model that first used it: expert
+routing belongs in `moe`, matrix multiplication (including quantized GEMM and
+its tuning data) in `gemm`, and attention index selection in `attention`.
+Keep a fused operation intact; an attention kernel that fuses RoPE with a
+projection may stay in `attention`. A model name inside a logical group is fine.
+
+Runtime integration that owns process groups, symmetric buffers, or model
+dispatch stays in `srt`; the K3 communication adapters live in
+`srt/layers/communication/`, while their callable kernels live in
+`kernels/ops/communication/`. Tests of this runtime state belong with the
+runtime subsystem, even when they need a GPU. Kernel inventory/dispatch tests
+belong in `test/registered/unit/kernels/`.
+
+When moving an operator, update its callers, lazy `KernelSpec` targets and op
+ids, tests, benchmark imports, and tuning-data paths together. Preserve CI
+stage/runner registrations and test cases when splitting files. See the
+[kernel organization skill](../../../.claude/skills/kernel-organization/SKILL.md)
+for the review checklist.
 
 ## How it works
 
@@ -63,26 +90,47 @@ from sglang.kernels import select_kernel, KernelBackend
 jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT).load()
 ```
 
-## `BaseFusedOp` — the per-operator implementation contract
+## `BaseFusedOp` — the unified operator contract
 
-Multi-backend operators (currently the `layernorm` and `activation` groups)
-are implemented as `BaseFusedOp` subclasses: one logical operator with one
-`forward_<backend>` method per backend, all sharing one signature behind a
-single `forward()`:
+`BaseFusedOp` is a standard `torch.nn.Module` (it replaced the former
+`sglang.srt.layers.utils.MultiPlatformOp`) that carries one logical operator
+with interchangeable implementations along **two independent dimensions**:
 
-- `forward_native` — **required**; the pure-`torch` correctness reference
-  every other backend is checked against.
-- `forward_torch_compile` — inherited for free as
-  `torch.compile(forward_native)`.
-- `forward_triton` / `forward_jit` / `forward_aot` /
-  `forward_cute_dsl` / `forward_flashinfer` / `forward_deepgemm` — opt-in
-  overrides. A backend is *available* iff its method is overridden.
+- **Kernel backends (provenance)** — one `forward_<backend>` method per
+  implementation source, all sharing one signature behind a single
+  `forward()`:
+  - `forward_native` — **required**; the pure-`torch` correctness reference
+    every other implementation is checked against.
+  - `forward_torch_compile` — inherited for free as
+    `torch.compile(forward_native)`.
+  - `forward_triton` / `forward_jit` / `forward_aot` / `forward_cute_dsl` /
+    `forward_flashinfer` / `forward_deepgemm` / `forward_aiter` /
+    `forward_torch_npu` — opt-in overrides. A backend is *available* iff its
+    method is overridden; it joins **auto-selection** only when also declared
+    in `capabilities` (device support is metadata, not guesswork).
+- **Platforms / devices** — optional composite per-device paths:
+  `forward_cuda`, `forward_hip` (falls back to `forward_cuda`),
+  `forward_npu`, `forward_xpu`, `forward_musa` (no implicit CUDA fallback —
+  MUSA ops opt into the CUDA path with an explicit `forward_musa`),
+  `forward_cpu` (AMX CPUs), plus `forward_<key>` /
+  `register_oot_forward()` for out-of-tree platform plugins. CUDA / HIP are
+  **not** kernel backends.
 
-`forward()` auto-selects the best available backend by the class's `priority`,
-filtered per call through `backend_eligible()` (a
-`CapabilityRequirement`-vs-`PlatformInfo` check, extensible with per-call
-shape/dtype gates), and degrades to the native reference when no optimized
-backend fits. The public `ops.<group>` functions stay thin wrappers over
+Dispatch priority, highest first: explicit `forward(..., backend=...)` →
+global forced backend (`SGLANG_FORCE_FUSED_OP_BACKEND`) → OOT platform
+override → declared optimized kernel backends by `priority` (filtered by
+`backend_eligible()`, a `CapabilityRequirement`-vs-`PlatformInfo` check
+extensible with per-call shape/dtype gates) → platform-specific forward →
+`forward_native`. The static part of the decision is resolved once and cached
+on the instance, so the hot path stays a single indirect call.
+
+`BaseFusedOp` also owns the torch.compile mode protocol
+(`enter_torch_compile(num_tokens)` / `leave_torch_compile()`, both
+idempotent): while an outer model is compiled, ops switch to their
+compile-safe native path so device kernels are never traced (TopK and Fused
+MoE override `_torch_compile_forward()` to keep their bs>1 behavior).
+
+The public `ops.<group>` functions stay thin wrappers over
 module-level instances, so the import surface is unchanged; each instance also
 registers all of its backends as `KernelSpec`s so the registry inventory and
 `select_kernel(..., backend=...)` keep working.

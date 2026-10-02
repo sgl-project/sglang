@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-4-npu-a3", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 _ASCEND_BACKEND = "ascend"
@@ -86,7 +86,6 @@ class TestNpuSpeculativeDraftParams(CustomTestCase):
         env.update(
             {
                 "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-                "SGLANG_ENABLE_SPEC_V2": "1",
             }
         )
         cls.process = popen_launch_server(

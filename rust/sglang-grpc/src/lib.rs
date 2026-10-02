@@ -3,10 +3,6 @@ pub mod server;
 pub mod tokenizers;
 pub(crate) mod utils;
 
-pub mod proto {
-    tonic::include_proto!("sglang.runtime.v1");
-}
-
 use pyo3::prelude::*;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
@@ -257,7 +253,7 @@ fn start_server(
 }
 
 #[pymodule]
-fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _grpc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
     m.add_class::<GrpcServerHandle>()?;
     m.add_class::<ChunkSendStatus>()?;

@@ -50,7 +50,7 @@ import { PopularModels } from "/src/snippets/_popular_models.jsx";
 
 <Card title="Extensive Hardware Support" icon="microchip">
   Native support across <a href="./docs/hardware-platforms/overview">Hardware Platforms</a>
-  including NVIDIA, AMD, Intel Xeon, Google TPU, and Ascend NPU accelerators.
+  including NVIDIA, AMD, Intel Xeon, Google TPU, Ascend NPU, and Moore Threads MUSA accelerators.
 </Card>
 
   <Card title="Community & Training" icon="users">
@@ -68,14 +68,16 @@ SGLang is an inference framework meant for production level serving.
 It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
 
 <CardGroup cols={2}>
-<Card title="Install SGLang" icon="angles-down" href="./docs/get-started/install">
-  Install SGLang with pip, from source, or via Docker on your preferred hardware platform.
+<Card title="Quickstart" icon="zap" href="./docs/get-started/quickstart">
+  Start a model server and send a request to verify it is running.
 </Card>
 
-<Card title="Quickstart" icon="zap" href="./docs/get-started/quickstart">
-  Launch your first model server and send requests in minutes with OpenAI-compatible APIs.
+<Card title="Examples" icon="code" href="/docs/get-started/examples">
+  Stream replies, request tool calls, and process multiple prompts from Python.
 </Card>
 </CardGroup>
+
+For environment setup and other installation methods, see the [Installation guide](/docs/get-started/install).
 
 ## News and latest blogs
 
@@ -90,7 +92,7 @@ It is designed to deliver low-latency and high-throughput inference across a wid
     }}
   >
     <a
-      href="https://lmsys.org/blog/2026-07-29-mxfp8-nvfp4-rl/"
+      href="https://lmsys.org/blog/2026-09-16-nvfp4-kv-cache/"
       target="_blank"
       rel="noopener noreferrer"
       style={{
@@ -111,8 +113,8 @@ It is designed to deliver low-latency and high-throughput inference across a wid
         }}
       >
         <img
-          src="https://lmsys.org/images/blog/mxfp8-nvfp4-rl/NVFP4-dq.drawio.png"
-          alt="Towards Blackwell-Native 8-bit and 4-bit RL: End-to-End MXFP8 and NVFP4 RL in Miles"
+          src="https://lmsys.org/images/blog/nvfp4-kv-cache/kv-cache-layout.svg"
+          alt="Accelerating Long-Context and Agentic Inference with NVFP4 KV Cache"
           style={{
             width: "100%",
             height: "100%",
@@ -131,7 +133,7 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             fontSize: "0.98rem",
           }}
         >
-          {"Towards Blackwell-Native 8-bit and 4-bit RL: End-to-End MXFP8 and NVFP4 RL in Miles"}
+          {"Accelerating Long-Context and Agentic Inference with NVFP4 KV Cache"}
         </p>
         <p
           style={{
@@ -140,12 +142,12 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             opacity: 0.75,
           }}
         >
-          {"July 29, 2026"}
+          {"September 16, 2026"}
         </p>
       </div>
     </a>
     <a
-      href="https://lmsys.org/blog/2026-07-27-kimi-k3-day0-support/"
+      href="https://lmsys.org/blog/2026-09-10-deepseek-v41/"
       target="_blank"
       rel="noopener noreferrer"
       style={{
@@ -166,8 +168,8 @@ It is designed to deliver low-latency and high-throughput inference across a wid
         }}
       >
         <img
-          src="https://lmsys.org/images/blog/kimi-k3-day0-support/cover-kimi-k3.png"
-          alt="SGLang and Miles Add Day-0 Support for Kimi K3"
+          src="https://lmsys.org/images/blog/deepseek-v41/preview.png"
+          alt="SGLang and Miles Add Day-0 Support for DeepSeek-V4.1"
           style={{
             width: "100%",
             height: "100%",
@@ -186,7 +188,7 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             fontSize: "0.98rem",
           }}
         >
-          {"SGLang and Miles Add Day-0 Support for Kimi K3"}
+          {"SGLang and Miles Add Day-0 Support for DeepSeek-V4.1"}
         </p>
         <p
           style={{
@@ -195,12 +197,12 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             opacity: 0.75,
           }}
         >
-          {"July 27, 2026"}
+          {"September 10, 2026"}
         </p>
       </div>
     </a>
     <a
-      href="https://lmsys.org/blog/2026-07-18-opd-support-in-miles/"
+      href="https://lmsys.org/blog/2026-08-29-sglang-ssd-expert-pack/"
       target="_blank"
       rel="noopener noreferrer"
       style={{
@@ -221,8 +223,8 @@ It is designed to deliver low-latency and high-throughput inference across a wid
         }}
       >
         <img
-          src="https://lmsys.org/images/blog/opd-support-in-miles/figure-1.png"
-          alt="OPD Support in Miles"
+          src="https://lmsys.org/images/blog/sglang-ssd-expert-pack/expert-pack-layout.png"
+          alt="Running DeepSeek-V4-Flash and Kimi-K3 on Consumer Hardware with SSD Expert Pack"
           style={{
             width: "100%",
             height: "100%",
@@ -241,7 +243,7 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             fontSize: "0.98rem",
           }}
         >
-          {"OPD Support in Miles"}
+          {"Running DeepSeek-V4-Flash and Kimi-K3 on Consumer Hardware with SSD Expert Pack"}
         </p>
         <p
           style={{
@@ -250,12 +252,12 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             opacity: 0.75,
           }}
         >
-          {"July 18, 2026"}
+          {"August 29, 2026"}
         </p>
       </div>
     </a>
     <a
-      href="https://lmsys.org/blog/2026-07-15-inkling-day0-support/"
+      href="https://lmsys.org/blog/2026-08-28-infer-forge-loop-engineering/"
       target="_blank"
       rel="noopener noreferrer"
       style={{
@@ -276,8 +278,8 @@ It is designed to deliver low-latency and high-throughput inference across a wid
         }}
       >
         <img
-          src="https://lmsys.org/images/blog/inkling-day0-support/inkling-cover.png"
-          alt="SGLang and Miles Add Day-0 Support for Inkling, a Frontier Multimodal Model"
+          src="https://lmsys.org/images/blog/infer-forge-loop/cover.png"
+          alt="Infer-forge: Harness, Loop, and Graph Engineering Around SGLang"
           style={{
             width: "100%",
             height: "100%",
@@ -296,7 +298,7 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             fontSize: "0.98rem",
           }}
         >
-          {"SGLang and Miles Add Day-0 Support for Inkling, a Frontier Multimodal Model"}
+          {"Infer-forge: Harness, Loop, and Graph Engineering Around SGLang"}
         </p>
         <p
           style={{
@@ -305,12 +307,12 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             opacity: 0.75,
           }}
         >
-          {"July 15, 2026"}
+          {"August 28, 2026"}
         </p>
       </div>
     </a>
     <a
-      href="https://lmsys.org/blog/2026-07-13-glm52-optimization/"
+      href="https://lmsys.org/blog/2026-08-27-minimax-h3-h200/"
       target="_blank"
       rel="noopener noreferrer"
       style={{
@@ -331,8 +333,8 @@ It is designed to deliver low-latency and high-throughput inference across a wid
         }}
       >
         <img
-          src="https://lmsys.org/images/blog/glm52-optimization/glm52-nvfp4-performance-pareto.png"
-          alt="Serving GLM5.2 NVFP4 Agentic Workload with SGLang: Reaching 500 TPS in 2 Weeks"
+          src="https://lmsys.org/images/blog/minimax-h3-h200/preview.png"
+          alt="MiniMax-H3 on 8\u00d7H200: 1.95\u00d7 Lossless, Up to 6.24\u00d7 at 0.76\u20130.91 SSIM"
           style={{
             width: "100%",
             height: "100%",
@@ -351,7 +353,7 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             fontSize: "0.98rem",
           }}
         >
-          {"Serving GLM5.2 NVFP4 Agentic Workload with SGLang: Reaching 500 TPS in 2 Weeks"}
+          {"MiniMax-H3 on 8\u00d7H200: 1.95\u00d7 Lossless, Up to 6.24\u00d7 at 0.76\u20130.91 SSIM"}
         </p>
         <p
           style={{
@@ -360,12 +362,12 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             opacity: 0.75,
           }}
         >
-          {"July 14, 2026"}
+          {"August 27, 2026"}
         </p>
       </div>
     </a>
     <a
-      href="https://lmsys.org/blog/2026-07-10-rocm-miles-dsv4/"
+      href="https://lmsys.org/blog/2026-08-26-qwen-flash-next/"
       target="_blank"
       rel="noopener noreferrer"
       style={{
@@ -386,8 +388,8 @@ It is designed to deliver low-latency and high-throughput inference across a wid
         }}
       >
         <img
-          src="https://lmsys.org/images/blog/rocm-miles-dsv4/preview.png"
-          alt="Bringing DeepSeek-V4 Flash RL Training to AMD Instinct MI355X GPUs with Miles"
+          src="https://lmsys.org/images/blog/qwen-flash-next/cover.png"
+          alt="Qwen3.8-Flash-Next: Day-0 Support in SGLang"
           style={{
             width: "100%",
             height: "100%",
@@ -406,7 +408,7 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             fontSize: "0.98rem",
           }}
         >
-          {"Bringing DeepSeek-V4 Flash RL Training to AMD Instinct MI355X GPUs with Miles"}
+          {"Qwen3.8-Flash-Next: Day-0 Support in SGLang"}
         </p>
         <p
           style={{
@@ -415,7 +417,7 @@ It is designed to deliver low-latency and high-throughput inference across a wid
             opacity: 0.75,
           }}
         >
-          {"July 10, 2026"}
+          {"August 26, 2026"}
         </p>
       </div>
     </a>
@@ -425,80 +427,10 @@ It is designed to deliver low-latency and high-throughput inference across a wid
 
 ---
 
-## Learn more and join the community
+## Community and resources
 
-<div className="not-prose">
-  <div
-    style={{
-      padding: "0.9rem 0",
-      borderTop: "1px solid rgba(128, 128, 128, 0.24)",
-      borderBottom: "1px solid rgba(128, 128, 128, 0.24)",
-    }}
-  >
-    <p
-      style={{
-        margin: "0 0 0.35rem",
-        fontSize: "0.82rem",
-        fontWeight: 700,
-        letterSpacing: "0.08em",
-        textTransform: "uppercase",
-        opacity: 0.72,
-      }}
-    >
-      Stay connected
-    </p>
-    <div
-      style={{
-        display: "grid",
-        gap: "0.55rem",
-        fontSize: "0.97rem",
-        lineHeight: 1.7,
-      }}
-    >
-      <div>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="map" size={14} />
-        </span>{" "}
-        <a href="https://roadmap.sglang.io">Development roadmap</a>
-        <span style={{ opacity: 0.62 }}> to follow current priorities and upcoming work.</span>
-      </div>
-      <div>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="calendar-days" size={14} />
-        </span>{" "}
-        <a href="https://meet.sglang.io">Weekly public development meeting</a>
-        <span style={{ opacity: 0.62 }}> to hear updates and join open discussions.</span>
-      </div>
-      <div>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="slack" size={14} />
-        </span>{" "}
-        <a href="https://slack.sglang.io/">Slack</a>
-        <span style={{ opacity: 0.62 }}> for questions, feedback, and community support.</span>
-      </div>
-      <div>
-        <a href="https://x.com/lmsysorg">X Twitter</a>
-        <span style={{ opacity: 0.62 }}> and </span>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="linkedin" size={14} />
-        </span>{" "}
-        <a href="https://www.linkedin.com/company/sgl-project/">LinkedIn</a>
-        <span style={{ opacity: 0.62 }}> for project updates.</span>
-      </div>
-      <div>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="newspaper" size={14} />
-        </span>{" "}
-        <a href="https://lmsys.org/blog/">LMSYS blog</a>
-        <span style={{ opacity: 0.62 }}> for release notes, benchmarks, and technical deep dives.</span>
-      </div>
-      <div>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="book-open" size={14} />
-        </span>{" "}
-        <a href="https://github.com/sgl-project/sgl-learning-materials">Learning materials</a>
-        <span style={{ opacity: 0.62 }}> for blogs, slides, and videos.</span>
-      </div>
-    </div>
-  </div>
-</div>
+- [Slack](https://slack.sglang.io/): Technical questions and development discussions.
+- Events: [Meetups, workshops, and office hours](https://www.sglang.io/events) | [Developer meetings](https://meet.sglang.io/).
+- Updates: [X](https://x.com/lmsysorg) | [LinkedIn](https://www.linkedin.com/company/sgl-project/) | [LMSYS Blog](https://lmsys.org/blog/).
+- Contribute: [Contributor guide](/docs/developer_guide/contribution_guide) | [Roadmap](https://roadmap.sglang.io/).
+- [Release notes](https://github.com/sgl-project/sglang/releases): Changes in each release.

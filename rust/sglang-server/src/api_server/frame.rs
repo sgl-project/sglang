@@ -1,81 +1,17 @@
 //! Frame shaping for the native `/generate` protocol: the cumulative
-//! [`OutputAccumulator`] plus the functions that render [`ChunkEvent`]s /
+//! [`OutputAccumulator`] plus the functions that render [`FrontendOutput`]s /
 //! accumulated state into wire JSON (`meta_info`, logprob tuples, error and
 //! abort frames). No HTTP here — the sibling `native_api` module owns the handlers
 //! and streams; it calls these per frame.
 
-use crate::message::{ChunkEvent, ChunkExtras};
-
-/// The text slot of a `[logprob, token_id, text]` tuple: the decoded token when
-/// `return_text_in_logprobs` supplied a text buffer, else `null`.
-fn text_slot(texts: Option<&[String]>, j: usize) -> serde_json::Value {
-    texts
-        .and_then(|t| t.get(j))
-        .map(|s| serde_json::json!(s))
-        .unwrap_or(serde_json::Value::Null)
-}
-
-/// A decoded-text column becomes the tuples' text source only when populated
-/// (`return_text_in_logprobs`); empty → `None` → null text slots.
-fn opt_texts(t: &[String]) -> Option<&[String]> {
-    (!t.is_empty()).then_some(t)
-}
-
-/// The logprob slot of a tuple: a finite value, or `null` for the `NaN` sentinel.
-fn lp_value(v: f32) -> serde_json::Value {
-    if v.is_nan() {
-        serde_json::Value::Null
-    } else {
-        serde_json::json!(v)
-    }
-}
-
-/// SGLang logprob shape: a list of `[logprob, token_id, text]` tuples. `texts`
-/// (parallel to `idxs`) fills the text slot when set, else `null`.
-fn logprob_tuples(vals: &[f32], idxs: &[i32], texts: Option<&[String]>) -> serde_json::Value {
-    let tuples: Vec<serde_json::Value> = vals
-        .iter()
-        .zip(idxs.iter())
-        .enumerate()
-        .map(|(j, (&v, &tid))| serde_json::json!([lp_value(v), tid, text_slot(texts, j)]))
-        .collect();
-    serde_json::Value::Array(tuples)
-}
-
-/// Ragged top-k / token-ids shape: one entry per position — a list of
-/// `[logprob, token_id, text]` tuples, or `null` when `lens[p] == 0` (mirrors
-/// `detokenize_top_logprobs_tokens`). `texts` is parallel to `vals`/`idxs`.
-fn ragged_logprob_tuples(
-    vals: &[f32],
-    idxs: &[i32],
-    lens: &[u32],
-    texts: Option<&[String]>,
-) -> serde_json::Value {
-    let mut positions = Vec::with_capacity(lens.len());
-    let mut off = 0usize;
-    for &l in lens {
-        let l = l as usize;
-        if l == 0 {
-            positions.push(serde_json::Value::Null);
-        } else {
-            // Bounds-checked like `hidden_states_rows`: a header whose `lens` run
-            // past the value buffer would otherwise panic the api thread on an
-            // out-of-range index.
-            let tuples: Vec<serde_json::Value> = (off..off + l)
-                .filter_map(|j| {
-                    Some(serde_json::json!([
-                        lp_value(*vals.get(j)?),
-                        *idxs.get(j)?,
-                        text_slot(texts, j)
-                    ]))
-                })
-                .collect();
-            positions.push(serde_json::Value::Array(tuples));
-        }
-        off += l;
-    }
-    serde_json::Value::Array(positions)
-}
+use crate::frontend::FrontendOutput;
+#[cfg(test)]
+use crate::message::response::ChunkExtras;
+use crate::native_generation::{
+    hidden_states_rows, lp_value, meta_info_value, opt_texts, text_slot,
+};
+#[cfg(test)]
+use crate::native_generation::{logprob_tuples, ragged_logprob_tuples};
 
 /// Append a flat family's `[logprob, token_id, text]` tuples to `dst`, comma
 /// separated and WITHOUT the enclosing brackets, so a cumulative frame can
@@ -142,97 +78,16 @@ fn ragged_array_json(vals: &[f32], idxs: &[i32], lens: &[u32], texts: Option<&[S
     format!("[{body}]")
 }
 
-/// Reshape flat hidden-state f32s + per-row lengths into `meta_info`'s nested
-/// `list[list[float]]` (one row per output position).
-fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
-    let mut rows = Vec::with_capacity(lens.len());
-    let mut off = 0usize;
-    for &l in lens {
-        let l = l as usize;
-        // `get`, not a clamped index: clamping only the END leaves `off` past
-        // `vals.len()` after one over-long row, making the next range reversed
-        // (`start > end`) — which panics on the api thread rather than yielding
-        // an empty row. Same reasoning as the egress decoder's `take_f32`.
-        rows.push(serde_json::json!(vals.get(off..off + l).unwrap_or(&[])));
-        off += l;
-    }
-    serde_json::Value::Array(rows)
-}
-
-/// The `{ "error": { message, code } }` object every error path emits (an SSE
-/// event's data, a unary body, or one entry of a batch array).
-pub(super) fn error_value(code: u16, message: &str) -> serde_json::Value {
-    serde_json::json!({ "error": { "message": message, "code": code } })
-}
-
-/// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`
+/// Format a decoded [`FrontendOutput`] as one SGLang `/generate` frame's JSON. `rid`
 /// (response `meta_info.id`) is passed as a string; the event's numeric `rid` is
 /// just the shard routing key.
-pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
+pub(super) fn frame_value(out: &FrontendOutput, rid: &str) -> serde_json::Value {
     let mut v = serde_json::json!({
         "text": out.text,
-        "meta_info": {
-            "id": rid,
-            "prompt_tokens": out.prompt_tokens,
-            "completion_tokens": out.completion_tokens,
-            // Full dict (type + matched + message + status_code + …), or null.
-            "finish_reason": out.finish_reason,
-        },
+        "meta_info": meta_info_value(out, rid),
     });
     if !out.token_ids.is_empty() {
         v["output_ids"] = serde_json::json!(out.token_ids);
-    }
-    // Logprobs + hidden states ride behind the boxed extras (absent for a plain
-    // token/text frame). `[logprob, token_id, text|null]` tuples; text
-    // (`return_text_in_logprobs`) was decoded on the detok shard into `*_txt`.
-    let Some(ex) = out.extras.as_deref() else {
-        return v;
-    };
-    // Python (`add_logprob_to_meta_info`) always sets input+output token
-    // logprobs together, empty lists included. A PD decode node never receives
-    // input logprobs (they belong to prefill), yet its response must still
-    // carry the key — the PD router keys its merge of prefill's
-    // `input_token_logprobs` on its presence.
-    if !ex.out_lp_val.is_empty() || !ex.in_lp_val.is_empty() {
-        v["meta_info"]["output_token_logprobs"] =
-            logprob_tuples(&ex.out_lp_val, &ex.out_lp_idx, opt_texts(&ex.out_lp_txt));
-        v["meta_info"]["input_token_logprobs"] =
-            logprob_tuples(&ex.in_lp_val, &ex.in_lp_idx, opt_texts(&ex.in_lp_txt));
-    }
-    if !ex.out_top_lens.is_empty() {
-        v["meta_info"]["output_top_logprobs"] = ragged_logprob_tuples(
-            &ex.out_top_val,
-            &ex.out_top_idx,
-            &ex.out_top_lens,
-            opt_texts(&ex.out_top_txt),
-        );
-    }
-    if !ex.in_top_lens.is_empty() {
-        v["meta_info"]["input_top_logprobs"] = ragged_logprob_tuples(
-            &ex.in_top_val,
-            &ex.in_top_idx,
-            &ex.in_top_lens,
-            opt_texts(&ex.in_top_txt),
-        );
-    }
-    if !ex.out_tid_lens.is_empty() {
-        v["meta_info"]["output_token_ids_logprobs"] = ragged_logprob_tuples(
-            &ex.out_tid_val,
-            &ex.out_tid_idx,
-            &ex.out_tid_lens,
-            opt_texts(&ex.out_tid_txt),
-        );
-    }
-    if !ex.in_tid_lens.is_empty() {
-        v["meta_info"]["input_token_ids_logprobs"] = ragged_logprob_tuples(
-            &ex.in_tid_val,
-            &ex.in_tid_idx,
-            &ex.in_tid_lens,
-            opt_texts(&ex.in_tid_txt),
-        );
-    }
-    if !ex.hidden_lens.is_empty() {
-        v["meta_info"]["hidden_states"] = hidden_states_rows(&ex.hidden_val, &ex.hidden_lens);
     }
     v
 }
@@ -324,7 +179,7 @@ pub(super) fn tag_value(mut v: serde_json::Value, index: Option<usize>) -> Strin
 
 /// One streaming frame's JSON: cumulative ignores `delta`, incremental ships it.
 pub(super) fn stream_frame_string(
-    delta: ChunkEvent,
+    delta: FrontendOutput,
     acc: &OutputAccumulator,
     incremental: bool,
     rid_str: &str,
@@ -350,7 +205,7 @@ pub(super) fn cumulative_frame_string(
 /// Format one streaming frame: the accumulator's cumulative view (default), or this
 /// step's delta with the cumulative token count in `meta_info` (matching Python).
 pub(super) fn stream_frame_value(
-    delta: ChunkEvent,
+    delta: FrontendOutput,
     acc: &OutputAccumulator,
     incremental: bool,
     rid_str: &str,
@@ -364,15 +219,15 @@ pub(super) fn stream_frame_value(
     }
 }
 
-/// Folds per-chunk [`ChunkEvent`] deltas into a cumulative view — used by the drain
+/// Folds per-chunk [`FrontendOutput`] deltas into a cumulative view — used by the drain
 /// loops needing cumulative output (every unary response + the cumulative SGLang
 /// stream; OpenAI streaming forwards deltas and skips this). Holds a single
-/// [`ChunkEvent`] so `snapshot` hands back a **borrow** per frame — no per-frame
+/// [`FrontendOutput`] so `snapshot` hands back a **borrow** per frame — no per-frame
 /// clone of the growing buffers (that added O(T²) atop the wire's inherent O(T²)).
 /// Shared with the [`openai`] submodule.
 #[derive(Default)]
 pub(super) struct OutputAccumulator {
-    out: ChunkEvent,
+    out: FrontendOutput,
     /// Serialized cumulative `output_ids` body (`"1,2,3"`, no brackets), appended per
     /// delta so a frame memcpy's it instead of rebuilding the array — O(T), not O(T²).
     ids_json: String,
@@ -420,7 +275,7 @@ impl OutputAccumulator {
     /// Fold one delta frame in. Output families concatenate; input families and
     /// hidden states are set-once / last-writer-wins (they ride the prefill/final
     /// chunk), matching the Python `meta_info` assignment.
-    pub(super) fn fold(&mut self, d: &ChunkEvent) {
+    pub(super) fn fold(&mut self, d: &FrontendOutput) {
         use std::fmt::Write;
 
         // Grow the memoized serializations alongside the raw cumulative buffers.
@@ -432,34 +287,10 @@ impl OutputAccumulator {
             let _ = write!(self.ids_json, "{id}");
         }
 
-        let o = &mut self.out;
-        o.rid.clone_from(&d.rid); // constant across the request; keeps the accumulated view coherent
-        o.text.push_str(&d.text);
-        o.token_ids.extend_from_slice(&d.token_ids); // token_ids doubles as output_ids
-        o.completion_tokens += d.completion_tokens;
-        o.prompt_tokens = d.prompt_tokens; // constant across the request
-        if d.finish_reason.is_some() {
-            o.finish_reason = d.finish_reason.clone();
-        }
-        // Logprobs/hidden ride behind the boxed extras — most frames have none, so
-        // only allocate the accumulator's box once a delta actually carries some.
         let Some(de) = d.extras.as_deref() else {
+            self.out.append_delta(d);
             return;
         };
-        let oe = o
-            .extras
-            .get_or_insert_with(|| Box::new(ChunkExtras::default()));
-        oe.out_lp_val.extend_from_slice(&de.out_lp_val);
-        oe.out_lp_idx.extend_from_slice(&de.out_lp_idx);
-        oe.out_top_val.extend_from_slice(&de.out_top_val);
-        oe.out_top_idx.extend_from_slice(&de.out_top_idx);
-        oe.out_top_lens.extend_from_slice(&de.out_top_lens);
-        oe.out_tid_val.extend_from_slice(&de.out_tid_val);
-        oe.out_tid_idx.extend_from_slice(&de.out_tid_idx);
-        oe.out_tid_lens.extend_from_slice(&de.out_tid_lens);
-        oe.out_lp_txt.extend_from_slice(&de.out_lp_txt);
-        oe.out_top_txt.extend_from_slice(&de.out_top_txt);
-        oe.out_tid_txt.extend_from_slice(&de.out_tid_txt);
         // Append THIS delta's tuples, indexed within the delta — equivalent to
         // indexing the accumulated arrays only while texts stay in lockstep, which
         // the guard below verifies.
@@ -483,6 +314,45 @@ impl OutputAccumulator {
             &de.out_tid_lens,
             opt_texts(&de.out_tid_txt),
         );
+        if !de.in_lp_val.is_empty() {
+            let mut body = String::new();
+            push_logprob_tuples(
+                &mut body,
+                &de.in_lp_val,
+                &de.in_lp_idx,
+                opt_texts(&de.in_lp_txt),
+            );
+            self.in_lp_json = Some(format!("[{body}]"));
+        }
+        // Input families ride once (prefill); `lens` non-empty marks their arrival.
+        if !de.in_top_lens.is_empty() {
+            self.in_top_json = Some(ragged_array_json(
+                &de.in_top_val,
+                &de.in_top_idx,
+                &de.in_top_lens,
+                opt_texts(&de.in_top_txt),
+            ));
+        }
+        if !de.in_tid_lens.is_empty() {
+            self.in_tid_json = Some(ragged_array_json(
+                &de.in_tid_val,
+                &de.in_tid_idx,
+                &de.in_tid_lens,
+                opt_texts(&de.in_tid_txt),
+            ));
+        }
+        // Hidden states are non-cumulative: the latest non-empty set wins.
+        if !de.hidden_lens.is_empty() {
+            self.hidden_json =
+                Some(hidden_states_rows(&de.hidden_val, &de.hidden_lens).to_string());
+        }
+
+        self.out.append_delta(d);
+        let oe = self
+            .out
+            .extras
+            .as_deref()
+            .expect("a delta with extras creates cumulative extras");
         let lockstep = |txt: &Vec<String>, val: &Vec<f32>| txt.is_empty() || txt.len() == val.len();
         if !lockstep(&oe.out_lp_txt, &oe.out_lp_val)
             || !lockstep(&oe.out_top_txt, &oe.out_top_val)
@@ -490,60 +360,15 @@ impl OutputAccumulator {
         {
             self.extras_memo_broken = true;
         }
-        if !de.in_lp_val.is_empty() {
-            oe.in_lp_val = de.in_lp_val.clone();
-            oe.in_lp_idx = de.in_lp_idx.clone();
-            oe.in_lp_txt = de.in_lp_txt.clone();
-            let mut body = String::new();
-            push_logprob_tuples(
-                &mut body,
-                &oe.in_lp_val,
-                &oe.in_lp_idx,
-                opt_texts(&oe.in_lp_txt),
-            );
-            self.in_lp_json = Some(format!("[{body}]"));
-        }
-        // Input families ride once (prefill); `lens` non-empty marks their arrival.
-        if !de.in_top_lens.is_empty() {
-            oe.in_top_val = de.in_top_val.clone();
-            oe.in_top_idx = de.in_top_idx.clone();
-            oe.in_top_lens = de.in_top_lens.clone();
-            oe.in_top_txt = de.in_top_txt.clone();
-            self.in_top_json = Some(ragged_array_json(
-                &oe.in_top_val,
-                &oe.in_top_idx,
-                &oe.in_top_lens,
-                opt_texts(&oe.in_top_txt),
-            ));
-        }
-        if !de.in_tid_lens.is_empty() {
-            oe.in_tid_val = de.in_tid_val.clone();
-            oe.in_tid_idx = de.in_tid_idx.clone();
-            oe.in_tid_lens = de.in_tid_lens.clone();
-            oe.in_tid_txt = de.in_tid_txt.clone();
-            self.in_tid_json = Some(ragged_array_json(
-                &oe.in_tid_val,
-                &oe.in_tid_idx,
-                &oe.in_tid_lens,
-                opt_texts(&oe.in_tid_txt),
-            ));
-        }
-        // Hidden states are non-cumulative: the latest non-empty set wins.
-        if !de.hidden_lens.is_empty() {
-            oe.hidden_val = de.hidden_val.clone();
-            oe.hidden_lens = de.hidden_lens.clone();
-            self.hidden_json =
-                Some(hidden_states_rows(&oe.hidden_val, &oe.hidden_lens).to_string());
-        }
     }
 
     /// Borrow the cumulative output for an intermediate streaming frame.
-    pub(super) fn snapshot(&self) -> &ChunkEvent {
+    pub(super) fn snapshot(&self) -> &FrontendOutput {
         &self.out
     }
 
     /// Consume into the final cumulative output.
-    pub(super) fn into_output(self) -> ChunkEvent {
+    pub(super) fn into_output(self) -> FrontendOutput {
         self.out
     }
 }
@@ -612,12 +437,12 @@ mod tests {
         );
     }
 
-    /// End-to-end: a `ChunkEvent` carrying a prompt-logprob request (first input
+    /// End-to-end: a `FrontendOutput` carrying a prompt-logprob request (first input
     /// logprob is the `NaN` sentinel) formats without panicking and emits
     /// `input_token_logprobs` with a leading `[null, token_id, text]`.
     #[test]
     fn prompt_logprob_frame_emits_null_first() {
-        let out = ChunkEvent {
+        let out = FrontendOutput {
             extras: Some(Box::new(ChunkExtras {
                 in_lp_val: vec![f32::NAN, -0.5],
                 in_lp_idx: vec![10, 20],
@@ -638,7 +463,7 @@ mod tests {
     #[test]
     fn accumulator_snapshot_is_cumulative() {
         let mut acc = OutputAccumulator::default();
-        acc.fold(&ChunkEvent {
+        acc.fold(&FrontendOutput {
             text: "he".into(),
             token_ids: vec![1, 2],
             completion_tokens: 2,
@@ -649,7 +474,7 @@ mod tests {
             assert_eq!(s.text, "he");
             assert_eq!(s.token_ids, vec![1, 2]);
         }
-        acc.fold(&ChunkEvent {
+        acc.fold(&FrontendOutput {
             text: "llo".into(),
             token_ids: vec![3],
             completion_tokens: 1,
@@ -687,32 +512,28 @@ mod tests {
     #[test]
     fn cumulative_frame_json_matches_serde() {
         let deltas = [
-            ChunkEvent {
-                rid: "7".into(),
+            FrontendOutput {
                 text: String::new(),
                 token_ids: vec![],
                 completion_tokens: 0,
                 prompt_tokens: 128,
                 ..Default::default()
             },
-            ChunkEvent {
-                rid: "7".into(),
+            FrontendOutput {
                 text: "He\"llo\n\t".into(),
                 token_ids: vec![1000],
                 completion_tokens: 1,
                 prompt_tokens: 128,
                 ..Default::default()
             },
-            ChunkEvent {
-                rid: "7".into(),
+            FrontendOutput {
                 text: " 世界 🌍 \\".into(),
                 token_ids: vec![-2, 3],
                 completion_tokens: 2,
                 prompt_tokens: 128,
                 ..Default::default()
             },
-            ChunkEvent {
-                rid: "7".into(),
+            FrontendOutput {
                 text: "!".into(),
                 token_ids: vec![9],
                 completion_tokens: 1,
@@ -758,8 +579,7 @@ mod tests {
             };
             let deltas = [
                 // Prefill: the set-once input families and a null top-k position.
-                ChunkEvent {
-                    rid: "9".into(),
+                FrontendOutput {
                     prompt_tokens: 4,
                     extras: Some(Box::new(ChunkExtras {
                         in_lp_val: vec![f32::NAN, -1.5],
@@ -777,8 +597,7 @@ mod tests {
                     })),
                     ..Default::default()
                 },
-                ChunkEvent {
-                    rid: "9".into(),
+                FrontendOutput {
                     text: "He\"llo".into(),
                     token_ids: vec![100],
                     completion_tokens: 1,
@@ -799,8 +618,7 @@ mod tests {
                     })),
                     ..Default::default()
                 },
-                ChunkEvent {
-                    rid: "9".into(),
+                FrontendOutput {
                     text: " 世界".into(),
                     token_ids: vec![-2, 3],
                     completion_tokens: 2,
@@ -853,8 +671,7 @@ mod tests {
     #[test]
     fn mismatched_logprob_texts_fall_back_to_the_value_path() {
         let mut acc = OutputAccumulator::default();
-        acc.fold(&ChunkEvent {
-            rid: "1".into(),
+        acc.fold(&FrontendOutput {
             extras: Some(Box::new(ChunkExtras {
                 out_lp_val: vec![-0.5],
                 out_lp_idx: vec![5],
@@ -863,8 +680,7 @@ mod tests {
             ..Default::default()
         });
         assert!(cumulative_frame_json(&acc, "1", None).is_some());
-        acc.fold(&ChunkEvent {
-            rid: "1".into(),
+        acc.fold(&FrontendOutput {
             extras: Some(Box::new(ChunkExtras {
                 out_lp_val: vec![-0.25],
                 out_lp_idx: vec![6],

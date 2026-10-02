@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -29,8 +30,7 @@ if _is_hip:
     )
 
 
-class DeepseekMLARocmForwardMixin:
-
+class DeepseekMLAFusedRopeRocmForwardMixin:
     def init_mla_fused_rope_rocm_forward(self: DeepseekV2AttentionMLA):
         self.rocm_fused_decode_mla = get_bool_env_var(
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
@@ -131,7 +131,7 @@ class DeepseekMLARocmForwardMixin:
 
         # save current latent cache.
         get_token_to_kv_pool().set_kv_buffer(
-            self.attn_mqa, forward_batch.out_cache_loc, k_input, None
+            self.attn_mqa, KVWriteLoc.for_batch(forward_batch), k_input, None
         )
         key_cache_buf = get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id)
         val_cache_buf = key_cache_buf[..., : self.kv_lora_rank]
@@ -173,6 +173,7 @@ class DeepseekMLARocmForwardMixin:
         k_input,
         forward_batch,
         zero_allocator,
+        gate=None,
     ):
         decode_attention_fwd_grouped_rope(
             q_input,
@@ -197,7 +198,7 @@ class DeepseekMLARocmForwardMixin:
         if enable_rope_fusion:
             k_input[..., self.kv_lora_rank :] = k_pe_output
             get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mqa, forward_batch.out_cache_loc, k_input, None
+                self.attn_mqa, KVWriteLoc.for_batch(forward_batch), k_input, None
             )
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
@@ -224,6 +225,8 @@ class DeepseekMLARocmForwardMixin:
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
         output, _ = self.o_proj(attn_output)
 
         return output

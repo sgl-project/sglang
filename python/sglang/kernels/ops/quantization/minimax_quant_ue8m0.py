@@ -89,8 +89,9 @@ def per_token_quant_fp8_ue8m0_scatter(
     then writes them to each of the token's ``topk`` destination rows:
       ``gateup_input``       fp8  ``[E, m_max, hidden]``      (row ``src2dst[token, i]``)
       ``gateup_input_scale`` int32 ``[E, hidden//group//4, m_max]`` (MN-major; byte-scattered)
-    Slots with ``topk_ids[token, i] < 0`` are skipped. Byte-identical to the
-    two-kernel path on every written row.
+    Slots with ``src2dst[token, i] < 0`` are skipped. Byte-identical to the
+    two-kernel path on every written row. ``topk_ids`` remains in the ABI for
+    compatibility with already-compiled JIT modules.
     """
     assert x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2
     assert x.is_contiguous()

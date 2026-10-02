@@ -1,24 +1,28 @@
-import time
 import unittest
 
-import requests
+from transformers import AutoTokenizer
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.pd_parity_kit import PDLogprobParityMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
-    assert_process_healthy,
-)
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    popen_launch_server,
 )
 
-register_cuda_ci(est_time=480, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=400, stage="extra-b", runner_config="4-gpu-h100")
 
-KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"
+KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
-SERVER_ARGS = [
+
+PAGE_SIZE = 16
+CHUNKED_PREFILL_SIZE = 64
+DCP_SIZE = 2
+# Prefill checkpoints the linear-attn state every 64 tokens, so shorter
+# prompts never get a radix hit.
+LINEAR_ATTN_CHECKPOINT_TOKENS = 64
+
+# Deterministic so a cached-prefix prefill, which runs only the suffix, stays
+# bit-exact with the reference's full prefill.
+DETERMINISTIC_ARGS = [
     "--skip-tokenizer-init",
     "--random-seed",
     "1",
@@ -33,83 +37,71 @@ SERVER_ARGS = [
     "disabled",
 ]
 
+DCP_ARGS = DETERMINISTIC_ARGS + [
+    "--attention-backend",
+    "flashinfer",
+    "--page-size",
+    str(PAGE_SIZE),
+    "--chunked-prefill-size",
+    str(CHUNKED_PREFILL_SIZE),
+]
 
-class TestKimiLinearHeterogeneousTPDisaggregation(PDDisaggregationServerBase):
-    prefill_tp_size = 2
-    decode_tp_size = 1
-    decode_base_gpu_id = 2
-    reference_parallel_args = ["--tp-size", "2"]
-    extra_prefill_args = SERVER_ARGS
-    extra_decode_args = SERVER_ARGS
+
+def _boundary_prompts(tokenizer):
+    # Straddle the physical page, the DCP virtual page, and the prefill chunk.
+    filler = tokenizer.encode(
+        "Archive note: the weather was mild, the office lights were on, "
+        "and no unusual event was reported. ",
+        add_special_tokens=False,
+    )
+    question = tokenizer.encode(
+        "\nSummarize the archive in one sentence:", add_special_tokens=False
+    )
+    virtual_page_size = PAGE_SIZE * DCP_SIZE
+    lengths = sorted(
+        {
+            boundary + delta
+            for boundary in (PAGE_SIZE, virtual_page_size, CHUNKED_PREFILL_SIZE)
+            for delta in (-1, 0, 1)
+        }
+        | {2 * CHUNKED_PREFILL_SIZE + 1, 4 * CHUNKED_PREFILL_SIZE + 1}
+    )
+    body = filler * (max(lengths) // len(filler) + 1)
+    return [body[: length - len(question)] + question for length in lengths]
+
+
+# Every arm runs the same layout as its monolithic reference, so PD must match
+# it token for token.
+class TestKimiLinearTPDisaggregation(PDLogprobParityMixin, PDDisaggregationServerBase):
+    model = KIMI_LINEAR_MODEL
     extra_prefill_env = SERVER_ENV
     extra_decode_env = SERVER_ENV
+    prefill_tp_size = 2
+    decode_tp_size = 2
+    decode_base_gpu_id = 2
+    reference_parallel_args = ["--tp-size", "2"]
+    baseline_args = DETERMINISTIC_ARGS
+    extra_prefill_args = DETERMINISTIC_ARGS
+    extra_decode_args = DETERMINISTIC_ARGS
+    parity_max_new_tokens = 8
+    # Measured 0.0 on every prompt; a corrupted DCP relayout moved it by >= 0.05.
+    parity_logprob_delta = 1e-3
+    parity_cached_prefix_min_prompt_tokens = LINEAR_ATTN_CHECKPOINT_TOKENS
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = KIMI_LINEAR_MODEL
-
-    @staticmethod
-    def generate(base_url):
-        response = requests.post(
-            base_url + "/generate",
-            json={
-                "input_ids": [1] + [100 + i % 1000 for i in range(256)],
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 4,
-                    "ignore_eos": True,
-                },
-                "return_logprob": True,
-                "top_logprobs_num": 5,
-            },
-            timeout=120,
-        )
-        response.raise_for_status()
-        return response.json()["meta_info"]
-
-    def test_logprob_parity(self):
-        baseline = popen_launch_server(
-            self.model,
-            self.lb_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=self.reference_parallel_args
-            + ["--trust-remote-code"]
-            + SERVER_ARGS,
-            env=SERVER_ENV,
-        )
-        try:
-            reference = self.generate(self.lb_url)
-        finally:
-            kill_process_tree(baseline.pid, wait_timeout=60)
-        time.sleep(5)
-
-        self.launch_all()
-        disaggregated = self.generate(self.lb_url)
-
-        reference_logprobs = reference["output_token_logprobs"]
-        disaggregated_logprobs = disaggregated["output_token_logprobs"]
-        self.assertEqual(
-            [item[1] for item in reference_logprobs],
-            [item[1] for item in disaggregated_logprobs],
-        )
-        self.assertEqual(len(reference_logprobs), 4)
-        for reference_item, disaggregated_item in zip(
-            reference_logprobs, disaggregated_logprobs
-        ):
-            self.assertAlmostEqual(reference_item[0], disaggregated_item[0], delta=0.05)
-
-        assert_process_healthy(self, "load balancer", self.process_lb, self.lb_url)
-        assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
-        assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+        tokenizer = AutoTokenizer.from_pretrained(cls.model, trust_remote_code=True)
+        cls.parity_prompts = _boundary_prompts(tokenizer)
 
 
-class TestKimiLinearPipelineDisaggregation(TestKimiLinearHeterogeneousTPDisaggregation):
-    prefill_tp_size = 1
-    decode_tp_size = 1
-    decode_base_gpu_id = 2
-    reference_parallel_args = ["--tp-size", "1", "--pp-size", "2"]
-    extra_prefill_args = SERVER_ARGS + ["--pp-size", "2"]
+class TestKimiLinearDCPDisaggregation(TestKimiLinearTPDisaggregation):
+    reference_parallel_args = ["--tp-size", "2", "--dcp-size", str(DCP_SIZE)]
+    baseline_args = DCP_ARGS
+    extra_prefill_args = DCP_ARGS
+    extra_decode_args = DCP_ARGS + ["--dcp-size", str(DCP_SIZE)]
+    # Deterministic flashinfer runs without the radix cache.
+    parity_cached_prefix_min_prompt_tokens = None
 
 
 if __name__ == "__main__":

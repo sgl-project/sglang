@@ -17,7 +17,7 @@
 #include <cuda_fp8.h>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 constexpr float LOCAL_ABSMAX_ABS = 1e-10f;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
@@ -536,4 +536,4 @@ struct PerTokenGroupQuant8bitV2Kernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

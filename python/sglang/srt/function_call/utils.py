@@ -3,7 +3,7 @@ import threading
 import warnings
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
@@ -304,6 +304,25 @@ def _get_tool_schema(tool: Tool) -> dict:
     }
 
 
+def get_schema_properties(schema: Any) -> Dict[str, Any]:
+    """Top-level ``properties`` of a tool ``parameters`` schema, descending
+    into ``anyOf``/``oneOf``/``allOf`` branches when the top level declares
+    none (legal JSON Schema, e.g. discriminated-union arguments)."""
+    if not isinstance(schema, dict):
+        return {}
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        return properties
+    merged: Dict[str, Any] = {}
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        branches = schema.get(keyword)
+        if isinstance(branches, list):
+            for branch in branches:
+                for key, value in get_schema_properties(branch).items():
+                    merged.setdefault(key, value)
+    return merged
+
+
 def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
     """
     Infer the primary type of a parameter from JSON Schema.
@@ -457,3 +476,40 @@ def get_json_schema_constraint(
         return json_schema
 
     return None
+
+
+def strip_structural_tag_excludes(structural_tag: Any, tokens: Iterable[str]) -> None:
+    """Remove ``tokens`` from every free-text ``excludes`` list in a structural
+    tag, in place.
+
+    xgrammar's builtin tags forbid the model's think tokens in free text. When
+    SGLang's reasoning parser owns the reasoning section that exclusion only
+    fights the model (e.g. an empty ``</think>`` emitted before prose).
+    """
+    tokens = set(tokens)
+    if not tokens:
+        return
+
+    def visit(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if isinstance(node, dict):
+            excludes = node.get("excludes")
+            if isinstance(excludes, list):
+                node["excludes"] = [s for s in excludes if s not in tokens]
+            for key in ("format", "content", "tags", "elements"):
+                if key in node:
+                    visit(node[key])
+            return
+        if not hasattr(node, "__dict__"):
+            return
+        excludes = getattr(node, "excludes", None)
+        if isinstance(excludes, list):
+            node.excludes = [s for s in excludes if s not in tokens]
+        for key in ("format", "content", "tags", "elements"):
+            if hasattr(node, key):
+                visit(getattr(node, key))
+
+    visit(structural_tag)

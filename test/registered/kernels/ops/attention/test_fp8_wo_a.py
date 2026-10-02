@@ -1,8 +1,8 @@
 """DeepSeek-V4 wo_a FP8 activation quant for DeepGEMM fp8_einsum.
 
-Covers the dedicated DSV4 wo_a quant helper: bit-exact FP8/scales against the
-ordinary flat UE8M0 quant values, group-major scale storage, large / DSV4-shaped
-token axes, and the DeepGEMM fp8_einsum consumer contract.
+Covers the dedicated DSV4 wo_a quant helper: bit-exact FP8/packed scales against
+the ordinary flat UE8M0 quant values, DeepGEMM's native TMA-aligned scale
+layout, large / DSV4-shaped token axes, and the fp8_einsum consumer contract.
 """
 
 import unittest
@@ -58,26 +58,41 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
             torch.randn(T, G + 1, D, device=device, dtype=torch.float32) * 0.25
         ).to(dtype)
         o = storage[:, 1:, :]
-        self.assertFalse(o.is_contiguous())
+        if T > 1:
+            self.assertFalse(o.is_contiguous())
         self.assertEqual(o.stride(-1), 1)
         return o
 
     def _assert_matches_flat_reference(self, o, o_fp8, o_s):
         T, G, D = o.shape
         q_ref, s_ref = self._flat_reference(o)
+        packed_ref = (
+            self.deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                s_ref.transpose(0, 1).contiguous()
+            ).transpose(0, 1)
+        )
         torch.cuda.synchronize()
 
+        hidden_groups = D // _GROUP_SIZE
+        packed_hidden_groups = (hidden_groups + 3) // 4
+        aligned_num_tokens = (T + 3) // 4 * 4
         self.assertEqual(o_fp8.shape, (T, G, D))
         self.assertEqual(o_fp8.dtype, fp8_dtype)
-        self.assertEqual(o_s.shape, (T, G, D // _GROUP_SIZE))
-        self.assertEqual(o_s.dtype, torch.float32)
-        self.assertEqual(o_s.stride(), (D // _GROUP_SIZE, T * (D // _GROUP_SIZE), 1))
-        self.assertTrue(o_s[:, 0, :].is_contiguous())
+        self.assertEqual(o_s.shape, (T, G, packed_hidden_groups))
+        self.assertEqual(o_s.dtype, torch.int32)
+        self.assertEqual(
+            o_s.stride(),
+            (
+                1,
+                packed_hidden_groups * aligned_num_tokens,
+                aligned_num_tokens,
+            ),
+        )
         self.assertTrue(
             torch.equal(o_fp8.view(torch.int8), q_ref.view(torch.int8)),
             "fp8 codes differ",
         )
-        self.assertTrue(torch.equal(o_s, s_ref), "scales differ")
+        self.assertTrue(torch.equal(o_s, packed_ref), "packed scales differ")
 
     def test_dsv4_wo_a_quant_matches_flat_reference(self):
         torch.manual_seed(1)
@@ -85,6 +100,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
 
         device = torch.device("cuda")
         for dtype, T, G, D in [
+            (torch.bfloat16, 1, 2, 256),
             (torch.bfloat16, 9, 5, 384),
             (torch.float16, 7, 3, 512),
         ]:
@@ -105,9 +121,8 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
 
         self.assertEqual(o_fp8.shape, o.shape)
         self.assertEqual(o_fp8.dtype, fp8_dtype)
-        self.assertEqual(o_s.shape, (0, 3, 2))
-        self.assertEqual(o_s.dtype, torch.float32)
-        self.assertEqual(o_s.stride(), (2, 2, 1))
+        self.assertEqual(o_s.shape, (0, 3, 1))
+        self.assertEqual(o_s.dtype, torch.int32)
 
     def test_dsv4_wo_a_quant_large_token_dimension(self):
         torch.manual_seed(2)
@@ -152,7 +167,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
         finally:
             fp8_wo_a_module._jit_module = original_jit_module
 
-    def test_fp8_wo_a_einsum_uses_group_major_activation_scales(self):
+    def test_fp8_wo_a_einsum_uses_tma_aligned_activation_scales(self):
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
 
@@ -183,6 +198,8 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
                 weight_s = transform_scale_ue8m0(weight_s_raw, mn=R)
 
                 q_dsv4, s_dsv4 = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                q_ref, s_ref = self._flat_reference(o)
+                s_ref_group_major = s_ref.transpose(0, 1).contiguous().transpose(0, 1)
                 out = torch.empty(T, G, R, device=device, dtype=torch.bfloat16)
                 self.deep_gemm.fp8_einsum(
                     "bhr,hdr->bhd",
@@ -191,11 +208,24 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
                     out,
                     recipe=(1, 1, _GROUP_SIZE),
                 )
+                out_ref = torch.empty_like(out)
+                self.deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (q_ref, s_ref_group_major),
+                    (weight_fp8, weight_s),
+                    out_ref,
+                    recipe=(1, 1, _GROUP_SIZE),
+                )
                 torch.cuda.synchronize()
+
+                self.assertTrue(
+                    torch.equal(out, out_ref),
+                    "einsum outputs differ between packed and fp32 scales",
+                )
 
                 o_dequant = q_dsv4.float().view(
                     T, G, D // _GROUP_SIZE, _GROUP_SIZE
-                ) * s_dsv4.unsqueeze(-1)
+                ) * s_ref.unsqueeze(-1)
                 weight_dequant = block_quant_dequant(
                     weight_fp8,
                     weight_s_raw,

@@ -47,6 +47,7 @@ def _global_args():
             comfyui_mode=False,
             enable_cfg_parallel=False,
             enable_torch_compile=False,
+            enable_breakable_cuda_graph=False,
             attention_backend=None,
             # DenoisingStage.__init__ reads this for its CFG-parallel plumbing.
             pipeline_config=SimpleNamespace(

@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=200, suite="stage-b-test-1-npu-a3", nightly=False)
+register_npu_ci(est_time=200, suite="base-b-test-1-npu-a3")
 register_npu_ci(est_time=200, suite="nightly-1-npu-a3", nightly=True)
 
 
@@ -56,11 +56,11 @@ class TestBasicSanityEagle3(
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--mem-fraction-static",
                 "0.7",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
             ],
         )
 

@@ -80,16 +80,32 @@ mod python {
 
     use super::{decode_rgb, resize};
 
+    /// `resample` names the implementation to reproduce: `"pil_lanczos"` (the
+    /// inkling default), `"pil_bicubic"`, or `"aten_u8"` (torchvision's uint8
+    /// antialias bicubic). Exposed so the bit-exactness tests can cover each.
     #[pyfunction]
+    #[pyo3(signature = (arr, out_w, out_h, resample="pil_lanczos"))]
     pub fn resize_rgb<'py>(
         py: Python<'py>,
         arr: PyReadonlyArray3<'py, u8>,
         out_w: usize,
         out_h: usize,
+        resample: &str,
     ) -> PyResult<Bound<'py, PyArray1<u8>>> {
         if out_w == 0 || out_h == 0 {
             return Err(PyValueError::new_err("output size must be positive"));
         }
+        let resample = match resample {
+            "pil_lanczos" => resize::Resample::Pil(resize::Filter::Lanczos),
+            "pil_bicubic" => resize::Resample::Pil(resize::Filter::Bicubic),
+            "aten_u8" => resize::Resample::AtenU8,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown resample {other:?}; expected \"pil_lanczos\", \
+                     \"pil_bicubic\" or \"aten_u8\""
+                )));
+            }
+        };
         let shape = arr.shape();
         let (h, w, c) = (shape[0], shape[1], shape[2]);
         if c != 3 {
@@ -101,7 +117,7 @@ mod python {
             .as_slice()
             .map_err(|_| PyValueError::new_err("array must be C-contiguous"))?
             .to_vec();
-        let out = py.detach(move || resize::resize_lanczos_rgb(&data, h, w, out_h, out_w));
+        let out = py.detach(move || resize::resize_rgb(&data, h, w, out_h, out_w, resample));
         Ok(out.into_pyarray(py))
     }
 

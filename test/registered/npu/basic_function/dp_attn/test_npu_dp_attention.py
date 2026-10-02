@@ -23,8 +23,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-4-npu-a3", nightly=False)
-register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(
+    est_time=400,
+    suite="base-b-test-4-npu-a3",
+    disabled="Temporarily disable this test case due to DTS2026091464350",
+)
+register_npu_ci(est_time=2400, suite="nightly-4-npu-a3", nightly=True)
 
 
 class TestDPAttentionDP2TP2(
@@ -52,8 +56,7 @@ class TestDPAttentionDP2TP2(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
                 "--attention-backend",
                 "ascend",
@@ -74,6 +77,8 @@ class TestDPAttentionMixedChunk(
     CustomTestCase,
     NPUGSM8KMixin,
 ):
+    # Use full GSM8K dataset to avoid sampling variance.
+    gsm8k_num_examples = 1319
     gsm8k_accuracy_thres = 0.34
 
     @classmethod
@@ -88,8 +93,7 @@ class TestDPAttentionMixedChunk(
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
                 "--enable-mixed-chunk",
                 "--chunked-prefill-size",
@@ -122,8 +126,7 @@ class TestDPRetract(
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
                 "--max-total-tokens",
                 "4500",
@@ -160,8 +163,7 @@ class TestDPAttentionDP2TP2VLM(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
                 "--attention-backend",
                 "ascend",

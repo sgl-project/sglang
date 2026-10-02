@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-large")
 
 
 def ceil_div(a, b):
@@ -179,6 +179,8 @@ def test_moe_align_block_size_compare_implementations(
     max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
     if topk_ids.numel() < num_experts + 1:
         max_num_tokens_padded = topk_ids.numel() * block_size
+    # The kernel pads sorted_ids with int4 stores.
+    max_num_tokens_padded = (max_num_tokens_padded + 3) // 4 * 4
 
     sorted_ids_cuda = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
@@ -294,6 +296,8 @@ def test_moe_align_block_size_v2_large_num_experts(
     max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
     if topk_ids.numel() < num_experts + 1:
         max_num_tokens_padded = topk_ids.numel() * block_size
+    # The kernel pads sorted_ids with int4 stores.
+    max_num_tokens_padded = (max_num_tokens_padded + 3) // 4 * 4
 
     sorted_ids_cuda = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
@@ -357,6 +361,60 @@ def test_moe_align_block_size_v2_large_num_experts(
             f"Block {b} sorted_ids mismatch for num_experts={num_experts}, "
             f"num_tokens={num_tokens}"
         )
+
+
+@pytest.mark.parametrize("remainder", [1, 2, 3])
+@pytest.mark.parametrize(
+    "num_experts,num_tokens",
+    [
+        (32, 8),  # small-batch kernel: <= 64 buckets and numel < 1024
+        (128, 640),  # generic kernel: <= 1024 buckets
+        (1025, 640),  # v2 kernel: > 1024 buckets
+    ],
+)
+def test_moe_align_block_size_pad_fill_stays_in_bounds(
+    num_experts, num_tokens, remainder
+):
+    """The pad fill writes sorted_token_ids with int4 stores; a buffer whose
+    length is not a multiple of 4 must be filled to its end and no further."""
+    block_size, topk = 64, 8
+    topk_ids = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    needed = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    length = needed + (remainder - needed) % 4
+    assert length % 4 == remainder
+
+    # sorted_ids is a prefix view of a longer buffer; a fill that runs past the
+    # view lands in the guard words behind it.
+    backing = torch.full((length + 4,), -1, dtype=torch.int32, device="cuda")
+    sorted_ids = backing[:length]
+    expert_ids = torch.zeros(
+        (ceil_div(length, block_size),), dtype=torch.int32, device="cuda"
+    )
+    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device="cuda")
+    cumsum_buffer = torch.empty(num_experts + 2, dtype=torch.int32, device="cuda")
+
+    moe_align_block_size(
+        topk_ids,
+        num_experts + 1,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        True,
+    )
+    torch.cuda.synchronize()
+
+    guard = backing[length:]
+    assert torch.equal(guard, torch.full_like(guard, -1)), (
+        f"pad fill wrote past sorted_token_ids for length={length}: {guard.tolist()}"
+    )
+    tail = sorted_ids[num_tokens_post_pad.item() :]
+    assert torch.equal(tail, torch.full_like(tail, topk_ids.numel())), (
+        f"pad fill left part of the tail unfilled for length={length}"
+    )
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@
 #include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
-#include <sgl_kernel/warp.cuh>   // For warp::copy_bytes, elect_one_lane, inclusive_sum
+#include <sgl_kernel/warp.cuh>   // For warp::inclusive_sum, reduce_sum
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -60,7 +60,7 @@ SGL_DEVICE void bar_sync(uint32_t id, uint32_t num_threads) {
 // smem_warp_sum[kNumWarps]; syncs on entry (so the workspace can be reused
 // across calls) and before the cross-warp read.
 SGL_DEVICE uint32_t block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t warp_id, uint32_t* smem_warp_sum) {
-  const uint32_t inc = device::warp::inclusive_sum(lane_id, cnt);
+  const uint32_t inc = device::warp::inclusive_sum(cnt, lane_id);
   if (lane_id == 31) smem_warp_sum[warp_id] = inc;
   __syncthreads();
   // TODO: replace `__reduce_add_sync` with `warp::reduce_sum`
@@ -134,17 +134,18 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
 
   // ---- Load + key transform: thread tx owns experts [4*tx, 4*tx+4) ----
   uint32_t keys[kVecSize];
-  float act[kVecSize];  // raw sigmoid (weight source) — never NaN-sanitized
+  float act[kVecSize];  // raw sigmoid (weight source) -- never NaN-sanitized
   {
     const auto scores = static_cast<const TScore*>(params.scores) + bx * params.scores_stride;
     AlignedVector<fp32x2_t, kVecSize / 2> bias_vec;
     // bf16: 2x bf16x2 (8B row loads); fp32: 2x fp32x2 (16B row loads). The
-    // radix math below is fp32 either way — only the load width differs.
+    // radix math below is fp32 either way -- only the load width differs.
     AlignedVector<packed_t<TScore>, kVecSize / 2> scores_vec;
 
-    // prefetch bias (frozen weight) before the PDL wait
-    bias_vec.load(params.bias, tx);
+    // Bias may be produced by a preceding cast or fill kernel (the caller
+    // does not guarantee a frozen weight), so wait before loading either input.
     PDLWaitPrimary<kUsePDL>();
+    bias_vec.load(params.bias, tx);
     scores_vec.load(scores, tx);
 
 #pragma unroll
@@ -207,7 +208,7 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
         AlignedVector<uint32_t, 2> hist;
         hist.load(smem.histogram, tx);
         const auto local_val = hist[0] + hist[1];
-        const auto warp_inc = device::warp::inclusive_sum(lane_id, local_val);
+        const auto warp_inc = device::warp::inclusive_sum(local_val, lane_id);
         if (lane_id == kWarpThreads - 1) smem.warp_sum[0][warp_id] = warp_inc;
         moe::radix::bar_sync(BAR_SUM, kRadixLanes);
         const auto inter = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem.warp_sum[0][lane_id] : 0u);
@@ -315,7 +316,7 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
     params.out_w[bx * params.out_w_stride + rank] = w;
     params.out_i[bx * params.out_i_stride + rank] = id;
     if (params.out_packed != nullptr) {
-      // (id << 16) | bf16(w) bits — RN float->bf16 matches the triton pack.
+      // (id << 16) | bf16(w) bits -- RN float->bf16 matches the triton pack.
       const auto bits = static_cast<uint32_t>(__bfloat16_as_ushort(__float2bfloat16_rn(w)));
       params.out_packed[bx * params.out_packed_stride + rank] =
           static_cast<int32_t>((static_cast<uint32_t>(id) << 16) | bits);
@@ -457,7 +458,7 @@ SGL_DEVICE void fgt_select_topk(
         device::AlignedVector<uint32_t, 2> hist;
         hist.load(smem.histogram, tx);
         const auto local_val = hist[0] + hist[1];
-        const auto warp_inc = device::warp::inclusive_sum(lane_id, local_val);
+        const auto warp_inc = device::warp::inclusive_sum(local_val, lane_id);
         if (lane_id == 31) smem.warp_sum[0][warp_id] = warp_inc;
         moe::radix::bar_sync(BAR_SUM, kRadixLanes);
         const auto inter = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem.warp_sum[0][lane_id] : 0u);
@@ -583,8 +584,6 @@ __global__ __launch_bounds__(kBlockSize)  //
   if (!kCastFirst) cast_latent();
 }
 
-}  // namespace sglang
-
 template <bool kUsePDL>
 struct RouteRadixKernel {
   static void
@@ -616,7 +615,7 @@ struct RouteRadixKernel {
     TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device).verify(out_i);
 
     RuntimeCheck(
-        N_.unwrap() == sglang::kNumExperts_ && K_.unwrap() == sglang::kTopK_ && topk == sglang::kTopK_,
+        N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_,
         "route_radix is specialized for N=896, K=16");
     // Vectorized row loads (8B for bf16, 16B for fp32) need aligned row
     // starts; stride % 4 elements covers both (4 x 2B = 8B / 4 x 4B = 16B).
@@ -625,7 +624,7 @@ struct RouteRadixKernel {
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
 
-    const auto params = sglang::RouteRadixParams{
+    const auto params = RouteRadixParams{
         scores.data_ptr(),
         static_cast<const fp32_t*>(bias.data_ptr()),
         static_cast<fp32_t*>(out_w.data_ptr()),
@@ -642,11 +641,11 @@ struct RouteRadixKernel {
         sorted ? 1 : 0};
 
     if (score_dtype.is_type<fp32_t>()) {
-      LaunchKernel(M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap())
-          .enable_pdl(kUsePDL)(sglang::route_radix_kernel<kUsePDL, fp32_t>, params);
+      LaunchKernel(M, LargeRouterRadixTrait::kBlockSize, device.unwrap())
+          .enable_pdl(kUsePDL)(route_radix_kernel<kUsePDL, fp32_t>, params);
     } else {
-      LaunchKernel(M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap())
-          .enable_pdl(kUsePDL)(sglang::route_radix_kernel<kUsePDL, bf16_t>, params);
+      LaunchKernel(M, LargeRouterRadixTrait::kBlockSize, device.unwrap())
+          .enable_pdl(kUsePDL)(route_radix_kernel<kUsePDL, bf16_t>, params);
     }
   }
 };
@@ -685,10 +684,10 @@ struct FusedFrontEpilogueKernel {
     const auto M = static_cast<int>(M_.unwrap());
     const auto latent = static_cast<int>(L_.unwrap());
     RuntimeCheck(
-        E_.unwrap() == sglang::kFGTNumExperts && K_.unwrap() == sglang::kFGTTopK && topk == sglang::kFGTTopK,
+        E_.unwrap() == kFGTNumExperts && K_.unwrap() == kFGTTopK && topk == kFGTTopK,
         "fused_front_epilogue is specialized for E=896, topk=16");
     RuntimeCheck(
-        static_cast<int>(W_.unwrap()) == static_cast<int>(sglang::kFGTNumExperts) + latent,
+        static_cast<int>(W_.unwrap()) == static_cast<int>(kFGTNumExperts) + latent,
         "fused_front_epilogue: merged width must be num_experts + latent");
     // 16B vectorized reads of the fp32 rows and 8B writes of the bf16 rows.
     RuntimeCheck(latent % 4 == 0, "fused_front_epilogue: latent must be a multiple of 4");
@@ -697,7 +696,7 @@ struct FusedFrontEpilogueKernel {
         "fused_front_epilogue: row strides must be a multiple of 4");
     if (M == 0) return;
 
-    auto params = sglang::MoEFrontParams{};
+    auto params = MoEFrontParams{};
     params.bias = static_cast<const fp32_t*>(bias.data_ptr());
     params.logits = static_cast<fp32_t*>(merged.data_ptr());
     params.out_w = static_cast<fp32_t*>(out_w.data_ptr());
@@ -718,9 +717,8 @@ struct FusedFrontEpilogueKernel {
     RuntimeCheck(cast_vec == 2 || cast_vec == 4 || cast_vec == 8, "fused_front_epilogue: cast_vec must be 2, 4 or 8");
     RuntimeCheck(latent % cast_vec == 0, "fused_front_epilogue: cast_vec must divide latent");
 
-#define SGL_FRONT_LAUNCH(BS, CV, CF)   \
-  LaunchKernel(M, BS, device.unwrap()) \
-      .enable_pdl(kUsePDL)(sglang::fused_front_epilogue_kernel<kUsePDL, BS, CV, CF>, params)
+#define SGL_FRONT_LAUNCH(BS, CV, CF) \
+  LaunchKernel(M, BS, device.unwrap()).enable_pdl(kUsePDL)(fused_front_epilogue_kernel<kUsePDL, BS, CV, CF>, params)
 #define SGL_FRONT_DISPATCH_CV(BS, CF) \
   do {                                \
     if (cast_vec == 2) {              \
@@ -751,3 +749,5 @@ struct FusedFrontEpilogueKernel {
 #undef SGL_FRONT_LAUNCH
   }
 };
+
+}  // namespace sglang
