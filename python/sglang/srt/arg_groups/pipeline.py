@@ -204,6 +204,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_gpu_memory_settings, server_args)
 
+    # PPU acext backend init + token limit (reads the resolved chunked-prefill
+    # size, so it must run after handle_gpu_memory_settings).
+    from sglang.srt.arg_groups.platform_hook import handle_ppu_backends
+
+    handle_ppu_backends(server_args)
+
+    # Apply model-specific adjustments.
     from sglang.srt.arg_groups.model_hook import (
         handle_model_capability_adjustments,
         handle_model_specific_adjustments,

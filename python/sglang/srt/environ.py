@@ -1849,6 +1849,8 @@ class Envs:
     # SAIL
     SGLANG_SAIL_FUSEDMOE_OPT = EnvBool(False)
     SGLANG_SAIL_FUSEDMOE_MAX_TOKENS = EnvInt(32768)
+    SGLANG_SAIL_USE_ACEXT_CUDA = EnvBool(False)
+    SGLANG_SAIL_ACEXT_MOE_DEBUG = EnvBool(False)
 
 
 envs = Envs()

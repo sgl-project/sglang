@@ -8,12 +8,14 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -29,6 +31,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_host_cpu_arm64,
+    is_ppu,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -41,6 +44,7 @@ _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
+_is_ppu = is_ppu()
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
@@ -58,6 +62,9 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
+
+if _is_ppu:
+    from acext import int8_gemm as acext_int8_gemm
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +225,11 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             )
         x_q, x_scale = per_token_quant_int8(x)
 
+        if envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
+            return acext_int8_gemm(
+                x_q, layer.weight.t(), layer.weight_scale, x_scale, bias, x.dtype
+            )
+
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
         output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
@@ -329,7 +341,20 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+
+        if moe_runner_backend.is_auto():
+            if envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
+                moe_runner_backend = MoeRunnerBackend.ACEXT
+            else:
+                moe_runner_backend = MoeRunnerBackend.TRITON
+        if moe_runner_backend.is_acext():
+            import sglang.srt.layers.moe.moe_runner.acext  # noqa: F401 – triggers @register_fused_func
+        if moe_runner_backend.is_acext() or moe_runner_backend.is_triton():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            # TODO(cwan): refactor other backends
+            pass
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(

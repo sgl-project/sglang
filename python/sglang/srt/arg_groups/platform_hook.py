@@ -15,9 +15,32 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_host_cpu_arm64
+from sglang.srt.utils.common import is_host_cpu_arm64, is_ppu
 
 logger = logging.getLogger(__name__)
+
+
+def handle_ppu_backends(server_args: Any):
+    # PPU INT8 MoE / linear layers run on the acext backend. Initialize the
+    # acext CUDA path (defaulting it on) and validate the acext version, then
+    # size its token limit from the resolved chunked-prefill size.
+    if not is_ppu():
+        return
+    from sglang.srt.environ import envs
+    from sglang.srt.utils.common import (
+        check_acext_version_compatibility,
+        set_acext_token_limit,
+    )
+
+    cfg = resolving_view(server_args)
+    if not envs.SGLANG_SAIL_USE_ACEXT_CUDA.is_set():
+        envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(True)
+    if envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
+        check_acext_version_compatibility()
+    if cfg.chunked_prefill_size is not None:
+        set_acext_token_limit(
+            acext_num_tokens=int(cfg.chunked_prefill_size * 0.5),
+        )
 
 
 def handle_hardware_runtime_validation(server_args: Any):

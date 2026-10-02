@@ -161,6 +161,8 @@ class MoeRunner:
             # Import here (not at module top, to avoid a circular import) to
             # register the hpc_ops fused func before the pool lookup.
             from sglang.srt.layers.moe.moe_runner import hpc_ops  # noqa: F401
+        elif runner_backend.is_acext():
+            self.runner_core = None  # Acext only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 

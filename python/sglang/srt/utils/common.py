@@ -4975,3 +4975,25 @@ def init_cublas():
     b = torch.ones((16, 16), dtype=dtype, device=device)
     c = a @ b
     return c
+
+
+def set_acext_token_limit(acext_num_tokens: int = 6144):
+    if "ACEXT_NUM_TOKENS_LIMIT" not in os.environ:
+        os.environ["ACEXT_NUM_TOKENS_LIMIT"] = str(acext_num_tokens)
+    logger.warning(f"acext token limit: {os.environ['ACEXT_NUM_TOKENS_LIMIT']}")
+
+
+def check_acext_version_compatibility(acext_version: int = 1050100):
+    if get_device_sm() >= 89:
+        envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(0)
+        return
+    from acext import get_version as acext_get_version
+
+    current_ver = acext_get_version()
+    if current_ver < acext_version:
+        logger.warning(
+            f"acext version {current_ver} don't satisfy minimum version {acext_version}. Fallback to triton"
+        )
+        envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(0)
+    else:
+        logger.warning(f"Current acext version: {current_ver}")

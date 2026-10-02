@@ -82,7 +82,7 @@ dependencies = [
   "deep_gemm",
   "flash_attn_3",
   "flash_mla",
-  "acext",
+  "acext>=1.1.0",
   "flashinfer_python[cu13]>=0.6.12,<=0.6.17", # keep it aligned with jit-cache version in Dockerfile
   "torch>=2.11.0,<=2.13.0",
   "torch_memory_saver>=0.0.9.post1",
