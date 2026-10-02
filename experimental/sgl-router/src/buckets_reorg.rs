@@ -138,6 +138,7 @@ pub struct BucketRequest<'a> {
     pub expected_peak_tokens: Option<u64>,
     pub prefix: Option<&'a crate::policies_reorg::cache_aware::PrefixMemo>,
     pub token_ids: Option<&'a [u32]>,
+    pub cache_salt: Option<&'a str>,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
     /// Engines this request already failed on; no group offers them again.
@@ -301,6 +302,7 @@ impl Bucket {
             expected_peak_tokens: request.expected_peak_tokens,
             prefix: request.prefix,
             token_ids: request.token_ids,
+            cache_salt: request.cache_salt,
             session_key: request.session_key,
             routing_key: request.routing_key,
         };

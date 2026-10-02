@@ -6,7 +6,8 @@
 use super::{EligibilityFilter, ScoringPolicy};
 use crate::policies::SelectionContext;
 use crate::state::kv_events::{
-    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
+    compute_block_hashes_bigram_with_salt, compute_block_hashes_with_salt, BlockSizeOracle,
+    HashTree,
 };
 use crate::workers::Worker;
 use std::sync::Arc;
@@ -64,9 +65,9 @@ impl PrefixCachePolicy {
             return flat();
         };
         let hashes = if self.block_size_oracle.is_bigram() {
-            compute_block_hashes_bigram(tokens, block_size as usize)
+            compute_block_hashes_bigram_with_salt(tokens, block_size as usize, ctx.cache_salt())
         } else {
-            compute_block_hashes(tokens, block_size as usize)
+            compute_block_hashes_with_salt(tokens, block_size as usize, ctx.cache_salt())
         };
         if hashes.is_empty() {
             return flat();
@@ -123,6 +124,7 @@ mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::state::kv_events::KvWorkerId;
+    use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 
     const BLOCK: usize = 4;
 
@@ -181,6 +183,29 @@ mod tests {
         assert_eq!(scores[0], 0.75, "3 of 4 blocks held, not a neutral 1.0");
         assert_eq!(scores[1], 0.0, "tail without block 0 holds nothing");
         assert_eq!(scores[2], 0.0, "never seen");
+    }
+
+    #[test]
+    fn cache_salt_scopes_scores_and_eligibility() {
+        let tree = Arc::new(HashTree::new());
+        let ids = tokens();
+        insert(&tree, "unsalted", 0, 0, 4);
+        tree.insert(
+            &KvWorkerId::new("salted".into(), 0),
+            None,
+            &compute_block_hashes_with_salt(&ids, BLOCK, Some("tenant-a")),
+        );
+        let workers = [worker("unsalted"), worker("salted")];
+        let model = ModelId("tiny".into());
+        let policy = policy(tree).with_min_share(0.5);
+        let ctx = SelectionContext::new(&model, None)
+            .with_request_tokens(Some(&ids))
+            .with_cache_salt(Some("tenant-a"));
+        assert_eq!(policy.scores(&workers, &ctx), [0.0, 1.0]);
+        assert_eq!(policy.keep(&workers, &ctx), [false, true]);
+        let other = ctx.with_cache_salt(Some("tenant-b"));
+        assert_eq!(policy.scores(&workers, &other), [0.0, 0.0]);
+        assert_eq!(policy.keep(&workers, &other), [false, false]);
     }
 
     #[test]
