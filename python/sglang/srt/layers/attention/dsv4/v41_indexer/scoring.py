@@ -15,11 +15,13 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_prefill import fused_index_scores
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 from .types import (
@@ -332,13 +334,25 @@ def _score_chunks(
     request: RequestScores,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
+    # The torch prefill indexer flag asks for the torch oracle, not this kernel.
+    fused = (
+        q.is_cuda
+        and envs.SGLANG_OPT_USE_FUSED_DSV41_INDEXER_SCORES.get()
+        and not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+    )
     # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
-    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
+    # The fused kernel holds only the fp32 [rows, lc] scores; at a quarter of
+    # the budget its [rows, lc] copies downstream stay under the torch peak.
+    row_bytes = lc * 16 if fused else q.shape[1] * lc * 2
+    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // row_bytes)
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-        s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+        if fused:
+            s = fused_index_scores(q[tok_c], index_k, weights[tok_c], lens_c)
+        else:
+            s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+            s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
         yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
 
 
