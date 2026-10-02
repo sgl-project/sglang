@@ -242,9 +242,10 @@ async fn pd_fan_out_leaves_the_prefill_rank_to_the_engine() {
     }
 }
 
-/// The engine's `/v1/embeddings` and `/v1/rerank` read no rank, so the router pins none.
+/// The engine's `/v1/embeddings`, `/v1/classify` and `/v1/rerank` read no rank,
+/// so the router pins none.
 #[tokio::test]
-async fn embeddings_and_rerank_leave_the_rank_to_the_engine() {
+async fn embedding_like_endpoints_leave_the_rank_to_the_engine() {
     let worker = MockWorker::start(vec![]).await;
     let app = router(
         sticky_config(),
@@ -253,6 +254,7 @@ async fn embeddings_and_rerank_leave_the_rank_to_the_engine() {
     );
     for (path, body) in [
         ("/v1/embeddings", json!({"model": MODEL, "input": "hi"})),
+        ("/v1/classify", json!({"model": MODEL, "input": "hi"})),
         ("/v1/rerank", json!({"query": "hi", "documents": ["yo"]})),
     ] {
         let request = Request::post(path)
