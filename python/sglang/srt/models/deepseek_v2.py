@@ -197,6 +197,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_forward,
+    get_lora,
     get_model,
     get_parallel,
     get_platform,
@@ -786,6 +787,9 @@ class DeepseekV2MoE(nn.Module):
             # Flags must be set before weight load so
             # process_weights_after_loading sees them and builds the
             # [Up, Gate]-interleaved weight + scale.
+            from sglang.srt.layers.quantization.fp4_utils import (
+                get_fp4_gemm_runner_backend,
+            )
             from sglang.srt.layers.quantization.modelopt_quant import (
                 ModelOptFp4LinearMethod,
             )
@@ -793,11 +797,14 @@ class DeepseekV2MoE(nn.Module):
             fc1_n = self.shared_experts.gate_up_proj.output_size_per_partition
             if (
                 get_platform().is_sm100
+                # The fused kernel bypasses the LoRA wrappers.
+                and not (get_lora().enable_lora or get_lora().lora_paths)
                 and isinstance(
                     self.shared_experts.gate_up_proj.quant_method,
                     ModelOptFp4LinearMethod,
                 )
                 and self.shared_experts.gate_up_proj.quant_method.quant_mode == "w4a4"
+                and get_fp4_gemm_runner_backend().supports_swiglu_fusion()
                 and isinstance(
                     self.shared_experts.down_proj.quant_method,
                     ModelOptFp4LinearMethod,
