@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.utils.common import is_remote_url
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+from sglang.srt.utils.network import local_ephemeral_port_range
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -250,6 +251,8 @@ def handle_load_format(server_args: Any):
                 "_handle_load_format",
                 load_format="auto",
             )
+        else:
+            validate_remote_instance_group_ports(server_args)
 
     # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
     if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
@@ -284,6 +287,33 @@ def handle_load_format(server_args: Any):
             "decoding (--speculative-algorithm): the weight cache daemon does "
             "not export the draft model's weights. Disable one of them "
             "(--weight-cache-mode off) for this configuration."
+        )
+
+
+def validate_remote_instance_group_ports(server_args: Any):
+    """Reject send-weights group ports that sit in the ephemeral port range.
+
+    The seed *listens* on these, but the kernel also hands them out to
+    outbound connections, so an overlapping choice races with whatever else
+    the host is dialing and loses with EADDRINUSE some fraction of the time.
+    Fail at startup instead of intermittently mid-transfer.
+    """
+    ports = resolving_view(
+        server_args
+    ).remote_instance_weight_loader_send_weights_group_ports
+    if not ports:
+        return
+    port_range = local_ephemeral_port_range()
+    if port_range is None:
+        return
+    low, high = port_range
+    clashing = [p for p in ports if low <= p <= high]
+    if clashing:
+        raise ValueError(
+            f"--remote-instance-weight-loader-send-weights-group-ports {clashing} "
+            f"fall inside this host's ephemeral port range ({low}-{high}), where "
+            f"the kernel may already have handed the port to an outbound "
+            f"connection. Pick ports below {low}."
         )
 
 
