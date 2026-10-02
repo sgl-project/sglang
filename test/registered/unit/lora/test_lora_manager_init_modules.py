@@ -22,13 +22,14 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora import lora_manager as lora_manager_module
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 # A VL model whose vision tower nests under `layers.<i>.` just like the decoder,
 # so get_layer_id() resolves both to layer 0 and only should_apply_lora can tell
@@ -36,6 +37,9 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 LANGUAGE_QKV = "language_model.model.layers.0.mixer.qkv_proj"
 VISION_QKV = "vision_model.encoder.layers.0.attn.attn.qkv_proj"
 LANGUAGE_EMBED_TOKENS = "language_model.model.embed_tokens"
+# Intern-S2-Mobius routed banks: a FusedMoE outside the decoder hierarchy, so
+# get_layer_id() returns None and should_apply_lora rejects the prefix.
+META_MLP_BANK = "model.meta_mlp.0.experts"
 
 
 class _TiedEmbedding(torch.nn.Module):
@@ -142,6 +146,21 @@ class TestShouldApplyLoRAGate(CustomTestCase):
             manager.init_lora_modules()
 
         self.assertEqual(manager.embed_tokens_module, LANGUAGE_EMBED_TOKENS)
+
+    def test_routed_bank_outside_the_gated_prefix_still_raises(self):
+        """Unsupported routed-expert targets must fail loudly rather than be
+        skipped; the gate would otherwise drop the bank before the FusedMoE
+        branch rejects it, and the adapter's weights are then dropped silently
+        because lora_strict_loading defaults to off."""
+        bank = FusedMoE.__new__(FusedMoE)
+        manager = self._manager(
+            modules=[(META_MLP_BANK, bank)],
+            target_modules={"gate_up_proj", "down_proj"},
+        )
+
+        with patch.object(manager, "set_lora_module", side_effect=lambda name, _: name):
+            with self.assertRaisesRegex(ValueError, "meta_mlp routed banks"):
+                manager.init_lora_modules()
 
 
 if __name__ == "__main__":
