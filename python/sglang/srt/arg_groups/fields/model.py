@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.arg_utils import (
 )
 from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
+    ONLINE_QUANTIZATION_CHOICES,
     QUANTIZATION_CHOICES,
 )
 from sglang.srt.utils.common import (
@@ -171,6 +172,17 @@ class Model(msgspec.Struct):
         Arg(
             help="The quantization method.",
             choices=QUANTIZATION_CHOICES,
+            resolvable=True,
+        ),
+    ] = None
+    online_quantization: A[
+        Optional[str],
+        Arg(
+            help=(
+                "The online quantization method. Ascend integer online "
+                "quantization supports full-precision FP16 and BF16 checkpoints."
+            ),
+            choices=ONLINE_QUANTIZATION_CHOICES,
             resolvable=True,
         ),
     ] = None

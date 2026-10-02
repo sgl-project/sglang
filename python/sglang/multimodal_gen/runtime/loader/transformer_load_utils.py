@@ -1053,7 +1053,12 @@ def _resolve_quant_config(
         # process_weights_after_loading.
         quant_cls = get_quantization_config(server_args.quantization)
         quant_kwargs = {}
-        if server_args.quantization in {"fp8", "mxfp4", "kitchen_int8"}:
+        if server_args.quantization in {
+            "fp8",
+            "mxfp4",
+            "kitchen_int8",
+            "w8a8_int",
+        }:
             quant_kwargs["ignored_layers"] = getattr(
                 server_args, "quantization_ignored_layers", None
             )

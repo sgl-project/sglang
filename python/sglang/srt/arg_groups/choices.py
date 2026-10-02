@@ -65,6 +65,14 @@ QUANTIZATION_CHOICES = [
     "humming",
 ]
 
+# Ascend online quantization for full-precision checkpoints.
+ONLINE_QUANTIZATION_CHOICES = [
+    "w8a8_int",
+    "w4a4_int",
+]
+
+W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS = {"Qwen3MoeForCausalLM"}
+
 ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
