@@ -8,7 +8,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
-from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
+from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
+    DualGemmActivationType,
+    DualGemmQuantMode,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -83,6 +86,81 @@ def _make_qwen2_mlp(dtype=torch.bfloat16):
     finally:
         torch.set_default_dtype(original_dtype)
     return _initialize_mlp_weights(mlp, dtype)
+
+
+def _make_gemma_mlp(
+    model_name,
+    dtype=torch.bfloat16,
+    activation_sparsity=0.0,
+    quant_config=None,
+):
+    if model_name == "gemma":
+        from sglang.srt.models.gemma import GemmaMLP
+
+        constructor = lambda: GemmaMLP(
+            _HIDDEN_SIZE, _INTERMEDIATE_SIZE, quant_config=quant_config
+        )
+    elif model_name == "gemma2":
+        from sglang.srt.models.gemma2 import Gemma2MLP
+
+        constructor = lambda: Gemma2MLP(
+            _HIDDEN_SIZE,
+            _INTERMEDIATE_SIZE,
+            "gelu_pytorch_tanh",
+            "gelu_pytorch_tanh",
+            quant_config=quant_config,
+        )
+    elif model_name in ("gemma3", "gemma4"):
+        if model_name == "gemma3":
+            from sglang.srt.models.gemma3_causal import Gemma3MLP as GemmaMLPClass
+        else:
+            from sglang.srt.models.gemma4_causal import Gemma4MLP as GemmaMLPClass
+
+        constructor = lambda: GemmaMLPClass(
+            _HIDDEN_SIZE,
+            _INTERMEDIATE_SIZE,
+            "gelu_pytorch_tanh",
+            quant_config=quant_config,
+        )
+    elif model_name == "gemma3n":
+        from sglang.srt.models.gemma3n_causal import Gemma3nTextMLP
+
+        constructor = lambda: Gemma3nTextMLP(
+            _HIDDEN_SIZE,
+            _INTERMEDIATE_SIZE,
+            "gelu_pytorch_tanh",
+            activation_sparsity=activation_sparsity,
+            quant_config=quant_config,
+        )
+    else:
+        raise ValueError(f"Unknown Gemma model: {model_name}")
+
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with get_parallel().override(tp_rank=0, tp_size=1):
+            mlp = constructor().cuda()
+    finally:
+        torch.set_default_dtype(original_dtype)
+    return _initialize_mlp_weights(mlp, dtype)
+
+
+def _make_gemma4_diffusion_self_conditioning(dtype=torch.bfloat16):
+    from sglang.srt.models.gemma4_diffusion import DiffusionGemmaSelfConditioning
+
+    config = SimpleNamespace(
+        hidden_size=_HIDDEN_SIZE,
+        intermediate_size=_INTERMEDIATE_SIZE,
+        rms_norm_eps=1e-6,
+    )
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with get_parallel().override(tp_rank=0, tp_size=1):
+            layer = DiffusionGemmaSelfConditioning(config).cuda()
+    finally:
+        torch.set_default_dtype(original_dtype)
+    return _initialize_mlp_weights(layer, dtype)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -160,6 +238,112 @@ class TestDualGemm(CustomTestCase):
                 actual = mlp(x)
 
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2.5e-1)
+
+    def test_gemma_integrations(self):
+        """Every dense Gemma MLP must select its model-accurate GELU variant."""
+        for model_name in ("gemma", "gemma2", "gemma3", "gemma3n", "gemma4"):
+            with self.subTest(model_name=model_name):
+                mlp, generator = _make_gemma_mlp(model_name)
+                x = torch.randn(
+                    (16, _HIDDEN_SIZE),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=generator,
+                )
+                expected_activation = (
+                    DualGemmActivationType.GELU
+                    if model_name == "gemma"
+                    else DualGemmActivationType.GELU_TANH
+                )
+                with torch.inference_mode(), get_parallel().override(tp_group=object()):
+                    gate_up, _ = mlp.gate_up_proj(x)
+                    expected, _ = mlp.down_proj(mlp.act_fn(gate_up))
+                    self.assertEqual(mlp.dual_gemm.activation_type, expected_activation)
+                    with patch.object(
+                        mlp.gate_up_proj,
+                        "forward",
+                        side_effect=AssertionError(
+                            f"{model_name} used the unfused gate/up path"
+                        ),
+                    ):
+                        actual = mlp(x)
+
+                torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2.5e-1)
+
+    def test_gemma3n_activation_sparsity_falls_back(self):
+        """Gemma3n sparsification must run before GELU and cannot be bypassed."""
+        mlp, generator = _make_gemma_mlp("gemma3n", activation_sparsity=0.5)
+        x = torch.randn(
+            (4, _HIDDEN_SIZE),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        with torch.inference_mode(), get_parallel().override(tp_group=object()):
+            gate_up, _ = mlp.gate_up_proj(x)
+            gate, up = gate_up.chunk(2, dim=-1)
+            expected, _ = mlp.down_proj(
+                mlp.act_fn(torch.cat((mlp._gaussian_topk(gate), up), dim=-1))
+            )
+            actual = mlp(x)
+
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2.5e-1)
+
+    def test_gemma4_diffusion_self_conditioning(self):
+        """Gemma4 diffusion's standalone gated MLP must use tanh GELU."""
+        layer, generator = _make_gemma4_diffusion_self_conditioning()
+        inputs_embeds = torch.randn(
+            (16, _HIDDEN_SIZE),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        signal = torch.randn(
+            (16, _HIDDEN_SIZE),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        with torch.inference_mode(), get_parallel().override(tp_group=object()):
+            normed_signal = layer.pre_norm(signal)
+            gate_up, _ = layer.gate_up_proj(normed_signal)
+            projected, _ = layer.down_proj(layer.act_fn(gate_up))
+            expected = layer.post_norm(inputs_embeds + projected)
+            with patch.object(
+                layer.gate_up_proj,
+                "forward",
+                side_effect=AssertionError("Gemma4 diffusion used the unfused path"),
+            ):
+                actual = layer(inputs_embeds, signal)
+
+        self.assertEqual(
+            layer.dual_gemm.activation_type, DualGemmActivationType.GELU_TANH
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2.5e-1)
+
+    def test_gemma_fp8_integration(self):
+        """Gemma's FP8 handoff must retain tanh-GELU through down projection."""
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        mlp, generator = _make_gemma_mlp("gemma2", quant_config=Fp8Config())
+        for projection in (mlp.gate_up_proj, mlp.down_proj):
+            projection.quant_method.process_weights_after_loading(projection)
+
+        x = torch.randn(
+            (16, _HIDDEN_SIZE),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        with torch.inference_mode(), get_parallel().override(tp_group=object()):
+            gate_up, _ = mlp.gate_up_proj(x)
+            expected, _ = mlp.down_proj(mlp.act_fn(gate_up))
+            actual = mlp(x)
+
+        self.assertEqual(
+            mlp.dual_gemm.activation_type, DualGemmActivationType.GELU_TANH
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-1, atol=5e-1)
 
     def test_fp8_handoff_skips_down_quantization(self):
         from sglang.srt.layers.quantization.fp8 import Fp8Config
