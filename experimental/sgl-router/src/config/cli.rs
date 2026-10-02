@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
+use reqwest::header::HeaderValue;
 use std::num::NonZeroU32;
 
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
@@ -14,10 +15,10 @@ use crate::config::{
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
     Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
-    DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
+    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
+    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -67,10 +68,26 @@ pub struct ModelArgs {
     #[arg(long)]
     pub tokenizer_path: Option<String>,
 
+    /// Skip loading a tokenizer; workers tokenize requests. Load-only policies only:
+    /// cache-aware routing, prefix-cache terms or filters, and length buckets require one.
+    #[arg(long, conflicts_with = "tokenizer_path")]
+    pub no_tokenizer: bool,
+
     /// Disable generated input_ids; workers tokenize messages, while routing still renders locally.
     /// Use for worker parser/template overrides or template stop strings.
     #[arg(long)]
     pub disable_input_ids_forwarding: bool,
+
+    /// Encode backend for router tokenization. fast uses fastokens for encoding and HF for
+    /// decoding, falling back to hf when fastokens cannot load the tokenizer.
+    #[arg(long, value_enum, default_value = "hf", value_name = "BACKEND")]
+    pub tokenizer_backend: TokenizerBackend,
+
+    /// L1 prefix-tokenization cache budget in MiB; 0 disables it. Reuses the tokens of a
+    /// previously encoded prompt up to its deepest shared special-token boundary, so a
+    /// multi-turn chat encodes only its new turns.
+    #[arg(long, default_value_t = 0, value_name = "MB")]
+    pub tokenizer_l1_cache_mb: usize,
 
     /// Same as SGLang's --default-chat-template-kwargs; must match the workers.
     #[arg(long, value_name = "JSON")]
@@ -116,6 +133,11 @@ pub struct ServerArgs {
     /// Omitting this assumes 30 seconds; this flag does not change the pod spec.
     #[arg(long)]
     pub termination_grace_secs: Option<u64>,
+
+    /// API key the router sends on its own requests to workers (`/server_info`,
+    /// `/model_info`). Set it to the engines' `--api-key`.
+    #[arg(long)]
+    pub worker_api_key: Option<String>,
 
     /// Per-request upstream timeout in seconds.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
@@ -174,6 +196,11 @@ pub struct DiscoveryArgs {
     /// and every replica starts cold.
     #[arg(long)]
     pub kv_peer_selector: Option<String>,
+    /// EndpointSlice label key whose value is a worker's PD version group; a
+    /// prefill worker is paired only with decode workers of the same group.
+    /// Requires --prefill-selector and --decode-selector.
+    #[arg(long)]
+    pub pd_version_group_label: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -194,6 +221,10 @@ pub struct RoutingArgs {
     /// Policy used to select decode workers for PD requests.
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
+
+    /// Also pick the DP rank inside each selected multi-rank worker.
+    #[arg(long)]
+    pub dp_aware: bool,
 
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
@@ -252,6 +283,19 @@ pub struct CacheArgs {
     /// Defaults to 600000 (10 minutes).
     #[arg(long)]
     pub kv_bootstrap_timeout_ms: Option<u64>,
+
+    /// Cap on one peer-snapshot fetch in milliseconds; raise it when one
+    /// snapshot transfer + decode outgrows it. Requires --kv-peer-selector.
+    /// Defaults to 300000; at least 30000.
+    #[arg(long)]
+    pub kv_bootstrap_fetch_timeout_cap_ms: Option<u64>,
+
+    /// Hold `/readyz` at 503 when siblings were found but their tree could not
+    /// be pulled. The hold is bounded at max(3x --kv-bootstrap-timeout-ms,
+    /// 60s) and nothing re-sweeps during it, so it delays a failed seed's
+    /// replica rather than keeping it out for good. Requires --kv-peer-selector.
+    #[arg(long)]
+    pub kv_bootstrap_seed_required: bool,
 
     /// Minimum cache-hit tokens for a candidate. Defaults to 1024.
     #[arg(long)]
@@ -387,14 +431,20 @@ impl Cli {
             .transpose()?;
         let circuit_breaker = self.routing.build_circuit_breaker()?;
         let kv_bootstrap_timeout_ms = self.cache.kv_bootstrap_timeout_ms;
+        let kv_bootstrap_fetch_timeout_cap_ms = self.cache.kv_bootstrap_fetch_timeout_cap_ms;
+        let kv_bootstrap_seed_required = self.cache.kv_bootstrap_seed_required;
         let cache_aware = self.cache.into_config(self.routing.policy)?;
         // Peer bootstrap grafts into this router's own radix tree, so it needs
         // cache-aware over a local tree; checked here because it spans groups.
         let has_peer_selector = discovery.peer_selector().is_some();
         ensure!(
-            has_peer_selector || kv_bootstrap_timeout_ms.is_none(),
-            "--kv-bootstrap-timeout-ms requires --kv-peer-selector, which is what \
-             enables peer bootstrap"
+            has_peer_selector
+                || (kv_bootstrap_timeout_ms.is_none()
+                    && kv_bootstrap_fetch_timeout_cap_ms.is_none()
+                    && !kv_bootstrap_seed_required),
+            "--kv-bootstrap-timeout-ms / --kv-bootstrap-fetch-timeout-cap-ms / \
+             --kv-bootstrap-seed-required require --kv-peer-selector, which is \
+             what enables peer bootstrap"
         );
         if has_peer_selector {
             match cache_aware.as_ref().map(|c| c.prefix_provider) {
@@ -431,26 +481,39 @@ impl Cli {
             .context("--default-chat-template-kwargs must be a JSON object")?
             .unwrap_or_default();
 
+        let worker_auth = self
+            .server
+            .worker_api_key
+            .as_deref()
+            .map(bearer)
+            .transpose()?;
         let config = Config {
             server: ServerConfig {
                 host: self.server.host,
                 port: self.server.port,
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
+                worker_auth,
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
                 log_format: self.server.log_format,
             },
             model: ModelConfig {
-                tokenizer_path: self
-                    .model
-                    .tokenizer_path
-                    .unwrap_or_else(|| self.model.model_id.clone()),
+                tokenizer_path: (!self.model.no_tokenizer).then(|| {
+                    self.model
+                        .tokenizer_path
+                        .unwrap_or_else(|| self.model.model_id.clone())
+                }),
                 id: self.model.model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
+                tokenizer: TokenizerConfig {
+                    backend: self.model.tokenizer_backend,
+                    l1_cache_mb: self.model.tokenizer_l1_cache_mb,
+                },
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
+                dp_aware: self.routing.dp_aware,
                 bucket_config,
                 circuit_breaker,
                 cache_aware,
@@ -498,9 +561,10 @@ impl DiscoveryArgs {
                     self.service_discovery_namespace.is_none()
                         && self.selector.is_empty()
                         && self.prefill_selector.is_empty()
-                        && self.decode_selector.is_empty(),
+                        && self.decode_selector.is_empty()
+                        && self.pd_version_group_label.is_none(),
                     "--service-discovery-namespace / --selector / --prefill-selector / \
-                         --decode-selector require --service-discovery"
+                         --decode-selector / --pd-version-group-label require --service-discovery"
                 );
                 // Peer replicas are found through EndpointSlices too, so with
                 // any other backend the flag would be accepted and then
@@ -520,6 +584,17 @@ impl DiscoveryArgs {
                     join_selector(&self.prefill_selector).as_deref(),
                     join_selector(&self.decode_selector).as_deref(),
                 )?;
+                let version_group_label = self.pd_version_group_label;
+                if let Some(label) = &version_group_label {
+                    ensure!(
+                        matches!(mode, K8sDiscoveryMode::PdDisaggregation { .. }),
+                        "--pd-version-group-label requires --prefill-selector and --decode-selector"
+                    );
+                    ensure!(
+                        !label.trim().is_empty(),
+                        "--pd-version-group-label must not be empty"
+                    );
+                }
                 // An empty selector matches every EndpointSlice in the watched
                 // namespace(s), turning unrelated Services into "siblings".
                 ensure!(
@@ -533,6 +608,7 @@ impl DiscoveryArgs {
                     namespace: self.service_discovery_namespace.unwrap_or_default(),
                     mode,
                     peer_selector: self.kv_peer_selector,
+                    version_group_label,
                 })
             }
         };
@@ -686,6 +762,10 @@ impl CacheArgs {
             bootstrap_timeout_ms: self
                 .kv_bootstrap_timeout_ms
                 .unwrap_or(DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS),
+            bootstrap_fetch_timeout_cap_ms: self
+                .kv_bootstrap_fetch_timeout_cap_ms
+                .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
+            bootstrap_seed_required: self.kv_bootstrap_seed_required,
         }))
     }
 }
@@ -913,11 +993,20 @@ fn join_selector(terms: &[String]) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(","))
 }
 
+/// `Bearer <key>`, marked sensitive so it stays out of `Debug` output.
+fn bearer(key: &str) -> Result<HeaderValue> {
+    let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
+        .context("--worker-api-key is not a valid HTTP header value")?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+        DiscoveryBackend, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+        MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
     };
 
     #[test]
@@ -1156,7 +1245,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
-        assert_eq!(c.model.tokenizer_path, "Qwen/Qwen3-0.6B");
+        assert_eq!(c.model.tokenizer_path.as_deref(), Some("Qwen/Qwen3-0.6B"));
     }
 
     #[test]
@@ -1170,7 +1259,25 @@ mod tests {
             "http://x:30000",
         ])
         .unwrap();
-        assert_eq!(c.model.tokenizer_path, "/models/qwen3/tokenizer.json");
+        assert_eq!(
+            c.model.tokenizer_path.as_deref(),
+            Some("/models/qwen3/tokenizer.json")
+        );
+    }
+
+    #[test]
+    fn no_tokenizer_disables_loading_and_conflicts_with_a_path() {
+        let base = ["--model-id", "qwen3", "--worker-urls", "http://x:30000"];
+        let c = into_config(&[&base[..], &["--no-tokenizer"]].concat()).unwrap();
+        assert_eq!(c.model.tokenizer_path, None);
+        assert!(into_config(
+            &[
+                &base[..],
+                &["--no-tokenizer", "--tokenizer-path", "/t.json"]
+            ]
+            .concat()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1237,6 +1344,13 @@ mod tests {
         ];
         args.extend_from_slice(extra);
         into_config_owned(with_model(&args))
+    }
+
+    /// The resolved cache config of a peer-bootstrap-enabled `peer_cfg`.
+    fn bootstrap_cache_cfg(extra: &[&str]) -> CacheAwareConfig {
+        let mut args = vec!["--kv-peer-selector", "app=sgl-router"];
+        args.extend_from_slice(extra);
+        peer_cfg(&args).unwrap().model.cache_aware.unwrap()
     }
 
     #[test]
@@ -1343,15 +1457,6 @@ mod tests {
         assert!(err.contains("greater than zero"), "got: {err}");
     }
 
-    /// Without a selector the timeout tunes a bootstrap that never runs.
-    #[test]
-    fn rejects_bootstrap_timeout_without_a_peer_selector() {
-        let err = peer_cfg(&["--kv-bootstrap-timeout-ms", "20000"])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("requires --kv-peer-selector"), "got: {err}");
-    }
-
     /// An empty selector matches every EndpointSlice in the namespace.
     #[test]
     fn rejects_an_empty_peer_selector() {
@@ -1361,6 +1466,59 @@ mod tests {
                 .to_string();
             assert!(err.contains("must not be empty"), "{selector:?} got: {err}");
         }
+    }
+
+    /// Without a selector these tune a bootstrap that never runs.
+    #[test]
+    fn rejects_bootstrap_tuning_without_a_peer_selector() {
+        for flag in [
+            vec!["--kv-bootstrap-seed-required"],
+            vec!["--kv-bootstrap-timeout-ms", "20000"],
+            vec!["--kv-bootstrap-fetch-timeout-cap-ms", "60000"],
+        ] {
+            let err = peer_cfg(&flag).unwrap_err().to_string();
+            assert!(
+                err.contains("require --kv-peer-selector"),
+                "{flag:?} got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_bootstrap_fetch_timeout_cap_bounds() {
+        let parse = |ms: u64| {
+            peer_cfg(&[
+                "--kv-peer-selector",
+                "app=sgl-router",
+                "--kv-bootstrap-fetch-timeout-cap-ms",
+                &ms.to_string(),
+            ])
+        };
+        let plumbed = |ms: u64| {
+            bootstrap_cache_cfg(&["--kv-bootstrap-fetch-timeout-cap-ms", &ms.to_string()])
+                .bootstrap_fetch_timeout_cap_ms
+        };
+        assert_eq!(
+            plumbed(MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
+            MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS
+        );
+        assert_eq!(
+            plumbed(MAX_KV_BOOTSTRAP_TIMEOUT_MS),
+            MAX_KV_BOOTSTRAP_TIMEOUT_MS
+        );
+        for ms in [
+            MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS - 1,
+            MAX_KV_BOOTSTRAP_TIMEOUT_MS + 1,
+        ] {
+            let err = parse(ms).unwrap_err().to_string();
+            assert!(err.contains("out of range"), "{ms} got: {err}");
+        }
+    }
+
+    #[test]
+    fn seed_required_is_off_by_default_and_opt_in() {
+        assert!(!bootstrap_cache_cfg(&[]).bootstrap_seed_required);
+        assert!(bootstrap_cache_cfg(&["--kv-bootstrap-seed-required"]).bootstrap_seed_required);
     }
 
     #[test]
@@ -1476,6 +1634,69 @@ mod tests {
                 }
             ),
             _ => panic!("expected k8s backend"),
+        }
+    }
+
+    const PD_K8S: [&str; 5] = [
+        "--service-discovery",
+        "--prefill-selector",
+        "app=sglang,role=prefill",
+        "--decode-selector",
+        "app=sglang,role=decode",
+    ];
+
+    #[test]
+    fn pd_version_group_label_reaches_k8s_config() {
+        let args: Vec<_> = PD_K8S
+            .iter()
+            .copied()
+            .chain(["--pd-version-group-label", "sglang.ai/version-group"])
+            .collect();
+        let config = into_config_owned(with_model(&args)).unwrap();
+        let DiscoveryBackend::K8s(discovery) = config.discovery else {
+            panic!("expected k8s")
+        };
+        assert_eq!(
+            discovery.version_group_label.as_deref(),
+            Some("sglang.ai/version-group")
+        );
+    }
+
+    #[test]
+    fn rejects_pd_version_group_label_outside_k8s_pd() {
+        for (args, expected) in [
+            (
+                vec![
+                    "--worker-urls",
+                    "http://x:30000",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "require --service-discovery",
+            ),
+            (
+                vec![
+                    "--service-discovery",
+                    "--selector",
+                    "app=sglang",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "requires --prefill-selector and --decode-selector",
+            ),
+            (
+                PD_K8S
+                    .iter()
+                    .copied()
+                    .chain(["--pd-version-group-label", " "])
+                    .collect(),
+                "must not be empty",
+            ),
+        ] {
+            let err = into_config_owned(with_model(&args))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "args={args:?} got: {err}");
         }
     }
 
@@ -2662,6 +2883,29 @@ mod tests {
         ]))
         .unwrap();
         assert!(disabled.model.disable_input_ids_forwarding);
+    }
+
+    #[test]
+    fn tokenizer_backend_and_l1_cache_are_plumbed() {
+        let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(defaults.model.tokenizer, TokenizerConfig::default());
+        assert_eq!(defaults.model.tokenizer.backend, TokenizerBackend::Hf);
+        let fast = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--tokenizer-backend",
+            "fast",
+            "--tokenizer-l1-cache-mb",
+            "4096",
+        ]))
+        .unwrap();
+        assert_eq!(
+            fast.model.tokenizer,
+            TokenizerConfig {
+                backend: TokenizerBackend::Fast,
+                l1_cache_mb: 4096,
+            }
+        );
     }
 
     #[test]

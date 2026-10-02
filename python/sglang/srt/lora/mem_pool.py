@@ -180,7 +180,7 @@ class LoRAMemoryPool:
         )
 
         # Per-expert MoE weights are sharded by `moe_tp_size`, NOT the outer
-        # `tp_size`: `moe_tp_size = tp_size // ep_size // dp_size`, so under
+        # `tp_size`: `moe_tp_size = tp_size // ep_size // moe_dp_size`, so under
         # e.g. `--tp 4 --ep 4` each rank holds full-width expert weights
         # (`moe_tp_size == 1`). Sizing per-expert LoRA buffers by `tp_size`
         # here would yield a 4x-narrower inner dim than the adapter weight
@@ -190,7 +190,7 @@ class LoRAMemoryPool:
         self.moe_tp_size, self.moe_tp_rank = _get_moe_tp_context()
 
         # Attention projections shard along the attention TP group, which
-        # under `--enable-dp-attention` is `attn_tp_size = tp_size // dp_size`.
+        # under attention DP is `attn_tp_size = tp_size // attn_dp_size`.
         # The corresponding LoRA wrappers slice weights by the base layer's
         # attn_tp-local rank, so the buffer shapes must match that shard.
         self.attn_tp_size: int = attn_tp_size
@@ -273,7 +273,7 @@ class LoRAMemoryPool:
         """TP width the module's weights are actually sharded along: routed
         MoE experts shard by `moe_tp_size` (shared experts by the outer
         `tp_size` at EP=1), attention projections by `attn_tp_size` (smaller
-        than the outer `tp_size` under `--enable-dp-attention`), everything
+        than the outer `tp_size` under attention DP), everything
         else by the outer `tp_size`."""
         if self.is_moe_module(module_name) and not self.is_shared_moe_module(
             module_name

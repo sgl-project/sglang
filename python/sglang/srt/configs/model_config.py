@@ -88,6 +88,8 @@ SWA_SINK_ARCHS = frozenset(
         "GptOssForCausalLM",
         "GraniteSWAForCausalLM",
         "GraniteMoeSWAForCausalLM",
+        "IQuestQ1ForCausalLM",
+        "IQuestQ1MTP",
     }
 )
 
