@@ -9,8 +9,12 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_sample_path
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4A16LinearMethod
+from sglang.srt.layers.linear import LinearBase, ReplicatedLinear
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4LinearMethod,
+    ModelOptNvFp4A16LinearMethod,
+)
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.lilicorr_utils import (
@@ -26,6 +30,20 @@ def _apply_2d(layer: ReplicatedLinear, x: torch.Tensor) -> torch.Tensor:
     # Quantized linear methods take [tokens, features] input.
     out, _ = layer(x.reshape(-1, x.shape[-1]))
     return out.view(*x.shape[:-1], -1)
+
+
+def _is_nvfp4_a16(module: nn.Module) -> bool:
+    return isinstance(module, LinearBase) and isinstance(
+        module.quant_method, ModelOptNvFp4A16LinearMethod
+    )
+
+
+def _runs_fp4_marlin(module: nn.Module) -> bool:
+    return _is_nvfp4_a16(module) or (
+        isinstance(module, LinearBase)
+        and isinstance(module.quant_method, ModelOptFp4LinearMethod)
+        and get_fp4_gemm_runner_backend().is_marlin()
+    )
 
 
 class LiLiCorrMLP(nn.Module):
@@ -446,9 +464,7 @@ def check_head_weight_coverage(head: LiLiCorrHead, seen: set) -> None:
     optional = {
         f"lilicorr.{name}.input_scale"
         for name, module in head.named_modules()
-        if isinstance(
-            getattr(module, "quant_method", None), ModelOptNvFp4A16LinearMethod
-        )
+        if _is_nvfp4_a16(module)
     }
     missing = sorted(expected - optional - seen)
     if missing:
@@ -526,10 +542,9 @@ class LiLiCorrDraftModel(DFlashDraftModel):
         # Every TP rank runs the replicated head, so its draft must match bit for bit.
         # Marlin's atomic-add reduce at the head's shapes does not.
         if get_parallel().tp_size > 1 and any(
-            isinstance(getattr(m, "quant_method", None), ModelOptNvFp4A16LinearMethod)
-            for m in self.lilicorr.modules()
+            _runs_fp4_marlin(m) for m in self.lilicorr.modules()
         ):
-            raise ValueError("A W4A16 LiLiCorr head requires tp_size 1.")
+            raise ValueError("A LiLiCorr head on NVFP4 Marlin requires tp_size 1.")
 
     def set_block_size(self, block_size: int) -> None:
         super().set_block_size(block_size)
