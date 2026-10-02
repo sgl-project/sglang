@@ -2965,7 +2965,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 raise RuntimeError(
                     f"PD Disaggregation via NIXL does NOT support {st} hybrid models yet."
                 )
-            if h is not None:
+            if h is None:
+                # Counted no-op components (empty tail or no local PP layers)
+                # still need to satisfy decode's component completion count.
+                self._post_notif(peer_name, comp_notif)
+            else:
                 handles.append(h)
         return handles
 

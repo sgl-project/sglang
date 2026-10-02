@@ -229,6 +229,13 @@ class Rig:
         kinds = {
             "dsa": (StateType.DSA, [8, 0, 16], self.source, self.destination),
             "mamba": (StateType.MAMBA, [24, 40], np.array([5]), np.array([9])),
+            # seq_len % index_kpool == 0: no live tail tokens, still counted.
+            "empty_tail": (
+                StateType.DSA_TAIL,
+                [8],
+                np.array([], int),
+                np.array([], int),
+            ),
         }
         self.components = [kinds[k] for k in state]
         self.state_items = [n for _, items, _, _ in self.components for n in items]
@@ -646,6 +653,43 @@ class HostStagingTest(unittest.TestCase):
                         self.assertFalse(rig.handler.staging_allocator.allocations)
                 self.assertNotEqual(decoded[False], fresh)  # Native wrote bytes.
                 self.assertEqual(decoded[True], decoded[False])
+
+    def test_counted_empty_tail_completes_in_both_transports(self):
+        for host in (False, True):
+            with self.subTest(host=host):
+                rig = Rig(host=host, state=("dsa", "empty_tail"))
+                status = rig.decode.transfer_statuses[ROOM]
+                self.assertEqual(rig.drive(timeout=1), [rig.req.req])
+                rig.assert_bytes(self)
+                self.assertEqual(status.expected_state_per_pp, {0: 2})
+                self.assertEqual(status.received_state_per_pp[0], {0, 1})
+
+    def test_counted_state_with_no_matching_pp_layers_notifies(self):
+        for host in (False, True):
+            with self.subTest(host=host):
+                rig = Rig(host=host, state=("dsa",))
+                manager = rig.prefill
+                manager.pp_size = 2
+                manager.kv_args.state_types = [StateType.SWA]
+                # This PP stage has no buffers for the counted component.
+                manager.kv_args.state_data_ptrs = [[]]
+                manager.kv_args.state_item_lens = [[]]
+                with patch.object(manager, "_post_notif") as notify:
+                    handles = manager.maybe_send_extra(
+                        peer_name="decode",
+                        prefill_state_indices=[rig.source],
+                        dst_state_data_ptrs=rig.decode.kv_args.state_data_ptrs,
+                        dst_state_indices=[rig.destination],
+                        dst_gpu_id=0,
+                        notif=f"{ROOM}_state_0",
+                        decode_tp_size=1,
+                        dst_state_item_lens=rig.decode.kv_args.state_item_lens,
+                    )
+                self.assertEqual(handles, [])
+                notify.assert_called_once_with("decode", f"{ROOM}_state_0_0_1")
+                self.assertFalse(manager.agent.handles)  # No native WRITE.
+                if host:
+                    self.assertFalse(manager.host_staging.queue)  # No staged WRITE.
 
     def test_mamba_and_dsa_components_land_and_all_count(self):
         # Two state components: Mamba (whole-slot rows) and DSA (page rows) take
