@@ -33,6 +33,7 @@ from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
 import torch
 from torch.profiler import record_function
 
+from sglang.kernels.ops.kvcache.copy_pages import copy_pages
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -642,10 +643,13 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
         src_pages = src_loc.view(-1, ps)[:, 0] // ps
         with record_function("UnifiedMHA.move_kv_cache"):
-            env = self._unified_buffer._raw[: self._num_pages * self._page_bytes].view(
-                self._num_pages, self._page_bytes
+            copy_pages(
+                self._unified_buffer._raw,
+                tgt_pages,
+                src_pages,
+                self._num_pages,
+                self._page_bytes,
             )
-            env[tgt_pages] = env[src_pages]
 
     def get_contiguous_buf_infos(self):
         """Register the raw buffer as physical page envelopes for PD transfer.
@@ -767,10 +771,13 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
         src_pages = src_loc.view(-1, ps)[:, 0] // ps
         with record_function("UnifiedMLA.move_kv_cache"):
-            env = self._unified_buffer._raw[: self._num_pages * self._page_bytes].view(
-                self._num_pages, self._page_bytes
+            copy_pages(
+                self._unified_buffer._raw,
+                tgt_pages,
+                src_pages,
+                self._num_pages,
+                self._page_bytes,
             )
-            env[tgt_pages] = env[src_pages]
 
     def zero_physical_pages(self, phys_pages: torch.Tensor) -> None:
         """Zero whole page envelopes (PHYSICAL page ids) on allocator
