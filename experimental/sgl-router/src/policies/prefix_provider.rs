@@ -24,15 +24,7 @@ impl RadixTreePrefixProvider {
     }
 
     pub fn match_request_tokens(&self, tokens: &[u32]) -> Option<ExternalPrefixSignal> {
-        let block_size = self.block_size_oracle.get()?;
-        let hashes = if self.block_size_oracle.is_bigram() {
-            compute_block_hashes_bigram(tokens, block_size as usize)
-        } else {
-            compute_block_hashes(tokens, block_size as usize)
-        };
-        if hashes.is_empty() {
-            return None;
-        }
+        let hashes = self.block_hashes(tokens)?;
 
         let mut depth_by_url = BTreeMap::<String, u32>::new();
         for (worker, depth) in self.tree.prefix_depths(None, &hashes) {
@@ -58,5 +50,28 @@ impl RadixTreePrefixProvider {
             },
             query_blocks: hashes.len(),
         })
+    }
+
+    /// `(dp_rank, cached prefix blocks)` for each rank of `worker_url`.
+    pub fn rank_depths(&self, tokens: &[u32], worker_url: &str) -> Vec<(u32, usize)> {
+        let Some(hashes) = self.block_hashes(tokens) else {
+            return Vec::new();
+        };
+        self.tree
+            .prefix_depths(None, &hashes)
+            .into_iter()
+            .filter(|(worker, _)| worker.url == worker_url)
+            .map(|(worker, depth)| (worker.dp_rank, depth))
+            .collect()
+    }
+
+    fn block_hashes(&self, tokens: &[u32]) -> Option<Vec<i64>> {
+        let block_size = self.block_size_oracle.get()?;
+        let hashes = if self.block_size_oracle.is_bigram() {
+            compute_block_hashes_bigram(tokens, block_size as usize)
+        } else {
+            compute_block_hashes(tokens, block_size as usize)
+        };
+        (!hashes.is_empty()).then_some(hashes)
     }
 }
