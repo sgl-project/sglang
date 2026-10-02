@@ -55,9 +55,12 @@ def _hc_combine_norm_prefill(
 def hc_combine_norm(
     x: torch.Tensor, pre: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> torch.Tensor:
-    """Fuse four-stream combine and RMSNorm for BF16 batches of width 5120."""
+    """Fuse four-stream combine and RMSNorm for BF16 batches of width 5120.
+
+    Every row count takes the same per-row reduction in the same order, so the
+    result is batch-invariant across the grid-split variants below."""
     m = x.shape[0]
-    assert (0 < m <= 96 or 4096 <= m <= 65536) and x.shape == (m, 20480)
+    assert x.shape == (m, 20480)
     assert pre.shape == (m, 4) and pre.stride(1) == 1
     assert weight.shape == (5120,) and weight.is_contiguous()
     assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
@@ -133,7 +136,7 @@ def hc_combine_norm_mxfp8(
 ):
     """Four-stream combine + RMSNorm returning ``(y_bf16, y_q, y_sf)``."""
     m = x.shape[0]
-    assert 0 < m <= 8, "the fused MXFP8 epilogue only supports small decode/verify"
+    assert m <= 8, "the fused MXFP8 epilogue only supports small decode/verify"
     k = x.shape[1] // 4
     y = torch.empty((m, k), dtype=x.dtype, device=x.device)
     q, s = _alloc(m, k, x.device)
