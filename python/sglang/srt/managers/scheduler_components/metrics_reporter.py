@@ -832,7 +832,6 @@ class SchedulerMetricsReporter:
             self.num_retracted_reqs = self.num_paused_reqs = 0
 
             # PD disaggregation
-            self.stats.num_decode_deferred_kv_release_reqs = 0
             if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_prefill_bootstrap_queue.queue,
@@ -1060,7 +1059,6 @@ class SchedulerMetricsReporter:
             self.num_retracted_reqs = self.num_paused_reqs = 0
 
             # PD disaggregation
-            self.stats.num_decode_deferred_kv_release_reqs = 0
             if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_prefill_bootstrap_queue.queue,
@@ -1432,7 +1430,6 @@ class SchedulerMetricsReporter:
             self.scheduler.waiting_queue, priority_enabled
         )
         self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
-        self.stats.num_decode_deferred_kv_release_reqs = 0
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_prefill_bootstrap_queue.queue, priority_enabled
