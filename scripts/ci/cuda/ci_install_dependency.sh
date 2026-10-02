@@ -148,6 +148,27 @@ cleanup_stale_shm() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+repair_stale_nvidia_dkms() {
+    # GDRCopy used to install nvidia-dkms-580, whose nvidia-firmware-580
+    # dependency collides with the host firmware the NVIDIA container runtime
+    # mounts in. The failed install leaves packages unpacked but unconfigured,
+    # and apt then refuses every later install. Drop those packages and finish
+    # configuring the rest. Removable once no runner still has them.
+    local -a stale_nvidia_packages
+    mapfile -t stale_nvidia_packages < <(
+        dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' \
+            'nvidia-dkms-*' 'nvidia-kernel-common-*' 'nvidia-kernel-source-*' 2>/dev/null |
+            awk 'substr($1, 2, 1) !~ /[nci]/ || substr($1, 3, 1) != "" {print $2}'
+    )
+    if [ "${#stale_nvidia_packages[@]}" -gt 0 ]; then
+        echo "Removing half-installed packages: ${stale_nvidia_packages[*]}"
+        dpkg --remove --force-depends "${stale_nvidia_packages[@]}"
+        dpkg --configure -a
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 is_apt_package_installed() {
     local name
     # Ubuntu 24.04 renamed time64 libraries (librdmacm1 -> librdmacm1t64);
@@ -217,25 +238,10 @@ install_gdrcopy() {
 
     local gdrcopy_root=/opt/gdrcopy
     local gdrcopy_version=2.5.1
-    # Userspace libgdrapi only: the gdrdrv kernel module comes from the host,
-    # and the gdrcopy test tools are unused.
+    # Userspace libgdrapi only: the gdrdrv kernel module comes from the host
+    # and must be exposed to the container, and the gdrcopy test tools are
+    # unused.
     local -a gdrcopy_packages=(devscripts debhelper fakeroot)
-
-    # The former nvidia-dkms-580 install can be left unpacked but unconfigured
-    # when its nvidia-firmware-580 dependency collides with the host firmware
-    # the NVIDIA container runtime mounts in, and apt then refuses every later
-    # install. Drop those packages and finish configuring the rest.
-    local -a stale_nvidia_packages
-    mapfile -t stale_nvidia_packages < <(
-        dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' \
-            'nvidia-dkms-*' 'nvidia-kernel-common-*' 'nvidia-kernel-source-*' 2>/dev/null |
-            awk '$1 ~ /^i/ && $1 != "ii" {print $2}'
-    )
-    if [ "${#stale_nvidia_packages[@]}" -gt 0 ]; then
-        echo "Removing half-installed packages: ${stale_nvidia_packages[*]}"
-        dpkg --remove --force-depends "${stale_nvidia_packages[@]}"
-        dpkg --configure -a
-    fi
 
     apt-get update || true
     apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
@@ -909,6 +915,7 @@ main() {
     detect_host
     kill_existing_processes
     cleanup_stale_shm
+    repair_stale_nvidia_dkms
     install_apt_packages
     install_gdrcopy
     clean_site_packages
