@@ -74,12 +74,15 @@ class TestDSV4CompressedPools(CustomTestCase):
         self.assertEqual(pool.get_state_buf_infos(), ([], [], []))
 
     def test_pp_mapping_and_pd_buffer_order(self):
-        for unified, stage_ratios in product(
-            (False, True), ([4, 0, 128, 4], [128], [0])
+        for unified, fp8, stage_ratios in product(
+            (False, True), (False, True), ([4, 0, 128, 4], [128], [0])
         ):
-            with self.subTest(unified=unified, stage_ratios=stage_ratios):
+            if fp8 and not unified:
+                continue
+            with self.subTest(unified=unified, fp8=fp8, stage_ratios=stage_ratios):
                 pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
                 pool._unified_kv = unified
+                pool._unified_kv_fp8 = fp8
                 pool.uniform_fp8 = False
                 pool.kv_layout = KVLayout.V4
                 pool.compressed_kv_layout_option = None
@@ -142,8 +145,13 @@ class TestDSV4CompressedPools(CustomTestCase):
                     buffers = [
                         torch.empty((9, 8), dtype=torch.uint8) for _ in stage_ratios
                     ]
+                    rope_buffers = [
+                        torch.empty((9, 16), dtype=torch.uint8) for _ in stage_ratios
+                    ]
                     pool.unified_kv_pool = SimpleNamespace(
-                        swa_pages=2, kv_buffer=buffers
+                        swa_pages=2,
+                        kv_buffer=buffers,
+                        kv_buffer_rope=rope_buffers,
                     )
 
                     def kv_entries(ratio):
@@ -152,6 +160,14 @@ class TestDSV4CompressedPools(CustomTestCase):
                             for buf, r in zip(buffers, stage_ratios)
                             if r == ratio
                         ]
+
+                    def rope_entries(ratio):
+                        return [
+                            (buf.data_ptr() + 32, 112, 256 // ratio * 16)
+                            for buf, r in zip(rope_buffers, stage_ratios)
+                            if r == ratio
+                        ]
+
                 else:
 
                     def kv_entries(ratio):
@@ -160,10 +176,22 @@ class TestDSV4CompressedPools(CustomTestCase):
                             for b in pool.kv_pools[ratio].kv_buffer
                         ]
 
+                    def rope_entries(ratio):
+                        return []
+
                 indexer_entries = [
                     (b.data_ptr(), b.nbytes, b[0].nbytes) for b in indexer_buffers
                 ]
-                expected = kv_entries(4) + indexer_entries + kv_entries(128)
+                if fp8:
+                    expected = (
+                        kv_entries(4)
+                        + rope_entries(4)
+                        + indexer_entries
+                        + kv_entries(128)
+                        + rope_entries(128)
+                    )
+                else:
+                    expected = kv_entries(4) + indexer_entries + kv_entries(128)
                 actual = list(zip(*pool.get_contiguous_buf_infos()))
                 self.assertEqual(actual, expected)
 
@@ -327,6 +355,25 @@ class TestV41KVPoolLayouts(CustomTestCase):
             self.assertEqual(pool.kv_pools[ratio].page_size, PAGE_SIZE // ratio)
         # The 2-token c128 page is the only production page that pads.
         self.assertEqual(pool.kv_pools[128].bytes_per_page_padded, 1536)
+
+    def test_pd_entries_cover_the_c4_kv_page_count(self):
+        """The PD transfer walks every registered entry with the c4 KV pool's
+        page count, so the c4 indexer must reserve the same FULL logical page."""
+        pool = self.make_pool(
+            [0, 4, 128],
+            [],
+            KVLayout.V4,
+            c4_size=PAGE_SIZE,
+            c128_size=PAGE_SIZE // 32,
+            c4_state_pool_size=16,
+            c128_state_pool_size=16,
+        )
+        self.assertEqual(pool.c4_indexer_kv_pool.size, pool.c4_kv_pool.size)
+        _, data_lens, item_lens = pool.get_contiguous_buf_infos()
+        rows = [n // item for n, item in zip(data_lens, item_lens)]
+        c4_kv_rows = _num_dsv4_physical_kv_pages(PAGE_SIZE, PAGE_SIZE // 4, PAGE_SIZE)
+        self.assertEqual(rows[:2], [c4_kv_rows] * 2)  # c4 KV, then its indexer
+        self.assertEqual(min(rows), c4_kv_rows)
 
 
 class TestPagedDSparkWithEncoderReplay(CustomTestCase):

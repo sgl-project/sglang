@@ -85,6 +85,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
+    is_hip,
     is_npu,
     is_pin_memory_available,
 )
@@ -94,6 +95,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 
@@ -365,6 +367,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+        self._simulate_acc_greedy = (
+            _is_hip
+            and self._simulate_acc_len > 0
+            and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
+        )
         if (
             self._simulate_acc_len > 0
             and self._simulate_acc_len != 1.0
@@ -839,6 +846,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
+        # Simulated acceptance overrides correct_len, so only the bonus token needs the
+        # request's temperature: draft + accept run greedy, the bonus is still sampled.
+        simulate_bonus_sampling_info = None
+        if (
+            self._simulate_acc_greedy
+            and sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and not batch.has_grammar
+            and verify_logits_adjustments_are_noop(sampling_info)
+            and not sampling_info.need_top_p_sampling
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_min_p_sampling
+        ):
+            simulate_bonus_sampling_info = sampling_info
+            sampling_info = None
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -963,6 +985,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+            simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,

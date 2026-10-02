@@ -34,11 +34,12 @@ async fn failover_when_one_worker_dies() {
         observability: Default::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: Some(CircuitBreakerConfig {
                 threshold: std::num::NonZeroU32::new(1).unwrap(), // open after first failure
