@@ -9,6 +9,7 @@ small quant_info payload and route through ``MoeRunner``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -262,6 +263,28 @@ def _sm120_moe_gemv_enabled() -> bool:
     return os.environ.get("SGLANG_NEMOTRON_MOE_GEMV", "1") == "1"
 
 
+@lru_cache(maxsize=1)
+def _sm120_mtp_mma_enabled() -> bool:
+    import os
+
+    # This implementation preserves FlashInfer's default FP4 quantizer and
+    # fused FC2 epilogue. Other quantization recipes retain the stock runner.
+    return (
+        envs.SGLANG_SM120_MTP_MOE_MMA.get()
+        and torch.cuda.get_device_capability() == (12, 0)
+        and envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
+        and not envs.FLASHINFER_NVFP4_4OVER6.get()
+        and os.environ.get("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0"
+        and os.environ.get("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0"
+    )
+
+
+def _flashinfer_autotune_active() -> bool:
+    from flashinfer.autotuner import AutoTuner
+
+    return AutoTuner.get().is_tuning_mode
+
+
 def _run_flashinfer_cutlass(
     *,
     dispatch_output,
@@ -279,6 +302,47 @@ def _run_flashinfer_cutlass(
     x, x_sf, output_dtype, output_col = _prepare_input(
         dispatch_output, quant_info, runner_config
     )
+
+    # Native small-M NVFP4 MoE uses the actual CUTLASS-swizzled scales.
+    if (
+        quant_info.quant_type == "fp4"
+        and not runner_config.is_gated
+        and runner_config.activation == "relu2"
+        and x.ndim == 2
+        and 1 <= x.shape[0] <= 16
+        and x.shape[1] == 1024
+        and x_sf is None
+        and x.dtype == output_dtype == torch.bfloat16
+        and quant_info.moe_ep_size == quant_info.moe_tp_size == 1
+        and not enable_alltoall
+        and quant_info.w13_weight.shape == (512, 2688, 512)
+        and quant_info.w2_weight.shape == (512, 1024, 1344)
+        and topk_ids.shape == (x.shape[0], 22)
+        and _sm120_mtp_mma_enabled()
+        # Keep the original tuning forward: FlashInfer 0.6.18 shares mutable
+        # MoERunner bucket state across target and draft quantization types.
+        # Bypassing target calls during tuning changes draft tactic keys.
+        and not _flashinfer_autotune_active()
+    ):
+        from sglang.kernels.ops.gemm.sm120_nvfp4_moe_mtp_mma import (
+            nvfp4_moe_mtp_mma,
+        )
+
+        qs = quant_info.quant_scales
+        return nvfp4_moe_mtp_mma(
+            x,
+            quant_info.w13_weight,
+            qs[1],
+            quant_info.w2_weight,
+            qs[4],
+            qs[2],
+            qs[5],
+            qs[0],
+            qs[3],
+            topk_ids,
+            topk_weights,
+            out=output,
+        )
 
     # SM120 decode fast path: M=1 NVFP4 non-gated ReLU^2 grouped GEMV.
     if (
@@ -306,9 +370,7 @@ def _run_flashinfer_cutlass(
         if use_nvfp4_moe_gemv(1, n1, k1, n2, k2):
             qs = quant_info.quant_scales
             if output is None:
-                output = torch.empty(
-                    1, output_col, dtype=output_dtype, device=x.device
-                )
+                output = torch.empty(1, output_col, dtype=output_dtype, device=x.device)
             nvfp4_moe_gemv_decode(
                 x,
                 w13,
@@ -323,9 +385,7 @@ def _run_flashinfer_cutlass(
                 topk_weights,
                 out=output,
             )
-            return _maybe_apply_routed_scaling_factor(
-                output, quant_info, runner_config
-            )
+            return _maybe_apply_routed_scaling_factor(output, quant_info, runner_config)
 
     if output is None:
         with use_symmetric_memory(

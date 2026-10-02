@@ -67,23 +67,23 @@ _deep_gemm_layout_memory_budget_initialized = False
 def _align_pipeline_layers(layers: list, layer_model) -> list:
     has_start_layer = hasattr(layer_model, "start_layer")
     has_end_layer = hasattr(layer_model, "end_layer")
-    assert has_start_layer == has_end_layer, (
-        "pipeline layer ranges must define start_layer and end_layer together"
-    )
+    assert (
+        has_start_layer == has_end_layer
+    ), "pipeline layer ranges must define start_layer and end_layer together"
     start_layer = layer_model.start_layer if has_start_layer else 0
     end_layer = layer_model.end_layer if has_end_layer else len(layer_model.layers)
-    assert isinstance(start_layer, int) and isinstance(end_layer, int), (
-        "pipeline layer ranges must define integer start_layer and end_layer"
-    )
+    assert isinstance(start_layer, int) and isinstance(
+        end_layer, int
+    ), "pipeline layer ranges must define integer start_layer and end_layer"
     assert 0 <= start_layer <= end_layer <= len(layer_model.layers), (
         f"invalid pipeline layer range [{start_layer}, {end_layer}) for "
         f"{len(layer_model.layers)} layers"
     )
     if len(layers) == len(layer_model.layers):
         return layers
-    assert len(layers) <= end_layer - start_layer, (
-        f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
-    )
+    assert (
+        len(layers) <= end_layer - start_layer
+    ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
     return (
         [None] * start_layer + layers + [None] * (len(layer_model.layers) - end_layer)
     )
@@ -94,6 +94,25 @@ def has_standard_gqa_for_all_local_layers(
 ) -> bool:
     """Check the layers materialized on this pipeline rank, not the full model."""
     return attention_layer_count >= end_layer - start_layer
+
+
+def has_hybrid_graph_handlers(
+    *,
+    attention_layers: list[Any],
+    moe_layers: list[Any],
+    start_layer: int,
+    end_layer: int,
+) -> bool:
+    """Accept pure MoE layers while rejecting gaps in the local decoder range."""
+    return (
+        0 <= start_layer < end_layer
+        and end_layer <= len(attention_layers)
+        and end_layer <= len(moe_layers)
+        and all(
+            attention_layers[i] is not None or moe_layers[i] is not None
+            for i in range(start_layer, end_layer)
+        )
+    )
 
 
 def index_attention_layers_by_global_id(
@@ -118,8 +137,13 @@ def index_attention_layers_by_global_id(
             )
         return attention_layers, mha_companion_layers
     max_layer_id = max(int(layer.layer_id) for layer in populated)
-    indexed_attention = [None] * (max_layer_id + 1)
-    indexed_companions = [None] * (max_layer_id + 1)
+    # Keep trailing pure MoE layers represented as well. Their graph handler
+    # lives in moe_layers, and shrinking this list loses decoder alignment.
+    indexed_size = max(
+        max_layer_id + 1, len(layer_model.layers) if layer_model is not None else 0
+    )
+    indexed_attention = [None] * indexed_size
+    indexed_companions = [None] * indexed_size
     has_reused_layers = False
     for attention, companion in zip(attention_layers, mha_companion_layers):
         if attention is None:
@@ -621,7 +645,18 @@ def capture_prefill_graph(
         layer_model,
     )
 
-    if not has_standard_gqa_for_all_local_layers(
+    supports_hybrid_graph = (
+        envs.SGLANG_NEMOTRON_MTP_PREFILL_GRAPH.get()
+        and type(layer_model).__name__ == "NemotronHModel"
+        and prefill_backend == Backend.BREAKABLE
+        and has_hybrid_graph_handlers(
+            attention_layers=model_runner.attention_layers,
+            moe_layers=model_runner.moe_layers,
+            start_layer=model_runner.layer_info.start_layer,
+            end_layer=model_runner.layer_info.end_layer,
+        )
+    )
+    if not supports_hybrid_graph and not has_standard_gqa_for_all_local_layers(
         attention_layer_count=sum(
             layer is not None for layer in model_runner.attention_layers
         ),
