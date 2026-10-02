@@ -17,7 +17,7 @@ import torch
 
 from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers import layernorm_sp
-from sglang.srt.layers.cp import interleave_boundary as dsa_cp
+from sglang.srt.layers.cp import interleave as dsa_cp
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.test.boundary_fixtures import finish_exit, make_test_stages, prepare_input
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -149,7 +149,7 @@ class TestAttentionCpBoundary(CustomTestCase):
                 ),
                 ((dsa_cp, "attn_cp_all_gather_into_tensor"), collectives["gather"]),
                 (
-                    (dsa_cp, "attn_cp_reduce_scatter_tensor"),
+                    (comm, "attn_cp_reduce_scatter_tensor"),
                     collectives["reduce_scatter"],
                 ),
             ]:

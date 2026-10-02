@@ -51,7 +51,8 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.runtime_context import get_parallel
 
 
-def attn_cp_gather(hidden_states: torch.Tensor):
+def attn_cp_interleave_gather(hidden_states: torch.Tensor):
+    """Gather equal padded interleave shards in rank order, not token order."""
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1

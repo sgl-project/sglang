@@ -128,7 +128,8 @@ def attn_tp_reduce_scatter(
     return local_hidden_states
 
 
-def attn_cp_reduce_scatter(hidden_states: torch.Tensor):
+def attn_cp_interleave_reduce_scatter(hidden_states: torch.Tensor):
+    """Sum rank-major output onto each rank's equal, padded interleave shard."""
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
@@ -363,7 +364,7 @@ def attn_cp_reduce_scatter_output(
 ):
     """DSA and MLA CP: sum the FFN output over the attention-CP group and
     keep this rank's shard."""
-    return attn_cp_reduce_scatter(hidden_states), residual
+    return attn_cp_interleave_reduce_scatter(hidden_states), residual
 
 
 def dp_cp_take_back_output(
@@ -403,8 +404,7 @@ def moe_cp_take_back_output(
     If DP>1, further scatter back to the local DP slice.
     """
     # Only scatter back during prefill; decode was never allgathered so no-op.
-    # Safe w.r.t. empty tensors: same reasoning as _then_moe_cp_gather
-    # — CP extend always has non-zero tokens per rank, and decode skips this path.
+    # CP extend has non-zero tokens per rank, and decode skips this path.
     rows = moe_cp_gathered_rows(forward_batch)
     if rows is not None:
         hidden_states = moe_cp_take_back(hidden_states, rows)

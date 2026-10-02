@@ -25,7 +25,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.cp.interleave import (
-    attn_cp_gather,
+    attn_cp_interleave_gather,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -43,7 +43,6 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
 from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
     _cp_shard_token_rows,
-    moe_cp_gathered_rows,
 )
 from sglang.srt.layers.layer_boundary.output import (
     DeferredFinalize,
@@ -415,7 +414,7 @@ def _then_attn_cp_gather(
     hidden_states, residual = gather(
         hidden_states, residual, forward_batch, norm, update=update, cache=cache
     )
-    return attn_cp_gather(hidden_states), residual
+    return attn_cp_interleave_gather(hidden_states), residual
 
 
 def _then_moe_cp_gather(
@@ -428,25 +427,20 @@ def _then_moe_cp_gather(
     gather: Callable,
     update: ResidualUpdate = PLAIN_ADD,
 ):
-    """Gather for the FFN, then over the MoE-CP group so each rank holds all
-    tokens of its MoE group (moe_dp_size < attn_cp_size). The residual stays on
-    this rank's attention rows."""
-    # Early return on empty tensor is safe for MOE_CP because:
-    # - During CP extend: zigzag split guarantees all CP ranks have non-zero tokens,
-    #   so no rank hits this path while others proceed to the allgather.
-    # - During decode: moe_cp allgather is skipped (guarded by is_context_parallel_extend).
-    # - CUDA graph warmup: not applicable when --cuda-graph-backend-prefill=disabled is used.
-    if hidden_states.shape[0] == 0:
-        return hidden_states, residual
+    """Read each shard, then gather the MoE group's tokens on its CP path.
 
+    StagePlan selects this path only for a CP extend with MoE-CP rows; zigzag
+    eligibility guarantees nonempty shards. Decode and non-CP batches use the
+    ordinary path. The residual stays on this rank's attention rows.
+    """
     hidden_states, residual = gather(
         hidden_states, residual, forward_batch, norm, update=update, cache=cache
     )
-
-    rows = moe_cp_gathered_rows(forward_batch)
-    if rows is not None and hidden_states.shape[0] > 0:
-        hidden_states = moe_cp_gather(hidden_states, rows, get_moe_cp_size())
-
+    hidden_states = moe_cp_gather(
+        hidden_states,
+        forward_batch.attn_cp_metadata.per_rank_actual_token,
+        get_moe_cp_size(),
+    )
     return hidden_states, residual
 
 
