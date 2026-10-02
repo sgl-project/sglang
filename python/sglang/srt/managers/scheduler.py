@@ -3647,8 +3647,7 @@ class Scheduler(
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
-        if self.enable_fpm:
-            self._fpm_batch_t0 = time.monotonic()
+        schedule_start = time.monotonic()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -3779,8 +3778,7 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
-            if self.enable_fpm:
-                ret.fpm_start_time = self._fpm_batch_t0
+            ret.fpm_start_time = schedule_start
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
@@ -4377,6 +4375,7 @@ class Scheduler(
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
 
+        forward_timer_begin = self.metrics_reporter.forward_timer_ordinal()
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
@@ -4646,6 +4645,7 @@ class Scheduler(
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
+        self.metrics_reporter.stamp_forward_timer_span(batch, forward_timer_begin)
         self._maybe_report_active_ranks()
 
         return ret
@@ -4800,6 +4800,7 @@ class Scheduler(
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
+        self.metrics_reporter.observe_forward_pass_interference(batch)
 
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:

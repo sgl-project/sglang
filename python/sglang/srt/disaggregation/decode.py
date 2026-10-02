@@ -2994,6 +2994,7 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        schedule_start = time.monotonic()
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
@@ -3020,6 +3021,7 @@ class SchedulerDisaggregationDecodeMixin:
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
             set_schedule_time_batch(ret)
+            ret.fpm_start_time = schedule_start
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_new_prebuilt_batch(

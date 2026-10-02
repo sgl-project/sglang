@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -650,6 +651,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
+        schedule_start = time.monotonic()
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
         running_batch.batch_is_full = False
@@ -665,6 +667,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         if batch:
             set_schedule_time_batch(batch)
+            batch.fpm_start_time = schedule_start
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 

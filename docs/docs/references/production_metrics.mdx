@@ -253,6 +253,201 @@ to generate some requests.
 
 Then you should be able to see the metrics in the Grafana dashboard.
 
+## Forward-Pass Decode Interference Metrics
+
+SGLang exports per-forward-pass histograms for diagnosing whether long prefill
+work co-scheduled with decode work is causing decode-step latency tail spikes.
+
+Two different quantities are exported, under names that keep them apart,
+because only one of them is forward time:
+
+- `sglang:forward_pass_duration_seconds`: Histogram of the duration of a single
+  model forward pass, as measured on the device. The `phase` label is
+  `prefill_only`, `decode_only`, `mixed`, or `other`. With `--pp-size` greater
+  than one the emitting rank is the final pipeline stage, so the value is that
+  stage's forward — a fraction of the full model's per-step device time, not
+  the end-to-end pipeline latency.
+- `sglang:decode_step_latency_seconds`: The same measurement restricted to
+  passes that include decode requests. This approximates the delay active
+  decoding requests experience before the next decode step completes.
+- `sglang:schedule_to_result_latency_seconds`: Histogram of the wall-clock
+  interval from the start of a batch's scheduling decision to the end of its
+  result processing. Under overlap this span also covers the *next* batch's
+  scheduling and launch, so it is an engine-step pipeline latency and must not
+  be read as forward-pass time. It is the right series for "how long did one
+  scheduler iteration take end to end", and it is what shows a regression in
+  scheduling or launch cost that leaves the forward itself untouched.
+
+Labels:
+
+- `phase`: Scheduling phase derived from scheduled prefill token and decode
+  request counts.
+- `prefill_tokens_bucket`: Bucketed scheduled prefill token count for
+  `sglang:forward_pass_duration_seconds` and
+  `sglang:schedule_to_result_latency_seconds`.
+- `co_scheduled_prefill_bucket`: Bucketed scheduled prefill token count for
+  `sglang:decode_step_latency_seconds`.
+- `decode_reqs_bucket`: Bucketed number of scheduled decode requests.
+
+Prefill token buckets are `0`, `1_1k`, `1k_4k`, `4k_16k`, `16k_64k`, and
+`64k_plus`. Decode request buckets are `0`, `1`, `2_4`, `5_8`, `9_16`,
+`17_32`, and `33_plus`.
+
+### Enabling
+
+`sglang:schedule_to_result_latency_seconds` needs only `--enable-metrics`.
+
+The two forward-pass series additionally need the forward device timer, which
+is what gives them a boundary that is the forward pass itself rather than a
+position in the scheduler loop. Start the server with either
+`SGLANG_ENABLE_METRICS_DEVICE_TIMER=1` in the environment or
+`--enable-forward-pass-metrics`; without one of them those two series stay
+empty rather than reporting a scheduler-loop interval under a forward-pass
+name.
+
+Each batch is sampled by exactly one scheduler rank: attention TP rank 0 and
+attention CP rank 0 on the final pipeline stage, the same rank predicate the
+forward-pass metrics publisher uses. The other TP, CP and PP ranks run the same
+batch and export nothing, so the queries below can aggregate over `le` without
+a `tp_rank` or `pp_rank` selector; with `--pp-size` set, stages other than the
+last stay silent rather than adding N samples per step. This holds under
+`--enable-metrics-for-all-schedulers` too: that flag widens the other scheduler
+metrics to every rank, but these three stay on the one rank so that one sample
+still means one batch.
+
+With `--enable-dp-attention`, each attention DP group runs its own batch, so
+each group exports its own samples under its `dp_rank` label, and one engine
+step yields one sample per `dp_rank`.
+
+`sglang:schedule_to_result_latency_seconds` samples every engine step, on
+unified, pipeline-parallel and PD-disaggregated schedulers. A forward-pass
+sample is the device time of exactly the forward segments that batch's own
+launch recorded, summed when one batch launches several (for example
+speculative draft and verify). Under overlap the next batch's forward may
+already have finished when this batch's result is processed; it is left for
+the next batch's sample rather than folded into this one. A step is skipped
+only when it launched no timed forward segment (for example a
+disaggregated-decode placeholder batch), or, defensively, when one of its
+segments has not completed by result processing; the metric never waits on the
+device to find out.
+
+None of the three series is exported with `--enable-pdmux`: PD multiplexing
+runs decode and split prefill concurrently on separate streams, so one batch's
+forward time cannot be separated from the other's.
+
+To check that the metrics are exposed:
+
+```bash
+curl http://localhost:<metrics_port>/metrics | grep -E "decode_step_latency|forward_pass_duration|schedule_to_result_latency"
+```
+
+### Interpretation
+
+These metrics are intentionally not completed-request TPOT. Speculative
+decoding, stream interval, and two-batch-overlap can make "one forward pass
+equals one visible token interval" only approximate.
+
+`sglang:schedule_to_result_latency_seconds` minus
+`sglang:forward_pass_duration_seconds` is the scheduler-side share of an engine
+step. A gap that widens while forward duration stays flat points at scheduling
+or launch cost, not at the model.
+
+With DP attention the attention DP ranks run each forward in lockstep, so a
+prefill on one rank can stretch a step that carries only decode requests on
+another. That step is recorded on the decode rank as `phase="decode_only"` with
+`co_scheduled_prefill_bucket="0"`, because the labels describe the rank's own
+batch. A `decode_only` tail that tracks prefill on peer ranks is cross-rank
+interference, not a slow decode.
+
+### PromQL examples
+
+Decode-only p99:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le) (
+    rate(sglang:decode_step_latency_seconds_bucket{
+      phase="decode_only",
+      co_scheduled_prefill_bucket="0"
+    }[1m])
+  )
+)
+```
+
+Mixed long-prefill p99:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le, co_scheduled_prefill_bucket) (
+    rate(sglang:decode_step_latency_seconds_bucket{
+      phase="mixed",
+      co_scheduled_prefill_bucket=~"16k_64k|64k_plus"
+    }[1m])
+  )
+)
+```
+
+Compare p99 by prefill bucket:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le, co_scheduled_prefill_bucket) (
+    rate(sglang:decode_step_latency_seconds_bucket{
+      phase=~"decode_only|mixed"
+    }[5m])
+  )
+)
+```
+
+Decode steps per second. Note this counts only passes that carried decode
+requests — `decode_step_latency_seconds` skips prefill-only and idle steps — so
+it is decode-step throughput, not engine-step throughput:
+
+```promql
+sum by (co_scheduled_prefill_bucket) (
+  rate(sglang:decode_step_latency_seconds_count[5m])
+)
+```
+
+For engine-step throughput, count the series that samples every step. Keep
+`dp_rank` in the grouping, since with DP attention every `dp_rank` samples each
+step:
+
+```promql
+sum by (dp_rank) (
+  rate(sglang:schedule_to_result_latency_seconds_count[5m])
+)
+```
+
+Engine-step p99 including scheduling and launch, to compare against the
+forward-pass p99 above:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le) (
+    rate(sglang:schedule_to_result_latency_seconds_bucket{
+      phase=~"decode_only|mixed"
+    }[5m])
+  )
+)
+```
+
+If `sglang:decode_step_latency_seconds` p99 for `phase="mixed"` and
+`co_scheduled_prefill_bucket="16k_64k"` or `"64k_plus"` is repeatedly much
+higher than `phase="decode_only"`, long prefill co-scheduling is likely causing
+decode ITL/TPOT tail spikes. As a practical guide, mixed p99 within 1.2x of
+decode-only p99 is weak interference, repeated 1.5x or higher suggests tuning
+chunked prefill or mixed batching, and repeated 2x or higher suggests prefill
+throttling or prefill/decode disaggregation.
+
+If instead `sglang:schedule_to_result_latency_seconds` p99 rises while
+`sglang:decode_step_latency_seconds` p99 stays flat, the model step is fine and
+the cost is in the scheduler iteration around it.
+
 ## Estimated Performance Metrics (MFU-related)
 
 SGLang exports the following estimated per-GPU counters that can be used to derive
