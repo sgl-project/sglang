@@ -178,7 +178,7 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     if req.skip_radix_cache_insert:
         return
 
-    tree_cache.insert_req(req, up_to=req.extend_range.end)
+    tree_cache.checkpoint(req, up_to=req.extend_range.end)
 
 
 def evict_from_tree_cache(
@@ -325,7 +325,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         )
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
-        tree_cache.insert_req(req, up_to=owned_kv_len)
+        tree_cache.checkpoint(req, up_to=owned_kv_len)
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
     tree_cache.unpin(req)

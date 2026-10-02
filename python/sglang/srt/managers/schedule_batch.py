@@ -1220,7 +1220,7 @@ class Req(ReqDllmMixin):
         # Refreshed at every sharded alloc — read through last_node, or drawn
         # least-full for a new chain — and consumed by the radix insert to
         # stamp new tree nodes. Allocation itself must NOT read it back when
-        # a tree node is available (the insert_req dedup rebind
+        # a tree node is available (the checkpoint dedup rebind
         # would make it stale); the only allocation-time reader is the
         # ChunkCache fallback, which has no tree nodes and no rebind.
         self.kv_rotation_base: Optional[int] = None

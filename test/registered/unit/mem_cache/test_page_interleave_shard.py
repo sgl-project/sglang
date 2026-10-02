@@ -775,7 +775,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
 
 
 class _GraftReq:
-    """Minimal Req stand-in for insert_req."""
+    """Minimal Req stand-in for checkpoint."""
 
     def __init__(self, fill_ids, req_pool_idx=0):
         self.fill_ids = list(fill_ids)
@@ -914,7 +914,7 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 3
         own_locs = self._own_row(tree, req, 12)
-        tree.insert_req(req, up_to=len(req.fill_ids))
+        tree.checkpoint(req, up_to=len(req.fill_ids))
         # No dedup free, no rebind: the request keeps its own locs whole.
         self.assertEqual([t.tolist() for t in freed], [])
         self.assertTrue(torch.equal(req.prefix_indices, own_locs))
@@ -923,7 +923,7 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
             torch.equal(tree.req_to_token_pool.req_to_token[0, :12], own_locs)
         )
 
-    def test_insert_req_decline_frees_duplicates_and_suffix(self):
+    def test_checkpoint_decline_frees_duplicates_and_suffix(self):
         tree, freed = self._tree_with_spy()
         self._seed_chain(tree, list(range(8)), base=1)
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
@@ -937,7 +937,7 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
         self.assertEqual(set(released.tolist()), set(own_locs.tolist()))
         self.assertEqual(_match_len(tree, req.fill_ids), 8)
 
-    def test_insert_req_same_base_keeps_the_tail_cached(self):
+    def test_checkpoint_same_base_keeps_the_tail_cached(self):
         """Control for the decline test: with an agreeing base the tail is
         grafted and only the matched duplicates are freed."""
         tree, freed = self._tree_with_spy()
