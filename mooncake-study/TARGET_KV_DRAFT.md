@@ -621,6 +621,10 @@ CUDA/cuDNN versions and the observed SDPA operators: PyTorch's `sdpa` selection
 can choose different kernels with different BF16 rounding. Nonfinite values
 fail. A failed rerun invalidates an older passing report; early artifact-loading
 failures leave no report. The command exits unsuccessfully on a failed comparison.
+Before returning success, the gate also calls `audit_target_kv_checkpoint` to
+bind the completed report to the current config, weights and golden fixture.
+An artifact mismatch changes the report to failed even when numerical comparison
+passed.
 This gate is separate from online capture's exact tensor readback test and is not
 implicitly selected by installing SpecForge. Neither a successful tiny fixture
 nor the separate FP32 diagnostic certifies the real BF16 serving path.
@@ -631,6 +635,35 @@ input ownership, and report failure handling. It requires the pinned SpecForge
 checkout and is explicitly disabled in generic CI until that dependency is wired.
 The adapter and loss are test references, not a production SpecForge trainer,
 collator, Catalog consumer or exporter.
+
+### Offline Artifact Audit
+
+The deployment/export integration API is
+`audit_target_kv_checkpoint(directory, require_acceptance=False)` in
+`sglang.srt.speculative.dspark_components.dspark_target_kv_artifact`. Its CLI is:
+
+```bash
+python -m sglang.srt.speculative.dspark_components.dspark_target_kv_artifact \
+  --checkpoint /models/kv-draft
+```
+
+It reads an existing `validation/parity.json` without loading a trainer, target
+decoder or GPU model. The receipt binds exact config/weight/fixture/report bytes,
+complete layer/hidden/logit coverage, dtype, tolerances, finite gradients and the
+golden fixture contract. Missing, stale, failed or incomplete evidence exits
+nonzero. The current numerical report uses a single `model.safetensors`; extra
+root weight files and a sharded index are rejected by this audit.
+
+When the contract pins `acceptance_report_sha256`, the audit also hashes
+`validation/acceptance.json`. `--require-acceptance` additionally rejects an
+unpinned report. This is an opaque artifact reference: `acceptance_report_bound`
+does not interpret benchmark results or establish SLO/quality acceptance.
+
+The input parity report must come from a trusted validation run. The audit does
+not rerun numerical comparisons, attest report authenticity, check the current
+serving dependency versions or replace strict startup weight/target binding.
+Keep the audited directory immutable and retain the receipt with the deployment.
+See [the artifact audit runbook](experiments/CHECKPOINT_ARTIFACT_AUDIT.md).
 
 `test/registered/unit/spec/test_dspark_target_kv.py` covers contracts, codec math,
 gradient ownership, prefix isolation, range validation, request-slot reuse,

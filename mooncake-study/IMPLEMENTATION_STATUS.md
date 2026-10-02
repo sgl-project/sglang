@@ -40,6 +40,7 @@ it does not redefine the goal as the modules already implemented.
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production exporter and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
+| Checkpoint artifact audit | Offline API/CLI binds config, weights, golden fixture and complete numerical report; optional pinned acceptance artifact | Nine CPU tests, five parity regressions and a fresh retained BF16 parity/audit run pass; production exporter, report trust and quality/SLO acceptance remain separate |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes synchronous/overlap and eager/graph combinations; retired captures fail once, released slots are reused, fresh admission and exact post-exit Store reads pass; distributed pressure and SLOs remain open |
@@ -3243,6 +3244,53 @@ double. Qwen3's eight target KV heads are sharded, not replicated, at TP2.
 Trained/exported checkpoints, replicated target heads, additional models,
 asymmetric combined P/D, distributed prefill graphs, asynchronous PP, cross-node
 combined RDMA, production retention and performance SLOs remain open.
+
+## Checkpoint Artifact Evidence Binding
+
+`audit_target_kv_checkpoint` adds a production SGLang API and CLI for export and
+deployment systems to check an existing fixed-input parity report against the
+exact checkpoint being deployed. It uses the existing typed input contract and
+hashes config, weights and golden fixture bytes. Every configured decoder layer,
+normalized hidden output and both logits stages must have full element coverage,
+zero mismatches/nonfinite values, matching dtype and tolerances no weaker than
+the contract. The report must include finite nonzero training gradient groups
+and pinned training-source identities.
+
+The auditor bounds metadata reads, streams large hashes and checks file
+identity/size/timestamps across the operation. Missing or stale artifacts,
+inconsistent fixture/weight digests, extra root safetensors or a shard index
+fail. The current numerical producer records one `model.safetensors`; auditing
+other layouts requires extending that producer. A pinned acceptance report is
+checked as an opaque artifact and does not imply that quality/SLO thresholds
+passed. Startup weight and target-identity validation remain in force.
+
+The fixed-input parity command now audits its completed report before returning
+success. A failure there replaces the apparent numerical pass with a failed
+report. Serving inference, capture and checkpoint parameter loading are unchanged.
+
+Final source validation on the resident H100 includes **nine CPU tests in 0.055
+seconds**, run with no visible CUDA devices, and the complete **five-test parity
+regression in 2.499 seconds**. The latter covers vanilla/gated/RNN heads, optimizer
+step/export/reload, prefix isolation and failed-report handling. A fresh run on
+the retained Qwen3 BF16 checkpoint, using only saved KV/teacher data and frozen
+shared embedding/head, passes all two-layer/hidden/base/corrected comparisons
+with exactly zero error. Its seven valid labels produce finite gradients for
+all four trainable groups. The standalone CPU CLI subsequently verifies the
+same artifact bytes and report.
+
+The first CPU launch failed before tests because the shared test utility indexes
+the first character of an empty `CUDA_VISIBLE_DEVICES`. The final CPU jobs use
+an unavailable ordinal (`999`) to hide devices. Earlier successful runs preceded
+the extra-weight-layout check and are excluded from final totals. All final jobs
+are terminal; the H100 has no active/queued experiment and resumed its 60% idle
+load. No additional allocation was needed. Source/log hashes and final results
+are in [the evidence](experiments/checkpoint-artifact-audit.json); commands and
+boundaries are in [the runbook](experiments/CHECKPOINT_ARTIFACT_AUDIT.md).
+
+This is artifact evidence binding, not report authentication or a repeat of
+numerical calculations during audit. It does not certify a different installed
+runtime, implement SpecForge's production KV exporter/trainer, or establish
+trained-model quality, production Catalog retention or serving performance.
 
 ## Next Implementation
 

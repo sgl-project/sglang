@@ -37,6 +37,9 @@ from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.models.dspark_target_kv import DSparkTargetKVDraftModel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
+from sglang.srt.speculative.dspark_components.dspark_target_kv_artifact import (
+    audit_target_kv_checkpoint,
+)
 from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
     SharedHeadTransform,
     read_target_kv_draft_contract,
@@ -589,6 +592,12 @@ def validate_captured_checkpoint(directory, target_path, *, attention_backend="e
             if "scaled_dot_product" in event.key
         )
         write_report()
+    try:
+        audit_target_kv_checkpoint(directory)
+    except Exception as error:
+        report.update(status="failed", error=f"artifact audit failed: {error}")
+        write_report()
+        raise
     return report
 
 

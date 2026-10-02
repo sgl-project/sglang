@@ -1,0 +1,312 @@
+{
+  "purpose": "Bind current target-KV checkpoint artifacts to complete trusted fixed-input parity evidence before deployment",
+  "source_baseline": "4059f9ae8710fc4df4b2643a95585db705f4f8e6",
+  "source_sha256": {
+    "python/sglang/srt/speculative/dspark_components/dspark_target_kv_artifact.py": "5ef550674d698e1236da7bfd96d4d5465892e5a2ccfaf4f9c71c50d086457ad1",
+    "test/registered/unit/spec/test_dspark_target_kv_artifact.py": "ef56984d95c641124f86c12773aa9686f2b7f99838fe999ee9d096871ab83f90",
+    "python/sglang/test/dspark_target_kv_parity.py": "114c2f43240a34683fece3e32e6faf22a6582190446458eac6d7add30e1de9a6",
+    "test/registered/spec/dspark/test_dspark_target_kv_parity.py": "1685abb68ebeca5bdcca52e5701f5dbf40e2446eab3cfc969dfe85f51398d3da",
+    "python/sglang/srt/models/dspark_target_kv.py": "87e00ac0b11c7dc583ef120dcfbadb06ef610b7aa6d3f119116305d1baec969c",
+    "python/sglang/srt/speculative/dspark_components/dspark_target_kv_contract.py": "4965476ab7d6659f0c2c0b0b4f5e94ff775138fb9668de687eb383e1853ed53a"
+  },
+  "environment_lock": "h100-runtime-lock.json",
+  "api": "sglang.srt.speculative.dspark_components.dspark_target_kv_artifact.audit_target_kv_checkpoint",
+  "production_change": "New offline audit API/CLI; numerical parity now rejects success when its report does not bind the current artifacts",
+  "serving_inference_capture_and_weight_loading_changed": false,
+  "checks": [
+    "Exact config, single-file weights and fixture byte hashes match the completed numerical report and typed golden-fixture contract",
+    "Every decoder layer and hidden/base/corrected stage has the full reported element count, no mismatches/nonfinite values, compatible dtype and no weaker tolerances",
+    "Nonempty windows, feasible valid-label count, finite loss and nonzero finite encoder/backbone/norm/Markov gradients",
+    "Pinned training source identities and optional opaque acceptance artifact",
+    "Bounded metadata reads, streamed hashes and file identity/size/timestamp checks across the audit",
+    "Missing/changed artifacts and extra root safetensors or a shard index fail without writing the checkpoint",
+    "CLI failures return structured JSON and nonzero status"
+  ],
+  "runs": [
+    {
+      "kind": "cpu_artifact_contract",
+      "job_id": "01790918966437685632-f61d65cc63a4",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790918979.7870107,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790918966437685632-f61d65cc63a4.log",
+      "tests": 9,
+      "test_seconds": 0.055,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/unit/spec/test_dspark_target_kv_artifact.py",
+        "-v",
+        "-f"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-artifact-audit-final/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+        "CUDA_VISIBLE_DEVICES": "999"
+      },
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-artifact-audit-final",
+      "log_sha256": "acd7686fcf933bfc2524d0e04d94b1653a18486d363957dea4b6f6a5391ab0fd"
+    },
+    {
+      "kind": "retained_bf16_numerical_parity",
+      "job_id": "01790918966769438775-d62b67ed7a98",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790919004.5990677,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790918966769438775-d62b67ed7a98.log",
+      "tests": null,
+      "test_seconds": null,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "sglang.test.dspark_target_kv_parity",
+        "--checkpoint",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/fixtures/qwen3-target-kv-artifact-audit-20261002",
+        "--target-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--reference-attention",
+        "flex_attention"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-artifact-audit-final/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference"
+      },
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-artifact-audit-final",
+      "log_sha256": "3d65ae1a1cee24437cca4dab4537f0bec826ee31cd5cf5ff9c0e7b08590fe53d"
+    },
+    {
+      "kind": "complete_gpu_parity_regression",
+      "job_id": "01790918967082591007-6ed18145e684",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790919019.8903258,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790918967082591007-6ed18145e684.log",
+      "tests": 5,
+      "test_seconds": 2.499,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/spec/dspark/test_dspark_target_kv_parity.py",
+        "-v",
+        "-f"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-artifact-audit-final/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference"
+      },
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-artifact-audit-final",
+      "log_sha256": "5eb05a99e267c335ed20b563de3892cd29fb327765eeebd3aa6f5286ede35c96"
+    },
+    {
+      "kind": "standalone_cpu_artifact_audit",
+      "job_id": "01790918967358240186-a76b5252acf7",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790919027.913987,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790918967358240186-a76b5252acf7.log",
+      "tests": null,
+      "test_seconds": null,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "sglang.srt.speculative.dspark_components.dspark_target_kv_artifact",
+        "--checkpoint",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/fixtures/qwen3-target-kv-artifact-audit-20261002"
+      ],
+      "env": {
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-artifact-audit-final/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+        "CUDA_VISIBLE_DEVICES": "999"
+      },
+      "source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-artifact-audit-final",
+      "log_sha256": "484495b5e3104080a80493c6552f2942f1103308774ac37f6fedebb61b720a27"
+    }
+  ],
+  "totals": {
+    "unit_and_regression_tests": 14,
+    "numerical_parity_commands": 1,
+    "standalone_audit_commands": 1
+  },
+  "checkpoint_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/fixtures/qwen3-target-kv-artifact-audit-20261002",
+  "original_fixture_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/fixtures/qwen3-target-kv-parity-20261001",
+  "fixture_note": "Copied the retained fixture before the fresh numerical run; original fixture and report remain unchanged. Synthetic weights do not establish trained-draft quality.",
+  "parity_report": {
+    "status": "passed",
+    "reference_adapter": "specforge_backbone_with_shared_kv_encoder",
+    "reference_attention": "flex_attention",
+    "serving_attention": "triton",
+    "dtype": "bfloat16",
+    "device": "NVIDIA H100 80GB HBM3",
+    "torch_version": "2.13.0+cu130",
+    "cuda_version": "13.0",
+    "cudnn_version": 92000,
+    "transformers_version": "5.12.1",
+    "specforge_sources": {
+      "specforge.modeling.draft.dflash": "d0cbb0dafb77fe6cc64c9a2850515aaca6f11b811af767b141a5aa473e4213ba",
+      "specforge.modeling.draft.dflash_kernels": "ce6496a07282b8d3ab4b69942191d27a8ba2d0a107613b2ae74e60604b0faf46",
+      "specforge.modeling.draft.dspark": "4ec764996b8a48c24e1ba15513503255ae9165a2c3abb9ad2d3e988c6a526be7"
+    },
+    "artifact_sha256": {
+      "config.json": "4b74ae312ce217dae27d1346a617245f370ebd0fbb80feeeccbc2b0e12bf6dbd",
+      "model.safetensors": "1bad9b3c7fdf78e75a180d3cc08fc536a643e6a70a82fd9c856f9249dbd69982",
+      "validation/inputs.safetensors": "75f2a38ab933a0112a2de1365511782c101578d00d0503c991cd1e752fdcc472"
+    },
+    "rtol": 0.03,
+    "atol": 0.03,
+    "stages": {
+      "layer.0": {
+        "passed": true,
+        "elements": 9216,
+        "mismatched": 0,
+        "nonfinite": 0,
+        "max_abs": 0,
+        "rms": 0
+      },
+      "layer.1": {
+        "passed": true,
+        "elements": 9216,
+        "mismatched": 0,
+        "nonfinite": 0,
+        "max_abs": 0,
+        "rms": 0
+      },
+      "hidden": {
+        "passed": true,
+        "elements": 9216,
+        "mismatched": 0,
+        "nonfinite": 0,
+        "max_abs": 0,
+        "rms": 0
+      },
+      "base": {
+        "passed": true,
+        "elements": 1367424,
+        "mismatched": 0,
+        "nonfinite": 0,
+        "max_abs": 0,
+        "rms": 0
+      },
+      "corrected": {
+        "passed": true,
+        "elements": 1367424,
+        "mismatched": 0,
+        "nonfinite": 0,
+        "max_abs": 0,
+        "rms": 0
+      }
+    },
+    "max_abs": {
+      "layer.0": 0,
+      "layer.1": 0,
+      "hidden": 0,
+      "base": 0,
+      "corrected": 0
+    },
+    "anchors": [
+      159,
+      160,
+      162
+    ],
+    "valid_labels": 7,
+    "loss": 8556.904296875,
+    "gradient_l1": {
+      "layers": 644639.2390060425,
+      "norm": 18.816329956054688,
+      "markov_head": 8545.822575569153,
+      "kv_encoder": 151947.00708007812
+    },
+    "fixture_sha256": "75f2a38ab933a0112a2de1365511782c101578d00d0503c991cd1e752fdcc472",
+    "weights_sha256": "1bad9b3c7fdf78e75a180d3cc08fc536a643e6a70a82fd9c856f9249dbd69982",
+    "observed_sdpa_operators": []
+  },
+  "audit_receipt": {
+    "acceptance_report_bound": false,
+    "anchors": [
+      159,
+      160,
+      162
+    ],
+    "artifact_sha256": {
+      "config.json": "4b74ae312ce217dae27d1346a617245f370ebd0fbb80feeeccbc2b0e12bf6dbd",
+      "model.safetensors": "1bad9b3c7fdf78e75a180d3cc08fc536a643e6a70a82fd9c856f9249dbd69982",
+      "validation/inputs.safetensors": "75f2a38ab933a0112a2de1365511782c101578d00d0503c991cd1e752fdcc472"
+    },
+    "contract_sha256": "17a631dee6d4e1f87027a5a27ed8090db283db5407431f534b29b3535ed80eed",
+    "dtype": "bfloat16",
+    "parity_report_sha256": "994fb020c41eb7db4fb2adc99764ccce64dc81af49cf12e383400c4c142fb0e1",
+    "reference_attention": "flex_attention",
+    "scope": "fixed_input_parity_artifact_binding_v1",
+    "stages": [
+      "layer.0",
+      "layer.1",
+      "hidden",
+      "base",
+      "corrected"
+    ],
+    "status": "verified",
+    "valid_labels": 7
+  },
+  "earlier_attempts": [
+    {
+      "job_id": "01790918662708728269-118a4c52f4ba",
+      "outcome": "failed before tests",
+      "reason": "Shared CustomTestCase module indexes CUDA_VISIBLE_DEVICES[0]; the empty string raises IndexError. Final CPU commands use invisible ordinal 999."
+    },
+    {
+      "job_id": "01790918722124364414-91b644f31494",
+      "outcome": "completed",
+      "tests": 8,
+      "note": "Before the extra-weight-layout check; excluded from final totals"
+    },
+    {
+      "job_id": "01790918741655490780-0310956c1bff",
+      "outcome": "completed",
+      "note": "Intermediate retained parity before the extra-weight-layout check"
+    },
+    {
+      "job_id": "01790918764845524836-76746df251f3",
+      "outcome": "completed",
+      "tests": 5,
+      "note": "Intermediate parity regression before the extra-weight-layout check"
+    },
+    {
+      "job_id": "01790918841267960120-a574af8784b2",
+      "outcome": "completed",
+      "note": "Intermediate standalone audit before the extra-weight-layout check"
+    }
+  ],
+  "resources": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "node": "node064",
+    "gpu_uuid": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "additional_allocations": 0,
+    "final_worker_state": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790919132.1579034,
+      "idle_pid": 13242,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.9007234573364258
+    },
+    "final_live_python_processes": [
+      "1     0 Ss   python3         python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60",
+      "13242     1 Ssl  python3         /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6"
+    ],
+    "idle_duty_cycle": 0.6,
+    "no_live_experiment_model_or_store_processes": true
+  },
+  "static_checks": {
+    "ruff": "passed",
+    "black": "passed",
+    "git_diff_check": "passed",
+    "frozen_source_hashes_match": true,
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "limitations": [
+    "An artifact receipt assumes a trusted numerical report; it is not report authentication or a numerical rerun",
+    "The current parity producer/auditor supports one model.safetensors, not sharded artifact reports",
+    "No certification of a different installed serving runtime, production exporter or trained-model quality",
+    "acceptance_report_bound checks bytes only; SLO and quality thresholds are not interpreted",
+    "Startup parameter and target-identity checks remain necessary; deployment directories must remain immutable",
+    "SpecForge production KV trainer/exporter, Catalog integration and serving performance acceptance remain open"
+  ]
+}

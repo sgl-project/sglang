@@ -1211,6 +1211,22 @@ prefill 注入已提交 prefix；verify 后增量注入 accepted/committed token
 
 先完成离线 fixed-input parity，再做 speculative 质量/吞吐测试，然后新服务实例加载或 drain 后切换。旧 projected KV 与新权重不能混用。
 
+SGLang 提供 `audit_target_kv_checkpoint(directory, require_acceptance=False)`
+作为导出/部署系统的产物校验入口，也可通过
+`python -m sglang.srt.speculative.dspark_components.dspark_target_kv_artifact`
+加 `--checkpoint` 调用。它读取已完成的 parity 报告，绑定当前配置、权重和
+golden fixture 的字节哈希，检查全部层与 logits 的覆盖、误差阈值、dtype 以及
+有限且非零的训练梯度。产物被替换、报告过期或不完整时返回失败；数值 parity
+命令在成功返回前也执行该检查，不能留下与当前产物不一致的通过报告。
+
+当前 parity 产物采用单个 `model.safetensors`，审计拒绝额外权重分片或索引。
+若 contract 声明 `acceptance_report_sha256`，则要求
+`validation/acceptance.json` 与之匹配；`--require-acceptance` 进一步要求必须
+声明该报告。哈希匹配只证明报告绑定，不解释质量或 SLO 是否达标。审计不执行
+target prefill，也不替代数值验证、生产 exporter、当前运行环境兼容性和在线
+加载检查。部署目录应保持不可变，具体接口见
+[checkpoint audit runbook](experiments/CHECKPOINT_ARTIFACT_AUDIT.md)。
+
 通过 acceptance length、TPOT、总吞吐及目标生成质量门槛后扩大流量。回滚同时恢复 draft 权重和输入配置，并清理对应 projected KV；target 本身可以继续普通 decode。
 
 权重 registry/hot update 不是所读 SpecForge 控制面的现成能力。V1 可用已有模型发布系统或人工受控部署，本文要求的是版本可追踪、兼容检查和可回滚，不虚构现有自动上线功能。
