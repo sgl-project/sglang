@@ -316,7 +316,17 @@ class AgenticBenchPoint:
 
     ``bench_serving`` reports no input throughput for multi-turn replay (it
     cannot attribute a prompt length to a turn it did not construct), so the
-    prefill side shows up as cache hit rate rather than input tok/s.
+    prefill side shows up as reused prompt tokens rather than input tok/s.
+
+    Those are absolute token counts, not a hit rate, because a rate needs a
+    prompt length the two sides agree on and here they do not.
+    ``cache_report.cache_hit_rate_pct`` divides the server's ``cached_tokens``
+    by the client's ``len(tokenizer.encode(prompt_text))``, and on a chat
+    backend the server additionally tokenizes the chat template the client
+    never saw. Run 34551237847 reported 117% on every point of both arms.
+    ``host_share_pct`` below is a ratio of two server-side numbers, so it is
+    sound, and it is the one this recipe is about: how much of the reuse came
+    from the DRAM tier rather than from GPU memory.
     """
 
     concurrency: int
@@ -332,13 +342,25 @@ class AgenticBenchPoint:
     mean_e2e_latency_ms: float
     achieved_concurrency: float
     accept_length: Optional[float] = None
-    cache_hit_rate_pct: Optional[float] = None
+    cached_tokens: Optional[int] = None
     host_cached_tokens: Optional[int] = None
     raw: Dict = field(default_factory=dict, repr=False)
 
     @property
     def failed_turns(self) -> int:
         return self.total_turns - self.completed_turns
+
+    @property
+    def reused_tokens_per_turn(self) -> Optional[float]:
+        if self.cached_tokens is None or not self.completed_turns:
+            return None
+        return self.cached_tokens / self.completed_turns
+
+    @property
+    def host_share_pct(self) -> Optional[float]:
+        if not self.cached_tokens or self.host_cached_tokens is None:
+            return None
+        return 100.0 * self.host_cached_tokens / self.cached_tokens
 
 
 # Per-turn arrays that `--output-details` adds. Only the errors list is read;
@@ -376,7 +398,7 @@ def _parse_bench_record(record: Dict, concurrency: int, conversations: int):
         mean_e2e_latency_ms=record.get("mean_e2e_latency_ms", 0.0),
         achieved_concurrency=record.get("concurrency", 0.0),
         accept_length=record.get("accept_length"),
-        cache_hit_rate_pct=cache_report.get("cache_hit_rate_pct"),
+        cached_tokens=cache_report.get("total_cached_tokens"),
         host_cached_tokens=cache_report.get("host_cached_tokens"),
         raw=summary,
     )
@@ -568,20 +590,21 @@ def generate_agentic_markdown_report(
     summary += (
         "| concurrency | conversations | turns (ok/total) | duration (s) | "
         "output throughput (tok/s) | mean TTFT (ms) | p99 TTFT (ms) | "
-        "mean ITL (ms) | p99 ITL (ms) | mean E2E (ms) | cache hit (%) | "
-        "accept len |\n"
+        "mean ITL (ms) | p99 ITL (ms) | mean E2E (ms) | reused tok/turn | "
+        "host tier (%) | accept len |\n"
     )
     summary += (
         "| ----------- | ------------- | ---------------- | ------------ | "
         "------------------------- | -------------- | ------------- | "
-        "------------- | ------------ | ------------- | ------------- | "
-        "---------- |\n"
+        "------------- | ------------ | ------------- | --------------- | "
+        "------------- | ---------- |\n"
     )
 
     for p in points:
-        cache_hit = (
-            f"{p.cache_hit_rate_pct:.1f}" if p.cache_hit_rate_pct is not None else "n/a"
-        )
+        reused = p.reused_tokens_per_turn
+        reused_cell = f"{reused:,.0f}" if reused is not None else "n/a"
+        host = p.host_share_pct
+        host_cell = f"{host:.1f}" if host is not None else "n/a"
         accept = f"{p.accept_length:.2f}" if p.accept_length else "n/a"
         summary += (
             f"| {p.concurrency} | {p.conversations} | "
@@ -589,7 +612,8 @@ def generate_agentic_markdown_report(
             f"{p.duration_s:.1f} | {p.output_throughput:.2f} | "
             f"{p.mean_ttft_ms:.2f} | {p.p99_ttft_ms:.2f} | "
             f"{p.mean_itl_ms:.2f} | {p.p99_itl_ms:.2f} | "
-            f"{p.mean_e2e_latency_ms:.2f} | {cache_hit} | {accept} |\n"
+            f"{p.mean_e2e_latency_ms:.2f} | {reused_cell} | {host_cell} | "
+            f"{accept} |\n"
         )
 
     return summary

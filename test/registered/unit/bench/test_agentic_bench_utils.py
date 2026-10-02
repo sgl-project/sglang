@@ -68,7 +68,11 @@ def _bench_record(**overrides):
         "mean_e2e_latency_ms": 6000.0,
         "concurrency": 3.9,
         "accept_length": 3.42,
-        "cache_report": {"cache_hit_rate_pct": 71.25, "host_cached_tokens": 120345},
+        "cache_report": {
+            "cache_hit_rate_pct": 117.2,
+            "total_cached_tokens": 1200000,
+            "host_cached_tokens": 300000,
+        },
         "errors": [None] * 24,
     }
     record.update(overrides)
@@ -291,8 +295,20 @@ class TestParseBenchRecord(CustomTestCase):
         self.assertEqual(point.failed_turns, 0)
         self.assertEqual(point.output_throughput, 512.0)
         self.assertEqual(point.accept_length, 3.42)
-        self.assertEqual(point.cache_hit_rate_pct, 71.25)
-        self.assertEqual(point.host_cached_tokens, 120345)
+        self.assertEqual(point.cached_tokens, 1200000)
+        self.assertEqual(point.host_cached_tokens, 300000)
+        self.assertEqual(point.reused_tokens_per_turn, 50000)
+        self.assertEqual(point.host_share_pct, 25.0)
+
+    def test_ignores_the_hit_rate_bench_serving_reports(self):
+        # It divides the server's cached_tokens by the client's tokenization of
+        # the prompt, and on a chat backend the server also tokenizes a chat
+        # template the client never saw. Run 34551237847 reported 117% on every
+        # point of both arms, so the reported ratio must not reach the table.
+        point = _parse_bench_record(_bench_record(), concurrency=4, conversations=8)
+        report = generate_agentic_markdown_report([point], "hit-rate")
+        self.assertNotIn("117", report)
+        self.assertNotIn("cache hit", report)
 
     def test_counts_dropped_turns(self):
         record = _bench_record(completed=20, errors=[None] * 20 + ["boom"] * 4)
@@ -312,7 +328,9 @@ class TestParseBenchRecord(CustomTestCase):
         del record["cache_report"]
         del record["accept_length"]
         point = _parse_bench_record(record, concurrency=1, conversations=2)
-        self.assertIsNone(point.cache_hit_rate_pct)
+        self.assertIsNone(point.cached_tokens)
+        self.assertIsNone(point.reused_tokens_per_turn)
+        self.assertIsNone(point.host_share_pct)
         self.assertIsNone(point.accept_length)
 
 
