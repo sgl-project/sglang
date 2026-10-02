@@ -36,6 +36,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -194,7 +195,7 @@ class BaseTpWorker(ABC):
         refcounting."""
         monkey_patch_torch_reductions()
         return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[self.model_runner.tp_rank]
+            serialized_named_tensors[get_parallel().tp_rank]
         )
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -249,12 +250,12 @@ class BaseTpWorker(ABC):
             extra = [n for n in tensors if n not in exp]
             if mismatch or missing or extra:
                 raise RuntimeError(
-                    f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+                    f"[LORA-CHECK] rank{get_parallel().tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
                     f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
                     f"{len(extra)} extra {extra[:5]}"
                 )
             logger.info(
-                f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+                f"[LORA-CHECK] rank{get_parallel().tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
             )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
@@ -365,18 +366,18 @@ class TpModelWorker(BaseTpWorker):
             # the set of ranks holding a draft worker. The draft worker is
             # constructed with pp_rank=0, so derive the caller's global rank
             # from the TP group rather than tp_size * pp_rank + tp_rank.
-            tp_group = self.model_runner.tp_group
+            tp_group = get_parallel().tp_group
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                tp_group.ranks[self.model_runner.tp_rank],
+                tp_group.ranks[tp_group.rank_in_group],
                 tp_group.cpu_group,
                 src=tp_group.ranks[0],
             )[0]
         else:
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                self.model_runner.tp_size * get_parallel().pp_rank
-                + self.model_runner.tp_rank,
+                get_parallel().tp_size * get_parallel().pp_rank
+                + get_parallel().tp_rank,
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]
@@ -409,9 +410,7 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens
-            * get_parallel().attn_dcp_size
-            - 1,
+            self.model_runner.effective_logical_max_total_num_tokens - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
@@ -537,19 +536,20 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
+        # The runner already reports logical DCP capacity.
+        kv_capacity = (
+            self.model_runner.effective_logical_max_total_num_tokens
+            * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
+        )
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens
-            * get_parallel().attn_dcp_size
-            - 1,
+            kv_capacity - 1,
         )
         max_req_input_len = max_req_len - 5
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size
         return (
-            self.model_runner.req_to_token_pool.schedulable_token_capacity(
-                self.model_runner.max_total_num_tokens
-            ),
+            self.model_runner.logical_max_total_num_tokens,
             get_schedule().max_prefill_tokens,
             self.model_runner.max_running_requests,
             get_schedule().max_queued_requests,

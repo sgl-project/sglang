@@ -85,7 +85,7 @@ class TestEnableMetrics(CustomTestCase):
             self.assertIn("1", num_prefill_ranks_values)
 
         self._execute_core(
-            other_args=["--tp", "2", "--dp", "2", "--enable-dp-attention"],
+            other_args=["--tp", "2", "--attn-dp-size", "2"],
             verify_metrics_extra=_verify_metrics_extra,
             expect_mfu_metrics=True,
             enable_mfu_metrics=True,
@@ -246,6 +246,10 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:startup_time_seconds", {"phase": "scheduler_e2e"}),
             ("sglang:startup_time_seconds", {"phase": "tokenizer_e2e"}),
             ("sglang:startup_cuda_graph_time_seconds", {"phase": "decode"}),
+            (
+                "sglang:request_time_per_output_token_seconds_count",
+                {"is_streaming": "true"},
+            ),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
 

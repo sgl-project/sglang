@@ -239,10 +239,19 @@ class TestDecodeRetractionBackup(CustomTestCase):
         cache = env.cache
 
         req, source_indices = self._admit_req(env, self.num_tokens)
+        virtual_to_physical = torch.roll(
+            torch.arange(self.pool_size, device=self.device),
+            shifts=self.pool_size // 2,
+        )
+        target_pool.host_transfer_translate = lambda indices: virtual_to_physical[
+            indices
+        ]
+        source_physical_indices = target_pool.host_transfer_translate(source_indices)
+        self.assertFalse(torch.equal(source_indices, source_physical_indices))
 
-        self._seed_pool(target_pool, source_indices, base=1000)
+        self._seed_pool(target_pool, source_physical_indices, base=1000)
         self._seed_pool(draft_pool, source_indices, base=3000)
-        target_expected = self._snapshot_pool(target_pool, source_indices)
+        target_expected = self._snapshot_pool(target_pool, source_physical_indices)
         draft_expected = self._snapshot_pool(draft_pool, source_indices)
 
         host_free_before = cache.host_pool_group.available_size()
@@ -267,10 +276,15 @@ class TestDecodeRetractionBackup(CustomTestCase):
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, self.num_tokens)), destination_indices
         )
+        destination_physical_indices = target_pool.host_transfer_translate(
+            destination_indices
+        )
 
         cache.restore_kv_cache(req, backup)
 
-        self._assert_pool_equal(target_pool, destination_indices, target_expected)
+        self._assert_pool_equal(
+            target_pool, destination_physical_indices, target_expected
+        )
         self._assert_pool_equal(draft_pool, destination_indices, draft_expected)
         self.assertEqual(cache.host_pool_group.available_size(), host_free_before)
 

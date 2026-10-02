@@ -141,6 +141,10 @@ class BaseKVManager(ABC):
     # role switch (release transfer resources; the scheduler owns the KV pool).
     supports_role_switch: bool = False
 
+    # Opt-in per backend: set True once the prefill acks a drained abort
+    # (ABORT_ACK carrying the sender rank). Without it a hold only ends on timeout.
+    supports_deferred_decode_kv_release: bool = False
+
     def teardown(self) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} does not support PD role switch teardown"
