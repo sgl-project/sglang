@@ -45,7 +45,7 @@ it does not redefine the goal as the modules already implemented.
 | Checkpoint artifact audit | Offline API/CLI binds config, weights, golden fixture and complete numerical report; optional pinned acceptance artifact | Nine CPU tests, five parity regressions and a fresh retained BF16 parity/audit run pass; production exporter, report trust and quality/SLO acceptance remain separate |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
-| Operator capture control | Authenticated pause/resume/abort management route, distributed readiness gating, P/D teacher epoch fencing, independent pause metrics | 103 CPU methods and four H100 HTTP/P-D methods pass; 16 post-exit snapshots read back; real multi-GPU and separate-endpoint P/D live control remain open |
+| Operator capture control | Authenticated pause/resume/abort management route, distributed readiness gating, P/D teacher epoch fencing, independent pause metrics | Initial 107 methods/16 post-exit snapshots pass; separate-endpoint TP1/PP1 AR/static target-KV DSpark control adds a four-cell eager/graph-overlap matrix with 32 post-exit snapshots and a 15-method CPU P/D suite; multi-GPU and cross-node live control remain open |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes synchronous/overlap and eager/graph combinations; retired captures fail once, released slots are reused, fresh admission and exact post-exit Store reads pass; distributed pressure and SLOs remain open |
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes colocated and P/D PP1 synchronous/overlap and eager/graph combinations, plus synchronous TP1/PP2 and TP2/PP2 eager/graph; P/D checks exact all-layer CPU restore and failed Catalog leases |
 | PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2, synchronous P2/D2 and P2/D1, matching TP2/PP2, and cross-node TP1 RDMA pass eager/graph source parity and failure exclusion; wider distributed RDMA remains open |
@@ -3822,11 +3822,52 @@ Validation on the resident H100 and its CPU environment:
   unique panel IDs validate, but a live Grafana deployment is not certified.
 
 The 107 test methods and additional IPC check use Qwen3-0.6B, a test Catalog and
-TCP. Live multi-GPU control, P/D control across separate endpoints, production
-SLOs, rollout orchestration and trained-model quality remain open. Commands,
+TCP. This initial run does not test P/D control across separate endpoints; the
+follow-up below covers single-rank P/D. Live multi-GPU control, production SLOs,
+rollout orchestration and trained-model quality remain open. Commands,
 terminal results, initial failures and source/log hashes are recorded in the
 [runbook](experiments/CAPTURE_CONTROL.md) and
 [evidence index](experiments/capture-control.json).
+
+## Separate-Endpoint P/D Capture Control
+
+Real P/D HTTP control now has a four-cell correctness matrix: ordinary AR and
+static target-KV DSpark, each in eager/synchronous and decode CUDA graph +
+overlap execution. The services share the resident H100 at TP1/PP1 and use actual
+Mooncake TCP transfer/Store with the test Catalog. The existing production
+implementation from `9fb873039` is unchanged by this validation.
+
+A test-only partial-prefill gate returns to the scheduler event loop so actual
+HTTP controls can execute between chunks. Cases cover both-endpoint pause,
+ordered resume, draining an admitted capture, P-only/D-only/both-endpoint abort
+and resume, P-only pause with D still admitting, and D abort after teacher import.
+Each generation request completes with the full deterministic output. Every
+abort is followed by a fresh successful publication.
+
+For D-only abort, the test observes a valid late teacher payload from P and
+proves D does not import or publish it. P's abort advances its capture epoch and
+suppresses the old handoff. An additional CPU case covers abort/resume after
+teacher tensor materialization and after PP handoff serialization, proving both
+representations remain fenced without altering the ordinary response.
+
+The final H100 matrix passes **four methods in 433.711 seconds**, completing
+**60 generation requests** and publishing **32 snapshots**. A new Store reader
+checks them after both producers exit, comparing tokens, masks, positions, KV,
+raw top-128 IDs/values and LSE against independent target observations. Each
+cell publishes eight, fails three captures as `operator_aborted` and two as
+`pd_handoff_failed`, with zero quarantine, admission backpressure, Catalog errors
+or writer-stage errors. Graph and speculative counters prove those paths ran.
+The CPU P/D suite passes **15 methods in 9.725 seconds**, for **19 unique methods**
+with the final matrix. An earlier AR-only pass is retained as interim evidence.
+
+All three jobs are terminal and successful. The final source hashes match the
+frozen tested mirror; all three changed Python files pass Black and full Ruff.
+The resident H100 has resumed idle load without an additional allocation.
+The [runbook](experiments/PD_CAPTURE_CONTROL.md) and
+[evidence index](experiments/pd-capture-control.json) retain commands, source/log
+hashes and per-mode state. This covers synthetic-checkpoint execution, not
+trained-draft quality. Real multi-GPU TP/PP, cross-node/RDMA management, global
+drain acknowledgement and production SLO/retention acceptance remain open.
 
 ## Next Implementation
 
@@ -3858,7 +3899,8 @@ terminal results, initial failures and source/log hashes are recorded in the
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to
    representative workloads and SLO thresholds, and complete dashboard runtime
    acceptance and rollout/rollback checks beyond the new single-GPU live capture
-   controls, including real TP/PP and separately controlled P/D endpoints.
+   controls and passing TP1/PP1 separate-endpoint P/D matrix, including real
+   multi-GPU TP/PP and cross-node P/D control.
    Investigate the timing experiment's
    short-request p99 TTFT increase, which the latest unchanged baseline did not
    reproduce. After consolidating single-rank content validation and reducing

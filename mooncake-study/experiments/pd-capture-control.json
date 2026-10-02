@@ -1,0 +1,874 @@
+{
+  "schema_version": 1,
+  "change": "Validate live P/D capture pause/resume/abort with AR and static target-KV DSpark",
+  "parent_commit": "9fb87303919a0fd530b4c6a5dba0b587c1eaf48e",
+  "branch": "codex/dspark-maas-capture",
+  "date_utc": "2026-10-02",
+  "runtime_lock": {
+    "path": "h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84"
+  },
+  "allocation": {
+    "job": "job-fe1ce1dcdea6-20261001023258",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "gpu_uuid": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "additional_gpu_allocations": 0
+  },
+  "validation": {
+    "passed_unique_test_methods": 19,
+    "cpu_methods": 15,
+    "final_runtime_methods": 4,
+    "final_runtime_seconds": 433.711,
+    "cpu_seconds": 9.725,
+    "ordinary_requests_per_final_cell": 15,
+    "ordinary_requests_final_matrix": 60,
+    "post_exit_snapshots_per_final_cell": 8,
+    "post_exit_snapshots_final_matrix": 32,
+    "interim_methods_not_added_to_unique_count": 2,
+    "synthetic_draft_seed_excluded_from_matrix_counts": true,
+    "black_python_files": 3,
+    "full_ruff_passed": true,
+    "production_code_changed": false
+  },
+  "jobs": [
+    {
+      "label": "Interim AR-only eager and graph/overlap",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-control-v1",
+      "environment": {
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-control-v1/python"
+      },
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_pd_control.py",
+        "-v"
+      ],
+      "timeout_seconds": 1200,
+      "passed_methods": 2,
+      "test_seconds": 183.962,
+      "result": {
+        "job_id": "01790958129062045441-df8d934bc1ac",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790958326.4527018,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790958129062045441-df8d934bc1ac.log"
+      }
+    },
+    {
+      "label": "CPU P/D suite with materialized/encoded teacher epoch fencing",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-control-unit",
+      "environment": {
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-control-v1/python",
+        "CUDA_VISIBLE_DEVICES": "999"
+      },
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/unit/training_capture/test_pd_capture.py",
+        "-v"
+      ],
+      "timeout_seconds": 180,
+      "passed_methods": 15,
+      "test_seconds": 9.725,
+      "result": {
+        "job_id": "01790958218127326389-a0a47f10e371",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790958347.0101607,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790958218127326389-a0a47f10e371.log"
+      }
+    },
+    {
+      "label": "Final AR/static target-KV DSpark P/D HTTP control matrix",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-control-v2",
+      "environment": {
+        "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMP_NUM_THREADS": "1",
+        "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-control-v2/python"
+      },
+      "argv": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_pd_control.py",
+        "-v"
+      ],
+      "timeout_seconds": 1200,
+      "passed_methods": 4,
+      "test_seconds": 433.711,
+      "result": {
+        "job_id": "01790958592873053017-48078a2b1409",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790959040.2464755,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790958592873053017-48078a2b1409.log"
+      },
+      "submission_command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-control-v2 --timeout-seconds 1200 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-control-v2/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_control.py -v"
+    }
+  ],
+  "sources": {
+    "committed_worktree": "/gpfs/user/fuxuanwei/sglang/mooncake-study/implementation/sglang",
+    "final_matrix_mirror": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-control-v2",
+    "final_matrix_and_worktree_sha256": {
+      "python/sglang/test/pd_capture_control_server.py": "b71bfffb31739b2a45f208c19e99515be1cb8ff1c6ad9055a2764a00a885e346",
+      "test/registered/storage/test_training_capture_pd_control.py": "676ddff951cc8691fda6cf6187521b1f5429cf29ee789775578db456e62ef81e",
+      "test/registered/unit/training_capture/test_pd_capture.py": "a33208d19a1ab6ae1d636595c355194cab7c92f2646da3654b6e053e005ffa3d",
+      "python/sglang/test/pd_capture_runtime.py": "ddee6e187186af801f553db1a703709d2f7d9241aa1fb60aa4acd19b31eaef62",
+      "python/sglang/test/pd_capture_server.py": "9787493bba282776148e2223f0fa9565de6c2ab44569ed4c5e368686d8d74dc0",
+      "python/sglang/test/dspark_capture_observer.py": "7daa50af90c489b8377d19759123587385d6cd6cbf67b02c2f4dab0582a0d5e3",
+      "python/sglang/test/dspark_target_kv_runtime.py": "cb45b5e854e393948c7bf98746a5d097df17a3e8adaa9431d21d8ceed2700377",
+      "python/sglang/test/dspark_target_kv_server.py": "4bf0856cc4516dc49a8034378280ef46cf71838ae7e817a07fa1ebbe1de8757b",
+      "python/sglang/srt/training_capture/pd_capture.py": "ea2a78c9f662f7914da840dcba443404fc69687f29fa50d8c084c4674b07cf08",
+      "python/sglang/srt/training_capture/coordinator.py": "02ccbb75d426f704f7407ba364e6a098a76d4b2ff5f90feb74b892efa4d27355",
+      "python/sglang/srt/managers/scheduler.py": "c8457d7b0b7f638bba75d9b32416a7e9fbf43e73b77763d269ed31cbda58602a",
+      "python/sglang/srt/entrypoints/http_server.py": "bc9993d176cb8cac788e74a252936b5f38d863aed0bc9aa3fcdb10e2073624d3"
+    },
+    "interim_runtime_mirror": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-control-v1",
+    "interim_runtime_sha256": {
+      "python/sglang/test/pd_capture_control_server.py": "b71bfffb31739b2a45f208c19e99515be1cb8ff1c6ad9055a2764a00a885e346",
+      "test/registered/storage/test_training_capture_pd_control.py": "c2082c5091f63f81a8049518dd0d90f544dee5483aa4444dd278c78585f6af84"
+    },
+    "cpu_test_sha256": {
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-control-unit/test/registered/unit/training_capture/test_pd_capture.py": "a33208d19a1ab6ae1d636595c355194cab7c92f2646da3654b6e053e005ffa3d"
+    },
+    "description": "The final matrix and worktree match for all listed files. The CPU run uses the v1 production Python sources; its test file matches the final worktree. The interim runtime file predates DSpark parametrization."
+  },
+  "final_matrix": [
+    {
+      "decode": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 0,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "admission_paused": true,
+        "counters": {
+          "admitted": 13,
+          "considered": 15,
+          "control_abort": 3,
+          "control_pause": 3,
+          "control_resume": 5,
+          "copies_completed": 13,
+          "eager_forwards": 35,
+          "excluded_paused": 2,
+          "failed_operator_aborted": 3,
+          "failed_pd_handoff_failed": 2,
+          "pd_handoff_committed": 9,
+          "ready": 8,
+          "sealed": 8,
+          "snapshot_built": 8,
+          "speculative_commits_copied": 35,
+          "speculative_verify_forwards": 35,
+          "writer_started": 13
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "filling": 4,
+          "free": 0,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 3,
+        "stage_timings": {
+          "catalog_publish": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0021414123475551605,
+            "seconds": 0.007238093763589859
+          },
+          "catalog_register": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0013321898877620697,
+            "seconds": 0.00915784016251564
+          },
+          "catalog_seal": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0017363429069519043,
+            "seconds": 0.012024909257888794
+          },
+          "catalog_written": {
+            "calls": 16,
+            "errors": 0,
+            "max_seconds": 0.0011433511972427368,
+            "seconds": 0.014538701623678207
+          },
+          "copy_wait": {
+            "calls": 13,
+            "errors": 0,
+            "max_seconds": 0.00011947378516197205,
+            "seconds": 0.0004221126437187195
+          },
+          "journal_complete": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0003052167594432831,
+            "seconds": 0.002355232834815979
+          },
+          "journal_save": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0011353455483913422,
+            "seconds": 0.0070330910384655
+          },
+          "queue_wait": {
+            "calls": 13,
+            "errors": 0,
+            "max_seconds": 0.00028135254979133606,
+            "seconds": 0.0012558139860630035
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "max_seconds": 0,
+            "seconds": 0
+          },
+          "snapshot_build": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.004569903016090393,
+            "seconds": 0.019353527575731277
+          },
+          "store_manifest": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0004597194492816925,
+            "seconds": 0.0034045912325382233
+          },
+          "store_payload": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.005287058651447296,
+            "seconds": 0.01880188286304474
+          },
+          "validation": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.011097438633441925,
+            "seconds": 0.03397262841463089
+          }
+        },
+        "states": {
+          "available": 3
+        },
+        "writer_age_seconds": 0
+      },
+      "draft_kind": "target_kv",
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "capture_epoch": 1,
+          "current_epoch": 1,
+          "payload_present": true,
+          "teacher_present": true
+        },
+        "control-gated-abort-prefill": {
+          "capture_epoch": 0,
+          "current_epoch": 1,
+          "payload_present": false,
+          "teacher_present": false
+        },
+        "control-gated-abort-prefill-decode": {
+          "capture_epoch": 1,
+          "current_epoch": 2,
+          "payload_present": false,
+          "teacher_present": false
+        },
+        "control-gated-drain": {
+          "capture_epoch": 0,
+          "current_epoch": 0,
+          "payload_present": true,
+          "teacher_present": true
+        }
+      },
+      "pd_control": true,
+      "post_exit_snapshots": 8,
+      "prefill": {
+        "admission_paused": false,
+        "counters": {
+          "control_abort": 2,
+          "control_pause": 3,
+          "control_resume": 5,
+          "pd_handoff_ready": 10,
+          "pd_selected": 12,
+          "pd_teacher_copied": 10
+        },
+        "disabled_reason": null,
+        "role": "prefill_teacher"
+      },
+      "replay": false
+    },
+    {
+      "decode": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 0,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "admission_paused": true,
+        "counters": {
+          "admitted": 13,
+          "considered": 15,
+          "control_abort": 3,
+          "control_pause": 3,
+          "control_resume": 5,
+          "copies_completed": 13,
+          "cuda_graph_forwards": 43,
+          "excluded_paused": 2,
+          "failed_operator_aborted": 3,
+          "failed_pd_handoff_failed": 2,
+          "overlap_forwards": 43,
+          "pd_handoff_committed": 9,
+          "ready": 8,
+          "sealed": 8,
+          "snapshot_built": 8,
+          "speculative_commits_copied": 43,
+          "speculative_verify_forwards": 43,
+          "writer_started": 13
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "filling": 4,
+          "free": 0,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 4,
+        "stage_timings": {
+          "catalog_publish": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.002263173460960388,
+            "seconds": 0.007650498300790787
+          },
+          "catalog_register": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.001361709088087082,
+            "seconds": 0.009398642927408218
+          },
+          "catalog_seal": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0019030235707759857,
+            "seconds": 0.01221843808889389
+          },
+          "catalog_written": {
+            "calls": 16,
+            "errors": 0,
+            "max_seconds": 0.0011801496148109436,
+            "seconds": 0.014580730348825455
+          },
+          "copy_wait": {
+            "calls": 13,
+            "errors": 0,
+            "max_seconds": 0.00011799484491348267,
+            "seconds": 0.00040838494896888733
+          },
+          "journal_complete": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0003258734941482544,
+            "seconds": 0.0024905838072299957
+          },
+          "journal_save": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0011783838272094727,
+            "seconds": 0.007403414696455002
+          },
+          "queue_wait": {
+            "calls": 13,
+            "errors": 0,
+            "max_seconds": 0.0002996958792209625,
+            "seconds": 0.0015228725969791412
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "max_seconds": 0,
+            "seconds": 0
+          },
+          "snapshot_build": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0051058270037174225,
+            "seconds": 0.01979314535856247
+          },
+          "store_manifest": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.00048610568046569824,
+            "seconds": 0.003506503999233246
+          },
+          "store_payload": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.005791008472442627,
+            "seconds": 0.019748754799365997
+          },
+          "validation": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.017039086669683456,
+            "seconds": 0.040591590106487274
+          }
+        },
+        "states": {
+          "available": 4
+        },
+        "writer_age_seconds": 0
+      },
+      "draft_kind": "target_kv",
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "capture_epoch": 1,
+          "current_epoch": 1,
+          "payload_present": true,
+          "teacher_present": true
+        },
+        "control-gated-abort-prefill": {
+          "capture_epoch": 0,
+          "current_epoch": 1,
+          "payload_present": false,
+          "teacher_present": false
+        },
+        "control-gated-abort-prefill-decode": {
+          "capture_epoch": 1,
+          "current_epoch": 2,
+          "payload_present": false,
+          "teacher_present": false
+        },
+        "control-gated-drain": {
+          "capture_epoch": 0,
+          "current_epoch": 0,
+          "payload_present": true,
+          "teacher_present": true
+        }
+      },
+      "pd_control": true,
+      "post_exit_snapshots": 8,
+      "prefill": {
+        "admission_paused": false,
+        "counters": {
+          "control_abort": 2,
+          "control_pause": 3,
+          "control_resume": 5,
+          "pd_handoff_ready": 10,
+          "pd_selected": 12,
+          "pd_teacher_copied": 10
+        },
+        "disabled_reason": null,
+        "role": "prefill_teacher"
+      },
+      "replay": true
+    },
+    {
+      "decode": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 0,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "admission_paused": true,
+        "counters": {
+          "admitted": 13,
+          "considered": 15,
+          "control_abort": 3,
+          "control_pause": 3,
+          "control_resume": 5,
+          "copies_completed": 13,
+          "eager_forwards": 124,
+          "excluded_paused": 2,
+          "failed_operator_aborted": 3,
+          "failed_pd_handoff_failed": 2,
+          "pd_handoff_committed": 9,
+          "ready": 8,
+          "sealed": 8,
+          "snapshot_built": 8,
+          "writer_started": 13
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "filling": 4,
+          "free": 0,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 3,
+        "stage_timings": {
+          "catalog_publish": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.002170845866203308,
+            "seconds": 0.007608529180288315
+          },
+          "catalog_register": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.001326926052570343,
+            "seconds": 0.009364254772663116
+          },
+          "catalog_seal": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0017262622714042664,
+            "seconds": 0.011675916612148285
+          },
+          "catalog_written": {
+            "calls": 16,
+            "errors": 0,
+            "max_seconds": 0.0011387914419174194,
+            "seconds": 0.014418087899684906
+          },
+          "copy_wait": {
+            "calls": 13,
+            "errors": 0,
+            "max_seconds": 0.00007692724466323853,
+            "seconds": 0.0004546456038951874
+          },
+          "journal_complete": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.00030084699392318726,
+            "seconds": 0.0023555345833301544
+          },
+          "journal_save": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.001443382352590561,
+            "seconds": 0.00750311091542244
+          },
+          "queue_wait": {
+            "calls": 13,
+            "errors": 0,
+            "max_seconds": 0.0002720765769481659,
+            "seconds": 0.0012668520212173462
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "max_seconds": 0,
+            "seconds": 0
+          },
+          "snapshot_build": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.004948582500219345,
+            "seconds": 0.020596105605363846
+          },
+          "store_manifest": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.00046821683645248413,
+            "seconds": 0.00354597344994545
+          },
+          "store_payload": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.005450941622257233,
+            "seconds": 0.019520841538906097
+          },
+          "validation": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0112265944480896,
+            "seconds": 0.03467936813831329
+          }
+        },
+        "states": {
+          "available": 3
+        },
+        "writer_age_seconds": 0
+      },
+      "draft_kind": null,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "capture_epoch": 1,
+          "current_epoch": 1,
+          "payload_present": true,
+          "teacher_present": true
+        },
+        "control-gated-abort-prefill": {
+          "capture_epoch": 0,
+          "current_epoch": 1,
+          "payload_present": false,
+          "teacher_present": false
+        },
+        "control-gated-abort-prefill-decode": {
+          "capture_epoch": 1,
+          "current_epoch": 2,
+          "payload_present": false,
+          "teacher_present": false
+        },
+        "control-gated-drain": {
+          "capture_epoch": 0,
+          "current_epoch": 0,
+          "payload_present": true,
+          "teacher_present": true
+        }
+      },
+      "pd_control": true,
+      "post_exit_snapshots": 8,
+      "prefill": {
+        "admission_paused": false,
+        "counters": {
+          "control_abort": 2,
+          "control_pause": 3,
+          "control_resume": 5,
+          "pd_handoff_ready": 10,
+          "pd_selected": 12,
+          "pd_teacher_copied": 10
+        },
+        "disabled_reason": null,
+        "role": "prefill_teacher"
+      },
+      "replay": false
+    },
+    {
+      "decode": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 0,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "admission_paused": true,
+        "counters": {
+          "admitted": 13,
+          "considered": 15,
+          "control_abort": 3,
+          "control_pause": 3,
+          "control_resume": 5,
+          "copies_completed": 13,
+          "cuda_graph_forwards": 137,
+          "excluded_paused": 2,
+          "failed_operator_aborted": 3,
+          "failed_pd_handoff_failed": 2,
+          "overlap_forwards": 137,
+          "pd_handoff_committed": 9,
+          "ready": 8,
+          "sealed": 8,
+          "snapshot_built": 8,
+          "writer_started": 13
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "filling": 4,
+          "free": 0,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 3,
+        "stage_timings": {
+          "catalog_publish": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.002494577318429947,
+            "seconds": 0.007712632417678833
+          },
+          "catalog_register": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0015411265194416046,
+            "seconds": 0.008976083248853683
+          },
+          "catalog_seal": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.001888573169708252,
+            "seconds": 0.012264657765626907
+          },
+          "catalog_written": {
+            "calls": 16,
+            "errors": 0,
+            "max_seconds": 0.0012326166033744812,
+            "seconds": 0.014481749385595322
+          },
+          "copy_wait": {
+            "calls": 13,
+            "errors": 0,
+            "max_seconds": 0.00015413016080856323,
+            "seconds": 0.000640038400888443
+          },
+          "journal_complete": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.00031724199652671814,
+            "seconds": 0.002448335289955139
+          },
+          "journal_save": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0013056397438049316,
+            "seconds": 0.007684618234634399
+          },
+          "queue_wait": {
+            "calls": 13,
+            "errors": 0,
+            "max_seconds": 0.00028249621391296387,
+            "seconds": 0.0014120936393737793
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "max_seconds": 0,
+            "seconds": 0
+          },
+          "snapshot_build": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0060655586421489716,
+            "seconds": 0.023256737738847733
+          },
+          "store_manifest": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.0006014443933963776,
+            "seconds": 0.003705054521560669
+          },
+          "store_payload": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.006387554109096527,
+            "seconds": 0.02094418555498123
+          },
+          "validation": {
+            "calls": 8,
+            "errors": 0,
+            "max_seconds": 0.015500020235776901,
+            "seconds": 0.040256477892398834
+          }
+        },
+        "states": {
+          "available": 3
+        },
+        "writer_age_seconds": 0
+      },
+      "draft_kind": null,
+      "handoffs": {
+        "control-gated-abort-decode": {
+          "capture_epoch": 1,
+          "current_epoch": 1,
+          "payload_present": true,
+          "teacher_present": true
+        },
+        "control-gated-abort-prefill": {
+          "capture_epoch": 0,
+          "current_epoch": 1,
+          "payload_present": false,
+          "teacher_present": false
+        },
+        "control-gated-abort-prefill-decode": {
+          "capture_epoch": 1,
+          "current_epoch": 2,
+          "payload_present": false,
+          "teacher_present": false
+        },
+        "control-gated-drain": {
+          "capture_epoch": 0,
+          "current_epoch": 0,
+          "payload_present": true,
+          "teacher_present": true
+        }
+      },
+      "pd_control": true,
+      "post_exit_snapshots": 8,
+      "prefill": {
+        "admission_paused": false,
+        "counters": {
+          "control_abort": 2,
+          "control_pause": 3,
+          "control_resume": 5,
+          "pd_handoff_ready": 10,
+          "pd_selected": 12,
+          "pd_teacher_copied": 10
+        },
+        "disabled_reason": null,
+        "role": "prefill_teacher"
+      },
+      "replay": true
+    }
+  ],
+  "artifact_sha256": {
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790958129062045441-df8d934bc1ac.log": "1ee6aeafb871e7909e8832421bbc771960b13f153b50286003f995c50a70e132",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790958129062045441-df8d934bc1ac.json": "1774d73b3c8fbc0a262c9c0d101d2abb526395829a8f064590f9e18f123596fb",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790958218127326389-a0a47f10e371.log": "2a56dfa86e7c1a6cb69b4fcf97749379d354d8ba3fff4c023599c29a3eba7fb4",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790958218127326389-a0a47f10e371.json": "55e2031131750f97250ed69d2d381566e140bad0c400e41aabeebd349a9e04f8",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790958592873053017-48078a2b1409.log": "593916579ac068c9a4a050389e8c6ba0dffe620f13b8d97a09310ff76d444a9b",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790958592873053017-48078a2b1409.json": "893d7bd144f1747407ec94b5b95c41809d427c65056656e52c1af9fdf23fa90c"
+  },
+  "limits": [
+    "Both P and D are TP1/PP1 processes sharing one H100; no multi-GPU or cross-node HTTP control claim.",
+    "Mooncake P/D and Store use TCP; the test process owns the data segment and outlives the producers. No Store-node restart or durable-retention claim.",
+    "The Catalog is the repository test implementation, not SpecForge's production Catalog.",
+    "Static target-KV DSpark uses a synthetic checkpoint to test execution and capture ownership, not training quality or acceptance rates.",
+    "Prefill graphs are disabled; only decode graph and overlap are covered here.",
+    "No confidence-scheduled DSpark, global all-rank drain barrier, production rollout or SLO acceptance.",
+    "Observers copy source tensors and write reference files; elapsed test times are not serving benchmarks.",
+    "Authentication is covered by the initial operator-control run, not repeated by this P/D matrix."
+  ],
+  "outer_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+}

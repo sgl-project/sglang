@@ -1462,8 +1462,12 @@ rank 指标确认。已存在的 Host arena 与 lease 不因暂停立即释放�
 P/D 分别控制两个服务端点：先暂停 D，保留 P 完成已有 handoff，再暂停 P；
 恢复时先 P 后 D。紧急终止向两端发送 `abort`。P 使用本地代次检查，防止
 终止前留下的 teacher 状态在恢复后进入 handoff。具体复现和验证范围见
-[采集控制实验](experiments/CAPTURE_CONTROL.md)。此能力不替代生产 SLO、
-真实多机灰度流程或训练收益验收。
+[采集控制实验](experiments/CAPTURE_CONTROL.md)。后续的
+[P/D 控制矩阵](experiments/PD_CAPTURE_CONTROL.md) 已验证单卡 TP1/PP1 下
+两个独立 HTTP 端点的 AR 与静态 target-KV DSpark，包括 eager、decode graph
+和 overlap、分块 prefill 期间暂停、abort/resume 后迟到的 teacher handoff、
+解码期间只终止采集，以及两端退出后的 32 份 Store 样本校验。
+此验证不替代多 GPU/跨节点控制、生产 SLO、真实灰度流程或训练收益验收。
 
 ## 21. 待定参数与研究风险
 

@@ -93,8 +93,10 @@ multi-node control behavior.
   The graph run records 307 graph forwards and 311 overlap forwards.
 - The existing two real P/D tests pass: eager and graph + overlap, handoff faults,
   cancellation, source parity and five post-exit Store snapshots each. Live HTTP
-  controls on separate P/D endpoints and real multi-GPU TP/PP control still need
-  dedicated integration coverage; unit/control-protocol evidence is not that gate.
+  controls on separate P/D endpoints were not exercised by this initial run.
+  The subsequent [P/D control matrix](PD_CAPTURE_CONTROL.md) validates TP1/PP1
+  separate-endpoint AR and static target-KV DSpark control. Real multi-GPU TP/PP
+  and cross-node live control still need dedicated integration coverage.
 
 Unit job: `01790955971085003936-cd670ad63a29` (80.134 s).
 Eager HTTP: `01790956196564215278-85cff0a67a54` (49.126 s).

@@ -209,6 +209,45 @@ class TestPDCapture(CustomTestCase):
             self.catalog.captures[record.lease.capture_id]["state"], "FAILED"
         )
 
+    def test_prefill_abort_fences_materialized_and_encoded_teacher_after_resume(self):
+        decode, payload = self.begin()
+        record = decode.training_capture_context
+        for encoded in (False, True):
+            with self.subTest(encoded=encoded):
+                req = self.prefill_request(payload)
+                req.output_ids = [10]
+                batch = SimpleNamespace(reqs=[req], seq_lens_cpu=[2])
+                self.prefill.after_forward(
+                    batch,
+                    SimpleNamespace(extend_seq_lens_cpu=[2], positions=torch.arange(2)),
+                    SimpleNamespace(next_token_logits=torch.arange(256).float()[None]),
+                )
+                state = req.training_capture_pd
+                self.assertIsNotNone(state.teacher)
+                if encoded:
+                    wire = self.prefill.pack_pp_handoffs(batch, [10])
+                    self.assertIsNotNone(wire)
+                    self.assertIsNotNone(state.handoff)
+                    self.assertIsNone(state.teacher)
+                self.prefill.control("abort")
+                self.prefill.control("resume")
+                self.assertIsNone(self.prefill.pack_pp_handoffs(batch, [10]))
+                if encoded:
+                    self.prefill.accept_pp_handoffs(batch, wire)
+                self.assertIsNone(self.prefill.finish_handoff(req))
+                self.assertIsNone(req.training_capture_pd)
+                self.assertEqual(req.output_ids, [10])
+        self.assertEqual(self.prefill.counters["pd_teacher_copied"], 2)
+        self.assertEqual(self.prefill.counters["pd_handoff_ready"], 0)
+        self.assertEqual(self.prefill.counters["pd_pp_handoff_received"], 0)
+        decode.output_ids = [10]
+        self.decode.accept_pd_handoff(decode, None)
+        self.wait_until(lambda: record.state == "done")
+        self.assertFalse(self.catalog.publications)
+        self.assertEqual(
+            self.catalog.captures[record.lease.capture_id]["state"], "FAILED"
+        )
+
     def test_pd_verify_trims_accepted_tail_after_length_or_eos(self):
         from sglang.srt.managers.schedule_batch import (
             FINISH_LENGTH,

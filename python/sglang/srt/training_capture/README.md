@@ -167,6 +167,11 @@ exports `sglang:training_capture_admission_paused` and bounded `control_pause`,
 dashboard distinguishes manual pause from failure disable. See the
 [operator-control runbook](../../../../mooncake-study/experiments/CAPTURE_CONTROL.md)
 for commands, validation scope and asynchronous rollback limits.
+The [P/D control matrix](../../../../mooncake-study/experiments/PD_CAPTURE_CONTROL.md)
+covers separate TP1/PP1 P/D HTTP endpoints with AR and static target-KV DSpark,
+in eager and decode graph/overlap execution. It validates partial-prefill pause,
+late teacher handoff after abort/resume, and active decode abort while ordinary
+generation completes. It does not certify multi-GPU or cross-node control.
 
 ### Reservation Refill
 
