@@ -637,7 +637,7 @@ def test_abort_before_sender_exists_is_consumed_by_sender() -> None:
 
     assert mgr.pending_aborts == {room: "early abort"}
     assert room not in mgr.request_status
-    with get_parallel().override(dp_size=1):
+    with get_parallel().override(num_dp_ranks=1):
         sender = UniflowKVSender(mgr, f"{LOCALHOST}:8998", room, [0], 0)
     assert not mgr.pending_aborts
     assert sender.poll() == KVPoll.Failed
