@@ -516,7 +516,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        # One pooled index key per index_kpool tokens.
         indexer_size_per_token = ceil_div(
             index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
             get_dsa_index_kpool(kvc.model_config.hf_config),

@@ -143,8 +143,6 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     "needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1)."
                 )
             else:
-                # A k-pool logical page spans index_kpool 64-token physical
-                # pages, so its pooled index keys fill one 64-slot index page.
                 index_kpool = get_dsa_index_kpool(hf_config)
                 if index_kpool > 1 and getattr(cfg, "dcp_size", 1) > 1:
                     raise ValueError(

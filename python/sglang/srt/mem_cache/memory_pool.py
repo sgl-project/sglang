@@ -4992,9 +4992,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
-        # page_size is the logical (allocator) page; kernels see index_kpool
-        # physical pages in it. Pooled key j lives at index slot
-        # loc(j * index_kpool) // index_kpool, so index page id == logical page id.
         assert self.page_size % index_kpool == 0, (
             f"page_size {self.page_size} must be a multiple of index_kpool {index_kpool}"
         )

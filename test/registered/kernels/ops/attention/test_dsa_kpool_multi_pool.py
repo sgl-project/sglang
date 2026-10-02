@@ -64,7 +64,6 @@ class TestDsaKpoolMultiPool(CustomTestCase):
             dtype=torch.int32,
             device="cuda",
         )
-        # Group heads are the first physical page of logical pages 2, 3, 5, 6.
         real_page_table[:num_draft_tokens, 0] = 2 * self.POOL_SIZE
         real_page_table[:num_draft_tokens, 4] = 3 * self.POOL_SIZE
         real_page_table[num_draft_tokens:, 0] = 5 * self.POOL_SIZE

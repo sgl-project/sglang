@@ -64,7 +64,6 @@ def build_pooled_page_table_64(
     idx = torch.arange(
         0, page_table_64.shape[-1], pool_size, device=page_table_64.device
     )
-    # Logical page L starts at physical page L * pool_size and owns index page L.
     return page_table_64[..., idx] // pool_size
 
 
@@ -160,8 +159,6 @@ def kpool_build_ragged_layout(
     total_q: int,
     pool_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # One index page holds 64 pooled keys: those of the logical page whose
-    # first physical page sits at every pool_size-th real token page.
     device = full_page_table.device
     n_rag = cu_pages_excl.shape[0]
     concat_page_table = torch.empty(

@@ -33,8 +33,7 @@ s: scale, 1 item per token, fp32
 
 
 def _index_page_slots(pool) -> int:
-    # Under k-pool an index page holds page_size // index_kpool pooled keys.
-    return getattr(pool, "slots_per_page", pool.page_size)
+    return pool.slots_per_page
 
 
 class GetK:
