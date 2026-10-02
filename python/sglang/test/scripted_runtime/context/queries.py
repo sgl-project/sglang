@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
 
+from sglang.srt.runtime_context import get_parallel
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.test.scripted_runtime.context.api import ScriptedContext
@@ -12,7 +14,7 @@ def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
     if s.chunked_req is not None:
         yield s.chunked_req
     yield from s.waiting_queue
-    if s.ps.pp_size > 1:
+    if get_parallel().pp_size > 1:
         for mb in (*s.mbs, *s.last_mbs, *s.running_mbs):
             if mb is not None:
                 yield from mb.reqs
