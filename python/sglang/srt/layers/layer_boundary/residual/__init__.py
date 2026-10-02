@@ -94,6 +94,7 @@ class ResidualReadout(Protocol):
         norm,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
+        forward_batch=None,
     ) -> Tuple:
         """Read input from a residual that already includes the producer update.
 
@@ -127,6 +128,7 @@ class ResidualReadout(Protocol):
             norm: Consumer normalization module.
             quant_format: Requested input quantization format, as in read().
             post_residual_addition: Optional extra added after update, before norm.
+            forward_batch: Active batch, when the readout needs phase-specific dispatch.
 
         Returns:
             (compute_input, residual). A fused implementation can preserve FP32

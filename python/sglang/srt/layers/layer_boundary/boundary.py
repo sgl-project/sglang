@@ -165,6 +165,7 @@ class _TransformedRead:
         norm,
         quant_format="",
         post_residual_addition=None,
+        forward_batch=None,
     ):
         if hidden_states.shape[0] != 0:
             hidden_states = self.transform.apply(hidden_states)
@@ -175,6 +176,7 @@ class _TransformedRead:
             norm,
             quant_format=quant_format,
             post_residual_addition=post_residual_addition,
+            forward_batch=forward_batch,
         )
 
 
@@ -347,8 +349,8 @@ def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> Exit
 
     Args:
         edge: Output contract and destination/residual rows. Deferred updates
-            must outlive the producer; pipeline handoffs require a plain add
-            or a residual already written by the producer.
+            must outlive the producer; nonlinear updates are flushed by the
+            residual stream before pipeline transport.
         cp_moves: Context-parallel return operations, when the edge needs them.
 
     Returns:
@@ -361,9 +363,14 @@ def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> Exit
             raise NotImplementedError(
                 "a deferred update must guarantee its lifetime across layers"
             )
-        if not update.is_plain_add and get_parallel().pp_size > 1:
+        if (
+            not update.is_plain_add
+            and get_parallel().pp_size > 1
+            and not getattr(update, "flushes_before_pp", False)
+        ):
             raise NotImplementedError(
-                "pipeline boundaries require a plain add or a producer-written residual"
+                "pipeline boundaries require a plain add, a producer-written "
+                "residual, or an update flushed before transport"
             )
     if edge.need.layout != edge.residual_to:
         raise NotImplementedError(f"{edge=}")

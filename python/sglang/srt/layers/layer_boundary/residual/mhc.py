@@ -38,6 +38,8 @@ class MHCState:
     hc_ffn_pre: Callable
     hc_post: Callable
     hc_ffn_post_pre: Optional[Callable] = None
+    hc_attn_post_pre: Optional[Callable] = None
+    defer_ffn_update: bool = False
     # The last layer's write-back also contracts the streams into the hidden
     # states the layer stack hands on.
     is_last_layer: bool = False
@@ -63,7 +65,11 @@ class MHCState:
         return hidden_states, residual
 
     def update_and_read_ffn_input(
-        self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
+        self,
+        hidden_states,
+        residual,
+        out_norm: Optional[torch.nn.Module] = None,
+        forward_batch=None,
     ):
         out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         if self.hc_ffn_post_pre is not None and hidden_states.shape[0] != 0:
@@ -76,6 +82,8 @@ class MHCState:
                 h_post=self.h_post,
                 out_norm_weight=out_norm_weight,
                 out_norm_eps=out_norm_eps,
+                is_prefill=forward_batch is not None
+                and forward_batch.forward_mode.is_extend_without_speculative(),
             )
             if fused is not None:
                 hidden_states, residual, self.h_res, self.h_post, norm_fused = fused
@@ -86,6 +94,43 @@ class MHCState:
         hidden_states = self.hc_post(hidden_states, residual, self.h_res, self.h_post)
         residual = hidden_states
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_ffn_pre(
+            hidden_states, out_norm_weight, out_norm_eps
+        )
+        if out_norm is not None and not norm_fused and hidden_states.shape[0] != 0:
+            hidden_states = out_norm(hidden_states)
+        return hidden_states, residual
+
+    def update_and_read_attn_input(
+        self,
+        producer: "MHCState",
+        hidden_states,
+        residual,
+        out_norm: Optional[torch.nn.Module] = None,
+        forward_batch=None,
+    ):
+        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
+        if self.hc_attn_post_pre is not None and hidden_states.shape[0] != 0:
+            fused = self.hc_attn_post_pre(
+                hidden_states=hidden_states,
+                residual=residual,
+                h_res=producer.h_res,
+                h_post=producer.h_post,
+                out_norm_weight=out_norm_weight,
+                out_norm_eps=out_norm_eps,
+                is_prefill=forward_batch is not None
+                and forward_batch.forward_mode.is_extend_without_speculative(),
+            )
+            if fused is not None:
+                hidden_states, residual, self.h_res, self.h_post, norm_fused = fused
+                producer.clear_coefficients()
+                if out_norm is not None and not norm_fused:
+                    hidden_states = out_norm(hidden_states)
+                return hidden_states, residual
+
+        hidden_states = producer.apply_post(hidden_states, residual)
+        producer.clear_coefficients()
+        residual = hidden_states
+        hidden_states, self.h_res, self.h_post, norm_fused = self.hc_attn_pre(
             hidden_states, out_norm_weight, out_norm_eps
         )
         if out_norm is not None and not norm_fused and hidden_states.shape[0] != 0:
@@ -139,7 +184,15 @@ class _AttnReadout:
         return self.state.read_attn_input(residual, out_norm=norm)
 
     def update_and_read(self, update, hidden_states, residual, norm, **kwargs):
-        raise NotImplementedError("an MHC layer takes its input written back")
+        if not isinstance(update, _FfnUpdate):
+            raise NotImplementedError(f"an MHC attention input after {update=}")
+        return self.state.update_and_read_attn_input(
+            update.state,
+            hidden_states,
+            residual,
+            out_norm=norm,
+            forward_batch=kwargs.get("forward_batch"),
+        )
 
 
 class _AttnUpdate:
@@ -183,7 +236,10 @@ class _FfnReadout:
         if not isinstance(update, _AttnUpdate) or update.state is not self.state:
             raise NotImplementedError(f"an MHC FFN input after {update=}")
         return self.state.update_and_read_ffn_input(
-            hidden_states, residual, out_norm=norm
+            hidden_states,
+            residual,
+            out_norm=norm,
+            forward_batch=kwargs.get("forward_batch"),
         )
 
 
@@ -193,11 +249,21 @@ class _FfnUpdate:
     hidden states the layer stack hands on."""
 
     is_plain_add = False
-    applied_at_exit = True
-    outlives_layer = False
 
     def __init__(self, state: MHCState):
         self.state = state
+
+    @property
+    def applied_at_exit(self):
+        return self.state.is_last_layer or not self.state.defer_ffn_update
+
+    @property
+    def outlives_layer(self):
+        return self.state.defer_ffn_update and not self.state.is_last_layer
+
+    @property
+    def flushes_before_pp(self):
+        return self.outlives_layer
 
     def update(self, hidden_states, residual):
         hidden_states = self.state.apply_post(hidden_states, residual)

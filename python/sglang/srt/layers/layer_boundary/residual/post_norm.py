@@ -65,6 +65,7 @@ class PlainReadout:
         norm,
         quant_format="",
         post_residual_addition=None,
+        forward_batch=None,
     ):
         if residual is not None:
             hidden_states = update.update(hidden_states, residual)

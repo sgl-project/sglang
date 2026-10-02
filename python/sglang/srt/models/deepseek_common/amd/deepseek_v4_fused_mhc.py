@@ -262,6 +262,8 @@ def try_aiter_fused_mhc_post_pre(
     sinkhorn_iters: int,
     norm_weight: Optional[torch.Tensor],
     norm_eps: Optional[float],
+    force_fused: bool = False,
+    w_preshuffle_bf16: bool = False,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
     """Fused mhc_post + next-layer mhc_pre via the aiter HIP kernel.
 
@@ -309,6 +311,8 @@ def try_aiter_fused_mhc_post_pre(
             hc_sinkhorn_eps=hc_eps,
             hc_post_mult_value=hc_post_mult,
             sinkhorn_repeat=sinkhorn_iters,
+            force_fused=force_fused,
+            w_preshuffle_bf16=w_preshuffle_bf16,
             **norm_kwargs,
         )
     except Exception as err:
@@ -345,6 +349,8 @@ def try_mhc_fused_post_pre_boundary(
     norm_eps: Optional[float],
     fn_transpose: bool,
     is_gfx95_supported_flag: bool,
+    force_fused: bool = False,
+    w_preshuffle_bf16: bool = False,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
     """Dispatch the fused mHC post+pre across the attn/MoE boundary.
 
@@ -370,9 +376,15 @@ def try_mhc_fused_post_pre_boundary(
         sinkhorn_iters,
         norm_weight,
         norm_eps,
+        force_fused,
+        w_preshuffle_bf16,
     )
     if aiter_result is not None:
         return aiter_result
+    if w_preshuffle_bf16:
+        # Packed hi/lo weights are an AITER-only layout. Returning None lets the
+        # caller run the ordinary FP32 unfused boundary if AITER is unavailable.
+        return None
 
     triton_fn = hc_fn.T if fn_transpose else hc_fn
     return try_fused_hc_post_pre(
@@ -409,6 +421,8 @@ def apply_mhc_post_pre_boundary(
     norm_eps: Optional[float],
     *,
     fn_transpose: bool,
+    force_fused: bool = False,
+    w_preshuffle_bf16: bool = False,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
     # Try the aiter/Triton fused post+pre kernels first; if neither fires,
     # fall back to the TileLang fused kernel, else return None so the caller
@@ -430,6 +444,8 @@ def apply_mhc_post_pre_boundary(
         norm_eps,
         fn_transpose,
         _is_gfx95_supported,
+        force_fused,
+        w_preshuffle_bf16,
     )
     if fused is not None:
         return fused
