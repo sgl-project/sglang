@@ -6,7 +6,7 @@
 use serde_json::Value;
 
 use super::{
-    function_call_item, message_item, new_id, now_secs, reasoning_item, response_object,
+    call_item, message_item, new_id, now_secs, reasoning_item, response_object,
     set_incomplete_reason, usage_from_chat, EchoContext, Finish,
 };
 
@@ -61,12 +61,13 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
             .pointer("/function/arguments")
             .and_then(Value::as_str)
             .unwrap_or("");
-        output.push(function_call_item(
+        output.push(call_item(
             &new_id("fc"),
             &call_id,
             name,
             args,
             "completed",
+            &echo.tools,
         ));
     }
 
@@ -165,5 +166,36 @@ mod tests {
         assert_eq!(out[0]["name"], "get_weather");
         assert_eq!(out[0]["arguments"], "{\"city\":\"bj\"}");
         assert!(out[0]["id"].as_str().unwrap().starts_with("fc_"));
+    }
+
+    #[test]
+    fn codex_tool_calls_map_back() {
+        let echo = to_chat(json!({"model": "m", "input": "x", "tools": [
+            {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+            {"type": "custom", "name": "apply_patch", "description": "Edit files.",
+             "format": {"type": "grammar", "syntax": "lark", "definition": "start: patch"}},
+            {"type": "namespace", "name": "mcp__fs__", "description": "fs",
+             "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]},
+        ]}))
+        .unwrap()
+        .echo;
+        let chat = json!({"choices": [{"finish_reason": "tool_calls", "message": {
+        "role": "assistant", "content": null, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "apply_patch",
+             "arguments": "{\"input\":\"*** Begin Patch\"}"}},
+            {"id": "c2", "type": "function", "function": {"name": "mcp__fs__read",
+             "arguments": "{}"}},
+            {"id": "c3", "type": "function", "function": {"name": "shell",
+             "arguments": "{}"}},
+        ]}}]});
+        let out = chat_to_response(&chat, &echo)["output"].clone();
+        assert_eq!(out[0]["type"], "custom_tool_call");
+        assert_eq!(out[0]["name"], "apply_patch");
+        assert_eq!(out[0]["input"], "*** Begin Patch");
+        assert_eq!(out[1]["type"], "function_call");
+        assert_eq!(out[1]["name"], "read");
+        assert_eq!(out[1]["namespace"], "mcp__fs__");
+        assert_eq!(out[2]["name"], "shell");
+        assert!(out[2].get("namespace").is_none());
     }
 }

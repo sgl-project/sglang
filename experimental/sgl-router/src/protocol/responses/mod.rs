@@ -9,7 +9,7 @@ pub mod stream;
 
 use serde_json::{json, Map, Value};
 
-pub use request::{to_chat, Converted, EchoContext};
+pub use request::{to_chat, Converted, EchoContext, ToolMap};
 
 pub(crate) fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
@@ -140,21 +140,39 @@ pub(crate) fn message_item(id: &str, text: &str, status: &str) -> Value {
     })
 }
 
-pub(crate) fn function_call_item(
+/// A tool call output item; `name` is the chat function name, mapped back to
+/// the declared tool.
+pub(crate) fn call_item(
     id: &str,
     call_id: &str,
     name: &str,
     arguments: &str,
     status: &str,
+    tools: &ToolMap,
 ) -> Value {
-    json!({
-        "id": id,
-        "type": "function_call",
-        "call_id": call_id,
-        "name": name,
-        "arguments": arguments,
-        "status": status,
-    })
+    let Some(t) = tools.get(name) else {
+        return json!({"id": id, "type": "function_call", "call_id": call_id, "name": name,
+                      "arguments": arguments, "status": status});
+    };
+    let mut item = if t.custom {
+        json!({"id": id, "type": "custom_tool_call", "call_id": call_id, "name": t.name,
+               "input": custom_input(arguments), "status": status})
+    } else {
+        json!({"id": id, "type": "function_call", "call_id": call_id, "name": t.name,
+               "arguments": arguments, "status": status})
+    };
+    if let Some(ns) = &t.namespace {
+        item["namespace"] = Value::String(ns.clone());
+    }
+    item
+}
+
+/// A custom tool's raw input, unwrapped from `{"input": ...}`.
+pub(crate) fn custom_input(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|v| v.get("input").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| arguments.to_owned())
 }
 
 /// Re-wrap sglang's flat error body into `{"error": {...}}`; `None` = keep.

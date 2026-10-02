@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 
 use super::{
-    function_call_item, message_item, new_id, now_secs, output_text_part, reasoning_item,
+    call_item, custom_input, message_item, new_id, now_secs, output_text_part, reasoning_item,
     response_object, set_incomplete_reason, usage_from_chat, EchoContext, Finish,
 };
 use crate::protocol::{data_payload, write_event, LineBuffer, SseTransducer};
@@ -208,7 +208,7 @@ impl ResponsesStream {
             self.emit(
                 "response.output_item.added",
                 json!({"output_index": index,
-                       "item": function_call_item(&id, &call_id, &name, "", "in_progress")}),
+                       "item": call_item(&id, &call_id, &name, "", "in_progress", &self.echo.tools)}),
                 out,
             );
             self.open = Some(Open::Function {
@@ -237,8 +237,11 @@ impl ResponsesStream {
             .filter(|s| !s.is_empty())
         {
             args.push_str(delta);
-            let data = json!({"item_id": id, "output_index": *index, "delta": delta});
-            self.emit("response.function_call_arguments.delta", data, out);
+            // A custom tool's input is JSON-wrapped; it is sent whole on close.
+            if !self.echo.tools.get(name.as_str()).is_some_and(|t| t.custom) {
+                let data = json!({"item_id": id, "output_index": *index, "delta": delta});
+                self.emit("response.function_call_arguments.delta", data, out);
+            }
         }
     }
 
@@ -285,16 +288,23 @@ impl ResponsesStream {
                 args,
                 ..
             } => {
-                self.emit(
-                    "response.function_call_arguments.done",
-                    json!({"item_id": id, "output_index": index, "name": name,
-                           "arguments": args}),
-                    out,
-                );
-                (
-                    index,
-                    function_call_item(&id, &call_id, &name, &args, "completed"),
-                )
+                let item = call_item(&id, &call_id, &name, &args, "completed", &self.echo.tools);
+                if item["type"] == "custom_tool_call" {
+                    self.emit(
+                        "response.custom_tool_call_input.done",
+                        json!({"item_id": id, "output_index": index,
+                               "input": custom_input(&args)}),
+                        out,
+                    );
+                } else {
+                    self.emit(
+                        "response.function_call_arguments.done",
+                        json!({"item_id": id, "output_index": index, "name": item["name"],
+                               "arguments": args}),
+                        out,
+                    );
+                }
+                (index, item)
             }
         };
         let (index, item) = item;
@@ -569,5 +579,44 @@ mod tests {
     fn stream_without_finish_reason_fails() {
         let evs = run(&[chunk(json!({"content": "cut"}), None)]);
         assert_eq!(evs.last().unwrap().0, "response.failed");
+    }
+
+    #[test]
+    fn streamed_custom_tool_call() {
+        let echo = to_chat(
+            json!({"model": "m", "input": "x", "stream": true, "tools": [
+            {"type": "custom", "name": "apply_patch"}]}),
+        )
+        .unwrap()
+        .echo;
+        let mut s = ResponsesStream::new(echo);
+        let mut raw = Vec::new();
+        for c in [
+            chunk(
+                json!({"tool_calls": [{"index": 0, "id": "c1", "type": "function",
+                         "function": {"name": "apply_patch", "arguments": "{\"input\":"}}]}),
+                None,
+            ),
+            chunk(
+                json!({"tool_calls": [{"index": 0, "function": {"arguments": "\"*** P\"}"}}]}),
+                Some("tool_calls"),
+            ),
+        ] {
+            raw.extend(s.feed(c.as_bytes()));
+        }
+        raw.extend(s.finish());
+        let evs = events(&raw);
+        assert_framing(&evs);
+        assert!(!evs
+            .iter()
+            .any(|(e, _)| e == "response.function_call_arguments.delta"));
+        let done = evs
+            .iter()
+            .find(|(e, _)| e == "response.custom_tool_call_input.done")
+            .unwrap();
+        assert_eq!(done.1["input"], "*** P");
+        let item = &evs.last().unwrap().1["response"]["output"][0];
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(item["input"], "*** P");
     }
 }

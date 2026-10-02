@@ -4,6 +4,8 @@
 //! Responses request → chat request. `Value`-based so unconsumed fields
 //! (sglang extensions) pass through; item merging follows dynamo.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Map, Value};
 
 /// Request fields echoed on every Response object.
@@ -11,6 +13,27 @@ use serde_json::{json, Map, Value};
 pub struct EchoContext {
     pub model: String,
     pub fields: Map<String, Value>,
+    /// Chat function name → declared tool, for namespaced and custom tools only.
+    pub tools: ToolMap,
+}
+
+/// A namespaced or `custom` tool, flattened to one chat function.
+#[derive(Debug, Clone)]
+pub struct ToolRef {
+    pub namespace: Option<String>,
+    pub name: String,
+    pub custom: bool,
+}
+
+pub type ToolMap = HashMap<String, ToolRef>;
+
+/// Chat function name for a tool, e.g. `mcp__fs__` + `read` → `mcp__fs__read`.
+fn flat_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        None => name.to_owned(),
+        Some(ns) if ns.ends_with("__") => format!("{ns}{name}"),
+        Some(ns) => format!("{ns}__{name}"),
+    }
 }
 
 #[derive(Debug)]
@@ -112,11 +135,12 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
     if let Some(v) = req.get("max_output_tokens").filter(|v| !v.is_null()) {
         chat.insert("max_completion_tokens".into(), v.clone());
     }
-    if let Some(tools) = req.get("tools").filter(|v| !v.is_null()) {
-        let converted = convert_tools(tools)?;
-        if !converted.is_empty() {
-            chat.insert("tools".into(), Value::Array(converted));
-        }
+    let (tools, tool_map) = match req.get("tools").filter(|v| !v.is_null()) {
+        Some(tools) => convert_tools(tools)?,
+        None => Default::default(),
+    };
+    if !tools.is_empty() {
+        chat.insert("tools".into(), Value::Array(tools));
     }
     if let Some(tc) = req.get("tool_choice").filter(|v| !v.is_null()) {
         chat.insert("tool_choice".into(), convert_tool_choice(tc)?);
@@ -137,6 +161,7 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
         echo: EchoContext {
             model,
             fields: echo_fields(&req),
+            tools: tool_map,
         },
         stream,
     })
@@ -250,20 +275,24 @@ fn convert_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Strin
                     other => return Err(format!("input[{i}] has unsupported role `{other}`")),
                 }
             }
-            "function_call" => {
+            "function_call" | "custom_tool_call" => {
                 let call_id = obj
                     .get("call_id")
                     .or_else(|| obj.get("id"))
                     .and_then(Value::as_str)
-                    .ok_or_else(|| format!("input[{i}] (function_call) is missing `call_id`"))?;
+                    .ok_or_else(|| format!("input[{i}] ({typ}) is missing `call_id`"))?;
                 let name = obj
                     .get("name")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| format!("input[{i}] (function_call) is missing `name`"))?;
-                let arguments = match obj.get("arguments") {
-                    Some(Value::String(s)) => s.clone(),
-                    None | Some(Value::Null) => "{}".into(),
-                    Some(other) => other.to_string(),
+                    .ok_or_else(|| format!("input[{i}] ({typ}) is missing `name`"))?;
+                let name = flat_name(obj.get("namespace").and_then(Value::as_str), name);
+                let arguments = match (typ, obj.get("arguments"), obj.get("input")) {
+                    ("custom_tool_call", _, Some(Value::String(s))) => {
+                        json!({ "input": s }).to_string()
+                    }
+                    (_, Some(Value::String(s)), _) => s.clone(),
+                    (_, None | Some(Value::Null), _) => "{}".into(),
+                    (_, Some(other), _) => other.to_string(),
                 };
                 pending.tool_calls.push(json!({
                     "id": call_id,
@@ -271,11 +300,12 @@ fn convert_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Strin
                     "function": {"name": name, "arguments": arguments},
                 }));
             }
-            "function_call_output" => {
+            "function_call_output" | "custom_tool_call_output" => {
                 pending.flush(messages);
-                let call_id = obj.get("call_id").and_then(Value::as_str).ok_or_else(|| {
-                    format!("input[{i}] (function_call_output) is missing `call_id`")
-                })?;
+                let call_id = obj
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("input[{i}] ({typ}) is missing `call_id`"))?;
                 let output = match obj.get("output") {
                     Some(Value::String(s)) => s.clone(),
                     Some(v @ Value::Array(_)) => content_text(v, i)?,
@@ -443,40 +473,106 @@ fn url_field(v: Option<&Value>) -> Option<String> {
     }
 }
 
-fn convert_tools(tools: &Value) -> Result<Vec<Value>, String> {
+/// `namespace` groups are flattened; a `custom` tool becomes a function taking
+/// one `input` string.
+fn convert_tools(tools: &Value) -> Result<(Vec<Value>, ToolMap), String> {
     let Value::Array(tools) = tools else {
         return Err("`tools` must be an array".into());
     };
-    tools
-        .iter()
-        .enumerate()
-        .map(|(i, tool)| {
-            let typ = tool.get("type").and_then(Value::as_str).unwrap_or("");
-            if typ != "function" {
-                return Err(format!(
-                    "tools[{i}]: tool type `{typ}` is not supported; only `function` tools are"
-                ));
-            }
-            if tool.get("function").is_some_and(Value::is_object) {
-                return Ok(tool.clone());
-            }
-            let name = tool
-                .get("name")
+    let (mut out, mut map) = (Vec::new(), ToolMap::new());
+    for (i, tool) in tools.iter().enumerate() {
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            convert_tool(tool, None, &format!("tools[{i}]"), &mut out, &mut map)?;
+            continue;
+        }
+        let ns = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("tools[{i}] (namespace) is missing `name`"))?;
+        let children = tool
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("tools[{i}] (namespace) is missing `tools`"))?;
+        for (j, child) in children.iter().enumerate() {
+            convert_tool(
+                child,
+                Some(ns),
+                &format!("tools[{i}].tools[{j}]"),
+                &mut out,
+                &mut map,
+            )?;
+        }
+    }
+    Ok((out, map))
+}
+
+fn convert_tool(
+    tool: &Value,
+    ns: Option<&str>,
+    at: &str,
+    out: &mut Vec<Value>,
+    map: &mut ToolMap,
+) -> Result<(), String> {
+    let typ = tool.get("type").and_then(Value::as_str).unwrap_or("");
+    if !matches!(typ, "function" | "custom") {
+        return Err(format!(
+            "{at}: tool type `{typ}` is not supported; only `function`, `custom` and \
+             `namespace` tools are"
+        ));
+    }
+    if ns.is_none() && tool.get("function").is_some_and(Value::is_object) {
+        out.push(tool.clone());
+        return Ok(());
+    }
+    let name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{at} is missing `name`"))?;
+    let flat = flat_name(ns, name);
+    let mut function = Map::new();
+    function.insert("name".into(), Value::String(flat.clone()));
+    let custom = typ == "custom";
+    if custom {
+        let mut desc = tool
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if let Some(def) = tool.pointer("/format/definition").and_then(Value::as_str) {
+            let syntax = tool
+                .pointer("/format/syntax")
                 .and_then(Value::as_str)
-                .ok_or_else(|| format!("tools[{i}] is missing `name`"))?;
-            let mut function = Map::new();
-            function.insert("name".into(), Value::String(name.into()));
-            for key in ["description", "parameters", "strict"] {
-                if let Some(v) = tool.get(key).filter(|v| !v.is_null()) {
-                    function.insert(key.into(), v.clone());
-                }
+                .unwrap_or("");
+            desc.push_str(&format!(
+                "\n\n`input` must follow this {syntax} grammar:\n{def}"
+            ));
+        }
+        function.insert("description".into(), Value::String(desc));
+        function.insert(
+            "parameters".into(),
+            json!({"type": "object", "properties": {"input": {"type": "string"}},
+                   "required": ["input"]}),
+        );
+    } else {
+        for key in ["description", "parameters", "strict"] {
+            if let Some(v) = tool.get(key).filter(|v| !v.is_null()) {
+                function.insert(key.into(), v.clone());
             }
-            function
-                .entry("parameters")
-                .or_insert_with(|| json!({"type": "object", "properties": {}}));
-            Ok(json!({"type": "function", "function": function}))
-        })
-        .collect()
+        }
+        function
+            .entry("parameters")
+            .or_insert_with(|| json!({"type": "object", "properties": {}}));
+    }
+    if custom || ns.is_some() {
+        let r = ToolRef {
+            namespace: ns.map(str::to_owned),
+            name: name.to_owned(),
+            custom,
+        };
+        map.insert(flat, r);
+    }
+    out.push(json!({"type": "function", "function": function}));
+    Ok(())
 }
 
 fn convert_tool_choice(tc: &Value) -> Result<Value, String> {
@@ -486,13 +582,15 @@ fn convert_tool_choice(tc: &Value) -> Result<Value, String> {
             "`tool_choice` `{s}` is not supported; use auto, none, required or a function"
         )),
         Value::Object(o) => match o.get("type").and_then(Value::as_str) {
-            Some("function") => {
+            Some(t @ ("function" | "custom")) => {
                 if o.get("function").is_some_and(Value::is_object) {
                     return Ok(tc.clone());
                 }
-                let name = o.get("name").and_then(Value::as_str).ok_or_else(|| {
-                    "`tool_choice` of type function is missing `name`".to_string()
-                })?;
+                let name = o
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("`tool_choice` of type {t} is missing `name`"))?;
+                let name = flat_name(o.get("namespace").and_then(Value::as_str), name);
                 Ok(json!({"type": "function", "function": {"name": name}}))
             }
             // Keep the mode, drop the allow-list.
@@ -827,5 +925,56 @@ mod tests {
             json!({"effort": null, "summary": null})
         );
         assert_eq!(e.fields["temperature"], Value::Null);
+    }
+
+    #[test]
+    fn codex_namespace_and_custom_tools() {
+        let c = to_chat(json!({"model": "m", "tools": [
+            {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+            {"type": "custom", "name": "apply_patch", "description": "Edit files.",
+             "format": {"type": "grammar", "syntax": "lark", "definition": "start: patch"}},
+            {"type": "namespace", "name": "mcp__fs__", "description": "fs",
+             "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]},
+        ],
+            "input": [
+                {"type": "message", "role": "user", "content": "go"},
+                {"type": "custom_tool_call", "call_id": "c1", "name": "apply_patch",
+                 "input": "*** Begin Patch"},
+                {"type": "custom_tool_call_output", "call_id": "c1", "output": "ok"},
+                {"type": "function_call", "call_id": "c2", "name": "read",
+                 "namespace": "mcp__fs__", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c2", "output": "data"},
+            ]}))
+        .unwrap();
+        let names: Vec<&str> = c.chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["shell", "apply_patch", "mcp__fs__read"]);
+        let patch = &c.chat["tools"][1]["function"];
+        assert_eq!(patch["parameters"]["required"], json!(["input"]));
+        assert!(patch["description"]
+            .as_str()
+            .unwrap()
+            .contains("start: patch"));
+        assert!(c.echo.tools["apply_patch"].custom);
+        assert_eq!(
+            c.echo.tools["mcp__fs__read"].namespace.as_deref(),
+            Some("mcp__fs__")
+        );
+        assert!(!c.echo.tools.contains_key("shell"));
+
+        let m = &c.chat["messages"];
+        assert_eq!(
+            m[1]["tool_calls"][0]["function"],
+            json!({"name": "apply_patch", "arguments": "{\"input\":\"*** Begin Patch\"}"})
+        );
+        assert_eq!(
+            m[2],
+            json!({"role": "tool", "tool_call_id": "c1", "content": "ok"})
+        );
+        assert_eq!(m[3]["tool_calls"][0]["function"]["name"], "mcp__fs__read");
     }
 }
