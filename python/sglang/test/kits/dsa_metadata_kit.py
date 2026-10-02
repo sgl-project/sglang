@@ -27,7 +27,8 @@ def inputs(lengths, requests):
     )
 
 
-def make_backend(mode, seq, req, *, fusion=True):
+def make_backend(mode, seq, req, *, fusion=True, width=WIDTH):
+    bs = seq.shape[0]
     backend = object.__new__(DeepseekSparseAttnBackend)
     backend.device = torch.device("cuda")
     backend.device_sm_major = torch.cuda.get_device_capability()[0]
@@ -47,14 +48,15 @@ def make_backend(mode, seq, req, *, fusion=True):
     backend._get_device_sm = lambda: backend.device_sm_major * 10
     backend._is_blackwell = lambda: backend.device_sm_major == 10
     backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+    num_requests = max(8, bs)
     backend.req_to_token = torch.arange(
-        8 * WIDTH, device="cuda", dtype=torch.int32
-    ).view(8, WIDTH)
+        num_requests * width, device="cuda", dtype=torch.int32
+    ).view(num_requests, width)
     backend._arange_buf = torch.arange(
-        BS * NEXT_N + 1, device="cuda", dtype=torch.int32
+        bs * NEXT_N + 1, device="cuda", dtype=torch.int32
     )
     backend.decode_cuda_graph_metadata = {
-        "page_table": torch.zeros(BS * NEXT_N, WIDTH, device="cuda", dtype=torch.int32),
+        "page_table": torch.zeros(bs * NEXT_N, width, device="cuda", dtype=torch.int32),
         "cu_seqlens_q": backend._arange_buf,
     }
     with envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.override(fusion):
@@ -67,7 +69,7 @@ def make_backend(mode, seq, req, *, fusion=True):
 
 def apply_metadata(backend, mode, seq, req, spec_info=None):
     backend._apply_cuda_graph_metadata(
-        bs=BS,
+        bs=seq.shape[0],
         req_pool_indices=req,
         seq_lens=seq,
         seq_lens_cpu=seq.cpu(),
