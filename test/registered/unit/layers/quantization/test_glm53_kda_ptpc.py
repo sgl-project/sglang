@@ -11,11 +11,7 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp8_utils, unquant
-from sglang.srt.layers.quantization.unquant import (
-    Glm53KdaPtpcLinearMethod,
-    Glm53KdaSplitPtpcLinearMethod,
-    UnquantizedLinearMethod,
-)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.glm5_next import (
     GLM53_KDA_FUSED_O_NORM_MIN_M,
     GLM53_KDA_PTPC_BF16_MAX_M,
@@ -44,33 +40,42 @@ class _RecordingLinear(torch.nn.Module):
         return self.output, None
 
 
-class _RecordingFusedLinear(torch.nn.Module):
-    def __init__(self, output_size, quant_method=None):
-        super().__init__()
-        self.output_size = output_size
-        self.quant_method = quant_method or UnquantizedLinearMethod()
-        self.inputs = []
-
-    def forward(self, x):
-        self.inputs.append(x)
-        tensor = x if isinstance(x, torch.Tensor) else x[0]
-        return tensor.new_empty(tensor.shape[0], self.output_size)
-
-
-class _RecordingBatchedLinear(torch.nn.Module):
-    def forward(self, x):
-        return x.new_empty(2, x.shape[1], 6).unbind(0)
-
-
 class TestGLM53KDAPTPC(CustomTestCase):
-    def test_method_activation_boundary(self):
+    def test_gate_truth_table(self):
+        layer = SimpleNamespace()
         self.assertEqual(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.default, ())
-        method = Glm53KdaPtpcLinearMethod("qkv_proj", bf16_max_m=512)
-        self.assertFalse(method.is_active(513))
-        method._fp8_ptpc_ready = True
-        self.assertFalse(method.is_active(0))
-        self.assertFalse(method.is_active(512))
-        self.assertTrue(method.is_active(513))
+        for selected in (False, True):
+            for use_aiter in (False, True):
+                for marked in (False, True):
+                    for gfx950 in (False, True):
+                        selector = "qkv_proj" if selected else ""
+                        with (
+                            self.subTest(
+                                selected=selected,
+                                use_aiter=use_aiter,
+                                marked=marked,
+                                gfx950=gfx950,
+                            ),
+                            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(selector),
+                            patch.object(unquant, "_use_aiter", use_aiter),
+                            patch.object(
+                                unquant,
+                                "is_gfx95_supported",
+                                return_value=gfx950,
+                            ) as gfx95_supported,
+                        ):
+                            if marked:
+                                layer._glm53_kda_ptpc_module = "qkv_proj"
+                            elif hasattr(layer, "_glm53_kda_ptpc_module"):
+                                del layer._glm53_kda_ptpc_module
+                            self.assertEqual(
+                                unquant._glm53_kda_ptpc_enabled(layer),
+                                selected and use_aiter and marked and gfx950,
+                            )
+                            self.assertEqual(
+                                gfx95_supported.call_count,
+                                int(selected and use_aiter and marked),
+                            )
 
     def test_default_off_preserves_bf16_linear(self):
         method = UnquantizedLinearMethod()
@@ -83,17 +88,61 @@ class TestGLM53KDAPTPC(CustomTestCase):
         with (
             envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(""),
             patch.object(unquant, "_is_cpu_amx_available", False),
+            patch.object(method, "_repack_bf16_to_fp8_ptpc") as repack,
         ):
             method.process_weights_after_loading(layer)
+        repack.assert_not_called()
         with (
             patch.object(unquant, "use_intel_amx_backend", return_value=False),
             patch.object(unquant, "_use_aiter", False),
         ):
             actual = method.apply(layer, x)
         torch.testing.assert_close(actual, F.linear(x, weight), rtol=0, atol=0)
+        self.assertFalse(hasattr(layer, "_fp8_ptpc_ready"))
+
+    def test_non_gfx950_does_not_repack(self):
+        method = UnquantizedLinearMethod()
+        layer = _Linear(method)
+        layer._glm53_kda_ptpc_module = "qkv_proj"
+        layer.register_parameter(
+            "weight",
+            torch.nn.Parameter(
+                torch.zeros(4, 8, dtype=torch.bfloat16), requires_grad=False
+            ),
+        )
+        with (
+            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("qkv_proj"),
+            patch.object(unquant, "_use_aiter", True),
+            patch.object(unquant, "is_gfx95_supported", return_value=False),
+            patch.object(method, "_repack_bf16_to_fp8_ptpc") as repack,
+            patch.object(unquant, "_is_cpu_amx_available", False),
+        ):
+            method.process_weights_after_loading(layer)
+        repack.assert_not_called()
+
+    def test_o_proj_repack_supports_validated_tp4_and_tp8_local_k(self):
+        method = UnquantizedLinearMethod()
+        layer = _Linear(method)
+        layer._glm53_kda_ptpc_module = "o_proj"
+        layer._fp8_ptpc_allowed_k = (1024, 2048)
+        with (
+            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("o_proj"),
+            patch.object(unquant, "_use_aiter", True),
+            patch.object(unquant, "is_gfx95_supported", return_value=True),
+        ):
+            for k, expected in ((2048, True), (1024, True), (1536, False)):
+                layer.weight = torch.nn.Parameter(
+                    torch.zeros(4096, k, dtype=torch.bfloat16),
+                    requires_grad=False,
+                )
+                with self.subTest(k=k):
+                    self.assertEqual(
+                        unquant._glm53_kda_ptpc_enabled(layer),
+                        expected,
+                    )
 
     def test_repack_preserves_bf16_and_registers_nonpersistent_buffers(self):
-        method = Glm53KdaPtpcLinearMethod("qkv_proj", bf16_max_m=0)
+        method = UnquantizedLinearMethod()
         layer = _Linear(method)
         weight = torch.arange(32, dtype=torch.bfloat16).view(4, 8)
         parameter = torch.nn.Parameter(weight.clone(), requires_grad=False)
@@ -115,8 +164,8 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 "aiter.ops.shuffle": fake_shuffle,
             },
         ):
-            method.process_weights_after_loading(layer)
-            method.process_weights_after_loading(layer)
+            method._repack_bf16_to_fp8_ptpc(layer)
+            method._repack_bf16_to_fp8_ptpc(layer)
         self.assertIs(layer.weight, parameter)
         torch.testing.assert_close(layer.weight, weight, rtol=0, atol=0)
         torch.testing.assert_close(layer._fp8_ptpc_weight, shuffled)
@@ -130,7 +179,7 @@ class TestGLM53KDAPTPC(CustomTestCase):
         )
         self.assertNotIn("_fp8_ptpc_weight", layer.state_dict())
         self.assertNotIn("_fp8_ptpc_weight_scale", layer.state_dict())
-        self.assertTrue(method._fp8_ptpc_ready)
+        self.assertTrue(layer._fp8_ptpc_ready)
         fake_aiter.pertoken_quant.assert_called_once()
         fake_shuffle.shuffle_weight.assert_called_once_with(fp8_weight, (16, 16))
 
@@ -140,21 +189,20 @@ class TestGLM53KDAPTPC(CustomTestCase):
             torch.zeros(2, 4, 8, dtype=torch.bfloat16),
         ):
             layer = _Linear()
+            layer._glm53_kda_ptpc_module = "qkv_proj"
             layer.register_parameter(
                 "weight", torch.nn.Parameter(weight, requires_grad=False)
             )
             with self.subTest(dtype=weight.dtype, shape=tuple(weight.shape)):
                 with self.assertRaisesRegex(ValueError, "2-D BF16"):
-                    Glm53KdaPtpcLinearMethod(
-                        "qkv_proj", bf16_max_m=0
-                    ).process_weights_after_loading(layer)
+                    UnquantizedLinearMethod._repack_bf16_to_fp8_ptpc(layer)
 
     def test_per_module_bf16_ptpc_boundaries_and_rollback(self):
+        method = UnquantizedLinearMethod()
         for module_name, max_m in GLM53_KDA_PTPC_BF16_MAX_M.items():
-            method = Glm53KdaPtpcLinearMethod(module_name, bf16_max_m=max_m)
-            method._fp8_ptpc_ready = True
-            method.output_size = 4
             layer = _Linear(method)
+            layer._fp8_ptpc_ready = True
+            layer._fp8_ptpc_bf16_max_m = max_m
             layer.register_parameter(
                 "weight",
                 torch.nn.Parameter(
@@ -192,7 +240,7 @@ class TestGLM53KDAPTPC(CustomTestCase):
                     layer._fp8_ptpc_weight_scale,
                     bias=None,
                 )
-                method._fp8_ptpc_ready = False
+                layer._fp8_ptpc_ready = False
                 bf16_linear.reset_mock()
                 fallback = torch.empty_like(ptpc_output)
                 bf16_linear.return_value = fallback
@@ -200,15 +248,17 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 bf16_linear.assert_called_once_with(x_ptpc, layer.weight, None)
 
     def test_zero_tokens_remain_bf16(self):
-        method = Glm53KdaPtpcLinearMethod("qkv_proj", bf16_max_m=0)
-        method._fp8_ptpc_ready = True
-        self.assertFalse(method.is_active(0))
+        layer = SimpleNamespace(
+            _fp8_ptpc_ready=True,
+            _fp8_ptpc_bf16_max_m=0,
+        )
+        self.assertFalse(unquant.fp8_ptpc_linear_active(layer, 0))
 
     def test_tuple_dispatch_preserves_quantized_input_and_bias(self):
-        method = Glm53KdaPtpcLinearMethod("qkv_proj", bf16_max_m=512)
-        method._fp8_ptpc_ready = True
-        method.output_size = 4
+        method = UnquantizedLinearMethod()
         layer = SimpleNamespace(
+            _fp8_ptpc_ready=True,
+            _fp8_ptpc_bf16_max_m=512,
             _fp8_ptpc_weight=torch.empty(4, 8),
             _fp8_ptpc_weight_scale=torch.ones(4, 1),
         )
@@ -228,140 +278,49 @@ class TestGLM53KDAPTPC(CustomTestCase):
             bias=bias,
         )
 
-    def test_model_selector_requires_aiter_gfx950(self):
-        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
-        torch.nn.Module.__init__(attention)
-        with (
-            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("o_proj"),
-            patch.object(
-                sys.modules[Glm5NextLinearAttention.__module__],
-                "_use_aiter_gfx95",
-                False,
-            ),
-            self.assertRaisesRegex(ValueError, "requires AITER on gfx950"),
-        ):
-            attention._configure_ptpc_modules()
-
-    def test_model_selector_marks_shared_input_modules_together(self):
-        model_module = sys.modules[Glm5NextLinearAttention.__module__]
+    def test_model_selector_marks_only_requested_unquantized_modules(self):
         attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
         torch.nn.Module.__init__(attention)
         attention.do_fuse_qkvbfg = False
-        attention.fuse_bfg = False
+        for name in ("qkv_proj", "o_proj", "b_proj", "f_a_proj", "g_a_proj"):
+            setattr(attention, name, _Linear())
+        with envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("qkv_proj"):
+            attention._configure_ptpc_modules()
+        module = attention.qkv_proj
+        self.assertEqual(module._glm53_kda_ptpc_module, "qkv_proj")
+        self.assertEqual(
+            module._fp8_ptpc_bf16_max_m,
+            GLM53_KDA_PTPC_BF16_MAX_M["qkv_proj"],
+        )
+        for name in ("o_proj", "b_proj", "f_a_proj", "g_a_proj"):
+            self.assertFalse(
+                hasattr(getattr(attention, name), "_glm53_kda_ptpc_module")
+            )
+
+    def test_model_selector_marks_shared_input_modules_together(self):
+        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+        torch.nn.Module.__init__(attention)
+        attention.do_fuse_qkvbfg = False
         for name in ("qkv_proj", "f_a_proj", "g_a_proj", "o_proj"):
             setattr(attention, name, _Linear())
-        attention.o_proj.register_parameter(
-            "weight",
-            torch.nn.Parameter(
-                torch.empty(4096, 2048, device="meta"),
-                requires_grad=False,
-            ),
-        )
         selector = "qkv_proj,f_a_proj,g_a_proj,o_proj"
-        with (
-            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(selector),
-            patch.object(model_module, "_use_aiter_gfx95", True),
-        ):
+        with envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(selector):
             attention._configure_ptpc_modules()
         for name in ("qkv_proj", "f_a_proj", "g_a_proj", "o_proj"):
             module = getattr(attention, name)
-            self.assertIsInstance(
-                module.quant_method,
-                Glm53KdaPtpcLinearMethod,
-            )
+            self.assertEqual(module._glm53_kda_ptpc_module, name)
             self.assertEqual(
-                module.quant_method.bf16_max_m,
+                module._fp8_ptpc_bf16_max_m,
                 GLM53_KDA_PTPC_BF16_MAX_M[name],
             )
-
-    def test_model_selector_preserves_fused_first_stage(self):
-        model_module = sys.modules[Glm5NextLinearAttention.__module__]
-        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
-        torch.nn.Module.__init__(attention)
-        attention.do_fuse_qkvbfg = True
-        attention.fuse_bfg = False
-        attention.split_sizes = [3072, 8, 256]
-        attention.fused_qkvbfg_a_proj = _Linear()
-        attention.o_proj = _Linear()
-        selector = "qkv_proj,f_a_proj,g_a_proj"
-        with (
-            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(selector),
-            patch.object(model_module, "_use_aiter_gfx95", True),
-        ):
-            attention._configure_ptpc_modules()
-        self.assertIsInstance(
-            attention.fused_qkvbfg_a_proj.quant_method,
-            Glm53KdaSplitPtpcLinearMethod,
-        )
-        self.assertTrue(attention.do_fuse_qkvbfg)
-
-    def test_model_selector_rejects_unsupported_fused_qkv_size(self):
-        model_module = sys.modules[Glm5NextLinearAttention.__module__]
-        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
-        torch.nn.Module.__init__(attention)
-        attention.do_fuse_qkvbfg = True
-        attention.fuse_bfg = False
-        attention.split_sizes = [12288, 32, 256]
-        attention.fused_qkvbfg_a_proj = _Linear()
-        attention.o_proj = _Linear()
-        with (
-            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(
-                "qkv_proj,f_a_proj,g_a_proj"
-            ),
-            patch.object(model_module, "_use_aiter_gfx95", True),
-            self.assertRaisesRegex(ValueError, "supports fused qkv sizes"),
-        ):
-            attention._configure_ptpc_modules()
-
-    def test_fused_first_stage_keeps_decode_bf16_and_uses_ptpc_for_prefill(self):
-        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
-        torch.nn.Module.__init__(attention)
-        attention.head_dim = 4
-        attention.split_sizes = [12, 2, 8]
-        attention.fused_qkvbfg_a_proj = _RecordingFusedLinear(22)
-        attention.fused_fg_b_proj = _RecordingBatchedLinear()
-        method = Glm53KdaSplitPtpcLinearMethod(
-            bf16_max_m=3,
-            fp8_max_m=8,
-            qkv_size=12,
-            beta_size=2,
-            fg_size=8,
-        )
-        method._fp8_ptpc_ready = True
-        attention.fused_qkvbfg_a_proj.quant_method = method
-
-        decode_input = torch.empty(2, 8)
-        attention.forward_qkvbfg_fused(decode_input, forward_batch=None)
-        self.assertIs(attention.fused_qkvbfg_a_proj.inputs[-1], decode_input)
-
-        prefill_input = torch.empty(4, 8)
-        split_outputs = (
-            torch.empty(4, 12),
-            torch.empty(4, 2),
-            (torch.empty(4, 4), torch.empty(4, 4)),
-        )
-        with patch.object(
-            method,
-            "apply_ptpc_prefill",
-            return_value=split_outputs,
-        ) as apply_ptpc:
-            attention.forward_qkvbfg_fused(prefill_input, forward_batch=None)
-        self.assertEqual(len(attention.fused_qkvbfg_a_proj.inputs), 1)
-        apply_ptpc.assert_called_once_with(
-            attention.fused_qkvbfg_a_proj,
-            prefill_input,
-        )
+        self.assertEqual(attention.o_proj._fp8_ptpc_allowed_k, (1024, 2048))
 
     def test_fused_o_norm_dispatch_uses_local_k_and_token_boundaries(self):
         model_module = sys.modules[Glm5NextLinearAttention.__module__]
         attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
         torch.nn.Module.__init__(attention)
-        method = Glm53KdaPtpcLinearMethod(
-            "o_proj",
-            bf16_max_m=GLM53_KDA_PTPC_BF16_MAX_M["o_proj"],
-        )
-        method._fp8_ptpc_ready = True
-        attention.o_proj = _Linear(method)
+        attention.o_proj = _Linear()
+        attention.o_proj._fp8_ptpc_ready = True
         attention.o_norm = _Linear()
         attention.o_norm.register_parameter(
             "weight",
@@ -374,6 +333,11 @@ class TestGLM53KDAPTPC(CustomTestCase):
         with (
             patch.object(
                 model_module,
+                "fp8_ptpc_linear_active",
+                return_value=True,
+            ),
+            patch.object(
+                model_module,
                 "can_use_rms_norm_gated_per_token_fp8",
                 return_value=True,
             ),
@@ -383,7 +347,6 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 (1024, 1, True),
                 (2048, 255, False),
                 (2048, 256, True),
-                (2048, 4096, True),
                 (1536, 4096, False),
             ):
                 heads = local_k // 128
@@ -419,56 +382,32 @@ class TestGLM53KDAPTPC(CustomTestCase):
         )
 
     def test_model_selector_rejects_unknown_fused_and_quantized_targets(self):
-        model_module = sys.modules[Glm5NextLinearAttention.__module__]
         attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
         torch.nn.Module.__init__(attention)
         attention.do_fuse_qkvbfg = True
         attention.o_proj = _Linear()
-        attention.o_proj.register_parameter(
-            "weight",
-            torch.nn.Parameter(
-                torch.empty(4096, 2048, device="meta"),
-                requires_grad=False,
-            ),
-        )
         with envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("unknown"):
             with self.assertRaisesRegex(ValueError, "Unsupported"):
                 attention._configure_ptpc_modules()
-        with (
-            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("o_proj"),
-            patch.object(model_module, "_use_aiter_gfx95", True),
-        ):
+        with envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("o_proj"):
             attention._configure_ptpc_modules()
-        self.assertIsInstance(
-            attention.o_proj.quant_method,
-            Glm53KdaPtpcLinearMethod,
-        )
+        self.assertEqual(attention.o_proj._glm53_kda_ptpc_module, "o_proj")
         with envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("qkv_proj"):
-            with self.assertRaisesRegex(ValueError, "selected together"):
+            with self.assertRaisesRegex(ValueError, "unavailable"):
                 attention._configure_ptpc_modules()
         attention.do_fuse_qkvbfg = False
-        attention.fuse_bfg = False
         attention.qkv_proj = _Linear(quant_method=object())
-        attention.f_a_proj = _Linear()
-        attention.g_a_proj = _Linear()
-        with (
-            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(
-                "qkv_proj,f_a_proj,g_a_proj"
-            ),
-            patch.object(model_module, "_use_aiter_gfx95", True),
-        ):
+        with envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("qkv_proj"):
             with self.assertRaisesRegex(ValueError, "UnquantizedLinearMethod"):
                 attention._configure_ptpc_modules()
 
     def test_model_selector_rejects_partial_shared_input_group(self):
-        model_module = sys.modules[Glm5NextLinearAttention.__module__]
         attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
         torch.nn.Module.__init__(attention)
         attention.do_fuse_qkvbfg = False
         for name in ("qkv_proj", "f_a_proj", "g_a_proj"):
             setattr(attention, name, _Linear())
         for selector in (
-            "qkv_proj",
             "f_a_proj",
             "g_a_proj",
             "qkv_proj,f_a_proj",
@@ -477,7 +416,6 @@ class TestGLM53KDAPTPC(CustomTestCase):
             with (
                 self.subTest(selector=selector),
                 envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(selector),
-                patch.object(model_module, "_use_aiter_gfx95", True),
                 self.assertRaisesRegex(ValueError, "selected together"),
             ):
                 attention._configure_ptpc_modules()
@@ -501,8 +439,8 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 return_value=quantized,
             ) as quantize,
             patch.object(
-                Glm5NextLinearAttention,
-                "_ptpc_linear_active",
+                sys.modules[Glm5NextLinearAttention.__module__],
+                "fp8_ptpc_linear_active",
                 side_effect=lambda layer, _: (
                     layer in (attention.f_a_proj, attention.g_a_proj)
                 ),
@@ -517,9 +455,10 @@ class TestGLM53KDAPTPC(CustomTestCase):
 
     def test_model_quantization_boundary_and_zero_tokens(self):
         threshold = GLM53_KDA_PTPC_BF16_MAX_M["qkv_proj"]
-        method = Glm53KdaPtpcLinearMethod("qkv_proj", bf16_max_m=threshold)
-        method._fp8_ptpc_ready = True
-        layer = SimpleNamespace(quant_method=method)
+        layer = SimpleNamespace(
+            _fp8_ptpc_ready=True,
+            _fp8_ptpc_bf16_max_m=threshold,
+        )
         x_small = torch.empty(threshold, 8)
         x_empty = torch.empty(0, 8)
         self.assertIs(
