@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
     StagingBuffer,
@@ -49,7 +50,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 ROOM = 37
 MODES = {"prefill": DisaggregationMode.PREFILL, "decode": DisaggregationMode.DECODE}
-PARALLEL = lambda: NS(dp_size=1, tp_size=1, enable_dsa_cache_layer_split=False)
+PARALLEL = lambda: NS(num_dp_ranks=1, tp_size=1, enable_dsa_cache_layer_split=False)
 
 
 class FailStop(BaseException):
@@ -104,7 +105,10 @@ class Agent:
 
     def prep_xfer_dlist(self, peer, rows, kind):
         assert not self.host, "HOST prepared a NIXL dlist"
-        return NS(rows=np.asarray(rows, dtype=np.uint64), peer=peer, kind=kind)
+        rows = np.asarray(rows, dtype=np.uint64)
+        if rows.shape[1] == 5:
+            rows = NixlKVManager._expand_stride_descs(rows)
+        return NS(rows=rows, peer=peer, kind=kind)
 
     def make_prepped_xfer(self, op, src, src_idx, dst, dst_idx, notif):
         assert not self.host, "HOST posted a prepped NIXL xfer"
@@ -282,7 +286,9 @@ class Rig:
         m.transfer_statuses = defaultdict(TransferStatus)
         m.required_prefill_response_num_table, m.prefill_response_tracker = {}, {}
         m._deferred_abort_ack_tracker, m._deferred_ack_targets = {}, {}
+        m._deferred_ack_fanout_snapshots = {}
         m._staging_outstanding = defaultdict(int)
+        m._abandoned, m._abandoned_lock, m._aux_in_flight = {}, threading.Lock(), set()
         m.transfer_queues = [FastQueue()]
         m.exceptions, m.failure_records = {}, {}
         m.failure_lock = threading.Lock()
@@ -358,6 +364,7 @@ class Rig:
         h.queue, h.seqs, h.ready, h.failed_rooms = deque(), defaultdict(int), {}, set()
         h.slots, h.allocator, h.stream = [], None, Stream()
         if prefill:
+            m._start_host_abort_ack_worker()
             h.slots = [
                 H.HostSlot(StagingBuffer(slot_bytes, "cpu", 0), Stream())
                 for _ in range(H.SLOT_COUNT)
@@ -536,6 +543,9 @@ class HostStagingTest(unittest.TestCase):
         Event.auto_complete = True
         for context in (
             patch.object(H, "fail_stop", side_effect=fail_stop),
+            patch(
+                "sglang.srt.disaggregation.nixl.conn.fail_stop", side_effect=fail_stop
+            ),
             patch.object(H, "copy_rows", memmove_rows),
             patch.object(torch.cuda, "Event", Event),
             patch.object(torch.cuda, "current_stream", lambda *a: Stream()),
@@ -734,6 +744,48 @@ class HostStagingTest(unittest.TestCase):
         self.assertFalse([h for h in rig.prefill.agent.handles if b"_hst_" in h.notif])
         self.assertFalse(rig.sender.is_source_pending())
 
+    def test_failed_room_stays_released_after_clear(self):
+        # A room fails (client AbortReq, or a transfer error) with a non-last
+        # chunk still outstanding (no aux posted). The scheduler's failure path
+        # calls failure_exception(), whose clear() pops the room's status, then
+        # re-checks is_source_pending() before releasing the KV pages. The room
+        # was drained when it failed; clearing it must not make it pending.
+        for fail in ("abort", "transfer"):
+            with self.subTest(fail=fail):
+                rig = Rig(count=4, slot_bytes=600)
+                rig.decode._handle_staging_req = Mock()  # Parts wait for ring space.
+                rig.submit([2, 2])
+                host = rig.prefill.host_staging
+                for _ in range(200):
+                    if host.queue:
+                        break
+                    time.sleep(0.001)
+                host.progress()  # Slots claimed: the first chunk stays outstanding.
+                self.assertFalse(rig.sender.is_aux_in_flight())
+                if fail == "abort":
+                    rig.sender.abort()
+                else:
+                    rig.prefill.record_failure(ROOM, "transfer failed")
+                    rig.prefill.update_status(ROOM, KVPoll.Failed)
+                self.assertGreater(rig.prefill._staging_outstanding.get(ROOM, 0), 0)
+                self.assertEqual(rig.sender.poll(), KVPoll.Failed)
+                with self.assertRaises(KVTransferError):
+                    rig.sender.failure_exception()
+                self.assertNotIn(ROOM, rig.prefill.request_status)
+                # The release guards (release_kv_cache, metadata buffer, clear).
+                self.assertFalse(rig.sender.is_source_pending())
+                rig.sender.clear()
+                # The claimed parts retire unposted and the chunk settles.
+                for _ in range(200):
+                    host.progress()
+                    if not rig.prefill._staging_outstanding.get(ROOM, 0):
+                        break
+                    time.sleep(0.001)
+                self.assertFalse(rig.prefill._staging_outstanding.get(ROOM, 0))
+                self.assertFalse(
+                    [h for h in rig.prefill.agent.handles if b"_hst_" in h.notif]
+                )
+
     def test_dropped_part_keeps_its_slot_until_its_gather_finished(self):
         Event.auto_complete = False  # Gathers wait on a forward still running.
         rig = Rig(count=4, slot_bytes=600)
@@ -867,9 +919,40 @@ class HostStagingTest(unittest.TestCase):
             rig.prefill.host_staging.progress()  # No fail-stop.
             time.sleep(0.01)
 
+    def test_stride_descriptors_expand_only_for_host(self):
+        runs = np.array([[100, 4, 0, 8, 2], [200, 2, 0, 4, 3]], dtype=np.uint64)
+        expanded = np.array(
+            [[100, 4, 0], [108, 4, 0], [200, 2, 0], [204, 2, 0], [208, 2, 0]],
+            dtype=np.uint64,
+        )
+        for host in (None, object()):
+            with self.subTest(host=host is not None):
+                manager = NixlKVManager.__new__(NixlKVManager)
+                manager.host_staging = host
+                manager.agent = NS(prep_xfer_dlist=Mock(return_value="native"))
+                manager._prep_dlist = Mock(return_value="host")
+                result = manager._prep_xfer_dlist("peer", runs, "VRAM")
+                prepare = (
+                    manager._prep_dlist
+                    if host is not None
+                    else manager.agent.prep_xfer_dlist
+                )
+                args = prepare.call_args.args
+                self.assertEqual((args[0], args[2]), ("peer", "VRAM"))
+                np.testing.assert_array_equal(
+                    args[1], expanded if host is not None else runs
+                )
+                self.assertEqual(result, "host" if host is not None else "native")
+                unused = (
+                    manager.agent.prep_xfer_dlist
+                    if host is not None
+                    else manager._prep_dlist
+                )
+                unused.assert_not_called()
+
     def test_unfinished_chunk_insert_skip_is_rank_invariant(self):
         # Gather state differs per TP rank; the insert decision must not.
-        from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+        from sglang.srt.mem_cache.common import checkpoint_kv_cache
 
         tree = Mock()
         tree.req_to_token_pool.req_to_token = torch.arange(8).reshape(1, 8)
@@ -880,12 +963,14 @@ class HostStagingTest(unittest.TestCase):
             req = NS(
                 disagg_kv_sender=sender,
                 kv=NS(req_pool_idx=0),
-                get_fill_ids=lambda: [0] * 4,
+                extend_range=NS(end=4),
+                finished=lambda: False,
+                skip_radix_cache_insert=False,
                 prefix_indices=None,
             )
-            tree.cache_unfinished_req.reset_mock()
-            maybe_cache_unfinished_req(req, tree)
-            self.assertEqual(tree.cache_unfinished_req.called, host is None)
+            tree.insert_req.reset_mock()
+            checkpoint_kv_cache(req, tree)
+            self.assertEqual(tree.insert_req.called, host is None)
             if host is not None:
                 self.assertEqual(req.prefix_indices.tolist(), [0, 1, 2, 3])
 

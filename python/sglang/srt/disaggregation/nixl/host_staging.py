@@ -31,6 +31,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.common.staging_handler import DecodeStagingHandler
 from sglang.srt.disaggregation.utils import DisaggregationMode, fail_stop
+from sglang.srt.environ import envs
 
 SLOT_COUNT = 2
 VERSION = 3
@@ -55,6 +56,18 @@ PAYLOAD_ALIGN = 256
 # drain-ack wait, so an unacked room's ring regions are free to reuse on release.
 POST_DEADLINE_S, WRITE_DEADLINE_S = 15.0, 10.0
 logger = logging.getLogger(__name__)
+
+
+def check_release_timeout(timeout: float) -> None:
+    """Decode frees an unacked failed room's memory after this timeout; every
+    HOST writer WRITE (staged or native aux) settles or fail-stops within the
+    writer deadlines, so the timeout must outlast them."""
+    if timeout < POST_DEADLINE_S + WRITE_DEADLINE_S:
+        raise ValueError(
+            f"SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT={timeout} "
+            f"must be >= the HOST writer deadlines "
+            f"({POST_DEADLINE_S + WRITE_DEADLINE_S}s)"
+        )
 
 
 def payload_offset(n_rows: int) -> int:
@@ -186,6 +199,9 @@ class HostStaging:
                 self.slots.append(HostSlot(buffer, torch.cuda.Stream(self.device)))
             threading.Thread(target=self.run, args=(self.worker,), daemon=True).start()
         else:
+            check_release_timeout(
+                envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
+            )
             # One stream serializes the scatters; distinct ring regions are written
             # concurrently and retired only by their own scatter events.
             self.stream = torch.cuda.Stream(device=self.device)
@@ -361,6 +377,7 @@ class HostStaging:
             time.sleep(0.0005)
 
     def progress(self):
+        self.manager._reap_abandoned()
         for slot in self.slots:
             if slot.part is not None:
                 self._advance(slot)

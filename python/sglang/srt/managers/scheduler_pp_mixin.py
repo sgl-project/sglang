@@ -698,25 +698,34 @@ class SchedulerPPMixin:
         )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
+    def _pp_prefill_releasable_rids(self: Scheduler) -> List[str]:
+        """This stage's Success/Failed inflight rids, minus Failed ones still
+        held (a WRITE may read their source): the consensus then releases a
+        rid only once no stage holds it."""
+        queue = self.disagg_prefill_inflight_queue
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in queue],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        held = self.hold_failed_prefill_transfers(queue, polls)
+        return [
+            req.rid
+            for req, poll, hold in zip(queue, polls, held)
+            if poll in (KVPoll.Success, KVPoll.Failed) and not hold
+        ]
+
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = self._pp_prefill_releasable_rids()
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            curr_transferred_rids = self._pp_prefill_releasable_rids()
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)

@@ -200,6 +200,15 @@ class BaseKVSender(ABC):
         """Config-level is_source_pending(): the same on every rank."""
         return False
 
+    def is_aux_in_flight(self) -> bool:
+        """Whether a posted aux WRITE may still read this request's metadata slot."""
+        return False
+
+    def holds_failed_source(self) -> bool:
+        """For a request whose (reduced) poll is Failed: stop new WRITEs for its
+        room on this rank, then report whether one may still read its source."""
+        return False
+
     @abstractmethod
     def get_transfer_metric(self) -> KVTransferMetric:
         """Return backend-specific transfer metrics for this sender."""
