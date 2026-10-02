@@ -1006,6 +1006,10 @@ def main() -> None:
         else:
             run_expert_major(config, rank, inputs, device)
     finally:
+        # Destroy cached C++ communication runtimes before the process group.
+        MSCCLPPDispatcher.clear_shared_resources()
+        gc.collect()
+        torch.cuda.synchronize()
         destroy_model_parallel()
         if dist.is_initialized():
             dist.destroy_process_group()
