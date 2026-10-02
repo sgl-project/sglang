@@ -412,6 +412,16 @@ class RadixCache(BasePrefixCache):
             best_match_node=last_node,
         )
 
+    def refresh_device_prefix(self, key: RadixKey) -> int:
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        if self.disable or len(key) == 0:
+            return 0
+        key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return 0
+        value, _ = self._match_prefix_helper(self.root_node, key)
+        return sum(len(v) for v in value)
+
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
