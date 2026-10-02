@@ -1,0 +1,20 @@
+type(scope): concise behavior-oriented summary
+
+Why:
+- <problem or limitation this commit is intended to solve>
+
+How:
+- <solution or implementation approach, or None when no explanation is needed>
+
+Dependency:
+- None
+
+Test:
+- Unit:
+  - <UT filename changed by the commit, caller-provided UT filename, or None>
+- E2E:
+  - <Model name>:
+    - Model data type: <dtype or model data type>
+    - Affected platforms: <hardware and software platforms>
+    - Test case:
+      - <required validation scenario, including applicable args, environment variables, topology, inputs, and acceptance criteria>
