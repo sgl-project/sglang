@@ -316,9 +316,8 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
 
     def test_swa_composite_translates_the_swa_side_separately(self):
         """The SWA sub-pool runs its OWN compaction, so a full-side physical id
-        does not name the SWA page holding the same virtual token. The read-path
-        `translate_loc_from_full_to_swa` cannot stand in either: it returns
-        kernel-facing ids, and the transfer addresses raw page envelopes."""
+        does not name the SWA page holding the same virtual token: the transfer
+        translate must go through the SWA sub-pool's own table."""
         virtual = torch.tensor([1, 3], dtype=torch.int32)
         for name in (
             "UnifiedSWATokenToKVPoolAllocator",
@@ -331,7 +330,6 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 )
                 alloc.swa_attn_allocator = SimpleNamespace(
                     translate_kv_loc=lambda ids: ids + 32,
-                    translate_kv_loc_for_kernel=lambda ids: ids + 64,
                 )
                 physical = alloc.translate_swa_indices_for_transfer(virtual)
                 self.assertEqual(physical.dtype, torch.int64)

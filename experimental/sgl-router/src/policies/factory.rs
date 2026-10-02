@@ -254,7 +254,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("modelA".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 
@@ -341,6 +341,7 @@ mod tests {
                 tokenizer: Default::default(),
                 policy,
                 decode_policy: Default::default(),
+                dp_aware: false,
                 bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,

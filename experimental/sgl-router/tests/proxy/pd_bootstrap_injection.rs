@@ -50,6 +50,7 @@ fn config() -> Config {
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
@@ -152,13 +153,14 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(8997),
+            ..Default::default()
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
             url: decode.url.clone(),
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         },
     ]);
     let app = build_router(ctx);
@@ -208,13 +210,14 @@ async fn round_robin_pd_prefill_does_not_track_dispatch_timestamps() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(8997),
+            ..Default::default()
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
             url: decode.url.clone(),
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         },
     ]);
     let prefill_worker = ctx
@@ -244,7 +247,7 @@ async fn plain_mode_chat_does_not_inject_bootstrap_fields() {
         url: plain.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }]);
     let app = build_router(ctx);
 
@@ -282,6 +285,7 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(11111),
+            ..Default::default()
         },
         WorkerSpec {
             id: WorkerId("pB".into()),
@@ -289,13 +293,14 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(22222),
+            ..Default::default()
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
             url: decode.url.clone(),
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         },
     ]);
     let app = build_router(ctx);
@@ -355,13 +360,14 @@ async fn pd_mode_disconnect_aborts_decode_but_not_prefill() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(8997),
+            ..Default::default()
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
             url: decode.url.clone(),
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         },
     ]);
     let app = build_router(ctx);
