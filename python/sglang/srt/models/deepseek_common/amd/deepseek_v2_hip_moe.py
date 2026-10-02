@@ -39,13 +39,13 @@ def router_max_tokens(gate, config, is_hash_moe: bool) -> int:
 
 
 def batch_has_images(forward_batch) -> bool:
-    """Whether a batch can carry image tokens: only extend batches with image inputs do, so
-    every other batch takes the fused top-k instead of the vision one."""
-    if forward_batch is None:
-        return True
-    return (
-        forward_batch.forward_mode.is_extend() and forward_batch.contains_image_inputs()
+    """Deprecated alias: the canonical platform-neutral check lives in
+    sglang.srt.multimodal.dsv41.vl_routing."""
+    from sglang.srt.multimodal.dsv41.vl_routing import (
+        batch_has_images as _batch_has_images,
     )
+
+    return _batch_has_images(forward_batch)
 
 
 def forward_gate(

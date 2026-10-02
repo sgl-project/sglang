@@ -12,6 +12,21 @@ from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.utils import is_cuda
 
 
+def batch_has_images(forward_batch) -> bool:
+    """Whether a batch can carry image tokens: only extend batches with image inputs
+    do, so every other batch takes the fused top-k instead of the vision one.
+
+    The vision top-k bypasses the standard TopK post-processing (expert
+    distribution recording and EPLB logical->physical dispatch), so text-only
+    batches must not take it even when the checkpoint ships a VL bias.
+    """
+    if forward_batch is None:
+        return True
+    return (
+        forward_batch.forward_mode.is_extend() and forward_batch.contains_image_inputs()
+    )
+
+
 def _scale_fused_shared_weights(weights, num_fused_shared_experts, scaling_factor):
     # Standard EP replicates the fused shared expert on every rank and all-reduces,
     # so the shared columns carry a 1/ep_size factor.
