@@ -153,6 +153,7 @@ fn config(policy: PolicyKind) -> Config {
             tokenizer: Default::default(),
             policy,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,

@@ -135,6 +135,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             tokenizer: Default::default(),
             policy: sgl_router::config::PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,

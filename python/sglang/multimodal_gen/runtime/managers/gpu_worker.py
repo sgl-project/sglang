@@ -758,18 +758,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
 
-            # dump per-request perf report to the server-mode file path.
-            if (
-                req.perf_dump_path is not None
-                and not req.is_warmup
-                and output_batch.metrics is not None
-            ):
-                PerformanceLogger.dump_benchmark_report(
-                    file_path=req.perf_dump_path,
-                    metrics=output_batch.metrics,
-                    meta={"model": self.server_args.model_path},
-                    tag="server_perf_dump",
-                )
+            self._dump_perf_report(req, output_batch)
         except Exception as e:
             if propagate_forward_errors and forward_failed:
                 if isinstance(e, StopIteration):
@@ -1104,6 +1093,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if self.is_output_rank:
             output_batch.peak_memory_mb = snapshot.peak_reserved_mb
 
+    def _dump_perf_report(self, req: Req, output_batch: OutputBatch) -> None:
+        """Write the per-request perf report to the server-mode file path."""
+        # one writer per replica, or ranks sharing the path clobber each other
+        if (
+            req.perf_dump_path is None
+            or req.is_warmup
+            or output_batch.metrics is None
+            or not self.is_output_rank
+        ):
+            return
+        PerformanceLogger.dump_benchmark_report(
+            file_path=req.perf_dump_path,
+            metrics=output_batch.metrics,
+            meta={"model": self.server_args.model_path},
+            tag="server_perf_dump",
+        )
+
     def _record_replica_peak_memory(self, output_metrics: list[Any]) -> None:
         """Record replica-wide loading and runtime allocator peaks."""
         if not current_platform.is_cuda():
@@ -1118,9 +1124,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 self._runtime_peak_allocated_mb,
             ],
             dtype=torch.float64,
-            device=current_platform.get_device(self.local_rank),
         )
-        peaks = get_replica_group().all_reduce(peaks, op=torch.distributed.ReduceOp.MAX)
+        replica = get_replica_group()
+        if replica.world_size > 1:
+            # Host counters over gloo: the device group's first collective
+            # sets up NCCL connections, which cost the first dumped request
+            # 0.15 s of latency.
+            torch.distributed.all_reduce(
+                peaks, op=torch.distributed.ReduceOp.MAX, group=replica.cpu_group
+            )
         if not self.is_output_rank:
             return
 

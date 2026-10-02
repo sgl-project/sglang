@@ -1100,7 +1100,10 @@ def test_concat_qkv_attention_skips_grouped_weight_loader() -> None:
     assert grouped_weight.rank_local_weight_transform is not None
 
 
-def test_integrated_h3_int8_loader_preserves_quantized_weights(tmp_path, monkeypatch):
+@pytest.mark.parametrize("backend,out_features", [("comfy_kitchen", 12), ("jit", 16)])
+def test_integrated_h3_int8_loader_preserves_quantized_weights(
+    tmp_path, monkeypatch, backend, out_features
+):
     _ensure_single_process_parallel_runtime()
     import json
     from types import SimpleNamespace
@@ -1122,7 +1125,7 @@ def test_integrated_h3_int8_loader_preserves_quantized_weights(tmp_path, monkeyp
             super().__init__()
             self.proj = ReplicatedLinear(
                 256,
-                12,
+                out_features,
                 bias=False,
                 params_dtype=torch.bfloat16,
                 quant_config=quant_config,
@@ -1133,8 +1136,10 @@ def test_integrated_h3_int8_loader_preserves_quantized_weights(tmp_path, monkeyp
             pass
 
     marker = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
-    weight = torch.arange(12 * 256).reshape(12, 256).to(torch.int8)
-    scales = torch.arange(1, 13, dtype=torch.float32).reshape(12, 1)
+    weight = torch.arange(out_features * 256).reshape(out_features, 256).to(torch.int8)
+    scales = torch.arange(1, out_features + 1, dtype=torch.float32).reshape(
+        out_features, 1
+    )
     path = tmp_path / "h3.safetensors"
     save_file(
         {
@@ -1158,9 +1163,14 @@ def test_integrated_h3_int8_loader_preserves_quantized_weights(tmp_path, monkeyp
         ),
     )
     monkeypatch.setattr(
-        "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8._load_comfy_kitchen",
+        "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen._load_comfy_kitchen",
         lambda: None,
     )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit._load_jit_kernel",
+        lambda: None,
+    )
+    monkeypatch.setenv("SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", backend)
     arguments = SimpleNamespace(
         pipeline_config=SimpleNamespace(
             dit_config=MiniMaxH3DiTConfig(), dit_precision="bf16"
@@ -1189,6 +1199,7 @@ def test_integrated_h3_int8_loader_preserves_quantized_weights(tmp_path, monkeyp
     assert torch.equal(loaded.proj.weight, weight)
     assert torch.equal(loaded.proj.weight_scale, scales)
     assert loaded.proj.quant_method.is_checkpoint_serialized
+    assert loaded.proj.quant_method.quant_config.backend == backend
     assert (
         arguments.pipeline_config.dit_config.arch_config.qkv_checkpoint_grouped is False
     )

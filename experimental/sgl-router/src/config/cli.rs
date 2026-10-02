@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
+use reqwest::header::HeaderValue;
 use std::num::NonZeroU32;
 
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
@@ -133,6 +134,11 @@ pub struct ServerArgs {
     #[arg(long)]
     pub termination_grace_secs: Option<u64>,
 
+    /// API key the router sends on its own requests to workers (`/server_info`,
+    /// `/model_info`). Set it to the engines' `--api-key`.
+    #[arg(long)]
+    pub worker_api_key: Option<String>,
+
     /// Per-request upstream timeout in seconds.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
@@ -215,6 +221,10 @@ pub struct RoutingArgs {
     /// Policy used to select decode workers for PD requests.
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
+
+    /// Also pick the DP rank inside each selected multi-rank worker.
+    #[arg(long)]
+    pub dp_aware: bool,
 
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
@@ -471,12 +481,19 @@ impl Cli {
             .context("--default-chat-template-kwargs must be a JSON object")?
             .unwrap_or_default();
 
+        let worker_auth = self
+            .server
+            .worker_api_key
+            .as_deref()
+            .map(bearer)
+            .transpose()?;
         let config = Config {
             server: ServerConfig {
                 host: self.server.host,
                 port: self.server.port,
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
+                worker_auth,
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
@@ -496,6 +513,7 @@ impl Cli {
                 },
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
+                dp_aware: self.routing.dp_aware,
                 bucket_config,
                 circuit_breaker,
                 cache_aware,
@@ -973,6 +991,14 @@ fn load_bucket_config(path: &str) -> Result<crate::config::BucketConfig> {
 
 fn join_selector(terms: &[String]) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(","))
+}
+
+/// `Bearer <key>`, marked sensitive so it stays out of `Debug` output.
+fn bearer(key: &str) -> Result<HeaderValue> {
+    let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
+        .context("--worker-api-key is not a valid HTTP header value")?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 #[cfg(test)]
