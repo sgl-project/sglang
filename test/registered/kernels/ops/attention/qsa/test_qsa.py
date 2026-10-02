@@ -44,11 +44,6 @@ BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
 
 
-def _seeded(seed: int) -> torch.Generator:
-    """CPU generator so the two branches see byte-identical inputs."""
-    return torch.Generator().manual_seed(seed)
-
-
 def test_qsa_write_plan_tracks_group_crossing_extend_prefix():
     """Plan math for a prefix that starts mid compression group.
 
@@ -179,58 +174,97 @@ def test_qsa_write_plan_cross_rows_cover_every_straddling_entry():
 class _CrossPrefixPool:
     """Minimal QSA pool exposing just the buffers the compress path touches."""
 
-    def __init__(self, ring_slots: int, compressed_slots: int, head_dim: int):
-        self.key_state = torch.zeros(ring_slots, 1, head_dim)
-        self.qsa_rope_position_buffer = torch.zeros(ring_slots, 3, dtype=torch.long)
-        self.compressed = torch.zeros(compressed_slots, 1, head_dim)
+    def __init__(
+        self,
+        ring_slots: int,
+        compressed_slots: int,
+        head_dim: int,
+        device="cpu",
+        dtype=torch.float32,
+    ):
+        self.key_state = torch.zeros(
+            ring_slots, 1, head_dim, device=device, dtype=dtype
+        )
+        self.qsa_rope_position_buffer = torch.zeros(
+            ring_slots, 3, dtype=torch.long, device=device
+        )
+        self.compressed = torch.zeros(
+            compressed_slots, 1, head_dim, device=device, dtype=dtype
+        )
+        self.index_state_dtype = dtype
 
     def get_qsa_key_state_buffer(self, layer_id):
         return self.key_state
 
+    def get_qsa_compressed_k_buffer(self, layer_id):
+        return self.compressed
+
     def set_qsa_compressed_k_buffer(self, layer_id, locs, values):
-        self.compressed[locs.long()] = values
+        self.compressed[locs.long()] = values.to(self.compressed.dtype)
 
 
-def test_qsa_cross_prefix_recompress_reads_the_pre_store_ring(monkeypatch):
-    """A straddling group must pool the prefix keys, not this chunk's tail.
+def _seeded(seed: int) -> torch.Generator:
+    """CPU generator so the two branches see byte-identical inputs."""
+    return torch.Generator().manual_seed(seed)
 
-    The pending ring holds only `compress_ratio` entries per request, keyed by
-    `position % ratio`. With prefix 10 / extend 4 the group is [8, 12): tokens
-    8 and 9 sit in ring slots 0 and 1, and this forward's own tokens 12 and 13
-    land on those same two slots. Reading the ring after the store would pool
-    mean(K12, K13, K10, K11) and take the RoPE position from token 12.
+
+_CROSS_PREFIX_HEAD_DIM = 2
+# Packed extend rows are tokens 10..13; member_rows=-2 clamps to row 0.
+_CROSS_PREFIX_TOKEN_K = torch.tensor(
+    [[[10.0, 10.0]], [[11.0, 11.0]], [[12.0, 12.0]], [[13.0, 13.0]]]
+)
+_CROSS_PREFIX_GROUP_LOCS = torch.tensor([[0, 0, 0, 1], [0, 1, 2, 3]])
+_CROSS_PREFIX_COMPRESSED_LOCS = torch.tensor([3, 7], dtype=torch.int32)
+
+
+def _cross_prefix_case(monkeypatch, use_fused: bool, captured: dict):
+    """Prefix 10 / extend 4: group [8, 12) straddles, group [12, 16) does not.
+
+    Returns the indexer and metadata with the snapshot already taken and the
+    ring already overwritten by this forward's own store, so the caller only
+    has to run `_overwrite_cross_prefix_groups` and assert.
     """
     monkeypatch.setattr(qsa_indexer_module, "is_gfx95_supported", lambda: True)
-    head_dim = 2
-    pool = _CrossPrefixPool(ring_slots=8, compressed_slots=8, head_dim=head_dim)
+    pool = _CrossPrefixPool(
+        ring_slots=8, compressed_slots=8, head_dim=_CROSS_PREFIX_HEAD_DIM
+    )
     # Request 1 owns ring slots [4, 8); its previous chunk left tokens 8 and 9
     # in the first two, which is what makes prefix_len=10 unaligned.
-    prefix_keys = torch.tensor([[[8.0, 8.0]], [[9.0, 9.0]]])
-    pool.key_state[4:6] = prefix_keys
+    pool.key_state[4:6] = torch.tensor([[[8.0, 8.0]], [[9.0, 9.0]]])
     pool.qsa_rope_position_buffer[4] = 8
     pool.qsa_rope_position_buffer[5] = 9
+    # Distinct start coordinate for the second group, so a rope gathered from
+    # the wrong group is visible rather than aliasing onto the same value.
+    pool.qsa_rope_position_buffer[6] = 99
 
     metadata = SimpleNamespace(
         has_cross_prefix_group=True,
         # Group [8, 12) for request 1, oldest member first; the trailing
         # entry is a group wholly inside this extend.
-        compress_group_ring_locs=torch.tensor([[4, 5, 6, 7], [4, 5, 6, 7]]),
+        compress_group_ring_locs=torch.tensor([[4, 5, 6, 7], [6, 7, 4, 5]]),
         compress_cross_prefix_members=torch.tensor([2, 0]),
         token_to_kv_pool=pool,
     )
 
-    captured = {}
-
     def _normalize(pooled, rope_positions):
         captured["rope"] = rope_positions
         return pooled
+
+    def _capture_fused_store(pool, group_locs, write_locs, source_keys, source_rope):
+        captured["fused"] = SimpleNamespace(
+            group_locs=group_locs,
+            write_locs=write_locs,
+            source_keys=source_keys,
+            source_rope=source_rope,
+        )
 
     indexer = SimpleNamespace(
         layer_id=0,
         compress_ratio=COMPRESS_RATIO,
         rotary_emb=SimpleNamespace(),
         normalize_compressed_keys=_normalize,
-        _use_fused_compress=lambda pool: False,
+        _use_fused_compress=lambda pool: use_fused,
+        _fused_compress_store=_capture_fused_store,
     )
     for name in (
         "_snapshot_cross_prefix_members",
@@ -246,23 +280,166 @@ def test_qsa_cross_prefix_recompress_reads_the_pre_store_ring(monkeypatch):
     pool.key_state[4:6] = torch.tensor([[[12.0, 12.0]], [[13.0, 13.0]]])
     pool.qsa_rope_position_buffer[4] = 12
     pool.qsa_rope_position_buffer[5] = 13
+    # The pre-store snapshot is the point of the test; re-taking it here would
+    # read tokens 12 and 13 back out of the reused ring slots.
+    return indexer, metadata, pool, snapshot
 
-    # Packed extend rows are tokens 10..13; member_rows=-2 clamps to row 0.
-    token_k = torch.tensor(
-        [[[10.0, 10.0]], [[11.0, 11.0]], [[12.0, 12.0]], [[13.0, 13.0]]]
-    )
-    current_group_locs = torch.tensor([[0, 0, 0, 1], [0, 1, 2, 3]])
-    compressed_locs = torch.tensor([3, 7], dtype=torch.int32)
+
+def test_qsa_cross_prefix_recompress_reads_the_pre_store_ring(monkeypatch):
+    """A straddling group must pool the prefix keys, not this chunk's tail.
+
+    The pending ring holds only `compress_ratio` entries per request, keyed by
+    `position % ratio`. With prefix 10 / extend 4 the group is [8, 12): tokens
+    8 and 9 sit in ring slots 0 and 1, and this forward's own tokens 12 and 13
+    land on those same two slots. Reading the ring after the store would pool
+    mean(K12, K13, K10, K11) and take the RoPE position from token 12.
+    """
+    captured = {}
+    indexer, metadata, pool, snapshot = _cross_prefix_case(monkeypatch, False, captured)
     indexer._overwrite_cross_prefix_groups(
-        token_k, metadata, current_group_locs, compressed_locs, snapshot
+        _CROSS_PREFIX_TOKEN_K,
+        metadata,
+        _CROSS_PREFIX_GROUP_LOCS,
+        _CROSS_PREFIX_COMPRESSED_LOCS,
+        snapshot,
     )
 
-    expected = torch.full((1, head_dim), (8 + 9 + 10 + 11) / 4)
+    expected = torch.full((1, _CROSS_PREFIX_HEAD_DIM), (8 + 9 + 10 + 11) / 4)
     torch.testing.assert_close(pool.compressed[3], expected)
     assert captured["rope"][0].item() == 8
     # The group wholly inside this extend keeps the main pass's result and is
     # routed to the inert reserved slot 0 instead of its own slot.
     assert torch.count_nonzero(pool.compressed[7]) == 0
+
+
+def test_qsa_cross_prefix_fused_scratch_denotes_the_same_groups(monkeypatch):
+    """The fused branch is the gfx95 path; its scratch layout is its own logic.
+
+    The kernel reads members as `source_keys[group_locs]` and the group's RoPE
+    from column 0, so a wrong `expand`/`reshape` here silently compresses the
+    wrong tokens. Pin the gathered layout rather than the kernel, which the
+    eager branch above already covers numerically.
+    """
+    captured = {}
+    indexer, metadata, pool, snapshot = _cross_prefix_case(monkeypatch, True, captured)
+    indexer._overwrite_cross_prefix_groups(
+        _CROSS_PREFIX_TOKEN_K,
+        metadata,
+        _CROSS_PREFIX_GROUP_LOCS,
+        _CROSS_PREFIX_COMPRESSED_LOCS,
+        snapshot,
+    )
+
+    fused = captured["fused"]
+    members = fused.source_keys[fused.group_locs.long()]
+    # Straddling group pools the ring's tokens 8, 9 then this chunk's 10, 11.
+    torch.testing.assert_close(
+        members[0].reshape(COMPRESS_RATIO, _CROSS_PREFIX_HEAD_DIM),
+        torch.tensor([[8.0, 8.0], [9.0, 9.0], [10.0, 10.0], [11.0, 11.0]]),
+    )
+    # The kernel rotates by the group-start coordinate in column 0; 99 here
+    # would mean the scratch rope was gathered from the other group.
+    assert fused.source_rope[fused.group_locs[0, 0].long()][0].item() == 8
+    assert fused.source_rope[fused.group_locs[1, 0].long()][0].item() == 99
+    # Non-straddling group is routed to the inert reserved slot 0.
+    assert fused.write_locs.tolist() == [3, 0]
+    assert torch.count_nonzero(pool.compressed) == 0
+
+
+def test_qsa_cross_prefix_fused_kernel_matches_eager(monkeypatch):
+    """The fused and eager branches must compress a straddling group alike.
+
+    `qsa_index_k_compress_store` has no test of its own, so the scratch layout
+    the fused branch builds is only as good as the kernel's reading of it.
+    Run both branches over identical state and compare the stored keys.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("fused compress-store kernel requires CUDA/ROCm")
+    from sglang.srt.layers.layernorm import GemmaRMSNorm
+    from sglang.srt.layers.rotary_embedding import get_rope
+
+    head_dim, dtype = 64, torch.bfloat16
+    monkeypatch.setattr(qsa_indexer_module, "is_gfx95_supported", lambda: True)
+    rotary_emb = get_rope(
+        head_size=head_dim,
+        rotary_dim=head_dim,
+        max_position=4096,
+        base=10000,
+        is_neox_style=True,
+    ).to("cuda")
+    k_layernorm = GemmaRMSNorm(head_dim, eps=1e-6).to("cuda").to(dtype)
+    with torch.no_grad():
+        k_layernorm.weight.copy_(
+            torch.randn(head_dim, generator=_seeded(0), dtype=torch.float32).to(
+                "cuda", dtype
+            )
+            * 0.1
+        )
+    token_k = torch.randn(4, 1, head_dim, generator=_seeded(1), dtype=torch.float32).to(
+        "cuda", dtype
+    )
+    ring_state = torch.randn(
+        8, 1, head_dim, generator=_seeded(2), dtype=torch.float32
+    ).to("cuda", dtype)
+
+    stored = {}
+    for use_fused in (False, True):
+        pool = _CrossPrefixPool(
+            ring_slots=8,
+            compressed_slots=8,
+            head_dim=head_dim,
+            device="cuda",
+            dtype=dtype,
+        )
+        pool.key_state.copy_(ring_state)
+        pool.qsa_rope_position_buffer[4] = 8
+        pool.qsa_rope_position_buffer[5] = 9
+        pool.qsa_rope_position_buffer[6] = 99
+        metadata = SimpleNamespace(
+            has_cross_prefix_group=True,
+            compress_group_ring_locs=torch.tensor(
+                [[4, 5, 6, 7], [6, 7, 4, 5]], device="cuda"
+            ),
+            compress_cross_prefix_members=torch.tensor([2, 0], device="cuda"),
+            token_to_kv_pool=pool,
+        )
+        indexer = SimpleNamespace(
+            layer_id=0,
+            compress_ratio=COMPRESS_RATIO,
+            index_head_dim=head_dim,
+            index_kv_heads=1,
+            rotary_emb=rotary_emb,
+            k_layernorm=k_layernorm,
+            _rope_axis_map_cache=None,
+            _use_fused_compress=lambda pool: use_fused,
+        )
+        for name in (
+            "_snapshot_cross_prefix_members",
+            "_overwrite_cross_prefix_groups",
+            "_fused_compress_store",
+            "_rope_from_matrix",
+            "_rope_axis_map",
+            "apply_rope",
+            "normalize_compressed_keys",
+        ):
+            setattr(indexer, name, MethodType(getattr(QSAIndexer, name), indexer))
+
+        snapshot = indexer._snapshot_cross_prefix_members(metadata)
+        indexer._overwrite_cross_prefix_groups(
+            token_k,
+            metadata,
+            _CROSS_PREFIX_GROUP_LOCS.to("cuda"),
+            _CROSS_PREFIX_COMPRESSED_LOCS.to("cuda"),
+            snapshot,
+        )
+        stored[use_fused] = pool.compressed.clone()
+
+    eager, fused = stored[False].float(), stored[True].float()
+    # bf16 accumulation order differs between the two paths.
+    torch.testing.assert_close(fused[3], eager[3], atol=2e-2, rtol=2e-2)
+    # Both must leave the non-straddling group's own slot untouched.
+    assert torch.count_nonzero(eager[7]) == 0
+    assert torch.count_nonzero(fused[7]) == 0
 
 
 def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
