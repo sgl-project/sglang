@@ -47,7 +47,6 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         quant_config = _mtp_quant_config(quant_config)
 
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.hidden_size = config.hidden_size

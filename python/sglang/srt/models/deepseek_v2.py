@@ -209,7 +209,7 @@ from sglang.srt.utils import (
     add_prefix,
     is_non_idle_and_non_empty,
     is_sm90_supported,
-    make_layers,
+    make_pp_layers,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -259,6 +259,7 @@ _moe_quant_once_logged = False
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
+_hip_shared_act_mxfp8 = _is_hip and envs.SGLANG_HIP_SHARED_ACT_MXFP8.get()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -411,7 +412,16 @@ class DeepseekV2MLP(nn.Module):
         if self.use_fused_clamp_act_mul and not self._fused_clamp_fp8_checked:
             _hip_act.resolve_fused_clamp_route(self, gate_up.shape[-1] // 2)
 
-        if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
+        # SGLANG_HIP_SHARED_ACT_MXFP8: an MXFP8 down_proj takes fp8 + ue8m0 straight from the Triton
+        # epilogue instead of aiter's bf16 output plus a separate quant launch.
+        if (
+            self.use_fused_clamp_act_mul
+            and self.swiglu_limit is not None
+            and _hip_shared_act_mxfp8
+            and self._hip_act_fp8_grid
+        ):
+            x = _hip_act.silu_and_mul_clamp(self, gate_up)
+        elif self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
             from aiter.ops.triton.fusions.fused_clamp_act_mul import (
                 fused_clamp_act_mul,
             )
@@ -1733,6 +1743,9 @@ class DeepseekV2MoE(nn.Module):
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            if pre_quant_input is None and _is_hip:
+                # SGLANG_HIP_FFN_NORM_MXFP8: the FFN norm launch's fp8 + ue8m0 of these rows
+                pre_quant_input = getattr(hidden_states, "_hip_mxfp8_operand", None)
             if pre_quant_input is not None:
                 # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
                 # multiple of 4; the padded rows flow through the MLP (all ops
@@ -2923,7 +2936,7 @@ class DeepseekV2Model(nn.Module):
             else None
         )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
                 config=config,
@@ -2933,8 +2946,6 @@ class DeepseekV2Model(nn.Module):
                 alt_stream=self.alt_stream,
                 skip_rope=config.qk_rope_head_dim == 0,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
             offloader_kwargs=dict(
                 submodule_accessor=lambda layer: (
@@ -3241,7 +3252,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.pp_group = get_parallel().pp_group
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)

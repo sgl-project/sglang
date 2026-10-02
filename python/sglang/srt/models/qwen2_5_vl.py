@@ -430,7 +430,6 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         )
 
         # Resource prepared for vit cuda graph
-        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
         self.max_context_len = max_context_len
         self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
 

@@ -55,6 +55,9 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     pub routing_key: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub request_input_tokens: u64,
+    /// The longest single prompt, which bucket limits bound; below
+    /// `request_input_tokens` only for a batch.
+    pub request_sequence_tokens: u64,
     pub request_tokens: Option<&'a [u32]>,
     pub external_prefix: Option<&'a ExternalPrefixSignal>,
     /// Required whenever `policy.uses_shared_prefill_admission()`; the
@@ -134,7 +137,7 @@ pub(crate) fn select_prefill_worker(
         // Prefill reserves no peak sequence room: the decode peer, not the
         // prefill worker, holds the KV for the tokens still to be generated.
         bucket_request: BucketRequest {
-            input_tokens: inputs.request_input_tokens,
+            input_tokens: inputs.request_sequence_tokens,
             expected_peak_sequence_tokens: None,
             ttft_slo_ms: inputs.ttft_slo_ms,
             tps_slo: inputs.tps_slo,
@@ -593,6 +596,8 @@ fn prefill_policy_reason(
 /// per-request facts.
 pub(crate) struct DecodeSelectionInputs<'a> {
     pub decode_policy_kind: DecodePolicyKind,
+    /// Disable for version-group probes so full groups do not count as admissible.
+    pub allow_capacity_fallback: bool,
     pub bucket_selector: &'a BucketSelector,
     /// Names the model in the log lines.
     pub model_id: &'a ModelId,
@@ -601,7 +606,12 @@ pub(crate) struct DecodeSelectionInputs<'a> {
     pub prefill_url: &'a str,
     pub decode_workers: &'a [Arc<Worker>],
     pub request_input_tokens: u64,
+    /// The longest single prompt, which bucket limits bound; below
+    /// `request_input_tokens` only for a batch.
+    pub request_sequence_tokens: u64,
     pub requested_max_output_tokens: Option<u64>,
+    /// Largest per-item input + output bound; unknown if any output budget is unset.
+    pub expected_peak_sequence_tokens: Option<u64>,
     pub ttft_slo_ms: Option<u64>,
     pub tps_slo: Option<f64>,
     /// Required: every rung resolves its proposal against the snapshot, so
@@ -627,17 +637,11 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
         inputs.request_input_tokens,
         inputs.requested_max_output_tokens,
     );
-    // Only an explicit output budget justifies reserving peak sequence room;
-    // without one the projection degenerates to the input length and would
-    // bucket every request as if it decoded nothing.
-    let expected_peak_sequence_tokens = inputs
-        .requested_max_output_tokens
-        .map(|_| request_kv_tokens);
     let decode_domains = inputs.bucket_selector.decode_domains(
         inputs.decode_workers,
         BucketRequest {
-            input_tokens: inputs.request_input_tokens,
-            expected_peak_sequence_tokens,
+            input_tokens: inputs.request_sequence_tokens,
+            expected_peak_sequence_tokens: inputs.expected_peak_sequence_tokens,
             ttft_slo_ms: inputs.ttft_slo_ms,
             tps_slo: inputs.tps_slo,
         },
@@ -675,6 +679,9 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
         .iter()
         .find_map(|domain| select_in_domain(domain, false))
         .or_else(|| {
+            if !inputs.allow_capacity_fallback {
+                return None;
+            }
             decode_domains
                 .iter()
                 .find_map(|domain| select_in_domain(domain, true))
@@ -717,7 +724,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("model".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 
@@ -826,6 +833,7 @@ mod tests {
             routing_key: None,
             session_id: None,
             request_input_tokens,
+            request_sequence_tokens: request_input_tokens,
             request_tokens: None,
             external_prefix: None,
             load_snapshot,
@@ -848,12 +856,15 @@ mod tests {
     ) -> DecodeSelectionInputs<'a> {
         DecodeSelectionInputs {
             decode_policy_kind: DecodePolicyKind::PowerOfTwo,
+            allow_capacity_fallback: true,
             bucket_selector,
             model_id,
             prefill_url: "http://prefill:30000",
             decode_workers,
             request_input_tokens,
+            request_sequence_tokens: request_input_tokens,
             requested_max_output_tokens: None,
+            expected_peak_sequence_tokens: None,
             ttft_slo_ms: None,
             tps_slo: None,
             load_snapshot,
