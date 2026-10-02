@@ -52,9 +52,13 @@ Families the router emits. The dashboard graphs all of them except the
 | `sgl_router_kv_bootstrap_rank_total` | Counter | Final per-rank bootstrap verdicts by `outcome` (`warm`, `warm_unwitnessed`, `from_origin`, `gap`, `uncovered`, `abandoned`, `overflow`, `publisher_reset`, `tree_rejected`); one count per rank per incarnation |
 | `sgl_router_kv_bootstrap_sweep_total` | Counter | Peer sweeps by `result` (`found` / `no_peers` / `fleet_cold` / `timed_out` / `ranks_resolved`) — what separates a healthy early settle on a cold fleet from burning the whole deadline |
 
-The legacy `sgl_router_overlap_blocks` metric was removed with the
-`cache_aware_zmq` policy and has no direct replacement. Remove queries, alerts,
-and dashboard panels that depend on this metric before upgrading.
+`sgl_router_overlap_blocks` is back after its removal with the
+`cache_aware_zmq` policy, and its meaning is narrower than the one old queries
+assume: it is the FLEET-BEST overlap, the ceiling a router with no load
+constraints could reach, not what the chosen worker holds. Queries that read
+its `_sum` as a hit rate were already reading the ceiling; point them at
+`sgl_router_selected_overlap_blocks_total` over
+`sgl_router_cache_aware_query_blocks_total` instead.
 
 The `sgl_router_workers` / `sgl_router_worker_*` gauges are sampled from the
 live worker registry on every scrape, so a removed worker stops emitting
