@@ -775,8 +775,9 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         if (
             self.use_offline_qk_rotation
             and self.attn.backend is AttentionBackendEnum.FA
-            and query.shape[2:] == key.shape[2:]
+            and query.shape[1:3] == key.shape[1:3]
             and key.shape == value.shape
+            and (query.shape[0] * query.shape[1]) % 64 == 0
         ):
             self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
             self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)
