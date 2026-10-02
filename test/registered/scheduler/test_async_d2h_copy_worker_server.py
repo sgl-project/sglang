@@ -29,9 +29,20 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
 
-N_REQUESTS = 16
 MAX_NEW_TOKENS = 32
-PROMPT = "The capital of France is"
+REPEATS = 2
+# Distinct answers make a readback that returns another row's tokens visible.
+# Identical prompts cannot: every row would still carry a plausible answer.
+PROMPTS = (
+    ("The capital of France is", "Paris"),
+    ("The capital of Japan is", "Tokyo"),
+    ("The capital of Italy is", "Rome"),
+    ("The capital of Germany is", "Berlin"),
+    ("The capital of Spain is", "Madrid"),
+    ("The capital of Russia is", "Moscow"),
+    ("The capital of Egypt is", "Cairo"),
+    ("The capital of Greece is", "Athens"),
+)
 
 
 class TestAsyncD2HCopyWorkerServer(CustomTestCase):
@@ -61,9 +72,9 @@ class TestAsyncD2HCopyWorkerServer(CustomTestCase):
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
 
-    def _generate(self, idx: int) -> dict:
+    def _generate(self, prompt: str) -> dict:
         payload = {
-            "text": PROMPT,
+            "text": prompt,
             "sampling_params": {
                 "max_new_tokens": MAX_NEW_TOKENS,
                 "temperature": 0.0,
@@ -77,27 +88,25 @@ class TestAsyncD2HCopyWorkerServer(CustomTestCase):
         return r.json()
 
     def test_concurrent_decode_readback(self):
-        with ThreadPoolExecutor(max_workers=N_REQUESTS) as pool:
-            results = [
-                f.result()
-                for f in as_completed(
-                    [pool.submit(self._generate, i) for i in range(N_REQUESTS)]
+        # Not asserting that repeats of one prompt agree: batching is not
+        # batch-invariant, so two coherent completions can legitimately differ.
+        cases = list(PROMPTS) * REPEATS
+        with ThreadPoolExecutor(max_workers=len(cases)) as pool:
+            futures = {
+                pool.submit(self._generate, prompt): (prompt, answer)
+                for prompt, answer in cases
+            }
+            for future in as_completed(futures):
+                prompt, answer = futures[future]
+                result = future.result()
+                self.assertIn(answer, result["text"], f"{prompt!r} -> wrong answer")
+
+                meta = result["meta_info"]
+                self.assertEqual(meta["completion_tokens"], MAX_NEW_TOKENS)
+                # The logprob readback rides the same copy as next_token_ids.
+                self.assertEqual(
+                    len(meta["output_token_logprobs"]), meta["completion_tokens"]
                 )
-            ]
-
-        texts = {r["text"] for r in results}
-        self.assertEqual(len(texts), 1, f"greedy decode diverged: {texts}")
-        # Requests sharing a batch read the same bad data on a wrong readback,
-        # so matching texts alone cannot catch it; check the answer too.
-        self.assertIn("Paris", texts.pop())
-
-        for r in results:
-            meta = r["meta_info"]
-            self.assertEqual(meta["completion_tokens"], MAX_NEW_TOKENS)
-            # The logprob readback rides the same copy as next_token_ids.
-            self.assertEqual(
-                len(meta["output_token_logprobs"]), meta["completion_tokens"]
-            )
 
 
 class TestAsyncD2HCopyWorkerServerDelaySample(TestAsyncD2HCopyWorkerServer):
