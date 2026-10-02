@@ -375,6 +375,19 @@ class PrefillBootstrapQueue:
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
 
+        # Record the authoritative (encoder-side, post-multimodal) expanded
+        # input length for this room, so the bootstrap thread can push it to
+        # decode when decode's own expansion count disagrees (see
+        # CommonKVManager.push_prefill_input_len).
+        note_room_input_len = getattr(self.kv_manager, "note_room_input_len", None)
+        if note_room_input_len is not None:
+            note_room_input_len(req.bootstrap_room, len(req.origin_input_ids))
+            # Rooms whose bootstrap (decode registration) completed before
+            # this admission never see the completion-time push -- retry here.
+            getattr(self.kv_manager, "push_prefill_input_len", lambda _: None)(
+                req.bootstrap_room
+            )
+
         dest_tp_ranks = [self.tp_rank]
 
         req.disagg_kv_sender = kv_sender_class(
@@ -1398,6 +1411,23 @@ class SchedulerDisaggregationPrefillMixin:
             # that decode used to register the destination row.
             seq_len = min(req.extend_range.end, transfer_input_len)
             c128_seq_len = transfer_input_len
+            if req.multimodal_inputs is not None:
+                # PD-disagg mm requests: decode registers its state payloads
+                # from its own (independently computed) expanded input length.
+                # If that differs from the range prefill materialized, the KV
+                # /state index length checks in the transfer backend fail.
+                # Log both accounting bases so the divergence is directly
+                # visible in the prefill log.
+                logger.info(
+                    "disagg mm state base: rid=%s materialized seq_len=%d "
+                    "(extend_range.end=%d, transfer_input_len=%d, "
+                    "fill_ids=%d)",
+                    req.rid,
+                    seq_len,
+                    req.extend_range.end,
+                    transfer_input_len,
+                    len(req.full_untruncated_fill_ids),
+                )
 
             def _mamba_payload():
                 return [

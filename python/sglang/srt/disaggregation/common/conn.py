@@ -240,6 +240,21 @@ class CommonKVManager(BaseKVManager):
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
+        # PD multimodal length reconciliation: under encoder-disaggregation the
+        # prefill instance expands mm placeholder tokens from the encoder-side
+        # pipeline while the decode instance expands from its own local
+        # preprocessing. When the two disagree, decode registers more/fewer
+        # transfer slots than prefill materializes and the state index length
+        # checks fail (or worse, bypass them into a positionally shifted
+        # layout). The prefill role records its authoritative expanded input
+        # length per room here and pushes it to decode; the decode role
+        # records the last pushed length per room and the scheduler consumes
+        # it before/at pre-allocation registration.
+        self.room_input_len: Dict[int, int] = {}
+        self.room_inlen_pending: Dict[int, int] = {}
+        # Set by the decode scheduler (DecodePreallocQueue) to receive the
+        # authoritative length pushes on the listener thread.
+        self.on_prefill_input_len = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
             # participate in KV transfer; Otherwise only CP rank 0 sends.
@@ -683,6 +698,45 @@ class CommonKVManager(BaseKVManager):
             )
         except Exception as e:
             logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
+
+    def note_room_input_len(self, room: int, length: int) -> None:
+        """Prefill role: record the authoritative expanded input length of a
+        room. Called at sender creation, after multimodal data has arrived, so
+        ``length`` already reflects the encoder-side real token count."""
+        if room is not None:
+            self.room_input_len[room] = length
+
+    def push_prefill_input_len(self, room: int) -> None:
+        """Prefill role: tell decode the authoritative expanded input length.
+        Called both at room-bootstrap completion and at sender creation (the
+        latter covers rooms that bootstrapped before the request was
+        admitted). The decode handler is idempotent, so pushing for
+        already-matching rooms is harmless."""
+        length = self.room_input_len.get(room)
+        if length is None:
+            return
+        for info in self.transfer_infos.get(room, {}).values():
+            if getattr(info, "is_dummy", False):
+                continue
+            try:
+                na = NetworkAddress(info.endpoint, info.dst_port)
+                self._send_multipart_locked(
+                    na.to_tcp(),
+                    [
+                        b"INLEN",
+                        str(room).encode("ascii"),
+                        str(length).encode("ascii"),
+                    ],
+                    is_ipv6=na.is_ipv6,
+                )
+                logger.info(
+                    "PD mm length reconcile: pushed authoritative input_len=%d "
+                    "for room=%s",
+                    length,
+                    room,
+                )
+            except Exception as e:
+                logger.debug(f"Failed to push INLEN for room {room}: {e}")
 
     def _abort_ack_fanout_targets(self, room: int) -> List[Tuple[str, int]]:
         """Every decode peer of the room, dummy pairings included: each decode

@@ -654,6 +654,29 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             int(msg[1].decode("ascii")), int(msg[2].decode("ascii"))
                         )
                     continue
+                if msg[0] == b"INLEN":
+                    # Prefill pushed the authoritative expanded input length
+                    # for a room (multimodal requests under encoder
+                    # disaggregation). Record it and let the scheduler-side
+                    # handler reconcile the request's registration.
+                    if len(msg) >= 3:
+                        try:
+                            room = int(msg[1].decode("ascii"))
+                            length = int(msg[2].decode("ascii"))
+                        except ValueError:
+                            logger.warning("INLEN message with bad payload: %s", msg)
+                            continue
+                        self.room_inlen_pending[room] = length
+                        callback = self.on_prefill_input_len
+                        if callback is not None:
+                            try:
+                                callback(room, length)
+                            except Exception:
+                                logger.exception(
+                                    "prefill input-length handler failed for %s",
+                                    room,
+                                )
+                    continue
                 parsed = self.parse_kv_status_message(msg)
                 if parsed is not None:
                     room, status, prefill_rank, reason = parsed
@@ -2676,9 +2699,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st == StateType.DSA:
                 if len(src_indices) != len(dst_indices):
+                    # dst is sized by decode's own request length; src by the
+                    # KV range prefill actually materialized. These diverge
+                    # for multimodal requests when the two instances expand
+                    # mm placeholders independently (e.g. encoder-sidecar
+                    # real frame count vs decode-side local estimate).
                     raise RuntimeError(
                         f"State index length mismatch at component {i}: "
-                        f"prefill={len(src_indices)}, dst={len(dst_indices)}"
+                        f"prefill={len(src_indices)}, dst={len(dst_indices)}. "
+                        f"This means the two engines disagree on the request's "
+                        f"expanded input length: decode preallocated for a "
+                        f"longer sequence than prefill materialized. For "
+                        f"multimodal requests under PD disaggregation, check "
+                        f"that the mm token count is identical on both sides "
+                        f"(encoder sidecar count vs decode-local preprocessing "
+                        f"count) and that prefill chunked prefill covered "
+                        f"len(origin_input_ids) tokens."
                     )
                 h = self._send_kvcache_generic(
                     peer_name=peer_name,
@@ -3109,6 +3145,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         ),
                         0,
                     )
+                    # Multimodal requests under encoder disaggregation may have
+                    # a decode-side expanded count that differs from our
+                    # (authoritative, encoder-side) input length. Push it now,
+                    # strictly before this room becomes eligible to send, so
+                    # decode can reconcile its registration and its request
+                    # layout before the transfer concludes.
+                    self.push_prefill_input_len(room)
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
@@ -3260,6 +3303,7 @@ class NixlKVReceiver(CommonKVReceiver):
         # backends track completion through prefill_response_tracker, which
         # CommonKVReceiver.clear() already drops -- so it needs its own pop.
         self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
+        self.kv_mgr.room_inlen_pending.pop(self.bootstrap_room, None)
 
     def send_metadata(
         self,
