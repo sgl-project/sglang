@@ -75,6 +75,7 @@ impl MockWorker {
             .route("/v1/chat/completions", post(chat))
             .route("/generate", post(generate))
             .route("/v1/embeddings", post(embeddings))
+            .route("/v1/rerank", post(rerank))
             .route("/server_info", get(serve_tiny_server_info))
             .route("/abort_request", abort_request_route(abort_log.clone()))
             .with_state(state);
@@ -518,4 +519,15 @@ async fn embeddings(
     capture_request(&s, &headers, &body);
     let data = [serde_json::json!({"object": "embedding", "embedding": [0.5], "index": 0})];
     Json(serde_json::json!({"object": "list", "data": data, "model": "tiny"})).into_response()
+}
+
+/// A rerank response, a list of scored documents.
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+async fn rerank(
+    State(s): State<MockWorkerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    capture_request(&s, &headers, &body);
+    Json(serde_json::json!([{"score": 0.5, "index": 0}])).into_response()
 }
