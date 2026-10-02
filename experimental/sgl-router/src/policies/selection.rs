@@ -593,6 +593,8 @@ fn prefill_policy_reason(
 /// per-request facts.
 pub(crate) struct DecodeSelectionInputs<'a> {
     pub decode_policy_kind: DecodePolicyKind,
+    /// Disable for version-group probes so full groups do not count as admissible.
+    pub allow_capacity_fallback: bool,
     pub bucket_selector: &'a BucketSelector,
     /// Names the model in the log lines.
     pub model_id: &'a ModelId,
@@ -675,6 +677,9 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
         .iter()
         .find_map(|domain| select_in_domain(domain, false))
         .or_else(|| {
+            if !inputs.allow_capacity_fallback {
+                return None;
+            }
             decode_domains
                 .iter()
                 .find_map(|domain| select_in_domain(domain, true))
@@ -717,7 +722,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("model".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 
@@ -848,6 +853,7 @@ mod tests {
     ) -> DecodeSelectionInputs<'a> {
         DecodeSelectionInputs {
             decode_policy_kind: DecodePolicyKind::PowerOfTwo,
+            allow_capacity_fallback: true,
             bucket_selector,
             model_id,
             prefill_url: "http://prefill:30000",
