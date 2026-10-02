@@ -9,7 +9,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
-
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.training_capture.config import (
@@ -162,6 +161,8 @@ class TestCaptureConfiguration(CustomTestCase):
             {"max_host_bytes": 0},
             {"kv_d2h_batch_tokens": 0},
             {"kv_d2h_batch_tokens": 16},
+            {"teacher_d2h_batch_tokens": 0},
+            {"teacher_d2h_batch_tokens": 16},
             {"max_device_bytes": -1},
             {"sample_ratio": 2},
             {"catalog_endpoint": "file:///tmp/catalog"},
@@ -190,6 +191,7 @@ class TestCaptureConfiguration(CustomTestCase):
     def test_staging_budget_is_explicit_and_changes_capture_identity(self):
         baseline = CaptureConfig.load(str(self.path))
         self.assertEqual(baseline.kv_d2h_batch_tokens, 1)
+        self.assertEqual(baseline.teacher_d2h_batch_tokens, 1)
         self.assertEqual(baseline.max_device_bytes, 0)
         self.path.write_text(
             json.dumps(
@@ -198,6 +200,15 @@ class TestCaptureConfiguration(CustomTestCase):
         )
         staged = CaptureConfig.load(str(self.path))
         self.assertNotEqual(baseline.fingerprint, staged.fingerprint)
+        self.path.write_text(
+            json.dumps(
+                self.config
+                | {"teacher_d2h_batch_tokens": 16, "max_device_bytes": 1 << 20}
+            )
+        )
+        teacher_staged = CaptureConfig.load(str(self.path))
+        self.assertNotEqual(baseline.fingerprint, teacher_staged.fingerprint)
+        self.assertNotEqual(staged.startup_policy, teacher_staged.startup_policy)
 
 
 if __name__ == "__main__":

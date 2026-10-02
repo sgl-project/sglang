@@ -49,7 +49,13 @@ class CaptureResources:
                 replica_num=config.replica_num,
                 max_receive_bytes=config.max_host_bytes,
             )
-            resources._allocate(config, kv, partition, pin_memory)
+            resources._allocate(
+                config,
+                kv,
+                partition,
+                pin_memory,
+                device=getattr(source_pool, "device", None),
+            )
         except Exception:
             resources.close()
             raise
@@ -71,7 +77,7 @@ class CaptureResources:
             raise
         return resources
 
-    def _allocate(self, config, kv, partition, pin_memory):
+    def _allocate(self, config, kv, partition, pin_memory, *, device=None):
         self.pool = HostBufferPool(
             kv=kv,
             max_tokens=config.max_sample_tokens,
@@ -80,8 +86,9 @@ class CaptureResources:
             registrar=self.store,
             manifest_bytes=config.manifest_buffer_bytes,
             pin_memory=pin_memory,
-            device=self.exporter.device if self.exporter is not None else None,
+            device=self.exporter.device if self.exporter is not None else device,
             kv_d2h_batch_tokens=config.kv_d2h_batch_tokens,
+            teacher_d2h_batch_tokens=config.teacher_d2h_batch_tokens,
             max_device_bytes=config.max_device_bytes,
             partition=partition,
         )

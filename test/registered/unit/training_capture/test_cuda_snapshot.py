@@ -8,7 +8,7 @@ from sglang.srt.training_capture.context import RequestCaptureContext
 from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.protocol import CaptureError, ContractError
-from sglang.srt.training_capture.teacher import capture_teacher
+from sglang.srt.training_capture.teacher import TeacherRows, capture_teacher
 from sglang.srt.training_capture.topology import plan_capture_layout
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -19,6 +19,101 @@ register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCudaSnapshot(CustomTestCase):
+    def test_teacher_tail_fence_failure_retains_staging_and_host_storage(self):
+        pool = HostBufferPool(
+            kv=make_kv_spec(),
+            max_tokens=8,
+            slots=1,
+            max_bytes=2 << 20,
+            registrar=Registrar(),
+            device=torch.device("cuda"),
+            teacher_d2h_batch_tokens=3,
+            max_device_bytes=1 << 20,
+        )
+        slot = pool.acquire()
+        context = RequestCaptureContext(
+            slot=slot, prompt_ids=(3,), max_tokens=8, vocab_size=256
+        )
+        context.kv_end = 1
+        context.record_teacher(
+            capture_teacher(torch.arange(256, device="cuda").float()[None], 256),
+            row=0,
+            position=1,
+        )
+        context.commit_token(position=1, token_id=8)
+        storage = slot.device_storage
+        try:
+            with (
+                patch(
+                    "torch.cuda.Event", side_effect=RuntimeError("teacher fence failed")
+                ),
+                self.assertRaisesRegex(RuntimeError, "teacher fence failed"),
+            ):
+                context.seal("length")
+            self.assertTrue(context.transfer_uncertain)
+            context.abort("teacher_fence_failed")
+            with self.assertRaisesRegex(ContractError, "uncertain"):
+                context.wait_for_copies()
+            pool.release(slot, transfer_complete=False)
+            self.assertIsNone(pool.acquire())
+            with self.assertRaises(CaptureError):
+                pool.close()
+            self.assertIs(pool.slots[0].device_storage, storage)
+        finally:
+            torch.cuda.synchronize()
+
+    def test_teacher_cpu_handoff_cross_stream_reuse_and_tail(self):
+        pool = HostBufferPool(
+            kv=make_kv_spec(),
+            max_tokens=12,
+            slots=1,
+            max_bytes=2 << 20,
+            registrar=Registrar(),
+            device=torch.device("cuda"),
+            teacher_d2h_batch_tokens=3,
+            max_device_bytes=1 << 20,
+        )
+        slot = pool.acquire()
+        context = RequestCaptureContext(
+            slot=slot, prompt_ids=(3, 4), max_tokens=12, vocab_size=256
+        )
+        names = tuple(slot.teacher_device_tensors)
+        raw = torch.arange(8 * 256).reshape(8, 256).float()
+        reference = capture_teacher(raw, 256)
+        expected = (reference.token_ids, reference.logits, reference.logsumexp)
+        for name in names:
+            slot.tensors[name].fill_(-5)
+        first, second = torch.cuda.Stream(), torch.cuda.Stream()
+        try:
+            context.kv_end = 2
+            context.record_teacher(reference, row=0, position=2)
+            context.commit_token(position=2, token_id=10)
+            for name, source in zip(names, expected):
+                torch.testing.assert_close(slot.tensors[name][0], source[0])
+            for index in range(1, 8):
+                with torch.cuda.stream(first if index % 2 else second):
+                    rows = TeacherRows(
+                        *(value[index : index + 1].cuda() for value in expected)
+                    )
+                    torch.cuda._sleep(1000000)
+                    context.kv_end = index + 2
+                    context.record_teacher(rows, row=0, position=index + 2)
+                    context.commit_token(position=index + 2, token_id=10)
+                    for value in (rows.token_ids, rows.logits, rows.logsumexp):
+                        value.zero_()
+            # Seal runs on a different stream from the last append.
+            context.seal("length")
+            context.wait_for_copies()
+            for name, source in zip(names, expected):
+                torch.testing.assert_close(
+                    slot.tensors[name][:8], source, rtol=0, atol=0
+                )
+                self.assertTrue((slot.tensors[name][8:] == -5).all())
+        finally:
+            torch.cuda.synchronize()
+            pool.release(slot, transfer_complete=True)
+            pool.close()
+
     def test_partition_staging_survives_canonical_rank_source_slot_reuse(self):
         kv = make_kv_spec()
         partition = plan_capture_layout(
@@ -93,6 +188,7 @@ class TestCudaSnapshot(CustomTestCase):
             registrar=Registrar(),
             device=torch.device("cuda"),
             kv_d2h_batch_tokens=2,
+            teacher_d2h_batch_tokens=3,
             max_device_bytes=1 << 20,
         )
         slot = pool.acquire()

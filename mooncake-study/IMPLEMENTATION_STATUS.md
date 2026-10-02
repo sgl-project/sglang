@@ -29,6 +29,7 @@ it does not redefine the goal as the modules already implemented.
 | Raw teacher capture | Unpadded top-128 IDs/values and full-vocabulary LSE before serving processors | Independent online logits observer validates every captured row; serving bias does not leak into teacher scores |
 | KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode |
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Coordinator admission, renewal, expiry, retract, shutdown and publication tests pass; traffic-scale stress remains open |
+| Teacher D2H batching | Optional bounded aux-owner staging shares the existing device budget with KV | Source reuse, cross-stream tail fencing, CPU P/D handoff and real AR/DSpark/P/D pass; decode transfer work falls, but no serving throughput improvement is established |
 | Mooncake adapter | Required hard pin, registered raw buffers, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including complete reads after producer exit; production retention remains open |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Two independent writer processes publish logical head shards through real TCP Store; distributed inference admission and scheduler integration remain open |
@@ -3335,6 +3336,53 @@ state gathering, SpecForge's checkpoint-manager adapter or a production KV
 trainer. FP32/FP16/BF16 validation is structural; retained full-model numerical
 evidence is BF16. These fixtures do not establish trained quality, serving SLOs,
 production Catalog retention or automatic rollout.
+
+## Bounded Teacher D2H
+
+`teacher_d2h_batch_tokens` independently opts into compact teacher staging; its
+default is one. The aux owner allocates per-slot IDs, logits and LSE device
+buffers within the existing all-slot `max_device_bytes` budget. Aux-only PP
+owners obtain their device from the target pool. Short ranges own the source
+values immediately, large ranges bypass staging, and full batches plus sealed
+tails copy to registered Host tensors. CPU P/D handoff rows stay on Host and
+advance the same row ledger. Cross-stream reuse, terminal trimming, abort and
+uncertain-completion quarantine preserve the existing publication contract.
+
+The full capture unit suite passes 192 tests in 180.733s. The final seven-test
+CUDA file, six-test teacher CPU file and four-test trace file also pass; these
+overlap discovery, which preceded two added cases and a test-only lint fix.
+Complete single-GPU runtime passes two tests in 641.671s with AR/DSpark,
+ordinary/graph/overlap, ragged verification, memory pressure and lifecycle
+coverage. Real P/D passes two tests in 134.279s, reads ten complete snapshots,
+and excludes four bad/missing handoffs plus two aborted captures.
+
+Separate direct/staged profiles complete 40 measured READY requests in each
+workload. In the 1-to-32 workload, teacher D2H calls fall from 3,960 to 360 with
+the same 1,356,960 bytes. D2H work falls from 9.863ms to 0.980ms; the newly
+reported 3,960 D2D copies add 3.956ms. Combined transfer work is about half,
+while annotated teacher CPU scope time increases from 263.658ms to 276.240ms.
+Total capture D2H calls fall from 6,000 to 2,400 with identical bytes. Short
+128-to-1 responses add transfer and CPU work. Profiler sums are not latency.
+
+The paired serving runs each bracket 10% capture with off phases. All 12,288
+timed requests complete, yielding 393,216 output tokens and 380 validated
+measured snapshots with identical tensor sizes and no capture exclusions.
+Direct/staged capture throughput is 1,118.35/1,115.33 tokens/s; losses against
+their own off brackets are 14.7%/16.3%, and TPOT p95 increases are 13.1%/15.3%.
+There is no demonstrated end-to-end speedup. One round per policy and drifting
+TTFT baselines do not establish statistical significance or satisfy P10's SLO.
+Default direct transfer remains in force.
+
+All ten jobs are terminal, the original staged index is unchanged, and the
+resident H100 resumed its 60% idle workload with no active/queued experiment.
+No additional allocation was needed. New files pass Ruff; touched existing
+files add no diagnostics. Black and whitespace checks pass. See
+[the runbook](experiments/TEACHER_D2H.md) and
+[source/log/trace evidence](experiments/teacher-d2h.json).
+
+This validates local TCP and an HTTP Catalog test double. Production Catalog,
+trained draft quality, distributed teacher-batching runtime/throughput,
+cross-node RDMA for this option, and service SLOs remain open.
 
 ## Next Implementation
 

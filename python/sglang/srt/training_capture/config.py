@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import msgspec
-
 from sglang.srt.training_capture.protocol import (
     ContractError,
     Digest,
@@ -99,6 +98,7 @@ class CaptureConfig(StrictStruct):
     max_inflight_samples: Positive = 4
     max_host_bytes: Positive = 512 << 20
     kv_d2h_batch_tokens: Positive = 1
+    teacher_d2h_batch_tokens: Positive = 1
     max_device_bytes: Nonnegative = 0
     manifest_buffer_bytes: Positive = 1 << 20
     storage_chunk_tokens: Positive = 256
@@ -134,6 +134,8 @@ class CaptureConfig(StrictStruct):
             raise ContractError("capture journal directory must be absolute")
         if config.kv_d2h_batch_tokens > 1 and not config.max_device_bytes:
             raise ContractError("batched KV D2H requires a device staging budget")
+        if config.teacher_d2h_batch_tokens > 1 and not config.max_device_bytes:
+            raise ContractError("batched teacher D2H requires a device staging budget")
         if config.adaptive is not None:
             config.adaptive.validate()
         return config

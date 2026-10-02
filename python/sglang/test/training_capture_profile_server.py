@@ -10,6 +10,7 @@ from sglang.srt.training_capture import coordinator
 from sglang.srt.training_capture.context import RequestCaptureContext
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.kv_staging import KVStaging
+from sglang.srt.training_capture.teacher_staging import TeacherStaging
 
 
 def scoped(name, function):
@@ -30,6 +31,21 @@ RequestCaptureContext.record_teacher_range = scoped(
 RequestCaptureContext.record_positions = scoped(
     "positions_d2h", RequestCaptureContext.record_positions
 )
+
+flush_staging = RequestCaptureContext._flush_staging
+flush_teacher = scoped("teacher_d2h", flush_staging)
+
+
+def flush_capture_staging(self, staging):
+    # Append flushes are already inside record_teacher_range's scope.
+    return (
+        flush_teacher(self, staging)
+        if isinstance(staging, TeacherStaging)
+        else flush_staging(self, staging)
+    )
+
+
+RequestCaptureContext._flush_staging = flush_capture_staging
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from sglang.srt.training_capture.snapshot import (
     prepare_snapshot_partition,
 )
 from sglang.srt.training_capture.teacher import TeacherRows
+from sglang.srt.training_capture.teacher_staging import TeacherStaging
 from sglang.srt.training_capture.topology import CapturePartition
 
 
@@ -80,6 +81,11 @@ class RequestCaptureContext:
         self.kv_staging = (
             KVStaging(slot.device_tensors, slot.tensors)
             if slot is not None and slot.device_tensors is not None
+            else None
+        )
+        self.teacher_staging = (
+            TeacherStaging(slot.teacher_device_tensors, slot.tensors)
+            if slot is not None and slot.teacher_device_tensors is not None
             else None
         )
         self.transfer_uncertain = False
@@ -187,18 +193,30 @@ class RequestCaptureContext:
             raise ContractError("teacher range is missing, duplicated, or shifted")
         index = self.teacher_rows
         try:
-            for name, source in (
-                ("teacher_topk_ids", rows.token_ids),
-                ("teacher_topk_logits", rows.logits),
-                ("teacher_logsumexp", rows.logsumexp),
-            ):
-                self.slot.tensors[name][index : index + count].copy_(
-                    source[row : row + count], non_blocking=source.is_cuda
-                )
-                if source.is_cuda:
-                    source.record_stream(torch.cuda.current_stream(source.device))
+            if self.teacher_staging is not None:
+                self.teacher_staging.append(rows, row=row, start=index, count=count)
+            else:
+                for name, source in (
+                    ("teacher_topk_ids", rows.token_ids),
+                    ("teacher_topk_logits", rows.logits),
+                    ("teacher_logsumexp", rows.logsumexp),
+                ):
+                    self.slot.tensors[name][index : index + count].copy_(
+                        source[row : row + count], non_blocking=source.is_cuda
+                    )
+                    if source.is_cuda:
+                        source.record_stream(torch.cuda.current_stream(source.device))
         finally:
-            self._record_completion(rows.logits.device)
+            if (
+                self.teacher_staging is not None
+                and self.teacher_staging.transfer_uncertain
+            ):
+                self.transfer_uncertain = True
+            self._record_completion(
+                self.teacher_staging.device
+                if self.teacher_staging is not None
+                else rows.logits.device
+            )
         self.slot.tensors["logits_positions"][index : index + count].copy_(
             torch.arange(position, position + count)
         )
@@ -271,6 +289,7 @@ class RequestCaptureContext:
         ):
             raise ContractError("cannot seal an incomplete response or KV prefix")
         self._flush_kv()
+        self._flush_staging(self.teacher_staging)
         if self.owns_aux:
             self.slot.tensors["token_ids"][:n].copy_(
                 torch.tensor(self.token_ids, dtype=torch.int32)
@@ -286,7 +305,9 @@ class RequestCaptureContext:
         self.state = "SEALED"
 
     def _flush_kv(self):
-        staging = self.kv_staging
+        self._flush_staging(self.kv_staging)
+
+    def _flush_staging(self, staging):
         if staging is None or staging.start == staging.end:
             return
         # Finalization may run outside the model's forward-stream context.

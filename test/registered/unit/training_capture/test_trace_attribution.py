@@ -86,6 +86,44 @@ class TestCaptureTraceAttribution(CustomTestCase):
         self.assertIsNone(group["d2h_bytes"])
         self.assertEqual(group["d2h_events_missing_bytes"], 1)
 
+    def test_device_staging_copy_is_counted_separately_from_d2h(self):
+        for size in (1028, None):
+            with self.subTest(bytes=size):
+                result = self.evaluate(
+                    [
+                        self.event(
+                            "training_capture.teacher_d2h", "user_annotation", 10, 10
+                        ),
+                        self.event(
+                            "cudaMemcpyAsync", "cuda_runtime", 12, 1, correlation=1
+                        ),
+                        self.event(
+                            "Memcpy DtoD (Device -> Device)",
+                            "gpu_memcpy",
+                            35,
+                            2,
+                            correlation=1,
+                            **({"bytes": size} if size is not None else {})
+                        ),
+                        self.event(
+                            "Memcpy DtoD (Device -> Device)",
+                            "gpu_memcpy",
+                            12,
+                            10,
+                            correlation=2,
+                            bytes=5,
+                        ),
+                    ]
+                )
+                group = result["groups"]["training_capture.teacher_d2h"]
+                self.assertEqual(group["d2h_calls"], 0)
+                self.assertEqual(group["d2h_bytes"], 0)
+                self.assertEqual(group["d2d_calls"], 1)
+                self.assertEqual(group["d2d_us"], 2)
+                self.assertEqual(group["d2d_bytes"], size)
+                self.assertEqual(group["d2d_events_missing_bytes"], int(size is None))
+                self.assertEqual(result["all_d2d_us"], 12)
+
     def test_ambiguous_scope_and_correlation_are_rejected(self):
         scope = self.event("training_capture.kv", "user_annotation", 10, 10)
         for extra in (

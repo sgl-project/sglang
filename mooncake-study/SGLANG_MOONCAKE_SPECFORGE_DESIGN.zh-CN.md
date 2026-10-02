@@ -446,6 +446,14 @@ Store: WRITTEN -> SAMPLE_READY -> LEASED/RETAINED -> GC_ELIGIBLE -> REMOVED
 
 网络错误或 CUDA 错误后，只有确认传输停止才可回收注册 buffer。不能仅因 Future 抛错就假设 DMA/RDMA 不再访问内存；需要 transport completion 或 quarantine 队列。
 
+紧凑 teacher 回传可通过 `teacher_d2h_batch_tokens` 单独启用批量 D2H，
+默认值 1 保持逐次回传。aux owner 为每个 inflight slot 分配有界 GPU 缓冲，
+与 KV staging 共用 `max_device_bytes` 预算，并在注册 Host buffer 前校验总量。
+ID、原始 top-128 logits 和全词表 LSE 立即复制到独占缓冲；满批和 seal 尾部
+在 producer stream 回传。P/D 首行 teacher 已在 Host 时直接写入并推进相同行号。
+abort/retract 不发布剩余缓冲，跨 stream 复用和尾部 flush 都受 completion
+事件约束；最终 manifest 只包含已提交 token 对应的行。
+
 多 worker 进程不能直接使用其他进程的 Python tensor 地址。V1 writer 放在持有/注册 Host buffer 的同一进程；独立进程 writer 需要共享内存映射和该进程注册流程，另行实现。
 
 #### 7.5.1 当前自动 KV 容量回收验收

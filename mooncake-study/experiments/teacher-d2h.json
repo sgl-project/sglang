@@ -1,0 +1,1573 @@
+{
+  "purpose": "Bounded optional batching of raw teacher IDs, logits and LSE into registered Host tensors",
+  "source_baseline": "9b6cd2206c3552a79d0d94af323204a8bc1adb93",
+  "source_sha256": {
+    "mooncake-study/experiments/benchmark_training_capture.py": "de3d9a294e6d8dc3982ea0285d800615f5d0e7c2c28f166995c904ed29ae9417",
+    "mooncake-study/experiments/profile_training_capture.py": "a1213e86c0ff89ce5927c8033130e8cfba6edc87dde2dd36200dd76d658d707d",
+    "python/sglang/srt/training_capture/config.py": "9cf427b9f673c376f728aa4bec45b0b4a31bffb360ce88731b32b8fccc34530d",
+    "python/sglang/srt/training_capture/context.py": "377d3afd09c2f4be5ea373ba7afba495521f190e8fd8a89a6dcbda2ea9fa183d",
+    "python/sglang/srt/training_capture/host_pool.py": "591086d65bd855dfb671588c4c7e1b0af7270237ef738e0967db32f5e5816bfc",
+    "python/sglang/srt/training_capture/resources.py": "4f615e4b1b79b94637ba664e05e93bdbb827f865a176d06abbf23e8bcd02cd8d",
+    "python/sglang/test/training_capture_profile_server.py": "9b54a9b0d23e62befcd454aa17694c6121e20d2511e52fce0e2b7c9ce75f53bf",
+    "test/registered/storage/test_training_capture_runtime.py": "d61586428b26bc49c16b64e29b4e7f05a83379fc2219c625c9bfa947e0f79ddd",
+    "test/registered/unit/training_capture/test_config.py": "3bfe83839e73284c633a6bb3274a75b865431648a0bf10d0b6920adbfb3cc41a",
+    "test/registered/unit/training_capture/test_coordinator.py": "d952cbea226fbf3b44bc661b64707056634d49dcd63aa04eabba0b20d9c9ad6a",
+    "test/registered/unit/training_capture/test_cuda_snapshot.py": "0bc81729318651aa4e1bc2e208d6599635a32d8b69e89b4d871ecccc8904be91",
+    "python/sglang/srt/training_capture/teacher_staging.py": "9afe4b9bb7bdf16e43156377b47d034f9707ed1c09b62dbfdac3795bb7032fd0",
+    "test/registered/unit/training_capture/test_teacher_staging.py": "563d3c83820d3dc280756af2946cb09d04eabd3ba5d22f226c81d3abe7a357d7",
+    "test/registered/unit/training_capture/test_resources.py": "af84080295b5048f606cf9ac8a52972d1a60d7a75090616014c6e12e68d07cdb",
+    "python/sglang/test/pd_capture_runtime.py": "62ad0abe3e259ed107022a862497c7784950354025b18dfa5793f98c8d0e7b5a",
+    "test/registered/storage/test_training_capture_pd.py": "24cd1594e9938a52a21948bb5d02f4c70f926d35b10c741f548caa7b3626ae7b",
+    "mooncake-study/experiments/summarize_capture_trace.py": "c25c0b9856dd32ea021a953b766eb4fc102814b46ade6217f452d876dfe41ee1",
+    "test/registered/unit/training_capture/test_trace_attribution.py": "254281fd22302b84c11e327287db0fa57da1c35de0355ac415d86c82b339bac3"
+  },
+  "frozen_source_directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged",
+  "environment_lock": "h100-runtime-lock.json",
+  "change": [
+    "teacher_d2h_batch_tokens defaults to 1; larger values share max_device_bytes with KV staging across all local slots.",
+    "Only the aux owner allocates teacher staging, including aux-only PP stages using the target pool device.",
+    "Short ranges own source values immediately, full batches and sealed tails copy to Host, and large ranges bypass staging.",
+    "CPU P/D teacher rows stay on Host; append/flush/reuse follows a single row ledger and explicit CUDA stream fences.",
+    "Terminal trim limits manifest rows; abort discards unpublished tails; uncertain completion quarantines both arenas.",
+    "Trace attribution now includes correlated D2D separately from D2H, with unknown byte fields preserved."
+  ],
+  "jobs": [
+    {
+      "name": "baseline_profile",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-baseline --timeout-seconds 1800 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-baseline/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/profile_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision 9b6cd2206 --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-baseline-profile-20261002 --kv-d2h-batch-tokens 16 --device-mib 16",
+      "id": "01790921608319247743-89f5baa463e2",
+      "result": {
+        "job_id": "01790921608319247743-89f5baa463e2",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790921985.2746732,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790921608319247743-89f5baa463e2.log"
+      },
+      "log_sha256": "d5d7786ca852541365ac445eb16789d0b56c9db822d894b1022afa44bf00ed73"
+    },
+    {
+      "name": "unit",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged --timeout-seconds 1800 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m unittest discover -s test/registered/unit/training_capture -p 'test_*.py'",
+      "id": "01790922154950321909-62b55d149ddc",
+      "result": {
+        "job_id": "01790922154950321909-62b55d149ddc",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790922352.3094928,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790922154950321909-62b55d149ddc.log"
+      },
+      "tests": 192,
+      "seconds": 180.733,
+      "log_sha256": "2b2c29e0cbe92ddb80f8a1954a2d643779eaa436335ac5c4244439890026423c"
+    },
+    {
+      "name": "baseline_benchmark",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-baseline --timeout-seconds 1800 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-baseline/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/benchmark_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision 9b6cd2206 --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-baseline-benchmark-20261002 --kv-d2h-batch-tokens 16 --device-mib 16 --ratios 0.1 --repeats 1",
+      "id": "01790922254352582164-f10c466acca8",
+      "result": {
+        "job_id": "01790922254352582164-f10c466acca8",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790922697.6008189,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790922254352582164-f10c466acca8.log"
+      },
+      "log_sha256": "de2d3d270558678389de5f650415cf603b32641133dd13cb60158fb915e8d239"
+    },
+    {
+      "name": "cuda_final",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged --timeout-seconds 1800 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/unit/training_capture/test_cuda_snapshot.py",
+      "id": "01790922407443154781-718cb1749d06",
+      "result": {
+        "job_id": "01790922407443154781-718cb1749d06",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790922709.6794798,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790922407443154781-718cb1749d06.log"
+      },
+      "tests": 7,
+      "seconds": 0.421,
+      "log_sha256": "09612270a0167959ed8b00faa94ba3528a26af90af6750b42f6c35c0a9d8abbe"
+    },
+    {
+      "name": "runtime",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged --timeout-seconds 1800 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_runtime.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+      "id": "01790922407791727632-aab87b8e114a",
+      "result": {
+        "job_id": "01790922407791727632-aab87b8e114a",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790923363.0068736,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790922407791727632-aab87b8e114a.log"
+      },
+      "tests": 2,
+      "seconds": 641.671,
+      "log_sha256": "5c8e4163712162d9ab61d1ccfe755642b922fa3a1fffa02a1e43ba2436c1a4e3"
+    },
+    {
+      "name": "staged_profile",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged --timeout-seconds 1800 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/profile_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision 9b6cd2206+teacher-staging --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-staged-profile-20261002 --kv-d2h-batch-tokens 16 --teacher-d2h-batch-tokens 16 --device-mib 16",
+      "id": "01790922408119930405-45939441e318",
+      "result": {
+        "job_id": "01790922408119930405-45939441e318",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790923749.8940535,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790922408119930405-45939441e318.log"
+      },
+      "log_sha256": "f3ec336e91297e058fb924499effe548c8fc6a5ac6a2b4014b338bfa3c63eecd"
+    },
+    {
+      "name": "staged_benchmark",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged --timeout-seconds 1800 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/benchmark_training_capture.py --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --source-revision 9b6cd2206+teacher-staging --output-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-staged-benchmark-20261002 --kv-d2h-batch-tokens 16 --teacher-d2h-batch-tokens 16 --device-mib 16 --ratios 0.1 --repeats 1",
+      "id": "01790922408460069439-44ba81058b22",
+      "result": {
+        "job_id": "01790922408460069439-44ba81058b22",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790924083.6365013,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790922408460069439-44ba81058b22.log"
+      },
+      "log_sha256": "ef965abf1f2fdf29f4f617b145af16c504e2c77d5cf168348a9eab3c5d502196"
+    },
+    {
+      "name": "pd_runtime",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged --timeout-seconds 1800 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd.py",
+      "id": "01790922617623114128-149e2b0d6b9e",
+      "result": {
+        "job_id": "01790922617623114128-149e2b0d6b9e",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790924229.2292116,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790922617623114128-149e2b0d6b9e.log"
+      },
+      "tests": 2,
+      "seconds": 134.279,
+      "log_sha256": "9c80ca6aac9ca61002cba5d60dd136f290eb76306daf812ccd0476558c27a58f"
+    },
+    {
+      "name": "teacher_cpu_final",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged --timeout-seconds 1800 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env CUDA_VISIBLE_DEVICES=999 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/unit/training_capture/test_teacher_staging.py",
+      "id": "01790922834988643763-d5692b4c641d",
+      "result": {
+        "job_id": "01790922834988643763-d5692b4c641d",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790924239.7663763,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790922834988643763-d5692b4c641d.log"
+      },
+      "tests": 6,
+      "seconds": 0.008,
+      "log_sha256": "1c77afcbb97b03c90cbc9cb2f7ee9f1817efd5092e00897250bb2814d2c612d3"
+    },
+    {
+      "name": "trace_cpu_final",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged --timeout-seconds 1800 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-teacher-staged/python --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env CUDA_VISIBLE_DEVICES=999 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/unit/training_capture/test_trace_attribution.py",
+      "id": "01790923848711719745-5f8037476b39",
+      "result": {
+        "job_id": "01790923848711719745-5f8037476b39",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790924250.2971656,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790923848711719745-5f8037476b39.log"
+      },
+      "tests": 4,
+      "seconds": 0.011,
+      "log_sha256": "682e68f9cfa93f5641e391a5b8a378238ffeed5865d4b0a151a9e57f3c62251c"
+    }
+  ],
+  "test_scope": {
+    "unit": "Full training_capture unit discovery passed. The CUDA-only tail-fence test and the D2D attribution case were then added; their complete test files passed separately. Teacher CPU tests were rerun after a dict-literal lint correction. Production sources were unchanged after initial discovery.",
+    "runtime": "Complete single-GPU AR/DSpark, eager/graph, overlap, prefix, abort, memory-pressure, lifecycle and ragged verification regression; baseline direct-transfer coverage also remains in the unit suite.",
+    "pd": "Single-GPU real TCP P/D eager and graph/overlap runs with teacher batching 16; ten complete snapshots read after producer cleanup, four failed handoffs and two aborted captures excluded.",
+    "limits": "Synthetic draft and HTTP Catalog test double. Runtime cleanup uses the existing monolithic fixture; its snapshot total is not claimed as strengthened full-process-tree exit evidence. Distributed teacher batching, cross-node RDMA, production Catalog and trained quality were not validated by this change."
+  },
+  "profile": [
+    {
+      "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-baseline-profile-20261002/on/prefill/prefill-1790921747.0453758-TP-0.trace.json.gz",
+      "sha256": "3f3460efc510c41d54a8a8dd54eb76a1bc3ad68e6243cb4c00f1f49b64e7e7ee",
+      "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+      "groups": {
+        "training_capture.kv": {
+          "cpu_calls": 45,
+          "cpu_scope_us": 24029.250999999997,
+          "gpu_kernel_calls": 270,
+          "gpu_kernel_us": 499.8759999999995,
+          "d2h_calls": 240,
+          "d2h_us": 1992.1260000000009,
+          "d2h_bytes": 62914560,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.positions_d2h": {
+          "cpu_calls": 45,
+          "cpu_scope_us": 4624.089999999999,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 45,
+          "d2h_us": 123.55000000000001,
+          "d2h_bytes": 41000,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.teacher": {
+          "cpu_calls": 45,
+          "cpu_scope_us": 23966.554000000007,
+          "gpu_kernel_calls": 1395,
+          "gpu_kernel_us": 3777.4990000000053,
+          "d2h_calls": 0,
+          "d2h_us": 0,
+          "d2h_bytes": 0,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.teacher_d2h": {
+          "cpu_calls": 45,
+          "cpu_scope_us": 11191.759,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 135,
+          "d2h_us": 319.6829999999998,
+          "d2h_bytes": 46260,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.kv_d2h": {
+          "cpu_calls": 5,
+          "cpu_scope_us": 1068.395,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 30,
+          "d2h_us": 76.799,
+          "d2h_bytes": 61440,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        }
+      },
+      "all_kernel_us": 77408.74100000148,
+      "all_d2h_us": 2629.436999999997,
+      "all_d2d_us": 143.58399999999997
+    },
+    {
+      "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-baseline-profile-20261002/on/decode/decode-1790921862.9577706-TP-0.trace.json.gz",
+      "sha256": "86565c4415b0eba126b1c987e3d46dcaa84119e44c7d5fdc4a9faeb2f11554dd",
+      "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+      "groups": {
+        "training_capture.kv": {
+          "cpu_calls": 1320,
+          "cpu_scope_us": 291156.221,
+          "gpu_kernel_calls": 7920,
+          "gpu_kernel_us": 15328.359000000424,
+          "d2h_calls": 0,
+          "d2h_us": 0,
+          "d2h_bytes": 0,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.positions_d2h": {
+          "cpu_calls": 1320,
+          "cpu_scope_us": 114327.17399999984,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 1320,
+          "d2h_us": 3282.906999999993,
+          "d2h_bytes": 10560,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.teacher": {
+          "cpu_calls": 165,
+          "cpu_scope_us": 85200.34800000004,
+          "gpu_kernel_calls": 5115,
+          "gpu_kernel_us": 17129.038999999946,
+          "d2h_calls": 0,
+          "d2h_us": 0,
+          "d2h_bytes": 0,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.teacher_d2h": {
+          "cpu_calls": 1320,
+          "cpu_scope_us": 263658.1839999999,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 3960,
+          "d2h_us": 9863.000999999978,
+          "d2h_bytes": 1356960,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.kv_d2h": {
+          "cpu_calls": 120,
+          "cpu_scope_us": 30153.618,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 720,
+          "d2h_us": 2214.904999999992,
+          "d2h_bytes": 16220160,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        }
+      },
+      "all_kernel_us": 239416.0869999942,
+      "all_d2h_us": 15787.78099999995,
+      "all_d2d_us": 1917.4019999999875
+    },
+    {
+      "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-staged-profile-20261002/on/prefill/prefill-1790923502.204465-TP-0.trace.json.gz",
+      "sha256": "9e9086422bc107c46bdf121b02d82e7f1932cef7ef16a988458c2a3f6006c761",
+      "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+      "groups": {
+        "training_capture.kv": {
+          "cpu_calls": 45,
+          "cpu_scope_us": 24338.924000000003,
+          "gpu_kernel_calls": 270,
+          "gpu_kernel_us": 498.17400000000015,
+          "d2h_calls": 240,
+          "d2h_us": 1989.7240000000018,
+          "d2h_bytes": 62914560,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.positions_d2h": {
+          "cpu_calls": 45,
+          "cpu_scope_us": 5003.4839999999995,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 45,
+          "d2h_us": 123.48500000000004,
+          "d2h_bytes": 41000,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.teacher": {
+          "cpu_calls": 45,
+          "cpu_scope_us": 23921.569000000003,
+          "gpu_kernel_calls": 1395,
+          "gpu_kernel_us": 3775.6139999999996,
+          "d2h_calls": 0,
+          "d2h_us": 0,
+          "d2h_bytes": 0,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.teacher_d2h": {
+          "cpu_calls": 85,
+          "cpu_scope_us": 21690.329,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 120,
+          "d2h_us": 331.5799999999999,
+          "d2h_bytes": 46260,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 135,
+          "d2d_us": 135.99100000000007,
+          "d2d_bytes": 46260,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.kv_d2h": {
+          "cpu_calls": 5,
+          "cpu_scope_us": 1049.6100000000001,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 30,
+          "d2h_us": 76.925,
+          "d2h_bytes": 61440,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        }
+      },
+      "all_kernel_us": 77355.96300000153,
+      "all_d2h_us": 2638.7360000000003,
+      "all_d2d_us": 280.1459999999999
+    },
+    {
+      "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-staged-profile-20261002/on/decode/decode-1790923629.8664603-TP-0.trace.json.gz",
+      "sha256": "fd545ed0d3273336900b84cdb2b690c7bc9a5559716bf9327094cc60181c80d9",
+      "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+      "groups": {
+        "training_capture.kv": {
+          "cpu_calls": 1320,
+          "cpu_scope_us": 289107.476,
+          "gpu_kernel_calls": 7920,
+          "gpu_kernel_us": 15321.89400000035,
+          "d2h_calls": 0,
+          "d2h_us": 0,
+          "d2h_bytes": 0,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.positions_d2h": {
+          "cpu_calls": 1320,
+          "cpu_scope_us": 115471.27100000023,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 1320,
+          "d2h_us": 3055.4550000000067,
+          "d2h_bytes": 10560,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.teacher": {
+          "cpu_calls": 165,
+          "cpu_scope_us": 87483.12999999998,
+          "gpu_kernel_calls": 5115,
+          "gpu_kernel_us": 17128.21199999985,
+          "d2h_calls": 0,
+          "d2h_us": 0,
+          "d2h_bytes": 0,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.teacher_d2h": {
+          "cpu_calls": 1360,
+          "cpu_scope_us": 276239.8039999998,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 360,
+          "d2h_us": 979.6450000000001,
+          "d2h_bytes": 1356960,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 3960,
+          "d2d_us": 3956.491000000117,
+          "d2d_bytes": 1356960,
+          "d2d_events_missing_bytes": 0
+        },
+        "training_capture.kv_d2h": {
+          "cpu_calls": 120,
+          "cpu_scope_us": 31174.995000000006,
+          "gpu_kernel_calls": 0,
+          "gpu_kernel_us": 0,
+          "d2h_calls": 720,
+          "d2h_us": 2216.5149999999944,
+          "d2h_bytes": 16220160,
+          "d2h_events_missing_bytes": 0,
+          "d2d_calls": 0,
+          "d2d_us": 0,
+          "d2d_bytes": 0,
+          "d2d_events_missing_bytes": 0
+        }
+      },
+      "all_kernel_us": 239441.8299999952,
+      "all_d2h_us": 6624.998999999967,
+      "all_d2d_us": 5868.597000000358
+    }
+  ],
+  "serving": {
+    "direct": {
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "9b6cd2206",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-baseline-benchmark-20261002",
+        "num_prompts": 2048,
+        "input_len": 128,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 16,
+        "device_mib": 16,
+        "segment_mib": 2048,
+        "phase_timeout": 600
+      },
+      "versions": {
+        "torch": "2.13.0",
+        "transformers": "5.12.1",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      },
+      "producer_source_sha256": {
+        "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+        "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+        "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+        "python/sglang/srt/training_capture/cohort.py": "6bd093ee9a219970b08023d279852b07caaacf288f2f617236b6b2e1c7d5af56",
+        "python/sglang/srt/training_capture/cohort_coordinator.py": "c858b29968f2dda7e8ae5353324bae5bfa436f0ea216d10da58d040c33acfa45",
+        "python/sglang/srt/training_capture/cohort_exchange.py": "b37abb0499a23fa8650521fe28c04a7219b887f5d2920e6f8070d4bfacae2ed3",
+        "python/sglang/srt/training_capture/cohort_service.py": "d57c7ee616c08a01c49d6fd643012da63a24bd51cde3f78f25b0f3eb3207b1b3",
+        "python/sglang/srt/training_capture/cohort_startup.py": "dfacd1a45203de5f3c08ccf73b06933f7aa4183bd670979981cfe2cb960208ed",
+        "python/sglang/srt/training_capture/cohort_writer.py": "fd28ef6229fa89d447aaf53d6bbcf18789371d96ef5dd008c7375d7bbc967dca",
+        "python/sglang/srt/training_capture/config.py": "14160fa8f464fd9e3a96ba91f94915fa2274bd43356e20a0936dd50179ce3b6a",
+        "python/sglang/srt/training_capture/context.py": "f796e2b83dcfa7f83bb536e4460e9a6b5fe1563b1772a4ad4152bf905a1b1871",
+        "python/sglang/srt/training_capture/coordinator.py": "e74b955334cc58ab98a0e5a903345e52329e81ebed6c9157ace2fd1ba34d2f7e",
+        "python/sglang/srt/training_capture/host_pool.py": "d18bdf4620c0508a16a52dafc0c55e12106abde9289e6d62c2989e905d86d549",
+        "python/sglang/srt/training_capture/identity.py": "47f91ad994b716d27454eace428d9d0a5ce7468c5708e4dd3d3e385119c8ac24",
+        "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+        "python/sglang/srt/training_capture/kv_exporter.py": "2cecaf4db75bd9b2b0adf664f12fd6c56cfaba74be01b1c755b40cfd62299c8f",
+        "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+        "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+        "python/sglang/srt/training_capture/metrics.py": "17703ff9d2c19b63c7d7d8e83ea3642264ddda6a6f258fc2634117cecf67241f",
+        "python/sglang/srt/training_capture/mooncake_store.py": "9d2f448c5b8275e5c117f8f4f25567c49d178af6e14570252a425011768ef80d",
+        "python/sglang/srt/training_capture/pd_capture.py": "81fb0550f2ea923aeda71add0c5f29955f00a7bb0e8c917880bfbb4315be81db",
+        "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+        "python/sglang/srt/training_capture/protocol.py": "e57f130767eb7ca4aef6dc63a7cfdbaa37cc1d02326a068bc973d818a7bb9d62",
+        "python/sglang/srt/training_capture/request_router.py": "b97ca76fd4621398c617414098c539850e331e0ee42d88e91eb7e0cb41f09824",
+        "python/sglang/srt/training_capture/resources.py": "648d52121b8531dd905e13a0bd0f7a9eca482e43a93798be87897af2f83747ea",
+        "python/sglang/srt/training_capture/snapshot.py": "367c25a94e52c260c8c0dd622312cc40cadbf238adc27ebce46a9d83f115a4b1",
+        "python/sglang/srt/training_capture/snapshot_writer.py": "024cc676dc93c531ac34165646f2044479a24e04a5462f7a50b90d27188f883e",
+        "python/sglang/srt/training_capture/startup.py": "00d81ee4757ef83347248e419065a81dd8f812837f5589a91fd9b7511e895371",
+        "python/sglang/srt/training_capture/teacher.py": "ca48d11bf2eff16bf206aaa9928f820e6ed8d134e1b55622c68c116473a7a708",
+        "python/sglang/srt/training_capture/topology.py": "b35eef08cd7ac804817c5b22c232e9c1e6dd76fc292220acc928eb58af5f1a35"
+      },
+      "driver_sha256": "4e09b53de3c330fd308a0e27a99f88f596a4e7c7d7e19d9daadaab982920398f",
+      "comparison": {
+        "baseline_bracket_mean": {
+          "median_ttft_ms": 93.31918135285378,
+          "p95_ttft_ms": 148.3810858801007,
+          "p99_ttft_ms": 174.4602051004764,
+          "median_tpot_ms": 3.282864397812274,
+          "p95_tpot_ms": 6.063909693470886,
+          "p99_tpot_ms": 6.380101497615536,
+          "output_throughput": 1310.4276730947195
+        },
+        "baseline_after_over_before": {
+          "median_ttft_ms": 0.9382063558908204,
+          "p95_ttft_ms": 0.94131513544193,
+          "p99_ttft_ms": 0.8314062048839882,
+          "median_tpot_ms": 1.0157651821097582,
+          "p95_tpot_ms": 1.0257861396959038,
+          "p99_tpot_ms": 0.943591790744269,
+          "output_throughput": 1.0094137684797921
+        },
+        "capture_over_baseline": [
+          {
+            "sample_ratio": 0.1,
+            "ratios": {
+              "median_ttft_ms": 1.0980817620570107,
+              "p95_ttft_ms": 1.0478478842491232,
+              "p99_ttft_ms": 0.9885359277661706,
+              "median_tpot_ms": 1.18990651458832,
+              "p95_tpot_ms": 1.1306192996804052,
+              "p99_tpot_ms": 1.2778352620300446,
+              "output_throughput": 0.8534236311989533
+            }
+          }
+        ]
+      },
+      "phases": [
+        {
+          "sample_ratio": null,
+          "serving": {
+            "completed": 2048,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "duration": 50.24655058607459,
+            "output_throughput": 1304.2885379312536,
+            "median_ttft_ms": 96.29437141120434,
+            "p95_ttft_ms": 152.86656264215705,
+            "p99_ttft_ms": 190.52049145102433,
+            "median_tpot_ms": 3.2571893065206465,
+            "p95_tpot_ms": 5.9867224626002775,
+            "p99_tpot_ms": 6.565269032312977,
+            "cache_report": {
+              "total_prompt_tokens": 262144,
+              "total_cached_tokens": 0,
+              "cache_hit_rate_pct": 0,
+              "device_cached_tokens": null,
+              "host_cached_tokens": null,
+              "storage_cached_tokens": null,
+              "storage_backend": null
+            }
+          },
+          "capture_counter_delta": {},
+          "readback": {},
+          "selected_requests": 0,
+          "host_pool": null
+        },
+        {
+          "sample_ratio": 0.1,
+          "serving": {
+            "completed": 2048,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "duration": 58.600619956851006,
+            "output_throughput": 1118.3499431960904,
+            "median_ttft_ms": 102.4720910936594,
+            "p95_ttft_ms": 155.48080690205097,
+            "p99_ttft_ms": 172.46018070727584,
+            "median_tpot_ms": 3.9063017334668872,
+            "p95_tpot_ms": 6.855973330957274,
+            "p99_tpot_ms": 8.152718668983828,
+            "cache_report": {
+              "total_prompt_tokens": 262144,
+              "total_cached_tokens": 0,
+              "cache_hit_rate_pct": 0,
+              "device_cached_tokens": null,
+              "host_cached_tokens": null,
+              "storage_cached_tokens": null,
+              "storage_backend": null
+            }
+          },
+          "capture_counter_delta": {
+            "considered": 2048,
+            "sampled_out": 1858,
+            "admitted": 190,
+            "overlap_forwards": 4830,
+            "eager_forwards": 190,
+            "cuda_graph_forwards": 4640,
+            "sealed": 190,
+            "writer_started": 190,
+            "copies_completed": 190,
+            "snapshot_built": 190,
+            "ready": 190
+          },
+          "readback": {
+            "validated_samples": 190,
+            "manifest_bytes": 2686220,
+            "payload_bytes": 380255360,
+            "aux_payload_bytes": 6700160,
+            "payload_objects": 4940,
+            "kv_payload_bytes": 373555200
+          },
+          "selected_requests": 190,
+          "host_pool": {
+            "allocated_bytes": 50913280,
+            "device_allocated_bytes": 3145728,
+            "device_limit_bytes": 16777216,
+            "free": 0,
+            "filling": 16,
+            "quarantined": 0
+          }
+        },
+        {
+          "sample_ratio": null,
+          "serving": {
+            "completed": 2048,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "duration": 49.77795246616006,
+            "output_throughput": 1316.5668082581851,
+            "median_ttft_ms": 90.34399129450321,
+            "p95_ttft_ms": 143.89560911804435,
+            "p99_ttft_ms": 158.39991874992845,
+            "median_tpot_ms": 3.3085394891039015,
+            "p95_tpot_ms": 6.141096924341494,
+            "p99_tpot_ms": 6.194933962918096,
+            "cache_report": {
+              "total_prompt_tokens": 262144,
+              "total_cached_tokens": 0,
+              "cache_hit_rate_pct": 0,
+              "device_cached_tokens": null,
+              "host_cached_tokens": null,
+              "storage_cached_tokens": null,
+              "storage_backend": null
+            }
+          },
+          "capture_counter_delta": {},
+          "readback": {},
+          "selected_requests": 0,
+          "host_pool": null
+        }
+      ]
+    },
+    "staged": {
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "9b6cd2206+teacher-staging",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-staged-benchmark-20261002",
+        "num_prompts": 2048,
+        "input_len": 128,
+        "output_len": 32,
+        "concurrency": 8,
+        "ratios": [
+          0.1
+        ],
+        "repeats": 1,
+        "seed": 42,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "kv_d2h_batch_tokens": 16,
+        "teacher_d2h_batch_tokens": 16,
+        "device_mib": 16,
+        "segment_mib": 2048,
+        "phase_timeout": 600
+      },
+      "versions": {
+        "torch": "2.13.0",
+        "transformers": "5.12.1",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+      },
+      "producer_source_sha256": {
+        "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+        "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+        "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+        "python/sglang/srt/training_capture/cohort.py": "6bd093ee9a219970b08023d279852b07caaacf288f2f617236b6b2e1c7d5af56",
+        "python/sglang/srt/training_capture/cohort_coordinator.py": "c858b29968f2dda7e8ae5353324bae5bfa436f0ea216d10da58d040c33acfa45",
+        "python/sglang/srt/training_capture/cohort_exchange.py": "b37abb0499a23fa8650521fe28c04a7219b887f5d2920e6f8070d4bfacae2ed3",
+        "python/sglang/srt/training_capture/cohort_service.py": "d57c7ee616c08a01c49d6fd643012da63a24bd51cde3f78f25b0f3eb3207b1b3",
+        "python/sglang/srt/training_capture/cohort_startup.py": "dfacd1a45203de5f3c08ccf73b06933f7aa4183bd670979981cfe2cb960208ed",
+        "python/sglang/srt/training_capture/cohort_writer.py": "fd28ef6229fa89d447aaf53d6bbcf18789371d96ef5dd008c7375d7bbc967dca",
+        "python/sglang/srt/training_capture/config.py": "9cf427b9f673c376f728aa4bec45b0b4a31bffb360ce88731b32b8fccc34530d",
+        "python/sglang/srt/training_capture/context.py": "377d3afd09c2f4be5ea373ba7afba495521f190e8fd8a89a6dcbda2ea9fa183d",
+        "python/sglang/srt/training_capture/coordinator.py": "e74b955334cc58ab98a0e5a903345e52329e81ebed6c9157ace2fd1ba34d2f7e",
+        "python/sglang/srt/training_capture/host_pool.py": "591086d65bd855dfb671588c4c7e1b0af7270237ef738e0967db32f5e5816bfc",
+        "python/sglang/srt/training_capture/identity.py": "47f91ad994b716d27454eace428d9d0a5ce7468c5708e4dd3d3e385119c8ac24",
+        "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+        "python/sglang/srt/training_capture/kv_exporter.py": "2cecaf4db75bd9b2b0adf664f12fd6c56cfaba74be01b1c755b40cfd62299c8f",
+        "python/sglang/srt/training_capture/kv_staging.py": "d483190132e5a3b79d2015862fc2921b413a8becf10190bcaad1be8059ef643d",
+        "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+        "python/sglang/srt/training_capture/metrics.py": "17703ff9d2c19b63c7d7d8e83ea3642264ddda6a6f258fc2634117cecf67241f",
+        "python/sglang/srt/training_capture/mooncake_store.py": "9d2f448c5b8275e5c117f8f4f25567c49d178af6e14570252a425011768ef80d",
+        "python/sglang/srt/training_capture/pd_capture.py": "81fb0550f2ea923aeda71add0c5f29955f00a7bb0e8c917880bfbb4315be81db",
+        "python/sglang/srt/training_capture/pd_protocol.py": "d21155c4121564913c5ebb9a57760dca7396e6958b8bd126767f65e4b38e7b89",
+        "python/sglang/srt/training_capture/protocol.py": "e57f130767eb7ca4aef6dc63a7cfdbaa37cc1d02326a068bc973d818a7bb9d62",
+        "python/sglang/srt/training_capture/request_router.py": "b97ca76fd4621398c617414098c539850e331e0ee42d88e91eb7e0cb41f09824",
+        "python/sglang/srt/training_capture/resources.py": "4f615e4b1b79b94637ba664e05e93bdbb827f865a176d06abbf23e8bcd02cd8d",
+        "python/sglang/srt/training_capture/snapshot.py": "367c25a94e52c260c8c0dd622312cc40cadbf238adc27ebce46a9d83f115a4b1",
+        "python/sglang/srt/training_capture/snapshot_writer.py": "024cc676dc93c531ac34165646f2044479a24e04a5462f7a50b90d27188f883e",
+        "python/sglang/srt/training_capture/startup.py": "00d81ee4757ef83347248e419065a81dd8f812837f5589a91fd9b7511e895371",
+        "python/sglang/srt/training_capture/teacher.py": "ca48d11bf2eff16bf206aaa9928f820e6ed8d134e1b55622c68c116473a7a708",
+        "python/sglang/srt/training_capture/teacher_staging.py": "9afe4b9bb7bdf16e43156377b47d034f9707ed1c09b62dbfdac3795bb7032fd0",
+        "python/sglang/srt/training_capture/topology.py": "b35eef08cd7ac804817c5b22c232e9c1e6dd76fc292220acc928eb58af5f1a35"
+      },
+      "driver_sha256": "de3d9a294e6d8dc3982ea0285d800615f5d0e7c2c28f166995c904ed29ae9417",
+      "comparison": {
+        "baseline_bracket_mean": {
+          "median_ttft_ms": 95.26816010475159,
+          "p95_ttft_ms": 140.70427473634481,
+          "p99_ttft_ms": 186.79913720116014,
+          "median_tpot_ms": 3.265420966331036,
+          "p95_tpot_ms": 6.020656255103888,
+          "p99_tpot_ms": 6.288585573314657,
+          "output_throughput": 1333.224328194061
+        },
+        "baseline_after_over_before": {
+          "median_ttft_ms": 0.9018032897033156,
+          "p95_ttft_ms": 1.0083906372037712,
+          "p99_ttft_ms": 0.7147689909716545,
+          "median_tpot_ms": 1.0046514872208456,
+          "p95_tpot_ms": 1.0057532041706223,
+          "p99_tpot_ms": 0.945912069734393,
+          "output_throughput": 1.0041584577264866
+        },
+        "capture_over_baseline": [
+          {
+            "sample_ratio": 0.1,
+            "ratios": {
+              "median_ttft_ms": 1.0724151257136725,
+              "p95_ttft_ms": 1.1068002813125617,
+              "p99_ttft_ms": 0.9385055976706397,
+              "median_tpot_ms": 1.2054089033374809,
+              "p95_tpot_ms": 1.1528527220406686,
+              "p99_tpot_ms": 1.317303770129724,
+              "output_throughput": 0.8365625408613364
+            }
+          }
+        ]
+      },
+      "phases": [
+        {
+          "sample_ratio": null,
+          "serving": {
+            "completed": 2048,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "duration": 49.25822530686855,
+            "output_throughput": 1330.4580015159759,
+            "median_ttft_ms": 100.18718615174294,
+            "p95_ttft_ms": 140.11644162237644,
+            "p99_ttft_ms": 217.87090644240365,
+            "median_tpot_ms": 3.2578440563332647,
+            "p95_tpot_ms": 6.003386899828911,
+            "p99_tpot_ms": 6.463381024377959,
+            "cache_report": {
+              "total_prompt_tokens": 262144,
+              "total_cached_tokens": 0,
+              "cache_hit_rate_pct": 0,
+              "device_cached_tokens": null,
+              "host_cached_tokens": null,
+              "storage_cached_tokens": null,
+              "storage_backend": null
+            }
+          },
+          "capture_counter_delta": {},
+          "readback": {},
+          "selected_requests": 0,
+          "host_pool": null
+        },
+        {
+          "sample_ratio": 0.1,
+          "serving": {
+            "completed": 2048,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "duration": 58.75952638685703,
+            "output_throughput": 1115.325531532172,
+            "median_ttft_ms": 102.16701589524746,
+            "p95_ttft_ms": 155.7315308600664,
+            "p99_ttft_ms": 175.31203590333462,
+            "median_tpot_ms": 3.9361675059603107,
+            "p95_tpot_ms": 6.940929952167695,
+            "p99_tpot_ms": 8.28397748451079,
+            "cache_report": {
+              "total_prompt_tokens": 262144,
+              "total_cached_tokens": 0,
+              "cache_hit_rate_pct": 0,
+              "device_cached_tokens": null,
+              "host_cached_tokens": null,
+              "storage_cached_tokens": null,
+              "storage_backend": null
+            }
+          },
+          "capture_counter_delta": {
+            "considered": 2048,
+            "sampled_out": 1858,
+            "admitted": 190,
+            "overlap_forwards": 4830,
+            "eager_forwards": 190,
+            "cuda_graph_forwards": 4640,
+            "sealed": 190,
+            "writer_started": 190,
+            "copies_completed": 190,
+            "snapshot_built": 190,
+            "ready": 190
+          },
+          "readback": {
+            "validated_samples": 190,
+            "manifest_bytes": 2689260,
+            "payload_bytes": 380255360,
+            "aux_payload_bytes": 6700160,
+            "payload_objects": 4940,
+            "kv_payload_bytes": 373555200
+          },
+          "selected_requests": 190,
+          "host_pool": {
+            "allocated_bytes": 50913280,
+            "device_allocated_bytes": 3408896,
+            "device_limit_bytes": 16777216,
+            "free": 0,
+            "filling": 16,
+            "quarantined": 0
+          }
+        },
+        {
+          "sample_ratio": null,
+          "serving": {
+            "completed": 2048,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "duration": 49.054235342890024,
+            "output_throughput": 1335.9906548721458,
+            "median_ttft_ms": 90.34913405776024,
+            "p95_ttft_ms": 141.2921078503132,
+            "p99_ttft_ms": 155.7273679599166,
+            "median_tpot_ms": 3.272997876328807,
+            "p95_tpot_ms": 6.037925610378865,
+            "p99_tpot_ms": 6.113790122251356,
+            "cache_report": {
+              "total_prompt_tokens": 262144,
+              "total_cached_tokens": 0,
+              "cache_hit_rate_pct": 0,
+              "device_cached_tokens": null,
+              "host_cached_tokens": null,
+              "storage_cached_tokens": null,
+              "storage_backend": null
+            }
+          },
+          "capture_counter_delta": {},
+          "readback": {},
+          "selected_requests": 0,
+          "host_pool": null
+        }
+      ]
+    },
+    "interpretation": "No demonstrated end-to-end speedup. Direct/staged capture throughput 1118.349943/1115.325532 tokens per second; one off/on/off round each. Teacher decode D2H+D2D work fell from 9.863ms to 4.936ms, but CPU scope work increased. Defaults remain direct; production SLO acceptance is open."
+  },
+  "runtime_observations": [
+    {
+      "graph_capture": {
+        "counters": {
+          "considered": 4,
+          "excluded_health_check": 1,
+          "admitted": 3,
+          "eager_forwards": 4,
+          "sealed": 3,
+          "writer_started": 3,
+          "copies_completed": 3,
+          "snapshot_built": 3,
+          "ready": 3,
+          "cuda_graph_forwards": 5
+        },
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 2,
+          "filling": 2,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "cuda_graph_enabled": false,
+      "samples": 9,
+      "aborted": true,
+      "canonical_remaps": 6,
+      "overlap_capture": {
+        "counters": {
+          "considered": 11,
+          "excluded_health_check": 1,
+          "admitted": 10,
+          "overlap_forwards": 43,
+          "eager_forwards": 43,
+          "sealed": 9,
+          "writer_started": 10,
+          "copies_completed": 10,
+          "snapshot_built": 9,
+          "ready": 9,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "host_pool": {
+          "allocated_bytes": 13581568,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "cuda_graph_enabled": true,
+      "samples": 9,
+      "aborted": true,
+      "canonical_remaps": 6,
+      "overlap_capture": {
+        "counters": {
+          "considered": 11,
+          "excluded_health_check": 1,
+          "admitted": 10,
+          "overlap_forwards": 43,
+          "eager_forwards": 9,
+          "cuda_graph_forwards": 34,
+          "sealed": 9,
+          "writer_started": 10,
+          "copies_completed": 10,
+          "snapshot_built": 9,
+          "ready": 9,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "host_pool": {
+          "allocated_bytes": 13581568,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "cuda_graph_enabled": false,
+      "overlap_enabled": false,
+      "samples": 9,
+      "aborted": false,
+      "speculative_capture": {
+        "counters": {
+          "considered": 10,
+          "excluded_health_check": 1,
+          "admitted": 9,
+          "eager_forwards": 33,
+          "sealed": 9,
+          "writer_started": 9,
+          "copies_completed": 9,
+          "snapshot_built": 9,
+          "ready": 9,
+          "speculative_verify_forwards": 24,
+          "speculative_commits_copied": 25
+        },
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "dspark_memory_pressure": {
+        "cuda_graph": false,
+        "enable_overlap": false,
+        "num_retractions": 2,
+        "ready_samples": 3,
+        "completed_requests": 4,
+        "output_tokens": 768
+      }
+    },
+    {
+      "cuda_graph_enabled": true,
+      "overlap_enabled": false,
+      "samples": 9,
+      "aborted": false,
+      "speculative_capture": {
+        "counters": {
+          "considered": 10,
+          "excluded_health_check": 1,
+          "admitted": 9,
+          "eager_forwards": 9,
+          "sealed": 9,
+          "writer_started": 9,
+          "copies_completed": 9,
+          "snapshot_built": 9,
+          "ready": 9,
+          "speculative_verify_forwards": 24,
+          "cuda_graph_forwards": 24,
+          "speculative_commits_copied": 25
+        },
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "dspark_memory_pressure": {
+        "cuda_graph": true,
+        "enable_overlap": false,
+        "num_retractions": 2,
+        "ready_samples": 3,
+        "completed_requests": 4,
+        "output_tokens": 768
+      }
+    },
+    {
+      "cuda_graph_enabled": false,
+      "overlap_enabled": true,
+      "samples": 11,
+      "aborted": true,
+      "speculative_capture": {
+        "counters": {
+          "considered": 13,
+          "excluded_health_check": 1,
+          "admitted": 12,
+          "overlap_forwards": 47,
+          "eager_forwards": 47,
+          "speculative_verify_forwards": 36,
+          "speculative_commits_copied": 42,
+          "sealed": 11,
+          "writer_started": 12,
+          "copies_completed": 12,
+          "snapshot_built": 11,
+          "ready": 11,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "dspark_memory_pressure": {
+        "cuda_graph": false,
+        "enable_overlap": true,
+        "num_retractions": 2,
+        "ready_samples": 3,
+        "completed_requests": 4,
+        "output_tokens": 768
+      }
+    },
+    {
+      "cuda_graph_enabled": true,
+      "overlap_enabled": true,
+      "samples": 11,
+      "aborted": true,
+      "speculative_capture": {
+        "counters": {
+          "considered": 13,
+          "excluded_health_check": 1,
+          "admitted": 12,
+          "overlap_forwards": 47,
+          "eager_forwards": 11,
+          "speculative_verify_forwards": 36,
+          "cuda_graph_forwards": 36,
+          "speculative_commits_copied": 42,
+          "sealed": 11,
+          "writer_started": 12,
+          "copies_completed": 12,
+          "snapshot_built": 11,
+          "ready": 11,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "dspark_memory_pressure": {
+        "cuda_graph": true,
+        "enable_overlap": true,
+        "num_retractions": 2,
+        "ready_samples": 3,
+        "completed_requests": 4,
+        "output_tokens": 768
+      }
+    },
+    {
+      "samples": 2,
+      "adaptive_capture": {
+        "counters": {
+          "considered": 4,
+          "excluded_health_check": 1,
+          "admitted": 2,
+          "overlap_forwards": 10,
+          "eager_forwards": 10,
+          "sealed": 2,
+          "writer_started": 2,
+          "copies_completed": 2,
+          "snapshot_built": 2,
+          "sampled_out": 1,
+          "adaptive_sampled_out": 1,
+          "ready": 2
+        },
+        "host_pool": {
+          "allocated_bytes": 8924160,
+          "device_allocated_bytes": 426112,
+          "device_limit_bytes": 8388608,
+          "free": 0,
+          "filling": 2,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "samples": 2,
+      "latency_capture": {
+        "counters": {
+          "considered": 5,
+          "excluded_health_check": 1,
+          "admitted": 2,
+          "overlap_forwards": 10,
+          "eager_forwards": 10,
+          "sealed": 2,
+          "writer_started": 2,
+          "copies_completed": 2,
+          "snapshot_built": 2,
+          "ready": 2,
+          "sampled_out": 2,
+          "adaptive_sampled_out": 2
+        },
+        "host_pool": {
+          "allocated_bytes": 8924160,
+          "device_allocated_bytes": 426112,
+          "device_limit_bytes": 8388608,
+          "free": 0,
+          "filling": 2,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "cuda_graph_enabled": false,
+      "samples": 5,
+      "evicted_tokens": 164,
+      "reused_kv_slots": 70,
+      "num_retractions": 1,
+      "staging_http_metrics_verified": true,
+      "lifecycle_capture": {
+        "counters": {
+          "considered": 7,
+          "excluded_health_check": 1,
+          "admitted": 6,
+          "eager_forwards": 26,
+          "sealed": 5,
+          "writer_started": 6,
+          "copies_completed": 6,
+          "snapshot_built": 5,
+          "ready": 5,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "cuda_graph_enabled": true,
+      "samples": 5,
+      "evicted_tokens": 166,
+      "reused_kv_slots": 72,
+      "num_retractions": 1,
+      "staging_http_metrics_verified": true,
+      "lifecycle_capture": {
+        "counters": {
+          "considered": 7,
+          "excluded_health_check": 1,
+          "admitted": 6,
+          "overlap_forwards": 32,
+          "eager_forwards": 10,
+          "cuda_graph_forwards": 22,
+          "sealed": 5,
+          "writer_started": 6,
+          "copies_completed": 6,
+          "snapshot_built": 5,
+          "ready": 5,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "ragged_capture": "cap-accept",
+      "graph_overlap": false,
+      "tp_size": 1,
+      "state": {
+        "counters": {
+          "considered": 4,
+          "excluded_health_check": 1,
+          "admitted": 3,
+          "eager_forwards": 10,
+          "speculative_verify_forwards": 7,
+          "speculative_commits_copied": 10,
+          "sealed": 3,
+          "writer_started": 3,
+          "copies_completed": 3,
+          "snapshot_built": 3,
+          "ready": 3
+        },
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "ragged_capture": "cap-accept",
+      "graph_overlap": true,
+      "tp_size": 1,
+      "state": {
+        "counters": {
+          "considered": 4,
+          "excluded_health_check": 1,
+          "admitted": 3,
+          "overlap_forwards": 12,
+          "eager_forwards": 3,
+          "speculative_verify_forwards": 9,
+          "cuda_graph_forwards": 9,
+          "speculative_commits_copied": 13,
+          "sealed": 3,
+          "writer_started": 3,
+          "copies_completed": 3,
+          "snapshot_built": 3,
+          "ready": 3
+        },
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 2,
+          "filling": 2,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "ragged_capture": "compact",
+      "graph_overlap": false,
+      "tp_size": 1,
+      "state": {
+        "counters": {
+          "considered": 4,
+          "excluded_health_check": 1,
+          "admitted": 3,
+          "eager_forwards": 10,
+          "speculative_verify_forwards": 7,
+          "speculative_commits_copied": 10,
+          "sealed": 3,
+          "writer_started": 3,
+          "copies_completed": 3,
+          "snapshot_built": 3,
+          "ready": 3
+        },
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 2,
+          "filling": 2,
+          "quarantined": 0
+        }
+      }
+    },
+    {
+      "ragged_capture": "compact",
+      "graph_overlap": true,
+      "tp_size": 1,
+      "state": {
+        "counters": {
+          "considered": 4,
+          "excluded_health_check": 1,
+          "admitted": 3,
+          "overlap_forwards": 12,
+          "eager_forwards": 3,
+          "speculative_verify_forwards": 9,
+          "cuda_graph_forwards": 9,
+          "speculative_commits_copied": 13,
+          "sealed": 3,
+          "writer_started": 3,
+          "copies_completed": 3,
+          "snapshot_built": 3,
+          "ready": 3
+        },
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        }
+      }
+    }
+  ],
+  "pd_observations": [
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "counters": {
+          "admitted": 8,
+          "considered": 8,
+          "copies_completed": 8,
+          "eager_forwards": 14,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5,
+          "snapshot_built": 5,
+          "writer_started": 8
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "filling": 1,
+          "free": 3,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 1,
+        "states": {
+          "available": 1
+        },
+        "writer_age_seconds": 0
+      },
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": null,
+      "post_exit_snapshots": 5,
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false
+    },
+    {
+      "capture": {
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "cooldown_remaining_seconds": 0,
+          "decreases": 0,
+          "effective_ratio": 1,
+          "failures": 0,
+          "latency": null,
+          "occupied_fraction": 0,
+          "pauses": 0,
+          "reason": "configured",
+          "recoveries": 0,
+          "target_ratio": 1,
+          "writer_age_seconds": 0
+        },
+        "counters": {
+          "admitted": 8,
+          "considered": 8,
+          "copies_completed": 8,
+          "cuda_graph_forwards": 17,
+          "failed_pd_handoff_failed": 2,
+          "failed_request_aborted_or_retracted": 1,
+          "overlap_forwards": 17,
+          "pd_handoff_committed": 6,
+          "ready": 5,
+          "sealed": 5,
+          "snapshot_built": 5,
+          "writer_started": 8
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "filling": 1,
+          "free": 3,
+          "quarantined": 0
+        },
+        "occupied_fraction": 0,
+        "queued": 0,
+        "reservations": 1,
+        "states": {
+          "available": 1
+        },
+        "writer_age_seconds": 0
+      },
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": null,
+      "post_exit_snapshots": 5,
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true
+    }
+  ],
+  "report_sha256": {
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-baseline-profile-20261002/report.json": "8ed612649feb3561ac69265f7baf37ad6e7e36bf1bdbe7235bd245fa2b9bb5c8",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-staged-profile-20261002/report.json": "3141523904538810bc3cc54fd3d18429865e4015c2d60b057d456a5da9e2e1ea",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-baseline-benchmark-20261002/report.json": "50e0a2dd42b3b00f80372f50dd03b8aeb33684402a444bce18ba15313d8a71e6",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/teacher-staged-benchmark-20261002/report.json": "1412b177332bf4723222906e011945bddde52b0a709abcf74fd99be66cd06077"
+  },
+  "validation": {
+    "black": "pass",
+    "ruff_new_files": "pass",
+    "ruff_imports_and_undefined_names": "pass",
+    "ruff_existing_files": "No new diagnostics; five existing C408/SIM115 remain, two preexisting import diagnostics fixed.",
+    "diff_check": "pass"
+  },
+  "resident_final": {
+    "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+    "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "pid": 1,
+    "mode": "idle_load",
+    "heartbeat_unix": 1790924309.9424496,
+    "idle_pid": 38077,
+    "active_job": null,
+    "active_pid": null,
+    "queued": 0,
+    "paused": false,
+    "heartbeat_age_seconds": 0.44526124000549316
+  },
+  "resources": {
+    "additional_gpu_allocations": 0,
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "idle_duty_cycle": 0.6,
+    "live_process_inspection": "Only the worker and idle cuda_load process remain, excluding inspection commands and zombies.",
+    "original_staged_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "goal_status": "active"
+}

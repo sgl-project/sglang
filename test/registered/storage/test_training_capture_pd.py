@@ -9,6 +9,8 @@ register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestPDCaptureRuntime(PDCaptureRuntimeBase):
+    teacher_d2h_batch_tokens = 16
+
     def test_eager_pd_handoff_and_failure_exclusion(self):
         self.exercise(replay=False)
 

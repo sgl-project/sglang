@@ -32,6 +32,7 @@ class HostSlot(msgspec.Struct, eq=False):
     state: str = "free"
     device_storage: torch.Tensor | None = None
     device_tensors: dict[str, torch.Tensor] | None = None
+    teacher_device_tensors: dict[str, torch.Tensor] | None = None
 
 
 class HostBufferPool:
@@ -53,13 +54,17 @@ class HostBufferPool:
         pin_memory: bool = True,
         device: torch.device | None = None,
         kv_d2h_batch_tokens: int = 1,
+        teacher_d2h_batch_tokens: int = 1,
         max_device_bytes: int = 0,
         partition: CapturePartition | None = None,
     ):
         if min(max_tokens, slots, max_bytes, manifest_bytes) <= 0:
             raise ValueError("Host pool sizes must be positive")
-        if kv_d2h_batch_tokens < 1 or max_device_bytes < 0:
-            raise ValueError("invalid KV staging limits")
+        if (
+            min(kv_d2h_batch_tokens, teacher_d2h_batch_tokens) < 1
+            or max_device_bytes < 0
+        ):
+            raise ValueError("invalid device staging limits")
         layers = kv.layers if partition is None else partition.local_layers(kv)
         include_aux = partition is None or partition.include_aux
         if partition is not None and not partition.active:
@@ -92,11 +97,25 @@ class HostBufferPool:
             )
         device_layout = {}
         device_bytes = 0
-        if kv_d2h_batch_tokens > 1 and kv_names:
+        staging_groups = (
+            (kv_names, kv_d2h_batch_tokens, "KV"),
+            (
+                (
+                    ["teacher_topk_ids", "teacher_topk_logits", "teacher_logsumexp"]
+                    if include_aux
+                    else []
+                ),
+                teacher_d2h_batch_tokens,
+                "teacher",
+            ),
+        )
+        for names, batch_tokens, label in staging_groups:
+            if batch_tokens <= 1 or not names:
+                continue
             if device is None or not max_device_bytes:
-                raise ValueError("KV staging requires a device and a byte budget")
-            capacity = min(kv_d2h_batch_tokens, max_tokens)
-            for name in kv_names:
+                raise ValueError(f"{label} staging requires a device and a byte budget")
+            capacity = min(batch_tokens, max_tokens)
+            for name in names:
                 dtype, shape = specs[name]
                 shape = [capacity, *shape[1:]]
                 device_bytes = (device_bytes + 63) // 64 * 64
@@ -105,7 +124,7 @@ class HostBufferPool:
                 device_bytes += length
             if device_bytes * slots > max_device_bytes:
                 raise ValueError(
-                    f"KV staging requires {device_bytes * slots} bytes, "
+                    f"{label} staging requires {device_bytes * slots} bytes, "
                     f"budget is {max_device_bytes}"
                 )
         self.registrar = registrar
@@ -131,12 +150,22 @@ class HostBufferPool:
                     slot.device_storage = torch.empty(
                         device_bytes, dtype=torch.uint8, device=device
                     )
-                    slot.device_tensors = {
+                    device_views = {
                         name: slot.device_storage[start : start + length]
                         .view(DTYPES[dtype])
                         .reshape(shape)
                         for name, (start, length, dtype, shape) in device_layout.items()
                     }
+                    slot.device_tensors = {
+                        name: value
+                        for name, value in device_views.items()
+                        if name in kv_names
+                    } or None
+                    slot.teacher_device_tensors = {
+                        name: value
+                        for name, value in device_views.items()
+                        if name not in kv_names
+                    } or None
                 self.registrar.register(storage)
                 self.slots.append(slot)
                 self.allocated_bytes += slot_bytes

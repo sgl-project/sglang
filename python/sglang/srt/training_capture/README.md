@@ -217,6 +217,11 @@ The dashboard plots scheduler quantiles/budgets separately from serving histogra
 - `HostBufferPool` allocates fixed-capacity registered arenas once. Admission
   fails when all slots are held. A slot is reusable only after D2H and all Store
   calls finish. An uncertain transfer quarantines the slot.
+- `teacher_d2h_batch_tokens` opts into request-owned compact teacher staging.
+  Its default is one (direct D2H). Larger values require `max_device_bytes`,
+  shared with KV staging across all local slots. The aux owner alone allocates
+  these buffers; CPU P/D handoff rows remain on Host. Seal flushes pending rows
+  on their producer stream before publication; abort discards unpublished tails.
 - `build_snapshot` runs only after D2H completion. It retains the final partial
   chunk and produces request-owned objects, including tokens and masks. It
   never aliases or modifies a shared HiCache page.
@@ -403,7 +408,8 @@ An inactive partition is explicit (`active=False`); it is excluded from the
 manifest's owners and must skip payload allocation/export. Passing it to a Host
 pool fails, while `partition=None` retains the full single-owner behavior.
 Inactive ranks must still participate in the future distributed control and
-collective protocol. An aux-only owner allocates no KV/device staging and must
+collective protocol. An aux-only owner allocates no KV staging, may allocate
+teacher staging when `teacher_d2h_batch_tokens > 1`, and must
 skip construction of a KV exporter. Non-aux owners allocate no aux or manifest
 capacity. Host and device budgets are enforced independently per rank.
 

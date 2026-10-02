@@ -39,6 +39,10 @@ def summarize(path):
                     "d2h_us": 0.0,
                     "d2h_bytes": 0,
                     "d2h_events_missing_bytes": 0,
+                    "d2d_calls": 0,
+                    "d2d_us": 0.0,
+                    "d2d_bytes": 0,
+                    "d2d_events_missing_bytes": 0,
                     "kernels": {},
                 },
             )
@@ -84,18 +88,20 @@ def summarize(path):
             kernel["calls"] += 1
             kernel["us"] += event["dur"]
         elif event.get("cat") == "gpu_memcpy" and event["name"].startswith(
-            "Memcpy DtoH"
+            ("Memcpy DtoH", "Memcpy DtoD")
         ):
-            group["d2h_calls"] += 1
-            group["d2h_us"] += event["dur"]
+            kind = "d2h" if event["name"].startswith("Memcpy DtoH") else "d2d"
+            group[kind + "_calls"] += 1
+            group[kind + "_us"] += event["dur"]
             size = event["args"].get("bytes")
             if not isinstance(size, (int, float)) or size < 0:
-                group["d2h_events_missing_bytes"] += 1
+                group[kind + "_events_missing_bytes"] += 1
             else:
-                group["d2h_bytes"] += size
+                group[kind + "_bytes"] += size
     for group in groups.values():
-        if group["d2h_events_missing_bytes"]:
-            group["d2h_bytes"] = None
+        for kind in ("d2h", "d2d"):
+            if group[kind + "_events_missing_bytes"]:
+                group[kind + "_bytes"] = None
     return {
         "trace": str(path),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -112,6 +118,13 @@ def summarize(path):
             if event.get("cat") == "gpu_memcpy"
             and event.get("ph") == "X"
             and event["name"].startswith("Memcpy DtoH")
+        ),
+        "all_d2d_us": sum(
+            event["dur"]
+            for event in events
+            if event.get("cat") == "gpu_memcpy"
+            and event.get("ph") == "X"
+            and event["name"].startswith("Memcpy DtoD")
         ),
     }
 

@@ -116,6 +116,7 @@ class TestTrainingCaptureRuntime(CustomTestCase):
             max_inflight_samples=4,
             max_host_bytes=64 << 20,
             kv_d2h_batch_tokens=16,
+            teacher_d2h_batch_tokens=16,
             max_device_bytes=8 << 20,
             storage_chunk_tokens=64,
             http_timeout_seconds=2.0,

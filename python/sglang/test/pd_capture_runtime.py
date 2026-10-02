@@ -48,6 +48,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
     decode_host = "127.0.0.1"
     transfer_protocol = "tcp"
     ib_device = None
+    teacher_d2h_batch_tokens = 1
 
     def new_bootstrap_port(self):
         return free_port(self.prefill_host)
@@ -148,6 +149,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
             "max_inflight_samples": 4,
             "max_host_bytes": 64 << 20,
             "kv_d2h_batch_tokens": 16,
+            "teacher_d2h_batch_tokens": self.teacher_d2h_batch_tokens,
             "max_device_bytes": 8 << 20,
             "storage_chunk_tokens": 64,
             "http_timeout_seconds": 2.0,

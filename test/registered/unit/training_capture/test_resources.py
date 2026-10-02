@@ -12,6 +12,7 @@ import weakref
 from contextlib import ExitStack
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
@@ -223,9 +224,9 @@ def resource_worker(rank, root):
                     row = {
                         "case": case,
                         "phase": "ready",
-                        "names": sorted(value.pool.slots[0].tensors)
-                        if value.pool
-                        else [],
+                        "names": (
+                            sorted(value.pool.slots[0].tensors) if value.pool else []
+                        ),
                         "journal": value.journal is not None,
                     }
                     value.close()
@@ -262,6 +263,45 @@ def resource_worker(rank, root):
 
 
 class TestCaptureResources(CustomTestCase):
+    def test_aux_only_rank_allocates_teacher_staging_on_source_device(self):
+        kv = make_kv_spec()
+        layout = plan_capture_layout(kv, tp_size=2, pp_layer_ranges=[(0, 4), (4, 6)])
+        partition = next(part for part in layout.partitions if part.include_aux)
+        self.assertFalse(partition.heads)
+        with tempfile.TemporaryDirectory() as root:
+            config = msgspec.structs.replace(
+                resource_config(root),
+                teacher_d2h_batch_tokens=3,
+                max_device_bytes=1 << 20,
+            )
+            store = MooncakeSnapshotStore(BufferStore(), FakeReplicateConfig())
+            with patch(
+                "sglang.srt.training_capture.resources.MooncakeSnapshotStore.connect",
+                return_value=store,
+            ):
+                resources = CaptureResources.prepare(
+                    config=config,
+                    kv=kv,
+                    partition=partition,
+                    source_pool=SimpleNamespace(device="cpu"),
+                    pin_memory=False,
+                )
+            try:
+                self.assertIsNone(resources.exporter)
+                self.assertGreater(resources.pool.device_allocated_bytes, 0)
+                for slot in resources.pool.slots:
+                    self.assertIsNone(slot.device_tensors)
+                    self.assertEqual(
+                        set(slot.teacher_device_tensors),
+                        {
+                            "teacher_topk_ids",
+                            "teacher_topk_logits",
+                            "teacher_logsumexp",
+                        },
+                    )
+            finally:
+                resources.close()
+
     @unittest.skipUnless(
         dist.is_available() and dist.is_gloo_available(), "Gloo required"
     )

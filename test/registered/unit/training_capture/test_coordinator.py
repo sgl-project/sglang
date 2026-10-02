@@ -66,6 +66,7 @@ class TestCaptureCoordinator(CustomTestCase):
             max_inflight_samples=1,
             max_host_bytes=2 << 20,
             kv_d2h_batch_tokens=self.kv_d2h_batch_tokens,
+            teacher_d2h_batch_tokens=self.kv_d2h_batch_tokens,
             max_device_bytes=1 << 20 if self.kv_d2h_batch_tokens > 1 else 0,
             sample_ratio=1.0,
         )
