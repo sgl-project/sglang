@@ -56,16 +56,13 @@ const BOS_FLAG_CLASSES: [&str; 7] = [
 /// Token ids SGLang's `tokenizer(text)` puts around a prompt and [`encode`]
 /// leaves out: BOS per `add_bos_token` (default true) for [`BOS_FLAG_CLASSES`],
 /// else the tokenizer.json post-processor's. Tiktoken models add none.
-pub fn prompt_affixes(source: &str) -> Result<(Vec<u32>, Vec<u32>)> {
+pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<(Vec<u32>, Vec<u32>)> {
     let path = resolve(source)?;
     if !path.ends_with(".json") {
         return Ok(Default::default());
     }
-    let config: serde_json::Value = Path::new(&path)
-        .parent()
-        .and_then(|dir| std::fs::read_to_string(dir.join("tokenizer_config.json")).ok())
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
+    // Through `files`, which downloads it: a cold HF cache holds only tokenizer.json.
+    let config = files.json("tokenizer_config.json")?.unwrap_or_default();
     let plain = create_tokenizer_from_file(&path)?;
     let ids = |t: &dyn traits::Tokenizer, text: &str| -> Result<Vec<u32>> {
         Ok(t.encode(text)?.token_ids().to_vec())
@@ -362,8 +359,9 @@ impl ModelFiles {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(repo = %self.source, %file, error = %format!("{e:#}"),
-                            "could not download; chat-formatter detection may be degraded for this \
-                             model (check HF_TOKEN / network for a gated or private repo)");
+                            "could not download; chat-formatter detection and prompt special \
+                             tokens may be degraded for this model (check HF_TOKEN / network for \
+                             a gated or private repo)");
                         return None;
                     }
                 }
@@ -458,7 +456,7 @@ mod model_files_tests {
 
 #[cfg(test)]
 mod prompt_affix_tests {
-    use super::prompt_affixes;
+    use super::{prompt_affixes, ModelFiles};
     use serde_json::{json, Value};
 
     #[test]
@@ -488,8 +486,9 @@ mod prompt_affix_tests {
                 std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string())
                     .unwrap();
             }
+            let path = path.to_str().unwrap();
             assert_eq!(
-                prompt_affixes(path.to_str().unwrap()).unwrap(),
+                prompt_affixes(path, &ModelFiles::open(path)).unwrap(),
                 (prefix, vec![])
             );
         }

@@ -90,13 +90,14 @@ impl TokenizerRegistry {
             "tokenizer loaded");
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
-        me.prompt_affixes = adapter::prompt_affixes(tokenizer_path)
+        let files = adapter::ModelFiles::open(tokenizer_path);
+        me.prompt_affixes = adapter::prompt_affixes(tokenizer_path, &files)
             .map_err(|e| {
                 tracing::warn!(model = %m.id, error = %format!("{e:#}"),
                     "cannot match the engine's special tokens; /generate forwards text")
             })
             .ok();
-        match ChatFormatter::load(&m.id, tokenizer_path) {
+        match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
                 let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
                 me.formatters
