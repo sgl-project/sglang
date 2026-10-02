@@ -74,7 +74,10 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
-from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    create_tree_core,
+    select_tree_core_backend,
+)
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
@@ -204,7 +207,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
-        self._tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+        self._tree_core_backend = select_tree_core_backend(params)
         self.tree_core = create_tree_core(
             name=self._tree_core_backend,
             params=params,
@@ -310,15 +313,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
-    def _barrier_attn_groups(self):
-        waited = False
-        for group in (self.attn_cp_group, self.attn_tp_group):
-            if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.barrier(group=group)
-                waited = True
-        if not waited and self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
-
     def _drain_async_work(self):
         """
         Block until all outstanding async sends are consumed, then clear.
@@ -355,7 +349,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 data,
                 group_src=self.pp_rank - 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=P2PTag.HICACHE_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
@@ -363,7 +357,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 copy_of_data,
                 group_dst=self.pp_rank + 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=P2PTag.HICACHE_PP_SYNC,
             )
             self.work_list.append(send_work)
 
@@ -761,6 +755,35 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> tuple[Optional[NodeId], bool]:
         """Advance the eviction walk one node, consuming its step result."""
         result = self.tree_core.evict_device_next_node(component_type, tracker)
+        if result.mamba_backup_node_id is not None:
+            assert component_type == ComponentType.MAMBA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
+            )
+            # Reserve a host state slot and wait for the backup acknowledgment
+            # before freeing device state. If allocation fails, eviction still
+            # proceeds to make room on the device.
+            node_id = result.mamba_backup_node_id
+            mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
+            if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
+                self.evict_host(1, ComponentType.MAMBA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_mamba_state_eviction(node_id)
+        elif result.swa_backup_node_id is not None:
+            assert component_type == ComponentType.SWA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
+            )
+            # The backup can cover several unbacked SWA segments. Reserve host
+            # space for the whole window before copying it, then resume eviction
+            # even if host allocation fails.
+            node_id = result.swa_backup_node_id
+            needed = result.swa_backup_num_tokens
+            swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
+            if swa_host_pool is not None and swa_host_pool.available_size() < needed:
+                self.evict_host(needed, ComponentType.SWA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_swa_state_eviction(node_id)
         self._free_values(result.device_frees, result.host_frees)
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
@@ -892,8 +915,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _tracks_write_through_unbacked_evictions(self) -> bool:
         return (
-            isinstance(self.tree_core, UnifiedTreeCore)
-            and self.host_memory_mode == "cache"
+            self.host_memory_mode == "cache"
             and self.cache_controller is not None
             and self.cache_controller.write_policy == "write_through"
         )
@@ -936,6 +958,11 @@ class UnifiedRadixCache(BasePrefixCache):
         receipt its acquire returned, so it never drops a lock it never took."""
         self.dec_lock_ref(req.last_node, req.lock_receipt, skip_swa=skip_swa)
 
+    def unpin(self, req: Req) -> None:
+        # Synthetic profiling requests may own KV without locking a tree node.
+        if req.last_node is not None:
+            self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -958,10 +985,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
-    @rank_consensus(same_params=["req.rid", "is_insert", "owned_kv_len"])
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
-    ) -> None:
+    def claim_kv_row(self, req: Req) -> bool:
         # Retraction also enters here: retain its ticket until actual finish.
         if (
             self.cache_controller is not None
@@ -969,160 +993,32 @@ class UnifiedRadixCache(BasePrefixCache):
             and req.finished()
         ):
             self.cache_controller.release_pp_prefetch(req.rid)
-        if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+        return self.session.try_cache_finished_req(req)
+
+    @rank_consensus(same_params=["req.rid", "inserted"])
+    def on_release(self, req: Req, *, inserted: bool) -> None:
+        if inserted:
             return
-
-        if self.disable:
-            self.free_kv_row(req.kv, [(0, owned_kv_len)])
-            for comp in self._components_tuple:
-                comp.cleanup_after_caching_req(req, is_finished=True)
-            return
-
-        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :owned_kv_len
-        ]
-
-        result = None
-        insert_params = None
-
-        if is_insert:
-            insert_params = InsertParams(
-                prev_prefix_len=req.kv.cache_protected_len,
-                priority=getattr(req, "priority", 0) or 0,
-                session_id=req.session_id,
-                rotation_base=req.kv_rotation_base,
-            )
-
-            # components prepare insert data + return effective cache_len
-            effective_cache_len = len(token_ids)
-            for comp in self._components_tuple:
-                cl = comp.prepare_for_caching_req(
-                    req=req,
-                    insert_params=insert_params,
-                    token_ids_len=len(token_ids),
-                    is_finished=True,
-                )
-                if cl is not None:
-                    effective_cache_len = min(effective_cache_len, cl)
-            for comp in self._components_tuple:
-                effective_cache_len = comp.floor_cache_len(effective_cache_len)
-
-            # Truncate if needed; the tail free is deferred and batched with
-            # the unaligned tail below so a shared boundary page is emitted once.
-            kv_indices_full = kv_indices
-            tail_free_start = None
-            if effective_cache_len < len(token_ids):
-                tail_free_start = max(effective_cache_len, req.kv.cache_protected_len)
-                token_ids = token_ids[:effective_cache_len]
-                kv_indices = kv_indices[:effective_cache_len]
-
-            radix_key = RadixKey(
-                token_ids,
-                req.extra_key,
-                is_bigram=self.tree_core.is_eagle,
-                cache_salt=req.cache_salt,
-            ).page_aligned(self.page_size)
-            page_aligned_len = len(radix_key)
-            values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
-
-            insert_params.key = radix_key
-            insert_params.value = values
-            result = self.insert(insert_params)
-
-            # Keep the prompt as an independent radix node. Finished requests
-            # append a short, request-specific output to a much longer prompt;
-            # without this split the prompt and output form one leaf and are
-            # evicted together. Re-inserting the prompt only changes topology:
-            # prev_prefix_len prevents the overlapping KV indices from being
-            # treated as duplicate allocations and freed. A declined rotation
-            # tail releases everything past the protected prefix below, so the
-            # split is skipped there rather than handing the tree rows that
-            # are about to be freed.
-            prompt_key = RadixKey(
-                req.origin_input_ids,
-                req.extra_key,
-                is_bigram=self.tree_core.is_eagle,
-                cache_salt=req.cache_salt,
-            ).page_aligned(self.page_size)
-            if (
-                not result.rotation_tail_declined
-                and len(self._components_tuple) == 1
-                and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
-                and 0 < len(prompt_key) < len(radix_key)
-            ):
-                self.insert(
-                    replace(
-                        insert_params,
-                        key=prompt_key,
-                        value=values[: len(prompt_key)],
-                        prev_prefix_len=len(prompt_key),
-                        priority=insert_params.priority + 1,
-                        # Topology-only re-insert: the request itself created
-                        # these nodes moments ago, so counting it as a hit is
-                        # the same self-referencing inflation `chunked` exists
-                        # to suppress. hit_count drives eviction order, so an
-                        # extra bump here would silently promote every prompt
-                        # node into the protected segment.
-                        chunked=True,
-                    )
-                )
-
-            # Free unaligned tail (+ deferred truncation tail). A rotation
-            # decline inserted nothing, so the whole span past the protected
-            # prefix stayed request-owned and is released here instead.
-            free_from = (
-                # min(): the protected prefix can already run past a truncated
-                # cache_len, and free_kv_row takes ascending ranges only.
-                min(req.kv.cache_protected_len, len(kv_indices))
-                if result.rotation_tail_declined
-                else page_aligned_len
-            )
-            ranges = [(free_from, len(kv_indices))]
-            if tail_free_start is not None:
-                if free_from < len(kv_indices) and tail_free_start <= len(kv_indices):
-                    # The two halves touch at the truncation boundary and share
-                    # that page; free the union as one range.
-                    ranges[0] = (free_from, len(kv_indices_full))
-                else:
-                    ranges.append((tail_free_start, len(kv_indices_full)))
-            self.free_kv_row(req.kv, ranges)
-        else:
-            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-
-        # Synthetic profiling requests may own KV without locking a tree node.
-        if req.last_node is not None:
-            self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
-
-        if is_insert and result is not None and result.last_device_node is not None:
-            req.last_node = result.last_device_node
-
-        # cleanup
         for comp in self._components_tuple:
-            comp.cleanup_after_caching_req(
-                req, is_finished=True, insert_result=result, insert_params=insert_params
-            )
+            comp.cleanup_after_caching_req(req, is_finished=True)
 
-        if self.enable_session_radix_cache and result is not None:
-            from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
-            if req.finished_reason is not None and not isinstance(
-                req.finished_reason, FINISH_ABORT
-            ):
-                self.session_refs.register_session_ref(req)
-
-    @rank_consensus(same_params=["req.rid", "chunked"])
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
+    @rank_consensus(same_params=["req.rid", "up_to"])
+    def insert_req(self, req: Req, *, up_to: int, **kwargs) -> None:
+        if self.session.try_insert_req(req, up_to=up_to, **kwargs):
             return
-
-        token_ids = req.get_fill_ids()
+        # A finished request hands its component state (mamba) to the tree
+        # instead of forking it, and the tree frees what the request still held.
+        is_finished = req.finished()
+        token_ids = req.full_untruncated_fill_ids[:up_to]
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, : len(token_ids)
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            if is_finished:
+                for comp in self._components_tuple:
+                    comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
@@ -1132,8 +1028,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
-            chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+            inserted_len=req.kv.cache_inserted_len,
+            priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
@@ -1143,7 +1039,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req=req,
                 insert_params=insert_params,
                 token_ids_len=len(token_ids),
-                is_finished=False,
+                is_finished=is_finished,
             )
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
@@ -1158,7 +1054,10 @@ class UnifiedRadixCache(BasePrefixCache):
             cache_salt=req.cache_salt,
         )
 
-        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+        if (
+            not is_finished
+            and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
+        ):
             # The frontier lands a page below page_floor(pre_len + 1), which has to
             # be where the insert stops, or the leaf it creates keeps less than a
             # sliding window of live SWA and the match after the insert rejects it.
@@ -1171,7 +1070,7 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
-                    req, is_finished=False, insert_params=insert_params
+                    req, is_finished=is_finished, insert_params=insert_params
                 )
             return
 
@@ -1193,14 +1092,40 @@ class UnifiedRadixCache(BasePrefixCache):
             # gather contract forbids -- keep the request entirely on its own
             # pages: no dedup free, no rebind, no protection change. The insert
             # declined before its walk, so nothing was freed underneath us. The
-            # final cache_finished_req releases everything past the protected
+            # release_kv_cache releases everything past the protected
             # prefix.
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
-                    req, is_finished=False, insert_params=insert_params
+                    req, is_finished=is_finished, insert_params=insert_params
                 )
             return
+        req.kv.cache_inserted_len = max(req.kv.cache_inserted_len, page_aligned_len)
+
+        # Split the leaf at the prompt boundary so eviction can drop the output
+        # KV without the prompt. prev_prefix_len keeps the overlapping indices
+        # from being freed as duplicates.
+        prompt_key = RadixKey(
+            req.origin_input_ids,
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        if (
+            len(self._components_tuple) == 1
+            and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
+            and 0 < len(prompt_key) < len(radix_key)
+        ):
+            self.insert(
+                replace(
+                    insert_params,
+                    key=prompt_key,
+                    value=values[: len(prompt_key)],
+                    prev_prefix_len=len(prompt_key),
+                    inserted_len=len(prompt_key),
+                    priority=insert_params.priority + 1,
+                )
+            )
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
@@ -1253,9 +1178,56 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req,
-                is_finished=False,
+                is_finished=is_finished,
                 insert_result=result,
                 insert_params=insert_params,
+            )
+
+        if self.enable_session_radix_cache and is_finished:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            if not isinstance(req.finished_reason, FINISH_ABORT):
+                self.session_refs.register_session_ref(
+                    req, leaf=result.last_device_node
+                )
+
+    @rank_consensus(same_params=["req.rid"])
+    def advance_unpublished_req(self, req: Req) -> None:
+        assert not self.supports_mamba()
+        token_ids = req.get_fill_ids()
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : len(token_ids)
+        ]
+        insert_params = InsertParams(
+            prev_prefix_len=req.kv.cache_protected_len,
+            priority=req.priority or 0,
+            rotation_base=req.kv_rotation_base,
+        )
+        effective_cache_len = len(token_ids)
+        for comp in self._components_tuple:
+            cache_len = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=len(token_ids),
+                is_finished=False,
+            )
+            if cache_len is not None:
+                effective_cache_len = min(effective_cache_len, cache_len)
+
+        radix_key = RadixKey(
+            token_ids[:effective_cache_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        )
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            for comp in self._components_tuple:
+                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(
+                req, is_finished=False, insert_params=insert_params
             )
 
     # ---- Internal Helpers ----
@@ -1438,26 +1410,19 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return self.evict_host(num_tokens)
 
-    def retraction_backup(self, req: Req) -> Optional[RetractionBackup]:
+    def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
         assert req.seqlen > 1
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
-        host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            self._reclaim_retraction_host(len(device_indices))
-            host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            return None
-
-        resolved = self.host_pool_group.resolve_host_transfers(
+        allocation = self.cache_controller.allocate_host_transfers(
+            device_indices,
             extra_transfers or None,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
+            reclaim=self._reclaim_retraction_host,
         )
-        if resolved is None and extra_transfers:
-            self.host_pool_group.free(host_indices)
+        if allocation is None:
             return None
+        host_indices, resolved = allocation
 
         backup = RetractionBackup(
             host_indices=host_indices,
@@ -1481,11 +1446,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             completion.finish_event.synchronize()
         except Exception:
-            self.retraction_discard(backup)
+            self.discard_kv_cache_backup(backup)
             raise
         return backup
 
-    def retraction_restore(self, req: Req, backup: RetractionBackup) -> None:
+    def restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1530,9 +1495,9 @@ class UnifiedRadixCache(BasePrefixCache):
             transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
         )
         completion.finish_event.synchronize()
-        self.retraction_discard(backup)
+        self.discard_kv_cache_backup(backup)
 
-    def retraction_discard(self, backup: RetractionBackup) -> None:
+    def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
         self.host_pool_group.free(backup.host_indices)
         self.host_pool_group.release_transfers(backup.pool_transfers)
 
@@ -1544,6 +1509,10 @@ class UnifiedRadixCache(BasePrefixCache):
         loop runs for leaves, reusable by component evictors ahead of an
         internal-state tombstone. Returns True once the backup is committed.
         """
+        # An auxiliary backup may already cover this node under another ack.
+        # Finish it before building a new transfer and claiming ack ownership.
+        if self.ongoing_write_through:
+            self.writing_check(write_back=True)
         written = self._execute_and_commit_kv_backup(
             BackupKV(node_ids=[node_id]), write_back=True
         )
@@ -1611,11 +1580,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
         kv_tokens = len(device_value)
-        host_avail = self.cache_controller.mem_pool_host.available_size()
-        if host_avail < kv_tokens:
-            needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
-                return None
+        anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
+        if (
+            anchor_entry.host_pool.shared_allocation_domain is None
+            or anchor_entry.host_evict_fn is None
+        ):
+            host_avail = self.cache_controller.mem_pool_host.available_size()
+            if host_avail < kv_tokens:
+                needed = kv_tokens - host_avail
+                if self.evict_host(needed) < needed:
+                    return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         # Defer submission so the next flush can merge pending node backups.
@@ -2511,6 +2485,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 unfulfilled, reason
             )
 
+    def _settle_storage_prefetch_hit(
+        self, request: CacheRequestHandle, credited_tokens: int
+    ) -> None:
+        """At buffer-mode admission, hit tokens not credited to storage were
+        covered by the device's joint match; the rest resolve at the fill ack."""
+        remaining = self._storage_prefetch_hit_remaining_by_reqid.get(request)
+        if remaining is not None:
+            self._resolve_storage_prefetch_tokens(
+                request, remaining - credited_tokens, reason="device_covered"
+            )
+
     def finish_storage_prefetch_admission(
         self, request: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
@@ -2727,9 +2712,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.ongoing_prefetch[request] = info
         self.cache_controller.trim_prefetch_full_head(operation, trim_tokens)
-        self._resolve_storage_prefetch_tokens(
-            request, trim_tokens, reason="device_covered"
-        )
+        # Labeled at admission: FULL reusable only with the fetched aux tail is a
+        # storage hit there, not device_covered.
         return info, hit_tokens - trim_tokens, original_hit_tokens
 
     def revoke_pending_prefetch(self, request: CacheRequestHandle) -> None:
@@ -3475,25 +3459,19 @@ class UnifiedRadixCache(BasePrefixCache):
         return 0
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
-        """Return True after the local load-back event is complete.
-
-        Mirrors ``HiRadixCache`` so the disagg decode restore state machine
-        (``DecodeHiCacheTransferMixin``) can gate on load-back completion; the
-        controller-level ``layer_done_counter`` event is shared across cache
-        implementations, while the tree-side bookkeeping runs in
-        ``loading_check``.
-        """
+        """Return True after this rank's load-back event is complete."""
         if consumer_index < 0 or self.cache_controller is None:
             return True
 
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
-            return False
+        return finish_event.query()
 
-        self.loading_check()
-        return True
+    def has_free_load_back_slot(self) -> bool:
+        """Acks are reaped in lockstep, so every rank agrees on this."""
+        cc = self.cache_controller
+        return len(cc.ack_load_queue) < cc.layer_done_counter.num_counters
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.

@@ -356,3 +356,38 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
 
 
 __all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+        FastH3SamplingParams,
+        MiniMaxH3SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=MiniMaxH3SamplingParams,
+        pipeline_config_cls=MiniMaxH3PipelineConfig,
+        hf_model_paths=[
+            "MiniMaxAI/MiniMax-H3",
+            "MiniMax/MiniMax-H3",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+                and "vdn" not in model_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=FastH3SamplingParams,
+        pipeline_config_cls=FastH3PipelineConfig,
+        hf_model_paths=[
+            "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "fasth3" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )

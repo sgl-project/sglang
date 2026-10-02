@@ -86,3 +86,17 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
 
     def preprocess_condition_image(self, image, **kwargs):
         return image
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.qwenimage21 import (
+        QwenImage21SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=QwenImage21SamplingParams,
+        pipeline_config_cls=QwenImage21PipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-2.1"],
+        model_detectors=[lambda hf_id: "qwen-image-2.1" in hf_id.lower()],
+    )

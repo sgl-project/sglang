@@ -10,6 +10,7 @@ class ComponentType(int, Enum):
     SWA = 1
     MAMBA = 2
     C128 = 3
+    AUXILIARY_SWA = 4
 
     def __str__(self) -> str:  # keep human-readable logging
         return self.name.lower()

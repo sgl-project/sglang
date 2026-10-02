@@ -786,18 +786,6 @@ class UnoWorkerV2(BaseSpecWorker):
             f"UNO expected an EXTEND or DECODE batch, got {batch.forward_mode}."
         )
 
-    def update_weights_from_disk(self, recv_req):
-        # The scheduler updates the target worker before calling the spec worker.
-        return True, "UNO has no separate draft weights."
-
-    def update_weights_from_ipc(self, recv_req):
-        # The scheduler updates the target worker before calling the spec worker.
-        return True, "UNO has no separate draft weights."
-
-    def update_weights_from_tensor(self, recv_req):
-        # This update route selects the spec worker instead of updating both.
-        return self.target_worker.update_weights_from_tensor(recv_req)
-
     @contextlib.contextmanager
     def _bind_uno_draft_runtime(self):
         target_attn_backend = self.model_runner.attn_backend

@@ -1,11 +1,4 @@
-"""Config fields of the ``spec`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``spec`` bag, which is what ``get_spec()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``spec`` namespace."""
 
 from __future__ import annotations
 
@@ -46,6 +39,10 @@ class Spec(msgspec.Struct):
             aliases=["--speculative-draft-model"],
         ),
     ] = None
+    speculative_boundary_reduction: A[
+        Literal["ar", "rs", "rsv", "rs+rsv"],
+        Arg(no_cli=True, resolvable=True),
+    ] = "rs+rsv"
     speculative_draft_model_revision: A[
         Optional[str],
         "The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
