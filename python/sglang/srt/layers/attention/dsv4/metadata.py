@@ -66,7 +66,8 @@ Some other notes:
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
 # DeepGEMM's paged-MQA metadata kernel cannot schedule more rows than this on
-# SM120 (shared-memory cap), so SM120 always splits larger batches.
+# SM120 (shared-memory cap), so SM120 always splits larger batches. The TileLang
+# and torch kernels take the same split, which keeps their logits within it too.
 _SM120_INDEXER_M_CHUNK = 4096
 
 
@@ -204,9 +205,16 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
+        use_deep_gemm_metadata = self.force_deep_gemm_metadata or not (
             is_hip() or is_xpu() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-        ) and not self.force_deep_gemm_metadata:
+        )
+        # The row plan bounds the logits, not the DeepGEMM schedule, so CUDA
+        # plans it whichever paged kernel scores the rows: the TileLang and torch
+        # kernels read no schedule and score each row independently. HIP and XPU
+        # keep their single call unless DeepGEMM metadata is forced.
+        if use_deep_gemm_metadata or not (is_hip() or is_xpu()):
+            self._plan_row_chunks()
+        if not use_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
@@ -226,22 +234,6 @@ class PagedIndexerMetadata:
             if compressed_seq_lens.dim() == 1:
                 compressed_seq_lens = compressed_seq_lens.unsqueeze(-1)
             num_rows = compressed_seq_lens.shape[0]
-            self.mqa_logits_budget_bytes = self._mqa_logits_budget(num_rows=num_rows)
-            self.rows_per_chunk = plan_indexer_row_chunks(
-                num_rows=num_rows,
-                num_cols=self.max_compressed_seq_len,
-                budget_bytes=self.mqa_logits_budget_bytes,
-                sm120_row_cap=_SM120_INDEXER_M_CHUNK if _IS_SM120 else None,
-            )
-            if self.rows_per_chunk is not None:
-                logger.debug(
-                    "DSV4 indexer chunks %d query rows x %d compressed cols into "
-                    "%d-row chunks (logits budget %s bytes)",
-                    num_rows,
-                    self.max_compressed_seq_len,
-                    self.rows_per_chunk,
-                    self.mqa_logits_budget_bytes,
-                )
             if self.row_chunk > 0:
                 self.deep_gemm_metadata = torch.stack(
                     [
@@ -294,6 +286,25 @@ class PagedIndexerMetadata:
             f"compress_ratio {self.compress_ratio} must divide page_size {self.page_size}"
         )
 
+    def _plan_row_chunks(self) -> None:
+        num_rows = self.compressed_seq_lens.shape[0]
+        self.mqa_logits_budget_bytes = self._mqa_logits_budget(num_rows=num_rows)
+        self.rows_per_chunk = plan_indexer_row_chunks(
+            num_rows=num_rows,
+            num_cols=self.max_compressed_seq_len,
+            budget_bytes=self.mqa_logits_budget_bytes,
+            sm120_row_cap=_SM120_INDEXER_M_CHUNK if _IS_SM120 else None,
+        )
+        if self.rows_per_chunk is not None:
+            logger.debug(
+                "DSV4 indexer chunks %d query rows x %d compressed cols into "
+                "%d-row chunks (logits budget %s bytes)",
+                num_rows,
+                self.max_compressed_seq_len,
+                self.rows_per_chunk,
+                self.mqa_logits_budget_bytes,
+            )
+
     def _mqa_logits_budget(self, *, num_rows: int) -> Optional[int]:
         """Free-memory budget for this forward's logits; None disables chunking.
 
@@ -327,6 +338,7 @@ class PagedIndexerMetadata:
 
     def row_chunks(self):
         num_rows = self.compressed_seq_lens.shape[0]
+        plans = self.deep_gemm_metadata
         if self.row_chunk > 0:
             rows_per_chunk = self.row_chunk
         elif isinstance(self.deep_gemm_metadata, list):
@@ -334,14 +346,17 @@ class PagedIndexerMetadata:
                 "chunked DeepGEMM metadata requires rows_per_chunk"
             )
             rows_per_chunk = self.rows_per_chunk
+        elif self.deep_gemm_metadata is None and self.rows_per_chunk is not None:
+            # Chunked without schedules (TileLang / torch kernels): the same rows
+            # as topk_metadata_chunks.
+            rows_per_chunk = self.rows_per_chunk
+            plans = [None] * -(-num_rows // rows_per_chunk)
         else:
             return [(slice(0, num_rows), self.deep_gemm_metadata)]
 
         chunks = [
             (slice(start, min(start + rows_per_chunk, num_rows)), plan)
-            for start, plan in zip(
-                range(0, num_rows, rows_per_chunk), self.deep_gemm_metadata
-            )
+            for start, plan in zip(range(0, num_rows, rows_per_chunk), plans)
         ]
         assert chunks and chunks[-1][0].stop == num_rows, (
             f"chunk schedules do not cover all rows: {num_rows=} {rows_per_chunk=} "

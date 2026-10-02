@@ -1039,7 +1039,7 @@ class C4IndexerBackendMixin:
 
             def run_paged_indexer(
                 rows: slice,
-                metadata: torch.Tensor,
+                metadata: Optional[torch.Tensor],
                 topk_plan: Optional[torch.Tensor] = None,
             ) -> None:
                 row_q = (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows]
@@ -1056,9 +1056,13 @@ class C4IndexerBackendMixin:
                 run_topk_transform(rows, logits, topk_plan)
 
             deep_gemm_metadata = indexer_metadata.deep_gemm_metadata
-            if isinstance(deep_gemm_metadata, list):
+            if isinstance(deep_gemm_metadata, list) or (
+                deep_gemm_metadata is None
+                and indexer_metadata.rows_per_chunk is not None
+            ):
                 # PagedIndexerMetadata split this forward into row chunks (SM120
-                # kernel cap and/or logits memory budget), one schedule each.
+                # kernel cap and/or logits memory budget): one DeepGEMM schedule
+                # each, or none for the TileLang and torch kernels.
                 num_rows = _c4sl.shape[0]
                 assert num_rows == indexer_metadata.compressed_seq_lens.shape[0], (
                     f"chunk schedules were built for "
@@ -1074,7 +1078,11 @@ class C4IndexerBackendMixin:
                 ):
                     run_paged_indexer(
                         rows,
-                        deep_gemm_metadata[chunk_idx],
+                        (
+                            deep_gemm_metadata[chunk_idx]
+                            if deep_gemm_metadata is not None
+                            else None
+                        ),
                         topk_plans[chunk_idx] if topk_plans is not None else None,
                     )
             else:
