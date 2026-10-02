@@ -39,6 +39,36 @@ pub enum WireProtocol {
     H2c,
 }
 
+/// Engine launch facts from `/server_info`; a bare [`WireProtocol`] means one DP rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineProfile {
+    pub protocol: WireProtocol,
+    /// `dp_size * attn_dp_size`; 0 is treated as 1.
+    pub dp_ranks: u32,
+}
+
+impl From<WireProtocol> for EngineProfile {
+    fn from(protocol: WireProtocol) -> Self {
+        Self {
+            protocol,
+            dp_ranks: 1,
+        }
+    }
+}
+
+/// Holds one router in-flight slot on a DP rank; see [`Worker::dp_rank_guard`].
+#[must_use = "dropping a DpRankGuard releases the rank slot"]
+pub struct DpRankGuard {
+    inflight: Arc<[AtomicUsize]>,
+    rank: usize,
+}
+
+impl Drop for DpRankGuard {
+    fn drop(&mut self) {
+        self.inflight[self.rank].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
 /// fallback chain: parse as-is, retry with `http://` prefix if missing,
 /// fall back to `"localhost"` if both fail. The fallback is defensive —
@@ -191,6 +221,8 @@ pub struct Worker {
     /// PD pairing scope; carried from `WorkerSpec`. See
     /// [`crate::discovery::WorkerSpec`].
     version_group: Option<String>,
+    /// Router in-flight requests per DP rank; one slot per rank.
+    dp_rank_inflight: Arc<[AtomicUsize]>,
 }
 
 impl Worker {
@@ -199,13 +231,14 @@ impl Worker {
     }
 
     /// Construct a worker with an explicit circuit-breaker configuration and
-    /// forwarding protocol. Pass `None` for the default breaker config
-    /// (threshold = 3, cool_down = 30 s).
+    /// engine profile (a bare [`WireProtocol`] means one DP rank). Pass `None`
+    /// for the default breaker config (threshold = 3, cool_down = 30 s).
     pub fn with_cb_config(
         spec: crate::discovery::WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
-        protocol: WireProtocol,
+        profile: impl Into<EngineProfile>,
     ) -> Self {
+        let EngineProfile { protocol, dp_ranks } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
             None => Arc::new(CircuitBreaker::new()),
@@ -226,6 +259,7 @@ impl Worker {
             bootstrap_port: spec.bootstrap_port,
             pooled_at: tokio::time::Instant::now(),
             version_group: spec.version_group,
+            dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
         }
     }
 
@@ -290,6 +324,23 @@ impl Worker {
         self.protocol
     }
 
+    pub fn dp_ranks(&self) -> u32 {
+        self.dp_rank_inflight.len() as u32
+    }
+
+    pub fn dp_rank_inflight(&self, rank: u32) -> usize {
+        self.dp_rank_inflight[rank as usize].load(Ordering::Relaxed)
+    }
+
+    pub fn dp_rank_guard(&self, rank: u32) -> DpRankGuard {
+        let rank = rank as usize;
+        self.dp_rank_inflight[rank].fetch_add(1, Ordering::Relaxed);
+        DpRankGuard {
+            inflight: Arc::clone(&self.dp_rank_inflight),
+            rank,
+        }
+    }
+
     pub fn router_inflight_load(&self) -> usize {
         self.active_requests.load(Ordering::Relaxed)
     }
@@ -339,6 +390,7 @@ impl std::fmt::Debug for Worker {
             .field("mode", &self.mode())
             .field("protocol", &self.protocol)
             .field("version_group", &self.version_group)
+            .field("dp_ranks", &self.dp_ranks())
             .field("router_inflight_load", &self.router_inflight_load())
             .finish()
     }
