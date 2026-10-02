@@ -9,10 +9,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.gemm.trtllm_lora_temp.kernel_utils import (
+from sglang.kernels.ops.lora.dense.trtllm_lora_temp.kernel_utils import (
     get_pdl_launch_metadata,
 )
-from sglang.kernels.ops.moe.virtual_experts import _align_block_size_large
+from sglang.kernels.ops.lora.moe.virtual_experts import _align_block_size_large
 from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
 
@@ -394,7 +394,7 @@ def _get_moe_lora_shrink_split_k(
     return max(1, min(triton.cdiv(target, base_grid), max_split_k, 8))
 
 
-# Rank-specialized LoRA-B expand kernel lives in lora/trtllm_lora_temp/.
+# Rank-specialized LoRA-B expand kernel lives in srt/lora/trtllm_lora_temp/.
 # Re-export so existing call sites (and any external imports) keep working.
 from sglang.srt.lora.trtllm_lora_temp.specialized_expand import (  # noqa: E402,F401
     _invoke_moe_lora_expand_add,
@@ -574,7 +574,7 @@ def _merged_experts_fused_moe_lora_add_impl(
             and bucket_experts + 1 <= 1024
             and topk_ids.shape[0] < 512
         ):
-            from sglang.kernels.ops.moe.trtllm_lora_temp.moe_lora_merged_align import (
+            from sglang.kernels.ops.lora.moe.trtllm_lora_temp.moe_lora_merged_align import (
                 moe_lora_merged_align,
             )
 

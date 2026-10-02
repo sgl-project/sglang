@@ -26,12 +26,20 @@ sglang/kernels/
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
 `diffusion`, `elementwise`, `embeddings`, `gemm`, `grammar`, `kv_canary`,
-`kvcache`, `layernorm`, `lplb`, `mamba`, `memory`, `mm`, `moe`, `quantization`,
-`sampling`, `speculative`.
+`kvcache`, `layernorm`, `lora`, `lplb`, `mamba`, `memory`, `mm`, `moe`,
+`quantization`, `sampling`, `speculative`.
 
 Place model-specific implementations and tuning data inside the corresponding
 logical operator group, rather than creating a model-specific top-level group
 under `ops/`.
+
+`lora` is an ownership group rather than a computation class: it holds the
+adapter-side kernels (`dense/` SGMV GEMMs and tuning data, `moe/` fused
+MoE-LoRA) that only the LoRA runtime in `srt/lora` calls, plus the experimental
+TRT-LLM LoRA path, kept whole as `dense/trtllm_lora_temp/` and
+`moe/trtllm_lora_temp/` (the latter includes the FlashInfer overlay and the
+flag-gated routing kernels that `srt/layers/moe/topk.py` reaches). Registry op
+ids keep the `gemm.` / `moe.` prefix of the computation they perform.
 
 As of the RFC #29630 finale (#32072) the legacy `sglang.jit_kernel` package has
 been **removed**: its shared build/runtime infra moved to `sglang.kernels.jit`

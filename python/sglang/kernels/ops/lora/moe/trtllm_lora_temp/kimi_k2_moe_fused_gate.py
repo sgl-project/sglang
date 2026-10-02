@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 def _jit_kimi_k2_moe_fused_gate_module() -> Module:
     return load_jit(
         "kimi_k2_moe_fused_gate",
-        cuda_files=["trtllm_lora_temp/kimi_k2_moe_fused_gate.cuh"],
+        cuda_files=["lora/trtllm_lora_temp/kimi_k2_moe_fused_gate.cuh"],
         cuda_wrappers=[
             ("kimi_k2_moe_fused_gate", "KimiK2MoEFusedGateKernel::run"),
         ],
