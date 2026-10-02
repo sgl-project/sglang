@@ -39,7 +39,7 @@ from sglang.kernels.ops.layernorm.mhc import mhc_post as _mhc_post_orig
 from sglang.kernels.ops.layernorm.mhc import mhc_pre as _mhc_pre_orig
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.configs.xing4_0 import Xing4_0Config
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
