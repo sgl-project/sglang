@@ -50,7 +50,12 @@ from sglang.srt.arg_groups.validation_hook import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hardware_backend.mps.runtime import validate_mps_runtime
-from sglang.srt.runtime_context import get_platform, publish
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    get_platform,
+    num_dp_ranks_of,
+    publish,
+)
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 
@@ -382,6 +387,15 @@ class ServerArgs:
             new_flag="--cuda-graph-backend-{decode,prefill}=disabled",
             help="Deprecated. Use --cuda-graph-backend-{decode,prefill}=disabled instead.",
         )
+        # `enable_dp_attention` is `no_cli=True` too; resolution turns it into
+        # `attn_dp_size`.
+        parser.add_argument(
+            "--enable-dp-attention",
+            action=DeprecatedStoreTrueAction,
+            new_flag="--attn-dp-size <dp-size>",
+            help="Deprecated. Use --attn-dp-size <dp-size> instead of "
+            "--dp-size <dp-size> --enable-dp-attention.",
+        )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
@@ -525,16 +539,15 @@ def resolve_encoder_transfer_backend(
     return "zmq_to_scheduler"
 
 
-def compute_world_size(
-    *, enable_dp_attention: bool, dp_size: int, tp_size: int, pp_size: int
-) -> int:
+def compute_world_size(*, dp_size: int, tp_size: int, pp_size: int) -> int:
     """Total GPU count across all data-parallel replicas.
 
-    Takes the values rather than a config object: the two sizes are the widths
+    Takes the values rather than a config object: the sizes are the widths
     the launch asked for, which the Ray driver needs before any process group
     exists, and passing a context would hand it the live groups instead.
+    Attention DP runs inside the TP group, so it adds no GPUs.
     """
-    return (1 if enable_dp_attention else dp_size) * tp_size * pp_size
+    return dp_size * tp_size * pp_size
 
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:
@@ -743,7 +756,7 @@ class PortArgs:
                 rank=int(server_args.decoupled_spec_rank),
             )
 
-        if not cfg.enable_dp_attention:
+        if not attn_dp_enabled_of(cfg):
             # Normal case, use IPC within a single node
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -769,12 +782,12 @@ class PortArgs:
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # Reserve port_base+0..NUM_DERIVED_PORTS-1 (6 fixed ports + dp_size
-            # rust-path slots); derive from server_args only (never dp_rank) so
+            # Reserve port_base+0..NUM_DERIVED_PORTS-1 (6 fixed ports + one
+            # rust-path slot per DP rank); derive from server_args only (never dp_rank) so
             # every init_new call agrees, decrementing below dist_init_port on
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
-            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + cfg.dp_size
+            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + num_dp_ranks_of(cfg)
             if ep_scale_joiner_of(resolving_view(server_args)):
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:

@@ -90,9 +90,11 @@ class Disagg(msgspec.Struct):
                 "Storage backend for KV preserved across PD decode retraction. "
                 "'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses "
                 "a reserved HiCache pool and does not fall back on exhaustion. "
+                "'none' keeps no backup: a retracted request is aborted with "
+                "503 for the client to retry. "
                 "If omitted, the backend is inferred from the decode KV pool."
             ),
-            choices=["cpu_tensor", "host_pool"],
+            choices=["cpu_tensor", "host_pool", "none"],
         ),
     ] = None
     num_reserved_decode_tokens: A[
