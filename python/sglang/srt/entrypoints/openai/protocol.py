@@ -331,7 +331,24 @@ def _migrate_deprecated_dp_rank(values: dict) -> dict:
     return values
 
 
-class CompletionRequest(BaseModel):
+class PDRoutingFields(BaseModel):
+    """PD and DP routing fields a router may inject into a request."""
+
+    # For PD disaggregation
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For DP routing -- external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg -- hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+
+    def pd_routing_kwargs(self) -> Dict[str, Any]:
+        return {name: getattr(self, name) for name in PDRoutingFields.model_fields}
+
+
+class CompletionRequest(PDRoutingFields):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str = Field(
@@ -384,15 +401,6 @@ class CompletionRequest(BaseModel):
 
     images_config: Optional[Dict] = None
 
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
@@ -847,7 +855,7 @@ def _has_message_level_tools(messages: Any) -> bool:
     )
 
 
-class ChatCompletionRequest(BaseModel):
+class ChatCompletionRequest(PDRoutingFields):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -965,15 +973,6 @@ class ChatCompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
@@ -1775,7 +1774,7 @@ ResponseInputOutputItem: TypeAlias = Union[
 ]
 
 
-class ResponsesRequest(BaseModel):
+class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
 
     # Core OpenAI API fields (ordered by official documentation)
@@ -1831,15 +1830,6 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 

@@ -174,7 +174,7 @@ class StreamingSession(BasePrefixCache):
         """Returns an active slot for this req, or None.
 
         Side effect: if req is pre-aborted (to_finish set, e.g. input too
-        long), detach it from the session so cache_finished_req treats it
+        long), detach it from the session so release_kv_cache treats it
         as a normal req. The slot stays intact for the next request.
         """
         if not _is_streaming(req):
@@ -325,25 +325,15 @@ class StreamingSession(BasePrefixCache):
 
         return True
 
-    def try_cache_unfinished_req(
-        self, req: Req, chunked: bool = False, **kwargs
-    ) -> bool:
-        """Handles a streaming-session mid-flight cache op:
-          - chunked prefill: snapshot current KV as prefix, skip radix
-          - subsequent turn: skip radix (slot already holds KV)
-        Returns False for first-turn non-chunked (caller must run raw radix
-        insert to set up the initial tree lock)."""
-        if not _is_streaming(req):
+    def try_insert_req(self, req: Req, *, up_to: int, **kwargs) -> bool:
+        """A first turn checkpoints into the tree like any request (its
+        prompt prefix is tree-owned and the slot inherits that lock); later
+        turns run on the slot's KV, so only the chunk cursor is kept."""
+        if not _is_streaming(req) or req.session.session_id not in self.slots:
             return False
-        if chunked:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, : req.extend_range.end
-            ]
-            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
-            return True
-        if req.session.session_id in self.slots:
-            return True
-        return False
+        kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :up_to]
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        return True
 
     # -- BasePrefixCache abstract methods: thin adapters over try_handle_* --
 
@@ -359,13 +349,10 @@ class StreamingSession(BasePrefixCache):
     def on_release(self, req: Req, *, inserted: bool) -> None:
         self.inner.on_release(req, inserted=inserted)
 
-    def cache_finished_req(self, req: Req, **kwargs):
-        self.inner.cache_finished_req(req, **kwargs)
-
-    def cache_unfinished_req(self, req: Req, **kwargs):
-        if self.try_cache_unfinished_req(req, **kwargs):
+    def insert_req(self, req: Req, **kwargs):
+        if self.try_insert_req(req, **kwargs):
             return
-        self.inner.cache_unfinished_req(req, **kwargs)
+        self.inner.insert_req(req, **kwargs)
 
     def unpin(self, req: Req) -> None:
         self.inner.unpin(req)
