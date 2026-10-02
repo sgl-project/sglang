@@ -129,6 +129,12 @@ _KEY_B = "fedcba9876543210"
             id="pp-spec",
         ),
         pytest.param(
+            {"sampling_backend": "token_oracle"},
+            {},
+            "sampling-backend token_oracle",
+            id="token-oracle-sampler",
+        ),
+        pytest.param(
             {},
             {"key_b": _KEY_B, "mixing_probability": 0.0},
             "strictly between 0 and 1",
@@ -267,6 +273,10 @@ def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):
     with pytest.raises(WatermarkConfigError) as error:
         load_watermark_config(str(config_path))
     assert secret not in str(error.value)
+
+    with pytest.raises(WatermarkConfigError) as error:
+        load_watermark_config(f'{{"key":"{secret}"')
+    assert error.value.__cause__ is None
 
     missing_path = tmp_path / "secret-config-name.json"
     with pytest.raises(WatermarkConfigError) as error:

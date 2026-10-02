@@ -333,7 +333,7 @@ A detector written from scratch instead of reusing this package must implement t
 | Decode retraction | Verified | Re-prefill restores the distinct-context history before generation resumes. |
 | Request abort and request-slot reuse | Verified | A later prefill resets ring-buffer and context-history state for the reused slot. |
 | Multimodal text generation | Verified | Qwen3-VL text tokens use the same watermark path after multimodal prefill. |
-| DP attention | Untested | The per-rank state path has not received a service-level DP-attention gate. |
+| DP attention | Verified | DP2/TP2 normal and NEXTN decoding were verified with Qwen3-8B on two H200 GPUs, including idle-rank batches. |
 | NGRAM speculative decoding | Verified | Draft-node contexts are reconstructed before verification sampling. |
 | EAGLE and EAGLE3 speculative decoding | Verified | Tree nodes use their own ancestor-derived contexts. |
 | NEXTN speculative decoding | Verified | NEXTN resolves to the EAGLE verification path. |
@@ -341,6 +341,7 @@ A detector written from scratch instead of reusing this package must implement t
 | Other speculative algorithms | Rejected | Startup validation fails closed. |
 | Speculative rejection sampling | Rejected | Startup validation fails closed. |
 | Custom logit processors | Rejected | Startup validation fails closed because processor ordering is not defined. |
+| Token-oracle sampling backend | Rejected | Startup validation fails closed because oracle-selected tokens bypass the watermark selector. |
 | Beam search | Rejected | Request validation rejects watermarked beam-search requests. |
 | Diffusion LLM | Rejected | Startup validation fails closed. |
 | PD disaggregation | Rejected | Startup validation fails closed because watermark state is not transferred between workers. |

@@ -73,6 +73,10 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError(
             "--enable-watermark is incompatible with --enable-custom-logit-processor"
         )
+    if cfg.sampling_backend == "token_oracle":
+        raise ValueError(
+            "--enable-watermark is incompatible with --sampling-backend token_oracle"
+        )
     if cfg.dllm_algorithm is not None:
         raise ValueError("--enable-watermark is not supported with diffusion LLM")
     if cfg.disaggregation_mode != "null":

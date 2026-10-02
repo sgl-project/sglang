@@ -54,7 +54,7 @@ Detection needs token IDs, the same key and context window, and preferably the e
 
 The detector scores each exact context tuple once. Runtime uses the 32-bit context hash for admission; a rare collision can only add an ordinary null term to detector scoring and dilute the signal. Without prompt IDs, positions whose initial context is unknown are skipped.
 
-Scoring uses the first `min(4,096, per-request token-pool capacity)` eligible distinct contexts. Later positions are ordinary samples after runtime reaches the same history budget, so including them would dilute the test. Entropy-gated and greedy positions are indistinguishable from ordinary samples and are also conservative null terms.
+Scoring uses a fixed prefix of the first `min(4,096, per-request token-pool capacity)` distinct contexts. Later positions are ordinary samples after runtime reaches the same history budget, so including them would dilute the test. The model-free detector cannot identify entropy-gated or greedy positions; it scores them as conservative null terms.
 
 The [operator guide's detector specification](../../../../../docs/docs/advanced_features/text_watermarking.mdx#detection) is normative for prompt alignment, prefix handling, dual-key partitioning, and result interpretation.
 

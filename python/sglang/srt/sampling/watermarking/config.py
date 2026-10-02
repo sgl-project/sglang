@@ -83,8 +83,8 @@ def load_watermark_config(source: str) -> WatermarkServerConfig:
         raise WatermarkConfigError("watermark config exceeds 4096 bytes")
     try:
         raw = json.loads(payload)
-    except json.JSONDecodeError as error:
-        raise WatermarkConfigError("failed to read watermark config JSON") from error
+    except json.JSONDecodeError:
+        raise WatermarkConfigError("failed to read watermark config JSON") from None
     if not isinstance(raw, dict):
         raise WatermarkConfigError("watermark config must be a JSON object")
     if set(raw) - set(WatermarkServerConfig.__struct_fields__):
