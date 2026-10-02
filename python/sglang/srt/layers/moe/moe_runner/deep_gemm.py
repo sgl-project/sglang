@@ -506,7 +506,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     hidden_states = self._run_masked_fp4_gemm(
                         runner_input, quant_info, running_state
                     )
-                elif quant_info.use_int4_w4a16 or quant_info.use_mxfp4_w4a16:
+                elif quant_info.use_int4_w4a16:
                     hidden_states = self._run_masked_int4_gemm(
                         runner_input, quant_info, running_state
                     )
@@ -517,6 +517,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 if topkid_pushed:
                     th_nvtx_range_pop()
                 th_nvtx_range_pop()
+
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
 
     def _run_contiguous_gemm(
