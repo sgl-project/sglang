@@ -472,7 +472,9 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         runner._input_embeds_arg_idx = 3
         runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: True)
         slot = torch.empty((8, 2 * 4))
-        runner._fill_input_embeds_slot = Mock(side_effect=lambda args, *_: slot[:1].copy_(args[3]))
+        runner._fill_input_embeds_slot = Mock(
+            side_effect=lambda args, *_: slot[:1].copy_(args[3])
+        )
         runner.backend = SimpleNamespace(replay=lambda *_args, **_kwargs: "replayed")
         runner.layer_model = SimpleNamespace(forward=None)
         runner.model_runner = SimpleNamespace(
@@ -494,7 +496,9 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         )
         self.assertEqual(output, "replayed")
         runner._fill_input_embeds_slot.assert_called_once()
-        self.assertEqual(runner._fill_input_embeds_slot.call_args.args[0][3].shape[1], slot.shape[1])
+        self.assertEqual(
+            runner._fill_input_embeds_slot.call_args.args[0][3].shape[1], slot.shape[1]
+        )
 
 
 if __name__ == "__main__":
