@@ -51,6 +51,19 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+To run two engine versions side by side in PD mode (e.g. during a rollout),
+pass `--pd-version-group-label <key>`. A prefill worker is then paired only with
+decode workers that have the same value for that EndpointSlice label (inherited
+from the Service, so use one Service per role and version), so KV never crosses
+versions. Unlabeled workers form their own group.
+
+```bash
+sgl-router --model-id qwen3 --service-discovery \
+  --prefill-selector app=engines-qwen3,role=prefill \
+  --decode-selector app=engines-qwen3,role=decode \
+  --pd-version-group-label sglang.ai/version-group
+```
+
 External KV indexer as the cache-aware signal source:
 
 ```bash
@@ -68,6 +81,52 @@ sgl-router \
 The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
+
+### Peer bootstrap (Kubernetes)
+
+A replica that starts mid-fleet subscribes to each worker's KV topic
+mid-stream, so everything already resident in the engines' caches is invisible
+to it and it routes cache-blind until traffic re-stores those blocks —
+degrading the engines' locality for the whole fleet, once per replica on every
+rolling update. With a peer selector set, a booting replica instead pulls a
+tree snapshot from a warm sibling over `/internal/kv_snapshot` and splices it
+under its own live delta stream, and `/readyz` stays 503 until that bootstrap
+settles. Off unless `--kv-peer-selector` is set; requires `--policy
+cache_aware` with the Router-local radix tree (not an external Indexer) and
+`--service-discovery`, which the CLI enforces.
+
+```bash
+sgl-router \
+  --model-id qwen3 --policy cache_aware \
+  --service-discovery --service-discovery-namespace prod \
+  --selector app=engines-qwen3 \
+  --kv-peer-selector kubernetes.io/service-name=sgl-router
+```
+
+- `--kv-peer-selector` is matched against **EndpointSlice labels** — the
+  router Service's labels plus `kubernetes.io/service-name`, never the pods'
+  labels, so `kubernetes.io/service-name=<router-service>` is the unambiguous
+  choice. A pod-template label matches nothing and every replica boots cold.
+- `--kv-bootstrap-timeout-ms` (default 600000) bounds the whole bootstrap;
+  readiness waits on it, so startup/readiness probes must tolerate a replica
+  staying unready this long.
+- `--kv-bootstrap-fetch-timeout-cap-ms` (default 300000) caps one snapshot
+  fetch within that budget.
+- `--kv-bootstrap-seed-required` (off by default) keeps holding `/readyz` when
+  siblings were present but their tree could not be pulled, bounded at
+  max(3× the bootstrap timeout, 60s) — it delays a failed seed's replica (and
+  with it a rolling update) rather than shipping it cache-blind; it cannot
+  stall a rollout indefinitely.
+
+The deployment needs two things beyond the flags: the router's ServiceAccount
+must hold `get`/`list`/`watch` on `endpointslices` in the watched namespace
+(the worker-discovery Role already grants this), and the pod spec should wire
+`POD_NAME`, `POD_NAMESPACE` and `POD_IP` from the downward API so a replica
+can exclude itself from its own peer list. A rolling update should surge
+(`maxUnavailable: 0`) so new replicas always have warm siblings to copy from.
+`tests/e2e/k8s_integration/manifests/kv-bootstrap.yaml` is a worked example of
+all of it, and the `sgl_router_kv_bootstrap_*` series in
+[monitoring/README.md](monitoring/README.md) make the whole path observable.
 
 ### Reorg routing
 
@@ -87,6 +146,39 @@ fail at startup. Legacy `--bucket-config` files cannot define complete reorg PD
 buckets and are not accepted on this path.
 
 Omitting `--chat-routing` keeps the existing policies and defaults.
+
+### Optional tokenizer for load-only routing
+
+`--no-tokenizer` skips tokenizer loading for load-only policies such as
+`power_of_two` and `session_aware`, on either routing path. Workers tokenize the
+original messages, and `/v1/tokenize` and `/v1/detokenize` are unavailable.
+Cache-aware routing, prefix-cache terms or filters, and `--bucket-config` still
+require a tokenizer.
+
+### DP-rank routing
+
+An engine launched with `--dp-size` or `--attn-dp-size` runs several DP ranks,
+each with its own KV cache, behind one endpoint. With `--dp-aware`, the router
+also picks the rank inside the selected worker. It sends that rank as
+`X-Data-Parallel-Rank`, which the engine honors, and overwrites any value the
+client sent. The router picks the first of these that applies:
+
+1. A hash of the sticky routing key or session id, so a conversation keeps
+   its rank and router replicas agree.
+2. The rank with the deepest cached prefix in the local KV tree.
+3. The rank with the fewest requests this router has in flight on it.
+
+In PD mode, decode is ranked by load only. The bootstrap room satisfies
+`room % prefill_dp_size == prefill_rank`, which is how a decode engine finds
+the prefill rank.
+
+### Engines with `--api-key`
+
+The router reads each worker's `/server_info` and `/model_info` to learn its
+model, KV-event publisher, HTTP/2 support and DP size. An engine launched with
+`--api-key` rejects those requests without the key, so pass the same key as
+`--worker-api-key`. Chat requests and `/flush_cache` forward the caller's
+`Authorization` header instead, so callers still need the engine key.
 
 ### Fleet-wide sampling contract
 
@@ -198,14 +290,20 @@ prefix queries match the blocks the engine caches. Models the engine encodes in
 code but dynamo-render cannot tokenize here (Inkling) route via raw prompt
 text, as does any model whose template fails to load or render.
 
-Plain text chat requests (string `content`, no tools, no template kwargs or
-reasoning controls or historical `reasoning_content`, no assistant continuation,
-no consecutive users or non-leading system turns) additionally forward the
-rendered tokens to the engine as `input_ids`, retaining the original messages,
-so the engine skips re-tokenizing. Every other request shape is rendered for
-routing only: the router renders with dynamo-render and does not replicate
-SGLang's request normalization, so forwarding is enabled shape by shape as
-parity is verified. Use matching model files on the router and workers, and set
+Some chats additionally forward the rendered tokens to the engine as
+`input_ids`, retaining the original messages, so the engine skips
+re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's native
+encoder is fixture-verified against SGLang's request normalization, so it
+forwards every chat except multimodal ones and those with caller-provided
+`input_ids`. Renderers without that verification (HF Jinja templates, Kimi-K3)
+forward only plain text chat requests (string `content`, no tools, no template
+kwargs or reasoning controls or historical `reasoning_content`, no assistant
+continuation, no consecutive users or non-leading system turns) and warn
+`UNVERIFIED` at startup; every other request shape is rendered for routing
+only. DeepSeek-V4.1 forwards nothing — its renderer is not verified against
+current SGLang — while routing tokenization keeps working.
+
+Use matching model files on the router and workers, and set
 the same `--default-chat-template-kwargs`, `SGLANG_DEFAULT_THINKING`,
 `SGLANG_DSV4_REASONING_EFFORT`, and `SGLANG_DSV41_REASONING_EFFORT` on both.
 The router reads these render defaults from its own configuration and environment;
@@ -235,6 +333,24 @@ Detailed content-format parity coverage follows in #39133.
 The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
 with `--locked`, so rendered bytes cannot change without a reviewed diff.
 
+Router tokenization sits on the TTFT path for every chat it renders. Two opt-in
+flags make it cheaper:
+
+- `--tokenizer-backend fast` encodes with fastokens (decoding stays on HF). It
+  needs a `tokenizer.json` and falls back to `hf` when fastokens cannot load it.
+- `--tokenizer-l1-cache-mb N` caches prefix tokenizations at special-token
+  boundaries, so a multi-turn chat encodes only the turns added since the
+  previous request. Boundaries are unconditional, non-normalized, non-stripping
+  special tokens with no overlapping added-token spellings. Unsafe candidates
+  are excluded; if none remain, encoding proceeds without the cache.
+
+On a ~69K-token DeepSeek-V4 chat, `hf` encodes in ~40 ms, `fast` in ~4 ms, and
+a new turn on a cached history in ~0.2 ms. The DeepSeek fixtures check every
+case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
+backend and cache state. `/metrics` exposes only
+`sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
+how much tokenization work the cache reuses.
+
 ## DeepSeek V4
 
 Native V4 rendering follows SGLang's serving path (`serving_chat.py`), not
@@ -246,9 +362,11 @@ official/preview effort profile is detected from the checkpoint's
 and are regenerated by `tests/scripts/generate_deepseek_parity.py`.
 
 V4.1 Flash uses Dynamo's separate V4.1 encoder with SGLang's numeric reasoning
-budgets, tool payloads, and `<｜System｜>` markers. Developer messages and media
-are left to the worker (the pinned encoder renders them differently), and a
-non-default `SGLANG_DSV41_REASONING_EFFORT` needs the forwarding precautions above.
+budgets, tool payloads, and `<｜System｜>` markers — for routing tokenization
+only, since V4.1 never forwards `input_ids`. Developer messages and media are
+left to the worker (the pinned encoder renders them differently), and a
+non-default `SGLANG_DSV41_REASONING_EFFORT` still matters for cache-aware
+routing-hash parity.
 
 ## Kimi-K3
 
