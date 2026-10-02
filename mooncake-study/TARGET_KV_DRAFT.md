@@ -194,9 +194,10 @@ incremental writes. It also checks coordinated rejection of a target binding
 failure, an invalid draft pool and a mismatched checkpoint digest, followed by
 a valid binding. Target artifact inspection is replaced by explicit rank
 contracts in this test; the startup protocol and tensor collectives are real.
-This does not verify multi-GPU NCCL or PP speculative serving. Proposal and
-activation transport, accepted-token propagation, shared embedding/output-head
-availability and request-state alignment remain required before enabling PP.
+This does not verify source-KV assembly over multi-GPU NCCL or PP speculative
+serving. The result relay, worker phases and shared modules described below
+provide separate dependencies. Their scheduler integration, proposal/activation
+ordering and request-state alignment remain required before enabling PP.
 See [the reproduction commands](experiments/PIPELINE_KV.md).
 
 ### Pipeline Execution Phases Prerequisite
@@ -239,8 +240,8 @@ API. Neither projection nor commit may be inserted before forwarding a PP frame
 that another participating rank is waiting for.
 
 The serving gates remain closed. Wiring the PP loop to these phases, synchronizing
-proposals, exposing shared embedding/output-head modules and validating actual
-multi-GPU speculative serving remain required. See
+proposals and validating actual multi-GPU speculative serving remain required.
+Shared modules are available through the startup operation below. See
 [the phase test runbook](experiments/PIPELINE_PHASES.md).
 
 ### Pipeline Result Relay Prerequisite
@@ -272,11 +273,52 @@ The codec is covered by four-process Gloo and two-H100 NCCL result round trips,
 single-GPU CUDA copy-stream checks, and malformed/stale-result tests. Fixtures
 exercise actual PP dictionary transport and the spec-v2 token resolver with
 deterministic result tensors. They do not execute a PP DSpark target/draft model.
-The worker still needs separate forward/commit phases: running a cross-stage KV
+The worker phases above must be scheduled separately: running a cross-stage KV
 collective inside a stage's forward before it sends activation would strand
-later stages. Proposal/activation scheduling and shared modules remain required,
-and the PP speculative serving gates stay in place. See
+later stages. Proposal/activation scheduling remains required, and the PP
+speculative serving gates stay in place. See
 [the result-channel runbook](experiments/PIPELINE_RESULT.md).
+
+### Pipeline Shared Modules Prerequisite
+
+`resolve_dspark_shared_modules` makes the target embedding and output head
+available to each draft replica. With PP=1, it returns the original modules,
+including custom implementations. With PP>1 and DP=1, the first target stage
+owns the embedding and the last owns the head. Each PP group broadcasts its
+own TP shard from those owners, using the device transport. Owner stages borrow
+their existing modules; other stages allocate native replicas. Missing target
+modules remain missing on their original target stages. Only the draft attaches
+the returned modules, and proposal embedding uses that attached draft module.
+
+The PP startup operation supports native unquantized `VocabParallelEmbedding`
+and `ParallelLMHead`, with contiguous BF16, FP16 or FP32 weights and no bias.
+It validates the complete PP/TP rank layout, native shard indices, vocabulary
+padding, constructor metadata and matching logical embedding/head dimensions.
+Every rank reports source validation and replica allocation/layout failures
+through CPU world collectives before any device broadcast. This coordinates
+ordinary Python startup failures; it does not recover a crashed process or a
+failed device collective. Quantized/custom PP modules require a separate binding
+implementation and remain unsupported.
+
+Each missing module costs its padded local TP-shard weight size on that stage.
+An intermediate stage needs both copies. Replication does not preserve shared
+storage between tied embedding/head weights and does not refresh copies after
+target weight replacement. A target update requires rebuilding the replicas.
+The current target-KV serving path still rejects runtime weight replacement.
+
+Draft construction uses a runner-local `ParallelState` with PP size one and
+rank zero, preserving its TP lane and the immutable target `ServerArgs` object.
+Graph buffer allocation and dummy forward proxy selection use the runner's PP
+size. The target runner continues to use its own pipeline dimensions.
+
+Native-module tests exercise TP2/PP2 and TP1/PP4 with real Gloo collectives and
+TP1/PP2 with two-H100 NCCL broadcasts. They verify embedding output and draft
+head logits, tied/untied values, vocabulary padding and coordinated failures.
+The runner tests check factory arguments and real buffer allocation. These are
+not full PP draft-model initialization or speculative serving tests. The PP
+scheduler, proposal agreement, cancellation/recovery and complete model/graph
+initialization still need integration and runtime validation. See
+[the shared-module runbook](experiments/PIPELINE_MODULES.md).
 
 ### Disaggregated Context
 

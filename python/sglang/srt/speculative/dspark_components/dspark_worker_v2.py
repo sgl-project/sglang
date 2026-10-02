@@ -63,6 +63,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
+from sglang.srt.speculative.dspark_components.dspark_shared_modules import (
+    resolve_dspark_shared_modules,
+)
 from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
     read_target_kv_draft_contract,
 )
@@ -164,7 +167,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
@@ -244,13 +247,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         target_model = self.target_worker.model_runner.model
-        lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
-            raise RuntimeError(
-                "DSpark requires the target model to expose `lm_head` with `weight`."
-            )
+        embed_tokens, lm_head = resolve_dspark_shared_modules(
+            target_model=target_model,
+            pp_group=self.model_runner.pp_group,
+            tp_group=self.model_runner.tp_group,
+            device=torch.device(self.device, self.gpu_id),
+        )
         self.draft_model.attach_shared_modules(
-            embed_tokens=self._resolve_target_embed_tokens(target_model),
+            embed_tokens=embed_tokens,
             lm_head=lm_head,
         )
 
@@ -377,11 +381,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._target_kv_contract is not None:
             return None
         return self.primary_draft_kv_pool
-
-    def _resolve_target_embed_tokens(self, target_model):
-        if hasattr(target_model, "get_input_embeddings"):
-            return target_model.get_input_embeddings()
-        return target_model.model.get_input_embeddings()
 
     @property
     def carries_confidence(self) -> bool:

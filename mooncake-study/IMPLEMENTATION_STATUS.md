@@ -2847,12 +2847,73 @@ No temporary GPU allocation was needed. The original checkout's staged index
 checksum is unchanged.
 
 The PP scheduler is not wired to these phases. Request/proposal agreement,
-activation/acceptance ordering, shared draft modules, actual multi-GPU
-speculative serving and cancellation/recovery validation remain required.
+activation/acceptance ordering, actual multi-GPU speculative serving and
+cancellation/recovery validation remain required. Shared draft modules are
+covered by the subsequent implementation below.
 PP speculative serving gates are unchanged. See
 [the worker contract](TARGET_KV_DRAFT.md#pipeline-execution-phases-prerequisite),
 [the runbook](experiments/PIPELINE_PHASES.md) and
 [retained evidence](experiments/pipeline-dspark-phases.json).
+
+## DSpark Pipeline Shared Modules
+
+The worker now resolves target embedding/head modules for every PP draft
+replica. PP1 retains the original module objects. For PP>1/DP1, the first and
+last target stages supply native unquantized vocabulary shards; corresponding
+PP lanes broadcast those weights to missing replicas. Source/layout and replica
+allocation failures are exchanged across the CPU world group before device
+collectives. Owner modules retain their identity, missing modules on other
+target stages stay untouched, and draft proposals use the attached embedding.
+BF16, FP16 and FP32 are supported; custom/quantized PP modules are rejected.
+
+The draft factory receives runner-local PP1/rank0 while preserving the target
+TP lane and the same immutable published `ServerArgs`. Base runner graph buffers
+and dummy activation proxies now use the owning runner's PP dimensions. This
+avoids allocating target PP proxy buffers for a fully replicated draft. The
+target runner retains its pipeline dimensions. Replica weights add local
+padded-shard storage and require rebuilding after target weight replacement.
+
+The complete shared-module unit file passed **three tests** in **39.389 seconds**,
+job `01790898832563646962-7437685f4eb0`. Native embedding/head operations use real
+Gloo collectives for TP2/PP2 and TP1/PP4. A temporary two-H100 node passed the
+complete NCCL file: **one test** in **15.574 seconds** for TP1/PP2. All topologies
+exercise BF16/FP16/FP32 and tied/untied values, padded vocabulary boundaries,
+coordinated source/allocation failure and valid reuse of the same groups; TP2
+also checks wrong shard ownership and mismatched source metadata.
+
+The complete modified runner configuration file passed **12 tests** in **0.095
+seconds**, job `01790899340779946742-15c2b1b19d35`. Its new cases check immutable
+configuration at the draft factory boundary and actual graph-buffer allocation
+for draft PP1 versus target PP4. The complete existing graph buffer registry file
+passed **36 tests** in **0.159 seconds**, job
+`01790899741075487995-1393080e201a`. The first runner attempt had an invalid
+fixture-only parallel override; the first graph-buffer command lacked the test
+file in the GPU checkout. Both corrected complete runs passed.
+
+The temporary node also passed both real-model AR PP2 P/D eager/graph tests in
+**174.605 seconds**. On the resident H100, all **four target-KV DSpark P/D tests**
+passed in **326.126 seconds**, job `01790899341422071086-a2ef66ded67b`, and all
+**six hidden-input tests** passed in **388.004 seconds**, job
+`01790899341866830798-70e7fc9790ab`. These 12 model cases checked **70 published
+snapshots** against online source tensors with actual Mooncake TCP/Store and
+the Catalog test double. Missing/stale handoffs and cancellation stayed excluded.
+
+All **64 final tests** passed. Black passes for all eight changed/new Python
+files; Ruff matches the same 25 diagnostics in the four existing files, with no
+diagnostics in the four new files. The 12 retained source/test hashes match the
+GPU checkout. The temporary job was deleted and its pod absence verified after
+a live-process check. The resident worker has no queued/active experiment and
+resumed its idle workload; no test/model/Store process remained. The original
+checkout's staged index checksum is unchanged.
+
+Native-module and runner-boundary tests do not prove complete PP draft model
+initialization. The real PP2 model regression is AR, and real speculative model
+tests are PP1. Full PP draft initialization, proposal/activation/acceptance
+scheduling, source-KV NCCL assembly, cancellation/recovery and performance remain
+required. Public PP speculative gates are unchanged. See
+[the binding contract](TARGET_KV_DRAFT.md#pipeline-shared-modules-prerequisite),
+[the runbook](experiments/PIPELINE_MODULES.md) and
+[retained evidence](experiments/pipeline-dspark-modules.json).
 
 ## Next Implementation
 

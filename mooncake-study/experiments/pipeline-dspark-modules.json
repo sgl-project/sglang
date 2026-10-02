@@ -1,0 +1,571 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-02",
+  "base_commit": "b5fc1c7c4193253baa821d5d9afc0fdbf367004c",
+  "feature": "Native target embedding/head replication for PP draft stages and runner-local graph PP dimensions",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "resident_node": "node064",
+    "resident_gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "temporary_job": "job-68b892a296c0-20261002074819",
+    "temporary_node": "node071",
+    "temporary_gpus": [
+      "GPU-7dc47845-2810-8101-7c87-dfc12d2bfbd3",
+      "GPU-7f16324c-fde5-ce5e-0ee0-81cc3c5872f4"
+    ],
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "versions": {
+      "python": "3.12.3",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "sglang-kernel": "0.4.6.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "temporary_environment_adjustment": "Removed incompatible flashinfer-cubin 0.6.12 and flashinfer-jit-cache 0.6.12+cu130 from the temporary pod's system Python. The shared capture venv and resident pod were unchanged."
+  },
+  "implementation": [
+    "PP1 borrows existing target embedding/head objects, including custom implementations.",
+    "For PP>1/DP1, gather native unquantized source metadata, validate the PP/TP layout and source shards, allocate missing replicas, then broadcast the matching TP shards from first/last PP owners.",
+    "Fence source and replica allocation/layout errors across all ranks before any device collective.",
+    "Keep owner object identity and leave other target stages' missing modules untouched. Only draft replicas attach the returned modules.",
+    "Draft construction has runner-local PP1/rank0 while retaining TP state and the published immutable ServerArgs object.",
+    "BaseRunner graph dimensions and dummy PP proxy selection use model_runner.ps.pp_size.",
+    "DraftBlockProposer embeds through the attached draft module, which is present on non-first PP stages.",
+    "No scheduler loop, capability gate, Mooncake API or snapshot format changed."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/model_executor/runner/base_runner.py": "14b79a807bf488eb875f834785affc649c93904d303bae786ae26baf10eb409e",
+    "python/sglang/srt/speculative/dspark_components/dspark_draft.py": "007da926fdb355a4e02e6ecdff254b1655db583cf072137cd2065becc88ddc07",
+    "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": "d82d64113ea0a693017afbee9a1d1fe593fc26ebcbd3887d492199b8f1bc61d6",
+    "python/sglang/srt/speculative/dspark_components/dspark_shared_modules.py": "150e7b0963cf5c1a933cf06e96e25baa344acad16ebfae0b8eeae34a8a7775f3",
+    "python/sglang/test/dspark_shared_modules_utils.py": "d6e40eb5f714afb5d22da75865a95fc99721b9d0684e7f61243f0b7969ad3e85",
+    "test/registered/unit/spec/test_draft_per_runner_config.py": "6c0dda86ef38d458c9f74d0356387198e7a1a6c836d9425e9c80b17c65fb51bc",
+    "test/registered/unit/spec/test_dspark_shared_modules.py": "ae3bed93a724ba66e2e203abf472707c1f1630519fe2523673e4f67e6101bb97",
+    "test/registered/storage/test_dspark_shared_modules_nccl.py": "6cceec98c631dbdefe77ab079b89ce0bbb69107f669aa0cd3880f6d206fc302a",
+    "test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py": "e11516cbe6269437ef65e5ca2dc07b0757dd4d1a85517083cc8340fc97660b01",
+    "test/registered/storage/test_training_capture_pd_pp.py": "011e33796a42a5dbe62c4e60b1731c7c76dedd541d43bd9b54c456a332f59933",
+    "test/registered/storage/test_training_capture_pd_dspark.py": "2842b2114bdc99cea4cc3fd1621f3b516178b25f46499ced899f6d79f9d19668",
+    "test/registered/storage/test_training_capture_pd_dspark_hidden.py": "f439c71f93b63154ac3e3463a894d2a0137fda79a1668518f9aeb7ad8fa0a1fa"
+  },
+  "gpu_source_hashes_match": true,
+  "tests": [
+    {
+      "file": "test/registered/unit/spec/test_dspark_shared_modules.py",
+      "job_id": "01790898832563646962-7437685f4eb0",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790898885.0611866,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790898832563646962-7437685f4eb0.log",
+      "tests": 3,
+      "seconds": 39.389,
+      "log_sha256": "d9db37bd008d8d7a100e3bfa90c52fb0d5933be08e5d494e52d8a01e10fac5c4"
+    },
+    {
+      "file": "test/registered/unit/spec/test_draft_per_runner_config.py",
+      "job_id": "01790899340779946742-15c2b1b19d35",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790899354.4043024,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790899340779946742-15c2b1b19d35.log",
+      "tests": 12,
+      "seconds": 0.095,
+      "log_sha256": "488d6075213272a062e1204ae391eab01958b364a1e57091d98f67c988d041be"
+    },
+    {
+      "file": "test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py",
+      "job_id": "01790899741075487995-1393080e201a",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790900099.494835,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790899741075487995-1393080e201a.log",
+      "tests": 36,
+      "seconds": 0.159,
+      "log_sha256": "3decb1e3cbd97ffb341dfd5ca7e7bbefaebd225d8fed4c65113836e60c634678"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark.py",
+      "job_id": "01790899341422071086-a2ef66ded67b",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790899691.881568,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790899341422071086-a2ef66ded67b.log",
+      "tests": 4,
+      "seconds": 326.126,
+      "log_sha256": "14e9b37395275e69b80667169573583d5a7761041d81f97dd4aac9b835c0d5ba"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark_hidden.py",
+      "job_id": "01790899341866830798-70e7fc9790ab",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790900090.9640055,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790899341866830798-70e7fc9790ab.log",
+      "tests": 6,
+      "seconds": 388.004,
+      "log_sha256": "4629a4635b7c3a226bee78de1ea52dfbb78ce573ebfefc9df0d5b68995fa852b"
+    },
+    {
+      "file": "test/registered/storage/test_dspark_shared_modules_nccl.py",
+      "tests": 1,
+      "seconds": 15.574,
+      "outcome": "completed",
+      "returncode": 0,
+      "exec_session_id": 62169,
+      "temporary_job": "job-68b892a296c0-20261002074819",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/shared-modules-nccl-20261001.log",
+      "log_sha256": "ad85ddbc0a5e1ea3801df0f2081de2d7a433d0d1279a16bac3c2c74ca50c10bb"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_pp.py",
+      "tests": 2,
+      "seconds": 174.605,
+      "outcome": "completed",
+      "returncode": 0,
+      "exec_session_id": 15326,
+      "temporary_job": "job-68b892a296c0-20261002074819",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/shared-modules-pp-regression-20261002.log",
+      "log_sha256": "5c24c8cf3475d9c166fd70f751aa6b54287d992539d06349320e4719b33df75b"
+    }
+  ],
+  "total_final_tests": 64,
+  "native_module_matrix": {
+    "gloo": [
+      {
+        "tp": 2,
+        "pp": 2
+      },
+      {
+        "tp": 1,
+        "pp": 4
+      }
+    ],
+    "nccl": [
+      {
+        "tp": 1,
+        "pp": 2,
+        "gpus": 2
+      }
+    ],
+    "dtypes": [
+      "bfloat16",
+      "float16",
+      "float32"
+    ],
+    "tied_weight_values": [
+      false,
+      true
+    ],
+    "vocabulary_size": 67,
+    "padding_size": 64,
+    "embedding_width": 8,
+    "failures": [
+      "missing embedding on one source rank",
+      "unsupported head dtype on one source rank",
+      "replica allocation failure on one destination rank",
+      "wrong source TP shard (TP2)",
+      "different native metadata between TP lanes (TP2)"
+    ],
+    "recovery": "After each pre-broadcast validation/allocation failure, all ranks run another valid binding on the same groups."
+  },
+  "real_model_cases": [
+    {
+      "log": "01790899341422071086-a2ef66ded67b.log",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "log": "01790899341422071086-a2ef66ded67b.log",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "log": "01790899341422071086-a2ef66ded67b.log",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "log": "01790899341422071086-a2ef66ded67b.log",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "log": "01790899341866830798-70e7fc9790ab.log",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "cap-accept",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 14,
+        "speculative_verify_forwards": 13,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "log": "01790899341866830798-70e7fc9790ab.log",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "cap-accept",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 16,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 16,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 18,
+        "speculative_verify_forwards": 16,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "log": "01790899341866830798-70e7fc9790ab.log",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "compact",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 14,
+        "speculative_verify_forwards": 13,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "log": "01790899341866830798-70e7fc9790ab.log",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "compact",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 16,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 16,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 18,
+        "speculative_verify_forwards": 16,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "log": "01790899341866830798-70e7fc9790ab.log",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "log": "01790899341866830798-70e7fc9790ab.log",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "prefill_pp": 1,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "log": "shared-modules-pp-regression-20261002.log",
+      "decode_pp": 2,
+      "decode_tp": 1,
+      "draft_kind": null,
+      "prefill_draft": false,
+      "prefill_pp": 2,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 8,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 6,
+        "ready": 0,
+        "sealed": 5
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "log": "shared-modules-pp-regression-20261002.log",
+      "decode_pp": 2,
+      "decode_tp": 1,
+      "draft_kind": null,
+      "prefill_draft": false,
+      "prefill_pp": 2,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 8,
+        "cuda_graph_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 6,
+        "ready": 0,
+        "sealed": 5
+      },
+      "quarantined_host_slots": 0
+    }
+  ],
+  "checked_snapshots": 70,
+  "failed_attempts": [
+    {
+      "job_id": "01790899245835029419-528208c95d63",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790899259.312833,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790899245835029419-528208c95d63.log",
+      "log_sha256": "65468acc0201cace97b49baf6b5179f5c88ba9b134a48d90d4b7bcf5eca1f074",
+      "reason": "The new runner test fixture tried to override config field dp_size through the live parallel override API. Removed the invalid fixture override; the seeded config already has DP1. The complete corrected suite passed."
+    },
+    {
+      "job_id": "01790899341094865744-e482b7b0f81b",
+      "outcome": "failed",
+      "returncode": 2,
+      "finished_unix": 1790899354.665125,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790899341094865744-e482b7b0f81b.log",
+      "log_sha256": "026ef493a2136790ffab0d0ad961e5d2215a019a4acd00b78b7983510a6cab22",
+      "reason": "The graph buffer test file had not been synced to the GPU checkout. Synced the existing file and reran the complete suite."
+    }
+  ],
+  "static_checks": {
+    "black": {
+      "files": 8,
+      "passed": true
+    },
+    "ruff": {
+      "baseline_count": 25,
+      "current_count": 25,
+      "same_diagnostics": true
+    },
+    "diff_check_passed": true
+  },
+  "cleanup": {
+    "temporary_live_process_check": "Only sleep 3600 and the inspection ps remained; no test/model/Store process.",
+    "temporary_delete_command": "northjob delete job-68b892a296c0-20261002074819 --namespace qiji",
+    "temporary_delete_api_code": 0,
+    "temporary_pod_absence_verified": true,
+    "resident_status": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790900118.0387454,
+      "idle_pid": 21941,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.7326304912567139
+    },
+    "resident_live_process_check": "Only worker PID 1, cuda_load PID 21941 and the inspection ps remained.",
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "limits": [
+    "Native-module fixtures replace target model containers and group discovery. Real native module operations and Gloo/NCCL communication do not prove full target/draft model initialization.",
+    "Runner tests stop at the draft factory boundary or allocate graph buffers with a fixture runner; they do not capture a real PP draft graph.",
+    "The AR PP2 regression exercises a real target model. DSpark real-model regressions are PP1; no PP speculative serving gate is enabled.",
+    "PP source-KV NCCL assembly, proposal agreement, activation/acceptance scheduling, distributed cancellation/recovery and performance remain to implement or verify.",
+    "PP replication supports only native unquantized contiguous BF16/FP16/FP32 modules, no bias, and DP1.",
+    "Copies consume padded local TP-shard weight memory and do not refresh on target weight replacement.",
+    "Capture runtime uses real Mooncake TCP and Store with a Catalog test double. It does not establish production Catalog/SpecForge training or trained-checkpoint quality."
+  ]
+}

@@ -10,7 +10,10 @@ one constructor each — so they travel as arguments to the runner that owns the
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import torch
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.model_runner import (
     ModelRunner,
@@ -22,7 +25,8 @@ from sglang.srt.model_executor.model_runner_components.attention_backend_setup i
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     build_load_config,
 )
-from sglang.srt.runtime_context import get_context, get_model
+from sglang.srt.model_executor.runner.base_runner import BaseRunner
+from sglang.srt.runtime_context import get_context, get_model, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -208,6 +212,71 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         self.assertIs(seen["worker"], server_args)
         self.assertEqual(seen["published_while_building"], "auto")
         self.assertIs(get_context().server_args, server_args)
+
+    def test_dspark_replicates_the_draft_without_copying_published_pp_config(self):
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            DSparkWorkerV2,
+        )
+
+        server_args = self._seed(
+            pp_size=4, device="cpu", speculative_algorithm="DSPARK"
+        )
+        ps = ParallelState.trivial(pp_size=4, pp_rank=2, tp_size=2, tp_rank=1)
+        target = SimpleNamespace(
+            device="cpu", model_runner=SimpleNamespace(model_config=None)
+        )
+        module = "sglang.srt.speculative.dspark_components.dspark_worker_v2"
+        with (
+            patch(f"{module}.draft_is_deepseek_v4", return_value=False),
+            patch(
+                f"{module}.build_draft_tp_worker", side_effect=_StopConstruction
+            ) as build,
+            self.assertRaises(_StopConstruction),
+        ):
+            DSparkWorkerV2(server_args, 0, ps, 0, target)
+        self.assertIs(build.call_args.kwargs["server_args"], server_args)
+        draft_ps = build.call_args.kwargs["ps"]
+        self.assertEqual((draft_ps.pp_size, draft_ps.pp_rank), (1, 0))
+        self.assertEqual((draft_ps.tp_size, draft_ps.tp_rank), (2, 1))
+        self.assertEqual((ps.pp_size, ps.pp_rank, server_args.pp_size), (4, 2, 4))
+        self.assertIs(get_context().server_args, server_args)
+
+    def test_draft_graph_buffers_use_runner_pp_size(self):
+        server_args = self._seed(pp_size=4, device="cpu")
+        for local_pp_size in (1, 4):
+            with (
+                self.subTest(local_pp_size=local_pp_size),
+                get_parallel().override(attn_tp_size=1, attn_tp_rank=0),
+            ):
+                mr = SimpleNamespace(
+                    device="cpu",
+                    server_args=server_args,
+                    ps=ParallelState.trivial(pp_size=local_pp_size),
+                    is_draft_worker=local_pp_size == 1,
+                    model_config=SimpleNamespace(
+                        hidden_size=8,
+                        vocab_size=67,
+                        dtype=torch.float32,
+                        is_encoder_decoder=False,
+                    ),
+                    attn_backend=SimpleNamespace(
+                        get_cuda_graph_seq_len_fill_value=lambda: 1
+                    ),
+                    ngram_embedding_manager=SimpleNamespace(enabled=False),
+                    get_pp_proxy_topk_size=lambda: None,
+                    get_pp_proxy_residual_num_blocks=lambda: None,
+                )
+                runner = SimpleNamespace()
+                BaseRunner.__init__(runner, mr)
+                buffers = BaseRunner._alloc_dummy_decode_buffers(runner, max_bs=2)
+                self.assertEqual(runner.pp_size, local_pp_size)
+                if local_pp_size == 1:
+                    self.assertIsNone(buffers.pp_proxy_tensors)
+                else:
+                    self.assertEqual(
+                        buffers.pp_proxy_tensors["hidden_states"].shape, (2, 8)
+                    )
+                self.assertEqual(server_args.pp_size, 4)
 
 
 if __name__ == "__main__":
