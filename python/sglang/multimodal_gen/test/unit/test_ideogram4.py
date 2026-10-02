@@ -781,7 +781,11 @@ class TestIdeogram4(unittest.TestCase):
         config = Ideogram4DiTConfig()
         self.assertEqual(
             Ideogram4Transformer2DModel._supported_attention_backends,
-            {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            {
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.AMX_ATTN,
+            },
         )
         prev_args = server_args_module._global_server_args
         try:

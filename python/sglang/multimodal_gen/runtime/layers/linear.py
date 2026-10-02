@@ -38,10 +38,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # yapf: enable
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.utils import cpu_has_amx_support, use_intel_amx_backend
 
 logger = init_logger(__name__)
 
 IS_AMP_SUPPORTED = current_platform.is_amp_supported()
+USE_CPU_AMX = current_platform.is_cpu() and cpu_has_amx_support()
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
     "AWQMarlinLinearMethod",
@@ -132,7 +135,9 @@ class LinearMethodBase(QuantizeMethodBase):
 
 
 def apply_unquantized_linear(
-    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply a plain linear projection with the runtime's reference semantics."""
     if x.device.type == "mps":
@@ -149,6 +154,18 @@ def apply_unquantized_linear(
         if IS_AMP_SUPPORTED or bias is None
         else F.linear(x, weight, bias.to(x.dtype))
     )
+
+
+def apply_amx_packed_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    output = torch.ops.sgl_kernel.weight_packed_linear(
+        x.reshape(-1, x.shape[-1]).to(weight.dtype),
+        weight,
+        bias,
+        True,  # is_vnni
+    )
+    return output.view(*x.shape[:-1], -1)
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
@@ -176,9 +193,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if USE_CPU_AMX:
+            _amx_process_weight_after_loading(layer, ["weight"])
+
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if use_intel_amx_backend(layer):
+            return apply_amx_packed_linear(x=x, weight=layer.weight, bias=bias)
         return apply_unquantized_linear(x, layer.weight, bias)
 
 
