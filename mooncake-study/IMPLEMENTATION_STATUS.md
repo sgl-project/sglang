@@ -45,6 +45,7 @@ it does not redefine the goal as the modules already implemented.
 | Checkpoint artifact audit | Offline API/CLI binds config, weights, golden fixture and complete numerical report; optional pinned acceptance artifact | Nine CPU tests, five parity regressions and a fresh retained BF16 parity/audit run pass; production exporter, report trust and quality/SLO acceptance remain separate |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
+| Operator capture control | Authenticated pause/resume/abort management route, distributed readiness gating, P/D teacher epoch fencing, independent pause metrics | 103 CPU methods and four H100 HTTP/P-D methods pass; 16 post-exit snapshots read back; real multi-GPU and separate-endpoint P/D live control remain open |
 | AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes synchronous/overlap and eager/graph combinations; retired captures fail once, released slots are reused, fresh admission and exact post-exit Store reads pass; distributed pressure and SLOs remain open |
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes colocated and P/D PP1 synchronous/overlap and eager/graph combinations, plus synchronous TP1/PP2 and TP2/PP2 eager/graph; P/D checks exact all-layer CPU restore and failed Catalog leases |
 | PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2, synchronous P2/D2 and P2/D1, matching TP2/PP2, and cross-node TP1 RDMA pass eager/graph source parity and failure exclusion; wider distributed RDMA remains open |
@@ -3784,6 +3785,49 @@ serving evidence are in the [runbook](experiments/TEACHER_LSE.md) and
 [evidence index](experiments/teacher-lse.json). Production target identity and
 acceptable TTFT/TPOT/throughput overhead remain unspecified.
 
+## Operator Capture Control
+
+`POST /control_training_capture` now accepts `pause`, `resume` and `abort` without
+pausing ordinary generation. It follows the Python server's existing management
+authentication and scheduler command routing. Manual pause is separate from
+permanent disable reasons and adaptive protection. Resume does not clear faults
+or collect a partial request that was skipped during pause.
+
+Pause stops new selection and reservation refill while admitted samples continue.
+Abort additionally invalidates collecting requests and unbound distributed tickets.
+Copy completion, lease renewal, writer ownership, journal recovery and Catalog/GC
+rules continue to apply. Already-handed-off snapshots can publish; the response
+does not certify global drain or revoke existing Store data. Prefill's abort epoch
+prevents an old teacher handoff from being revived by a subsequent resume.
+
+The first cohort control test exposed refill continuing while readiness was false.
+Reservation creation now requires the existing all-rank readiness vote, while
+renewal/retirement remain available during pause. The inference thread introduces
+no additional Store/Catalog RPC or distributed collective. Prometheus and the
+dashboard distinguish `admission_paused` from failure disable.
+
+Validation on the resident H100 and its CPU environment:
+
+- 103 methods pass across collection, P/D, cohort ownership, routing and metrics,
+  including new four-process Gloo unbound/mixed-bound cancellation cases.
+- Real HTTP eager and CUDA graph + overlap runs each admit four captures, publish
+  three and abort one while all six ordinary requests complete with unchanged
+  deterministic output. Six snapshots pass post-exit Store readback. Invalid
+  actions and missing/wrong management credentials do not alter capture state.
+- Both real P/D regression methods pass, including eager/graph+overlap, handoff
+  faults, cancellation and ten additional post-exit snapshot reads.
+- Final annotation-only cleanup is checked by an IPC roundtrip and the
+  unconfigured-scheduler rejection path. Black passes for all 15 Python files;
+  full Ruff adds no finding over the touched-file baseline. Dashboard JSON and
+  unique panel IDs validate, but a live Grafana deployment is not certified.
+
+The 107 test methods and additional IPC check use Qwen3-0.6B, a test Catalog and
+TCP. Live multi-GPU control, P/D control across separate endpoints, production
+SLOs, rollout orchestration and trained-model quality remain open. Commands,
+terminal results, initial failures and source/log hashes are recorded in the
+[runbook](experiments/CAPTURE_CONTROL.md) and
+[evidence index](experiments/capture-control.json).
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
@@ -3813,7 +3857,9 @@ acceptable TTFT/TPOT/throughput overhead remain unspecified.
    capability gates do not constitute implementation of those paths.
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to
    representative workloads and SLO thresholds, and complete dashboard runtime
-   acceptance and rollout/rollback checks. Investigate the timing experiment's
+   acceptance and rollout/rollback checks beyond the new single-GPU live capture
+   controls, including real TP/PP and separately controlled P/D endpoints.
+   Investigate the timing experiment's
    short-request p99 TTFT increase, which the latest unchanged baseline did not
    reproduce. After consolidating single-rank content validation and reducing
    teacher LSE work, profile the remaining capture and control/durability costs

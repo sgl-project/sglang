@@ -81,6 +81,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
         self.requests = {}
         self.counters = Counter()
         self.disabled_reason = None
+        self.admission_paused = False
         self.error = None
         self.closed = False
         self.started = False
@@ -181,6 +182,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
             return {
                 "counters": counters,
                 "disabled_reason": self.disabled_reason,
+                "admission_paused": self.admission_paused,
                 "enable_overlap": self.enable_overlap,
                 "reservations": reservations,
                 "states": dict(states),
@@ -190,7 +192,8 @@ class CohortCaptureCoordinator(CaptureCoordinator):
                 "stage_timings": writer["stage_timings"],
                 "host_pool": self._host_stats(),
                 "admission": self.admission.stats(
-                    time.monotonic(), disabled=self.disabled_reason is not None
+                    time.monotonic(),
+                    disabled=self.disabled_reason is not None or self.admission_paused,
                 ),
                 "cohort_writer": writer,
                 "request_router": dict(self.request_router.counters),
@@ -302,6 +305,17 @@ class CohortCaptureCoordinator(CaptureCoordinator):
         self.service.set_admission_ready(False)
         super().disable(reason)
 
+    def _set_admission_paused(self, paused):
+        with self.lock:
+            self.admission_paused = paused
+            if paused:
+                self.service.set_admission_ready(False)
+
+    def control(self, action):
+        super().control(action)
+        if action == "abort":
+            self.service.cancel_unbound("operator_aborted")
+
     def _handoff(self, record):
         context, metadata = record.context, None
         failure = record.invalid_reason
@@ -350,16 +364,18 @@ class CohortCaptureCoordinator(CaptureCoordinator):
                     return
             while not self.stop.is_set() or not self.work.empty():
                 writer = self.writer_actor.stats(include_timings=False)
-                self.service.set_admission_ready(
-                    bool(
-                        not self.disabled_reason
-                        and not self.stop.is_set()
-                        and writer["ready"]
-                        and not writer["error"]
-                        and not writer["stopping"]
-                        and not writer["states"].get("recovering", 0)
+                with self.lock:
+                    self.service.set_admission_ready(
+                        bool(
+                            not self.disabled_reason
+                            and not self.admission_paused
+                            and not self.stop.is_set()
+                            and writer["ready"]
+                            and not writer["error"]
+                            and not writer["stopping"]
+                            and not writer["states"].get("recovering", 0)
+                        )
                     )
-                )
                 try:
                     record = self.work.get(timeout=0.05)
                 except queue.Empty:

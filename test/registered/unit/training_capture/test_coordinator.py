@@ -24,7 +24,7 @@ from sglang.srt.training_capture.mooncake_store import (
     MooncakeSnapshotStore,
     TransportError,
 )
-from sglang.srt.training_capture.protocol import validate_tensors
+from sglang.srt.training_capture.protocol import ContractError, validate_tensors
 from sglang.srt.training_capture.teacher import capture_teacher
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -145,6 +145,75 @@ class TestCaptureCoordinator(CustomTestCase):
         _, tensors = read_snapshot(self.store, published[0])
         self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10])
         self.assertEqual(tensors["loss_mask"].tolist(), [0, 0, 1])
+
+    def test_operator_pause_drains_and_resume_does_not_admit_partial_requests(self):
+        req, record = self.sealed_request("drain")
+        self.coordinator.control("pause")
+        excluded = self.request("during-pause")
+        self.coordinator.before_forward([excluded])
+        self.assertTrue(excluded.training_capture_attempted)
+        self.assertIsNone(excluded.training_capture_context)
+        self.assertIs(req.training_capture_context, record)
+        self.assertEqual(self.coordinator._admission_ratio(), 0)
+        self.coordinator._detach(req, record)
+        publication = self.catalog.wait_publications(1)[0]
+        self.wait_until(lambda: record.state == "done")
+        read_snapshot(self.store, publication)
+        self.assertEqual(self.coordinator.stats()["host_pool"]["free"], 1)
+        self.assertEqual(self.coordinator.stats()["admission"]["effective_ratio"], 0)
+        self.coordinator.metrics.update(self.coordinator.stats())
+        self.assertEqual(self.metric("admission_paused"), 1)
+        self.assertEqual(self.metric("disabled"), 0)
+        self.coordinator.control("resume")
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        self.coordinator.before_forward([excluded])
+        self.assertIsNone(excluded.training_capture_context)
+        fresh = self.request("after-resume")
+        self.coordinator.before_forward([fresh])
+        self.assertIsNotNone(fresh.training_capture_context)
+
+    def test_operator_abort_retains_slot_until_d2h_finishes(self):
+        req, record = self.sealed_request("abort-dma")
+        entered, release = threading.Event(), threading.Event()
+
+        def wait_for_copy():
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("copy gate")
+
+        try:
+            with patch.object(
+                record.context, "wait_for_copies", side_effect=wait_for_copy
+            ):
+                self.coordinator.control("abort")
+                self.assertTrue(entered.wait(3))
+                self.assertIsNone(req.training_capture_context)
+                self.assertTrue(self.coordinator.admission_paused)
+                self.assertIsNone(self.coordinator.disabled_reason)
+                self.assertEqual(self.coordinator.pool.stats()["filling"], 1)
+                self.assertFalse(self.catalog.publications)
+                self.coordinator.control("resume")
+                self.assertEqual(self.coordinator.pool.stats()["filling"], 1)
+                release.set()
+                self.wait_until(lambda: record.state == "done")
+        finally:
+            release.set()
+        self.assertEqual(
+            self.catalog.captures[record.lease.capture_id]["state"], "FAILED"
+        )
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        self.assertFalse(self.store.quarantined)
+
+    def test_operator_resume_preserves_fault_and_invalid_action_is_atomic(self):
+        self.coordinator.control("pause")
+        with self.assertRaisesRegex(ContractError, "capture action"):
+            self.coordinator.control("invalid")
+        self.assertTrue(self.coordinator.admission_paused)
+        self.coordinator.disable("weights_changed")
+        self.coordinator.control("resume")
+        self.assertFalse(self.coordinator.admission_paused)
+        self.assertEqual(self.coordinator.disabled_reason, "weights_changed")
+        self.assertEqual(self.coordinator._admission_ratio(), 0)
 
     def test_corrupt_prepared_contents_never_register_or_write_objects(self):
         for field in (

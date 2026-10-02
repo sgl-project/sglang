@@ -13,6 +13,10 @@ class CaptureMetrics:
         "sampled_out",
         "adaptive_sampled_out",
         "excluded_disabled",
+        "excluded_paused",
+        "control_pause",
+        "control_resume",
+        "control_abort",
         "excluded_health_check",
         "excluded_length",
         "excluded_unsupported",
@@ -97,6 +101,9 @@ class CaptureMetrics:
         )
         self.disabled = gauge(
             "disabled", "One when capture is disabled by a failure or shutdown."
+        )
+        self.paused = gauge(
+            "admission_paused", "One when an operator paused capture admission."
         )
         self.adaptive = gauge(
             "adaptive_enabled", "One when adaptive admission is configured."
@@ -246,6 +253,7 @@ class CaptureMetrics:
             )
         for metric, value in (
             (self.disabled, int(stats["disabled_reason"] is not None)),
+            (self.paused, int(stats.get("admission_paused", False))),
             (self.adaptive, int(admission["adaptive"])),
             (self.queued, stats["queued"]),
             (self.host_bytes, stats["host_pool"]["allocated_bytes"]),

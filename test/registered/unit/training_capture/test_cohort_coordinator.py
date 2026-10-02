@@ -139,6 +139,70 @@ class TestCohortCaptureCoordinator(CustomTestCase):
         self.assertEqual(coordinator.records, {})
         self.assertFalse(self.catalog.publications)
 
+    def test_pause_preserves_issued_ticket_but_stops_new_claims(self):
+        coordinator = self.coordinator
+        ticket = coordinator.service.claim("ab" * 32)
+        self.assertIsNotNone(ticket)
+        coordinator.control("pause")
+        self.assertEqual(coordinator._admission_ratio(), 0)
+        self.assertIsNone(coordinator.service.claim("cd" * 32))
+        handle = coordinator.service.bind(ticket, ticket.request_sha256)
+        self.assertIsNotNone(handle)
+        route = SimpleNamespace(handle=handle, execution_sha256="cd" * 32)
+        req = CaptureTestRequest("issued-before-pause")
+        with patch.object(coordinator.request_router, "bind", return_value=route):
+            coordinator.before_forward([req])
+        self.assertIsNotNone(req.training_capture_context)
+        # The handoff supervisor must not re-enable admission while paused.
+        time.sleep(0.15)
+        self.assertFalse(coordinator.service.admission_ready)
+        coordinator.control("abort")
+        self.assertIsNone(req.training_capture_context)
+        self.wait_until(lambda: not coordinator.service.records)
+        self.assertFalse(self.catalog.publications)
+        coordinator.control("resume")
+        self.wait_until(lambda: coordinator.stats()["states"]["available"] == 1)
+        self.assertIsNotNone(coordinator.service.claim("ef" * 32))
+
+    def test_abort_fences_unbound_ticket_across_resume(self):
+        coordinator = self.coordinator
+        ticket = coordinator.service.claim("ab" * 32)
+        self.assertIsNotNone(ticket)
+        coordinator.control("abort")
+        coordinator.control("resume")
+        self.assertIsNone(coordinator.service.bind(ticket, ticket.request_sha256))
+        self.wait_until(lambda: ticket.capture_id not in coordinator.service.records)
+        self.assertEqual(self.catalog.captures[ticket.capture_id]["state"], "FAILED")
+        self.wait_until(lambda: coordinator.stats()["states"]["available"] == 1)
+
+    def test_abort_bound_copy_preserves_background_ownership(self):
+        coordinator = self.coordinator
+        route = self.bound_route()
+        req = CaptureTestRequest("abort-copy")
+        with patch.object(coordinator.request_router, "bind", return_value=route):
+            coordinator.before_forward([req])
+        entered, release = threading.Event(), threading.Event()
+        self.gates.append(release)
+
+        def wait_for_copy():
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError("copy gate")
+
+        req.training_capture_context.context.last_event = SimpleNamespace(
+            synchronize=wait_for_copy
+        )
+        coordinator.control("abort")
+        self.assertTrue(entered.wait(5))
+        self.assertFalse(route.handle.drained)
+        self.assertEqual(self.resources.pool.stats()["filling"], 1)
+        coordinator.control("resume")
+        release.set()
+        self.wait_until(lambda: route.handle.drained)
+        self.wait_until(lambda: not coordinator.records)
+        self.assertTrue(route.handle.transfer_complete)
+        self.assertFalse(self.catalog.publications)
+
     def test_owned_group_remains_alive_until_transport_close_succeeds(self):
         coordinator = self.coordinator
         coordinator.owns_control_group = True

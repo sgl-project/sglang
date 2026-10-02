@@ -125,6 +125,49 @@ These counters are rank-local. In PP, the READY publication counter belongs to
 the auxiliary owner on the last stage; PP0 reporting zero READY does not imply
 that no global snapshot was published.
 
+### Operator Control
+
+`POST /control_training_capture` accepts `{"action":"pause"}`, `resume`, or
+`abort` on a server started with capture configured. It uses the same
+`ADMIN_OPTIONAL` authentication policy as the other management endpoints:
+an administrator key when configured, otherwise the API key when configured.
+With neither key configured, the endpoint is open. Invalid actions and servers
+without capture return HTTP 400.
+
+`pause` stops new request selection and background reservation refill. Existing
+captures, lease renewals and publication continue. `resume` removes this manual
+pause; it does not clear permanent disable reasons, reset adaptive cooldowns,
+change the sampling ratio, revive aborted captures, or start collection in the
+middle of a request that was skipped while paused.
+
+`abort` pauses admission and invalidates collecting contexts and distributed
+tickets that have not bound. It leaves ordinary generation running. D2H and
+Store actors retain buffer ownership until their existing completion/cleanup
+protocol finishes. Snapshots already handed to a writer may still publish;
+the action does not revoke READY samples or delete Store objects. Spare Host
+arenas and existing leases remain allocated, and a reservation already in
+flight can finish. This is not a request to unload the capture subsystem.
+
+The response contains `success` and a `results` list of scheduler replies,
+including each replying scheduler's capture `state`. Existing scheduler
+communication forwards the command through TP/PP. The response is not an
+all-rank drain barrier or a Store cleanup acknowledgement. In particular, the
+ingress rank's counters cannot certify that the final PP stage has published.
+Use per-rank metrics and the Catalog to verify final outcomes.
+
+For P/D, control each endpoint separately. Pause D first to stop new complete
+samples, leave P running while existing handoffs drain, then pause P. Resume P
+before D. For immediate collection abort, send `abort` to both endpoints; P
+fences its old teacher state even if a later `resume` precedes its handoff.
+An ordinary request can finish successfully while its capture is discarded.
+
+State exposes `admission_paused` separately from `disabled_reason`. Prometheus
+exports `sglang:training_capture_admission_paused` and bounded `control_pause`,
+`control_resume`, `control_abort`, `excluded_paused` event counters. The Grafana
+dashboard distinguishes manual pause from failure disable. See the
+[operator-control runbook](../../../../mooncake-study/experiments/CAPTURE_CONTROL.md)
+for commands, validation scope and asynchronous rollback limits.
+
 ### Reservation Refill
 
 The single-rank coordinator fills available Host slots with background Catalog
@@ -861,6 +904,7 @@ are never metric labels. Event/action/state/kind/metric/stage labels have bounde
 | `stage_max_seconds` | Gauge / `stage` | Lifetime maximum completed attempt, not a quantile |
 | `adaptive_enabled` | Gauge | Whether adaptive admission is configured |
 | `disabled` | Gauge | Capture disabled by a failure or shutdown, distinct from adaptive cooldown |
+| `admission_paused` | Gauge | Operator pause/abort blocks new capture, independently of failures |
 | `cooldown_seconds` | Gauge | Remaining adaptive cooldown |
 | `latency_control_enabled` | Gauge | Whether scheduler latency protection is configured |
 | `latency_blocked` | Gauge | New capture paused by a latency breach or missing recovery evidence |

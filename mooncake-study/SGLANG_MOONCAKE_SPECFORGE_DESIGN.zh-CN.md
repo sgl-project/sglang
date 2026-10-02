@@ -1439,6 +1439,32 @@ SLO 阈值由实际服务基线制定，未测之前不给出“低于某个百�
 
 训练/验证按会话或稳定业务来源分组切分，并固定评估时间窗与 teacher 版本。共享前缀和重复请求不能简单随机拆到两边后当作独立泛化结果；采样率、长度上限、失败样本和短回复过滤造成的分布变化需要报告。
 
+### 20.5 采集暂停与回滚
+
+SGLang 增加 `POST /control_training_capture`，请求为
+`{"action":"pause"}`、`{"action":"resume"}` 或 `{"action":"abort"}`。
+接口沿用服务的管理鉴权，要求启动时已经配置 capture；非法操作和未配置
+capture 返回 HTTP 400。它不暂停 target 推理，也不修改 teacher 身份或采样率。
+
+- `pause` 停止新样本准入和后台补充预留，已经准入的样本继续采集、续租和发布。
+- `resume` 只解除人工暂停，保留故障禁用、自适应限流和冷却状态；不恢复已作废
+  的样本，也不从请求中间开始补采。
+- `abort` 同时暂停准入、作废仍在采集的样本及未绑定的分布式 ticket。缓冲区
+  仍等 D2H/Store completion 后才能回收；已经交给 writer 的完整快照可以继续
+  发布。READY 撤销和对象删除仍属于 Catalog/GC 协议，不由此接口执行。
+
+控制请求通过现有 scheduler 通信传到 TP/PP 各 rank，不新增推理线程上的
+Catalog/Store RPC 或 collective。HTTP 响应是回复 scheduler 的控制结果，
+不是所有 rank 排空或 Store 清理完成的屏障。`admission_paused` 与故障禁用
+分别通过状态接口和 Prometheus 暴露，跨 rank 的最终结果仍由 Catalog 和各
+rank 指标确认。已存在的 Host arena 与 lease 不因暂停立即释放。
+
+P/D 分别控制两个服务端点：先暂停 D，保留 P 完成已有 handoff，再暂停 P；
+恢复时先 P 后 D。紧急终止向两端发送 `abort`。P 使用本地代次检查，防止
+终止前留下的 teacher 状态在恢复后进入 handoff。具体复现和验证范围见
+[采集控制实验](experiments/CAPTURE_CONTROL.md)。此能力不替代生产 SLO、
+真实多机灰度流程或训练收益验收。
+
 ## 21. 待定参数与研究风险
 
 以下不影响协议设计，但实施前必须写入 P0 lock/config:

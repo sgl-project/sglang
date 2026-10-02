@@ -95,13 +95,17 @@
     },
     {
       "id": 6,
-      "title": "Capture Disabled",
+      "title": "Capture Disabled or Paused",
+      "description": "Failure/shutdown disable and operator admission pause are independent. Pausing retains active publication and lease renewal.",
       "type": "stat",
       "gridPos": {"x": 12, "y": 16, "w": 6, "h": 8},
       "datasource": {"type": "prometheus", "uid": "$datasource"},
       "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
       "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value"},
-      "targets": [{"refId": "A", "expr": "sglang:training_capture_disabled{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}}", "instant": true}]
+      "targets": [
+        {"refId": "A", "expr": "sglang:training_capture_disabled{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} disabled", "instant": true},
+        {"refId": "B", "expr": "sglang:training_capture_admission_paused{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} paused", "instant": true}
+      ]
     },
     {
       "id": 7,

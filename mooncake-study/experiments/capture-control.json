@@ -1,0 +1,1282 @@
+{
+  "schema_version": 1,
+  "change": "Live training capture pause/resume/abort",
+  "parent_commit": "90ae45656e6def4c384d40d167a149e47c067239",
+  "branch": "codex/dspark-maas-capture",
+  "date_utc": "2026-10-02",
+  "runtime_lock": {
+    "path": "h100-runtime-lock.json",
+    "sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84"
+  },
+  "allocation": {
+    "job": "job-fe1ce1dcdea6-20261001023258",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "gpu_uuid": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "additional_gpu_allocations": 0
+  },
+  "validation": {
+    "passed_test_methods": 107,
+    "cpu_methods": 103,
+    "http_methods": 2,
+    "pd_regression_methods": 2,
+    "post_exit_snapshots": 16,
+    "unit_seconds": 80.134,
+    "http_eager_seconds": 49.126,
+    "http_graph_overlap_seconds": 36.576,
+    "pd_seconds": 173.327,
+    "final_schema_check": "01790957049175892454-e9aab08cdffb",
+    "black_python_files": 15,
+    "new_ruff_findings": 0,
+    "grafana_json_parsed": true
+  },
+  "source_hashes": [
+    {
+      "source": "/gpfs/user/fuxuanwei/sglang/mooncake-study/implementation/sglang",
+      "hashes": {
+        "python/sglang/srt/entrypoints/http_server.py": "bc9993d176cb8cac788e74a252936b5f38d863aed0bc9aa3fcdb10e2073624d3",
+        "python/sglang/srt/managers/io_struct.py": "64c91ad03d97a6687fe69f23a8804d2a38aa787b53916003d9a9b38096be66af",
+        "python/sglang/srt/managers/scheduler.py": "c8457d7b0b7f638bba75d9b32416a7e9fbf43e73b77763d269ed31cbda58602a",
+        "python/sglang/srt/managers/tokenizer_control_mixin.py": "6f3ad7995a13545bd7faf77d81de2ab3b02d4bc07fbec440e7dd1aa1db50182a",
+        "python/sglang/srt/training_capture/coordinator.py": "02ccbb75d426f704f7407ba364e6a098a76d4b2ff5f90feb74b892efa4d27355",
+        "python/sglang/srt/training_capture/cohort_coordinator.py": "b1f4d340cab3b2400e7415c17773b27510524f8d3df55c6ec8af89455e3504f1",
+        "python/sglang/srt/training_capture/cohort_service.py": "60f8578cf250b4f3dbf97b15d67a2c78a67eb6b836a5bcda85dfdaf90ecf9324",
+        "python/sglang/srt/training_capture/pd_capture.py": "ea2a78c9f662f7914da840dcba443404fc69687f29fa50d8c084c4674b07cf08",
+        "python/sglang/srt/training_capture/metrics.py": "422f9522d27718ed015c354c9b1ad7bb6c9b49f366a4e8b02de083f7e424ac1f",
+        "test/registered/unit/training_capture/test_coordinator.py": "f22f138d9ccef586eb63422b12de92ce22af49a8cc7b8260c40081255d7b3526",
+        "test/registered/unit/training_capture/test_cohort_coordinator.py": "f6564a7eba420d965b4679e864e228dbbf456c7893966b4768bb1110b01df377",
+        "test/registered/unit/training_capture/test_cohort_service.py": "a5f96f95e9ea231bee318211c6d49f4839251cd76ffa1dbfb08549a0190da056",
+        "test/registered/unit/training_capture/test_pd_capture.py": "6e47e01f44073c4a8bf36bb6b86cf648cc882d22a3cfa8cab1a3db2b0dfacd39",
+        "test/registered/unit/training_capture/test_metrics.py": "6a25a1e6dfd76b7031a25d84f17634c50d3b2edd151fe33e8d0a742d07af652b",
+        "test/registered/storage/test_training_capture_control.py": "be7d7ec6af108b3098f07dc0287b0094e3d188fb5dd80fe5c9076e9d756db7a5",
+        "examples/monitoring/grafana/dashboards/json/training-capture-dashboard.json": "7fb197341248a1322b745f424db788eb5a3a745c7b18b22dd892d61b3f766328"
+      }
+    },
+    {
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v3",
+      "hashes": {
+        "python/sglang/srt/entrypoints/http_server.py": "bc9993d176cb8cac788e74a252936b5f38d863aed0bc9aa3fcdb10e2073624d3",
+        "python/sglang/srt/managers/io_struct.py": "f1631d874d024e8a377827f0b83f8d43fe53ad4a2036baccae62dc4c431d1118",
+        "python/sglang/srt/managers/scheduler.py": "c8457d7b0b7f638bba75d9b32416a7e9fbf43e73b77763d269ed31cbda58602a",
+        "python/sglang/srt/managers/tokenizer_control_mixin.py": "66f4e13996ecf2f338a668652983592c1560b0eb3cd4b5a7c19d096f448036c7",
+        "python/sglang/srt/training_capture/coordinator.py": "02ccbb75d426f704f7407ba364e6a098a76d4b2ff5f90feb74b892efa4d27355",
+        "python/sglang/srt/training_capture/cohort_coordinator.py": "b1f4d340cab3b2400e7415c17773b27510524f8d3df55c6ec8af89455e3504f1",
+        "python/sglang/srt/training_capture/cohort_service.py": "60f8578cf250b4f3dbf97b15d67a2c78a67eb6b836a5bcda85dfdaf90ecf9324",
+        "python/sglang/srt/training_capture/pd_capture.py": "ea2a78c9f662f7914da840dcba443404fc69687f29fa50d8c084c4674b07cf08",
+        "python/sglang/srt/training_capture/metrics.py": "422f9522d27718ed015c354c9b1ad7bb6c9b49f366a4e8b02de083f7e424ac1f",
+        "test/registered/unit/training_capture/test_coordinator.py": "f22f138d9ccef586eb63422b12de92ce22af49a8cc7b8260c40081255d7b3526",
+        "test/registered/unit/training_capture/test_cohort_coordinator.py": "f6564a7eba420d965b4679e864e228dbbf456c7893966b4768bb1110b01df377",
+        "test/registered/unit/training_capture/test_cohort_service.py": "a5f96f95e9ea231bee318211c6d49f4839251cd76ffa1dbfb08549a0190da056",
+        "test/registered/unit/training_capture/test_pd_capture.py": "6e47e01f44073c4a8bf36bb6b86cf648cc882d22a3cfa8cab1a3db2b0dfacd39",
+        "test/registered/unit/training_capture/test_metrics.py": "6a25a1e6dfd76b7031a25d84f17634c50d3b2edd151fe33e8d0a742d07af652b",
+        "test/registered/storage/test_training_capture_control.py": "8a6f8eb64f1f834bdab03717ee4fec41ee6c763eb5f51579beefad2c1227c2e0",
+        "examples/monitoring/grafana/dashboards/json/training-capture-dashboard.json": "7fb197341248a1322b745f424db788eb5a3a745c7b18b22dd892d61b3f766328"
+      }
+    },
+    {
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v4",
+      "hashes": {
+        "python/sglang/srt/entrypoints/http_server.py": "bc9993d176cb8cac788e74a252936b5f38d863aed0bc9aa3fcdb10e2073624d3",
+        "python/sglang/srt/managers/io_struct.py": "f1631d874d024e8a377827f0b83f8d43fe53ad4a2036baccae62dc4c431d1118",
+        "python/sglang/srt/managers/scheduler.py": "c8457d7b0b7f638bba75d9b32416a7e9fbf43e73b77763d269ed31cbda58602a",
+        "python/sglang/srt/managers/tokenizer_control_mixin.py": "66f4e13996ecf2f338a668652983592c1560b0eb3cd4b5a7c19d096f448036c7",
+        "python/sglang/srt/training_capture/coordinator.py": "02ccbb75d426f704f7407ba364e6a098a76d4b2ff5f90feb74b892efa4d27355",
+        "python/sglang/srt/training_capture/cohort_coordinator.py": "b1f4d340cab3b2400e7415c17773b27510524f8d3df55c6ec8af89455e3504f1",
+        "python/sglang/srt/training_capture/cohort_service.py": "60f8578cf250b4f3dbf97b15d67a2c78a67eb6b836a5bcda85dfdaf90ecf9324",
+        "python/sglang/srt/training_capture/pd_capture.py": "ea2a78c9f662f7914da840dcba443404fc69687f29fa50d8c084c4674b07cf08",
+        "python/sglang/srt/training_capture/metrics.py": "422f9522d27718ed015c354c9b1ad7bb6c9b49f366a4e8b02de083f7e424ac1f",
+        "test/registered/unit/training_capture/test_coordinator.py": "f22f138d9ccef586eb63422b12de92ce22af49a8cc7b8260c40081255d7b3526",
+        "test/registered/unit/training_capture/test_cohort_coordinator.py": "f6564a7eba420d965b4679e864e228dbbf456c7893966b4768bb1110b01df377",
+        "test/registered/unit/training_capture/test_cohort_service.py": "a5f96f95e9ea231bee318211c6d49f4839251cd76ffa1dbfb08549a0190da056",
+        "test/registered/unit/training_capture/test_pd_capture.py": "6e47e01f44073c4a8bf36bb6b86cf648cc882d22a3cfa8cab1a3db2b0dfacd39",
+        "test/registered/unit/training_capture/test_metrics.py": "6a25a1e6dfd76b7031a25d84f17634c50d3b2edd151fe33e8d0a742d07af652b",
+        "test/registered/storage/test_training_capture_control.py": "587db2f5565b3a28d14ff9afdc3416493190705c0e9bcc431f91aab5164496e2",
+        "examples/monitoring/grafana/dashboards/json/training-capture-dashboard.json": "7fb197341248a1322b745f424db788eb5a3a745c7b18b22dd892d61b3f766328"
+      }
+    },
+    {
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-final",
+      "hashes": {
+        "python/sglang/srt/entrypoints/http_server.py": "bc9993d176cb8cac788e74a252936b5f38d863aed0bc9aa3fcdb10e2073624d3",
+        "python/sglang/srt/managers/io_struct.py": "64c91ad03d97a6687fe69f23a8804d2a38aa787b53916003d9a9b38096be66af",
+        "python/sglang/srt/managers/scheduler.py": "c8457d7b0b7f638bba75d9b32416a7e9fbf43e73b77763d269ed31cbda58602a",
+        "python/sglang/srt/managers/tokenizer_control_mixin.py": "6f3ad7995a13545bd7faf77d81de2ab3b02d4bc07fbec440e7dd1aa1db50182a",
+        "python/sglang/srt/training_capture/coordinator.py": "02ccbb75d426f704f7407ba364e6a098a76d4b2ff5f90feb74b892efa4d27355",
+        "python/sglang/srt/training_capture/cohort_coordinator.py": "b1f4d340cab3b2400e7415c17773b27510524f8d3df55c6ec8af89455e3504f1",
+        "python/sglang/srt/training_capture/cohort_service.py": "60f8578cf250b4f3dbf97b15d67a2c78a67eb6b836a5bcda85dfdaf90ecf9324",
+        "python/sglang/srt/training_capture/pd_capture.py": "ea2a78c9f662f7914da840dcba443404fc69687f29fa50d8c084c4674b07cf08",
+        "python/sglang/srt/training_capture/metrics.py": "422f9522d27718ed015c354c9b1ad7bb6c9b49f366a4e8b02de083f7e424ac1f",
+        "test/registered/unit/training_capture/test_coordinator.py": "f22f138d9ccef586eb63422b12de92ce22af49a8cc7b8260c40081255d7b3526",
+        "test/registered/unit/training_capture/test_cohort_coordinator.py": "f6564a7eba420d965b4679e864e228dbbf456c7893966b4768bb1110b01df377",
+        "test/registered/unit/training_capture/test_cohort_service.py": "a5f96f95e9ea231bee318211c6d49f4839251cd76ffa1dbfb08549a0190da056",
+        "test/registered/unit/training_capture/test_pd_capture.py": "6e47e01f44073c4a8bf36bb6b86cf648cc882d22a3cfa8cab1a3db2b0dfacd39",
+        "test/registered/unit/training_capture/test_metrics.py": "6a25a1e6dfd76b7031a25d84f17634c50d3b2edd151fe33e8d0a742d07af652b",
+        "test/registered/storage/test_training_capture_control.py": "be7d7ec6af108b3098f07dc0287b0094e3d188fb5dd80fe5c9076e9d756db7a5",
+        "examples/monitoring/grafana/dashboards/json/training-capture-dashboard.json": "7fb197341248a1322b745f424db788eb5a3a745c7b18b22dd892d61b3f766328"
+      }
+    }
+  ],
+  "runtime_states": [
+    {
+      "id": "01790956196564215278-85cff0a67a54",
+      "stats": {
+        "graph_overlap": false,
+        "control_final_state": {
+          "counters": {
+            "considered": 7,
+            "excluded_health_check": 1,
+            "admitted": 4,
+            "eager_forwards": 306,
+            "sealed": 3,
+            "writer_started": 4,
+            "copies_completed": 4,
+            "snapshot_built": 3,
+            "ready": 3,
+            "control_pause": 3,
+            "excluded_paused": 2,
+            "control_resume": 3,
+            "failed_operator_aborted": 1,
+            "control_abort": 1
+          },
+          "disabled_reason": null,
+          "admission_paused": true,
+          "enable_overlap": false,
+          "reservations": 4,
+          "states": {
+            "available": 4
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "stage_timings": {
+            "queue_wait": {
+              "calls": 4,
+              "errors": 0,
+              "seconds": 0.0005795210599899292,
+              "max_seconds": 0.0002675168216228485
+            },
+            "copy_wait": {
+              "calls": 4,
+              "errors": 0,
+              "seconds": 0.00016324222087860107,
+              "max_seconds": 0.00007189437747001648
+            },
+            "snapshot_build": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.011508390307426453,
+              "max_seconds": 0.005084265023469925
+            },
+            "validation": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.020805686712265015,
+              "max_seconds": 0.012902375310659409
+            },
+            "catalog_register": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.0039529986679553986,
+              "max_seconds": 0.0015151537954807281
+            },
+            "store_payload": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.011048000305891037,
+              "max_seconds": 0.006078291684389114
+            },
+            "catalog_written": {
+              "calls": 6,
+              "errors": 0,
+              "seconds": 0.05169330909848213,
+              "max_seconds": 0.04761559143662453
+            },
+            "journal_save": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.0029170364141464233,
+              "max_seconds": 0.0010842345654964447
+            },
+            "catalog_seal": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.00716085359454155,
+              "max_seconds": 0.003923632204532623
+            },
+            "store_manifest": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.001431778073310852,
+              "max_seconds": 0.0005355142056941986
+            },
+            "catalog_publish": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.0023987293243408203,
+              "max_seconds": 0.0008596815168857574
+            },
+            "journal_complete": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.0007894150912761688,
+              "max_seconds": 0.000265754759311676
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0,
+              "max_seconds": 0
+            }
+          },
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 0,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        }
+      }
+    },
+    {
+      "id": "01790956196894794094-f3338265b007",
+      "stats": {
+        "graph_overlap": true,
+        "control_final_state": {
+          "counters": {
+            "considered": 7,
+            "excluded_health_check": 1,
+            "admitted": 4,
+            "overlap_forwards": 311,
+            "eager_forwards": 4,
+            "cuda_graph_forwards": 307,
+            "sealed": 3,
+            "writer_started": 4,
+            "copies_completed": 4,
+            "snapshot_built": 3,
+            "ready": 3,
+            "control_pause": 3,
+            "excluded_paused": 2,
+            "control_resume": 3,
+            "failed_operator_aborted": 1,
+            "control_abort": 1
+          },
+          "disabled_reason": null,
+          "admission_paused": true,
+          "enable_overlap": true,
+          "reservations": 4,
+          "states": {
+            "available": 4
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "stage_timings": {
+            "queue_wait": {
+              "calls": 4,
+              "errors": 0,
+              "seconds": 0.0005632713437080383,
+              "max_seconds": 0.00025863945484161377
+            },
+            "copy_wait": {
+              "calls": 4,
+              "errors": 0,
+              "seconds": 0.0008125863969326019,
+              "max_seconds": 0.0006065517663955688
+            },
+            "snapshot_build": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.011225152760744095,
+              "max_seconds": 0.005082029849290848
+            },
+            "validation": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.020897038280963898,
+              "max_seconds": 0.013185359537601471
+            },
+            "catalog_register": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.0036153197288513184,
+              "max_seconds": 0.001315295696258545
+            },
+            "store_payload": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.011069260537624359,
+              "max_seconds": 0.0059766098856925964
+            },
+            "catalog_written": {
+              "calls": 6,
+              "errors": 0,
+              "seconds": 0.005664847791194916,
+              "max_seconds": 0.001263197511434555
+            },
+            "journal_save": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.002681732177734375,
+              "max_seconds": 0.0010822825133800507
+            },
+            "catalog_seal": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.007189016789197922,
+              "max_seconds": 0.003948245197534561
+            },
+            "store_manifest": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.001382332295179367,
+              "max_seconds": 0.0005497895181179047
+            },
+            "catalog_publish": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.0028548091650009155,
+              "max_seconds": 0.001147158443927765
+            },
+            "journal_complete": {
+              "calls": 3,
+              "errors": 0,
+              "seconds": 0.0017264969646930695,
+              "max_seconds": 0.0009932555258274078
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0,
+              "max_seconds": 0
+            }
+          },
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 0,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        }
+      }
+    }
+  ],
+  "jobs": [
+    {
+      "id": "01790955514388509680-074a648e4fd0",
+      "name": "unit_initial_bad_module_path",
+      "failure": "The stdlib test package shadowed test.registered; no test cases ran.",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v1",
+      "terminal": {
+        "job_id": "01790955514388509680-074a648e4fd0",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790955515.4679763,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790955514388509680-074a648e4fd0.log"
+      }
+    },
+    {
+      "id": "01790955514739538438-a7279701f5c9",
+      "name": "http_v1_invalid_status_expectation",
+      "failure": "Expected 422 for malformed actions; existing HTTP validation returns 400.",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v1",
+      "terminal": {
+        "job_id": "01790955514739538438-a7279701f5c9",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790955586.147548,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790955514739538438-a7279701f5c9.log"
+      }
+    },
+    {
+      "id": "01790955601460561359-6285848faeea",
+      "name": "unit_v1_refill_failure",
+      "failure": "101 of 102 methods passed; coordinator test exposed reservation refill ignoring readiness. Fixed before v3.",
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v1",
+      "terminal": {
+        "job_id": "01790955601460561359-6285848faeea",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790955704.8447657,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790955601460561359-6285848faeea.log"
+      }
+    },
+    {
+      "name": "unit_v3",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v3/test/registered/unit/training_capture",
+      "args": [
+        "-m",
+        "unittest",
+        "test_coordinator",
+        "test_cohort_coordinator",
+        "test_pd_capture",
+        "test_metrics",
+        "test_request_router",
+        "test_cohort_service",
+        "-v"
+      ],
+      "timeout": 900,
+      "cpu": true,
+      "command": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v3/test/registered/unit/training_capture",
+        "--timeout-seconds",
+        "900",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v3/python",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "CUDA_VISIBLE_DEVICES=999",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "unittest",
+        "test_coordinator",
+        "test_cohort_coordinator",
+        "test_pd_capture",
+        "test_metrics",
+        "test_request_router",
+        "test_cohort_service",
+        "-v"
+      ],
+      "id": "01790955971085003936-cd670ad63a29",
+      "terminal": {
+        "job_id": "01790955971085003936-cd670ad63a29",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790956067.4657023,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790955971085003936-cd670ad63a29.log"
+      }
+    },
+    {
+      "name": "http_runtime_v3",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v3",
+      "args": [
+        "test/registered/storage/test_training_capture_control.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "-v"
+      ],
+      "timeout": 600,
+      "command": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v3",
+        "--timeout-seconds",
+        "600",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v3/python",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_control.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "-v"
+      ],
+      "id": "01790955971411599050-6ecaa21d8976",
+      "terminal": {
+        "job_id": "01790955971411599050-6ecaa21d8976",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790956127.3704607,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790955971411599050-6ecaa21d8976.log"
+      }
+    },
+    {
+      "name": "http_eager_v4",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v4",
+      "args": [
+        "test/registered/storage/test_training_capture_control.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "-v"
+      ],
+      "timeout": 600,
+      "command": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v4",
+        "--timeout-seconds",
+        "600",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v4/python",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_control.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "-v"
+      ],
+      "id": "01790956196564215278-85cff0a67a54",
+      "terminal": {
+        "job_id": "01790956196564215278-85cff0a67a54",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790956259.567711,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790956196564215278-85cff0a67a54.log"
+      }
+    },
+    {
+      "name": "http_graph_overlap_v4",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v4",
+      "args": [
+        "test/registered/storage/test_training_capture_control.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--cuda-graph-overlap",
+        "-v"
+      ],
+      "timeout": 600,
+      "command": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v4",
+        "--timeout-seconds",
+        "600",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v4/python",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_control.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--cuda-graph-overlap",
+        "-v"
+      ],
+      "id": "01790956196894794094-f3338265b007",
+      "terminal": {
+        "job_id": "01790956196894794094-f3338265b007",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790956307.1856341,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790956196894794094-f3338265b007.log"
+      }
+    },
+    {
+      "name": "pd_regression_v4",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v4",
+      "args": [
+        "test/registered/storage/test_training_capture_pd.py",
+        "-v"
+      ],
+      "timeout": 900,
+      "extra": [
+        "TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      ],
+      "command": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v4",
+        "--timeout-seconds",
+        "900",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-v4/python",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_pd.py",
+        "-v"
+      ],
+      "id": "01790956197235188513-ab4993c662d3",
+      "terminal": {
+        "job_id": "01790956197235188513-ab4993c662d3",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790956491.6201868,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790956197235188513-ab4993c662d3.log"
+      }
+    },
+    {
+      "name": "final_wire_schema",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-final",
+      "args": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-c",
+        "import msgspec\nfrom types import SimpleNamespace\nfrom sglang.srt.managers.io_struct import ControlTrainingCaptureReqInput as Input, ControlTrainingCaptureReqOutput as Output\nfrom sglang.srt.managers.scheduler import Scheduler\nfrom sglang.srt.managers.tokenizer_control_mixin import _COMMUNICATOR_SPECS\nfor action in (\"pause\", \"resume\", \"abort\"):\n    value = msgspec.json.decode(msgspec.json.encode({\"action\": action}), type=Input)\n    assert msgspec.msgpack.decode(msgspec.msgpack.encode(value), type=Input).action == action\nfor payload in (b'{\"action\":\"invalid\"}', b'{\"action\":true}', b'{}'):\n    try:\n        msgspec.json.decode(payload, type=Input)\n    except msgspec.ValidationError:\n        pass\n    else:\n        raise AssertionError(payload)\nfor state in (None, {\"admission_paused\": True, \"disabled_reason\": \"weights_changed\"}):\n    value = Output(success=True, message=\"test\", state=state)\n    assert msgspec.msgpack.decode(msgspec.msgpack.encode(value), type=Output) == value\nreply = Scheduler.control_training_capture(SimpleNamespace(tp_worker=SimpleNamespace(training_capture=None)), Input(action=\"pause\"))\nassert not reply.success and reply.state is None\nassert (\"control_training_capture\", Output) in _COMMUNICATOR_SPECS\nprint(\"Final control IPC schema and unconfigured scheduler checks passed.\")\n"
+      ],
+      "command": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-final",
+        "--timeout-seconds",
+        "120",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-final/python",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "CUDA_VISIBLE_DEVICES=999",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-c",
+        "import msgspec\nfrom types import SimpleNamespace\nfrom sglang.srt.managers.io_struct import ControlTrainingCaptureReqInput as Input, ControlTrainingCaptureReqOutput as Output\nfrom sglang.srt.managers.scheduler import Scheduler\nfrom sglang.srt.managers.tokenizer_control_mixin import _COMMUNICATOR_SPECS\nfor action in (\"pause\", \"resume\", \"abort\"):\n    value = msgspec.json.decode(msgspec.json.encode({\"action\": action}), type=Input)\n    assert msgspec.msgpack.decode(msgspec.msgpack.encode(value), type=Input).action == action\nfor payload in (b'{\"action\":\"invalid\"}', b'{\"action\":true}', b'{}'):\n    try:\n        msgspec.json.decode(payload, type=Input)\n    except msgspec.ValidationError:\n        pass\n    else:\n        raise AssertionError(payload)\nfor state in (None, {\"admission_paused\": True, \"disabled_reason\": \"weights_changed\"}):\n    value = Output(success=True, message=\"test\", state=state)\n    assert msgspec.msgpack.decode(msgspec.msgpack.encode(value), type=Output) == value\nreply = Scheduler.control_training_capture(SimpleNamespace(tp_worker=SimpleNamespace(training_capture=None)), Input(action=\"pause\"))\nassert not reply.success and reply.state is None\nassert (\"control_training_capture\", Output) in _COMMUNICATOR_SPECS\nprint(\"Final control IPC schema and unconfigured scheduler checks passed.\")\n"
+      ],
+      "id": "01790956794997500871-4a7c7b0d3695",
+      "cpu": true,
+      "terminal": {
+        "job_id": "01790956794997500871-4a7c7b0d3695",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790956810.7912931,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790956794997500871-4a7c7b0d3695.log"
+      }
+    },
+    {
+      "name": "final_wire_schema_corrected",
+      "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-final",
+      "command": [
+        "kubectl",
+        "exec",
+        "-n",
+        "qiji",
+        "job-fe1ce1dcdea6-20261001023258-master-0",
+        "-c",
+        "master",
+        "--",
+        "python3",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+        "--state-dir",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+        "submit",
+        "--cwd",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-final",
+        "--timeout-seconds",
+        "120",
+        "--env",
+        "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-capture-control-final/python",
+        "--env",
+        "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--env",
+        "OMP_NUM_THREADS=1",
+        "--env",
+        "CUDA_VISIBLE_DEVICES=999",
+        "--",
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-c",
+        "import msgspec\nfrom types import SimpleNamespace\nfrom sglang.srt.managers.io_struct import ControlTrainingCaptureReqInput as Input, ControlTrainingCaptureReqOutput as Output\nfrom sglang.srt.managers.scheduler import Scheduler\nfrom sglang.srt.managers.tokenizer_control_mixin import _COMMUNICATOR_SPECS\nfor action in (\"pause\", \"resume\", \"abort\"):\n    value = Input(action=action)\n    assert msgspec.msgpack.decode(msgspec.msgpack.encode(value), type=Input).action == action\nfor payload in (msgspec.msgpack.encode(Input(action=\"invalid\")), msgspec.msgpack.encode(Input(action=True)), msgspec.msgpack.encode([])):\n    try:\n        msgspec.msgpack.decode(payload, type=Input)\n    except msgspec.ValidationError:\n        pass\n    else:\n        raise AssertionError(payload)\nfor state in (None, {\"admission_paused\": True, \"disabled_reason\": \"weights_changed\"}):\n    value = Output(success=True, message=\"test\", state=state)\n    assert msgspec.msgpack.decode(msgspec.msgpack.encode(value), type=Output) == value\nreply = Scheduler.control_training_capture(SimpleNamespace(tp_worker=SimpleNamespace(training_capture=None)), Input(action=\"pause\"))\nassert not reply.success and reply.state is None\nassert (\"control_training_capture\", Output) in _COMMUNICATOR_SPECS\nprint(\"Final control IPC schema and unconfigured scheduler checks passed.\")\n"
+      ],
+      "id": "01790957049175892454-e9aab08cdffb",
+      "cpu": true,
+      "terminal": {
+        "job_id": "01790957049175892454-e9aab08cdffb",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790957061.5092838,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790957049175892454-e9aab08cdffb.log"
+      }
+    }
+  ],
+  "artifact_sha256": {
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790955514388509680-074a648e4fd0.json": "bb0c27c6881ac120e55962463858915826d5cac7faed0f760581a1391dd2d33a",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790955514388509680-074a648e4fd0.log": "70b6256d9b233f7256626171dcb55c3354a1a064027b9f4d5cc79d349e31e9ea",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790955514739538438-a7279701f5c9.json": "22514a1e84b60e5a3babc0f2ecc53bf40ffb18840d45f3bded1e49c04b2542c2",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790955514739538438-a7279701f5c9.log": "18d924f24587885713b1fd4b08f0a5a34345ad0f93265378781a29548a0f56ad",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790955601460561359-6285848faeea.json": "7712076f1eb156f6767e28373d32850605125b6b9512b52d532dc15c770b7ca2",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790955601460561359-6285848faeea.log": "a14e195cbae4e7230901c3f63d7c79154fe5063a413bebc4ef20054a828bbe67",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790955971085003936-cd670ad63a29.json": "cf4daf422e71aba249b6ffb511551c00a71b0ea108bc9f6d17fcb976ec21c308",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790955971085003936-cd670ad63a29.log": "35dc3199166b018f88a2117ee2fb5d9d3d8edc0394f663f7de0300ec5d1c6682",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790955971411599050-6ecaa21d8976.json": "bdb560f2d56cf17e80f9981e902886e496bfac59219d53e484b979e83ed163ed",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790955971411599050-6ecaa21d8976.log": "a85f9031639a9610c300d55c6a6ba8bf928660651745c73ee89c7e2a240f044a",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790956196564215278-85cff0a67a54.json": "89a9d2b5d21fc05eb4c885b64d98263ab4592e53715be5973cd3844758170ad1",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790956196564215278-85cff0a67a54.log": "59e88760b4baa601ec7a0b428c52b3188de0577de4144f10ff9530dcb754681e",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790956196894794094-f3338265b007.json": "5cb51315f75e8ccb7ac9fbf97e350fb315f1b2437669cf8ca26454cbbf7e4e6b",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790956196894794094-f3338265b007.log": "1fd32df3dec822280685dad4d3a7a9ebac33099707913a81abba769b0ea6bf16",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790956197235188513-ab4993c662d3.json": "1dbd6c19056e3a0cb3a17d99f581280663831bfa68061aff453419e1a2a9d6cb",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790956197235188513-ab4993c662d3.log": "813e41ab8a15ad0e256598f141d08e48f4162e92adeea08c34f1b718874d2c71",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790956794997500871-4a7c7b0d3695.json": "e3527f5ad84fc25de68f904d18ac8e113dc40d224e70fe64058f7bdb64c6a1fb",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790956794997500871-4a7c7b0d3695.log": "c57643606b6b72d985030c2f99252e3287fc99bf8940b7886ca589fd9fbaca1f",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790957049175892454-e9aab08cdffb.json": "a0dc617c32b26dfeb5dd9edc5931ce8c7fc69b2170106ba795b67dba7534c370",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790957049175892454-e9aab08cdffb.log": "9024790db36949db099fda018b10415762d4700702eebb9e8b6f0ae7654fa618"
+  },
+  "lint_comparison": [
+    {
+      "file": "python/sglang/srt/training_capture/coordinator.py",
+      "baseline": true,
+      "result": [
+        {
+          "code": "BLE001",
+          "count": 9
+        }
+      ]
+    },
+    {
+      "file": "python/sglang/srt/entrypoints/http_server.py",
+      "baseline": true,
+      "result": [
+        {
+          "code": "ASYNC210",
+          "count": 1
+        },
+        {
+          "code": "B008",
+          "count": 2
+        },
+        {
+          "code": "BLE001",
+          "count": 11
+        },
+        {
+          "code": "C408",
+          "count": 3
+        },
+        {
+          "code": "F541",
+          "count": 1
+        },
+        {
+          "code": "F811",
+          "count": 1
+        },
+        {
+          "code": "I001",
+          "count": 1
+        },
+        {
+          "code": "PERF102",
+          "count": 1
+        },
+        {
+          "code": "PIE790",
+          "count": 1
+        },
+        {
+          "code": "PLW1508",
+          "count": 2
+        },
+        {
+          "code": "RUF010",
+          "count": 1
+        },
+        {
+          "code": "RUF013",
+          "count": 2
+        },
+        {
+          "code": "SIM115",
+          "count": 1
+        },
+        {
+          "code": "TRY002",
+          "count": 1
+        },
+        {
+          "code": "UP006",
+          "count": 8
+        },
+        {
+          "code": "UP007",
+          "count": 2
+        },
+        {
+          "code": "UP035",
+          "count": 3
+        },
+        {
+          "code": "UP045",
+          "count": 9
+        }
+      ]
+    },
+    {
+      "file": "python/sglang/srt/managers/io_struct.py",
+      "baseline": true,
+      "result": [
+        {
+          "code": "I001",
+          "count": 1
+        },
+        {
+          "code": "PIE790",
+          "count": 1
+        },
+        {
+          "code": "PIE810",
+          "count": 1
+        },
+        {
+          "code": "TRY004",
+          "count": 1
+        },
+        {
+          "code": "UP006",
+          "count": 251
+        },
+        {
+          "code": "UP007",
+          "count": 50
+        },
+        {
+          "code": "UP035",
+          "count": 4
+        },
+        {
+          "code": "UP045",
+          "count": 298
+        }
+      ]
+    },
+    {
+      "file": "python/sglang/srt/managers/scheduler.py",
+      "baseline": true,
+      "result": [
+        {
+          "code": "BLE001",
+          "count": 11
+        },
+        {
+          "code": "C405",
+          "count": 1
+        },
+        {
+          "code": "C408",
+          "count": 2
+        },
+        {
+          "code": "F811",
+          "count": 2
+        },
+        {
+          "code": "LOG015",
+          "count": 7
+        },
+        {
+          "code": "PLR1711",
+          "count": 2
+        },
+        {
+          "code": "PLR1730",
+          "count": 1
+        },
+        {
+          "code": "RET501",
+          "count": 2
+        },
+        {
+          "code": "RUF010",
+          "count": 1
+        },
+        {
+          "code": "S110",
+          "count": 3
+        },
+        {
+          "code": "SIM102",
+          "count": 5
+        },
+        {
+          "code": "UP006",
+          "count": 14
+        },
+        {
+          "code": "UP007",
+          "count": 4
+        },
+        {
+          "code": "UP035",
+          "count": 5
+        },
+        {
+          "code": "UP045",
+          "count": 29
+        }
+      ]
+    },
+    {
+      "file": "python/sglang/srt/managers/tokenizer_control_mixin.py",
+      "baseline": true,
+      "result": [
+        {
+          "code": "BLE001",
+          "count": 2
+        },
+        {
+          "code": "I001",
+          "count": 1
+        },
+        {
+          "code": "RUF010",
+          "count": 1
+        },
+        {
+          "code": "SIM102",
+          "count": 1
+        },
+        {
+          "code": "SIM211",
+          "count": 1
+        },
+        {
+          "code": "UP006",
+          "count": 22
+        },
+        {
+          "code": "UP035",
+          "count": 3
+        },
+        {
+          "code": "UP045",
+          "count": 29
+        }
+      ]
+    },
+    {
+      "file": "python/sglang/srt/training_capture/coordinator.py",
+      "baseline": false,
+      "result": [
+        {
+          "code": "BLE001",
+          "count": 9
+        }
+      ]
+    },
+    {
+      "file": "python/sglang/srt/entrypoints/http_server.py",
+      "baseline": false,
+      "result": [
+        {
+          "code": "ASYNC210",
+          "count": 1
+        },
+        {
+          "code": "B008",
+          "count": 2
+        },
+        {
+          "code": "BLE001",
+          "count": 11
+        },
+        {
+          "code": "C408",
+          "count": 3
+        },
+        {
+          "code": "F541",
+          "count": 1
+        },
+        {
+          "code": "F811",
+          "count": 1
+        },
+        {
+          "code": "PERF102",
+          "count": 1
+        },
+        {
+          "code": "PIE790",
+          "count": 1
+        },
+        {
+          "code": "PLW1508",
+          "count": 2
+        },
+        {
+          "code": "RUF010",
+          "count": 1
+        },
+        {
+          "code": "RUF013",
+          "count": 2
+        },
+        {
+          "code": "SIM115",
+          "count": 1
+        },
+        {
+          "code": "TRY002",
+          "count": 1
+        },
+        {
+          "code": "UP006",
+          "count": 8
+        },
+        {
+          "code": "UP007",
+          "count": 2
+        },
+        {
+          "code": "UP035",
+          "count": 3
+        },
+        {
+          "code": "UP045",
+          "count": 9
+        }
+      ]
+    },
+    {
+      "file": "python/sglang/srt/managers/io_struct.py",
+      "baseline": false,
+      "result": [
+        {
+          "code": "PIE790",
+          "count": 1
+        },
+        {
+          "code": "PIE810",
+          "count": 1
+        },
+        {
+          "code": "TRY004",
+          "count": 1
+        },
+        {
+          "code": "UP006",
+          "count": 251
+        },
+        {
+          "code": "UP007",
+          "count": 50
+        },
+        {
+          "code": "UP035",
+          "count": 4
+        },
+        {
+          "code": "UP045",
+          "count": 298
+        }
+      ]
+    },
+    {
+      "file": "python/sglang/srt/managers/scheduler.py",
+      "baseline": false,
+      "result": [
+        {
+          "code": "BLE001",
+          "count": 11
+        },
+        {
+          "code": "C405",
+          "count": 1
+        },
+        {
+          "code": "C408",
+          "count": 2
+        },
+        {
+          "code": "F811",
+          "count": 2
+        },
+        {
+          "code": "LOG015",
+          "count": 7
+        },
+        {
+          "code": "PLR1711",
+          "count": 2
+        },
+        {
+          "code": "PLR1730",
+          "count": 1
+        },
+        {
+          "code": "RET501",
+          "count": 2
+        },
+        {
+          "code": "RUF010",
+          "count": 1
+        },
+        {
+          "code": "S110",
+          "count": 3
+        },
+        {
+          "code": "SIM102",
+          "count": 5
+        },
+        {
+          "code": "UP006",
+          "count": 14
+        },
+        {
+          "code": "UP007",
+          "count": 4
+        },
+        {
+          "code": "UP035",
+          "count": 5
+        },
+        {
+          "code": "UP045",
+          "count": 29
+        }
+      ]
+    },
+    {
+      "file": "python/sglang/srt/managers/tokenizer_control_mixin.py",
+      "baseline": false,
+      "result": [
+        {
+          "code": "BLE001",
+          "count": 2
+        },
+        {
+          "code": "RUF010",
+          "count": 1
+        },
+        {
+          "code": "SIM102",
+          "count": 1
+        },
+        {
+          "code": "SIM211",
+          "count": 1
+        },
+        {
+          "code": "UP006",
+          "count": 22
+        },
+        {
+          "code": "UP035",
+          "count": 3
+        },
+        {
+          "code": "UP045",
+          "count": 29
+        }
+      ]
+    }
+  ],
+  "limits": [
+    "HTTP response is not an all-rank drain or Store-cleanup barrier.",
+    "Live multi-GPU TP/PP control and separate-endpoint P/D control not exercised.",
+    "The existing P/D regression exercises handoffs and cancellation, not the new HTTP route.",
+    "Only local TCP and a test Catalog in these runs; no production retention or rollout claim.",
+    "No production SLO or trained-model quality acceptance.",
+    "Grafana JSON validation only, not a live Grafana deployment."
+  ],
+  "annotation_only_final_changes": [
+    "Equivalent dict/union annotation on IPC response.",
+    "Equivalent built-in list return annotation in tokenizer helper.",
+    "ClassVar test header annotation."
+  ],
+  "outer_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+}

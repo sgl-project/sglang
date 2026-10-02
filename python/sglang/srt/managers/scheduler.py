@@ -122,6 +122,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ControlTrainingCaptureReqInput,
+    ControlTrainingCaptureReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -1597,6 +1599,7 @@ class Scheduler(
                 (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (ControlTrainingCaptureReqInput, self.control_training_capture),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -4385,6 +4388,19 @@ class Scheduler(
         ret.pop("custom_sigquit_handler", None)
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
+
+    def control_training_capture(self, recv_req: ControlTrainingCaptureReqInput):
+        capture = self.tp_worker.training_capture
+        if capture is None:
+            return ControlTrainingCaptureReqOutput(
+                success=False, message="Training capture is not configured."
+            )
+        capture.control(recv_req.action)
+        return ControlTrainingCaptureReqOutput(
+            success=True,
+            message="Capture control applied; publication and cleanup are asynchronous.",
+            state=msgspec_to_builtins(capture.stats()),
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args

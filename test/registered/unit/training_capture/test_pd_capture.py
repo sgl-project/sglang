@@ -168,6 +168,47 @@ class TestPDCapture(CustomTestCase):
         for name, value in expected.items():
             torch.testing.assert_close(tensors[name], value, rtol=0, atol=0)
 
+    def test_prefill_pause_drains_but_abort_epoch_survives_resume(self):
+        _, payload = self.begin()
+        old = self.prefill_request(payload)
+        state = old.training_capture_pd
+        self.prefill.control("pause")
+        self.assertTrue(self.prefill._live_state(state))
+        excluded = self.prefill_request(payload)
+        self.assertIsNone(excluded.training_capture_pd)
+        self.prefill.control("abort")
+        self.prefill.control("resume")
+        self.assertFalse(self.prefill._live_state(state))
+        self.prefill.before_forward([excluded])
+        self.assertIsNone(excluded.training_capture_pd)
+        with patch("sglang.srt.training_capture.pd_capture.capture_teacher") as teacher:
+            batch = SimpleNamespace(reqs=[old], seq_lens_cpu=[2])
+            self.prefill.after_forward(
+                batch,
+                SimpleNamespace(extend_seq_lens_cpu=[2]),
+                SimpleNamespace(next_token_logits=torch.zeros(1, 256)),
+            )
+            teacher.assert_not_called()
+            self.assertIsNone(self.prefill.pack_pp_handoffs(batch, [10]))
+        self.assertIsNone(self.prefill.finish_handoff(old))
+        fresh = self.prefill_request(payload)
+        self.assertTrue(self.prefill._live_state(fresh.training_capture_pd))
+
+    def test_decode_abort_rejects_late_prefill_handoff(self):
+        req, payload = self.begin()
+        record = req.training_capture_context
+        handoff, _ = self.handoff(payload)
+        self.decode.control("abort")
+        self.decode.control("resume")
+        req.output_ids = [10]
+        self.decode.accept_pd_handoff(req, handoff)
+        self.assertIsNone(req.training_capture_context)
+        self.wait_until(lambda: record.state == "done")
+        self.assertFalse(self.catalog.publications)
+        self.assertEqual(
+            self.catalog.captures[record.lease.capture_id]["state"], "FAILED"
+        )
+
     def test_pd_verify_trims_accepted_tail_after_length_or_eos(self):
         from sglang.srt.managers.schedule_batch import (
             FINISH_LENGTH,

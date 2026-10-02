@@ -98,6 +98,19 @@ class TestCaptureMetrics(CustomTestCase):
             "private-error-details", generate_latest(self.registry).decode()
         )
 
+    def test_operator_pause_has_its_own_gauge_and_bounded_action_counters(self):
+        self.stats["admission_paused"] = True
+        self.stats["counters"].update(control_pause=1, control_abort=2)
+        self.metrics.update(self.stats)
+        self.assertEqual(self.value("admission_paused"), 1)
+        self.assertEqual(self.value("disabled"), 0)
+        self.assertEqual(self.value("events_total", event="control_abort"), 2)
+        self.stats["admission_paused"] = False
+        self.stats["counters"]["control_resume"] = 1
+        self.metrics.update(self.stats)
+        self.assertEqual(self.value("admission_paused"), 0)
+        self.assertEqual(self.value("events_total", event="control_resume"), 1)
+
     def test_latency_series_distinguish_missing_observations_and_budget_breach(self):
         controller = CaptureAdmission(
             1.0,

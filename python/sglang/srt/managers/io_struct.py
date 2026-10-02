@@ -49,7 +49,6 @@ import torch
 import zmq
 import zmq.asyncio
 from pydantic import PlainValidator
-
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -1980,6 +1979,16 @@ class SetInternalStateReq(BaseReq, kw_only=True):
 
 class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
+
+
+class ControlTrainingCaptureReqInput(BaseReq, kw_only=True):
+    action: Literal["pause", "resume", "abort"]
+
+
+class ControlTrainingCaptureReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    state: dict[str, Any] | None = None
 
 
 class ProfileReqType(Enum):

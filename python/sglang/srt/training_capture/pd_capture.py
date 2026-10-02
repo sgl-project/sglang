@@ -6,7 +6,6 @@ from collections import Counter
 
 import msgspec
 import torch
-
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.training_capture.cohort_coordinator import CohortCaptureCoordinator
 from sglang.srt.training_capture.coordinator import CaptureCoordinator
@@ -25,6 +24,7 @@ from sglang.srt.training_capture.teacher import TeacherRows, capture_teacher
 
 class PrefillCaptureState(msgspec.Struct):
     context: CaptureTransferContext
+    epoch: int = 0
     teacher: TeacherRows | None = None
     handoff: bytes | None = None
     failed: bool = False
@@ -38,6 +38,8 @@ class PrefillCaptureCoordinator:
         self.contract_sha256 = contract_digest(teacher, kv)
         self.capture_mode = "pd_autoregressive"
         self.disabled_reason = None
+        self.admission_paused = False
+        self.abort_epoch = 0
         self.counters = Counter()
 
     _provenance = CaptureCoordinator._provenance
@@ -49,6 +51,7 @@ class PrefillCaptureCoordinator:
             req.training_capture_attempted = True
             if (
                 self.disabled_reason
+                or self.admission_paused
                 or req.disagg_kv_sender is None
                 or req.bootstrap_host == FAKE_BOOTSTRAP_HOST
                 or req.multimodal_inputs is not None
@@ -75,7 +78,9 @@ class PrefillCaptureCoordinator:
                     raise ContractError(
                         "prefill request does not match capture context"
                     )
-                req.training_capture_pd = PrefillCaptureState(context)
+                req.training_capture_pd = PrefillCaptureState(
+                    context, epoch=self.abort_epoch
+                )
                 self.counters["pd_selected"] += 1
             except Exception:  # noqa: BLE001 - Exclude the sample on failure.
                 self.counters["pd_context_rejected"] += 1
@@ -89,7 +94,7 @@ class PrefillCaptureCoordinator:
         for row, req in enumerate(batch.reqs):
             count = forward_batch.extend_seq_lens_cpu[row]
             state = req.training_capture_pd
-            if state is not None and int(batch.seq_lens_cpu[row]) == len(
+            if self._live_state(state) and int(batch.seq_lens_cpu[row]) == len(
                 req.origin_input_ids
             ):
                 try:
@@ -133,16 +138,21 @@ class PrefillCaptureCoordinator:
                 raise ContractError("PP handoff does not match the committed token")
         return state.handoff
 
+    def _live_state(self, state):
+        return (
+            state is not None
+            and not state.failed
+            and state.epoch == self.abort_epoch
+            and not self.disabled_reason
+        )
+
     def pack_pp_handoffs(self, batch, next_token_ids):
         """Attach bounded immutable rows to the existing PP output circulation."""
         payloads = [None] * len(batch.reqs)
         for row, req in enumerate(batch.reqs):
             state = req.training_capture_pd
-            if (
-                state is None
-                or state.failed
-                or self.disabled_reason
-                or int(batch.seq_lens_cpu[row]) != len(req.origin_input_ids)
+            if not self._live_state(state) or int(batch.seq_lens_cpu[row]) != len(
+                req.origin_input_ids
             ):
                 continue
             try:
@@ -155,11 +165,8 @@ class PrefillCaptureCoordinator:
     def accept_pp_handoffs(self, batch, payloads):
         for row, req in enumerate(batch.reqs):
             state = req.training_capture_pd
-            if (
-                state is None
-                or state.failed
-                or self.disabled_reason
-                or int(batch.seq_lens_cpu[row]) != len(req.origin_input_ids)
+            if not self._live_state(state) or int(batch.seq_lens_cpu[row]) != len(
+                req.origin_input_ids
             ):
                 continue
             try:
@@ -183,7 +190,7 @@ class PrefillCaptureCoordinator:
     def finish_handoff(self, req):
         state = req.training_capture_pd
         req.training_capture_pd = None
-        if state is None or state.failed or self.disabled_reason:
+        if not self._live_state(state):
             return None
         try:
             payload = self._encode_handoff(state, int(req.output_ids[0]))
@@ -202,6 +209,14 @@ class PrefillCaptureCoordinator:
     def disable(self, reason):
         self.disabled_reason = reason
 
+    def control(self, action):
+        if action not in ("pause", "resume", "abort"):
+            raise ContractError("capture action must be pause, resume or abort")
+        self.admission_paused = action != "resume"
+        if action == "abort":
+            self.abort_epoch += 1
+        self.counters["control_" + action] += 1
+
     def close(self):
         self.disable("closed")
         return True
@@ -210,6 +225,7 @@ class PrefillCaptureCoordinator:
         return {
             "role": "prefill_teacher",
             "disabled_reason": self.disabled_reason,
+            "admission_paused": self.admission_paused,
             "counters": dict(self.counters),
         }
 

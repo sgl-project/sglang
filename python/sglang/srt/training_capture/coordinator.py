@@ -289,6 +289,7 @@ class CaptureCoordinator:
         self.work = queue.Queue(maxsize=config.max_inflight_samples)
         self.counters = Counter()
         self.disabled_reason = None
+        self.admission_paused = False
         self.closed = False
         self.rng = random.Random(config.sample_seed)
         self.admission = CaptureAdmission(config.sample_ratio, config.adaptive)
@@ -346,6 +347,7 @@ class CaptureCoordinator:
             return {
                 "counters": dict(self.counters),
                 "disabled_reason": self.disabled_reason,
+                "admission_paused": self.admission_paused,
                 "enable_overlap": self.enable_overlap,
                 "reservations": len(self.records),
                 "states": dict(
@@ -357,7 +359,8 @@ class CaptureCoordinator:
                 "stage_timings": self.writer.timings.stats(),
                 "host_pool": self.pool.stats(),
                 "admission": self.admission.stats(
-                    time.monotonic(), disabled=self.disabled_reason is not None
+                    time.monotonic(),
+                    disabled=self.disabled_reason is not None or self.admission_paused,
                 ),
             }
 
@@ -387,6 +390,8 @@ class CaptureCoordinator:
 
     def _admission_ratio(self):
         with self.lock:
+            if self.admission_paused or self.disabled_reason is not None:
+                return 0.0
             if self.admission.config is None:
                 return self.config.sample_ratio
             now = time.monotonic()
@@ -485,8 +490,11 @@ class CaptureCoordinator:
                         self._admission_failure("catalog_error")
             self._admission_ratio()
             with self.lock:
-                can_reserve = self.disabled_reason is None and time.monotonic() >= max(
-                    self.admission.pause_until, self.reservation_retry_at
+                can_reserve = (
+                    self.disabled_reason is None
+                    and not self.admission_paused
+                    and time.monotonic()
+                    >= max(self.admission.pause_until, self.reservation_retry_at)
                 )
             if not self.stop.is_set() and can_reserve and self._reserve():
                 # Recheck leases and admission between successful reservations;
@@ -522,6 +530,9 @@ class CaptureCoordinator:
         self._count("considered")
         if self.disabled_reason:
             self._count("excluded_disabled")
+            return
+        if self.admission_paused:
+            self._count("excluded_paused")
             return
         ratio = self._admission_ratio()
         draw = self.rng.random()
@@ -968,6 +979,23 @@ class CaptureCoordinator:
             self._detach(req, record)
         except Exception:
             self._fail_request(req, record, "sequence_seal_failed")
+
+    def _set_admission_paused(self, paused):
+        with self.lock:
+            self.admission_paused = paused
+        self.lease_wake.set()
+
+    def control(self, action):
+        """Scheduler-thread control; Store and D2H cleanup remain asynchronous."""
+        if action not in ("pause", "resume", "abort"):
+            raise ContractError("capture action must be pause, resume or abort")
+        self._set_admission_paused(action != "resume")
+        if action == "abort":
+            for req in list(self.requests.values()):
+                self._fail_request(
+                    req, req.training_capture_context, "operator_aborted"
+                )
+        self._count("control_" + action)
 
     def disable(self, reason):
         with self.lock:

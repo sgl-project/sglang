@@ -190,6 +190,15 @@ class CaptureCohortService:
             self.wake.set()
             return handle
 
+    def cancel_unbound(self, reason: str):
+        """Fence tickets still in the inference pipeline, including peer claims."""
+        with self.lock:
+            for handle in self.records.values():
+                if not handle.bound:
+                    handle.available = False
+                    handle.invalid_reason = handle.invalid_reason or reason
+            self.wake.set()
+
     def _check_handle(self, handle):
         if (
             self.records.get(handle.cohort.lease.capture_id) is not handle
@@ -505,8 +514,10 @@ class CaptureCohortService:
 
         # Admission/stop changes during the exchange are applied on the NEXT
         # exchange. Every rank must choose reserve using the same voted state.
-        if not any(frame[0][0] for frame in frames) and (
-            len(self.records) < self.allocator.config.max_inflight_samples
+        if (
+            not any(frame[0][0] for frame in frames)
+            and all(frame[0][1] for frame in frames)
+            and len(self.records) < self.allocator.config.max_inflight_samples
         ):
             cohort = self.allocator.reserve()
             if cohort is not None:

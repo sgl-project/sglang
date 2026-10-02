@@ -8,7 +8,6 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
-
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -21,6 +20,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    ControlTrainingCaptureReqInput,
+    ControlTrainingCaptureReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -116,6 +117,7 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
+    ("control_training_capture", ControlTrainingCaptureReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
@@ -850,6 +852,12 @@ class TokenizerControlMixin:
             await self.set_internal_state_communicator(obj)
         )
         return [res.updated for res in responses]
+
+    async def control_training_capture(
+        self: TokenizerManager, obj: ControlTrainingCaptureReqInput
+    ) -> list[ControlTrainingCaptureReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.control_training_capture_communicator(obj)
 
     async def dumper_control(
         self: TokenizerManager, obj: DumperControlReqInput

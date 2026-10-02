@@ -185,7 +185,9 @@ def run_case(rank, root, endpoint, case):
         assert not service._cycle()
     ticket = claim(service, rank)
     handle = None
-    if case == "unbound_cancel" or (case == "late_bind" and rank == 0):
+    if case in ("unbound_cancel", "operator_abort_unbound") or (
+        case in ("late_bind", "operator_abort_mixed") and rank == 0
+    ):
         pass
     elif case == "identity" and rank == 2:
         assert service.bind(ticket, "cd" * 32) is None
@@ -208,7 +210,21 @@ def run_case(rank, root, endpoint, case):
     assert service.claim("cd" * 32) is None
     result = {"case": case, "capture_id": ticket.capture_id}
 
-    if case == "multiple":
+    if case in ("operator_abort_unbound", "operator_abort_mixed"):
+        if rank == 0:
+            service.set_admission_ready(False)
+            service.cancel_unbound("operator_aborted")
+        assert not service._cycle()
+        if handle is not None:
+            assert service.status(handle)[1] is not None
+            assert pool is None or pool.stats()["filling"] == 1
+        service.set_admission_ready(True)
+        assert service.bind(ticket, _FINGERPRINT) is None
+        finish_failed(service, handle)
+        service.stopping = True
+        assert service._cycle()
+        assert service.close(timeout=0)
+    elif case == "multiple":
         assert not service._cycle()
         second_ticket = claim(service, rank)
         second = service.bind(second_ticket, _FINGERPRINT)
@@ -416,6 +432,8 @@ def lifecycle_worker(rank, root, endpoint):
         "expiry",
         "late_bind",
         "unbound_cancel",
+        "operator_abort_unbound",
+        "operator_abort_mixed",
         "published",
         "inactive_draining",
         "control_failure",
