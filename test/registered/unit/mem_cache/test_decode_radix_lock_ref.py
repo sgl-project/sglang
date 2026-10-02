@@ -11,7 +11,7 @@ transfer scenarios identified in PR #19746:
    inc_lock_ref(get_new_prebuilt_batch) -> dec+inc(checkpoint) -> dec(release_kv_cache)
 
 3. Incremental transfer & failure (prefix match > 0, transfer fails)
-   inc_lock_ref(pop_preallocated) -> dec(unpin via release_kv_cache is_insert=False)
+   inc_lock_ref(pop_preallocated) -> dec(unpin via release_kv_cache)
 
 4. Full transfer & failure (prefix match == 0, transfer fails)
    no inc_lock_ref -> dec(root_node) is no-op since root lock_ref starts at 1
@@ -48,7 +48,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -259,8 +259,9 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Step 2: checkpoint (dec old lock, inc new lock)
         cache.checkpoint(req, up_to=req.extend_range.end)
 
-        # Step 3: release_kv_cache (insert, free the rest, dec lock)
+        # Step 3: final checkpoint, then release (free the rest, dec lock)
         req.finished_reason = "finished"
+        checkpoint_kv_cache(req, cache)
         release_kv_cache(req, cache)
 
         # Verify: all non-root nodes should have lock_ref == 0
@@ -309,8 +310,9 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Step 2: checkpoint (dec root=no-op, inc new leaf)
         cache.checkpoint(req, up_to=req.extend_range.end)
 
-        # Step 3: cache_finished_req (dec leaf)
+        # Step 3: final checkpoint, then release (dec leaf)
         req.finished_reason = "finished"
+        checkpoint_kv_cache(req, cache)
         release_kv_cache(req, cache)
 
         # Root lock unchanged, all nodes unlocked
@@ -325,7 +327,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         must preserve the matched prefix and release the full request-owned suffix.
 
         Flow: inc_lock_ref(pop_preallocated)
-              -> dec_lock_ref(unpin via release_kv_cache is_insert=False)
+              -> dec_lock_ref(unpin via release_kv_cache)
         """
         cache, req_to_token = _make_cache_with_pools()
 
@@ -358,7 +360,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         # Transfer fails -> discard without inserting
         cache.token_to_kv_pool_allocator.reset_mock()
-        release_kv_cache(req, cache, is_insert=False)
+        release_kv_cache(req, cache)
 
         ((indices, start_pos),) = (
             cache.token_to_kv_pool_allocator.free_segments.call_args.args[0]
@@ -404,6 +406,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         cache.token_to_kv_pool_allocator.reset_mock()
         req.finished_reason = "finished"
+        checkpoint_kv_cache(req, cache)
         release_kv_cache(req, cache)
 
         # The unnamed tail slot is freed as the segment past the radix key.
@@ -454,7 +457,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
 
         # Transfer fails -> discard without inserting; dec_lock_ref(root) is a no-op
-        release_kv_cache(req, cache, is_insert=False)
+        release_kv_cache(req, cache)
 
         # Root lock unchanged, nothing protected or evictable
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -700,6 +703,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
             cache.checkpoint(req, up_to=req.extend_range.end)
             req.finished_reason = "finished"
+            checkpoint_kv_cache(req, cache)
             release_kv_cache(req, cache)
 
         # After all iterations, root lock should be 1, no protected nodes

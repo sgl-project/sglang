@@ -996,8 +996,8 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.session.try_cache_finished_req(req)
 
     @rank_consensus(same_params=["req.rid", "inserted"])
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        if inserted:
+    def on_release(self, req: Req) -> None:
+        if req.kv.cache_finalized:
             return
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(req, is_finished=True)

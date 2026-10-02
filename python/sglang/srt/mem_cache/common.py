@@ -170,15 +170,20 @@ def free_kv_row_segments(
 
 
 def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
-    """Publish what the running request has computed so far, unless it is
-    barred from the tree."""
-    # The tree reads req.finished() to tell a checkpoint from the final
-    # insert; a finished request belongs in release_kv_cache.
-    assert not req.finished(), f"checkpointing finished request {req.rid}"
+    """Hand the tree what the request has computed so far; a finished request
+    hands over everything it owns and is marked ``cache_finalized``."""
     if req.skip_radix_cache_insert:
         return
 
-    tree_cache.checkpoint(req, up_to=req.extend_range.end)
+    if req.finished():
+        # The fill-id array lags output_ids until the next prepare_for_decode.
+        req.refresh_fill_ids()
+        up_to = req.owned_kv_len()
+    else:
+        up_to = req.extend_range.end
+    tree_cache.checkpoint(req, up_to=up_to)
+    if req.finished():
+        req.kv.cache_finalized = True
 
 
 def evict_from_tree_cache(
@@ -294,9 +299,9 @@ def discard_kv_cache_backup(
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    """Give the request's kv row back; with ``is_insert`` the tree first keeps
-    what it can key."""
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache):
+    """Give the request's kv row back: free what the tree does not own, drop
+    the lock, return the row. Nothing is inserted here; see ``checkpoint_kv_cache``."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -316,23 +321,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     owned_kv_len = req.owned_kv_len()
-    is_insert = is_insert and not req.skip_radix_cache_insert
-    if is_insert:
-        # A tree that takes over component state (mamba) must see the request
-        # finished, or the insert forks the state and the slot leaks.
-        assert req.finished() or not tree_cache.supports_mamba(), (
-            f"releasing unfinished request {req.rid} into a mamba tree"
-        )
-        # The fill-id array lags output_ids until the next prepare_for_decode.
-        req.refresh_fill_ids()
-        tree_cache.checkpoint(req, up_to=owned_kv_len)
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
     tree_cache.unpin(req)
     _release_overallocated_kv_indices(
         req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
     )
-    tree_cache.on_release(req, inserted=is_insert)
+    tree_cache.on_release(req)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (

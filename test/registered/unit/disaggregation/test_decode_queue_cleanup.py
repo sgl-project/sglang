@@ -402,9 +402,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             [req], req.return_logprob
         )
         mock_prepare_abort.assert_called_once()
-        mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
-        )
+        mock_release_kv_cache.assert_called_once_with(req, queue.tree_cache)
 
         receiver = FakeReceiver()
         receiver.kv_mgr = FakeKVManager.__new__(FakeKVManager)
@@ -421,9 +419,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertTrue(receiver.clear_called)
         self.assertIsNone(decode_req.kv_receiver)
         queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
-        mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
-        )
+        mock_release_kv_cache.assert_called_once_with(req, queue.tree_cache)
 
         receiver = MagicMock()
         decode_req.kv_receiver = receiver
@@ -504,9 +500,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(queue.pop_transferred(), [])
         self.assertFalse(receiver.abort_notified)
         queue._defer_release.assert_not_called()
-        mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
-        )
+        mock_release_kv_cache.assert_called_once_with(req, queue.tree_cache)
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)

@@ -405,7 +405,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 if host_staged:
                     env.cache.discard_kv_cache_backup(req.kv.retraction_backup)
                 else:
-                    release_kv_cache(req, env.cache, is_insert=False)
+                    release_kv_cache(req, env.cache)
                 env.allocator.free(pressure)
                 self.assertEqual(env.allocator.available_size(), self.pool_size)
 
@@ -628,9 +628,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
         self._assert_pool_equal(env.target_pool, cached_indices, cached_values)
         self.assertEqual(env.allocator.available_size(), free_before_insert + 4)
         self.assertEqual(cache.protected_size(), 8)
-        release_kv_cache(req, cache, is_insert=False)
+        release_kv_cache(req, cache)
         self.assertEqual(cache.protected_size(), 4)
-        release_kv_cache(cached, cache, is_insert=False)
+        release_kv_cache(cached, cache)
         self.assertEqual(cache.protected_size(), 0)
 
 

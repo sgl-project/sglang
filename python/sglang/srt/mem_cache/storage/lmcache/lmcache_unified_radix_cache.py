@@ -248,9 +248,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
         return True
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        super().on_release(req, inserted=inserted)
-        if not inserted:
+    def on_release(self, req: Req) -> None:
+        super().on_release(req)
+        if not req.kv.cache_finalized:
             self.release_aborted_request(req.cache_request_handle)
 
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:

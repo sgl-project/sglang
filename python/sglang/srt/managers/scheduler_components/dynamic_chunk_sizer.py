@@ -259,7 +259,7 @@ class DynamicChunkSizer:
 
             # Release KV and Mamba cache
             if req.kv.holds_kv:
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                release_kv_cache(req, self.tree_cache)
 
         logger.info(
             f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "

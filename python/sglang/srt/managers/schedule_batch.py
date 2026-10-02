@@ -936,6 +936,9 @@ class ReqKvInfo:
     # This request already inserted [0, here) into the tree; later inserts count
     # a hit only on the nodes past it, so a request counts each node once.
     cache_inserted_len: int = 0
+    # The finished request's KV was handed to the tree as final; a release
+    # without it is a discard and the tree drops the request's side state.
+    cache_finalized: bool = False
     kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
 
@@ -1135,9 +1138,9 @@ class Req(ReqDllmMixin):
         self.lora_id = lora_id
         self.routing_key = routing_key
 
-        # Lazy extra buffer: skip radix cache insert when prealloc failed at
-        # boundary — the forward overwrites the only slot, corrupting the state.
-        self.mamba_lazy_is_insert: bool = True
+        # Lazy extra buffer: skip the final checkpoint when prealloc failed at
+        # boundary -- the forward overwrites the only slot, corrupting the state.
+        self.mamba_lazy_checkpoint: bool = True
 
         # Check finish
         self.tokenizer = None
@@ -1982,6 +1985,7 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.kv.cache_protected_len = 0
         self.kv.cache_inserted_len = 0
+        self.kv.cache_finalized = False
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
@@ -2290,7 +2294,7 @@ def release_req(
             get_disagg().disaggregation_decode_retraction_backup,
         )
     # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, is_insert=False)
+    release_kv_cache(req, tree_cache)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
