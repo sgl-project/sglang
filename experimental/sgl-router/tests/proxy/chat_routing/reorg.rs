@@ -110,6 +110,7 @@ fn context(workers: &[(&str, Stage, &MockWorker)], buckets: Vec<Bucket>) -> Arc<
                 mode,
                 model_ids: vec![ModelId("tiny".into())],
                 bootstrap_port: Some(8998),
+                ..Default::default()
             })
             .unwrap();
     }
@@ -305,7 +306,8 @@ async fn pd_picks_both_groups_from_selected_bucket_and_shares_bootstrap() {
     let d: serde_json::Value =
         serde_json::from_slice(decode.captured.lock().unwrap().last_body.as_ref().unwrap())
             .unwrap();
-    assert!(p.get("rid").is_none() && d.get("rid").is_none());
+    assert!(p["rid"].is_string());
+    assert_eq!(p["rid"], d["rid"]);
     assert!(p["bootstrap_room"].is_number());
     assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
     let calls = policy.calls.lock().unwrap();
@@ -355,7 +357,7 @@ async fn missing_decode_in_all_buckets_does_not_dispatch_prefill() {
     );
     assert!(prefill.captured.lock().unwrap().last_body.is_none());
     assert!(decode.captured.lock().unwrap().last_body.is_none());
-    assert_eq!(policy.calls.lock().unwrap().len(), 2);
+    assert!(policy.calls.lock().unwrap().is_empty());
     assert_eq!(ctx.router_inflight_load.inflight_count(), 0);
     assert_eq!(
         ctx.registry
@@ -535,7 +537,10 @@ async fn decode_failure_retries_both_groups_in_next_bucket_without_dispatching_f
                 .router_inflight_load(),
             0
         );
-        assert_eq!(first.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            first.calls.lock().unwrap().len(),
+            usize::from(reject_decode)
+        );
         let calls = accepted.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!((&*calls[0].0, calls[0].1), ("b-second", Stage::Prefill));
@@ -758,7 +763,7 @@ async fn portless_prefill_is_not_dispatched_until_bootstrap_is_resolved() {
             url: prefill.url.clone(),
             mode: Stage::Prefill,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         };
         ctx.registry.add(spec.clone()).unwrap();
         let app = build_router(ctx.clone());
@@ -855,4 +860,112 @@ async fn only_prefix_reading_routing_needs_request_tokens() {
             "reorg {policy:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn reorg_readiness_cannot_pair_workers_across_buckets() {
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let ctx = context(
+        &[
+            ("p", Stage::Prefill, &prefill),
+            ("d", Stage::Decode, &decode),
+        ],
+        vec![
+            Bucket::new(
+                "prefill-only",
+                BucketGroups::Pd {
+                    prefill: group("p", policy.clone()),
+                    decode: group("missing", policy.clone()),
+                },
+            ),
+            Bucket::new(
+                "decode-only",
+                BucketGroups::Pd {
+                    prefill: group("missing", policy.clone()),
+                    decode: group("d", policy.clone()),
+                },
+            ),
+        ],
+    );
+    ctx.mark_ready();
+    let app = build_router(ctx);
+    assert_eq!(
+        app.clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        app.oneshot(request(body("hello"))).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(policy.calls.lock().unwrap().is_empty());
+}
+
+/// Rejects every engine in one version group.
+#[derive(Debug)]
+struct RejectGroup(&'static str);
+
+impl EngineAdmission for RejectGroup {
+    fn check(&self, engine: &Worker, _: &EngineMetrics) -> Result<Decision, PickError> {
+        Ok(match engine.version_group() == Some(self.0) {
+            true => Decision::Reject("full".into()),
+            false => Decision::Allow,
+        })
+    }
+}
+
+/// A version group whose decodes are full falls back to another group.
+#[tokio::test]
+async fn full_decode_group_falls_back_to_another_version_group() {
+    let workers: Vec<_> =
+        futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+    let decode_policy = Arc::new(FirstPolicy {
+        admission: Arc::new(RejectGroup("v1")),
+        ..FirstPolicy::default()
+    });
+    let ctx = context(
+        &[],
+        vec![Bucket::new(
+            "pd",
+            BucketGroups::Pd {
+                prefill: EngineGroup::new(Arc::new(FirstPolicy::default())),
+                decode: EngineGroup::new(decode_policy),
+            },
+        )],
+    );
+    for ((id, mode, group), worker) in [
+        ("p-v1", Stage::Prefill, "v1"),
+        ("p-v2", Stage::Prefill, "v2"),
+        ("d-v1", Stage::Decode, "v1"),
+        ("d-v2", Stage::Decode, "v2"),
+    ]
+    .into_iter()
+    .zip(&workers)
+    {
+        ctx.registry
+            .add(WorkerSpec {
+                id: WorkerId(id.into()),
+                url: worker.url.clone(),
+                mode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8998),
+                version_group: Some(group.into()),
+            })
+            .unwrap();
+    }
+    let response = build_router(ctx)
+        .oneshot(request(body("hello")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let dispatched: Vec<_> = workers
+        .iter()
+        .map(|w| w.captured.lock().unwrap().last_body.is_some())
+        .collect();
+    assert_eq!(dispatched, [false, true, false, true]);
 }

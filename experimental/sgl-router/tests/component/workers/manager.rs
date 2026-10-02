@@ -61,7 +61,7 @@ fn spec_for(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
         url: url.into(),
         mode,
         model_ids: Vec::new(),
-        bootstrap_port: None,
+        ..Default::default()
     }
 }
 
