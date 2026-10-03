@@ -131,13 +131,20 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Build image
+        env:
+          # github.head_ref is the PR author's branch name; a ${{ }} expression is
+          # substituted into the run: script as TEXT before bash parses it, so a
+          # branch named x$(cmd)x would run cmd on this (self-hosted) runner. In
+          # env: the value is placed in the process environment as data, not code.
+          PR_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF_NAME: ${{ github.head_ref }}
         run: |
           # Fixed tag (no SHA): a new build overwrites the previous image so a
           # self-hosted box does not accumulate multi-GB images across PRs.
           # --no-cache keeps the CPU image clean (past sgl-eval/accelerate gaps
           # came from stale layers). One build per job, one container per box.
-          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
-          PR_HEAD_REF=${{ github.head_ref }}
+          PR_REPO="$PR_REPO_URL"
+          PR_HEAD_REF="$PR_HEAD_REF_NAME"
 
           docker build \
             ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
