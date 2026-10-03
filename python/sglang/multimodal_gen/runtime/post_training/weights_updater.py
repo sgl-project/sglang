@@ -193,6 +193,15 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     with torch.inference_mode():
         restore_weight_snapshot(module)
         model_params = dict(module.named_parameters())
+        # Checkpoints also contain persistent state such as VAE BatchNorm
+        # statistics. Keep runtime-only buffers out of the reload path.
+        for prefix, submodule in module.named_modules():
+            for name, buffer in submodule.named_buffers(
+                recurse=False, remove_duplicate=False
+            ):
+                if name not in submodule._non_persistent_buffers_set:
+                    full_name = f"{prefix}.{name}" if prefix else name
+                    model_params[full_name] = buffer
         weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
 
         offload_managers: list = []
