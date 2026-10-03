@@ -10,6 +10,7 @@ from compressed_tensors.quantization import ActivationOrdering
 
 # yapf conflicts with isort for this block
 # yapf: disable
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     ChannelQuantScaleParameter,
@@ -39,9 +40,10 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cpu, is_cuda
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
@@ -208,6 +210,40 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_cpu:
+            if self.has_g_idx:
+                raise NotImplementedError(
+                    "CPU compressed-tensors WNA16 does not support activation ordering."
+                )
+            if self.pack_factor != 8:
+                raise NotImplementedError(
+                    "CPU compressed-tensors WNA16 currently supports only 4-bit weights."
+                )
+            if self.symmetric:
+                raise NotImplementedError(
+                    "CPU compressed-tensors WNA16 does not support symmetric 4-bit weights."
+                )
+
+            qweight = layer.weight_packed.t().contiguous()
+            scales = layer.weight_scale.t().contiguous()
+            if hasattr(layer, "weight_zero_point"):
+                qzeros = layer.weight_zero_point.t().contiguous()
+            else:
+                qzeros = torch.zeros(
+                    scales.shape[0],
+                    qweight.shape[1] // self.pack_factor,
+                    dtype=torch.int32,
+                    device=qweight.device,
+                )
+
+            layer.qweight = torch.nn.Parameter(qweight, requires_grad=False)
+            layer.qzeros = torch.nn.Parameter(qzeros, requires_grad=False)
+            layer.scales = torch.nn.Parameter(scales, requires_grad=False)
+            _amx_process_weight_after_loading(
+                layer, ["qweight", "qzeros", "scales"], None, "gptq"
+            )
+            return
+
         # Default names since marlin requires empty parameters for these,
         # TODO: remove this requirement from marlin (allow optional tensors)
         self.w_q_name = "weight_packed"
@@ -303,6 +339,15 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
+        if _is_cpu:
+            return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+                x,
+                layer.qweight,
+                layer.qzeros,
+                layer.scales,
+                bias,
+            )
+
         c = self.kernel_config
 
         def _get_weight_params(
