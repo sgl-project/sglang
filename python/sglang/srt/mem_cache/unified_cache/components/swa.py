@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -28,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKVFullOnly,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
+    SWAEvictExcessPathWindows,
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -43,6 +45,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     TreeComponent,
     next_component_uuid,
 )
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -87,6 +90,8 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
+        # Shares the Mamba per-path cap: both are checkpoint-only state.
+        self.max_windows_per_path = get_exec().mamba.mamba_max_states_per_path
 
     component_type = ComponentType.SWA
     _independent = False
@@ -552,6 +557,47 @@ class SWAComponent(TreeComponent):
             cap_leaf=True,
             cache_actions=cache_actions,
         )
+        if self.max_windows_per_path > 0:
+            # Queued after the SWARebuild actions that stamp this insert's windows.
+            cache_actions.append(SWAEvictExcessPathWindows(node.id))
+
+    def _evict_excess_path_windows(
+        self,
+        tail: UnifiedTreeNode,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        if self.max_windows_per_path < 0:
+            return
+        ct = self.component_type
+        holders = []
+        node = tail
+        while node is not None and node is not self.tree_core.root_node:
+            if node.component_data[ct].value is not None:
+                holders.append(node)
+            node = node.parent
+
+        excess = len(holders) - self.max_windows_per_path
+        if excess <= 0:
+            return
+        tracker = {component: 0 for component in self.cache.tree_components}
+        for node in reversed(holders):
+            if excess <= 0 or node is tail:
+                break
+            if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
+                continue
+            if node in self.tree_core.evictable_device_leaves:
+                continue
+            self.tree_core._evict_component_and_detach_lru(
+                node,
+                self,
+                device_frees,
+                host_frees,
+                target=EvictLayer.DEVICE,
+                tracker=tracker,
+            )
+            self.tree_core._cascade_evict(node, self, tracker, device_frees, host_frees)
+            excess -= 1
 
     def _maybe_split_leaf_for_swa_lock(
         self, leaf: UnifiedTreeNode
@@ -1487,6 +1533,18 @@ class SWAComponent(TreeComponent):
 
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
+        if isinstance(action, SWAEvictExcessPathWindows):
+            device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            try:
+                self._evict_excess_path_windows(
+                    self.tree_core.node_by_id(action.tail_node_id),
+                    device_frees,
+                    host_frees,
+                )
+            finally:
+                self.cache._free_values(device_frees, host_frees)
+            return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
                 # Component values are page-aligned copies of a kv row.
