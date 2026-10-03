@@ -114,7 +114,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*?)(<｜tool▁call▁end｜>|$)",
+                pattern=r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)(<｜tool▁call▁end｜>|$)",
                 string=current_text,
                 flags=re.DOTALL,
             )
@@ -149,48 +149,49 @@ class DeepSeekV31Detector(BaseFormatDetector):
                         "name": func_name,
                         "arguments": {},
                     }
-                else:
-                    argument_diff = (
-                        func_args_raw[len(self._last_arguments) :]
-                        if func_args_raw.startswith(self._last_arguments)
-                        else func_args_raw
-                    )
 
-                    if argument_diff:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=argument_diff,
-                            )
+                # Not an else: a delta that carries the header can also carry
+                # (complete) arguments, and they must stream in the same pass.
+                # Otherwise they wait for a later increment that may never come.
+                argument_diff = (
+                    func_args_raw[len(self._last_arguments) :]
+                    if func_args_raw.startswith(self._last_arguments)
+                    else func_args_raw
+                )
+
+                if argument_diff:
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=argument_diff,
                         )
-                        self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                    )
+                    self._last_arguments += argument_diff
+                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
-                    if _is_complete_json(func_args_raw):
-                        # Update the stored arguments
-                        try:
-                            parsed_args = json.loads(func_args_raw)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
-                        except json.JSONDecodeError:
-                            pass
+                if _is_complete_json(func_args_raw):
+                    # Update the stored arguments
+                    try:
+                        parsed_args = json.loads(func_args_raw)
+                        self.prev_tool_call_arr[self.current_tool_id][
+                            "arguments"
+                        ] = parsed_args
+                    except json.JSONDecodeError:
+                        pass
 
-                        # Find the end of the current tool call and remove only that part from buffer
-                        if is_tool_end:
-                            # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[partial_match.end(3) :]
-                        else:
-                            self._buffer = ""
+                    # Find the end of the current tool call and remove only that part from buffer
+                    if is_tool_end:
+                        # Remove the completed tool call from buffer, keep any remaining content
+                        self._buffer = current_text[partial_match.end(3) :]
+                    else:
+                        self._buffer = ""
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
-                        return result
+                    result = StreamingParseResult(normal_text="", calls=calls)
+                    self.current_tool_id += 1
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+                    return result
 
             return StreamingParseResult(normal_text="", calls=calls)
 
