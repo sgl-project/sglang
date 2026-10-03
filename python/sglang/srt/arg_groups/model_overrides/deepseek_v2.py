@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -98,9 +99,14 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     assert cfg.dp_size == 1, (
                         "interleave DSA CP does not support DP attention."
                     )
-                assert cfg.tp_size <= 8, (
-                    "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-                )
+                if "810E" not in current_platform.get_device_name():
+                    assert cfg.tp_size <= 8, (
+                        "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                    )
+                else:
+                    assert cfg.tp_size <= 16, (
+                        "Context parallel only supports single machine (tp_size <= 16 on 810e). Cross-machine CP has precision issues."
+                    )
                 # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
                 # The DSA / MLA CP gather and reduce-scatter
                 # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.

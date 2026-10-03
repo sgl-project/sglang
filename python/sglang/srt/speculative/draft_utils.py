@@ -48,13 +48,7 @@ class DraftBackendFactory:
         # The draft runner's own backend, not the process-wide config.
         self.draft_attn_backend = draft_model_runner.draft_attention_backend
 
-    def _create_backend(
-        self,
-        backend_name: str,
-        backend_map: dict,
-        error_template: str,
-        stamps_children: bool = False,
-    ):
+    def _resolve_backend_type(self, backend_name: str):
         # The split pair with the base-backend fallback already applied.
         prefill_backend, decode_backend = attention_backends()
         configured = (
@@ -62,7 +56,27 @@ class DraftBackendFactory:
             if backend_name == "decode_attention_backend"
             else prefill_backend
         )
-        backend_type = self.draft_attn_backend or configured
+        return self.draft_attn_backend or configured
+
+    def resolve_decode_backend_type(self):
+        return self._resolve_backend_type("decode_attention_backend")
+
+    def resolve_draft_extend_backend_type(self):
+        backend_name = (
+            "decode_attention_backend"
+            if get_spec().speculative_attention_mode == "decode"
+            else "prefill_attention_backend"
+        )
+        return self._resolve_backend_type(backend_name)
+
+    def _create_backend(
+        self,
+        backend_name: str,
+        backend_map: dict,
+        error_template: str,
+        stamps_children: bool = False,
+    ):
+        backend_type = self._resolve_backend_type(backend_name)
 
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))

@@ -38,6 +38,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
@@ -82,6 +83,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_ppu,
     is_xpu,
     next_power_of_2,
 )
@@ -4868,7 +4870,12 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
-    index_k_with_scale_buffer_dtype = torch.uint8
+    # MXFP4 quant block — must match downcast_to_mxfp4_indexer / fused store mxfp4.
+    mxfp4_block_size = 32
+    use_bf16_indexer = envs.SGLANG_SAIL_BF16_INDEXER.get() and is_ppu()
+    index_k_with_scale_buffer_dtype = (
+        torch.uint8 if not use_bf16_indexer else torch.bfloat16
+    )
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
@@ -4891,6 +4898,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        use_fp4_indexer: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -4917,6 +4925,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
         self.slots_per_page = self.page_size
+        self.use_fp4_indexer = use_fp4_indexer
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
@@ -4929,6 +4938,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
             else [False] * layer_num
         )
         assert len(self.skip_topk_layers) == layer_num
+        if self.use_fp4_indexer:
+            assert not self.use_bf16_indexer, (
+                "FP4 indexer cache is incompatible with SGLANG_SAIL_BF16_INDEXER"
+            )
+            assert index_head_dim % self.mxfp4_block_size == 0, (
+                f"index_head_dim={index_head_dim} must be divisible by MXFP4 block {self.mxfp4_block_size}"
+            )
+            assert is_ppu(), "FP4 indexer cache is supported on PPU platforms"
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
@@ -5107,6 +5124,20 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self._compress_tail_k[idx][req_pool_idx, slots] = key_tail
             self._compress_tail_score[idx][req_pool_idx, slots] = score_tail
 
+    @property
+    def packed_bytes_per_token(self) -> int:
+        """K-side bytes per token in the cache buffer (excludes scales)."""
+        if self.use_fp4_indexer:
+            return self.index_head_dim // 2
+        return self.index_head_dim
+
+    @property
+    def scale_bytes_per_token(self) -> int:
+        """Per-token scale bytes. FP8: head_dim/quant_block * 4. FP4: head_dim/32 ue8m0 bytes."""
+        if self.use_fp4_indexer:
+            return self.index_head_dim // self.mxfp4_block_size
+        return (self.index_head_dim // self.quant_block_size) * 4
+
     def _clear_buffers(self):
         super()._clear_buffers()
         self.index_key_cache.clear()
@@ -5130,8 +5161,45 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len_sum: int,
         max_seq_len: int,
     ):
-        return self.index_key_cache.get_k_and_scale(
-            layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
+        """
+        Fused method to get both index K and scale data in a single call using Triton.
+        More efficient than calling get_index_k_continuous and get_index_k_scale_continuous separately.
+
+        :param layer_id: Layer index
+        :param seq_len: Sequence length
+        :param page_indices: Page indices tensor
+        :return: tuple of (k_buf, k_scale_buf) where
+                 FP8: k_buf  (seq_len, head_dim) uint8, k_scale_buf (seq_len, 4) uint8
+                 FP4: k_buf  (seq_len, head_dim/2) uint8 (packed E2M1),
+                      k_scale_buf (seq_len, head_dim/32) uint8 (ue8m0)
+        """
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if self.use_fp4_indexer:
+            # FP4 layout: per-token K bytes = head_dim/2; scale bytes = head_dim/32.
+            # The triton accessor is byte-stride agnostic; pass packed K width as
+            # the "head_dim" to gather K bytes, and gather scales separately.
+            from sglang.kernels.ops.attention.dsa.index_buf_accessor import (
+                _get_k_and_s_triton,
+            )
+
+            return _get_k_and_s_triton(
+                buf=buf,
+                page_indices=page_indices,
+                seq_lens=seq_len_tensor,
+                seq_len_sum=seq_len_sum,
+                max_seq_len=max_seq_len,
+                page_size=self.page_size,
+                index_head_dim=self.packed_bytes_per_token,
+            )
+        return index_buf_accessor.GetKAndS.execute(
+            self,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
         )
 
     def set_index_k_scale_buffer(
@@ -5141,7 +5209,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
+        assert not self.use_fp4_indexer, (
+            "Unfused FP4 cache insert is not supported. The FP4 path requires "
+            "the fused store kernel (fused_store_index_k_mxfp4_cache); the "
+            "scalar (k_fp8, k_scale) tensors here have no FP4 analog."
+        )
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        index_buf_accessor.SetKAndS.execute(
+            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
+        )
 
     def _get_compress_tail_cpu_copy(self, req_pool_index):
         if not self.kpool_use_compress or req_pool_index is None:

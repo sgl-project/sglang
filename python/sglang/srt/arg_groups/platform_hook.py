@@ -42,6 +42,9 @@ def handle_ppu_backends(server_args: Any):
         envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
     if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
         envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
+    # DSA FlashMLA decode compute stays non-FP8 on PPU by default.
+    if not envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.is_set():
+        envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.set(False)
     if cfg.chunked_prefill_size is not None:
         set_acext_token_limit(
             acext_num_tokens=int(cfg.chunked_prefill_size * 0.5),

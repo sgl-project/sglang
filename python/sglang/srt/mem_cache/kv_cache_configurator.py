@@ -1645,6 +1645,13 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+            from sglang.kernels.ops.attention.dsa.triton_kernel import (
+                is_fp4_indexer_cache_enabled,
+            )
+
+            pool_kwargs["use_fp4_indexer"] = (
+                current_platform.is_ppu() and is_fp4_indexer_cache_enabled()
+            )
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
