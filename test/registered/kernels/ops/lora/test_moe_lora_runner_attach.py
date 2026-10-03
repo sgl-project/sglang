@@ -208,6 +208,51 @@ class TestEngineAdmission(CustomTestCase):
 
         assert MoeLoraRunner._weight_family(self._base_layer()) == "bf16"
 
+    def _fp8_layer(self, *, block_quant=True, weight_dtype=torch.float8_e4m3fn):
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        layer = self._base_layer()
+        quant_method = object.__new__(Fp8MoEMethod)
+        quant_method.block_quant = block_quant
+        quant_method.use_mxfp8 = False
+        quant_method.weight_block_size = [128, 128] if block_quant else None
+        layer.quant_method = quant_method
+        layer.w13_weight = layer.w13_weight.to(weight_dtype)
+        layer.w2_weight = layer.w2_weight.to(weight_dtype)
+        return layer
+
+    def test_weight_family_of_a_block_fp8_layer(self):
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+        assert MoeLoraRunner._weight_family(self._fp8_layer()) == "fp8"
+
+    def test_rejects_per_tensor_fp8(self):
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+        with self.assertRaisesRegex(NotImplementedError, "128-block"):
+            MoeLoraRunner._weight_family(self._fp8_layer(block_quant=False))
+
+    def test_rejects_marlin_repacked_fp8(self):
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+        with self.assertRaisesRegex(NotImplementedError, "float8_e4m3fn"):
+            MoeLoraRunner._weight_family(self._fp8_layer(weight_dtype=torch.bfloat16))
+
+    def test_fp8_family_selects_its_vendors(self):
+
+        for vendor, rows in (
+            ("triton", "route_major"),
+            # No masked slab domain: decode plans run the route-major
+            # provider, same as the Marlin nvfp4 vendor.
+            ("triton", "expert_major"),
+        ):
+            assert select_provider_cls(rows, "fp8", vendor)
+        # Unsupported FP8 vendor choices resolve to the FP8 family default.
+        for absent in ("cutedsl", "marlin", "deepgemm"):
+            assert select_provider_cls(
+                "expert_major", "fp8", absent
+            ) is select_provider_cls("expert_major", "fp8")
+
     def test_every_listed_vendor_resolves_and_others_fall_back_to_the_first(self):
         """Mixed-quant layers resolve independently, falling back to their family's vendor."""
         from sglang.srt.lora.moe.base_gemm_provider import VENDORS
@@ -224,7 +269,10 @@ class TestEngineAdmission(CustomTestCase):
     def test_vendors_without_a_masked_domain_serve_expert_major_rows(self):
         """Vendors without a masked domain serve expert-major requests through their route-major class."""
 
-        for vendor, family in (("triton", "bf16"),):
+        for vendor, family in (
+            ("triton", "bf16"),
+            ("triton", "fp8"),
+        ):
             assert select_provider_cls(
                 "expert_major", family, vendor
             ) is select_provider_cls("route_major", family, vendor)

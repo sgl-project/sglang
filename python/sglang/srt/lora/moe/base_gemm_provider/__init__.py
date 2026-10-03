@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 # The first vendor is the default for each weight family.
 VENDORS = {
     "bf16": ("cutedsl", "triton"),
+    "fp8": ("triton",),
 }
 
 
@@ -58,3 +59,9 @@ def select_provider_cls(
             )
 
             return TritonBf16ContiguousProvider
+        case "triton", "fp8":
+            from sglang.srt.lora.moe.base_gemm_provider.triton_fp8 import (
+                TritonFp8ContiguousProvider,
+            )
+
+            return TritonFp8ContiguousProvider
