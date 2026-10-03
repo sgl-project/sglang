@@ -124,15 +124,22 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if gpu_id % gpus_per_replica == 0:
             endpoint = server_args.scheduler_endpoint_for(self.dp_replica)
             # router allocates identify (envelope) for each connection
-            self.receiver, actual_endpoint = get_zmq_socket(
-                self.context, zmq.ROUTER, endpoint, True
+            self.receiver, self.bound_endpoint = get_zmq_socket(
+                self.context,
+                zmq.ROUTER,
+                endpoint,
+                bind=True,
+                # Safe because run_scheduler_process reports the bound endpoint back
+                # to the launcher, which republishes it before any client connects.
+                allow_port_drift=not server_args.strict_ports,
             )
             logger.info(
                 f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
-                f"{actual_endpoint}"
+                f"{self.bound_endpoint}"
             )
         else:
             self.receiver = None
+            self.bound_endpoint = None
         from sglang.multimodal_gen.runtime.platforms import current_platform
 
         Exec_worker = CPUWorker if current_platform.is_cpu() else GPUWorker

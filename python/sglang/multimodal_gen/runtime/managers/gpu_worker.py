@@ -1626,6 +1626,9 @@ def run_scheduler_process(
         pipe_writer.send(
             {
                 "status": "ready",
+                # The port can drift when the requested one was taken; the launcher
+                # republishes what was really bound so clients reach this scheduler.
+                "scheduler_endpoint": scheduler.bound_endpoint,
             }
         )
         scheduler.event_loop()

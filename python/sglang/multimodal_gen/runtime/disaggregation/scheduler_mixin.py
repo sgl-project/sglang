@@ -470,7 +470,6 @@ class SchedulerDisaggMixin:
             sa.pool_work_endpoint,
             bind=True,
             max_bind_retries=5,
-            same_port=True,
         )
         # PUSH: send results to DiffusionServer
         self._pool_result_push, _ = get_zmq_socket(

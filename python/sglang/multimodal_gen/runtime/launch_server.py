@@ -133,6 +133,34 @@ def shutdown_scheduler_processes(
     _kill_alive_processes(alive, _WORKER_KILL_TIMEOUT_S)
 
 
+def _republish_scheduler_endpoints(
+    *,
+    server_args: ServerArgs,
+    scheduler_infos: list[dict],
+    rank_offset: int,
+) -> None:
+    """Record the ports the schedulers really bound, in local rank order."""
+    gpus_per_replica = max(1, server_args.num_gpus // server_args.dp_size)
+    for local_rank, info in enumerate(scheduler_infos):
+        bound_endpoint = info["scheduler_endpoint"]
+        if bound_endpoint is None:
+            continue
+        replica = (rank_offset + local_rank) // gpus_per_replica
+        bound_port = int(bound_endpoint.rsplit(":", 1)[1])
+        requested_port = server_args.scheduler_ports[replica]
+        if bound_port != requested_port:
+            # Clients read the port from server_args; left stale they would address
+            # the requested one, which belongs to whoever won the race for it.
+            logger.warning(
+                "Scheduler replica %d bound port %d because the requested port %d "
+                "was taken; clients will address the bound one.",
+                replica,
+                bound_port,
+                requested_port,
+            )
+            server_args.scheduler_ports[replica] = bound_port
+
+
 def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     """
     Args:
@@ -210,6 +238,12 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         scheduler_infos.append(data)
         reader.close()
 
+    _republish_scheduler_endpoints(
+        server_args=server_args,
+        scheduler_infos=scheduler_infos,
+        rank_offset=rank_offset,
+    )
+
     logger.debug("All workers are ready")
     logger.info("[server-load] workers_ready_monotonic_ns=%d", time.monotonic_ns())
 
@@ -241,7 +275,9 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             logger.info("Launch FastAPI server in another process because of webui.")
             http_server_process = worker_context.Process(
                 target=bootstrap_http_server_process,
-                args=(server_args_payload,),
+                # Re-captured: the payload sent to the workers predates the
+                # scheduler ports they reported back.
+                args=(ServerArgsPayload.capture(server_args),),
                 name="sglang-diffusion-webui",
                 daemon=True,
             )
