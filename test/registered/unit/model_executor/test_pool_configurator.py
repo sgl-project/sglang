@@ -1103,6 +1103,46 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
         self.assertLess(_tokens(10240), _tokens(None))
 
+    def test_swa_chunk_cap_budget_charges_draft_pool(self):
+        """A chunk-capped SWA budget must still fit the DFLASH draft pool, which is
+        allocated at the target's full token count."""
+        available = 1_000_000
+        draft_kv_per_token = 10_240
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            disable_radix_cache=True,
+            chunked_prefill_size=4,
+            sliding_window_size=8,
+            page_size=1,
+            max_running_requests=2,
+        )
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_aux_config = SimpleNamespace(
+            eagle_draft_num_layers=None,
+            dflash_draft_num_layers=5,
+            dflash_draft_cell_size_per_token=draft_kv_per_token,
+        )
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                SWAChunkCapPoolConfigurator,
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
+        full_tokens = config.full_max_total_num_tokens
+        used = full_tokens * (_full_per_token(mr) + draft_kv_per_token)
+        used += config.swa_max_total_num_tokens * _swa_per_token(mr)
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
+
 
 class TestSWAPoolFloor(CustomTestCase):
     """An SWA pool below the prefill admission floor must fail here, not livelock

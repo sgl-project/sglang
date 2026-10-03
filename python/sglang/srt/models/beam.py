@@ -18,6 +18,15 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.fused_op import get_fused_op_backend
+from sglang.kernels.ops.attention.log_scaling_tau import apply_log_scaling_tau
+from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
+    can_use_fused_inplace_qknorm_rope,
+    fused_inplace_qknorm_rope,
+)
+from sglang.kernels.ops.elementwise import BeamAttentionGateOp
+from sglang.kernels.ops.layernorm import BeamSandwichResidualRMSNormOp
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
@@ -54,23 +63,27 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_cuda, make_layers, set_weight_attrs
+
+_is_cuda = is_cuda()
 
 
-def apply_ssmax(q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-    """Scale Q using absolute positions, rounding only after multiplication."""
-    scale = torch.exp(0.1 * torch.log1p((positions.float() + 1) / 2048))
+def compute_ssmax_scale(positions: torch.Tensor) -> torch.Tensor:
+    return torch.exp(0.1 * torch.log1p((positions.float() + 1) / 2048))
+
+
+def apply_ssmax(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Scale Q rows by an FP32 scale, rounding only after multiplication."""
+    if (
+        q.is_cuda
+        and not torch.compiler.is_compiling()
+        and get_fused_op_backend() != KernelBackend.TORCH
+    ):
+        # One launch with the same FP32 product and single rounding.
+        return apply_log_scaling_tau(q, scale)
     return (q.float() * scale.unsqueeze(-1)).to(q.dtype)
-
-
-def apply_attention_gate(
-    attention_output: torch.Tensor, gate: torch.Tensor, gate_bias: torch.Tensor
-) -> torch.Tensor:
-    # Bias addition, sigmoid, and multiplication use the activation dtype.
-    # The bias has one entry per local query head, broadcast over head_dim.
-    multiplier = torch.sigmoid(gate + gate_bias[None, :, None])
-    return attention_output * multiplier
 
 
 def depth_scaled_residual(
@@ -82,6 +95,25 @@ def depth_scaled_residual(
     branch = branch * branch_scale
     residual = residual * residual_scale
     return branch + residual
+
+
+def _can_fuse_qk_norm_rope(head_dim: int) -> bool:
+    cuda_graph_config = get_exec().graph.cuda_graph_config
+    return (
+        _is_cuda
+        and not get_exec().deterministic.enable_deterministic_inference
+        and (
+            cuda_graph_config is None
+            or cuda_graph_config.prefill.tc_compiler != "inductor"
+        )
+        and can_use_fused_inplace_qknorm_rope(
+            head_dim=head_dim,
+            rope_dim=head_dim,
+            is_neox=True,
+            dtype=torch.get_default_dtype(),
+            round_norm_before_rope=True,
+        )
+    )
 
 
 class BeamRotaryEmbedding(RotaryEmbedding):
@@ -214,10 +246,16 @@ class BeamMoE(nn.Module):
         if self.experts.should_fuse_routed_scaling_factor_in_topk:
             self.topk.topk_config.routed_scaling_factor = config.routed_scaling_factor
             self.topk.topk_config.apply_routed_scaling_factor_on_output = True
+        # Offloading replaces parameters, but TopKConfig keeps an alias.
+        self.refresh_correction_bias = get_exec().offload.cpu_offload_gb > 0
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             router_logits, _ = self.gate(hidden_states.float())
+            if self.refresh_correction_bias:
+                self.topk.topk_config.correction_bias = (
+                    self.gate.e_score_correction_bias
+                )
             topk_output = self.topk(hidden_states, router_logits)
         else:
             topk_output = self.topk.empty_topk_output(
@@ -282,6 +320,7 @@ class BeamAttention(nn.Module):
             tp_size=self.tp_size,
             prefix=add_prefix("gate_proj", prefix),
         )
+        self.attention_gate = BeamAttentionGateOp()
         self.gate_bias = nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
         set_weight_attrs(self.gate_bias, {"weight_loader": self.load_gate_bias})
         self.o_proj = RowParallelLinear(
@@ -301,6 +340,9 @@ class BeamAttention(nn.Module):
             if self.apply_rope
             else None
         )
+        self.use_fused_qk_norm_rope = self.apply_rope and _can_fuse_qk_norm_rope(
+            self.head_dim
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -309,6 +351,25 @@ class BeamAttention(nn.Module):
             layer_id=layer_id,
             sliding_window_size=self.sliding_window,
             prefix=add_prefix("attn", prefix),
+        )
+
+    def _fused_qk_norm_rope(
+        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
+    ) -> None:
+        # In place on the packed QKV views. Rounding the norm to the activation
+        # dtype before the FP32 rotation matches RMSNorm followed by RoPE.
+        fused_inplace_qknorm_rope(
+            q=q.view(-1, self.num_heads, self.head_dim),
+            k=k.view(-1, self.num_kv_heads, self.head_dim),
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            positions=positions,
+            is_neox=True,
+            eps=self.q_norm.variance_epsilon,
+            head_dim=self.head_dim,
+            rope_dim=self.head_dim,
+            round_norm_before_rope=True,
         )
 
     def load_gate_bias(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -322,24 +383,40 @@ class BeamAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        ssmax_scale: torch.Tensor | None,
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = self.q_norm(q.reshape(-1, self.head_dim)).view(-1, self.q_size)
-        k = self.k_norm(k.reshape(-1, self.head_dim)).view(-1, self.kv_size)
-        if self.rotary_emb is not None:
-            q, k = self.rotary_emb(positions, q, k)
+        force_torch = get_fused_op_backend() == KernelBackend.TORCH
+        if self.use_fused_qk_norm_rope and not force_torch:
+            self._fused_qk_norm_rope(positions, q, k)
         else:
-            q = apply_ssmax(q, positions)
+            if force_torch:
+                q = self.q_norm(q.reshape(-1, self.head_dim)).view(q.shape)
+                k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)
+            else:
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    head_dim=self.head_dim,
+                    allow_inplace=_is_cuda,
+                )
+            if self.rotary_emb is not None:
+                q, k = self.rotary_emb(positions, q, k)
+            else:
+                q = apply_ssmax(q, ssmax_scale)
         attention_output = self.attn(q, k, v, forward_batch)
         gate, _ = self.gate_proj(hidden_states)
-        attention_output = apply_attention_gate(
-            attention_output.view(-1, self.num_heads, self.head_dim),
-            gate.view(-1, self.num_heads, self.head_dim),
+        attention_output = self.attention_gate(
+            attention_output.view(-1, self.q_size),
+            gate.view(-1, self.q_size),
             self.gate_bias,
-        ).view(-1, self.q_size)
+            self.head_dim,
+        )
         output, _ = self.o_proj(attention_output)
         return output
 
@@ -355,6 +432,8 @@ class BeamDecoderLayer(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
+        self.rms_norm_eps = config.rms_norm_eps
+        self.sandwich_residual_norm = BeamSandwichResidualRMSNormOp()
         attn_depth = 2 * (layer_id + 1)
         mlp_depth = attn_depth + 1
         attn_denominator = math.sqrt(attn_depth)
@@ -401,10 +480,13 @@ class BeamDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        ssmax_scale: torch.Tensor | None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states, forward_batch)
+        hidden_states = self.self_attn(
+            positions, hidden_states, forward_batch, ssmax_scale
+        )
         hidden_states = depth_scaled_residual(
             self.post_attention_layernorm(hidden_states),
             residual,
@@ -415,6 +497,41 @@ class BeamDecoderLayer(nn.Module):
         return depth_scaled_residual(
             self.post_feedforward_layernorm(hidden_states),
             residual,
+            self.mlp_residual_scales,
+        )
+
+    def forward_fused(
+        self,
+        positions: torch.Tensor,
+        normed: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        next_norm_weight: Optional[torch.Tensor],
+        ssmax_scale: torch.Tensor | None,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Same arithmetic as `forward` with the two norm/residual transitions fused.
+
+        `normed` is this layer's `input_layernorm(residual)`, produced by the
+        previous transition. Returns the next layer's normalized input (or None
+        when `next_norm_weight` is None, on the last layer of a pipeline stage
+        that does not own the final norm) and the new residual stream.
+        """
+        attn = self.self_attn(positions, normed, forward_batch, ssmax_scale)
+        normed, residual = self.sandwich_residual_norm(
+            attn,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.pre_feedforward_layernorm.weight,
+            self.rms_norm_eps,
+            self.attn_residual_scales,
+        )
+        mlp = self.mlp(normed)
+        return self.sandwich_residual_norm(
+            mlp,
+            residual,
+            self.post_feedforward_layernorm.weight,
+            next_norm_weight,
+            self.rms_norm_eps,
             self.mlp_residual_scales,
         )
 
@@ -458,6 +575,20 @@ class BeamModel(nn.Module):
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
+        self.has_full_attention = any(
+            config.layer_types[layer_id] == "full_attention"
+            for layer_id in range(self.start_layer, self.end_layer)
+        )
+        # Decoder layers whose outputs feed a speculative drafter (DFlash).
+        self.layers_to_capture = ()
+        # Offload wrappers load weights through each layer's regular forward.
+        # Fusing across layer boundaries would bypass those wrappers.
+        # A custom PP partition can leave a stage with no layer to fuse from.
+        self.fuse_layers = (
+            get_exec().offload.cpu_offload_gb <= 0
+            and get_exec().offload.offload_group_size <= 0
+            and self.start_layer < self.end_layer
+        )
 
     def forward(
         self,
@@ -473,13 +604,62 @@ class BeamModel(nn.Module):
             )
         else:
             hidden_states = pp_proxy_tensors["hidden_states"]
+        # Positions are shared by every full-attention layer of this stage.
+        scale = compute_ssmax_scale(positions) if self.has_full_attention else None
+        aux_hidden_states = []
+        if self.fuse_layers:
+            return self._forward_fused(
+                positions, hidden_states, forward_batch, aux_hidden_states, scale
+            )
         for layer_id in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[layer_id](
-                positions, hidden_states, forward_batch
+                positions, hidden_states, forward_batch, scale
             )
+            if layer_id in self.layers_to_capture:
+                # The post-layer residual stream, before the final norm.
+                aux_hidden_states.append(hidden_states)
         if not self.pp_group.is_last_rank:
             return PPProxyTensors({"hidden_states": hidden_states})
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if self.layers_to_capture:
+            return hidden_states, aux_hidden_states
+        return hidden_states
+
+    def _forward_fused(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        aux_hidden_states: list,
+        ssmax_scale: torch.Tensor | None,
+    ):
+        # Each fused transition also produces the next layer's normalized input,
+        # so the first norm of this stage is the only standalone one.
+        residual = hidden_states
+        normed = self.layers[self.start_layer].input_layernorm(residual)
+        for layer_id in range(self.start_layer, self.end_layer):
+            if layer_id + 1 < self.end_layer:
+                next_norm_weight = self.layers[layer_id + 1].input_layernorm.weight
+            elif self.pp_group.is_last_rank:
+                next_norm_weight = self.norm.weight
+            else:
+                next_norm_weight = None
+            normed, residual = self.layers[layer_id].forward_fused(
+                positions,
+                normed,
+                residual,
+                forward_batch,
+                next_norm_weight,
+                ssmax_scale,
+            )
+            if layer_id in self.layers_to_capture:
+                aux_hidden_states.append(residual)
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors({"hidden_states": residual})
+        # `normed` already holds `self.norm(residual)`.
+        if self.layers_to_capture:
+            return normed, aux_hidden_states
+        return normed
 
 
 def get_beam_quantization(quant_config: Optional[QuantizationConfig]) -> Optional[str]:
@@ -537,6 +717,18 @@ class BeamForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    # The attention output gate keeps its qualified name: its leaf, gate_proj,
+    # also names the MLP gate, which is fused into gate_up_proj.
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "self_attn.gate_proj",
+        "gate_up_proj",
+        "down_proj",
+        "embed_tokens",
+        "lm_head",
+    ]
+
     def __init__(
         self,
         config: BeamConfig,
@@ -582,6 +774,7 @@ class BeamForCausalLM(nn.Module):
         # The default head projection returns BF16; LogitsProcessor promotes
         # its output to FP32 before softcap and logprobs.
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     @torch.no_grad()
     def forward(
@@ -597,9 +790,28 @@ class BeamForCausalLM(nn.Module):
         )
         if not self.model.pp_group.is_last_rank:
             return hidden_states
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
+
+    def set_dflash_layers_to_capture(self, layer_ids):
+        """Capture the listed decoder layers' outputs for the DFlash drafter."""
+        if self.model.pp_group.world_size != 1:
+            raise ValueError("Beam DFlash capture currently requires PP=1")
+        layer_ids = tuple(layer_ids)
+        if (
+            not layer_ids
+            or list(layer_ids) != sorted(set(layer_ids))
+            or any(i < 0 or i >= self.config.num_hidden_layers for i in layer_ids)
+        ):
+            raise ValueError(
+                "DFlash capture layers must be sorted, unique, and in range"
+            )
+        self.model.layers_to_capture = layer_ids
+        self.capture_aux_hidden_states = True
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

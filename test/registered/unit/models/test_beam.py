@@ -1,6 +1,7 @@
 """Precision and checkpoint-layout regressions for native Beam."""
 
 import math
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 import torch
 from compressed_tensors.quantization import preset_name_to_scheme
 
+from sglang.kernels.ops.elementwise import BeamAttentionGateOp
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.configs.model_config import (
     _get_and_verify_dtype,
@@ -26,14 +28,15 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.models.beam import (
     BeamAttention,
     BeamDecoderLayer,
     BeamForCausalLM,
     BeamModel,
     BeamMoE,
-    apply_attention_gate,
     apply_ssmax,
+    compute_ssmax_scale,
     depth_scaled_residual,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -101,6 +104,36 @@ class _LoadedExpert:
 
     def weight_loader(self, param, weight, name, *, shard_id, expert_id):
         self.shards[expert_id, shard_id] = weight.clone()
+
+
+class AddLayer(torch.nn.Module):
+    def __init__(self, amount):
+        super().__init__()
+        self.amount = amount
+        self.input_layernorm = torch.nn.Linear(1, 1, bias=False)
+        self.input_layernorm.weight.data.fill_(1)
+
+    def forward(self, positions, hidden, batch, ssmax_scale):
+        return hidden + self.amount
+
+    def forward_fused(
+        self, positions, normed, residual, batch, next_weight, ssmax_scale
+    ):
+        hidden = self.forward(positions, residual, batch, ssmax_scale)
+        return hidden * next_weight, hidden
+
+
+def stub_beam_model(layers, norm, layers_to_capture):
+    model = BeamModel.__new__(BeamModel)
+    torch.nn.Module.__init__(model)
+    model.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+    model.embed_tokens = torch.nn.Identity()
+    model.layers = torch.nn.ModuleList(layers)
+    model.norm = norm
+    model.start_layer, model.end_layer = 0, len(layers)
+    model.layers_to_capture = layers_to_capture
+    model.has_full_attention = False
+    return model
 
 
 class TestBeamConfig(CustomTestCase):
@@ -372,14 +405,16 @@ class TestBeamNumerics(CustomTestCase):
         ).unsqueeze(-1)
         expected = (query.float() * scale).bfloat16()
 
-        actual = apply_ssmax(query, positions)
+        actual = apply_ssmax(query, compute_ssmax_scale(positions))
 
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         self.assertFalse(torch.equal(expected, query * scale.bfloat16()))
         # Chunking and cached decode must retain the supplied absolute positions.
         for start, end in ((0, 3), (3, 6), (6, 7)):
             torch.testing.assert_close(
-                apply_ssmax(query[start:end], positions[start:end]),
+                apply_ssmax(
+                    query[start:end], compute_ssmax_scale(positions[start:end])
+                ),
                 actual[start:end],
                 atol=0,
                 rtol=0,
@@ -395,7 +430,7 @@ class TestBeamNumerics(CustomTestCase):
             output.float() * torch.sigmoid(gate.float() + bias.float()[None, :, None])
         ).bfloat16()
 
-        actual = apply_attention_gate(output, gate, bias)
+        actual = BeamAttentionGateOp().forward_native(output, gate, bias, 8)
 
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         self.assertEqual(actual.dtype, torch.bfloat16)
@@ -977,6 +1012,7 @@ class TestBeamLoading(CustomTestCase):
         try:
             torch.set_default_dtype(torch.bfloat16)
             with (
+                get_context().override_server_args(),
                 get_parallel().override(
                     moe_tp_size=1,
                     moe_ep_size=1,
@@ -1076,6 +1112,92 @@ class TestBeamLoading(CustomTestCase):
                 expected = fp32_projection if use_fp32_lm_head else bf16_projection
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                 self.assertEqual(actual.dtype, expected.dtype)
+
+
+class TestBeamDFlashCapture(CustomTestCase):
+    def test_dflash_captures_post_layer_before_final_norm(self):
+        norm = torch.nn.Linear(1, 1, bias=False)
+        norm.weight.data.fill_(10)
+        model = stub_beam_model([AddLayer(1), AddLayer(2), AddLayer(3)], norm, (0, 2))
+        for fuse_layers in (True, False):
+            with self.subTest(fuse_layers=fuse_layers):
+                model.fuse_layers = fuse_layers
+                hidden, aux = model(torch.zeros(2, 1), torch.arange(2), None)
+                torch.testing.assert_close(hidden, torch.full((2, 1), 60.0))
+                torch.testing.assert_close(aux[0], torch.ones(2, 1))
+                torch.testing.assert_close(aux[1], torch.full((2, 1), 6.0))
+
+    def test_no_capture_returns_only_the_normed_stream(self):
+        norm = torch.nn.Linear(1, 1, bias=False)
+        norm.weight.data.fill_(1)
+        model = stub_beam_model([AddLayer(1)], norm, ())
+        model.fuse_layers = True
+        hidden = model(torch.zeros(2, 1), torch.arange(2), None)
+        torch.testing.assert_close(hidden, torch.ones(2, 1))
+
+    def test_dflash_rejects_ambiguous_capture_order(self):
+        model = BeamForCausalLM.__new__(BeamForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.config = BeamConfig(num_hidden_layers=4)
+        model.model = SimpleNamespace(pp_group=SimpleNamespace(world_size=1))
+        for ids in ([], [1, 1], [2, 0], [-1], [4]):
+            with self.subTest(ids=ids), self.assertRaises(ValueError):
+                model.set_dflash_layers_to_capture(ids)
+        model.set_dflash_layers_to_capture([0, 3])
+        self.assertTrue(model.capture_aux_hidden_states)
+        self.assertEqual(model.model.layers_to_capture, (0, 3))
+
+    def test_dflash_capture_requires_a_single_pipeline_stage(self):
+        model = BeamForCausalLM.__new__(BeamForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.config = BeamConfig(num_hidden_layers=4)
+        model.model = SimpleNamespace(pp_group=SimpleNamespace(world_size=2))
+        with self.assertRaisesRegex(ValueError, "PP=1"):
+            model.set_dflash_layers_to_capture([0])
+
+
+class TestBeamPipelineStage(CustomTestCase):
+    def test_empty_stage_hands_on_its_stream(self):
+        """A custom PP partition can leave a stage with no layer to run or fuse from."""
+        config = tiny_config(layer_types=["full_attention"] * 4)
+        stream = torch.arange(2.0).unsqueeze(-1)
+        for partition, rank in (("0,4", 0), ("4,0", 1)):
+            with self.subTest(partition=partition):
+                pp_group = SimpleNamespace(
+                    is_first_rank=rank == 0,
+                    is_last_rank=rank == 1,
+                    rank_in_group=rank,
+                    world_size=2,
+                )
+                with (
+                    patch.dict(os.environ, {"SGLANG_PP_LAYER_PARTITION": partition}),
+                    get_context().override_server_args(),
+                    get_parallel().override(
+                        tp_size=1,
+                        tp_rank=0,
+                        attn_tp_size=1,
+                        attn_tp_rank=0,
+                        attn_dp_size=1,
+                        pp_size=2,
+                        pp_rank=rank,
+                        pp_group=pp_group,
+                    ),
+                ):
+                    model = BeamModel(config)
+                self.assertEqual(model.start_layer, model.end_layer)
+                if rank == 0:
+                    proxy = model(None, torch.arange(2), None, input_embeds=stream)
+                    torch.testing.assert_close(proxy["hidden_states"], stream)
+                else:
+                    model.norm = torch.nn.Linear(1, 1, bias=False)
+                    model.norm.weight.data.fill_(10)
+                    hidden = model(
+                        None,
+                        torch.arange(2),
+                        None,
+                        pp_proxy_tensors=PPProxyTensors({"hidden_states": stream}),
+                    )
+                    torch.testing.assert_close(hidden, stream * 10)
 
 
 if __name__ == "__main__":
