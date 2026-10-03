@@ -1065,10 +1065,10 @@ class DefaultModelLoader(BaseModelLoader):
                 and kv_scheme.get("num_bits") == 8
                 and runtime_kv_dtype == "nvfp4"
             ):
-                logger.warning(
-                    f"Ignoring FP8 KV cache scales from checkpoint (kv_cache_scheme: {kv_scheme}) "
-                    "because runtime kv_cache_dtype is NVFP4. The FP8 scales (e.g. amax/448) "
-                    "would systematically mis-scale NVFP4 KVs (amax/6). Falling back to dynamic scales."
+                logger.info(
+                    "ignoring fp8 kv cache scales from checkpoint (kv_cache_scheme: %s) "
+                    "because runtime kv cache dtype is nvfp4. falling back to dynamic scales.",
+                    kv_scheme
                 )
 
                 def _filter_kv_scales(ws):
