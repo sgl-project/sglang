@@ -2289,6 +2289,7 @@ def cli_main():
             "sharegpt",
             "custom",
             "openai",
+            "embedding",
             "random",
             "random-ids",
             "generated-shared-prefix",
@@ -2805,3 +2806,4 @@ def cli_main():
 
 if __name__ == "__main__":
     cli_main()
+

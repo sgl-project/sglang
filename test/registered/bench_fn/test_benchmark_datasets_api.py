@@ -33,6 +33,7 @@ from sglang.benchmark.datasets.agentic_trace import (
 )
 from sglang.benchmark.datasets.common import DatasetRow, gen_mm_prompt
 from sglang.benchmark.datasets.custom import sample_custom_requests
+from sglang.benchmark.datasets.embedding import sample_embedding_requests
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
     _zipf_group_probs,
@@ -158,7 +159,6 @@ class TestEmbeddingBenchmarkBackends(CustomTestCase):
             ASYNC_REQUEST_FUNCS["vllm-embedding"], async_request_openai_embeddings
         )
         self.assertEqual(_BACKEND_API_PATHS["vllm-embedding"], "/v1/embeddings")
-
 
 class TestBenchmarkCacheFlush(CustomTestCase):
     def test_cache_flush_uses_the_backend_specific_request(self):
@@ -941,6 +941,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             "sharegpt",
             "custom",
             "openai",
+            "embedding",
             "random",
             "random-ids",
             "generated-shared-prefix",
@@ -1030,6 +1031,39 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         agentic_rows = get_dataset(agentic_args, self.tokenizer, model_id="dummy-model")
         self.assertEqual(len(agentic_rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in agentic_rows))
+
+    def test_embedding_dataset_supports_single_and_batch_inputs(self):
+        dataset_path = self.tmpdir_path / "embeddings.jsonl"
+        rows = [
+            {"input": "single input", "encoding_format": "float"},
+            {
+                "input": ["batch input one", "batch input two"],
+                "dimensions": 128,
+            },
+            {"input": ""},
+            {"input": ["valid input", 123]},
+        ]
+        with dataset_path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+
+        requests = sample_embedding_requests(
+            dataset_path=str(dataset_path),
+            num_requests=10,
+            tokenizer=self.tokenizer,
+        )
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0].prompt, "single input")
+        self.assertEqual(requests[0].output_len, 0)
+        self.assertEqual(requests[0].extra_request_body, {"encoding_format": "float"})
+        self.assertEqual(requests[1].prompt, ["batch input one", "batch input two"])
+        self.assertEqual(requests[1].extra_request_body, {"dimensions": 128})
+        self.assertEqual(
+            requests[1].prompt_len,
+            len(self.tokenizer.encode("batch input one"))
+            + len(self.tokenizer.encode("batch input two")),
+        )
 
     def test_get_dataset_unknown_dataset(self):
         args = make_args(dataset_name="not-a-dataset")
@@ -1480,3 +1514,4 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
