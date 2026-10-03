@@ -168,10 +168,13 @@ def reshape_and_cache_flash(
     num_heads,
     head_size,
     block_size,
+    reserved_skip_index,
+    size_limit,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     HAS_SWA: tl.constexpr,
     USE_SCALE: tl.constexpr,
+    HAS_SIZE_LIMIT: tl.constexpr,
 ):
     """
     Triton kernel for reshaping per-token K/V tensors into paged KV cache layout.
@@ -189,6 +192,7 @@ def reshape_and_cache_flash(
     Features:
         - optional SWA slot remapping
         - optional FP8 scale dequantization before cache write
+        - optional slot upper bound
 
     Args:
         key_ptr: Pointer to source key tensor.
@@ -205,10 +209,14 @@ def reshape_and_cache_flash(
         num_heads: Number of attention heads.
         head_size: Hidden dimension per head.
         block_size: Number of slots per cache block.
+        reserved_skip_index: Slot whose writes are skipped; -1 skips none.
+        size_limit: Writes to slots >= size_limit are skipped; read only when
+            HAS_SIZE_LIMIT.
         HEAD_BLOCK: Number of heads processed per program.
         BLOCK_D: Vectorized dimension size (power-of-2 padded).
         HAS_SWA: Enable SWA remapping.
         USE_SCALE: Enable scale division before storing.
+        HAS_SIZE_LIMIT: Enable the size_limit bound.
     """
 
     # ----------------------------------
@@ -227,8 +235,14 @@ def reshape_and_cache_flash(
     if HAS_SWA:
         slot_idx = tl.load(swa_slot_mapping_ptr + slot_idx)
 
-    if slot_idx < 0:
+    # Keep destination offsets in int64: a valid int32 slot can overflow when
+    # multiplied by the cache row stride.
+    slot_idx = slot_idx.to(tl.int64)
+    if (slot_idx < 0) | (slot_idx == reserved_skip_index):
         return
+    if HAS_SIZE_LIMIT:
+        if slot_idx >= size_limit:
+            return
 
     block_idx = slot_idx // block_size
     block_offset = slot_idx % block_size
@@ -285,6 +299,8 @@ def launch_reshape_and_cache_flash(
     swa_slot_mapping=None,
     k_scale=None,
     v_scale=None,
+    reserved_skip_index=-1,
+    size_limit=None,
 ):
     """
     Launch wrapper for reshape_and_cache_flash Triton kernel.
@@ -301,11 +317,25 @@ def launch_reshape_and_cache_flash(
         swa_slot_mapping: Optional SWA remapping table
         k_scale: Optional key scaling factor
         v_scale: Optional value scaling factor
+        reserved_skip_index: Slot whose writes are skipped, e.g. the reserved
+            padding slot 0 that store_cache skips; -1 (default) skips none.
+        size_limit: If set, writes to slots >= size_limit (after any SWA remap)
+            are skipped; must not exceed the caches' slot count. None (default)
+            checks no upper bound.
     """
 
     num_tokens = key.shape[0]
     num_heads = key.shape[1]
     head_size = key.shape[2]
+
+    if size_limit is not None:
+        num_slots = min(
+            key_cache.shape[0] * key_cache.shape[1],
+            value_cache.shape[0] * value_cache.shape[1],
+        )
+        assert 0 <= size_limit <= num_slots, (
+            f"size_limit={size_limit} is outside the caches' {num_slots} slots"
+        )
 
     HEAD_BLOCK = 4
 
@@ -331,10 +361,13 @@ def launch_reshape_and_cache_flash(
         num_heads,
         head_size,
         key_cache.shape[1],
+        reserved_skip_index,
+        size_limit if size_limit is not None else 0,
         HEAD_BLOCK=HEAD_BLOCK,
         BLOCK_D=BLOCK_D,
         HAS_SWA=(swa_slot_mapping is not None),
         USE_SCALE=(k_scale is not None),
+        HAS_SIZE_LIMIT=(size_limit is not None),
     )
 
 

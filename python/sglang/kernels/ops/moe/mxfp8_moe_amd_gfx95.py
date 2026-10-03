@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 
 @triton.jit
@@ -139,8 +140,7 @@ def _grouped_gemm_mxfp8(
     M_routed = num_valid_tokens
     E, N, K = w.shape
     assert K % 128 == 0, f"MXFP8 native MoE requires K%128==0, got K={K}"
-    # Keep zero-fill: moe_align_block_size reserves an extra expert bucket for
-    # filtered routes, which should contribute zeros if present.
+    # Filtered routes may be absent from the sort and must contribute zeros.
     out = torch.zeros((M_routed, N), dtype=out_dtype, device=a_q.device)
     if a_div == top_k and M_routed <= 32 and K >= 3072:
         BLOCK_N = 64
@@ -285,6 +285,14 @@ def fused_moe_mxfp8_native(
         topk_ids.masked_fill_((topk_ids < 0) | (topk_ids >= local_num_experts), -1)
     else:
         # May alias the caller's tensor; everything below reads topk_ids only.
+        # -1 is the filtered-route id the clamp also emits; any other id outside
+        # [0, local_num_experts) would reach moe_align_block_size unclamped.
+        maybe_detect_oob(
+            topk_ids,
+            -1,
+            local_num_experts,
+            "fused_moe_mxfp8_native unclamped topk_ids",
+        )
         topk_ids = topk_ids.to(torch.int32)
 
     block_m = 64
