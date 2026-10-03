@@ -1,4 +1,6 @@
+import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -6,6 +8,7 @@ import unittest
 
 import requests
 import torch
+from prometheus_client.parser import text_string_to_metric_families
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import kill_process_tree
@@ -49,6 +52,33 @@ PROMPTS = [
 def _gpu_uuids(tp_size: int) -> list:
     # Single-node, default base_gpu_id/gpu_id_step: rank i runs on physical GPU i.
     return [current_platform.get_device_uuid(i) for i in range(tp_size)]
+
+
+def _run_status_cli(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "sglang.srt.weight_cache.status", *args],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _scrape_metrics(port: int) -> dict:
+    """{metric name: {frozenset(labels): value}} from one scrape of the daemon."""
+    body = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=10).text
+    out = {}
+    for family in text_string_to_metric_families(body):
+        for sample in family.samples:
+            out.setdefault(sample.name, {})[frozenset(sample.labels.items())] = (
+                sample.value
+            )
+    return out
 
 
 @unittest.skipIf(
@@ -236,7 +266,9 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                     os.unlink(path)
 
         # Step 1: Launch the weight cache daemon (blocks until the rank is
-        # ready, then monitors the child process).
+        # ready, then monitors the child process). --metrics-port turns on the
+        # Prometheus endpoint that test_metrics_endpoint scrapes.
+        cls.metrics_port = _free_port()
         cls.daemon_process = subprocess.Popen(
             [
                 sys.executable,
@@ -246,6 +278,8 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                 cls.model,
                 "--tp-size",
                 str(cls.tp_size),
+                "--metrics-port",
+                str(cls.metrics_port),
             ]
         )
 
@@ -345,6 +379,65 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
             logs,
             "Expected the client server to load weights via IPC, but the IPC "
             "load log line was not found — the loader likely fell back to disk.",
+        )
+
+    def test_status_cli(self):
+        """The status CLI must find the live daemon by discovery and report the
+        client-mode server above as a served, live client."""
+        (device_uuid,) = self.gpu_uuids
+        proc = _run_status_cli("--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = {row["label"]: row for row in json.loads(proc.stdout)}
+        self.assertIn(device_uuid, rows, f"daemon not discovered: {rows.keys()}")
+        row = rows[device_uuid]
+        self.assertTrue(row["reachable"], row.get("error"))
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["config"]["model_path"], self.model)
+        self.assertEqual(row["config"]["tp_size"], self.tp_size)
+        self.assertGreater(row["num_tensors"], 0)
+        self.assertGreater(row["load_seconds"], 0)
+        self.assertGreaterEqual(row["serve_count"], 1)
+        self.assertEqual(row["mismatch_count"], 0)
+        self.assertGreaterEqual(row["live_client_count"], 1)
+
+        # Human-readable form renders the same daemon without error.
+        proc = _run_status_cli()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"{device_uuid}  pid {row['pid']}  up ", proc.stdout)
+        self.assertIn("mismatch 0", proc.stdout)
+
+    def test_metrics_endpoint(self):
+        """The daemon launched with --metrics-port must serve a Prometheus
+        scrape that agrees with the status CLI on the same live daemon."""
+        samples = _scrape_metrics(self.metrics_port)
+        # gpu_id=0 -> port+0, so this is the port as given.
+        labels = frozenset({("gpu_id", "0"), ("tp_rank", "0"), ("pp_rank", "0")})
+
+        self.assertEqual(samples["sglang:weight_cache_daemon_loaded"], {labels: 1})
+        self.assertGreater(
+            samples["sglang:weight_cache_daemon_load_seconds"][labels], 0
+        )
+        self.assertGreaterEqual(
+            samples["sglang:weight_cache_daemon_live_clients"][labels], 1
+        )
+        fetch = samples["sglang:weight_cache_daemon_fetch_state_total"]
+        self.assertGreaterEqual(fetch[labels | {("result", "hit")}], 1)
+        self.assertEqual(fetch[labels | {("result", "mismatch")}], 0)
+
+        (info_labels,) = samples["sglang:weight_cache_daemon_info"].keys()
+        info_labels = dict(info_labels)
+        self.assertEqual(info_labels["model_path"], self.model)
+        self.assertEqual(info_labels["tp_size"], str(self.tp_size))
+
+        # One source of truth: the scrape and the status CLI report the same
+        # tensor count for this daemon.
+        (device_uuid,) = self.gpu_uuids
+        proc = _run_status_cli("--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = {row["label"]: row for row in json.loads(proc.stdout)}
+        self.assertEqual(
+            samples["sglang:weight_cache_daemon_num_tensors"][labels],
+            rows[device_uuid]["num_tensors"],
         )
 
 
