@@ -1,0 +1,1244 @@
+{
+  "status": "completed",
+  "date": "2026-10-03",
+  "feature": "Ordinary AR mixed-chunk training capture",
+  "base_commit": "c992513ff22905f16f97f6acf8f56e49286eb43c",
+  "production_change": "Allow ordinary AR mixed-chunk capture while retaining speculative mixed-chunk rejection; reuse existing per-request lengths, owned staging and commit ledger.",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "node": "node064",
+    "image_id": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495, NVIDIA H100 80GB HBM3, 81559 MiB, 535.154.05",
+    "runtime": {
+      "python": "3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "devices": 1,
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "transport": "TCP",
+    "catalog": "HTTP TestCaptureCatalog",
+    "runtime_lock_sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84"
+  },
+  "jobs": [
+    {
+      "role": "unit",
+      "version": 1,
+      "job_id": "01790998329562060844-e14fb9192d05",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-chunk-v1 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-chunk-v1/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --timeout-seconds 600 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python -m pytest -q test/registered/unit/training_capture/test_config.py test/registered/unit/training_capture/test_coordinator.py",
+      "result": {
+        "job_id": "01790998329562060844-e14fb9192d05",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790998386.7103872,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790998329562060844-e14fb9192d05.log"
+      },
+      "log_sha256": "b47a5fec0a4a915b3b48979c87be8caa5dcd8e3ddc4e2cde02d74821cd895133",
+      "methods": null,
+      "seconds": null,
+      "unit": {
+        "tests": 69,
+        "subtests": 70,
+        "seconds": 53.82
+      }
+    },
+    {
+      "role": "smoke",
+      "version": 1,
+      "job_id": "01790998329902206010-414c57470697",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-chunk-v1 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-chunk-v1/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B --timeout-seconds 900 -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_mixed.py TestMixedCapture.test_synchronous_eager -v -f",
+      "result": {
+        "job_id": "01790998329902206010-414c57470697",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790998489.981608,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790998329902206010-414c57470697.log"
+      },
+      "log_sha256": "0afe006d5c968b762218a8c43a4577a15c35f10d131ff8c0854b2dab1351aff1",
+      "methods": 1,
+      "seconds": 91.233,
+      "unit": null
+    },
+    {
+      "role": "runtime",
+      "version": 2,
+      "job_id": "01790998550880699273-83c0d12086a9",
+      "command": "kubectl exec -n qiji job-fe1ce1dcdea6-20261001023258-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-chunk-v2 --timeout-seconds 1800 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-chunk-v2/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_mixed.py -v -f",
+      "result": {
+        "job_id": "01790998550880699273-83c0d12086a9",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790999163.6856976,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790998550880699273-83c0d12086a9.log"
+      },
+      "log_sha256": "d83cfb91f161998adad037cccdb43cc5574ef7f2ad76a5839b61fdd38c57df7f",
+      "methods": 7,
+      "seconds": 599.592,
+      "unit": null
+    }
+  ],
+  "cases": [
+    {
+      "mixed_capture": "mixed-True-breakable-full",
+      "overlap": true,
+      "prefill": "breakable",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 18,
+      "mixed_replay_frames": 18,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ],
+      "capture_counters": {
+        "considered": 7,
+        "excluded_health_check": 1,
+        "admitted": 5,
+        "overlap_forwards": 35,
+        "cuda_graph_forwards": 34,
+        "excluded_length": 1,
+        "sealed": 5,
+        "writer_started": 5,
+        "copies_completed": 5,
+        "snapshot_built": 5,
+        "ready": 5,
+        "eager_forwards": 1
+      },
+      "states": {
+        "available": 4
+      },
+      "host_pool": {
+        "allocated_bytes": 31502336,
+        "device_allocated_bytes": 852224,
+        "device_limit_bytes": 8388608,
+        "kv_export_host_enqueued_bytes": 0,
+        "kv_export_device_enqueued_bytes": 0,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      }
+    },
+    {
+      "mixed_capture": "mixed-True-full-full",
+      "overlap": true,
+      "prefill": "full",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 18,
+      "mixed_replay_frames": 18,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ],
+      "capture_counters": {
+        "considered": 7,
+        "excluded_health_check": 1,
+        "admitted": 5,
+        "overlap_forwards": 35,
+        "cuda_graph_forwards": 34,
+        "excluded_length": 1,
+        "sealed": 5,
+        "writer_started": 5,
+        "copies_completed": 5,
+        "snapshot_built": 5,
+        "ready": 5,
+        "eager_forwards": 1
+      },
+      "states": {
+        "available": 4
+      },
+      "host_pool": {
+        "allocated_bytes": 31502336,
+        "device_allocated_bytes": 852224,
+        "device_limit_bytes": 8388608,
+        "kv_export_host_enqueued_bytes": 0,
+        "kv_export_device_enqueued_bytes": 0,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      }
+    },
+    {
+      "mixed_capture": "mixed-True-disabled-full",
+      "overlap": true,
+      "prefill": "disabled",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 17,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ],
+      "capture_counters": {
+        "considered": 7,
+        "excluded_health_check": 1,
+        "admitted": 5,
+        "overlap_forwards": 35,
+        "eager_forwards": 11,
+        "cuda_graph_forwards": 24,
+        "excluded_length": 1,
+        "sealed": 5,
+        "writer_started": 5,
+        "copies_completed": 5,
+        "snapshot_built": 5,
+        "ready": 5
+      },
+      "states": {
+        "available": 4
+      },
+      "host_pool": {
+        "allocated_bytes": 31502336,
+        "device_allocated_bytes": 852224,
+        "device_limit_bytes": 8388608,
+        "kv_export_host_enqueued_bytes": 0,
+        "kv_export_device_enqueued_bytes": 0,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      }
+    },
+    {
+      "mixed_capture": "mixed-True-disabled-disabled",
+      "overlap": true,
+      "prefill": "disabled",
+      "decode": "disabled",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 18,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ],
+      "capture_counters": {
+        "considered": 7,
+        "excluded_health_check": 1,
+        "admitted": 5,
+        "overlap_forwards": 35,
+        "eager_forwards": 35,
+        "excluded_length": 1,
+        "sealed": 5,
+        "writer_started": 5,
+        "copies_completed": 5,
+        "snapshot_built": 5,
+        "ready": 5
+      },
+      "states": {
+        "available": 4
+      },
+      "host_pool": {
+        "allocated_bytes": 31502336,
+        "device_allocated_bytes": 852224,
+        "device_limit_bytes": 8388608,
+        "kv_export_host_enqueued_bytes": 0,
+        "kv_export_device_enqueued_bytes": 0,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      }
+    },
+    {
+      "mixed_capture": "mixed-True-tc_piecewise-full",
+      "overlap": true,
+      "prefill": "tc_piecewise",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 18,
+      "mixed_replay_frames": 18,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ],
+      "capture_counters": {
+        "considered": 7,
+        "excluded_health_check": 1,
+        "admitted": 5,
+        "overlap_forwards": 35,
+        "cuda_graph_forwards": 34,
+        "excluded_length": 1,
+        "sealed": 5,
+        "writer_started": 5,
+        "copies_completed": 5,
+        "snapshot_built": 5,
+        "ready": 5,
+        "eager_forwards": 1
+      },
+      "states": {
+        "available": 4
+      },
+      "host_pool": {
+        "allocated_bytes": 31502336,
+        "device_allocated_bytes": 852224,
+        "device_limit_bytes": 8388608,
+        "kv_export_host_enqueued_bytes": 0,
+        "kv_export_device_enqueued_bytes": 0,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      }
+    },
+    {
+      "mixed_capture": "mixed-False-disabled-full",
+      "overlap": false,
+      "prefill": "disabled",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 17,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ],
+      "capture_counters": {
+        "considered": 7,
+        "excluded_health_check": 1,
+        "admitted": 5,
+        "eager_forwards": 11,
+        "cuda_graph_forwards": 21,
+        "sealed": 5,
+        "writer_started": 5,
+        "copies_completed": 5,
+        "snapshot_built": 5,
+        "excluded_length": 1,
+        "ready": 5
+      },
+      "states": {
+        "available": 4
+      },
+      "host_pool": {
+        "allocated_bytes": 31502336,
+        "device_allocated_bytes": 852224,
+        "device_limit_bytes": 8388608,
+        "kv_export_host_enqueued_bytes": 0,
+        "kv_export_device_enqueued_bytes": 0,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      }
+    },
+    {
+      "mixed_capture": "mixed-False-disabled-disabled",
+      "overlap": false,
+      "prefill": "disabled",
+      "decode": "disabled",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 17,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": 8,
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ],
+      "capture_counters": {
+        "considered": 7,
+        "excluded_health_check": 1,
+        "admitted": 5,
+        "eager_forwards": 32,
+        "sealed": 5,
+        "writer_started": 5,
+        "copies_completed": 5,
+        "snapshot_built": 5,
+        "excluded_length": 1,
+        "ready": 5
+      },
+      "states": {
+        "available": 4
+      },
+      "host_pool": {
+        "allocated_bytes": 31502336,
+        "device_allocated_bytes": 852224,
+        "device_limit_bytes": 8388608,
+        "kv_export_host_enqueued_bytes": 0,
+        "kv_export_device_enqueued_bytes": 0,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      }
+    }
+  ],
+  "totals": {
+    "runtime_methods": 7,
+    "post_exit_snapshots": 35,
+    "capture_off_requests": 42,
+    "excluded_length_requests": 7,
+    "tensor_objects": 826,
+    "tensor_bytes": 57941350,
+    "mixed_source_frames": 123,
+    "mixed_replay_frames": 54
+  },
+  "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+  "source_sha256": {
+    "python/sglang/srt/training_capture/config.py": "c79bae7f18a4f48c44398b6e95bfc0a70cc78f67f8a014e11f60f0fcb8ac9f2c",
+    "python/sglang/test/training_capture_mixed_server.py": "329ef8b8f765de7f6ec617a669716d9d92692f3b2eb4562af5c8e9bf9fc9a800",
+    "test/registered/storage/test_training_capture_mixed.py": "d023ce505eee174c5bfd39141908c70c81e03c4904677ef0336633d8cfb02676",
+    "test/registered/unit/training_capture/test_config.py": "99832d52f20f8c207b9733eb8dd0f35519bb26d718ef140d59baee121159b96f",
+    "test/registered/unit/training_capture/test_coordinator.py": "7a3cbb88324c6bccdc7cf936fbe332b2eb86e63428258807005fa9c74abdcb60"
+  },
+  "source_audit": {
+    "scope": "All tracked Python source and storage tests plus changed unit tests",
+    "reports": [
+      {
+        "version": 1,
+        "files": 3363,
+        "differences": [
+          "test/registered/storage/test_training_capture_mixed.py"
+        ],
+        "manifest_sha256": "e520dce72d3ad644bd9eb5b8c8978c350259f2270ad24538f85eaa476c17c716"
+      },
+      {
+        "version": 2,
+        "files": 3363,
+        "differences": [
+          "test/registered/storage/test_training_capture_mixed.py"
+        ],
+        "manifest_sha256": "b1a26450b747c567059138189581a3b325e86374b7b0bfccaa129f349f8104d0"
+      }
+    ],
+    "unit_v1": "Production code and unit tests match final v2; only the unused runtime test gained formatting/resource assertions.",
+    "runtime_v2": "Only the runtime-no-op CI registration differs from current source: extra-b/1-gpu-h100 is corrected to extra-a/1-gpu-small. Exact single-line replacement is verified; all executable test bodies are identical."
+  },
+  "cleanup": {
+    "resident_worker_verified_live": true,
+    "idle_load_resumed": true,
+    "experiment_queue_empty": true,
+    "resident_allocation_retained": true,
+    "evidence": "cleanup.json"
+  },
+  "limitations": [
+    "One H100, Qwen3-0.6B and FlashInfer; mixed TP/PP and P/D are not runtime-certified.",
+    "Real TCP Store and test Catalog; production retention, RDMA and SLOs remain separate.",
+    "Receiver gating and synchronous source observation make this a correctness experiment, not a serving benchmark.",
+    "Piecewise uses eager compile debug mode; Full prefill is experimental.",
+    "Pool observations do not independently prove attention writes.",
+    "Test cleanup removes raw temporary reference tensors; logs and executed source are retained."
+  ],
+  "artifact_archive": {
+    "path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/mixed-chunk-20261003",
+    "files": 25,
+    "manifest": "artifact-manifest.json",
+    "sha256": "664bf43ecbf57540fe978fb07bae651a6f6d20f86fe6cebc3d1cb3a75ea1b309"
+  }
+}

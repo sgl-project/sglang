@@ -522,6 +522,22 @@ Catalog，不覆盖混合 TP/PP prefill、非对称 P/D prefill、跨节点 RDMA
 [`experiments/DISTRIBUTED_PD_PREFILL_CAPTURE.md`](experiments/DISTRIBUTED_PD_PREFILL_CAPTURE.md)
 与 [`experiments/distributed-pd-prefill-capture.json`](experiments/distributed-pd-prefill-capture.json)。
 
+#### 7.3.2 Mixed-Chunk 采集
+
+普通 AR 采集现允许 `--enable-mixed-chunk`。同一 forward 内可包含新请求的
+prefill chunk 和已有请求的 decode。采集沿用逐请求 `extend_seq_lens_cpu`
+计算 position 切片偏移，按各自的完整 prompt 长度决定是否保存 teacher 行。
+未完成 prompt 的 chunk 只保存 KV，同批 decode 仍保存 raw top128/LSE；
+未被采集的请求也参与偏移计算，不能将后续请求的 KV 或 logits 行错位。
+
+这条路径复用已有的 owned Host/device staging、overlap 提交账本和 Mooncake
+发布协议，不新增 Store 字段。单 H100/Qwen3-0.6B 验收覆盖同步与 overlap、
+decode CUDA graph，以及 Full/Breakable/piecewise prefill graph；逐配置比较
+关闭/开启采集的输出，并在服务退出后校验完整 Store 样本。测试还包含同批
+超长排除请求、单 token 回复和 prefix cache 命中。混合 speculative 仍由启动
+检查拒绝，混合 TP/PP、P/D 与生产性能需单独验证。复现与证据见
+[`experiments/MIXED_CHUNK_CAPTURE.md`](experiments/MIXED_CHUNK_CAPTURE.md)。
+
 ### 7.4 选层 KV 导出
 
 `SelectedLayerKVExporter` 接收 request logical positions 到物理 slot 的映射，以及当前 target KV pool。它只导出 contract 中明确选择的层和有效位置。

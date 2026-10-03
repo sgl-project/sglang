@@ -184,7 +184,8 @@ def validate_capture_server_args(args) -> None:
             args.disaggregation_transfer_backend != "mooncake"
             or args.optimistic_prefill_attempts > 0
         ),
-        "mixed-chunk scheduling": args.enable_mixed_chunk,
+        "mixed-chunk speculative decoding": args.enable_mixed_chunk
+        and args.speculative_algorithm is not None,
         "PDMux": args.enable_pdmux,
         "diffusion language models": args.dllm_algorithm is not None,
         "model overlap": args.enable_two_batch_overlap

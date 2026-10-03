@@ -60,3 +60,6 @@ production Catalog retention or serving SLOs. Cross-node RDMA evidence is
 recorded separately in `RDMA.md` and `PD_RDMA.md`.
 The separate KV-input DSpark lane is documented in
 [`DSPARK_PREFILL_CAPTURE.md`](DSPARK_PREFILL_CAPTURE.md).
+Native mixed prefill/decode capture has a separate single-H100 AR matrix in
+[`MIXED_CHUNK_CAPTURE.md`](MIXED_CHUNK_CAPTURE.md); the results above do not
+implicitly include that later validation.

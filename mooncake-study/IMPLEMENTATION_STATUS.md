@@ -39,6 +39,7 @@ it does not redefine the goal as the modules already implemented.
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Prefill graph collection | Live request lengths, owned teacher/KV staging, resolved hidden capture, stable PP activations and P/D teacher handoff | Qwen3 AR/static target-KV DSpark pass Full, Breakable and piecewise in colocated/P/D single-rank, TP2, PP2 and TP2/PP2 serving with eager output comparison; Qwen2.5 TP4 colocated graphs pass same-execution capture-on/off equality and post-exit Store parity while retaining a no-capture cross-backend output difference; distributed piecewise uses eager compile debug mode; asymmetric P/D and other speculative prefill graphs remain open |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
+| Mixed-chunk collection | Ordinary AR admits native mixed prefill/decode; per-request offsets reuse owned staging and overlap ledgers | Single-H100 Qwen3 eager/graph tests check selected/unselected rows, partial prompt chunks, prefix hits, capture-off output equality and post-exit Store reads; mixed speculative remains rejected and distributed mixed coverage remains open |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production checkpoint-manager integration and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
 | Draft checkpoint export | SGLang API/CLI packages consolidated training state, resolved HF config and pinned validation artifacts | Split/native packed weights, all Markov heads, optimizer-step export/reload and a retained BF16 export pass; SpecForge checkpoint-manager adapter and trained-quality validation remain open |
@@ -4245,11 +4246,44 @@ preserves all ten attempts, including three failures, source identities and
 P/D v3 differs only in two unused colocated prefill files. The temporary
 four-H100 job is deleted and the original resident worker remains live.
 
+## Native Mixed Prefill And Decode Capture
+
+The capture startup gate now accepts ordinary AR `--enable-mixed-chunk`, while
+still rejecting mixed speculative execution. The existing forward hook uses
+per-request extend lengths and sequence boundaries, so partial prompt chunks
+contribute KV without teacher rows and ongoing decode rows retain their own
+teacher predictions. No new tensor layout or Mooncake Master field is needed.
+
+Configuration/coordinator tests pass 69 tests and 70 subtests. The new real
+Qwen3-0.6B/FlashInfer suite passes seven methods in 599.592 seconds, covering
+synchronous/overlap eager, synchronous/overlap decode graphs, and overlap
+Breakable/Full/piecewise prefill graphs. A receiver-only arrival barrier lets
+native scheduling mix three new requests into an ongoing decode. One new
+request exceeds the capture limit and must be explicitly excluded without
+shifting the other requests' rows. Partial chunks, one-token replies and
+cached prefixes are checked against raw source observations.
+
+The final matrix validates 35 post-exit snapshots, 826 tensor objects and
+57,941,350 tensor bytes. Its 42 capture-off requests have identical output
+tokens when capture is enabled. It observes 123 mixed request-frames, including
+54 actual prefill replays. Every cell has five publications, one length
+exclusion, zero capture failures, all four reservations returned and no
+quarantined buffers. An earlier synchronous smoke is retained separately.
+
+The [runbook](experiments/MIXED_CHUNK_CAPTURE.md) and
+[evidence](experiments/mixed-chunk-capture.json) retain three successful jobs,
+25 archived artifacts and a 3,363-file source audit. Only a runtime-no-op CI
+registration differs from the final GPU test source; its exact replacement
+and CI parser result are checked. Tests use one H100, TCP and the test Catalog;
+the receiver barrier and source observations are not performance evidence.
+Mixed TP/PP, P/D and SLO acceptance remain open. The resident H100's existing
+idle workload resumes after all jobs finish.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2, PP2 and combined TP2/PP2 AR/static target-KV
    DSpark prefill graph coverage to asymmetric P/D, other speculative and
-   mixed-batch execution. Extend distributed
+   distributed mixed-chunk execution beyond the single-H100 AR matrix. Extend distributed
    pressure beyond passing
    colocated and P/D synchronous TP1/PP2 and TP2/PP2 DSpark to AR and asymmetric
    combined topologies. Broaden real-request coverage to speculative cache

@@ -80,9 +80,19 @@ compact uses FA3 to exercise ragged graph replay and folded acceptance. Triton
 currently falls back to eager for ragged target verification. These tests use
 synthetic draft weights and synchronous source observations, so they establish
 data correctness, not draft quality or latency/SLO acceptance.
+Ordinary AR also accepts `--enable-mixed-chunk`: new prefill and ongoing
+decode requests can share a forward. Capture uses each request's actual
+extend length, skips teacher rows for incomplete prompt chunks, and retains
+decode teacher rows in the same batch. The Qwen3-0.6B single-H100 matrix covers
+synchronous/overlap eager, decode graphs and all three prefill graph backends,
+with exact capture-on/off output equality and post-exit Store checks. Oversized
+unselected requests must not shift the captured rows. See
+[mixed-chunk capture](../../../../mooncake-study/experiments/MIXED_CHUNK_CAPTURE.md).
+Mixed speculative execution remains unsupported by the serving scheduler;
+mixed TP/PP and P/D require their own runtime validation.
 The configuration is checked before weights load; unsupported DP/context
 parallelism, non-DSpark speculative algorithms, non-Mooncake or optimistic PD,
-mixed-chunk, LoRA, quantized or embedding execution is rejected. Model/pool
+mixed-chunk speculative, LoRA, quantized or embedding execution is rejected. Model/pool
 binding additionally requires a local safetensors target, local tokenizer
 artifacts, standard unscaled RoPE, full attention, and dense unquantized NHD
 BF16/FP16 KV. Initial codecs recognize Qwen3, Qwen2 and Llama implementations;

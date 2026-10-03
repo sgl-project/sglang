@@ -88,6 +88,15 @@ class TestCaptureConfiguration(CustomTestCase):
                 finally:
                     setattr(self.args, name, previous)
 
+    def test_mixed_chunk_ar_preserves_speculative_exclusion(self):
+        self.args.enable_mixed_chunk = True
+        for overlap in (False, True):
+            self.args.disable_overlap_schedule = not overlap
+            validate_capture_server_args(self.args)
+        self.args.speculative_algorithm = "DSPARK"
+        with self.assertRaisesRegex(ValueError, "mixed-chunk speculative"):
+            validate_capture_server_args(self.args)
+
     def test_pd_requires_mooncake_and_waits_for_capture_context(self):
         for role in ("prefill", "decode"):
             self.args.disaggregation_mode = role

@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
@@ -371,6 +372,52 @@ class TestCaptureCoordinator(CustomTestCase):
         self.assertEqual(tensors["logits_positions"].tolist(), list(range(2, 8)))
         self.assertEqual(tensors["kv_valid"].tolist(), [1] * 8)
         self.assertEqual(self.coordinator.stats()["counters"]["overlap_forwards"], 7)
+
+    def test_mixed_forward_skips_unselected_prefill_rows_before_decode(self):
+        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        req = CaptureTestRequest("mixed-decode", 2)
+        fixture = OverlapCaptureFixture(self.coordinator, req)
+        first = fixture.forward(2)
+        req.output_ids = [10]
+        self.coordinator.after_result(first)
+        logits = torch.arange(256).float()[None].repeat(3, 1)
+        logits += torch.tensor([1000, 2000, 3000])[:, None]
+        ticket = self.coordinator.after_forward(
+            SimpleNamespace(
+                reqs=[CaptureTestRequest("partial"), CaptureTestRequest("last"), req],
+                seq_lens_cpu=[5, 7, 3],
+                forward_mode=ForwardMode.MIXED,
+            ),
+            SimpleNamespace(
+                extend_seq_lens_cpu=[3, 2, 1],
+                positions=torch.tensor([2, 3, 4, 5, 6, 2]),
+            ),
+            SimpleNamespace(next_token_logits=logits),
+        )
+        logits.zero_()
+        for source in self.coordinator.exporter.buffers.values():
+            source.zero_()
+        req.output_ids.append(11)
+        req.finished_len = 2
+        req.finished_reason = FINISH_LENGTH(2)
+        self.coordinator.after_result(ticket)
+        manifest, tensors = read_snapshot(
+            self.store, self.catalog.wait_publications(1)[0]
+        )
+        self.assertEqual(manifest.sequence.response_length, 2)
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10, 11])
+        self.assertEqual(tensors["logits_positions"].tolist(), [2, 3])
+        self.assertEqual(tensors["kv_valid"].tolist(), [1, 1, 1, 0])
+        torch.testing.assert_close(
+            tensors["teacher_topk_logits"][1], torch.arange(255, 127, -1).float() + 3000
+        )
+        for name, source in fixture.sources.items():
+            torch.testing.assert_close(
+                tensors[name][:3], source[fixture.slots[:3]], rtol=0, atol=0
+            )
 
     def test_overlap_abort_with_pending_forward_never_publishes(self):
         from sglang.srt.managers.schedule_batch import FINISH_ABORT
