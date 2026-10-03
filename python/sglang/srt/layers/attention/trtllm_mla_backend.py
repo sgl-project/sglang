@@ -72,7 +72,11 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
+from sglang.srt.utils import (
+    is_flashinfer_available,
+    is_float4_e2m1fn_x2,
+    is_sm120_supported,
+)
 
 if is_flashinfer_available():
     import flashinfer
@@ -1076,7 +1080,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
         extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
-        if self.backend == "trtllm-gen":
+        # FlashInfer auto-selects XQA on SM12x, which has no multi-CTA counter.
+        if self.backend == "trtllm-gen" and not is_sm120_supported():
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
                 self._multi_ctas_kv_counter_buffer
             )
