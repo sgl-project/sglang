@@ -16,16 +16,19 @@ Columns are runner modes; rows are attention backends. Cells use:
 | Backend | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `torch_native` | ✓ no-prefix + prefix window edges, MHA + GQA decode window edges (uses explicit SDPA local-attention mask) | — (no CG hooks) | — (no CG path) | — (no CG path) | — | — | — | — | — | — | — | — |
-| `triton` | ✓ no-prefix lengths below/equal/above window + prefix lengths below/equal/above window | ✓ within-window decode (`prefix_lens=(1,2,3)`, `window=4`) + above-window decode (`prefix_lens=(7,8,9)`, `window=4`) | ✓ no-prefix window edges, prefix-within-window MHA extend | ✓ same as PCG | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2), `window=4` | ✓ EAGLE tree within-window + EAGLE chain above-window (`prefix_lens=(6,8)`, `window=4`) | — | — | — | — | — | — |
+| `triton` | ✓ no-prefix lengths below/equal/above window + prefix lengths below/equal/above window, decode window edge | ✓ within-window decode (`prefix_lens=(1,2,3)`, `window=4`) + above-window decode (`prefix_lens=(7,8,9)`, `window=4`) | ✓ no-prefix window edges, prefix-within-window MHA extend | ✓ same as PCG | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2), `window=4` | ✓ EAGLE tree within-window + EAGLE chain above-window (`prefix_lens=(6,8)`, `window=4`) | — | — | — | — | — | — |
 | `flashinfer` | ✓ no-prefix lengths below/equal/above window (`head_dim=64` for SM90) | ✓ within-window decode | ✓ no-prefix window edges (MHA extend) | ✓ same as PCG | ✓ DFLASH chain (`topk=1`, `window=4`) | ✓ DFLASH chain (`topk=1`, `window=4`) | — | — | — | — | — | — |
 
 ## Input And Config Coverage
 
 - No-prefix lengths below / equal / above the configured `sliding_window_size`.
 - For `triton`: matching prefix-length cases.
-- For `torch_native`: extra MHA + GQA decode cases at the window edge.
-- CG decode covers both within-window (`min(seq_lens, window)` clipped) and
-  above-window (full window clip) for `triton`.
+- For `torch_native`: extra MHA + GQA decode cases at the window edge; for `triton`:
+  one decode case at the window edge.
+- CG decode covers both within-window and above-window decode for `triton`.
+- Every backend uses one reference rule: a query attends to itself and the
+  `sliding_window_size` keys before it (`sliding_window_size` is the window minus
+  one, as most models report it), in extend and in decode.
 
 ## Notes on the "—" cells
 
@@ -37,11 +40,9 @@ Columns are runner modes; rows are attention backends. Cells use:
 
 ## Mutation Coverage Notes
 
-- The CG-decode above-window case (`runner_cuda_graph_swa_decode_above_window`)
-  exists specifically to expose the `sliding_window_size + 1` mutation at
-  `triton_backend.py:786` (M5). The dense reference picks the matching SWA mask
-  rule based on `case.backend in _SWA_AWARE_DECODE_BACKENDS` and
-  `case.forward_mode.is_decode()`.
+- The above-window decode cases (`swa_decode_window_edges`,
+  `layout_swa_decode_page_boundary`, `runner_cuda_graph_swa_decode_above_window`)
+  catch a decode window one key short or long.
 - The Verify CG above-window case
   (`runner_cuda_graph_eagle_verify_swa_above_window`) extends above-window
   coverage to the verify replay path, but does not catch M6 by itself — the
@@ -54,10 +55,3 @@ Columns are runner modes; rows are attention backends. Cells use:
   coverage added for this path is limited to DFLASH `TARGET_VERIFY`.
 - **`torch_native` SWA speculative / CUDA graph** — no CG hooks; all graph
   integration is structurally unsupported.
-
-## Next Work
-
-- Investigate the Triton above-window decode/reference numerical detail
-  separately (the above-window case currently asserts within tolerance with the
-  matching reference rule; if a real backend regression appears, lower the
-  tolerance).
