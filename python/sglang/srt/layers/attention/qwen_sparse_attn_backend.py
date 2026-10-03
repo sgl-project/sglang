@@ -1483,6 +1483,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 pool.get_value_buffer(layer.layer_id),
                 slots,
                 layer.scaling,
+                allow_npu_prefill=forward_batch.forward_mode == ForwardMode.EXTEND,
             )
             return self._pad_extend_output(output, num_output_rows)
 

@@ -301,6 +301,9 @@ class Envs:
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # Qwen4-Exp QSA eager prefill through CANN SparseFlashAttention's MLA layout.
+    # Experimental BF16 D256 on 910C; unsupported inputs keep the fallback.
+    SGLANG_NPU_QSA_NATIVE_PREFILL = EnvBool(False)
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
