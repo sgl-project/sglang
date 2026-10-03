@@ -566,8 +566,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
-    def is_chunk_cache(self) -> bool:
-        return self.disable
+    def supports_prefix_sharing(self) -> bool:
+        return not self.disable
 
     @rank_consensus(
         same_params=["len(params.key)"],

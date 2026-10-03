@@ -83,6 +83,7 @@ class Gemma3MLP(nn.Module):
         hidden_activation: str,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -97,6 +98,7 @@ class Gemma3MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
         )
         if hidden_activation != "gelu_pytorch_tanh":
