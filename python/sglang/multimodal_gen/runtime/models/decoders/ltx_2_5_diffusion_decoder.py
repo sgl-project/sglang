@@ -329,6 +329,7 @@ class LTX2VideoVaeRotaryPosEmbed3D(nn.Module):
         if (
             not _LTX25_DECODER_ROPE.disabled
             and _is_cuda
+            and query.is_cuda
             and query.dtype is torch.bfloat16
             and (verified or _LTX25_DECODER_ROPE.can_attempt_once())
         ):

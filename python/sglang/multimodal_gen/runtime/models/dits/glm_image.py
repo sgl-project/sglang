@@ -103,6 +103,7 @@ def _glm_ln_modulate(
     if (
         not _GLM_LN_MOD.disabled
         and _is_cuda
+        and x.is_cuda
         and dtype is x.dtype
         and is_plain_layer_norm(norm, x.shape[-1])
         and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
@@ -144,6 +145,7 @@ def _glm_qk_layernorm(
     if (
         not _GLM_QK_LN.disabled
         and _is_cuda
+        and query.is_cuda
         and dtype is query.dtype
         and dtype is key.dtype
         and is_plain_layer_norm(norm_q, query.shape[-1])

@@ -86,6 +86,9 @@ Keep backend selection separate from input validation.
   device family, dtype, layout, alignment, architecture, and numerical contract.
   A shape restriction belongs here only when it is a real specialization, such
   as a fixed head dimension or an unsupported broadcast mode.
+  Use the input's device when selecting CPU versus CUDA: a CUDA-capable
+  process can still receive CPU tensors. A CPU fallback must not disable a
+  process-wide GPU fusion gate.
 - Validate the selected implementation's inputs before launching. For JIT CUDA,
   use `TensorMatcher` and `CHECK_HOST` in the C++ launcher; keep dtype checks in
   the cached module factory. For Triton, validate in the Python launch wrapper.

@@ -90,6 +90,7 @@ def _ernie_norm_scale_shift(
     verified = _ERNIE_NORM.verified
     if (
         not _ERNIE_NORM.disabled
+        and x.is_cuda
         and norm.variance_size_override is None
         and can_use_fused_rmsnorm_scale_shift(x.dtype, x.shape[-1])
         and (verified or _ERNIE_NORM.can_attempt_once())
@@ -134,6 +135,7 @@ def _ernie_gated_norm_scale_shift(
     verified = _ERNIE_GATED_NORM.verified
     if (
         not _ERNIE_GATED_NORM.disabled
+        and residual.is_cuda
         and norm.variance_size_override is None
         and can_use_fused_rmsnorm_scale_shift(residual.dtype, residual.shape[-1])
         and (verified or _ERNIE_GATED_NORM.can_attempt_once())

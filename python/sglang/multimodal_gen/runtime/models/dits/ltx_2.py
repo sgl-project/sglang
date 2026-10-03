@@ -208,8 +208,10 @@ def _ltx2_rms_norm_modulate(
     default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
     on the request-scoped mount rather than a runtime self-check.
     """
-    if ltx2_rms_norm_modulate_active(block) and can_use_fused_rmsnorm_scale_shift(
-        x.dtype, x.shape[-1]
+    if (
+        ltx2_rms_norm_modulate_active(block)
+        and x.is_cuda
+        and can_use_fused_rmsnorm_scale_shift(x.dtype, x.shape[-1])
     ):
         return fused_ltx2_rms_norm_modulate(x, scale, shift, eps)
     normed = rms_norm(x, eps)

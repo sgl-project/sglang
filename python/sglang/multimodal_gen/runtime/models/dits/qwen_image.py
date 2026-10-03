@@ -133,6 +133,7 @@ def _qwen_norm_out(
     scale, shift = torch.chunk(emb, 2, dim=1)
     if (
         _QWEN_NORM_OUT.disabled
+        or not hidden_states.is_cuda
         or not is_plain_layer_norm(norm_out.norm, hidden_states.shape[-1])
         or not can_use_fused_layernorm_modulate(
             hidden_states.dtype, hidden_states.shape[-1]

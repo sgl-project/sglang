@@ -129,7 +129,7 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
 
 def apply_rope(x, rope):
     fused = None
-    if _is_cuda and _ROPE_FUSION.can_attempt_once():
+    if _is_cuda and x.is_cuda and _ROPE_FUSION.can_attempt_once():
         fused = fused_complex_rope(x, rope)
         if _ROPE_FUSION.verified:
             return fused
@@ -144,6 +144,7 @@ def apply_qk_norm(x, norm):
     fused = None
     if (
         _is_cuda
+        and x.is_cuda
         and x.dtype in (torch.float16, torch.bfloat16)
         and _QK_NORM_FUSION.can_attempt_once()
     ):
@@ -160,6 +161,7 @@ def apply_qk_norm_rope(x, norm, rope):
     fused = None
     if (
         _is_cuda
+        and x.is_cuda
         and not torch.compiler.is_compiling()
         and can_use_qknorm_complex_rope_cuda(x.dtype, x.shape[-1])
         and _QK_ROPE_CUDA_FUSION.can_attempt_once()
@@ -171,6 +173,7 @@ def apply_qk_norm_rope(x, norm, rope):
         return _QK_ROPE_CUDA_FUSION.accept_or_fallback(fused, out, logger=logger)
     if (
         _is_cuda
+        and x.is_cuda
         and x.dtype in (torch.float16, torch.bfloat16)
         and x.shape[-1] == 128
         and _QK_ROPE_FUSION.can_attempt_once()
@@ -222,7 +225,8 @@ def cat_outputs(outputs, dim=0):
 def apply_modulation(x, norm, scale):
     fused = None
     if (
-        can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
+        x.is_cuda
+        and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
         and _MODULATION_FUSION.can_attempt_once()
     ):
         fused = fused_layernorm_modulate(x, scale.squeeze(1), None, norm.eps)
@@ -456,6 +460,7 @@ class QwenImage21Attention(nn.Module):
         """
         if not (
             _is_cuda
+            and q.is_cuda
             and not torch.compiler.is_compiling()
             and can_use_qknorm_complex_rope_cuda(q.dtype, self.head_dim)
         ):
@@ -614,6 +619,7 @@ class QwenImage21Attention(nn.Module):
         if (
             get_sp_world_size() == 1
             and _is_cuda
+            and k.is_cuda
             and k.dtype in (torch.float16, torch.bfloat16)
             and self.head_dim == 128
             and _KV_ROPE_FUSION.can_attempt_once()

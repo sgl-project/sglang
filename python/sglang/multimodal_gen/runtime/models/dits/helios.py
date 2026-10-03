@@ -299,7 +299,7 @@ class HeliosSelfAttention(nn.Module):
         k: torch.Tensor,
         rotary_emb: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.tp_rmsnorm and _is_cuda:
+        if not self.tp_rmsnorm and _is_cuda and q.is_cuda:
             fused_inplace_helios_qk_rope(q, k, rotary_emb)
             return q, k
         return (

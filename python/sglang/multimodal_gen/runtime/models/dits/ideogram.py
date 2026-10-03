@@ -149,6 +149,7 @@ def _ideogram_swiglu(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if (
         not _IDEOGRAM_SWIGLU.disabled
         and _is_cuda
+        and a.is_cuda
         and a.dtype is torch.bfloat16
         and (verified or _IDEOGRAM_SWIGLU.can_attempt_once())
     ):

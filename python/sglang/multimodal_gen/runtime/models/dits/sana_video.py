@@ -69,6 +69,7 @@ def apply_interleaved_rotary_emb_pair(
     if (
         not _SANA_VIDEO_ROPE.disabled
         and _is_cuda
+        and query.is_cuda
         and query.dtype is torch.bfloat16
         and (verified or _SANA_VIDEO_ROPE.can_attempt_once())
     ):

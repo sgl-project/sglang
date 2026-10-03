@@ -78,6 +78,7 @@ def _longcat_gelu_cat(
         and activation.approximate == "tanh"
         and _LONGCAT_GELU_CAT.can_attempt_once()
         and _is_cuda
+        and attn.is_cuda
         and attn.dtype is torch.bfloat16
         and not torch.is_grad_enabled()
         and not torch.compiler.is_compiling()

@@ -410,6 +410,7 @@ def _wan_temb_table_slices(
     if (
         not _WAN_TEMB_SLICES.disabled
         and _is_cuda
+        and temb.is_cuda
         and (verified or _WAN_TEMB_SLICES.can_attempt_once())
     ):
         try:
