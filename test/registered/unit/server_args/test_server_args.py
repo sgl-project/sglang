@@ -34,6 +34,8 @@ from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache_ratio_default,
 )
 from sglang.srt.arg_groups.hisparse_hook import (
+    _hisparse_allowed_backends,
+    _hisparse_default_backend,
     validate_hisparse_dsa_backend,
     validate_hisparse_kv_cache_dtype,
 )
@@ -1263,21 +1265,21 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             ),
         }
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self):
         resolved = self._resolve("bfloat16")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_sparse")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_sparse")
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self):
         resolved = self._resolve("fp8_e4m3")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_accepts_flashinfer_sparse_mla_on_cuda_fp8(self):
         """SM120 GLM DSA resolves both DSA backends to flashinfer_sparse_mla, so
         the fp8 hisparse allow-set must admit it or --enable-hisparse cannot
@@ -1333,7 +1335,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tilelang"):
             validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_rejects_rocm_backend_on_cuda(self):
         server_args = ServerArgs(
             model_path="dummy",
@@ -1344,6 +1346,64 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "flashmla_sparse"):
             validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_accepts_intel_xpu_backend_on_xpu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="intel_xpu",
+            dsa_decode_backend="intel_xpu",
+        )
+
+        validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
+        validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_default_backend_is_allowed_on_xpu(self):
+        self.assertIn(
+            _hisparse_default_backend("bfloat16"),
+            _hisparse_allowed_backends("bfloat16"),
+        )
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_rejects_fp8_kv_cache_on_xpu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+            dsa_decode_backend="intel_xpu",
+        )
+        with self.assertRaisesRegex(ValueError, "fp8_e4m3"):
+            validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_rejects_cuda_backend_on_xpu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_decode_backend="flashmla_sparse",
+        )
+        with self.assertRaisesRegex(ValueError, "intel_xpu"):
+            validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    def test_intel_xpu_is_a_dsa_backend_cli_choice(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--dsa-prefill-backend",
+                "intel_xpu",
+                "--dsa-decode-backend",
+                "intel_xpu",
+            ]
+        )
+        self.assertEqual(args.dsa_prefill_backend, "intel_xpu")
+        self.assertEqual(args.dsa_decode_backend, "intel_xpu")
 
     def test_hisparse_accepts_bfloat16_kv_cache_dtype(self):
         server_args = ServerArgs(
