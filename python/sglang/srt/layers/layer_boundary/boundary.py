@@ -14,6 +14,7 @@
 """What each stage produces and needs, and the boundary steps chosen from those
 declarations."""
 
+from dataclasses import dataclass
 from functools import partial
 from typing import Callable, NamedTuple, Optional, Tuple
 
@@ -50,6 +51,7 @@ from sglang.srt.layers.layer_boundary.ops import (
     tp_slice,
     update_attn_tp_gather_output,
 )
+from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.prepare import (
     _attn_tp_reduce_scatter_update_read,
     _attn_tp_slice_update_read,
@@ -64,6 +66,7 @@ from sglang.srt.layers.layer_boundary.prepare import (
     _tp_sum_with_residual_read,
     _update_read,
 )
+from sglang.srt.layers.layer_boundary.residual import ResidualReadout
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -136,6 +139,48 @@ def _capture_move(edge: EdgeContract) -> Tuple[Optional[Callable], bool]:
     return move, bool(edge.residual_to.sharded - edge.produced.layout.sharded)
 
 
+@dataclass(frozen=True)
+class _TransformedRead:
+    """The read of an output its producer declared an OutputTransform on: the
+    transform runs on the complete sum, then the update and ``inner``. Not a
+    plain norm, so no fused add + norm and no residual-first order takes it."""
+
+    inner: ResidualReadout
+    transform: OutputTransform
+
+    is_plain_norm = False
+
+    @property
+    def reads_before_dp_gather(self):
+        return self.inner.reads_before_dp_gather
+
+    def init_residual(self, hidden_states):
+        return self.inner.init_residual(hidden_states)
+
+    def read(self, residual, norm, quant_format="", post_residual_addition=None):
+        return self.inner.read(residual, norm, quant_format, post_residual_addition)
+
+    def update_and_read(
+        self,
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format="",
+        post_residual_addition=None,
+    ):
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.transform.apply(hidden_states)
+        return self.inner.update_and_read(
+            update,
+            hidden_states,
+            residual,
+            norm,
+            quant_format=quant_format,
+            post_residual_addition=post_residual_addition,
+        )
+
+
 def bind_entry(
     edge: EdgeContract,
     *,
@@ -160,6 +205,16 @@ def bind_entry(
         Multiple update capabilities select among preconstructed paths; a single
         capability needs no runtime dispatcher.
     """
+    if edge.produced.transform is not None:
+        # An attention's transform, run once its sum is complete.
+        edge = msgspec.structs.replace(
+            edge,
+            need=msgspec.structs.replace(
+                edge.need,
+                read=_TransformedRead(edge.need.read, edge.produced.transform),
+            ),
+            residual_joins_sum=False,
+        )
     capabilities = edge.arriving_plain_add
     if not capabilities:
         if edge.produced.update is None:

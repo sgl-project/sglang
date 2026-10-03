@@ -196,8 +196,10 @@ class StageDeclaration:
         terminal: Whether this stage ends the model's layer stack. Prevents
             leaving work that requires a following layer; a finalize handoff
             may still reach the terminal norm when the fusion provider allows it.
-        output_transform: Optional operation on the FFN contribution before
-            residual update, with an explicit reduction-order contract.
+        output_transform: Optional operation on the contribution before the
+            residual update. An FFN's exit runs it under an explicit
+            reduction-order contract; an attention's is run by the input of
+            the stage that follows, once the attention's sum is complete.
         reduction: Whether compute always leaves a partial sum, obeys the
             exit scope, or adds a replicated component after its own sum.
         gathers_attn_tp_input: Whether attention gathers TP-sharded input itself.
@@ -267,6 +269,7 @@ def declare_attn(
     terminal=False,
     reduction=ProducerReduction.ALWAYS_PARTIAL,
     gathers_attn_tp_input=True,
+    output_transform=None,
 ):
     """Declare attention or a mixer; construct its executable boundary later.
 
@@ -280,12 +283,21 @@ def declare_attn(
             EXIT_SCOPED for a mixer that follows its exit scope's reduction decision.
             TAIL_AFTER_SUM is rejected for attention stages.
         gathers_attn_tp_input: Whether compute gathers attention-TP input slices itself.
+        output_transform: Optional operation on the output once its sum is
+            complete, before the residual update (a sandwich norm). The next
+            stage's input runs it, so no fused add + norm takes that input.
+            Requires ALWAYS_PARTIAL.
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
     """
     if reduction is ProducerReduction.TAIL_AFTER_SUM:
         raise ValueError("TAIL_AFTER_SUM is not supported for attention stages")
+    if (
+        output_transform is not None
+        and reduction is not ProducerReduction.ALWAYS_PARTIAL
+    ):
+        raise ValueError("an attention output transform requires ALWAYS_PARTIAL")
     return StageDeclaration(
         StageKind.ATTENTION,
         read,
@@ -293,6 +305,7 @@ def declare_attn(
         previous=previous,
         prepared_from=prepared_from,
         terminal=terminal,
+        output_transform=output_transform,
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
     )
@@ -400,6 +413,7 @@ def _resolve_stage(stage, variant, following=None):
             and following is not None
             and following.kind is StageKind.ATTENTION,
             update=stage.update,
+            transform=stage.output_transform,
         ),
     )
     return declaration, None, attention

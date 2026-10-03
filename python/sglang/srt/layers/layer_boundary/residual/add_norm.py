@@ -367,9 +367,32 @@ class NormReadout:
         return norm(hidden_states, residual)
 
 
+@dataclass(frozen=True)
+class UnfusedNormReadout(NormReadout):
+    """The input is the norm of the residual after the producer's update, in
+    two steps: the update rounds to the activation dtype before the norm, as
+    in models that add their residual themselves. No fused kernel takes it."""
+
+    is_plain_norm = False
+
+    def update_and_read(
+        self,
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format="",
+        post_residual_addition=None,
+    ):
+        if residual is not None:
+            hidden_states = update.update(hidden_states, residual)
+        return self.read(hidden_states, norm, quant_format, post_residual_addition)
+
+
 PLAIN_ADD = PlainAdd()
 NORM_QUANT_READOUT = NormQuantReadout()
 NORM_READOUT = NormReadout()
+UNFUSED_NORM_READOUT = UnfusedNormReadout()
 # A plain residual: the attention reads with its input norm and the quantization
 # it wants, the FFN with its norm, and each stage's output is added.
 PLAIN_RESIDUAL_OPS = LayerResidualOps(
