@@ -112,7 +112,12 @@ class TestSpecialValues(unittest.TestCase):
         strided = torch.randn(8, 16)[:, ::2]
         reference = (strided.double() * 2).contiguous()
         baseline = strided * 2
-        ignores_stride = strided.flatten()[: strided.numel()].view_as(strided) * 2
+        # Read the same storage as if it were contiguous -- what a kernel that
+        # takes a data pointer and assumes packed rows actually does. (A
+        # `.flatten()` would quietly copy and get the right answer.)
+        ignores_stride = (
+            torch.as_strided(strided, strided.shape, (strided.shape[1], 1)) * 2
+        )
 
         with self.assertRaisesRegex(AssertionError, "not lossless-tier"):
             assert_error_no_worse_than_reference(
