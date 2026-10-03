@@ -89,14 +89,20 @@ impl ChatTemplate {
         // mirror that or rendered whitespace (and thus tokens) diverge.
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
-        // Printing a variable the router didn't supply (a custom
-        // `chat_template_kwargs` entry, a date var, ...) must be a render
-        // error so the caller falls back to raw-text hashing — under the
-        // default lenient behavior it would render as `""` and produce a
-        // plausible-but-divergent prompt whose hashes silently never match
-        // the engine's. If-tests and iteration over undefined stay permitted
-        // (`{% if enable_thinking is defined %}`-style guards are common).
-        env.set_undefined_behavior(UndefinedBehavior::SemiStrict);
+        // Undefined behaves as in jinja2 (`msg.name == 'x'` is false, if-tests
+        // pass), except that printing it is an error: a variable the router
+        // didn't supply would render as `""` and silently diverge from the
+        // engine's prompt, so the caller falls back to raw-text hashing.
+        env.set_undefined_behavior(UndefinedBehavior::Lenient);
+        env.set_formatter(|out, state, value| {
+            if value.is_undefined() {
+                return Err(JinjaError::new(
+                    JinjaErrorKind::UndefinedError,
+                    "printed a variable the router does not supply",
+                ));
+            }
+            minijinja::escape_formatter(out, state, value)
+        });
         // Python str/dict methods used by real templates (.startswith, .items,
         // .strip, ...) that minijinja doesn't implement natively.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -146,7 +152,7 @@ impl ChatTemplate {
     /// `opts` carries what SGLang's generic Jinja path threads into
     /// `apply_chat_template`: `tools` (`none` when absent — the no-tools path)
     /// and the merged template kwargs. `documents` is always `none`. Any other
-    /// variable the template prints is a render error (semi-strict undefined),
+    /// variable the template prints is a render error,
     /// falling back to raw rather than hashing a silently divergent prompt.
     pub fn render_with(
         &self,
@@ -866,9 +872,9 @@ mod tests {
         assert_eq!(tmpl.render(&json!([])).unwrap(), "<pad>|<unk>");
     }
 
-    /// Printing a variable the router doesn't supply is a render error
-    /// (semi-strict undefined) so the caller falls back to raw-text hashing,
-    /// instead of rendering a plausible-but-divergent prompt.
+    /// Printing a variable the router doesn't supply is a render error so the
+    /// caller falls back to raw-text hashing, instead of rendering a
+    /// plausible-but-divergent prompt.
     #[test]
     fn printing_unsupplied_variable_fails_render() {
         let cfg = json!({
@@ -879,9 +885,8 @@ mod tests {
         tmpl.render(&messages()).unwrap_err();
     }
 
-    /// Undefined names stay usable in if-tests (semi-strict only rejects
-    /// printing them); common `{% if enable_thinking is defined %}`-style
-    /// guards must keep rendering.
+    /// Undefined names stay usable in if-tests; common
+    /// `{% if enable_thinking is defined %}`-style guards must keep rendering.
     #[test]
     fn undefined_in_if_test_is_permitted() {
         let cfg = json!({
@@ -889,6 +894,20 @@ mod tests {
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
         assert_eq!(tmpl.render(&messages()).unwrap(), "X");
+    }
+
+    /// Comparing a missing field is false, as in jinja2. Step-5's template
+    /// reads `message.name` on every non-first system message.
+    #[test]
+    fn comparing_a_missing_field_is_false() {
+        let cfg = json!({
+            "chat_template": "{% for m in messages %}{{ 'obs' if (m.role == 'system' \
+                and m.name == 'observation') else m.role }};{% endfor %}",
+        });
+        let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
+        let msgs = json!([{"role": "user", "content": "a"}, {"role": "system", "content": "b"},
+                          {"role": "system", "content": "c", "name": "observation"}]);
+        assert_eq!(tmpl.render(&msgs).unwrap(), "user;system;obs;");
     }
 
     /// `tools` is `none` in the render context — the same context HuggingFace
