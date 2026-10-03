@@ -509,6 +509,7 @@ class HYV3ForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=f"{prefix}.lm_head",
+            use_fp32_lm_head=getattr(config, "enable_lm_head_fp32", False),
         )
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight

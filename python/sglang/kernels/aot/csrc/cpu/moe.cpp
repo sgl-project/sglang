@@ -203,8 +203,16 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
         __m512 x1 = vc0[row * COLS + col + 1];
         __m512 y0 = vc1[row * COLS + col + 0];
         __m512 y1 = vc1[row * COLS + col + 1];
-        x0 = _mm512_mul_ps(_mm512_rcp14_silu_ps(x0), y0);
-        x1 = _mm512_mul_ps(_mm512_rcp14_silu_ps(x1), y1);
+        const __m512 one = _mm512_set1_ps(1.0f);
+        __m512 silu0 = _mm512_mul_ps(
+            x0, _mm512_div_ps(one, _mm512_add_ps(_mm512_exp_u20_ps(_mm512_sub_ps(_mm512_setzero_ps(), x0)), one)));
+        __m512 silu1 = _mm512_mul_ps(
+            x1, _mm512_div_ps(one, _mm512_add_ps(_mm512_exp_u20_ps(_mm512_sub_ps(_mm512_setzero_ps(), x1)), one)));
+        __m512i silu_bf16 = (__m512i)_mm512_cvtne2ps_pbh(silu1, silu0);
+        silu0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(silu_bf16, 0));
+        silu1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(silu_bf16, 1));
+        x0 = _mm512_mul_ps(silu0, y0);
+        x1 = _mm512_mul_ps(silu1, y1);
 
         _mm512_storeu_si512(
             reinterpret_cast<__m512i*>((C + row * ldc + col * 16)),
@@ -829,8 +837,9 @@ static inline void check_moe_scales(
   } else if constexpr (quant == CPUQuantMethod::FP8_W8A16) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for fp8 w8a16.");
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for fp8 w8a16.");
-    TORCH_CHECK(block_size.has_value(), "missing block_size for fp8 w8a16.");
-    TORCH_CHECK(block_size.value().size() == 2, "expect block_size.size() to be 2.");
+    if (block_size.has_value()) {
+      TORCH_CHECK(block_size.value().size() == 2, "expect block_size.size() to be 2.");
+    }
   } else if constexpr (quant == CPUQuantMethod::MXFP4) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for mxfp4.");
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for mxfp4.");
@@ -1072,38 +1081,80 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
 
-      CHECK_MOE_SCALES_FP8(1, 2);
-      fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
-          out_hidden_states.data_ptr<scalar_t>(),
-          intermediate_cache0,
-          intermediate_cache1,
-          intermediate_cache2,
-          A_tmp,
-          B_tmp,
-          C_tmp,
-          hidden_states.data_ptr<scalar_t>(),
-          packed_w1.data_ptr<at::Float8_e4m3fn>(),
-          packed_w2.data_ptr<at::Float8_e4m3fn>(),
-          with_bias ? w1_bias.value().data_ptr<float>() : nullptr,
-          with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
-          w1s.data_ptr<float>(),
-          w2s.data_ptr<float>(),
-          block_size_N,
-          block_size_K,
-          topk_weights_.data_ptr<float>(),
-          sorted_ids,
-          expert_ids,
-          offsets,
-          M,
-          N,
-          K,
-          E,
-          topk,
-          num_tokens_post_pad,
-          alpha.has_value() ? float(alpha.value()) : 0,
-          limit.has_value() ? float(limit.value()) : 0,
-          act_func,
-          with_bias);
+      auto w1s = w1_scale.value();
+      auto w2s = w2_scale.value();
+      if (block_size.has_value()) {
+        auto block_size_val = block_size.value();
+        int64_t block_size_N = block_size_val[0];
+        int64_t block_size_K = block_size_val[1];
+        TORCH_CHECK(w1s.size(1) == div_up(2 * N, block_size_N));
+        TORCH_CHECK(w1s.size(2) == div_up(K, block_size_K));
+        TORCH_CHECK(w2s.size(1) == div_up(K, block_size_N));
+        TORCH_CHECK(w2s.size(2) == div_up(N, block_size_K));
+        fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
+            out_hidden_states.data_ptr<scalar_t>(),
+            intermediate_cache0,
+            intermediate_cache1,
+            intermediate_cache2,
+            A_tmp,
+            B_tmp,
+            C_tmp,
+            hidden_states.data_ptr<scalar_t>(),
+            packed_w1.data_ptr<at::Float8_e4m3fn>(),
+            packed_w2.data_ptr<at::Float8_e4m3fn>(),
+            with_bias ? w1_bias.value().data_ptr<float>() : nullptr,
+            with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
+            w1s.data_ptr<float>(),
+            w2s.data_ptr<float>(),
+            block_size_N,
+            block_size_K,
+            topk_weights_.data_ptr<float>(),
+            sorted_ids,
+            expert_ids,
+            offsets,
+            M,
+            N,
+            K,
+            E,
+            topk,
+            num_tokens_post_pad,
+            alpha.has_value() ? float(alpha.value()) : 0,
+            limit.has_value() ? float(limit.value()) : 0,
+            act_func,
+            with_bias);
+      } else {
+        TORCH_CHECK(!with_bias, "per-tensor fp8 w8a16 MoE does not support expert bias.");
+        TORCH_CHECK(w1s.scalar_type() == at::kFloat, "expect per-tensor fp8 w1_scale to be float32.");
+        TORCH_CHECK(w2s.scalar_type() == at::kFloat, "expect per-tensor fp8 w2_scale to be float32.");
+        TORCH_CHECK(w1s.numel() == E, "expect per-tensor fp8 w1_scale.numel() == num_experts.");
+        TORCH_CHECK(w2s.numel() == E, "expect per-tensor fp8 w2_scale.numel() == num_experts.");
+        fused_experts_fp8_pertensor_kernel_impl<scalar_t>(
+            out_hidden_states.data_ptr<scalar_t>(),
+            intermediate_cache0,
+            intermediate_cache1,
+            intermediate_cache2,
+            A_tmp,
+            B_tmp,
+            C_tmp,
+            hidden_states.data_ptr<scalar_t>(),
+            packed_w1.data_ptr<at::Float8_e4m3fn>(),
+            packed_w2.data_ptr<at::Float8_e4m3fn>(),
+            w1s.data_ptr<float>(),
+            w2s.data_ptr<float>(),
+            topk_weights_.data_ptr<float>(),
+            sorted_ids,
+            expert_ids,
+            offsets,
+            M,
+            N,
+            K,
+            E,
+            topk,
+            num_tokens_post_pad,
+            alpha.has_value() ? float(alpha.value()) : 0,
+            limit.has_value() ? float(limit.value()) : 0,
+            act_func);
+      }
     } else if (moe_comp_method == CPUQuantMethod::MXFP4) {
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
