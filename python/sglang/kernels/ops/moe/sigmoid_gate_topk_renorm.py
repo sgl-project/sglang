@@ -1,8 +1,8 @@
-"""Fused MoE gate: sigmoid + bias + top-k selection + logsigmoid renorm.
+"""Fused MoE gate: sigmoid + bias + top-k selection + stable sigmoid renorm.
 
     sel  = sigmoid(logits)[:, :N] + bias        # selection score (bias optional)
     idx  = topk(sel, k)                         # top-k routed experts
-    w    = logsigmoid_norm(logits[idx] ++ shared) * route_scale * global_scale
+    w    = softmax(logsigmoid(logits[idx] ++ shared)) * route_scale * global_scale
 
 The renorm runs on the RAW logits gathered at the selected indices, so the sort
 key (sigmoid+bias) is not the renorm value -> we re-gather the raw logits.
@@ -113,8 +113,14 @@ def _sigmoid_gate_topk_renorm_kernel(
     active = tl.where(mask_k[None, :], routed_vals, shared)
 
     A: tl.constexpr = K + S
-    probs = tl.sigmoid(active)
     mask_a = offs_a < A
+    # Factor out exp(max(min(active, 0))) before evaluating the sigmoids.
+    # This is equivalent to softmax(logsigmoid(active)), without log/log1p.
+    # A finite row has at least one scaled probability >= 0.5, even when every
+    # unscaled sigmoid underflows. Mask padding before the max as well as sum.
+    nonpositive = tl.where(mask_a[None, :], tl.minimum(active, 0.0), float("-inf"))
+    shift = tl.max(nonpositive, axis=1, keep_dims=True)
+    probs = tl.exp(nonpositive - shift) / (1.0 + tl.exp(-tl.abs(active)))
     probs = tl.where(mask_a[None, :], probs, 0.0)
     weights = probs / tl.sum(probs, axis=1, keep_dims=True)
     weights *= (route_scale * tl.load(global_scale_ptr)).to(weights.dtype)
@@ -154,12 +160,13 @@ def sigmoid_gate_topk_renorm(
     *,
     return_packed_topk: bool = False,
 ):
-    """Fused top-k + logsigmoid renorm (production sigmoid+bias gate path).
+    """Fused top-k + stable sigmoid renorm (production sigmoid+bias gate path).
 
     `logits` is [tokens, n_routed + n_shared]; the last `n_shared_experts`
     columns are the shared experts. Selection score is sigmoid(routed logit)
     plus `bias` (per routed expert, fp32). Returns
-    (routed_weights[t,k], shared_weights[t,s], topk_indices[t,k] int32).
+    (routed_weights[t,k], topk_indices[t,k] int32, shared_weights[t,s], packed).
+    In packed mode, routed_weights and topk_indices are None.
     """
     # Only column-stride-1 is required (the kernel reads rows via stride_lm). In
     # InklingGate the gate logits are a [t,258] slice of a padded [t,264] tensor, so
