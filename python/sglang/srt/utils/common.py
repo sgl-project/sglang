@@ -3380,6 +3380,25 @@ def human_readable_int(value: str) -> int:
         )
 
 
+def get_parent_process() -> Optional[psutil.Process]:
+    """Return the original launcher, not a worker's possibly reassigned OS parent.
+
+    multiprocessing retains the process that called Process.start(), even after
+    reparenting or when a forkserver is the OS parent. If that launcher has died,
+    fail instead of falling back to an unrelated process such as PID 1.
+    """
+    parent = parent_process()
+    if parent is None:
+        return psutil.Process().parent()
+
+    process = psutil.Process(parent.pid)
+    # Check the multiprocessing sentinel after capturing psutil's PID identity:
+    # the launcher's PID may already have been reused before the lookup.
+    if not parent.is_alive():
+        raise psutil.NoSuchProcess(parent.pid)
+    return process
+
+
 def kill_itself_when_parent_died():
     if sys.platform == "linux":
         # sigkill this process when parent worker manager dies
