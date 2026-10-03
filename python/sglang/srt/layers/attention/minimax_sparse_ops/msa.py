@@ -19,6 +19,9 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.minimax_sparse.common.gather_kv import (
+    gather_kv_hnd,
+)
 from sglang.kernels.ops.attention.minimax_sparse.common.utils import unit_scale
 
 
@@ -158,14 +161,39 @@ def msa_sparse_prefill_main(
         sm_scale = head_dim**-0.5
     sm_scale = sm_scale * unit_scale(q_scale) * unit_scale(k_scale)
 
-    # Whole pool as MSA paged KV: [num_phys_pages, num_kv_heads, P, head_dim].
-    n_phys_pages = max_slots // P
-    k_paged = k_cache.view(n_phys_pages, P, num_kv_heads, head_dim).permute(0, 2, 1, 3)
-    v_paged = v_cache.view(n_phys_pages, P, num_kv_heads, head_dim).permute(0, 2, 1, 3)
-
     # Per-request Q lengths (extend) and physical page table.
     qo_segment_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
     kv_indices = _build_page_table(req_to_token, slot_ids, seq_lens, P)
+
+    n_phys_pages = max_slots // P
+    if num_kv_heads == 1:
+        # Whole pool as MSA paged KV: [num_phys_pages, num_kv_heads, P, head_dim].
+        # With a single KV head the permuted view is already contiguous, so the
+        # .contiguous() inside fmha_sm100's sparse path is a no-op (zero-copy).
+        k_paged = k_cache.view(n_phys_pages, P, num_kv_heads, head_dim).permute(
+            0, 2, 1, 3
+        )
+        v_paged = v_cache.view(n_phys_pages, P, num_kv_heads, head_dim).permute(
+            0, 2, 1, 3
+        )
+    else:
+        # Hkv > 1 (TP < num_kv_heads, e.g. PP deployments): the permuted pool
+        # view is NON-contiguous and fmha_sm100's sparse path would .contiguous()
+        # it — copying the ENTIRE per-layer pool. Gather only the pages this
+        # batch references into a compact HND buffer instead (single fused
+        # read+write over batch KV).
+        #
+        # Radix-cache prefix sharing can repeat the same physical page across
+        # requests in kv_indices, so with heavy sharing the packed table can
+        # exceed the pool's unique page count. Dedup first: gather each unique
+        # page once and hand MSA the inverse mapping as the page table (any
+        # valid table works — identity is not required). This bounds the
+        # compact buffer by min(batch pages, pool pages).
+        unique_pages, inverse = torch.unique(kv_indices, return_inverse=True)
+        k_paged, v_paged = gather_kv_hnd(
+            k_cache, v_cache, unique_pages.to(torch.int32), P
+        )
+        kv_indices = inverse.to(torch.int32)
 
     # topk_idx [Hkv, total_q, topk] -> kv_block_indexes [total_q, Hkv, topk].
     kv_block_indexes = topk_idx.permute(1, 0, 2).contiguous().to(torch.int32)
