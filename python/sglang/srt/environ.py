@@ -1812,6 +1812,12 @@ class Envs:
     # bank write run on the local shard, then only the normalized attention
     # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # Opt-in Cake kernel routes (FlashInfer "Cake" kernels forwarded through
+    # sglang.kernels.cake_kernels). Comma-separated route names, or "all".
+    # Each route is still gated by the adapter's supports_<op>() admission and
+    # falls back to the engine's default kernel when the contract is not met.
+    # See python/sglang/kernels/cake_kernels/_routes.py for the route names.
+    SGLANG_CAKE_ROUTES = EnvStr("")
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
