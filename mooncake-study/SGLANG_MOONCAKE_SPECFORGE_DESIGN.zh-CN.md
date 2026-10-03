@@ -614,10 +614,25 @@ abort/retract 不发布剩余缓冲，跨 stream 复用和尾部 flush 都受 co
 
 四组共排除 8 份中断采集，12 份有效样本在服务退出后由新 Store client 完整读回，
 KV/raw top128/ID/LSE/token/mask/position/validity 均与实际在线来源一致。
-此验收使用单卡 Qwen3 MHA、Triton、TCP Store 和 Catalog test double；不包含
+上述单卡验收使用 Qwen3 MHA、Triton、TCP Store 和 Catalog test double；不包含
 CUDA allocator 异常、分布式压力、prefill graph 与容量压力的组合或生产 SLO。
 复现与原始数据见 [`experiments/AR_PRESSURE.md`](experiments/AR_PRESSURE.md) 和
 [`experiments/capture-ar-memory-pressure.json`](experiments/capture-ar-memory-pressure.json)。
+
+后续分布式验收将普通 AR 扩展至 TP2、PP2 与 TP2/PP2，并重跑单卡回归；最终
+12 组全部通过。PP 使用同步调度与两请求 microbatch，逐 rank 确认四个 capture
+context 同时存活，不能把一个 microbatch 的大小当作全局并发数。每个 rank 都
+验证原 capture ID、一致的回收计数、容量恢复、成功请求复用释放 slot 和准入恢复。
+teacher 与 KV 均使用 16-token D2H staging；只有末级 PP stage 持有 teacher。
+
+60 条请求完成 3,888 个输出 token，24 份中断采集进入失败状态，36 份完整样本
+在 producer 退出后读回，校验 828 个 tensor object / 33,032,352 bytes。分布式
+graph 用例覆盖 PP 的一请求/两请求 decode replay，非 PP 覆盖三请求 replay；
+TP overlap 用例逐 rank 检查 pending-result lookahead。未改变生产 scheduler、
+capture 或 Store 逻辑。详细证据见
+[`experiments/capture-ar-distributed-pressure.json`](experiments/capture-ar-distributed-pressure.json)。
+此扩展仍使用 Qwen3-0.6B、Triton、TCP Store 与 HTTP test Catalog；P/D AR 压力、
+非对称拓扑、跨节点 RDMA 压力、饱和回压和生产 SLO 仍需单独验收。
 
 ## 8. Mooncake 接入与存储协议
 

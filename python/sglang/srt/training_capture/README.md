@@ -157,6 +157,14 @@ These counters are rank-local. In PP, the READY publication counter belongs to
 the auxiliary owner on the last stage; PP0 reporting zero READY does not imply
 that no global snapshot was published.
 
+The [AR pressure suite](../../../../mooncake-study/experiments/AR_PRESSURE.md)
+verifies native KV pool exhaustion on single-rank, TP2, PP2 and combined TP2/PP2
+serving. It checks original capture IDs, all-rank retirement and slot reuse,
+fresh admission, and complete Store reads after producer exit. Resuming a
+retracted request does not start a second capture. The verified matrix uses
+16-token KV/teacher D2H batches, synchronous PP, Qwen3-0.6B and TCP Store;
+P/D AR pressure and production SLOs require separate validation.
+
 ### Operator Control
 
 `POST /control_training_capture` accepts `{"action":"pause"}`, `resume`, or

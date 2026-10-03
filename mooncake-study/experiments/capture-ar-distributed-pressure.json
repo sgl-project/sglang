@@ -1,0 +1,2803 @@
+{
+  "status": "completed",
+  "date": "2026-10-03T05:26:14.652Z",
+  "base_commit": "1909d33d5851a6d7af5d4de83233e26a3fee2168",
+  "feature": "Distributed ordinary AR capture retirement and recovery under native KV exhaustion",
+  "production_change": "None; existing scheduler, capture lifecycle and Store paths run unchanged.",
+  "environment": {
+    "time": "2026-10-03T05:07:24.835Z",
+    "pod": "job-6734426dafac-20261003125620-master-0",
+    "node": "node057",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "gpus": "0, NVIDIA H100 80GB HBM3, GPU-4a8a45ff-5693-5c0f-e317-ab35e000f774, 81559 MiB, 535.154.05\n1, NVIDIA H100 80GB HBM3, GPU-6857fd00-d43e-3328-18bc-d66def53cc89, 81559 MiB, 535.154.05\n2, NVIDIA H100 80GB HBM3, GPU-31acdeb8-82e4-a88b-40b0-4197c9ece7a7, 81559 MiB, 535.154.05\n3, NVIDIA H100 80GB HBM3, GPU-fcdff24c-bd52-d0ec-3d0f-1dd0a21ef618, 81559 MiB, 535.154.05",
+    "runtime": {
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "attention": "Triton",
+    "model": "Qwen3-0.6B BF16",
+    "store": "TCP",
+    "catalog": "HTTP TestCaptureCatalog",
+    "removed_pod_system_packages": [
+      "flashinfer-cubin==0.6.12",
+      "flashinfer-jit-cache==0.6.12+cu130"
+    ]
+  },
+  "jobs": [
+    {
+      "role": "smoke",
+      "id": "01791003839000240261-c0ca1adcc01b",
+      "state": "state-ar-pressure-distributed",
+      "pod": "job-6734426dafac-20261003125620-master-0",
+      "methods": 1,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v1",
+      "submission": {
+        "job_id": "01791003839000240261-c0ca1adcc01b",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_ar_pressure_distributed.py",
+          "TestARPressurePP.test_synchronous_eager",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 700
+      },
+      "result": {
+        "job_id": "01791003839000240261-c0ca1adcc01b",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791003961.3526347,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-ar-pressure-distributed/logs/01791003839000240261-c0ca1adcc01b.log"
+      },
+      "log_sha256": "2de7429d5743a11d706814c53eefd872e1ca4b7138493cf804d828783a3ed01d",
+      "diagnostic": "The v1 fixture required four requests in one batch. Native PP split them across microbatches. v2 explicitly uses two-request PP microbatches and requires four simultaneous capture contexts plus replay at both two and one requests."
+    },
+    {
+      "role": "single",
+      "id": "01791003839389329398-b1a928b3567a",
+      "state": "state",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "methods": 4,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v1",
+      "submission": {
+        "job_id": "01791003839389329398-b1a928b3567a",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_ar_pressure.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1300
+      },
+      "result": {
+        "job_id": "01791003839389329398-b1a928b3567a",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791004039.6648433,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791003839389329398-b1a928b3567a.log"
+      },
+      "elapsed_seconds": 186.916,
+      "log_sha256": "cc99bfe38eba4c78541bfbb6e287d7bf8c2617c86d5065daf969cadde00acf93"
+    },
+    {
+      "role": "smoke-v2",
+      "id": "01791004444165743652-ac6079d30308",
+      "state": "state-ar-pressure-distributed",
+      "pod": "job-6734426dafac-20261003125620-master-0",
+      "methods": 1,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2",
+      "submission": {
+        "job_id": "01791004444165743652-ac6079d30308",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_ar_pressure_distributed.py",
+          "TestARPressurePP.test_synchronous_graph",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 700
+      },
+      "result": {
+        "job_id": "01791004444165743652-ac6079d30308",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791004524.3785613,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-ar-pressure-distributed/logs/01791004444165743652-ac6079d30308.log"
+      },
+      "elapsed_seconds": 58.719,
+      "log_sha256": "f532356ae0bbb10f4a5656536979496183d9609b9848ea3c88089be107423934"
+    },
+    {
+      "role": "single-final",
+      "id": "01791004444573301763-b1ec3d5e4fca",
+      "state": "state",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "methods": 4,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2",
+      "submission": {
+        "job_id": "01791004444573301763-b1ec3d5e4fca",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_ar_pressure.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1300
+      },
+      "result": {
+        "job_id": "01791004444573301763-b1ec3d5e4fca",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791004645.060347,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791004444573301763-b1ec3d5e4fca.log"
+      },
+      "elapsed_seconds": 187.011,
+      "log_sha256": "d586ee6bbf7ddd20603f133ab98b45fd2e5b95760ba0bb23a35f7551eab4ae29"
+    },
+    {
+      "role": "distributed",
+      "id": "01791004580816438549-d73c08765ff6",
+      "state": "state-ar-pressure-distributed",
+      "pod": "job-6734426dafac-20261003125620-master-0",
+      "methods": 6,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2",
+      "submission": {
+        "job_id": "01791004580816438549-d73c08765ff6",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_ar_pressure_distributed.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1700
+      },
+      "result": {
+        "job_id": "01791004580816438549-d73c08765ff6",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791004972.7814324,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-ar-pressure-distributed/logs/01791004580816438549-d73c08765ff6.log"
+      },
+      "elapsed_seconds": 371.96,
+      "log_sha256": "75cac543ead4ddc4fae4c6dbda495d0c114c49704b9b62cf61c104c801da3201"
+    },
+    {
+      "role": "combined",
+      "id": "01791004581199552351-94551e653054",
+      "state": "state-ar-pressure-distributed",
+      "pod": "job-6734426dafac-20261003125620-master-0",
+      "methods": 2,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2",
+      "submission": {
+        "job_id": "01791004581199552351-94551e653054",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_ar_pressure_tppp.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-ar-pressure-distributed-v2/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 900
+      },
+      "result": {
+        "job_id": "01791004581199552351-94551e653054",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791005115.665649,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-ar-pressure-distributed/logs/01791004581199552351-94551e653054.log"
+      },
+      "elapsed_seconds": 122.741,
+      "log_sha256": "e1e9cb2d2bfcef091afd32587099ba59dff160441a3a22536df57c38d92bbc25"
+    }
+  ],
+  "cases": [
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "cuda_graph": false,
+      "overlap": true,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp1-pp1-False-True-2",
+        "ar-pressure-tp1-pp1-False-True-3"
+      ],
+      "reused_kv_slots": 64,
+      "source_frames": 286,
+      "ready_samples": 3,
+      "tensor_objects": 54,
+      "tensor_bytes": 2777272,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp1-pp1-False-True-0": "e8cacf6802304c109825bc6baf7d61a0",
+            "ar-pressure-tp1-pp1-False-True-1": "0ffbb1b16eb5401d9b99e522d9a64378",
+            "ar-pressure-tp1-pp1-False-True-2": "631a7b984978491f98c641adf7b79b03",
+            "ar-pressure-tp1-pp1-False-True-3": "33380d72a1d14d3d915c7551370ea34b",
+            "ar-pressure-tp1-pp1-False-True-fresh": "63725d08498a41dea6fbae51b37ec371"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 64,
+          "source_frames": 286,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp1-False-True-3",
+                  "capture_id": "33380d72a1d14d3d915c7551370ea34b",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp1-False-True-2",
+                  "capture_id": "631a7b984978491f98c641adf7b79b03",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 6,
+            "excluded_health_check": 1,
+            "admitted": 5,
+            "overlap_forwards": 87,
+            "eager_forwards": 87,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4
+          },
+          "host_pool": {
+            "allocated_bytes": 11021312,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "cuda_graph": true,
+      "overlap": true,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp1-pp1-True-True-2",
+        "ar-pressure-tp1-pp1-True-True-3"
+      ],
+      "reused_kv_slots": 64,
+      "source_frames": 286,
+      "ready_samples": 3,
+      "tensor_objects": 54,
+      "tensor_bytes": 2777272,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp1-pp1-True-True-0": "124a1934ea414230a453ba9dffdf9b71",
+            "ar-pressure-tp1-pp1-True-True-1": "fb29443149564d50802d18ec9a4382ce",
+            "ar-pressure-tp1-pp1-True-True-2": "84207e929e5843ec87f941536fca50c3",
+            "ar-pressure-tp1-pp1-True-True-3": "e3584bfca11f495cbdc21eff1b11920d",
+            "ar-pressure-tp1-pp1-True-True-fresh": "4ff25a4526754e778ba44035a5e7589b"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "reused_kv_slots": 64,
+          "source_frames": 286,
+          "graph_frames": 281,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp1-True-True-3",
+                  "capture_id": "e3584bfca11f495cbdc21eff1b11920d",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp1-True-True-2",
+                  "capture_id": "84207e929e5843ec87f941536fca50c3",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 6,
+            "excluded_health_check": 1,
+            "admitted": 5,
+            "overlap_forwards": 87,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 84,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4
+          },
+          "host_pool": {
+            "allocated_bytes": 11021312,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "cuda_graph": false,
+      "overlap": false,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp1-pp1-False-False-2",
+        "ar-pressure-tp1-pp1-False-False-3"
+      ],
+      "reused_kv_slots": 62,
+      "source_frames": 283,
+      "ready_samples": 3,
+      "tensor_objects": 54,
+      "tensor_bytes": 2740408,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp1-pp1-False-False-0": "32876ff756814dd69672d4aa90d17f5d",
+            "ar-pressure-tp1-pp1-False-False-1": "d828c4ccfb0e489f97c0d8a5bf542495",
+            "ar-pressure-tp1-pp1-False-False-2": "3ad49f6296fd458bbe0764af05f4e74b",
+            "ar-pressure-tp1-pp1-False-False-3": "136a46f203d340688fb886d086c73698",
+            "ar-pressure-tp1-pp1-False-False-fresh": "cb9857c79441407196e6876f90339583"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp1-False-False-3",
+                  "capture_id": "136a46f203d340688fb886d086c73698",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp1-False-False-2",
+                  "capture_id": "3ad49f6296fd458bbe0764af05f4e74b",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 6,
+            "excluded_health_check": 1,
+            "admitted": 5,
+            "eager_forwards": 85,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4
+          },
+          "host_pool": {
+            "allocated_bytes": 11021312,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "cuda_graph": true,
+      "overlap": false,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp1-pp1-True-False-2",
+        "ar-pressure-tp1-pp1-True-False-3"
+      ],
+      "reused_kv_slots": 62,
+      "source_frames": 283,
+      "ready_samples": 3,
+      "tensor_objects": 54,
+      "tensor_bytes": 2740408,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp1-pp1-True-False-0": "54397f83f7e24efb8c82d2dbd3e97a95",
+            "ar-pressure-tp1-pp1-True-False-1": "224c6fac80574fa89d8240b5783a3ed7",
+            "ar-pressure-tp1-pp1-True-False-2": "c689bd4f965e418381cec5e12bb07177",
+            "ar-pressure-tp1-pp1-True-False-3": "bc5dc20507ec408cb1a0fe49f153c7bc",
+            "ar-pressure-tp1-pp1-True-False-fresh": "bb652f39b6b64908b64a84b5cb6e3d2a"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 278,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp1-True-False-3",
+                  "capture_id": "bc5dc20507ec408cb1a0fe49f153c7bc",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp1-True-False-2",
+                  "capture_id": "c689bd4f965e418381cec5e12bb07177",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 6,
+            "excluded_health_check": 1,
+            "admitted": 5,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 82,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4
+          },
+          "host_pool": {
+            "allocated_bytes": 11021312,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 2,
+      "cuda_graph": false,
+      "overlap": false,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp1-pp2-False-False-1",
+        "ar-pressure-tp1-pp2-False-False-3"
+      ],
+      "reused_kv_slots": 124,
+      "source_frames": 566,
+      "ready_samples": 3,
+      "tensor_objects": 54,
+      "tensor_bytes": 2740408,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp1-pp2-False-False-0": "b401348067c2480c821988774b96c017",
+            "ar-pressure-tp1-pp2-False-False-1": "b1f215f95c7546598c67a5f4824e3369",
+            "ar-pressure-tp1-pp2-False-False-2": "8c522edd64174fbcb208c5894706f45f",
+            "ar-pressure-tp1-pp2-False-False-3": "f7611a8fe4d34d1185551ac86c280b7c",
+            "ar-pressure-tp1-pp2-False-False-fresh": "e8e7748735ba4dee99d1ece743810eea"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp2-False-False-1",
+                  "capture_id": "b1f215f95c7546598c67a5f4824e3369",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp2-False-False-3",
+                  "capture_id": "f7611a8fe4d34d1185551ac86c280b7c",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "ar-pressure-tp1-pp2-False-False-0": "b401348067c2480c821988774b96c017",
+            "ar-pressure-tp1-pp2-False-False-1": "b1f215f95c7546598c67a5f4824e3369",
+            "ar-pressure-tp1-pp2-False-False-2": "8c522edd64174fbcb208c5894706f45f",
+            "ar-pressure-tp1-pp2-False-False-3": "f7611a8fe4d34d1185551ac86c280b7c",
+            "ar-pressure-tp1-pp2-False-False-fresh": "e8e7748735ba4dee99d1ece743810eea"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp2-False-False-1",
+                  "capture_id": null,
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp2-False-False-3",
+                  "capture_id": null,
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 164,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 164,
+            "failed_peer_capture_failed": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 8924160,
+            "device_allocated_bytes": 590080,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 2,
+      "cuda_graph": true,
+      "overlap": false,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp1-pp2-True-False-1",
+        "ar-pressure-tp1-pp2-True-False-3"
+      ],
+      "reused_kv_slots": 124,
+      "source_frames": 566,
+      "ready_samples": 3,
+      "tensor_objects": 54,
+      "tensor_bytes": 2740408,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp1-pp2-True-False-0": "9d423ce4453c4f73b3721ee43a5f649e",
+            "ar-pressure-tp1-pp2-True-False-1": "bbad4c1287444dbc80207a8d05aaecf8",
+            "ar-pressure-tp1-pp2-True-False-2": "cf23cab77086488a8cc2934002e32263",
+            "ar-pressure-tp1-pp2-True-False-3": "a2cc822bdbed41d7902bc65e80499c0c",
+            "ar-pressure-tp1-pp2-True-False-fresh": "35d4a8d8389541b79738be2519dc082f"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2
+          ],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 278,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp2-True-False-1",
+                  "capture_id": "bbad4c1287444dbc80207a8d05aaecf8",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp2-True-False-3",
+                  "capture_id": "a2cc822bdbed41d7902bc65e80499c0c",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "ar-pressure-tp1-pp2-True-False-0": "9d423ce4453c4f73b3721ee43a5f649e",
+            "ar-pressure-tp1-pp2-True-False-1": "bbad4c1287444dbc80207a8d05aaecf8",
+            "ar-pressure-tp1-pp2-True-False-2": "cf23cab77086488a8cc2934002e32263",
+            "ar-pressure-tp1-pp2-True-False-3": "a2cc822bdbed41d7902bc65e80499c0c",
+            "ar-pressure-tp1-pp2-True-False-fresh": "35d4a8d8389541b79738be2519dc082f"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2
+          ],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 278,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp2-True-False-1",
+                  "capture_id": null,
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp1-pp2-True-False-3",
+                  "capture_id": null,
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 161,
+            "failed_peer_capture_failed": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 8924160,
+            "device_allocated_bytes": 590080,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "cuda_graph": false,
+      "overlap": true,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp2-pp1-False-True-2",
+        "ar-pressure-tp2-pp1-False-True-3"
+      ],
+      "reused_kv_slots": 128,
+      "source_frames": 572,
+      "ready_samples": 3,
+      "tensor_objects": 84,
+      "tensor_bytes": 2777272,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp2-pp1-False-True-0": "63bc082700f64ace97bf5b8502798fe7",
+            "ar-pressure-tp2-pp1-False-True-1": "c9e17540685949649daee6b6596cb3a1",
+            "ar-pressure-tp2-pp1-False-True-2": "21681918c28241e2a05358ebd6308a45",
+            "ar-pressure-tp2-pp1-False-True-3": "5fad7cb6ee2a4bc8a4c4dc83598e6060",
+            "ar-pressure-tp2-pp1-False-True-fresh": "c9cddac60f2a4385a6801b528415271d"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 64,
+          "source_frames": 286,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-False-True-3",
+                  "capture_id": "5fad7cb6ee2a4bc8a4c4dc83598e6060",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-False-True-2",
+                  "capture_id": "21681918c28241e2a05358ebd6308a45",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "ar-pressure-tp2-pp1-False-True-0": "63bc082700f64ace97bf5b8502798fe7",
+            "ar-pressure-tp2-pp1-False-True-1": "c9e17540685949649daee6b6596cb3a1",
+            "ar-pressure-tp2-pp1-False-True-2": "21681918c28241e2a05358ebd6308a45",
+            "ar-pressure-tp2-pp1-False-True-3": "5fad7cb6ee2a4bc8a4c4dc83598e6060",
+            "ar-pressure-tp2-pp1-False-True-fresh": "c9cddac60f2a4385a6801b528415271d"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 64,
+          "source_frames": 286,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-False-True-3",
+                  "capture_id": "5fad7cb6ee2a4bc8a4c4dc83598e6060",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-False-True-2",
+                  "capture_id": "21681918c28241e2a05358ebd6308a45",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 87,
+            "eager_forwards": 87,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 7875584,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 87,
+            "eager_forwards": 87,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 3145728,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0,
+          "test_service_admission_ready": true
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "cuda_graph": true,
+      "overlap": true,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp2-pp1-True-True-2",
+        "ar-pressure-tp2-pp1-True-True-3"
+      ],
+      "reused_kv_slots": 128,
+      "source_frames": 572,
+      "ready_samples": 3,
+      "tensor_objects": 84,
+      "tensor_bytes": 2777272,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp2-pp1-True-True-0": "3c1a5815952d48808f6138de081cfc0d",
+            "ar-pressure-tp2-pp1-True-True-1": "bd991b1f66634d4d9ee941bb3eca8047",
+            "ar-pressure-tp2-pp1-True-True-2": "a19ecb5dadf14d87a6e90142220f9404",
+            "ar-pressure-tp2-pp1-True-True-3": "3bb23d1cdc254c5490ca4713aaa16da6",
+            "ar-pressure-tp2-pp1-True-True-fresh": "2c4bf73799af49428515b02a5de4d788"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "reused_kv_slots": 64,
+          "source_frames": 286,
+          "graph_frames": 281,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-True-True-3",
+                  "capture_id": "3bb23d1cdc254c5490ca4713aaa16da6",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-True-True-2",
+                  "capture_id": "a19ecb5dadf14d87a6e90142220f9404",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "ar-pressure-tp2-pp1-True-True-0": "3c1a5815952d48808f6138de081cfc0d",
+            "ar-pressure-tp2-pp1-True-True-1": "bd991b1f66634d4d9ee941bb3eca8047",
+            "ar-pressure-tp2-pp1-True-True-2": "a19ecb5dadf14d87a6e90142220f9404",
+            "ar-pressure-tp2-pp1-True-True-3": "3bb23d1cdc254c5490ca4713aaa16da6",
+            "ar-pressure-tp2-pp1-True-True-fresh": "2c4bf73799af49428515b02a5de4d788"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "reused_kv_slots": 64,
+          "source_frames": 286,
+          "graph_frames": 281,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-True-True-3",
+                  "capture_id": "3bb23d1cdc254c5490ca4713aaa16da6",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-True-True-2",
+                  "capture_id": "a19ecb5dadf14d87a6e90142220f9404",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 87,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 84,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 7875584,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 87,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 84,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 3145728,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0,
+          "test_service_admission_ready": true
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "cuda_graph": false,
+      "overlap": false,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp2-pp1-False-False-2",
+        "ar-pressure-tp2-pp1-False-False-3"
+      ],
+      "reused_kv_slots": 124,
+      "source_frames": 566,
+      "ready_samples": 3,
+      "tensor_objects": 84,
+      "tensor_bytes": 2740408,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp2-pp1-False-False-0": "4082d766a4134c3e811d89ad03b578da",
+            "ar-pressure-tp2-pp1-False-False-1": "948db939eba540d6a88793f2c0cf3b00",
+            "ar-pressure-tp2-pp1-False-False-2": "15aecd721a9f412ab9f88f095b192e73",
+            "ar-pressure-tp2-pp1-False-False-3": "09e5d7d35c5e41dfb8c58ea1cfb589e7",
+            "ar-pressure-tp2-pp1-False-False-fresh": "009e68dd4ef34548bc987e89722b8427"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-False-False-3",
+                  "capture_id": "09e5d7d35c5e41dfb8c58ea1cfb589e7",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-False-False-2",
+                  "capture_id": "15aecd721a9f412ab9f88f095b192e73",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "ar-pressure-tp2-pp1-False-False-0": "4082d766a4134c3e811d89ad03b578da",
+            "ar-pressure-tp2-pp1-False-False-1": "948db939eba540d6a88793f2c0cf3b00",
+            "ar-pressure-tp2-pp1-False-False-2": "15aecd721a9f412ab9f88f095b192e73",
+            "ar-pressure-tp2-pp1-False-False-3": "09e5d7d35c5e41dfb8c58ea1cfb589e7",
+            "ar-pressure-tp2-pp1-False-False-fresh": "009e68dd4ef34548bc987e89722b8427"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-False-False-3",
+                  "capture_id": "09e5d7d35c5e41dfb8c58ea1cfb589e7",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-False-False-2",
+                  "capture_id": "15aecd721a9f412ab9f88f095b192e73",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 85,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 7875584,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 85,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 3145728,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "cuda_graph": true,
+      "overlap": false,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp2-pp1-True-False-2",
+        "ar-pressure-tp2-pp1-True-False-3"
+      ],
+      "reused_kv_slots": 124,
+      "source_frames": 566,
+      "ready_samples": 3,
+      "tensor_objects": 84,
+      "tensor_bytes": 2740408,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp2-pp1-True-False-0": "73507d2a4cc24b3a910aea425c839122",
+            "ar-pressure-tp2-pp1-True-False-1": "4376f61048d64e709a1044525b5c289d",
+            "ar-pressure-tp2-pp1-True-False-2": "a6244baf335d416aaa75f43dde380630",
+            "ar-pressure-tp2-pp1-True-False-3": "3155fd1439314c098ac94606ba71dd97",
+            "ar-pressure-tp2-pp1-True-False-fresh": "58bde80fd9ba4f6f89742ae16ed65285"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 278,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-True-False-3",
+                  "capture_id": "3155fd1439314c098ac94606ba71dd97",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-True-False-2",
+                  "capture_id": "a6244baf335d416aaa75f43dde380630",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "ar-pressure-tp2-pp1-True-False-0": "73507d2a4cc24b3a910aea425c839122",
+            "ar-pressure-tp2-pp1-True-False-1": "4376f61048d64e709a1044525b5c289d",
+            "ar-pressure-tp2-pp1-True-False-2": "a6244baf335d416aaa75f43dde380630",
+            "ar-pressure-tp2-pp1-True-False-3": "3155fd1439314c098ac94606ba71dd97",
+            "ar-pressure-tp2-pp1-True-False-fresh": "58bde80fd9ba4f6f89742ae16ed65285"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 278,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 64,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-True-False-3",
+                  "capture_id": "3155fd1439314c098ac94606ba71dd97",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 1,
+              "required_next_decode": 3,
+              "debug_retract": false,
+              "reference_boundary": 258,
+              "available_after": 70,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp1-True-False-2",
+                  "capture_id": "a6244baf335d416aaa75f43dde380630",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 82,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 7875584,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 82,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 3145728,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 2,
+      "cuda_graph": false,
+      "overlap": false,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp2-pp2-False-False-1",
+        "ar-pressure-tp2-pp2-False-False-3"
+      ],
+      "reused_kv_slots": 248,
+      "source_frames": 1132,
+      "ready_samples": 3,
+      "tensor_objects": 84,
+      "tensor_bytes": 2740408,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp2-pp2-False-False-0": "124c6c954da34fee97665512b81b76cc",
+            "ar-pressure-tp2-pp2-False-False-1": "9e9b399dd8c54a99baf1a3561bc21141",
+            "ar-pressure-tp2-pp2-False-False-2": "0a91d2632af44450826d84f704c673db",
+            "ar-pressure-tp2-pp2-False-False-3": "5a1b3104559b492aa4830df63ddf1974",
+            "ar-pressure-tp2-pp2-False-False-fresh": "20b0eed2e9a14c2f9c60cde72dc814d7"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-False-False-1",
+                  "capture_id": "9e9b399dd8c54a99baf1a3561bc21141",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-False-False-3",
+                  "capture_id": "5a1b3104559b492aa4830df63ddf1974",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "ar-pressure-tp2-pp2-False-False-0": "124c6c954da34fee97665512b81b76cc",
+            "ar-pressure-tp2-pp2-False-False-1": "9e9b399dd8c54a99baf1a3561bc21141",
+            "ar-pressure-tp2-pp2-False-False-2": "0a91d2632af44450826d84f704c673db",
+            "ar-pressure-tp2-pp2-False-False-3": "5a1b3104559b492aa4830df63ddf1974",
+            "ar-pressure-tp2-pp2-False-False-fresh": "20b0eed2e9a14c2f9c60cde72dc814d7"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-False-False-1",
+                  "capture_id": "9e9b399dd8c54a99baf1a3561bc21141",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-False-False-3",
+                  "capture_id": "5a1b3104559b492aa4830df63ddf1974",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "ar-pressure-tp2-pp2-False-False-0": "124c6c954da34fee97665512b81b76cc",
+            "ar-pressure-tp2-pp2-False-False-1": "9e9b399dd8c54a99baf1a3561bc21141",
+            "ar-pressure-tp2-pp2-False-False-2": "0a91d2632af44450826d84f704c673db",
+            "ar-pressure-tp2-pp2-False-False-3": "5a1b3104559b492aa4830df63ddf1974",
+            "ar-pressure-tp2-pp2-False-False-fresh": "20b0eed2e9a14c2f9c60cde72dc814d7"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-False-False-1",
+                  "capture_id": null,
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-False-False-3",
+                  "capture_id": null,
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp1-tp1": {
+          "admissions": {
+            "ar-pressure-tp2-pp2-False-False-0": "124c6c954da34fee97665512b81b76cc",
+            "ar-pressure-tp2-pp2-False-False-1": "9e9b399dd8c54a99baf1a3561bc21141",
+            "ar-pressure-tp2-pp2-False-False-2": "0a91d2632af44450826d84f704c673db",
+            "ar-pressure-tp2-pp2-False-False-3": "5a1b3104559b492aa4830df63ddf1974",
+            "ar-pressure-tp2-pp2-False-False-fresh": "20b0eed2e9a14c2f9c60cde72dc814d7"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 0,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-False-False-1",
+                  "capture_id": null,
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-False-False-3",
+                  "capture_id": null,
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 164,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 1048576,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 164,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 1048576,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 164,
+            "failed_peer_capture_failed": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 6827008,
+            "device_allocated_bytes": 327936,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp1-tp1": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 164,
+            "failed_peer_capture_failed": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 2,
+      "cuda_graph": true,
+      "overlap": false,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-tp2-pp2-True-False-1",
+        "ar-pressure-tp2-pp2-True-False-3"
+      ],
+      "reused_kv_slots": 248,
+      "source_frames": 1132,
+      "ready_samples": 3,
+      "tensor_objects": 84,
+      "tensor_bytes": 2740408,
+      "producer_exited": true,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "ar-pressure-tp2-pp2-True-False-0": "b8b854ab1f324493b24974a063202201",
+            "ar-pressure-tp2-pp2-True-False-1": "ef1e39688f7c4043a99a505dfe343dc3",
+            "ar-pressure-tp2-pp2-True-False-2": "410ad96012684e488d9e57f933f7b964",
+            "ar-pressure-tp2-pp2-True-False-3": "097bf6d73c124a94a2fb661efd91cb12",
+            "ar-pressure-tp2-pp2-True-False-fresh": "8f9b0c0751a0499b8cd83757570741b6"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2
+          ],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 278,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-True-False-1",
+                  "capture_id": "ef1e39688f7c4043a99a505dfe343dc3",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-True-False-3",
+                  "capture_id": "097bf6d73c124a94a2fb661efd91cb12",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "ar-pressure-tp2-pp2-True-False-0": "b8b854ab1f324493b24974a063202201",
+            "ar-pressure-tp2-pp2-True-False-1": "ef1e39688f7c4043a99a505dfe343dc3",
+            "ar-pressure-tp2-pp2-True-False-2": "410ad96012684e488d9e57f933f7b964",
+            "ar-pressure-tp2-pp2-True-False-3": "097bf6d73c124a94a2fb661efd91cb12",
+            "ar-pressure-tp2-pp2-True-False-fresh": "8f9b0c0751a0499b8cd83757570741b6"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2
+          ],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 278,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-True-False-1",
+                  "capture_id": "ef1e39688f7c4043a99a505dfe343dc3",
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-True-False-3",
+                  "capture_id": "097bf6d73c124a94a2fb661efd91cb12",
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "ar-pressure-tp2-pp2-True-False-0": "b8b854ab1f324493b24974a063202201",
+            "ar-pressure-tp2-pp2-True-False-1": "ef1e39688f7c4043a99a505dfe343dc3",
+            "ar-pressure-tp2-pp2-True-False-2": "410ad96012684e488d9e57f933f7b964",
+            "ar-pressure-tp2-pp2-True-False-3": "097bf6d73c124a94a2fb661efd91cb12",
+            "ar-pressure-tp2-pp2-True-False-fresh": "8f9b0c0751a0499b8cd83757570741b6"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2
+          ],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 278,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-True-False-1",
+                  "capture_id": null,
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-True-False-3",
+                  "capture_id": null,
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        },
+        "pp1-tp1": {
+          "admissions": {
+            "ar-pressure-tp2-pp2-True-False-0": "b8b854ab1f324493b24974a063202201",
+            "ar-pressure-tp2-pp2-True-False-1": "ef1e39688f7c4043a99a505dfe343dc3",
+            "ar-pressure-tp2-pp2-True-False-2": "410ad96012684e488d9e57f933f7b964",
+            "ar-pressure-tp2-pp2-True-False-3": "097bf6d73c124a94a2fb661efd91cb12",
+            "ar-pressure-tp2-pp2-True-False-fresh": "8f9b0c0751a0499b8cd83757570741b6"
+          },
+          "peak_active_captures": 4,
+          "observed_batch_sizes": [
+            1,
+            2
+          ],
+          "decode_graph_batch_sizes": [
+            1,
+            2
+          ],
+          "reused_kv_slots": 62,
+          "source_frames": 283,
+          "graph_frames": 278,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 195,
+              "available_after": 48,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-True-False-1",
+                  "capture_id": null,
+                  "committed_tokens": 64,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            },
+            {
+              "available_before": 0,
+              "required_next_decode": 2,
+              "debug_retract": false,
+              "reference_boundary": 259,
+              "available_after": 69,
+              "aborted": [],
+              "retracted": [
+                {
+                  "rid": "ar-pressure-tp2-pp2-True-False-3",
+                  "capture_id": null,
+                  "committed_tokens": 85,
+                  "context_detached": true,
+                  "finalizer_detached": true,
+                  "capture_attempted": true,
+                  "is_retracted": true
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 1048576,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 1048576,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 161,
+            "failed_peer_capture_failed": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 6827008,
+            "device_allocated_bytes": 327936,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        },
+        "pp1-tp1": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 3,
+            "cuda_graph_forwards": 161,
+            "failed_peer_capture_failed": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0,
+          "test_service_admission_ready": true
+        }
+      }
+    }
+  ],
+  "totals": {
+    "methods": 12,
+    "completed_requests": 60,
+    "output_tokens": 3888,
+    "retractions": 24,
+    "retired_captures": 24,
+    "snapshots": 36,
+    "tensor_objects": 828,
+    "tensor_bytes": 33032352,
+    "rank_slot_reuses": 1500,
+    "source_frames": 6810
+  },
+  "source_audit": {
+    "files": 5016,
+    "sha256": "09c2fcda7218f586f20cb71c1c05fe3f87e2d78a4450146479eb1b97d1bb64db"
+  },
+  "source_sha256": {
+    "python/sglang/test/training_capture_pressure_runtime.py": "c04a5d5e58acd106bbb8b44bfef0193ca4611da7ca66278557e59ef9b1e57829",
+    "python/sglang/test/training_capture_pressure_server.py": "602ee7db470009bec2bed95c2f62bc2c8de42e87c5eff90a53f0565ebd9ff864",
+    "test/registered/storage/test_training_capture_ar_pressure.py": "bfb4ac1d89cd6f985b1aba2a1bbe627a3d62b54e349b61167c0f51c7650ecd85",
+    "test/registered/storage/test_training_capture_ar_pressure_distributed.py": "efc14c1f9fa672192d48877561e228075ecdf713c01905a109c5df910053e6cb",
+    "test/registered/storage/test_training_capture_ar_pressure_tppp.py": "9814c6c791ad3bf305cac3694fa733e9873f1edd99bf1780b8d52520d41cff67"
+  },
+  "cleanup": {
+    "temporary_allocation_deleted": true,
+    "temporary_worker_exited": true,
+    "resident_worker_verified_live": true,
+    "idle_load_resumed": true,
+    "queues_empty": true,
+    "evidence": "cleanup.json"
+  },
+  "limitations": [
+    "BF16 Qwen3-0.6B, Triton attention, TCP Mooncake Store and HTTP TestCaptureCatalog on H100.",
+    "PP uses synchronous scheduling and two-request microbatches. Prefill graphs are disabled.",
+    "KV and teacher use 16-token D2H staging. A serving logit bias makes token paths deterministic.",
+    "Native KV pool exhaustion is tested; CUDA allocation failures, device faults and saturated Store/Catalog backpressure are separate.",
+    "Synchronous source-pool/logit observers validate preservation, not independent attention math or serving SLOs.",
+    "Distributed P/D AR pressure, cross-node RDMA, other models/topologies, production retention and trained draft quality remain outside this matrix."
+  ],
+  "artifact_archive": {
+    "path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/ar-pressure-distributed-20261003",
+    "files": 32,
+    "manifest": "artifact-manifest.json",
+    "sha256": "e84228a77ba63a0385ed7b44d2e7230aaf0c80e921d8018c1b70548bd5e40281"
+  }
+}

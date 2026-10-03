@@ -47,7 +47,7 @@ it does not redefine the goal as the modules already implemented.
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | Operator capture control | Authenticated pause/resume/abort management route, distributed readiness gating, P/D teacher epoch fencing, independent pause metrics | Initial HTTP/CPU and single-rank P/D suites pass; matching TP2/PP1, TP1/PP2 and TP2/PP2 AR/static target-KV DSpark add twelve live-control cells with 96 complete post-exit snapshots; asymmetric and cross-node live control remain open |
-| AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes synchronous/overlap and eager/graph combinations; retired captures fail once, released slots are reused, fresh admission and exact post-exit Store reads pass; distributed pressure and SLOs remain open |
+| AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes single-rank and TP2 synchronous/overlap, plus PP2 and combined TP2/PP2 synchronous eager/graph combinations; all-rank retirement, slot reuse, admission recovery and 36 complete post-exit Store reads pass; distributed P/D AR pressure, asymmetric topologies and SLOs remain open |
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes colocated and P/D PP1 synchronous/overlap and eager/graph combinations, plus synchronous TP1/PP2 and TP2/PP2 eager/graph; P/D checks exact all-layer CPU restore and failed Catalog leases |
 | PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2, synchronous P2/D2 and P2/D1, matching TP2/PP2, and cross-node TP1 RDMA pass eager/graph source parity and failure exclusion; wider distributed RDMA remains open |
 | Pipeline draft serving | Synchronous static target-KV PP loop, per-stage graph activations, P/D queue agreement and cohort capture | Qwen3 TP1/PP2 and TP2/PP2 eager/graph colocated and P/D serving pass exact Mooncake readback and memory retraction; asynchronous PP and broader topologies remain open |
@@ -4314,14 +4314,55 @@ acceptance and trained draft quality remain open. The temporary four-H100 job
 is deleted after verifying no live serving processes or GPU workloads; the
 resident worker and resumed idle load remain live.
 
+## Distributed Ordinary AR Memory Pressure (2026-10-03)
+
+The ordinary AR pressure fixture now covers TP2, PP2 and combined TP2/PP2.
+Each rank records its original capture lease, native retraction capacity,
+released slots and subsequent reuse. Nonce-tagged server-info observations
+check every rank's admission, failure counters and recovered Host reservations.
+The production scheduler, capture lifecycle and Store paths are unchanged.
+
+The initial PP smoke found a fixture assumption that all four requests shared
+one batch. Native PP schedules separate microbatches; the final fixture uses
+two-request PP microbatches and requires all four capture contexts to be active
+together. Graph coverage requires replay at both one and two requests in PP,
+and at three requests in non-PP cases. Retired capture IDs must agree across
+ranks, reach Catalog FAILED and never publish or be admitted again on resume.
+
+The final frozen source passed four single-GPU cases (187.011s), six TP2 or PP2
+cases (371.960s) and two TP2/PP2 combined cases (122.741s). All 60 requests
+completed with 3,888 output tokens. There were 24 native retractions and retired
+captures; 36 valid snapshots were read after producer exit, checking 828 tensor
+objects / 33,032,352 bytes. Observers recorded 6,810 request/rank source frames
+and 1,500 rank-local slot reuses. Every rank recovered all four reservations,
+with no quarantined Host buffers or queued work. The failed smoke and earlier
+passes are retained but excluded from these totals.
+
+The [runbook](experiments/AR_PRESSURE.md) and
+[report](experiments/capture-ar-distributed-pressure.json) record commands,
+per-rank evidence, source hashes and limitations. All 5,016 Python source and
+registered test files match the frozen runtime checkout. The 32-artifact
+archive is `/gpfs/user/fuxuanwei/mooncake-lab-archive/ar-pressure-distributed-20261003`;
+its manifest SHA-256 is
+`e84228a77ba63a0385ed7b44d2e7230aaf0c80e921d8018c1b70548bd5e40281`.
+
+These are Qwen3-0.6B BF16 correctness tests with Triton, TCP Store, an HTTP test
+Catalog, 16-token KV/teacher D2H batches and synchronous PP. Prefill graphs are
+disabled. Source observers verify preservation, not independent attention math
+or serving SLOs. Distributed P/D AR pressure, asymmetric topologies, cross-node
+RDMA pressure, saturated backpressure and production acceptance remain open.
+The temporary four-H100 allocation and worker are gone; the resident worker
+and resumed idle task remain live, with both task queues empty.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2, PP2 and combined TP2/PP2 AR/static target-KV
    DSpark prefill graph coverage to asymmetric P/D and other speculative modes.
    Extend the passing single-rank, TP2, PP2 and TP2/PP2 mixed-chunk matrix to
    P/D and cross-node transport. Extend distributed pressure beyond passing
-   colocated and P/D synchronous TP1/PP2 and TP2/PP2 DSpark to AR and asymmetric
-   combined topologies. Broaden real-request coverage to speculative cache
+   colocated AR on single-rank, TP2, PP2 and combined TP2/PP2, and colocated/P/D
+   synchronous TP1/PP2 and TP2/PP2 DSpark to distributed P/D AR and asymmetric combined
+   topologies. Broaden real-request coverage to speculative cache
    eviction, target weight replacement and
    saturated backpressure.
 2. Connect P8's SGLang export API to the SpecForge checkpoint manager and validate
