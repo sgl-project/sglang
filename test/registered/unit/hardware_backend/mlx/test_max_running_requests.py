@@ -268,10 +268,8 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, 3)
 
     def test_radix_disabled_sequential_requests_release_their_aux_slot(self):
-        # With radix disabled the unified cache's disabled mode still owns
-        # auxiliary release: on finish it runs the component cleanup without an
-        # insert (insert_result is None), which frees the slot before the row.
-        # Allocate/release far past the pool size; every slot must come back.
+        # With radix disabled the component cleanup still frees the slot on finish;
+        # sequential requests far past the pool size must get every slot back.
         stub = _hybrid_stub_for_initialize(
             max_running_requests=2,
             max_mamba_cache_size=2,

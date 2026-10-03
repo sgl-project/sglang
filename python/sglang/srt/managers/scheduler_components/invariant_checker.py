@@ -101,10 +101,8 @@ class SchedulerInvariantChecker:
             session_held = self.pool_stats_observer.session_held_full_tokens()
             total = ps.full_capacity
         elif self.is_hybrid_ssm:
-            # A mamba cache splits full/mamba protected sizes. Use the allocator's
-            # `.size` for `total`: static max_total_num_tokens for non-unified
-            # pools, the dynamic byte-coordinated cap (matching `available_size`)
-            # for the unified pool.
+            # `total` is the allocator's `.size`: static for non-unified pools,
+            # the byte-coordinated cap (matching `available_size`) for the unified pool.
             protected = self.tree_cache.full_protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.req_to_token_pool.schedulable_token_capacity(

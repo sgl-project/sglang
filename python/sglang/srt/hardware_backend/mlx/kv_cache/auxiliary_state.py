@@ -216,13 +216,8 @@ class MlxAuxiliaryStatePool:
 
 
 class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
-    """Req-to-token pool with MLX auxiliary-state slot bookkeeping.
-
-    The unified radix cache's ``MlxAuxiliaryStateComponent`` owns auxiliary-slot
-    release, with the radix cache enabled or disabled: on finish it either frees
-    the slot or transfers it to the tree, nulling ``req.kv.mamba_pool_idx``
-    before the request row is freed. The pool must NOT free auxiliary slots.
-    """
+    """Req-to-token pool with MLX auxiliary-state slot bookkeeping. It never
+    frees auxiliary slots: ``MlxAuxiliaryStateComponent`` owns their release."""
 
     def __init__(
         self,

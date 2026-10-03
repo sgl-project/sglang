@@ -84,9 +84,8 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     is_pure_swa = ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0
     if ctx.disable_radix_cache and (
         get_disagg().disaggregation_decode_retraction_backup == "host_pool"
-        # Streaming sessions and mamba states live in UnifiedRadixCache; its
-        # disabled mode stands in for the chunk caches. Pure-SWA has no
-        # unified layout.
+        # Streaming sessions and mamba states need UnifiedRadixCache, whose
+        # disabled mode replaces the chunk caches; pure-SWA has no unified layout.
         or (
             not is_pure_swa
             and (get_serving().enable_streaming_session or ctx.is_hybrid_ssm)

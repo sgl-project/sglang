@@ -67,8 +67,8 @@ class MambaComponent(TreeComponent):
         assert isinstance(params.req_to_token_pool, HybridReqToTokenPool), (
             f"MambaComponent requires HybridReqToTokenPool, got {type(params.req_to_token_pool)}"
         )
-        # Without the extra buffer only the sequence-end state is kept, so a
-        # cached state must sit on a page-1 boundary. A disabled tree caches none.
+        # Without the extra buffer only the sequence-end state exists, so a cached
+        # state needs page 1; a disabled tree caches none.
         if not params.enable_mamba_extra_buffer and not params.disable:
             assert params.page_size == 1, (
                 f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
