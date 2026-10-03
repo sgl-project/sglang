@@ -18,6 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.sampling.watermarking.config import load_watermark_config
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
@@ -27,6 +28,20 @@ from sglang.srt.utils.common import (
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+def handle_watermark_config(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.watermark_config is None:
+        return
+    config = load_watermark_config(cfg.watermark_config)
+    resolved = {
+        f"watermark_{field}": getattr(config, field)
+        for field in config.__struct_fields__
+        if getattr(config, field) is not None
+    }
+    if resolved:
+        declare_resolution(server_args, "handle_watermark_config", **resolved)
 
 
 def handle_ssl_validation(server_args: Any):
@@ -560,19 +575,25 @@ def handle_other_validations(server_args: Any):
                     )
 
     # Validate preferred_sampling_params
-    if cfg.preferred_sampling_params:
-        if isinstance(cfg.preferred_sampling_params, str):
+    preferred_sampling_params = cfg.preferred_sampling_params
+    if preferred_sampling_params:
+        if isinstance(preferred_sampling_params, str):
+            preferred_sampling_params = json.loads(preferred_sampling_params)
             declare_resolution(
                 server_args,
                 "_handle_other_validations",
-                preferred_sampling_params=json.loads(cfg.preferred_sampling_params),
+                preferred_sampling_params=preferred_sampling_params,
+            )
+        if "watermark" in preferred_sampling_params:
+            raise ValueError(
+                "watermark is not supported in --preferred-sampling-params"
             )
 
         # Validate preferred_sampling_params doesn't use tokenizer-dependent features
         if cfg.skip_tokenizer_init:
             from sglang.srt.sampling.sampling_params import SamplingParams
 
-            test_params = SamplingParams(**cfg.preferred_sampling_params)
+            test_params = SamplingParams(**preferred_sampling_params)
             # raises if tokenizer-dependent features used
             test_params.normalize(None)
 
