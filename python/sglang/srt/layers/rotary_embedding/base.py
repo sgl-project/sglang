@@ -18,6 +18,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_mlu,
     is_mps,
     is_musa,
     is_npu,
@@ -39,6 +40,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_is_mlu = is_mlu()
 _is_mps = is_mps()
 
 if _is_cuda:
@@ -122,6 +124,7 @@ class RotaryEmbedding(BaseFusedOp):
             and not (_is_xpu)
             and not (_is_npu)
             and not (_is_musa)
+            and not (_is_mlu)
             and not (_is_mps)
             and not (current_platform.is_out_of_tree())
         ):
@@ -151,6 +154,8 @@ class RotaryEmbedding(BaseFusedOp):
                 dynamic=True,
                 disable=_is_npu,
             )(apply_rotary_emb)
+        elif _is_mlu:
+            self._forward_method = self.forward_mlu
         self.position_cos, self.position_sin = None, None
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
@@ -461,6 +466,53 @@ class RotaryEmbedding(BaseFusedOp):
                     self.is_neox_style,
                 )
         return query, key
+
+    def forward_mlu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run RoPE through FlagTree's packed Cambricon Triton kernel."""
+        assert fused_set_kv_buffer_arg is None, (
+            "save kv cache is not supported by the MLU rotary kernel"
+        )
+        if offsets is not None:
+            positions = positions + offsets
+        positions = positions.flatten().to(device=query.device, dtype=torch.int32)
+        cos_sin = self.cos_sin_cache.to(device=query.device, dtype=query.dtype)
+        cos, sin = (part.contiguous() for part in cos_sin.chunk(2, dim=-1))
+        try:
+            from triton.ops.apply_rotary import apply_rotary
+        except (ImportError, ModuleNotFoundError):
+            return self.forward_native(positions, query, key)
+
+        num_tokens = positions.numel()
+        cu_seqlens = torch.tensor([0, num_tokens], device=query.device, dtype=torch.int32)
+        token_offsets = positions.view(1, num_tokens)
+        q = query.view(num_tokens, -1, self.head_size)
+        k = key.view(num_tokens, -1, self.head_size)
+        q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
+        k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
+        q_out = torch.empty_like(q_rot)
+        k_out = torch.empty_like(k_rot)
+        apply_rotary(
+            q_out, q_rot, cos, sin, BLOCK_M=2,
+            token_offsets=token_offsets, cu_seqlens=cu_seqlens,
+            max_seqlen=num_tokens,
+            interleaved=not self.is_neox_style,
+        )
+        apply_rotary(
+            k_out, k_rot, cos, sin, BLOCK_M=2,
+            token_offsets=token_offsets, cu_seqlens=cu_seqlens,
+            max_seqlen=num_tokens,
+            interleaved=not self.is_neox_style,
+        )
+        q_result = torch.cat((q_out, q_pass), dim=-1)
+        k_result = torch.cat((k_out, k_pass), dim=-1)
+        return q_result.view_as(query), k_result.view_as(key)
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"

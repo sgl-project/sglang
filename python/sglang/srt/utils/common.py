@@ -232,6 +232,18 @@ def is_musa() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_mlu() -> bool:
+    """Return whether the Cambricon Torch backend has a visible device."""
+    backend = getattr(torch, "mlu", None)
+    if backend is None:
+        return False
+    try:
+        return bool(backend.is_available())
+    except (OSError, RuntimeError):
+        return False
+
+
+@lru_cache(maxsize=1)
 def is_mps() -> bool:
     return torch.backends.mps.is_available()
 
