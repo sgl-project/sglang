@@ -13,7 +13,10 @@ Skips on non-Apple-Silicon platforms and when ``mlx`` is missing.
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
+import json
+import os
 import platform
 import tempfile
 import unittest
@@ -139,6 +142,41 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
                 profiler, _ = MetalCaptureProfiler.start_mlx(trace_path)
                 profiler.stop()
                 mock_stop.assert_called_once()
+
+
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
+class TestMetalTraceExport(unittest.TestCase):
+    def test_export_expands_home_in_chrome_trace_path(self):
+        from sglang.srt.hardware_backend.mlx.profiler import (
+            MetalCaptureProfiler,
+            MetalTorchProfiler,
+        )
+
+        for suffix in (".json", ".trace.json.gz"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as tmp:
+                source = Path(tmp) / "captured.gputrace"
+                source.mkdir()
+                (source / "marker").write_text("captured")
+                profiler = MetalTorchProfiler(
+                    start_metal_capture=MetalCaptureProfiler.start_mlx
+                )
+                profiler.metal_profiler = MetalCaptureProfiler(
+                    label="MLX",
+                    trace_path=source,
+                    stop_capture=lambda: None,
+                    standalone=True,
+                )
+                with patch.dict(os.environ, {"HOME": tmp}):
+                    profiler.export_chrome_trace(f"~/profiles/run{suffix}")
+                trace_path = Path(tmp) / "profiles" / f"run{suffix}"
+                opener = gzip.open if suffix.endswith(".gz") else open
+                with opener(trace_path, "rt") as f:
+                    self.assertEqual(json.load(f), {"traceEvents": []})
+                self.assertEqual(
+                    (Path(tmp) / "profiles" / "run.gputrace" / "marker").read_text(),
+                    "captured",
+                )
+                self.assertFalse(source.exists())
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
