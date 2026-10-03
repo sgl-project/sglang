@@ -763,6 +763,10 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # Host memory in bytes available to HiCache pools on this host. When set,
+    # it replaces cgroup and psutil discovery; the 10 GiB reserve and the
+    # per-local-rank split still apply.
+    SGLANG_HICACHE_HOST_MEMORY_BYTES = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -887,6 +891,10 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # aiter opus moe_sorting dispatch policy (0 auto, 1 oneshot, 2 multi-phase). Auto picks
+    # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
+    # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
+    SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY = EnvInt(2)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone
@@ -1588,6 +1596,12 @@ class Envs:
     # DSpark draft block on the HIP radix backend: build the attention metadata inside the
     # draft CUDA graph from the raw inputs instead of eagerly before every replay.
     SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
+    # gfx950 MXFP8 dense routes (aiter group32 / native): the producer emits fp8 + ue8m0 for its
+    # consumer instead of bf16 plus a separate quant launch -- the shared expert's SwiGLU for
+    # down_proj, the wo_a GEMM for wo_b, and the FFN norm for the shared expert's gate_up.
+    SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
@@ -1748,6 +1762,9 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # Opt-in gfx950 TP4 decode indexer context partitioning. Keeps the index
+    # cache replicated; gathers Q and exchanges local top-k candidates.
+    SGLANG_MINIMAX_M3_INDEXER_CP = EnvBool(False)
     # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
     # main attention K/V keep kv_cache_dtype.
     SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)

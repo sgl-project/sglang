@@ -71,6 +71,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
@@ -99,10 +100,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
-    attn_cp_gather,
-    attn_cp_reduce_scatter,
-)
+from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -462,7 +460,8 @@ def _apply_wo_a_bf16_matmul(
     is_prefill: bool = False,
     fast_path: bool = False,
     fp8_grid: bool = False,
-) -> torch.Tensor | Mxfp8SwizzledInput:
+    emit_fp8: bool = False,
+) -> torch.Tensor | Mxfp8SwizzledInput | Fp8GridActivation | Mxfp8Activation:
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
     # on the exact validated TP4 shapes and write token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
@@ -528,7 +527,7 @@ def _apply_wo_a_bf16_matmul(
         return result
     # the 16-row decode kernels also serve V4.1's target-verify rows
     if (is_decode or is_target_verify) and hip_fast_path:
-        y = _hip.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid)
+        y = _hip.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid, emit_fp8=emit_fp8)
         if y is not None:
             return y
     if (
@@ -669,6 +668,10 @@ def _apply_gguf_grouped_wo_a(
 
 
 if TYPE_CHECKING:
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        Fp8GridActivation,
+        Mxfp8Activation,
+    )
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
         LateLayerTail,
@@ -2579,6 +2582,8 @@ class MQALayer(MqaAttentionBase):
                             fast_path=self.is_dsv41,
                             fuse_mxfp8_quant=fuse_mxfp8_quant,
                             fp8_grid=_is_hip and _hip.wo_a_emits_fp8_grid(self),
+                            emit_fp8=_is_hip
+                            and _hip.wo_b_emits_mxfp8(self, o.shape[0]),
                         )
                 else:
                     o = _apply_gguf_grouped_wo_a(
@@ -3909,7 +3914,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                hidden_states = attn_cp_gather(hidden_states)
+                hidden_states = attn_cp_interleave_gather(hidden_states)
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
@@ -3960,7 +3965,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 skip_shared_experts=_do_shared_local,
             )
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = attn_cp_reduce_scatter(hidden_states)
+            hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),

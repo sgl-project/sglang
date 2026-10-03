@@ -24,7 +24,7 @@ The recovery must succeed rather than decline: the TreeCore insert walk counts
 the node in `prefix_len` regardless of component consumption, while the SWA
 match validator rejects a `value is None` node, so a declined recovery reports
 a prefix `match_prefix` cannot honor and trips
-`new_prefix_len <= len(new_indices)` in `cache_unfinished_req`.
+`new_prefix_len <= len(new_indices)` in `checkpoint`.
 """
 
 import unittest

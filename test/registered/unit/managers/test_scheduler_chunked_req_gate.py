@@ -41,6 +41,7 @@ def _make_req(
     req.host_hit_length = 0
     req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
+    req.finished_reason = None
     req.last_node = None
     req.lock_receipt = DecLockRefParams()
     req.session = None
@@ -118,7 +119,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
 
 
 class TestStashGatePreservesPrefixIndices(CustomTestCase):
-    """Consumer side: real ChunkCache.cache_unfinished_req mutates
+    """Consumer side: real ChunkCache.checkpoint mutates
     req.prefix_indices iff stash actually runs, so prefix_indices content
     is the bug-detection signal. The stash gate is content-based:
     `fill_len > len(prefix_indices)` means there is freshly computed KV to
