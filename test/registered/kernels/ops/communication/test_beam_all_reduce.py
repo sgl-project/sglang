@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=180, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=450, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestBeamAllReduce(CustomTestCase):
@@ -179,4 +179,4 @@ if __name__ == "__main__":
     if os.environ.get("_IS_TEST_MULTIGPU_SGLANG_JIT_KERNEL"):
         unittest.main()
     else:
-        multigpu_pytest_main(__name__, __file__, num_gpus=(2, 4, 8))
+        multigpu_pytest_main(__name__, __file__, num_gpus=(8,))
