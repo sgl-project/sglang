@@ -58,7 +58,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -1059,7 +1058,6 @@ class XllmSparseMoeBlock(nn.Module):
 
         if shared_output is not None:
             final_hidden_states += shared_output
-        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -1520,6 +1518,7 @@ class XllmDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                reduce_results=False,
             )
 
         self.input_layernorm = _make_norm(config)
@@ -1559,12 +1558,11 @@ class XllmDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if isinstance(self.mlp, XllmMLP):
-                hidden_states = self.mlp(hidden_states)
-            else:
-                hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states = ffn_exit.finish(hidden_states)
+        if isinstance(self.mlp, XllmMLP):
+            hidden_states = self.mlp(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 

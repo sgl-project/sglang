@@ -1030,7 +1030,10 @@ class ModelConfig:
             self.hf_config.num_nextn_predict_layers = 1
             self.hf_text_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "ExaoneMoEForCausalLM",
+            "ExaoneMoeForCausalLM",
+        ):
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
