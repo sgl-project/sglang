@@ -24,6 +24,9 @@ class TestDSparkExpertDistribution(CustomTestCase):
             _SelectExpertsSinglePassGatherer
         )
         self.gatherer._data = torch.zeros((2, 4), dtype=torch.int)
+        self.gatherer._expert_location_metadata = SimpleNamespace(
+            num_physical_experts=4
+        )
         self.recorder = _ExpertDistributionRecorderReal.__new__(
             _ExpertDistributionRecorderReal
         )
