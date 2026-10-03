@@ -13,6 +13,7 @@ no FlashInfer, Triton, CUDA or process group involved.
 import contextlib
 import importlib
 import logging
+import subprocess
 import sys
 import types
 from types import SimpleNamespace
@@ -772,8 +773,16 @@ def test_route_modules_import_no_flashinfer():
     ):
         source = open(importlib.util.find_spec(name).origin).read()
         assert "import flashinfer" not in source and "from flashinfer" not in source
-    for name in ("flashinfer.mamba", "flashinfer.comm"):
-        assert name not in sys.modules
+    # Fresh interpreter: other tests in the session legitimately import
+    # FlashInfer-backed sglang modules, so the check must not share sys.modules.
+    code = (
+        "import sys; "
+        "import sglang.srt.layers.attention.mamba.cake_routes; "
+        "import sglang.srt.layers.layernorm_sp; "
+        "bad = [n for n in ('flashinfer.mamba', 'flashinfer.comm') if n in sys.modules]; "
+        "assert not bad, bad"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=600)
 
 
 if __name__ == "__main__":

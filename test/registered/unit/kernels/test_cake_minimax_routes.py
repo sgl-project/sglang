@@ -15,6 +15,7 @@ checked here.
 """
 
 import logging
+import subprocess
 import sys
 from unittest import mock
 
@@ -94,8 +95,15 @@ def test_route_names_exist_in_route_table():
 def test_module_import_loads_no_flashinfer():
     # The stock DiT already imports ``sglang.kernels.ops.diffusion`` (whose
     # package registers the Cake specs lazily); what must not happen is a
-    # FlashInfer import at module import time.
-    assert not any(name.split(".")[0] == "flashinfer" for name in sys.modules)
+    # FlashInfer import at module import time.  Fresh interpreter: other tests
+    # in the session legitimately import FlashInfer-backed sglang modules.
+    code = (
+        "import sys; "
+        "import sglang.multimodal_gen.runtime.models.dits.minimax_h3_cake_routes; "
+        "bad = sorted(n for n in sys.modules if n.split('.')[0] == 'flashinfer'); "
+        "assert not bad, bad"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=600)
 
 
 # ---------------------------------------------------------------------------
