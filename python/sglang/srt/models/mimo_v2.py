@@ -80,6 +80,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     LazyValue,
@@ -1142,6 +1143,28 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+    # To ensure correct weight loading and mapping.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.mtp.layers.0.mlp": "model.decoder.mlp",
+            "model.mtp.layers.1.mlp": "model.decoder.mlp",
+            "model.mtp.layers.2.mlp": "model.decoder.mlp",
+            "model.mtp.layers.0.self_attn": "model.decoder.self_attn",
+            "model.mtp.layers.1.self_attn": "model.decoder.self_attn",
+            "model.mtp.layers.2.self_attn": "model.decoder.self_attn",
+        },
+    )
 
     # Prefixes for weight routing in encoder_only/language_only modes
     _LANGUAGE_WEIGHT_PREFIXES = ("model.", "lm_head.")
