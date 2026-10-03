@@ -29,10 +29,6 @@ import orjson
 import torch
 
 
-def _bytes(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.detach().contiguous().reshape(-1).view(torch.uint8)
-
-
 def swizzle_scale_bytes(scale: torch.Tensor) -> torch.Tensor:
     """NVFP4 128x4 block-scale permutation, with *zero* mask padding."""
     if scale.dtype != torch.uint8 or scale.ndim < 2:
@@ -605,24 +601,23 @@ class GpuDeltaLayout:
             raise ValueError(
                 "CuTe DSL warmup must initialize its wrapper before delta admission"
             )
-        if layer._cutedsl_wrapper is not None:
-            if layer._cutedsl_wrapper.quant_mode != "w4a16":
-                raise ValueError("prepared CuTe DSL wrapper is not W4A16")
-            # Standard CuTe DSL uses the gate alpha for its fused GEMM1.
-            self.derived.extend(
-                (
-                    DerivedImage(
-                        f"{prefix}._cutedsl_scales.0",
-                        layer._cutedsl_scales[0],
-                        gate,
-                    ),
-                    DerivedImage(
-                        f"{prefix}._cutedsl_scales.2",
-                        layer._cutedsl_scales[2],
-                        down,
-                    ),
-                )
+        if layer._cutedsl_wrapper.quant_mode != "w4a16":
+            raise ValueError("prepared CuTe DSL wrapper is not W4A16")
+        # Standard CuTe DSL uses the gate alpha for its fused GEMM1.
+        self.derived.extend(
+            (
+                DerivedImage(
+                    f"{prefix}._cutedsl_scales.0",
+                    layer._cutedsl_scales[0],
+                    gate,
+                ),
+                DerivedImage(
+                    f"{prefix}._cutedsl_scales.2",
+                    layer._cutedsl_scales[2],
+                    down,
+                ),
             )
+        )
 
     def _add_mla_derived(self, prefix, attn):
         if attn.kv_b_proj.weight.dtype != torch.bfloat16:
@@ -769,7 +764,6 @@ class _PreparedTensor:
     binding: TensorBinding
     entry: dict
     pinned: torch.Tensor
-    frames: list
     decoder: object
     payload: torch.Tensor
 
@@ -778,6 +772,82 @@ class _PreparedTensor:
 class _PreparedRawTensor:
     binding: TensorBinding
     payload: torch.Tensor
+
+
+def _qualify_canonical_plan(backend, manifest):
+    """Cache only qualified static definitions; payload geometry stays per-publication."""
+    cached = getattr(backend, "_canonical_plan", None)
+    if cached is not None and manifest["plan_digest"] != cached[0]:
+        raise ValueError("negotiated canonical delta plan changed")
+    entries, signatures, definitions = {}, {}, []
+    for entry in manifest["tensors"]:
+        name = entry["name"]
+        if name in entries:
+            raise ValueError("duplicate canonical delta tensor")
+        entries[name] = entry
+        if name not in backend.layout.inventory or backend.layout.excluded.get(
+            name
+        ) not in {None, "expert owned by another EP rank"}:
+            raise ValueError(f"delta publication has an unadmitted tensor: {name}")
+        canonical = backend.layout.inventory[name]
+        if (
+            entry["shape"] != canonical["shape"]
+            or entry["dtype"] != canonical["dtype"]
+            or entry.get("byte_order") != "little"
+        ):
+            raise ValueError(f"canonical tensor metadata mismatch: {name}")
+        if entry["nbytes"] != math.prod(entry["shape"]) * _itemsize(
+            entry["dtype"]
+        ) or entry["encoding"] != (
+            "raw_bytes" if len(entry["shape"]) <= 1 else "xor_bytes"
+        ):
+            raise ValueError(f"unsupported canonical tensor size/encoding: {name}")
+        views = tuple(
+            sorted(
+                (view["id"], tuple(tuple(pair) for pair in view["slices"]))
+                for view in entry["views"]
+            )
+        )
+        signature = (
+            entry["dtype"],
+            tuple(entry["shape"]),
+            entry["encoding"],
+            entry["nbytes"],
+            entry["byte_order"],
+            views,
+        )
+        if cached is not None:
+            if cached[1].get(name) != signature:
+                raise ValueError(f"canonical delta definition changed: {name}")
+        else:
+            signatures[name] = signature
+            definitions.append(
+                {
+                    "name": name,
+                    "dtype": signature[0],
+                    "shape": signature[1],
+                    "encoding": signature[2],
+                    "views": [
+                        {"id": view_id, "slices": slices} for view_id, slices in views
+                    ],
+                }
+            )
+    if not {binding.name for binding in backend.layout.bindings} <= entries.keys():
+        raise ValueError("publication omits an admitted mutable tensor")
+    if cached is not None:
+        if entries.keys() != cached[1].keys():
+            raise ValueError("publication omits a negotiated canonical tensor")
+    else:
+        if (
+            _digest(sorted(definitions, key=lambda entry: entry["name"]))
+            != manifest["plan_digest"]
+        ):
+            raise ValueError(
+                "publication does not match its negotiated canonical view plan"
+            )
+        # Tuples hold only static metadata, never old frames, payloads or the manifest.
+        backend._canonical_plan = manifest["plan_digest"], signatures
+    return entries, cached is not None
 
 
 class PreparedDelta:
@@ -822,51 +892,9 @@ class PreparedDelta:
             or manifest["target_version"] != manifest["base_version"] + 1
         ):
             raise ValueError("direct deltas require one consecutive version transition")
-        self._entries = {}
-        definitions = []
-        for entry in manifest["tensors"]:
-            name = entry["name"]
-            if name in self._entries:
-                raise ValueError("duplicate canonical delta tensor")
-            self._entries[name] = entry
-            if name not in backend.layout.inventory or backend.layout.excluded.get(
-                name
-            ) not in {None, "expert owned by another EP rank"}:
-                raise ValueError(f"delta publication has an unadmitted tensor: {name}")
-            canonical = backend.layout.inventory[name]
-            if (
-                entry["shape"] != canonical["shape"]
-                or entry["dtype"] != canonical["dtype"]
-                or entry.get("byte_order") != "little"
-            ):
-                raise ValueError(f"canonical tensor metadata mismatch: {name}")
-            itemsize = _itemsize(entry["dtype"])
-            if entry["nbytes"] != math.prod(entry["shape"]) * itemsize or entry[
-                "encoding"
-            ] != ("raw_bytes" if len(entry["shape"]) <= 1 else "xor_bytes"):
-                raise ValueError(f"unsupported canonical tensor size/encoding: {name}")
-            definitions.append(
-                {key: entry[key] for key in ("name", "dtype", "shape", "encoding")}
-                | {
-                    "views": sorted(
-                        (
-                            {"id": v["id"], "slices": v["slices"]}
-                            for v in entry["views"]
-                        ),
-                        key=lambda v: v["id"],
-                    )
-                }
-            )
-        if (
-            _digest(sorted(definitions, key=lambda e: e["name"]))
-            != manifest["plan_digest"]
-        ):
-            raise ValueError(
-                "publication does not match its negotiated canonical view plan"
-            )
-        if not {b.name for b in backend.layout.bindings} <= self._entries.keys():
-            raise ValueError("publication omits an admitted mutable tensor")
+        self._entries, reused_plan = _qualify_canonical_plan(backend, manifest)
         self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started
+        self.timings["host_plan_cache_reused"] = int(reused_plan)
         host_names = metadata["host_tensor_names"][backend.identity["host_cache_id"]]
         if (
             not isinstance(host_names, list)
@@ -1006,7 +1034,6 @@ class PreparedDelta:
                         binding,
                         entry,
                         pinned,
-                        frames,
                         decode,
                         binding.selected_bytes(self.decoded[: entry["nbytes"]]),
                     )

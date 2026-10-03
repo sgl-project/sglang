@@ -1,5 +1,6 @@
 """Byte-layout tests require PyTorch only; no FlashInfer import or GPU JIT."""
 
+import copy
 import importlib.util
 import json
 import os
@@ -26,6 +27,10 @@ _spec = importlib.util.spec_from_file_location("gpu_delta_layout_under_test", _p
 layout = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = layout
 _spec.loader.exec_module(layout)
+
+
+def _bytes(tensor):
+    return tensor.detach().contiguous().reshape(-1).view(torch.uint8)
 
 
 @contextmanager
@@ -66,6 +71,90 @@ def cpu_host_snapshot(backend, metadata, directory):
     finally:
         backend.host_arena.close()
         backend.outer_pool.close()
+
+
+class TestCanonicalPlanCache(unittest.TestCase):
+    def publication(self):
+        entries = [
+            {
+                "name": name,
+                "dtype": "U8",
+                "shape": [2, 4],
+                "encoding": "xor_bytes",
+                "byte_order": "little",
+                "nbytes": 8,
+                "views": [
+                    {"id": "b", "slices": [[0, 2], [2, 4]]},
+                    {"id": "a", "slices": [[0, 2], [0, 2]]},
+                ],
+                "frames": [],
+            }
+            for name in ("local", "foreign")
+        ]
+        backend = SimpleNamespace(
+            layout=SimpleNamespace(
+                inventory={
+                    name: {"dtype": "U8", "shape": [2, 4]}
+                    for name in ("local", "foreign")
+                },
+                excluded={"foreign": "expert owned by another EP rank"},
+                bindings=[SimpleNamespace(name="local")],
+            )
+        )
+        definitions = [
+            {key: entry[key] for key in ("name", "dtype", "shape", "encoding")}
+            | {"views": sorted(entry["views"], key=lambda view: view["id"])}
+            for entry in sorted(entries, key=lambda entry: entry["name"])
+        ]
+        return backend, {"tensors": entries, "plan_digest": layout._digest(definitions)}
+
+    def test_warm_plan_accepts_new_payloads_but_rejects_static_mutations(self):
+        backend, publication = self.publication()
+        _, reused = layout._qualify_canonical_plan(backend, publication)
+        self.assertFalse(reused)
+        updated = copy.deepcopy(publication)
+        updated["tensors"].reverse()
+        for entry in updated["tensors"]:
+            entry["views"].reverse()
+            entry["frames"] = [{"new": "per-publication payload geometry"}]
+        _, reused = layout._qualify_canonical_plan(backend, updated)
+        self.assertTrue(reused)
+        # Even a foreign expert's static definition is bound by the original
+        # global plan. Reusing its digest cannot authorize a changed definition.
+        mutations = {
+            "name": lambda p: p["tensors"][1].update(name="new"),
+            "dtype": lambda p: p["tensors"][1].update(dtype="BF16"),
+            "shape": lambda p: p["tensors"][1]["shape"].__setitem__(0, 3),
+            "encoding": lambda p: p["tensors"][1].update(encoding="raw_bytes"),
+            "nbytes": lambda p: p["tensors"][1].update(nbytes=7),
+            "byte_order": lambda p: p["tensors"][1].update(byte_order="big"),
+            "view_id": lambda p: p["tensors"][1]["views"][0].update(id="c"),
+            "view_slice": lambda p: p["tensors"][1]["views"][0]["slices"][
+                0
+            ].__setitem__(1, 1),
+            "missing_foreign": lambda p: p["tensors"].pop(),
+            "duplicate": lambda p: p["tensors"].append(p["tensors"][0]),
+            "digest": lambda p: p.update(plan_digest="different"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(field=name):
+                changed = copy.deepcopy(publication)
+                mutate(changed)
+                with self.assertRaises(ValueError):
+                    layout._qualify_canonical_plan(backend, changed)
+        # Mutating the original input cannot mutate the admitted cache itself.
+        publication["tensors"][1]["views"][0]["slices"][0][1] = 1
+        with self.assertRaises(ValueError):
+            layout._qualify_canonical_plan(backend, publication)
+        self.assertTrue(layout._qualify_canonical_plan(backend, updated)[1])
+
+    def test_failed_first_digest_does_not_admit_a_cache(self):
+        backend, publication = self.publication()
+        invalid = copy.deepcopy(publication)
+        invalid["plan_digest"] = "invalid"
+        with self.assertRaisesRegex(ValueError, "negotiated canonical view plan"):
+            layout._qualify_canonical_plan(backend, invalid)
+        self.assertFalse(layout._qualify_canonical_plan(backend, publication)[1])
 
 
 class TestFlashInferDeltaLayout(unittest.TestCase):
@@ -142,9 +231,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         )
         mask = torch.randint(256, (128 * 32,), dtype=torch.uint8)
         pointer = destination.data_ptr()
-        before = layout._bytes(gate).clone()
+        before = _bytes(gate).clone()
         binding.xor(mask)
-        torch.testing.assert_close(layout._bytes(gate), before ^ mask)
+        torch.testing.assert_close(_bytes(gate), before ^ mask)
         torch.testing.assert_close(
             destination.reshape(2, 2, 64, 32)[:, 0], old.reshape(2, 2, 64, 32)[:, 0]
         )
@@ -200,11 +289,10 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     binding,
                     {"nbytes": size},
                     torch.empty_like(canonical),
-                    [],
                     decoder,
                     payload,
                 )
-                expected = layout._bytes(target).clone()
+                expected = _bytes(target).clone()
                 pointer, stride = target.data_ptr(), target.stride()
                 # Two successful decodes observe new scratch values. An error
                 # then gates both that mask and every later mask in the batch.
@@ -213,9 +301,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     decoder.statuses.fill_(status)
                     if not status and not prepared.error.item():
                         mask = unit.pinned.view(dtype).reshape(12, 20)[2:10, 5:13]
-                        expected.bitwise_xor_(layout._bytes(mask))
+                        expected.bitwise_xor_(_bytes(mask))
                     prepared._apply_tensor(unit)
-                    torch.testing.assert_close(layout._bytes(target), expected)
+                    torch.testing.assert_close(_bytes(target), expected)
                     self.assertEqual(target.data_ptr(), pointer)
                     self.assertEqual(target.stride(), stride)
 
@@ -346,20 +434,18 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         plan = layout.GpuDeltaLayout(root, inventory)
         for binding in plan.bindings:
             key = binding.name.split(".")[-2].removesuffix("_proj")
-            mask = layout._bytes(before[key]) ^ layout._bytes(after[key])
+            mask = _bytes(before[key]) ^ _bytes(after[key])
             binding.xor(binding.selected_bytes(mask))
         plan.check_identity()
         torch.testing.assert_close(
-            layout._bytes(shared.gate_up_proj.weight),
-            layout._bytes(
-                torch.cat([after["gate"][selection], after["up"][selection]])
-            ),
+            _bytes(shared.gate_up_proj.weight),
+            _bytes(torch.cat([after["gate"][selection], after["up"][selection]])),
             rtol=0,
             atol=0,
         )
         torch.testing.assert_close(
-            layout._bytes(shared.down_proj.weight),
-            layout._bytes(after["down"][:, selection]),
+            _bytes(shared.down_proj.weight),
+            _bytes(after["down"][:, selection]),
             rtol=0,
             atol=0,
         )
@@ -438,12 +524,11 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     # canonical slice. Failure must preserve its pre-apply
                     # state, including that ordinary alias behavior.
                     mla_before = [
-                        layout._bytes(image.destination).clone()
-                        for image in plan.derived
+                        _bytes(image.destination).clone() for image in plan.derived
                     ]
                     mla_expected = [
-                        layout._bytes(key),
-                        layout._bytes(value.transpose(1, 2)),
+                        _bytes(key),
+                        _bytes(value.transpose(1, 2)),
                     ]
                     prepared.error = torch.tensor([error], dtype=torch.int32)
                     prepared.timings, prepared.h2d_bytes = {}, 0
@@ -468,8 +553,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         else:
                             self.assertTrue(prepared.apply()["applied"])
                     torch.testing.assert_close(
-                        layout._bytes(target),
-                        layout._bytes(before if error else source),
+                        _bytes(target),
+                        _bytes(before if error else source),
                         rtol=0,
                         atol=0,
                     )
@@ -483,7 +568,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         plan.derived, mla_before, mla_expected, mla_identity
                     ):
                         torch.testing.assert_close(
-                            layout._bytes(image.destination),
+                            _bytes(image.destination),
                             original if error else expected,
                         )
                         self.assertEqual(
@@ -529,9 +614,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             after = torch.tensor(0.5)
             self.assertEqual(binding.encoding, "raw_bytes")
             torch._foreach_copy_([binding.storage[0]], [after])
-            torch.testing.assert_close(
-                layout._bytes(binding.storage[0]), layout._bytes(after)
-            )
+            torch.testing.assert_close(_bytes(binding.storage[0]), _bytes(after))
         self.assertTrue(torch.all(layer.w13_input_scale == 7))
         self.assertTrue(torch.all(layer.w2_input_scale == 11))
 
@@ -842,7 +925,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 expected.copy_(source)  # The ordinary default_weight_loader.
                 torch._foreach_copy_([binding.storage[0]], [source.to(target.dtype)])
                 torch.testing.assert_close(
-                    layout._bytes(target), layout._bytes(expected), rtol=0, atol=0
+                    _bytes(target), _bytes(expected), rtol=0, atol=0
                 )
                 self.assertEqual(target.data_ptr(), pointer)
         plan.check_identity()
@@ -878,7 +961,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 "frames": [],
             }
             if value is not None:
-                data = bytes(layout._bytes(value).numpy())
+                data = bytes(_bytes(value).numpy())
                 entry["raw"] = {
                     "file": "owner.bin",
                     "encoded_offset": len(blob),
