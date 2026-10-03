@@ -710,10 +710,9 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     role = "draft" if model_runner.is_draft_worker else "target"
     if model_runner.spec_algorithm.is_speculative():
         capture_name = f"{role} verify"
-        num_tokens_per_req = model_runner.decode_num_tokens_per_req()
     else:
         capture_name = f"{role} decode"
-        num_tokens_per_req = 1
+    num_tokens_per_req = model_runner.decode_num_tokens_per_req()
     capture_bs, _ = get_batch_sizes_to_capture(model_runner, num_tokens_per_req)
     decode_backend = get_exec().graph.cuda_graph_config.decode.backend
     logger.info(
