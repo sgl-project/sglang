@@ -19,7 +19,7 @@ class _FakeMoeLayer:
     def __init__(self, *, is_lora_runner: bool, with_quant_info: bool, device=None):
         device = device or torch.device("cpu")
         self._lora_runner_backend = (
-            MoeRunnerBackend.LORA_TRITON
+            MoeRunnerBackend.LORA_CUTEDSL
             if is_lora_runner
             else MoeRunnerBackend.DEEP_GEMM
         )
@@ -312,7 +312,10 @@ class TestLayerRunnerBackendResolution(CustomTestCase):
                 )
 
     def test_v2_accepts_each_new_moe_runner(self):
-        for backend in (MoeRunnerBackend.LORA_TRITON,):
+        for backend in (
+            MoeRunnerBackend.LORA_CUTEDSL,
+            MoeRunnerBackend.LORA_TRITON,
+        ):
             with self.subTest(backend=backend):
                 layer = self._construct(
                     global_backend=backend,
@@ -322,7 +325,10 @@ class TestLayerRunnerBackendResolution(CustomTestCase):
                 self.assertIs(layer._lora_runner_backend, backend)
 
     def test_new_moe_runner_rejects_legacy_dense_backend(self):
-        for backend in (MoeRunnerBackend.LORA_TRITON,):
+        for backend in (
+            MoeRunnerBackend.LORA_CUTEDSL,
+            MoeRunnerBackend.LORA_TRITON,
+        ):
             with (
                 self.subTest(backend=backend),
                 self.assertRaisesRegex(ValueError, "mixing new and legacy"),
@@ -336,11 +342,11 @@ class TestLayerRunnerBackendResolution(CustomTestCase):
         """bf16 base layers run DeepGEMM's layout under the LoRA runner; the
         legacy path must not be picked off that runner (it has no quant info)."""
         layer = self._construct(
-            global_backend=MoeRunnerBackend.LORA_TRITON,
+            global_backend=MoeRunnerBackend.LORA_CUTEDSL,
             base_runner_backend=MoeRunnerBackend.DEEP_GEMM,
             lora_backend="triton_v2",
         )
-        self.assertIs(layer._lora_runner_backend, MoeRunnerBackend.LORA_TRITON)
+        self.assertIs(layer._lora_runner_backend, MoeRunnerBackend.LORA_CUTEDSL)
 
     def test_experimental_backends_win_over_their_aliased_base_runner(self):
         """is_marlin() / is_flashinfer_trtllm() alias the experimental backends,

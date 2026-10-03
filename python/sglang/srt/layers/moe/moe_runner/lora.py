@@ -27,6 +27,7 @@ class MoeLoraDispatchPayload(MoeQuantInfo):
     batch: MoeLoraBatch
 
 
+@register_fused_func("none", "lora_cutedsl")
 @register_fused_func("none", "lora_triton")
 def fused_experts_none_to_lora(
     dispatch_output: StandardDispatchOutput,

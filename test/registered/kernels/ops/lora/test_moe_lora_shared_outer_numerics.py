@@ -163,7 +163,7 @@ def _bind_test_menu(runner, plan, launch_config):
 
 def _build_runner(
     gpu: dict[str, torch.Tensor],
-    vendor: str = "triton",
+    vendor: str = "cutedsl",
     activation: ActivationFn = ActivationFn.SILU,
     gated: bool = True,
     phase: Phase = Phase.DECODE,
@@ -232,7 +232,7 @@ def _skip_unless_supported(device):
         pytest.skip(f"MoE LoRA does not support SM{major}{minor}")
 
 
-@pytest.mark.parametrize("vendor", ("triton",))
+@pytest.mark.parametrize("vendor", ("cutedsl", "triton"))
 @pytest.mark.parametrize(
     "identical_slots", (False, True), ids=("distinct", "identical")
 )
@@ -256,7 +256,7 @@ def test_shared_outer_decode_matches_fp32_reference(
     assert (reference - _fp32_reference(base_only)).abs().max().item() > 0.02
 
 
-@pytest.mark.parametrize("vendor", ("triton",))
+@pytest.mark.parametrize("vendor", ("cutedsl", "triton"))
 def test_shared_outer_decode_replays_in_a_cuda_graph(
     monkeypatch: pytest.MonkeyPatch, vendor: str
 ) -> None:
@@ -293,7 +293,7 @@ def test_shared_outer_decode_replays_in_a_cuda_graph(
     )
 
 
-@pytest.mark.parametrize("vendor", ("triton",))
+@pytest.mark.parametrize("vendor", ("cutedsl", "triton"))
 def test_shared_outer_prefill_graph_replays_other_request_boundaries(
     monkeypatch: pytest.MonkeyPatch, vendor: str
 ) -> None:
@@ -325,7 +325,7 @@ def test_shared_outer_prefill_graph_replays_other_request_boundaries(
     torch.testing.assert_close(out, reference, atol=0.018, rtol=0.06)
 
 
-@pytest.mark.parametrize("vendor", ("triton",))
+@pytest.mark.parametrize("vendor", ("cutedsl", "triton"))
 def test_shared_outer_relu2_non_gated_decode_matches_fp32_reference(
     monkeypatch: pytest.MonkeyPatch, vendor: str
 ) -> None:

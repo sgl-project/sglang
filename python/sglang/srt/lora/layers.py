@@ -1084,7 +1084,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         if (lora_backend.name == "triton_v2") != runner_backend.is_lora():
             raise ValueError(
                 "Routed MoE LoRA must pair --lora-backend triton_v2 with "
-                "--moe-runner-backend lora_triton; "
+                "--moe-runner-backend lora_cutedsl or lora_triton; "
                 "mixing new and legacy LoRA backends is unsupported"
             )
         if runner_backend.is_lora():
