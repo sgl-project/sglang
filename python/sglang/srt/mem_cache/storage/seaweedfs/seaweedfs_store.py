@@ -1,8 +1,11 @@
 """SeaweedFS backend for HiCache L3 storage.
 
 Each KV page is one object in a SeaweedFS bucket, reached through SeaweedFS's S3 gateway. The
-backend implements the generic tensor-page interface driven by the cache controller: pages are
-flat host tensors, ``batch_get`` returns one entry per key (``None`` on a miss), and
+cache controller drives the zero-copy interface: ``batch_get_v1`` / ``batch_set_v1`` move a
+page between its object and the host pool's own buffers (from ``get_page_buffer_meta``),
+returning one success flag per page. An object holds the page's buffers back to back, which
+for the page-first layouts is byte-identical to the flat page of the generic ``batch_get`` /
+``batch_set`` interface, so the two interfaces read each other's objects.
 ``batch_exists`` returns the length of the leading run of existing keys.
 
 Configuration comes from ``--hicache-storage-backend-extra-config``; only ``endpoint`` is
@@ -12,6 +15,7 @@ used, which keeps secrets off the command line.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -208,6 +212,83 @@ class SeaweedFSStore(HiCacheStorage):
             self._executor.submit(self.set, key, page) for key, page in zip(keys, pages)
         ]
         return all([f.result() for f in futures])
+
+    def _page_buffers(self, host_indices: torch.Tensor) -> List[List[tuple]]:
+        """(address, nbytes) of each host-pool buffer of every page, in page order."""
+        addresses, sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
+        num_pages = len(host_indices) // self.mem_pool_host.page_size
+        per_page = len(addresses) // num_pages
+        if isinstance(sizes, int):
+            sizes = [sizes] * len(addresses)
+        return [
+            list(
+                zip(
+                    addresses[i * per_page : (i + 1) * per_page],
+                    sizes[i * per_page : (i + 1) * per_page],
+                )
+            )
+            for i in range(num_pages)
+        ]
+
+    def _get_into(self, key: str, buffers: List[tuple]) -> bool:
+        data = self._fetch(key)
+        if data is None:
+            return False
+        expected = sum(nbytes for _, nbytes in buffers)
+        # A size mismatch is a stale or foreign object; copying it would overrun the page.
+        if len(data) != expected:
+            logger.warning(
+                "SeaweedFS object %s is %d bytes, page is %d", key, len(data), expected
+            )
+            return False
+        src = ctypes.cast(ctypes.c_char_p(data), ctypes.c_void_p).value
+        offset = 0
+        for address, nbytes in buffers:
+            ctypes.memmove(address, src + offset, nbytes)
+            offset += nbytes
+        return True
+
+    def _put_from(self, key: str, buffers: List[tuple]) -> bool:
+        try:
+            body = bytearray(sum(nbytes for _, nbytes in buffers))
+            dst = ctypes.addressof(ctypes.c_char.from_buffer(body))
+            offset = 0
+            for address, nbytes in buffers:
+                ctypes.memmove(dst + offset, address, nbytes)
+                offset += nbytes
+            self._s3.put_object(
+                Bucket=self.config.bucket, Key=self._object_key(key), Body=body
+            )
+            return True
+        except Exception as exc:
+            logger.error("SeaweedFS set %s failed: %s", key, exc)
+            return False
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        pages = self._page_buffers(host_indices)
+        futures = [
+            self._executor.submit(self._get_into, key, buffers)
+            for key, buffers in zip(keys, pages)
+        ]
+        return [f.result() for f in futures]
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        pages = self._page_buffers(host_indices)
+        futures = [
+            self._executor.submit(self._put_from, key, buffers)
+            for key, buffers in zip(keys, pages)
+        ]
+        return [f.result() for f in futures]
 
     def exists(self, key: str) -> bool:
         try:

@@ -164,8 +164,14 @@ class TestSeaweedFSStore(CustomTestCase):
             storage_backend=store, storage_host_pool=pool, page_size=PAGE_SIZE
         )
 
-    def _backup_and_reload(self, store, layout, drop_page=None):
-        """Back up NUM_PAGES random pages, wipe the pool, prefetch them back."""
+    def _backup_and_reload(
+        self, store, layout, drop_page=None, set_via="generic", get_via="generic"
+    ):
+        """Back up NUM_PAGES random pages, wipe the pool, prefetch them back.
+
+        set_via / get_via pick the controller path: "generic" (flat page tensors) or
+        "zero_copy" (batch_get_v1 / batch_set_v1 on the host pool's own buffers).
+        """
         pool = _host_pool(layout)
         ctrl = self._controller(store, pool)
         pool.kv_buffer.copy_(torch.randn(pool.kv_buffer.shape).to(torch.bfloat16))
@@ -173,37 +179,80 @@ class TestSeaweedFSStore(CustomTestCase):
         keys = [f"{layout}-{uuid.uuid4().hex[:8]}-{i}" for i in range(NUM_PAGES)]
         host_indices = torch.arange(NUM_PAGES * PAGE_SIZE, dtype=torch.int64)
 
-        self.assertTrue(HiCacheController._generic_page_set(ctrl, keys, host_indices))
+        page_set = {
+            "generic": HiCacheController._generic_page_set,
+            "zero_copy": HiCacheController._page_set_zero_copy,
+        }[set_via]
+        page_get = {
+            "generic": HiCacheController._generic_page_get,
+            "zero_copy": HiCacheController._page_get_zero_copy,
+        }[get_via]
+        self.assertTrue(page_set(ctrl, keys, host_indices))
         if drop_page is not None:
             store._s3.delete_object(
                 Bucket=self.bucket, Key=store._object_key(keys[drop_page])
             )
         pool.kv_buffer.zero_()
         operation = SimpleNamespace(request_id="r", is_terminated=lambda: False)
-        loaded = HiCacheController._generic_page_get(
-            ctrl, operation, keys, host_indices
-        )
+        loaded = page_get(ctrl, operation, keys, host_indices)
         return pool, keys, expected, loaded
 
     def test_controller_round_trip_is_bit_exact_for_every_layout(self):
         store = self._store()
-        for layout in ("layer_first", "page_first", "page_first_direct"):
-            with self.subTest(layout=layout):
-                pool, _, expected, loaded = self._backup_and_reload(store, layout)
-                self.assertEqual(loaded, NUM_PAGES)
-                for i in range(NUM_PAGES):
-                    self.assertTrue(torch.equal(_page(pool, i), expected[i]))
+        for via in ("generic", "zero_copy"):
+            for layout in ("layer_first", "page_first", "page_first_direct"):
+                with self.subTest(via=via, layout=layout):
+                    pool, _, expected, loaded = self._backup_and_reload(
+                        store, layout, set_via=via, get_via=via
+                    )
+                    self.assertEqual(loaded, NUM_PAGES)
+                    for i in range(NUM_PAGES):
+                        self.assertTrue(torch.equal(_page(pool, i), expected[i]))
+
+    def test_generic_and_zero_copy_read_each_others_pages(self):
+        """Both interfaces store a page as one object with the same bytes (page-first layouts)."""
+        store = self._store()
+        for layout in ("page_first", "page_first_direct"):
+            for set_via, get_via in (
+                ("generic", "zero_copy"),
+                ("zero_copy", "generic"),
+            ):
+                with self.subTest(layout=layout, set_via=set_via):
+                    pool, _, expected, loaded = self._backup_and_reload(
+                        store, layout, set_via=set_via, get_via=get_via
+                    )
+                    self.assertEqual(loaded, NUM_PAGES)
+                    for i in range(NUM_PAGES):
+                        self.assertTrue(torch.equal(_page(pool, i), expected[i]))
 
     def test_prefetch_stops_at_the_first_missing_page(self):
         """Pages after a miss are unusable and must not be loaded or counted."""
         store = self._store()
-        pool, keys, _, loaded = self._backup_and_reload(
-            store, "page_first", drop_page=2
+        for via in ("generic", "zero_copy"):
+            with self.subTest(via=via):
+                pool, keys, _, loaded = self._backup_and_reload(
+                    store, "page_first", drop_page=2, set_via=via, get_via=via
+                )
+                self.assertEqual(loaded, 2)
+                if via == "generic":
+                    # Zero-copy fetches a batch in parallel into slots the controller
+                    # releases after the count; only the generic path skips the copy.
+                    self.assertFalse(_page(pool, 3).any())
+                extra_info = HiCacheStorageExtraInfo(prefix_keys=[])
+                self.assertEqual(store.batch_exists(keys, extra_info), 2)
+
+    def test_zero_copy_rejects_an_object_of_the_wrong_size(self):
+        """A stale or foreign object must not be copied into the host pool."""
+        store = self._store()
+        pool = _host_pool("page_first")
+        pool.kv_buffer.zero_()
+        store.register_mem_pool_host(pool)
+        store._s3.put_object(
+            Bucket=self.bucket, Key=store._object_key("k"), Body=b"\x7f" * 8192
         )
-        self.assertEqual(loaded, 2)
-        self.assertFalse(_page(pool, 3).any())
-        extra_info = HiCacheStorageExtraInfo(prefix_keys=[])
-        self.assertEqual(store.batch_exists(keys, extra_info), 2)
+        host_indices = torch.arange(PAGE_SIZE, dtype=torch.int64)
+        self.assertEqual(store.batch_get_v1(["k"], host_indices), [False])
+        self.assertFalse(pool.kv_buffer.any())
 
     def test_object_of_the_wrong_size_is_a_miss_not_an_overrun(self):
         store = self._store()

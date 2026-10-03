@@ -73,8 +73,8 @@ Instances share cache entries only when the model name and parallel layout match
 
 ## Behaviour and limits
 
-- The backend uses the generic HiCache page interface: each page passes through one host staging
-  copy on its way to or from SeaweedFS.
+- The backend uses the zero-copy HiCache interface: pages move directly between SeaweedFS and the
+  host KV pool's own buffers, without a staging page.
 - A prefetch stops at the first missing page. Pages after a miss are not loaded.
 - An object whose size does not match the host page is treated as a miss and never copied.
 - `clear()` deletes only the calling rank's objects. Other models and ranks sharing the bucket are
