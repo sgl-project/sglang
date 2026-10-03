@@ -165,6 +165,11 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     AITER attention."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
+    if get_exec().kernel.dsv4_attn_backend == "trtllm":
+        assert mode in ("auto", "v4") and option in ("auto", "fp8"), (
+            "trtllm uses uniform FP8 pools, not the packed V4.1 KV layouts"
+        )
+        return KVLayout.V4, None
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
     assert mode in ("v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
@@ -2036,6 +2041,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """q ([B, H, head_dim]): rope its query heads in the same launch."""
         if self.uniform_fp8:
             assert q is None, "uniform FP8 store does not fuse query RoPE"
+            if envs.SGLANG_OPT_FUSED_TRTLLM_KV_STORE.get():
+                from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
+                    fused_k_norm_rope_uniform_fp8,
+                )
+
+                fused_k_norm_rope_uniform_fp8(
+                    kv,
+                    kv_weight,
+                    eps,
+                    freqs_cis,
+                    positions,
+                    swa_loc,
+                    self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id)),
+                )
+                return
             # Uniform-FP8 (trtllm-gen): in-place norm + RoPE (kv is not read again),
             # then an e4m3 cast + scatter with per-tensor scale 1.0.
             from sglang.kernels.ops.attention.deepseek_v4_rope import (

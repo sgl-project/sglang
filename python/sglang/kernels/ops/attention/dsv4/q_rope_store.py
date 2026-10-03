@@ -36,7 +36,11 @@ def _q_rope_store(
     else:
         odd = tl.fma(partner, sin, value * cos)
     rotated = tl.where((r & 1) == 0, even, odd)
-    tl.store(Y + row * SY + head * 512 + r, tl.where(r >= 448, rotated, value))
+    result = tl.where(r >= 448, rotated, value)
+    # Preserve the unfused RoPE -> BF16 -> FP8 rounding, including ties.
+    if Y.dtype.element_ty == tl.float8e4nv:
+        result = result.to(tl.bfloat16).to(tl.float32)
+    tl.store(Y + row * SY + head * 512 + r, result)
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -76,9 +80,12 @@ def _q_rope_store_prefill(
         odd = tl.fma(partner, sin, value * cos)
     rotated = tl.where((r[None, :] & 1) == 0, even, odd)
     y_offset = row[:, None].to(tl.int64) * SY + head[:, None] * 512 + r[None, :]
+    result = tl.where(r[None, :] >= 448, rotated, value)
+    if Y.dtype.element_ty == tl.float8e4nv:
+        result = result.to(tl.bfloat16).to(tl.float32)
     tl.store(
         Y + y_offset,
-        tl.where(r[None, :] >= 448, rotated, value),
+        result,
         row[:, None] < M,
     )
 
@@ -91,7 +98,8 @@ def q_rope_store(
 ) -> None:
     """Apply 64-wide forward RoPE to 512-wide heads without changing Q padding."""
     assert q.shape == output.shape and q.ndim == 3 and q.shape[2] == 512
-    assert q.dtype == output.dtype == torch.bfloat16
+    assert q.dtype == torch.bfloat16
+    assert output.dtype in (torch.bfloat16, torch.float8_e4m3fn)
     assert q.stride(2) == output.stride(2) == 1
     assert q.stride(1) == output.stride(1) == 512
     assert freqs_cis.dtype == torch.complex64 and freqs_cis.is_contiguous()

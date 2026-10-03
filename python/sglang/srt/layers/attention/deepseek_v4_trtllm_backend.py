@@ -11,12 +11,14 @@ from typing import TYPE_CHECKING, Literal, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.trtllm_metadata import pack_sparse_tail
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     DeepseekV4AttnBackend,
     DeepseekV4MultiStepBackend,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -150,6 +152,13 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         assert self.token_to_kv_pool.uniform_fp8, (
             "the trtllm backend requires the uniform-FP8 DSv4 KV pool."
         )
+        assert (
+            not self.is_dsv41
+            or get_exec().graph.cuda_graph_config.prefill.backend == Backend.DISABLED
+        ), (
+            "the experimental V4.1 trtllm path requires "
+            "--cuda-graph-backend-prefill disabled"
+        )
         assert not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get(), (
             "--dsv4-attn-backend trtllm does not support "
             "SGLANG_OPT_USE_ONLINE_COMPRESS yet."
@@ -166,7 +175,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         *,
         q: torch.Tensor,
         layer: RadixAttention,
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         core_attn_metadata: DSV4AttnMetadata,
         forward_batch: ForwardBatch,
         attn_sink: torch.Tensor,
@@ -175,6 +184,11 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         extra_topk_lengths: Optional[torch.Tensor],
     ) -> torch.Tensor:
         assert attn_sink is not None
+        if self.is_dsv41:
+            # FlashMLA pads TP query heads to 64. TRT-LLM accepts the native
+            # width; do not compute attention for the discarded padding.
+            q = q[:, : layer.tp_q_head_num, :]
+            attn_sink = attn_sink[: layer.tp_q_head_num]
         if (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
@@ -221,7 +235,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         return (self.softmax_scale, 1.0)
 
     def _trtllm_kv_cache_views(
-        self, layer_id: int, compress_ratio: Literal[0, 4, 128]
+        self, layer_id: int, compress_ratio: Literal[0, 1, 2, 4, 128]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return HND views of the uniform-FP8 SWA and compressed pools.
 
@@ -248,7 +262,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         *,
         q: torch.Tensor,
         layer: RadixAttention,
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
         swa_page_indices: torch.Tensor,
@@ -278,8 +292,10 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                 extra_topk_lengths = extra_topk_lengths[:n_meta_rows]
             bs = n_meta_rows
 
-        # Only the c4 tail and lens vary by layer; other table data is prebuilt.
-        assert swa_page_indices.shape == (bs, SWA_WINDOW)
+        # Indexed tails and lengths vary by layer; other table data is prebuilt.
+        swa_width = swa_page_indices.shape[1]
+        assert swa_page_indices.shape[0] == bs
+        assert swa_width == SWA_WINDOW or compress_ratio == 0
         if compress_ratio == 0:
             # Use the metadata view backed by 64-row-aligned storage because
             # the VarSeq kernel reads table rows to the tile boundary.
@@ -302,22 +318,21 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             assert sparse_topk_lens.shape[0] > bs, f"{sparse_topk_lens.shape=}"
             sparse_topk_lens = sparse_topk_lens[:bs]
 
-        if compress_ratio == 4:
+        if compress_ratio in (1, 2, 4):
             assert extra_indices is not None and extra_topk_lengths is not None
             width = extra_indices.shape[-1]
             assert SWA_WINDOW + width == sparse_indices.shape[1], (
                 f"{width=} {sparse_indices.shape=}"
             )
-            sparse_indices[:, SWA_WINDOW:].copy_(extra_indices)
-            # Lens include all 128 SWA slots; seq_lens controls their validity.
-            sparse_topk_lens.copy_(extra_topk_lengths)
-            sparse_topk_lens.add_(SWA_WINDOW)
+            pack_sparse_tail(
+                extra_indices, extra_topk_lengths, sparse_indices, sparse_topk_lens
+            )
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
             layer.layer_id, compress_ratio
         )
 
-        # RoPE is already applied; the unit scale makes this a plain e4m3 cast.
+        # Fused RoPE already emits FP8 on V4.1; to() is a no-op in that path.
         q_fp8 = q.to(torch.float8_e4m3fn).view(bs, 1, num_heads, 512)
 
         bmm1_scale, bmm2_scale = self._get_trtllm_bmm_scales(layer)
@@ -326,6 +341,13 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         if seq_lens.shape[0] != bs:
             assert seq_lens.shape[0] > bs, f"{seq_lens.shape=} {bs=}"
             seq_lens = seq_lens[:bs]
+        if swa_width > SWA_WINDOW:
+            # DSpark attends noncausally to its context window plus the whole
+            # draft block. The tail still indexes SWA storage, not compressed
+            # KV. Use the complete block's visible length rather than each
+            # token's causal length, including for short requests.
+            compressed_kv_cache = swa_kv_cache
+            seq_lens = core_attn_metadata.swa_topk_lengths[:bs]
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
         _check_trtllm_query_rows(bs)
@@ -342,6 +364,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             bmm2_scale=bmm2_scale,
             sinks=attn_sink,
             kv_layout="HND",
+            backend="trtllm-gen",
         )
         if out_pad_tail is not None:
             out_pad_tail[:bs] = out.view(bs, num_heads, 512)
@@ -353,7 +376,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         *,
         q: torch.Tensor,
         layer: RadixAttention,
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         forward_batch: ForwardBatch,
         attn_sink: torch.Tensor,
         swa_page_indices: torch.Tensor,
@@ -418,11 +441,10 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                 assert width % 4 == 0, f"{width=}"
                 table = _tile_padded_pf(-1, width=SWA_WINDOW + width)
                 table[:, :SWA_WINDOW].copy_(swa_indices)
-                table[:, SWA_WINDOW:].copy_(extra_indices[:sum_q])
                 assert extra_topk_lengths is not None
-                lens = _tile_padded_pf(
-                    SWA_WINDOW,
-                    extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW,
+                lens = _tile_padded_pf(SWA_WINDOW)
+                pack_sparse_tail(
+                    extra_indices[:sum_q], extra_topk_lengths[:sum_q], table, lens
                 )
                 core.trtllm_prefill_c128 = (table, lens)
             sparse_indices, sparse_topk_lens = core.trtllm_prefill_c128
@@ -441,14 +463,15 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                 sum_q,
                 SWA_WINDOW + width,
             ), f"{sparse_indices.shape=} {width=}"
-            sparse_indices[:, SWA_WINDOW:].copy_(extra_indices[:sum_q])
-            # Lens include 128 SWA slots; VarSeq metadata controls validity.
-            sparse_topk_lens = _tile_padded_pf(
-                SWA_WINDOW,
-                extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW,
+            sparse_topk_lens = _tile_padded_pf(SWA_WINDOW)
+            pack_sparse_tail(
+                extra_indices[:sum_q],
+                extra_topk_lengths[:sum_q],
+                sparse_indices,
+                sparse_topk_lens,
             )
 
-        # RoPE is already applied; the unit scale makes this a plain e4m3 cast.
+        # Retain a unit-scale cast for callers without fused FP8 Q preparation.
         q_fp8 = q[:sum_q].to(torch.float8_e4m3fn)
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
@@ -483,6 +506,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             bmm2_scale=bmm2_scale,
             sinks=attn_sink,
             kv_layout="HND",
+            backend="trtllm-gen",
             cum_seq_lens_q=cum_seq_lens_q,
             max_q_len=max_q_len,
         )

@@ -191,6 +191,11 @@ class DSparkAttention(MqaAttentionBase):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
+            if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
+                from sglang.kernels.ops.attention.dsv4.q_rope_store import q_rope_store
+
+                q_rope_store(q, q_out, self.freqs_cis, positions)
+                return q_out
             if self._use_fast_kernel and not _is_npu:
                 fused_rope_inplace(
                     q[..., -self.rope_head_dim :],
@@ -270,7 +275,17 @@ class DSparkAttention(MqaAttentionBase):
 
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
-        if self.n_local_heads < _PAD_NUM_HEADS:
+        if (
+            pool.uniform_fp8
+            and not self.q_head_norm
+            and self.n_local_heads in (8, 16, 32, 64, 128)
+        ):
+            q_out = torch.empty(
+                (hidden_states.shape[0], self.n_local_heads, self.head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=hidden_states.device,
+            )
+        elif self.n_local_heads < _PAD_NUM_HEADS:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )

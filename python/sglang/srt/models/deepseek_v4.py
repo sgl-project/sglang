@@ -1341,6 +1341,11 @@ class MQALayer(MqaAttentionBase):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
+            if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
+                from sglang.kernels.ops.attention.dsv4.q_rope_store import q_rope_store
+
+                q_rope_store(q, q_out, self.freqs_cis, positions)
+                return q_out
             if (
                 (_is_cuda or _is_gfx95_supported)
                 and q_out is not None
@@ -2256,7 +2261,19 @@ class MQALayer(MqaAttentionBase):
 
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         k_nope, k_rope = None, None
-        if unified_fp8_decode or unified_fp8_prefill:
+        if (
+            self.is_dsv41
+            and not self.q_head_norm
+            and get_token_to_kv_pool().uniform_fp8
+            and self.n_local_heads in (8, 16, 32, 64, 128)
+        ):
+            kernel_num_heads = self.n_local_heads
+            q_out = torch.empty(
+                (x.shape[0], self.n_local_heads, self.head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=x.device,
+            )
+        elif unified_fp8_decode or unified_fp8_prefill:
             # width and dtype come off the pools themselves; the kernel reads Q
             # with the kv row stride, so the two must not drift
             kv_pool = get_token_to_kv_pool()

@@ -231,8 +231,8 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   const int32_t out_loc = raw_out_loc >> 1;
   const auto kv_row = Paged::row(params.kvcache, out_loc);
 
-  if constexpr (kLayout == KVLayout::V41) {
-    // fp8 with one ue8m0 scale per 32 elements over the whole row, RoPE included.
+  if constexpr (kLayout == KVLayout::V41 || kLayout == KVLayout::UNIFORM_FP8) {
+    // FP8 over the whole row, RoPE included; the layout selects the scaling.
     return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
   }
 
