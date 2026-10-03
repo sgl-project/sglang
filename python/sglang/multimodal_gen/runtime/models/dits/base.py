@@ -44,6 +44,7 @@ class BaseDiT(nn.Module, ABC):
         AttentionBackendEnum.FA,
         AttentionBackendEnum.AITER,
         AttentionBackendEnum.AITER_SAGE,
+        AttentionBackendEnum.GLUON_FAV3,
         AttentionBackendEnum.TORCH_SDPA,
         AttentionBackendEnum.VIDEO_SPARSE_ATTN,
         AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,

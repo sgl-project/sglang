@@ -121,6 +121,30 @@ class RocmPlatform(Platform):
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
+        elif selected_backend == AttentionBackendEnum.GLUON_FAV3:
+            capability = cls.get_device_capability()
+            supported = (
+                capability is not None
+                and (capability.major, capability.minor) == (12, 5)
+                and dtype == torch.bfloat16
+                and head_size == 128
+            )
+            if supported:
+                logger.info("Using gfx1250 Gluon FAv3 backend on ROCm.")
+                return (
+                    "sglang.multimodal_gen.runtime.layers.attention.backends."
+                    "gluon_fav3.GluonFAv3Backend"
+                )
+            logger.warning(
+                "Gluon FAv3 requires ROCm capability 12.5, BF16, and head size "
+                "128 (found capability=%s, dtype=%s, head_size=%d); falling "
+                "back to AITER.",
+                capability.as_version_str() if capability is not None else "unknown",
+                dtype,
+                head_size,
+            )
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+
         elif selected_backend == AttentionBackendEnum.AITER_SAGE:
             if dtype in (torch.float16, torch.bfloat16):
                 logger.info("Using AITER Sage backend on ROCm.")
