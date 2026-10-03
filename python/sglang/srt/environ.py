@@ -933,6 +933,21 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Fused AITER KDA decode. Empty keeps the unfused chain; "aiter" selects
+    # the gfx950 FlyDSL kernel.
+    SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("")
+    # Requantize Quark per-channel FP8 kv_b to per-tensor FP8 so the MLA absorb
+    # BMMs run the AITER a8w8 kernel (~2.3% weight error vs dequant to bf16).
+    SGLANG_ROCM_K3_MLA_ABSORB_FP8 = EnvBool(True)
+    # Activation precision for MXFP4-weight dense linears, independent of the
+    # MoE: "fp4" is the checkpoint's own W4A4, "bf16" dequantizes the weights
+    # at load. bf16 by default: K3 GSM8K scores 0.947 vs fp4's 0.908, for
+    # ~3% decode throughput. Ignored off ROCm (both paths are aiter kernels).
+    SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT = EnvStr("bf16")
+    # Dequantize Quark MXFP4 shared experts before the MoE front merge so they
+    # join it. Needs SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT=bf16. Shared down stays
+    # BF16: PTPC on that dequantized weight scored GSM8K 0.937.
+    SGLANG_ROCM_K3_QUARK_SHARED_FULL_FRONT = EnvBool(True)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

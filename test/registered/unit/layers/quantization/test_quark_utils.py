@@ -4,10 +4,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import os
 import unittest
+import warnings
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+    QuarkW4A4MXFP4,
+    _resolve_dequant_linear_to_bf16,
+)
 from sglang.srt.layers.quantization.quark.utils import (
     e8m0_to_f32,
     should_ignore_layer,
@@ -154,6 +163,65 @@ class TestShouldIgnoreLayerFusedNames(CustomTestCase):
                 fused_mapping=QKV_MAPPING,
             )
         )
+
+
+class TestMXFP4WeightMaterialization(CustomTestCase):
+    def test_materializes_packed_weight_without_mutating_layer(self):
+        # Packed low/high nibbles 1/2 decode to 0.5/1.0. An e8m0 scale of
+        # 127 is exactly one.
+        packed = torch.full((2, 16), 0x21, dtype=torch.uint8)
+        scales = torch.full((2, 1), 127, dtype=torch.uint8)
+        layer = SimpleNamespace(weight=packed, weight_scale=scales)
+        scheme = object.__new__(QuarkW4A4MXFP4)
+
+        dense = scheme.materialize_bf16_weight(layer)
+
+        expected = torch.tensor([0.5, 1.0], dtype=torch.bfloat16).repeat(2, 16)
+        torch.testing.assert_close(dense, expected)
+        self.assertIs(layer.weight, packed)
+        self.assertIs(layer.weight_scale, scales)
+
+    def test_reuses_already_materialized_weight(self):
+        weight = torch.randn(2, 32, dtype=torch.bfloat16)
+        layer = SimpleNamespace(weight=weight, dequantized_bf16=True)
+        scheme = object.__new__(QuarkW4A4MXFP4)
+
+        self.assertIs(scheme.materialize_bf16_weight(layer), weight)
+
+
+class TestMXFP4LinearActResolution(CustomTestCase):
+    """The activation knob applies on ROCm and is inert everywhere else."""
+
+    def test_rocm_defaults_to_bf16(self):
+        self.assertTrue(_resolve_dequant_linear_to_bf16("bf16", is_hip=True))
+
+    def test_rocm_fp4_keeps_packed_weights(self):
+        self.assertFalse(_resolve_dequant_linear_to_bf16("fp4", is_hip=True))
+
+    def test_rocm_rejects_unknown_value(self):
+        with self.assertRaises(ValueError):
+            _resolve_dequant_linear_to_bf16("fp8", is_hip=True)
+
+    def test_non_rocm_ignores_every_value(self):
+        # Including values ROCm would reject.
+        for act in ("bf16", "fp4", "nonsense"):
+            with self.subTest(act=act):
+                self.assertFalse(_resolve_dequant_linear_to_bf16(act, is_hip=False))
+
+    def test_non_rocm_warns_only_when_explicitly_set(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(envs.SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT.name, None)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                _resolve_dequant_linear_to_bf16("bf16", is_hip=False)
+            self.assertEqual(list(caught), [])
+
+        with envs.SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT.override("fp4"):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                _resolve_dequant_linear_to_bf16("fp4", is_hip=False)
+        self.assertEqual(len(caught), 1)
+        self.assertIn("ROCm-only", str(caught[0].message))
 
 
 if __name__ == "__main__":

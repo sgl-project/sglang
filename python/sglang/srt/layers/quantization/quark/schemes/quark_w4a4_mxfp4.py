@@ -2,10 +2,12 @@
 
 import logging
 import threading
+import warnings
 from typing import Any, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -22,22 +24,40 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import direct_register_custom_op, is_gfx95_supported
 
 NVFP4_BLOCK_SIZE = 16
 
 _is_hip = is_hip()
 
-# On GPUs that lack the fp4-activation WMMA scale instruction
-# (V_WMMA_SCALE_F32_32X16X128_F4, e.g. gfx1250) the a4w4 (fp4 x fp4) linear GEMM
-# cannot run. The MoE path is switched to a8w4 via AITER_FORCE_A8W4=1 (handled
-# inside aiter.fused_moe); there is currently no working dense a8w4 GEMM for
-# plain nn.Linear on this arch, so under the same flag the (few) MXFP4-quantized
-# linear layers dequantize their FP4 weights to bf16 once at load and run a
-# plain bf16 GEMM. This trades a little memory for correctness on hardware that
-# cannot execute the fp4 kernel at all.
-_dequant_linear_to_bf16 = _is_hip and get_bool_env_var("AITER_FORCE_A8W4", "false")
+# Activation precision for MXFP4 dense linears; see the env docs for the bf16
+# default. bf16 is also the only option on GPUs without the fp4-activation
+# WMMA scale instruction (e.g. gfx1250), which cannot run the a4w4 GEMM.
+_MXFP4_LINEAR_ACTS = ("fp4", "bf16")
+
+
+def _resolve_dequant_linear_to_bf16(act: str, is_hip: bool) -> bool:
+    """Whether MXFP4 dense linears dequantize to bf16 at load. Off ROCm the
+    answer is always False: both branches are HIP-only aiter kernels."""
+    if not is_hip:
+        if envs.SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT.is_set():
+            warnings.warn(
+                "SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT is a ROCm-only switch and "
+                "is ignored on this platform."
+            )
+        return False
+    if act not in _MXFP4_LINEAR_ACTS:
+        raise ValueError(
+            "SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT must be one of "
+            f"{', '.join(_MXFP4_LINEAR_ACTS)}; got {act!r}"
+        )
+    return act == "bf16"
+
+
+_dequant_linear_to_bf16 = _resolve_dequant_linear_to_bf16(
+    envs.SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT.get(), _is_hip
+)
 
 # MXFP4 (OCP MX FP4 / e2m1) decode table, indexed by the 4-bit code.
 _MXFP4_VALUES = [
@@ -67,19 +87,30 @@ def _dequant_mxfp4_to_bf16(
     ``(N, K//32)`` uint8 into a dense bf16 weight ``(N, K)``."""
     N, k_packed = weight.shape
     K = k_packed * 2
-    lut = torch.tensor(_MXFP4_VALUES, device=weight.device, dtype=torch.float32)
-    lo = (weight & 0xF).long()
-    hi = (weight >> 4).long()
-    vals = torch.empty(N, K, device=weight.device, dtype=torch.float32)
-    vals[:, 0::2] = lut[lo]
-    vals[:, 1::2] = lut[hi]
+
+    # Decode straight to bf16: a LUT needs int64 indices plus a full-size fp32
+    # temporary, and K3 runs this over every MoE layer at load time.
+    def decode_nibble(nibble: torch.Tensor) -> torch.Tensor:
+        magnitude = nibble & 0x7
+        decoded = torch.where(
+            magnitude <= 4,
+            magnitude.to(torch.bfloat16) * 0.5,
+            (magnitude - 2).to(torch.bfloat16),
+        )
+        decoded = torch.where(magnitude == 7, 6.0, decoded)
+        return torch.where(nibble < 8, decoded, -decoded)
+
     # e8m0 byte b decodes to 2^(b-127); 255 is the NaN/Inf sentinel (unused by
     # real weights) -> map to 0 so it can't poison the matmul.
-    scale = torch.exp2(weight_scale.to(torch.float32) - 127.0)
+    scale = torch.exp2(weight_scale.to(torch.bfloat16) - 127.0)
     scale = torch.where(weight_scale == 255, torch.zeros_like(scale), scale)
-    scale = scale.view(N, K // 32, 1)
-    w = (vals.view(N, K // 32, 32) * scale).view(N, K)
-    return w.to(torch.bfloat16)
+    # Each scale covers 32 unpacked values, or 16 packed bytes.
+    scale = scale.repeat_interleave(16, dim=1)
+
+    w = torch.empty(N, K, device=weight.device, dtype=torch.bfloat16)
+    w[:, 0::2] = decode_nibble(weight & 0xF) * scale
+    w[:, 1::2] = decode_nibble(weight >> 4) * scale
+    return w
 
 
 if _is_hip:
@@ -259,13 +290,23 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
     def get_min_capability(cls) -> int:
         return 70
 
+    def materialize_bf16_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        """Dense BF16 view of this linear's checkpoint weight.
+
+        Lets a model build decode-side caches without depending on Quark's
+        packed MXFP4 representation.
+        """
+        if getattr(layer, "dequantized_bf16", False):
+            return layer.weight
+        return _dequant_mxfp4_to_bf16(layer.weight.data, layer.weight_scale.data)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not self.is_checkpoint_mxfp4_serialized:
             assert layer.weight.dtype == torch.uint8
             assert layer.weight_scale.dtype == torch.uint8
 
         if _dequant_linear_to_bf16:
-            w_bf16 = _dequant_mxfp4_to_bf16(layer.weight.data, layer.weight_scale.data)
+            w_bf16 = self.materialize_bf16_weight(layer)
             layer.weight = torch.nn.Parameter(w_bf16, requires_grad=False)
             # FP4 block scales are folded into the bf16 weight; drop them.
             layer.weight_scale = None
@@ -764,3 +805,25 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return y.view(*output_shape)
         else:
             return y
+
+    def apply_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run MXFP4 linear directly into caller-owned contiguous storage."""
+        if (
+            bias is not None
+            or getattr(layer, "dequantized_bf16", False)
+            or x.ndim != 2
+            or not output.is_contiguous()
+            or output.shape != (x.shape[0], layer.weight.shape[0])
+            or output.dtype != self.out_dtype
+        ):
+            output.copy_(self.apply_weights(layer, x, bias))
+            return output
+        # The existing three-tuple contract selects fused dynamic activation
+        # quantization + GEMM and writes the result directly into `output`.
+        return self.apply_weights(layer, (x, None, output), bias)

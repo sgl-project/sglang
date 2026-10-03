@@ -11,11 +11,11 @@ from collections.abc import Iterable
 import torch
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from .kernels.kimi_k3_kda_decode import (
-    create_kimi_k3_kda_decode_kernel,
+from .kernels.kda_decode_fused_projection_gfx950 import (
+    create_kda_decode_fused_projection_kernel,
 )
-from .kernels.kimi_k3_kda_decode_fb import (
-    create_kimi_k3_kda_decode_fb_kernel,
+from .kernels.kda_decode_gfx950 import (
+    create_kda_decode_kernel,
 )
 
 _HEADS = 12
@@ -44,7 +44,7 @@ def _rocm_arch(device: torch.device) -> str | None:
     return arch.split(":", 1)[0] if arch is not None else None
 
 
-def is_flydsl_kimi_k3_kda_decode_supported(
+def is_flydsl_kda_decode_supported(
     device: torch.device | str | int | None = None,
 ) -> bool:
     """Return whether ``device`` can run this gfx950-only specialization."""
@@ -128,7 +128,7 @@ def _validate_kda_inputs(
     out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Validate operands shared by both explicit KDA specializations."""
-    if not is_flydsl_kimi_k3_kda_decode_supported(device):
+    if not is_flydsl_kda_decode_supported(device):
         raise RuntimeError(f"`{api_name}` requires a gfx950 GPU.")
     if batch <= 0:
         raise ValueError(f"`{batch_source}` must have a non-empty batch dimension.")
@@ -256,7 +256,7 @@ def _validate_kda_inputs(
     return out
 
 
-def flydsl_kimi_k3_kda_decode(
+def flydsl_kda_decode(
     x: torch.Tensor,
     conv_weight: torch.Tensor,
     conv_bias: torch.Tensor | None,
@@ -282,7 +282,7 @@ def flydsl_kimi_k3_kda_decode(
 
     The layout is fixed to Kimi-K3 TP8: 12 local heads and 128-dimensional
     key/value state. Call
-    :func:`is_flydsl_kimi_k3_kda_decode_supported` before dispatching from a
+    :func:`is_flydsl_kda_decode_supported` before dispatching from a
     model implementation.
     """
     if x.ndim != 2:
@@ -292,7 +292,7 @@ def flydsl_kimi_k3_kda_decode(
     device = x.device
     batch = x.shape[0]
     out = _validate_kda_inputs(
-        api_name="flydsl_kimi_k3_kda_decode",
+        api_name="flydsl_kda_decode",
         batch_source="x",
         device=device,
         batch=batch,
@@ -320,7 +320,7 @@ def flydsl_kimi_k3_kda_decode(
         inner_strides=(_DIM, 1),
     )
 
-    executable = create_kimi_k3_kda_decode_kernel(
+    executable = create_kda_decode_kernel(
         float(norm_eps),
         float(lower_bound),
     )
@@ -359,7 +359,7 @@ def flydsl_kimi_k3_kda_decode(
     return out
 
 
-def flydsl_kimi_k3_kda_decode_with_f_b(
+def flydsl_kda_decode_with_f_b(
     f_a: torch.Tensor,
     f_b_weight: torch.Tensor,
     x: torch.Tensor,
@@ -408,7 +408,7 @@ def flydsl_kimi_k3_kda_decode_with_f_b(
         inner_strides=(_DIM, 1),
     )
     out = _validate_kda_inputs(
-        api_name="flydsl_kimi_k3_kda_decode_with_f_b",
+        api_name="flydsl_kda_decode_with_f_b",
         batch_source="f_a",
         device=device,
         batch=batch,
@@ -427,7 +427,7 @@ def flydsl_kimi_k3_kda_decode_with_f_b(
         out=out,
     )
 
-    executable = create_kimi_k3_kda_decode_fb_kernel(
+    executable = create_kda_decode_fused_projection_kernel(
         float(norm_eps),
         float(lower_bound),
         **_fb_build_options(batch),
@@ -471,7 +471,7 @@ def flydsl_kimi_k3_kda_decode_with_f_b(
 
 
 __all__ = [
-    "flydsl_kimi_k3_kda_decode",
-    "flydsl_kimi_k3_kda_decode_with_f_b",
-    "is_flydsl_kimi_k3_kda_decode_supported",
+    "flydsl_kda_decode",
+    "flydsl_kda_decode_with_f_b",
+    "is_flydsl_kda_decode_supported",
 ]
