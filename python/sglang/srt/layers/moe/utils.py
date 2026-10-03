@@ -170,6 +170,7 @@ class _MoeRunnerBackendPredicates:
         return self.value in (
             MoeRunnerBackend.LORA_CUTEDSL.value,
             MoeRunnerBackend.LORA_TRITON.value,
+            MoeRunnerBackend.LORA_MARLIN.value,
         )
 
     def is_lora_cutedsl(self):
@@ -177,6 +178,9 @@ class _MoeRunnerBackendPredicates:
 
     def is_lora_triton(self):
         return self.value == MoeRunnerBackend.LORA_TRITON.value
+
+    def is_lora_marlin(self):
+        return self.value == MoeRunnerBackend.LORA_MARLIN.value
 
     def is_humming(self):
         return self.value == MoeRunnerBackend.HUMMING.value
@@ -207,6 +211,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     LORA_CUTEDSL = "lora_cutedsl"
     LORA_TRITON = "lora_triton"
+    LORA_MARLIN = "lora_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
     INTEL_XPU = "intel_xpu"

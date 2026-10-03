@@ -274,6 +274,7 @@ class TestEngineAdmission(CustomTestCase):
         for vendor, family in (
             ("triton", "bf16"),
             ("triton", "fp8"),
+            ("marlin", "nvfp4"),
         ):
             assert select_provider_cls(
                 "expert_major", family, vendor
@@ -365,6 +366,7 @@ class TestLayerRunnerBackendResolution(CustomTestCase):
         for backend in (
             MoeRunnerBackend.LORA_CUTEDSL,
             MoeRunnerBackend.LORA_TRITON,
+            MoeRunnerBackend.LORA_MARLIN,
         ):
             with self.subTest(backend=backend):
                 layer = self._construct(
@@ -378,6 +380,7 @@ class TestLayerRunnerBackendResolution(CustomTestCase):
         for backend in (
             MoeRunnerBackend.LORA_CUTEDSL,
             MoeRunnerBackend.LORA_TRITON,
+            MoeRunnerBackend.LORA_MARLIN,
         ):
             with (
                 self.subTest(backend=backend),

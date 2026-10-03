@@ -4270,7 +4270,7 @@ class TestLoraMoeRunnerBackendGuards(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unquantized"):
             check_lora_moe_runner_args(server_args)
 
-        for quantization in (None, "fp8"):
+        for quantization in (None, "fp8", "modelopt_fp4"):
             server_args = ServerArgs(
                 model_path="dummy",
                 moe_runner_backend="lora_cutedsl",
