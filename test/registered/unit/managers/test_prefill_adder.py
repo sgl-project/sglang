@@ -1537,9 +1537,12 @@ class TestPrefillAdder(CustomTestCase):
 
     def _adder_with_extend_lens(self, extend_lens):
         adder = PrefillAdder.__new__(PrefillAdder)
-        adder.can_run_list = [
-            SimpleNamespace(extend_input_len=length) for length in extend_lens
-        ]
+        adder.can_run_list = []
+        for length in extend_lens:
+            req = Req.__new__(Req)
+            # Count only this extend, excluding the already cached prefix.
+            req.set_extend_range(256, 256 + length)
+            adder.can_run_list.append(req)
         # BLOCK_M is auto-detected from the attention backend in production; the
         # __new__ helper bypasses __init__, so set it explicitly. 64 matches the
         # block_m the tile-count assertions below are computed against.
@@ -1573,6 +1576,28 @@ class TestPrefillAdder(CustomTestCase):
             patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
         ):
             self.assertEqual(adder._check_prefill_tile_budget(129), AddReqResult.OTHER)
+
+    def test_prefill_tile_budget_counts_admitted_ranges(self):
+        adder = self._adder_with_extend_lens([129, 1])
+
+        # Including the one-token candidate: compact uses 3 + 1 + 1 tiles,
+        # while legacy uses 3 requests * 3 tiles for the longest extend.
+        for mode, required_tiles in [("compact", 5), ("legacy", 9)]:
+            with (
+                self.subTest(mode=mode),
+                patch.object(schedule_policy, "_IS_HIP", True),
+                patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", mode),
+            ):
+                with patch.object(
+                    schedule_policy, "PREFILL_TILE_BUDGET", required_tiles
+                ):
+                    self.assertIsNone(adder._check_prefill_tile_budget(1))
+                with patch.object(
+                    schedule_policy, "PREFILL_TILE_BUDGET", required_tiles - 1
+                ):
+                    self.assertEqual(
+                        adder._check_prefill_tile_budget(1), AddReqResult.OTHER
+                    )
 
     def test_prefill_tile_budget_always_allows_first_request(self):
         adder = self._adder_with_extend_lens([])
