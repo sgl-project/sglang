@@ -542,11 +542,20 @@ def register_fused_all_reduce_comm() -> None:
         )
 
 
-def can_fuse_all_reduce() -> bool:
-    """Whether fused-collective epilogues may stage rows through the registered
-    push plane. The deferred-finalize handle type carries its own contract (every
-    producer folds the routed scaling; no consumer rescales), and slot capacity /
-    geometry are checked loudly kernel-side."""
+def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
+    """Whether the registered push plane can stage ``[num_tokens, hidden_dim]``
+    BF16 rows: one slot holds them and each row owns a push phase counter. The
+    384 ceiling is the bench-validated range of the fused collective family.
+
+    The deferred-finalize handle type carries its own numeric contract (every
+    producer folds the routed scaling; no consumer rescales)."""
     from sglang.kernels.ops.communication import all_reduce_fusion
 
-    return all_reduce_fusion.get_registered_comm(get_parallel().tp_size) is not None
+    if all_reduce_fusion.get_registered_comm(get_parallel().tp_size) is None:
+        return False
+    comm = get_parallel().tp_group.ca_comm
+    return (
+        num_tokens <= 384
+        and num_tokens <= comm.config.num_push_blocks
+        and all_reduce_fusion.fits_push_slot(comm.max_push_size, num_tokens, hidden_dim)
+    )

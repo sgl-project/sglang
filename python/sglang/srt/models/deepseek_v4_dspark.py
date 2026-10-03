@@ -741,9 +741,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             stats_stream = self.hc_stats_stream
 
         residual = hidden_states
-        x = mhc.combine(
-            self.attn_hc, mhc.HcState(hidden_states, prev_pre), stats_stream
-        )
+        mhc.fork_stats_stream(stats_stream)
+        x = mhc.combine(self.attn_hc, mhc.HcState(hidden_states, prev_pre))
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(positions, x, forward_batch)
         attn_pre, attn_post, attn_comb = mhc.mix_stats(
@@ -754,7 +753,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
-        x = mhc.combine(self.ffn_hc, mhc.HcState(hidden_states, attn_pre), stats_stream)
+        mhc.fork_stats_stream(stats_stream)
+        x = mhc.combine(self.ffn_hc, mhc.HcState(hidden_states, attn_pre))
         x = self._run_ffn(x, forward_batch)
         ffn_pre, ffn_post, ffn_comb = mhc.mix_stats(
             self.ffn_hc, hidden_states, stats_stream

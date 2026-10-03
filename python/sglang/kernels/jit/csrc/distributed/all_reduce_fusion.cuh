@@ -707,7 +707,7 @@ struct MoeFinalizeAllReduceKernel {
     }
     const auto num_tokens = static_cast<uint32_t>(T.unwrap());
     if constexpr (kQuant) {
-      CHECK_HOST(num_tokens <= 8);
+      CHECK_HOST(num_tokens <= 128) << "the quant epilogue writes one 128-row scale tile";
       CHECK_HOST(norm_weight.has_value());
       TensorMatcher({T, kHiddenDim}).with_dtype<fp8_e4m3_t>().with_device<kDLCUDA>(device).verify(quantized.value());
       TensorMatcher({(kHiddenDim / 32) * 128})

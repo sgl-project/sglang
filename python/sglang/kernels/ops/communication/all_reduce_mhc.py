@@ -323,11 +323,13 @@ def moe_finalize_all_reduce_mhc_quant(
     cluster_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """:func:`moe_finalize_all_reduce_mhc_norm` plus fp8 e4m3 quantization of
-    the normalized row with ue8m0 group scales (rows <= 8). Returns
+    the normalized row with ue8m0 group scales (rows <= 128: the scale swizzle
+    addresses a single 128-row tile). Returns
     ``(reduced, mhc_out, normalized, quantized, scales)``.
     """
     rows = weights.shape[0]
-    assert 0 < rows <= 8
+    # One 128-row scale tile; larger needs a (token/128) block offset in the kernel.
+    assert 0 < rows <= 128
     out = torch.empty(
         (rows, _MHC_HIDDEN_DIM), dtype=torch.bfloat16, device=gemm2.device
     )

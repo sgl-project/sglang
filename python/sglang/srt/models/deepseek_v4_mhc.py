@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
+import msgspec
 import torch
 import torch.nn.functional as F
 
@@ -117,16 +118,26 @@ class HcPending(NamedTuple):
     comb: torch.Tensor
 
 
-class HcState(NamedTuple):
+class HcState(msgspec.Struct):
     """The mHC state of the stream between two hyper-connections.
 
     ``streams`` is the residual ``R``, or -- out of the HIP fused boundary -- the
-    post that would rebuild it, still outstanding.
+    post that would rebuild it, still outstanding. Mutable for one reason:
+    `release` must empty a consumed state in every frame that still binds it.
     """
 
-    streams: Union[torch.Tensor, HcPending]
+    streams: Union[torch.Tensor, HcPending, None]
     pre: Optional[torch.Tensor] = None
     input: Optional[HcPreOutput] = None
+
+    def release(self) -> None:
+        """Empty the state at its last reader, the combine; the residual the post
+        still needs lives on through the caller's alias. Stale holders -- above
+        all the model loop's binding across the layer call -- then stop pinning
+        the dead residual through the next sublayer."""
+        self.streams = None
+        self.pre = None
+        self.input = None
 
     @property
     def residual(self) -> torch.Tensor:
@@ -149,9 +160,11 @@ class HcState(NamedTuple):
     def take_rows(self, rows: Callable[[torch.Tensor], torch.Tensor]) -> HcState:
         """Keep only the rows ``rows`` selects -- the late-layer tail's narrowing."""
         pre = None if self.pre is None else rows(self.pre)
+        assert self.streams is not None
         if isinstance(self.streams, HcPending):
             return HcState(HcPending(*(rows(t) for t in self.streams)), pre)
-        return HcState(rows(self.streams), pre)
+        else:
+            return HcState(rows(self.streams), pre)
 
 
 # ---------------------------------------------------------------------------
@@ -338,10 +351,16 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
 # ---------------------------------------------------------------------------
 
 
+def fork_stats_stream(stats_stream: Optional[torch.cuda.Stream]) -> None:
+    """Let the side stream pick up from here; the layers call it right before
+    each combine (fork position measured indistinguishable across batch sizes)."""
+    if stats_stream is not None:
+        stats_stream.wait_stream(torch.cuda.current_stream())
+
+
 def combine(
     hc: HcSubLayer,
     state: HcState,
-    stats_stream: Optional[torch.cuda.Stream] = None,
     quantized: Optional[list] = None,
 ) -> torch.Tensor:
     """The sublayer's input: ``norm(sum_k pre[k] * R[k])``, short-circuited by
@@ -352,9 +371,6 @@ def combine(
     x, apply_pre, shortcut = state.residual, state.pre, state.input
     quantize = quantized is not None
     x_flat = x.flatten(1)
-    tiny = 0 < x.shape[0] <= 8
-    if stats_stream is not None and not tiny:
-        stats_stream.wait_stream(torch.cuda.current_stream())
 
     def combine_and_norm():
         if isinstance(shortcut, HcQuantized):
@@ -389,7 +405,7 @@ def combine(
             # One fused form for every row count. Each row's reduction order is
             # fixed regardless of the grid split, so this holds under
             # batch-invariant mode too.
-            if quantize and x.shape[0] <= 8:
+            if quantize and x.shape[0] <= 128:
                 from sglang.kernels.ops.layernorm.hc_combine_norm import (
                     hc_combine_norm_mxfp8,
                 )
@@ -406,10 +422,7 @@ def combine(
             )
         return norm(hc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
 
-    y = combine_and_norm()
-    if stats_stream is not None and tiny:
-        stats_stream.wait_stream(torch.cuda.current_stream())
-    return y
+    return combine_and_norm()
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +658,9 @@ def run_moe_post(
     if (
         isinstance(out, MoEOutput)
         and is_deferred_finalize(out.routed)
-        and can_fuse_all_reduce()
+        # expert_weights rows are the true token count; gemm2_out is the expanded
+        # [T x top_k (padded)] view and overstates the plane load by ~6x.
+        and can_fuse_all_reduce(out.routed.expert_weights.shape[0], hc.cfg.hidden)
     ):
         pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream)
         args = (
@@ -658,7 +673,13 @@ def run_moe_post(
             post_mix,
             comb,
         )
-        if next is not None and next.accepts_mxfp8 and next.norm_fusable:
+        if (
+            next is not None
+            and next.accepts_mxfp8
+            and next.norm_fusable
+            # The quant epilogue supports at most 128 batch size
+            and out.routed.expert_weights.shape[0] <= 128
+        ):
             from sglang.kernels.ops.communication.all_reduce_mhc import (
                 moe_finalize_all_reduce_mhc_quant,
             )
