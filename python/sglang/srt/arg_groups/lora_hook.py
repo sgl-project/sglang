@@ -34,6 +34,15 @@ def check_lora_server_args(server_args: Any):
             )
 
     if cfg.enable_lora:
+        # Dynamically loaded adapters can target either projection after startup.
+        if cfg.dcp_replicate_q_proj:
+            raise ValueError(
+                "--dcp-replicate-q-proj is not supported with LoRA: the "
+                "replicated-Q decode path bypasses q_b_proj LoRA and the "
+                "kv_b_proj Q correction; pass --no-dcp-replicate-q-proj "
+                "to use the local-head Q path."
+            )
+
         if cfg.enable_lora_overlap_loading is None:
             declare_resolution(
                 server_args, "check_lora_server_args", enable_lora_overlap_loading=False

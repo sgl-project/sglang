@@ -43,6 +43,9 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     handle_nvfp4_prefill_kv_dequant_dtype,
     validate_prefill_only_disable_kv_cache_args,
 )
+from sglang.srt.arg_groups.lora_hook import (
+    check_lora_server_args,
+)
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
@@ -53,6 +56,7 @@ from sglang.srt.arg_groups.moe_hook import (
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
+    declare_resolution,
     max_speculative_num_draft_tokens,
     resolution_result,
 )
@@ -4117,6 +4121,73 @@ class TestLazyReexports(CustomTestCase):
     def test_an_unknown_attribute_still_raises(self):
         with self.assertRaises(AttributeError):
             server_args_module.NotAThing
+
+
+class TestLoraReplicatedQArgs(unittest.TestCase):
+    def test_rejects_explicit_and_adapter_enabled_lora(self):
+        for lora_args in ({"enable_lora": True}, {"lora_paths": ["adapter=/unused"]}):
+            for target in ("q_b_proj", "kv_b_proj", "down_proj"):
+                with self.subTest(lora_args=lora_args, target=target):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        dcp_replicate_q_proj=True,
+                        max_lora_rank=16,
+                        lora_target_modules=[target],
+                        **lora_args,
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "--no-dcp-replicate-q-proj"
+                    ):
+                        check_lora_server_args(args)
+
+    def test_kimi_default_rejected_and_explicit_disable_preserved(self):
+        from sglang.srt.arg_groups.model_overrides.kimi_k3 import _kimi_k3_overrides
+
+        for replicate_q in (None, False):
+            with self.subTest(replicate_q=replicate_q):
+                args = ServerArgs(
+                    model_path="dummy",
+                    tp_size=2,
+                    dcp_size=2,
+                    dcp_comm_backend="a2a",
+                    decode_attention_backend="tokenspeed_mla",
+                    dcp_replicate_q_proj=replicate_q,
+                    enable_lora=True,
+                    max_lora_rank=16,
+                    lora_target_modules=["q_b_proj"],
+                )
+                declare_resolution(
+                    args, "kimi_k3", **_kimi_k3_overrides(args, SimpleNamespace())
+                )
+                if replicate_q is None:
+                    self.assertTrue(resolution_result(args, "dcp_replicate_q_proj"))
+                    with self.assertRaisesRegex(
+                        ValueError, "--no-dcp-replicate-q-proj"
+                    ):
+                        check_lora_server_args(args)
+                else:
+                    self.assertFalse(resolution_result(args, "dcp_replicate_q_proj"))
+                    check_lora_server_args(args)
+
+    def test_preserves_base_only_and_local_head_lora(self):
+        for kwargs in (
+            {"dcp_replicate_q_proj": True},
+            {
+                "enable_lora": False,
+                "lora_paths": ["adapter=/unused"],
+                "dcp_replicate_q_proj": True,
+            },
+            {"enable_lora": True, "dcp_replicate_q_proj": False},
+            {"enable_lora": True, "dcp_replicate_q_proj": None},
+        ):
+            with self.subTest(kwargs=kwargs):
+                args = ServerArgs(
+                    model_path="dummy",
+                    max_lora_rank=16,
+                    lora_target_modules=["q_b_proj"],
+                    **kwargs,
+                )
+                check_lora_server_args(args)
 
 
 if __name__ == "__main__":

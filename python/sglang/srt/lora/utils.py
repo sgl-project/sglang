@@ -681,3 +681,16 @@ def capturing_lora_graph() -> bool:
     )
 
     return get_is_capture_mode() and get_capture_lora_variant() != "nolora"
+
+
+def kv_b_lora_correction(attn_module) -> str | None:
+    """Select the absorbed-MLA correction: "v2", "legacy", or None.
+
+    The v2 path follows lora_active, including adapter-capable graph capture.
+    """
+    layer = getattr(attn_module, "kv_b_proj", None)
+    if not getattr(layer, "set_lora", False):
+        return None
+    if layer.lora_backend.name != "triton_v2":
+        return "legacy"
+    return "v2" if layer.lora_active else None
