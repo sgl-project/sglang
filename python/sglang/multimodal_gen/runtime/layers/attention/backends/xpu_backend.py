@@ -26,6 +26,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
 
 
 class XPUAttentionBackend(AttentionBackend):
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        return True
+
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -115,6 +119,7 @@ class XPUAttentionImpl(AttentionImpl):
         if return_softmax_lse:
             out_tensor, softmax_lse = out[:2]
             result = out_tensor.reshape(bsz, seqlen_q, nheads_q, d)
+            softmax_lse = softmax_lse.view(nheads_q, bsz, seqlen_q).permute(1, 0, 2)
             return result, softmax_lse
 
         result = out.reshape(bsz, seqlen_q, nheads_q, d)
