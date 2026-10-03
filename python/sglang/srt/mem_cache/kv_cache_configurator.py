@@ -661,6 +661,13 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
 
+    def _unified_scale_block_size(self) -> Optional[int]:
+        # mxfp8 and fp8_e4m3 resolve to the same torch dtype, so only the dtype
+        # string distinguishes them here.
+        if self.kv_cache_dtype_str != "mxfp8":
+            return None
+        return MHATokenToKVPoolMXFP8.MXFP8_SCALE_BLOCK_SIZE
+
     def _init_unified_mamba_pools(
         self,
         *,
@@ -814,6 +821,7 @@ class KVCacheConfigurator:
         return init_unified_mamba_swa_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
+            scale_block_size=self._unified_scale_block_size(),
             head_num=head_num,
             head_dim=head_dim,
             v_head_dim=v_head_dim,
@@ -912,6 +920,7 @@ class KVCacheConfigurator:
         bundle = init_unified_swa_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
+            scale_block_size=self._unified_scale_block_size(),
             head_num=head_num,
             head_dim=head_dim,
             v_head_dim=v_head_dim,
