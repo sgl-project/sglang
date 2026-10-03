@@ -295,7 +295,7 @@ def fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
 ):
-    topk_weights, topk_ids, _ = topk_output
+    topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
@@ -1160,7 +1160,7 @@ def fused_moe(
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
     if _is_xpu and not get_moe_runner_backend().is_triton():
-        topk_weight, topk_ids, _ = topk_output
+        topk_weight, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         from sgl_kernel import fused_experts as sgl_fused_experts
 
         return sgl_fused_experts(
