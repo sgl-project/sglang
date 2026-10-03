@@ -2249,6 +2249,16 @@ class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
 
 
+class GetHiCacheL3LayoutReq(BaseReq, kw_only=True):
+    pass
+
+
+class GetHiCacheL3LayoutReqOutput(BaseReq, kw_only=True):
+    # Untyped on purpose, like GetInternalStateReqOutput: the layout dict is
+    # sanitized with msgspec_to_builtins and can evolve without a migration.
+    layout: Dict[str, Any]
+
+
 class ProfileReqType(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2

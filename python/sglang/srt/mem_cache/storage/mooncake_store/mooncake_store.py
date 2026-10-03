@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -760,6 +761,54 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if group_ids is None:
             return None
         return [group_ids[i] for i in indices]
+
+    def describe_l3_object_layout(
+        self,
+        *,
+        sidecar_pool_specs: Sequence[SidecarPoolSpec],
+        swa_trailing_pages: Optional[int],
+        page_size: int,
+    ) -> dict:
+        """Per-pool key suffixes and hit policy for external KV routers.
+
+        An empty page key resolves to the pure suffix, taken from the same
+        key-building code mooncake stores objects with.
+        """
+        pools = []
+        for spec in sidecar_pool_specs:
+            if spec.pool_name not in self.registered_pools:
+                continue
+            suffixes, _ = self._get_hybrid_page_component_keys(
+                [""], PoolTransfer(name=spec.pool_name)
+            )
+            entry = {
+                "pool": str(spec.pool_name),
+                "suffixes": suffixes,
+                "hit_policy": spec.hit_policy.value,
+            }
+            if spec.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                if swa_trailing_pages is None:
+                    logger.warning(
+                        "Pool %s is trailing-page scoped but the SWA window is "
+                        "unknown; omitting trailing_pages.",
+                        spec.pool_name,
+                    )
+                else:
+                    entry["trailing_pages"] = swa_trailing_pages
+            pools.append(entry)
+        return {
+            "backend": "mooncake",
+            "page_size": page_size,
+            "hicache_object_layout": {
+                "pools": pools,
+                # _tag_keys() prepends this to every object key.
+                "key_prefix": getattr(self, "config_prefix", None),
+                # Suffixes embed the rank unless the layout is single-PP MLA.
+                "is_mla_backend": self.is_mla_backend,
+                "pp_rank": self.pp_rank,
+                "pp_size": self.pp_size,
+            },
+        }
 
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
