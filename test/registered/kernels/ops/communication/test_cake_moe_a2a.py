@@ -84,15 +84,17 @@ def test_supports_checks_device_and_backend(monkeypatch):
     assert cake_a2a.supports_moe_a2a(device.index) is expected
     assert not cake_a2a.supports_moe_a2a(torch.device("cpu"))
     assert not cake_a2a.supports_moe_ep_alltoall(torch.device("cpu"))
+    probe = cake_a2a._moe_a2a_cake_backend_available  # the lru_cache-wrapped probe
     monkeypatch.setattr(cake_a2a, "_moe_a2a_cake_backend_available", lambda: False)
     assert not cake_a2a.supports_moe_a2a(device)
     assert not cake_a2a.supports_moe_ep_alltoall(device)
+    # With the FlashInfer module reported missing, the real (uncached) probe is False.
     monkeypatch.setattr(cake_a2a, "flashinfer_module_available", lambda *a: False)
-    cake_a2a._moe_a2a_cake_backend_available.cache_clear()
+    probe.cache_clear()
     try:
-        assert not cake_a2a._moe_a2a_cake_backend_available.__wrapped__()
+        assert not probe.__wrapped__()
     finally:
-        cake_a2a._moe_a2a_cake_backend_available.cache_clear()
+        probe.cache_clear()
 
 
 # ---------------------------------------------------------------------------
