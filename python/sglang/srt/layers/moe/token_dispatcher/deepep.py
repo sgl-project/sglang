@@ -888,7 +888,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         quant_size: int = 128,
     ):
-        # [fix: FP8-channel模型quant_config无.get()方法, 跳过if后input_global_scale未定义导致UnboundLocalError]
         input_global_scale = None
         if hasattr(self.quant_config, "get"):
             input_global_scale = self.quant_config.get("input_global_scale", None)
