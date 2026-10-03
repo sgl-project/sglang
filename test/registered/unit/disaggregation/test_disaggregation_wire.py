@@ -1,5 +1,3 @@
-import ast
-import inspect
 import struct
 import threading
 import unittest
@@ -284,46 +282,30 @@ class TestDisaggregationWire(unittest.TestCase):
                     self.assertFalse(manager.transfer_infos)
                     self.assertFalse(manager.req_to_decode_prefix_len)
 
-    def test_mooncake_stride_check_mirrors_the_transfer_branch(self):
-        """The duplicated layout test must stay identical to the transfer's.
-
-        _state_stride_mismatch repeats _send_kvcache_generic's branch so that
-        registration can reach it too. If the two drift, the check stops
-        covering the entries actually transferred.
-        """
-        body = ast.parse(inspect.getsource(MooncakeKVManager)).body[0].body
-        funcs = {n.name: n for n in body if isinstance(n, ast.FunctionDef)}
-
-        def layout_branch(name):
-            found = [
-                ast.dump(n)
-                for n in ast.walk(funcs[name])
-                if isinstance(n, ast.BoolOp)
-                and isinstance(n.op, ast.Or)
-                and "is_mla_backend" in ast.dump(n)
-                and "force_flat" in ast.dump(n)
-            ]
-            self.assertEqual(len(found), 1, f"{name}: expected one layout branch")
-            return found[0]
-
-        def single_region(name):
-            found = [
-                ast.dump(n.value)
-                for n in ast.walk(funcs[name])
-                if isinstance(n, ast.Assign)
-                and getattr(n.targets[0], "id", None) == "is_single_region_swa"
-            ]
-            self.assertEqual(len(found), 1, f"{name}: expected one swa test")
-            return found[0]
-
-        self.assertEqual(
-            layout_branch("_send_kvcache_generic"),
-            layout_branch("_state_stride_mismatch"),
-        )
-        self.assertEqual(
-            single_region("_send_kvcache_generic"),
-            single_region("_state_stride_mismatch"),
-        )
+    def test_mooncake_short_decode_item_lens_is_a_verdict_not_an_index_error(self):
+        """A decode publishing fewer item lengths than entries used to raise
+        IndexError out of the stride check and take the transfer thread down;
+        it must come back as a rejection reason on both pairing paths."""
+        for layer_ids in ([], [3, 4]):
+            with self.subTest(layer_ids=layer_ids):
+                manager = object.__new__(MooncakeKVManager)
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.pp_size = 1
+                manager.kv_args = SimpleNamespace(
+                    mla_compression_ratios=None, prefill_start_layer=0
+                )
+                reason = manager._state_stride_mismatch(
+                    src_data_ptrs=[0x1000, 0x1100],
+                    dst_data_ptrs=[0x2000, 0x2100],
+                    item_lens=[32, 32],
+                    dst_item_lens=[32],
+                    state_type=StateType.SWA,
+                    src_layer_ids=layer_ids,
+                    dst_layer_ids=layer_ids,
+                )
+                self.assertIsNotNone(reason)
+                self.assertIn("item lengths", reason)
 
     def test_mooncake_validates_peer_state_layout_at_registration(self):
         """The verdict is reachable at registration, not just at transfer time."""

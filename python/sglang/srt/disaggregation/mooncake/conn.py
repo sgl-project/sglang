@@ -213,6 +213,27 @@ class KVArgsRegisterInfo:
         )
 
 
+def _uses_flat_entry_layout(
+    *,
+    mla_backend: bool,
+    force_flat: bool,
+    has_layer_ids: bool,
+    state_type: Optional[StateType],
+    num_src_entries: int,
+    num_dst_entries: int,
+) -> bool:
+    """One region per transfer entry, as opposed to plain MHA's K-then-V split.
+
+    Shared by the transfer and the registration-time stride check so both
+    judge the same entries. Unified SWA publishes one page-envelope region
+    even on an MHA backend.
+    """
+    is_single_region_swa = (
+        state_type == StateType.SWA and num_src_entries == 1 and num_dst_entries == 1
+    )
+    return mla_backend or force_flat or has_layer_ids or is_single_region_swa
+
+
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
     # Implements teardown() below, so runtime PD role switching is supported.
@@ -787,18 +808,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         wrong slot.
         """
         has_layer_ids = bool(src_layer_ids or dst_layer_ids)
-        # Mirrors the branch below in _send_kvcache_generic; keep the two in step.
-        is_single_region_swa = (
-            state_type == StateType.SWA
-            and len(src_data_ptrs) == 1
-            and len(dst_data_ptrs) == 1
-        )
-        if not (
-            self.is_mla_backend
-            or self.is_hybrid_mla_backend
-            or force_flat
-            or has_layer_ids
-            or is_single_region_swa
+        if not _uses_flat_entry_layout(
+            mla_backend=self.is_mla_backend or self.is_hybrid_mla_backend,
+            force_flat=force_flat,
+            has_layer_ids=has_layer_ids,
+            state_type=state_type,
+            num_src_entries=len(src_data_ptrs),
+            num_dst_entries=len(dst_data_ptrs),
         ):
             # The MHA branch splits the entries into K/V and is not covered.
             return None
@@ -811,6 +827,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 allow_positional_fallback=self.pp_size == 1,
             )
             for i, j in pairs:
+                if j >= len(dst_item_lens):
+                    return (
+                        f"{state_type} decode published {len(dst_item_lens)} item "
+                        f"lengths but paired entry dst[{j}] needs one"
+                    )
                 if item_lens[i] != dst_item_lens[j]:
                     return (
                         f"{state_type} item length mismatch for paired "
@@ -826,6 +847,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
             item_lens, dst_item_lens, state_type
         )
+        if len(mapped_dst_lens) < layers_current_pp_stage:
+            return (
+                f"{state_type} decode published {len(mapped_dst_lens)} item "
+                f"lengths for this stage's {layers_current_pp_stage} entries"
+            )
         for layer_id in range(layers_current_pp_stage):
             if item_lens[layer_id] != mapped_dst_lens[layer_id]:
                 return (
@@ -993,18 +1019,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Published layer IDs give exact pairing; plain-MHA peers publish none
         # and keep positional slicing.
         has_layer_ids = bool(src_layer_ids or dst_layer_ids)
-        # Unified SWA publishes one page-envelope region even on an MHA backend.
-        is_single_region_swa = (
-            state_type == StateType.SWA
-            and len(src_data_ptrs) == 1
-            and len(dst_data_ptrs) == 1
-        )
-        if (
-            self.is_mla_backend
-            or self.is_hybrid_mla_backend
-            or force_flat
-            or has_layer_ids
-            or is_single_region_swa
+        if _uses_flat_entry_layout(
+            mla_backend=self.is_mla_backend or self.is_hybrid_mla_backend,
+            force_flat=force_flat,
+            has_layer_ids=has_layer_ids,
+            state_type=state_type,
+            num_src_entries=len(src_data_ptrs),
+            num_dst_entries=len(dst_data_ptrs),
         ):
             # Layer IDs map PP-local buffers to global decode entries.
             # Registrations without them retain the existing PP mapping.
