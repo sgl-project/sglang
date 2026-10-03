@@ -1591,6 +1591,13 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # SM100 DeepSeek-V4.1 decode / verify: the ratio-1/2 index layers' top-512 from a
+    # histogram of DeepGEMM's MXFP4 logits (experimental litetopk_decode), if supported.
+    SGLANG_OPT_DSV41_LITETOPK_DECODE = EnvBool(False)
+    # Validation of the above: also run the default top-k and count the rows whose slot
+    # sets differ, logged at eager forwards; per process <file>.TP*_PP*_DP*_pid*.jsonl.
+    SGLANG_DEBUG_DSV41_LITETOPK_CHECK = EnvBool(False)
+    SGLANG_DEBUG_DSV41_LITETOPK_CHECK_FILE = EnvStr(None)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

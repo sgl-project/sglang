@@ -50,6 +50,8 @@ from .types import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
+    from .litetopk import LiteTopKDecode
+
 
 class _SparseTable(CandidateMetadata, msgspec.Struct):
     # [rows, topk_blocks] int32: ascending logical block ids, valid for the first
@@ -107,12 +109,14 @@ class SparseTableBackend:
         page_size: int,
         candidate_topk_blocks: int,
         candidate_block_size: int,
+        litetopk: Optional[LiteTopKDecode] = None,
     ) -> None:
         assert candidate_block_size == CANDIDATE_BLOCK_SIZE
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.page_size = page_size
         self.topk_blocks = candidate_topk_blocks
+        self.litetopk = litetopk
         self.alt_stream = torch.cuda.Stream()
         self._cached_row_ids: Optional[torch.Tensor] = None
         # captured graphs keep reading the buffers they saw
@@ -177,29 +181,37 @@ class SparseTableBackend:
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
         if isinstance(metadata.deep_gemm_metadata, list):
             return self._publish_decode_chunked(inputs, data, seq_lens, out)
-        logits = deep_gemm_fp4_paged_mqa_logits(
-            (data.q_fp4, data.q_sf),
-            data.k_cache,
-            data.weights,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
-            metadata.deep_gemm_metadata,
-            metadata.max_compressed_seq_len,
-        )
+        logits = None
+        if self.litetopk is not None:
+            logits = self.litetopk.scores(data=data, metadata=metadata, out=out)
+        use_litetopk = logits is not None
+        if not use_litetopk:
+            logits = deep_gemm_fp4_paged_mqa_logits(
+                (data.q_fp4, data.q_sf),
+                data.k_cache,
+                data.weights,
+                metadata.compressed_seq_lens,
+                metadata.page_table,
+                metadata.deep_gemm_metadata,
+                metadata.max_compressed_seq_len,
+            )
         main_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(main_stream)
         # The block-selection chain reads logits after the main stream moves on.
         logits.record_stream(self.alt_stream)
         # TODO(candidate): one kernel for both selections below (dense logits read once)
-        topk_transform_paged_v2(
-            logits,
-            seq_lens,
-            metadata.page_table,
-            out.page_indices,
-            metadata.compressed_page_size,
-            metadata.topk_metadata,
-            out_raw_indices=out.raw_indices,
-        )
+        if use_litetopk:
+            self.litetopk.select(logits=logits, metadata=metadata, out=out)
+        else:
+            topk_transform_paged_v2(
+                logits,
+                seq_lens,
+                metadata.page_table,
+                out.page_indices,
+                metadata.compressed_page_size,
+                metadata.topk_metadata,
+                out_raw_indices=out.raw_indices,
+            )
         # per row: block count for the block top-k, sparse-row length for the consumers
         with torch.cuda.stream(self.alt_stream):
             nblocks, row_valid_lens = candidate_row_lens(seq_lens, self.topk_blocks)

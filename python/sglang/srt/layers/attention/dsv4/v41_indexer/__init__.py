@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 
 from .full_topk import FullTopKIndexer
+from .litetopk import get_litetopk_decode
 from .types import (
     CandidateMetadata,
     CapturedPrefillInputs,
@@ -77,11 +78,13 @@ def make_full_topk_indexer(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
 ) -> FullTopKIndexer:
+    use_deep_gemm_decode = is_sm100_or_newer()
     return FullTopKIndexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=use_deep_gemm_decode,
+        litetopk=get_litetopk_decode() if use_deep_gemm_decode else None,
     )
 
 
@@ -126,6 +129,7 @@ def make_candidate_indexer(
         page_size=page_size,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
+        litetopk=get_litetopk_decode(),
     )
     # A CP rank's rows are an interleaved subset of the batch; the torch prefill
     # env keeps the sparse table on decode only.
