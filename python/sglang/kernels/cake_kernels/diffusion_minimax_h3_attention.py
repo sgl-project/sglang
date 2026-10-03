@@ -1,12 +1,15 @@
 """Cake MiniMax-H3 diffusion attention kernels via FlashInfer.
 
-Three FlashInfer families (FlashInfer ``46340689a5ab``):
+Three FlashInfer families (FlashInfer ``e4f94f9484``):
 
 **Packed-varlen attention, SM100a / SM103a** (public entries
 ``flashinfer.prefill.minimax_h3_varlen_attention`` /
 ``minimax_h3_varlen_nvfp4_attention``; implementation and prepared runners in
 ``flashinfer.experimental.minimax_h3_varlen_attention.cake_backend``, JIT in
-``...cake_jit``). BF16 THD ``q, k, v [T, H, 128]`` contiguous, int32 CUDA
+``...cake_jit``: one generated program per stage shared by both targets and
+compiled per exact arch, ``load_cake_minimax_h3_varlen_attention_module(name,
+arch)``; routes are keyed ``<variant>__sm_10{0,3}a``). BF16 THD ``q, k, v
+[T, H, 128]`` contiguous, int32 CUDA
 ``cu_seqlens [B+1]`` (starts at 0, non-decreasing, ends at ``T``; empty and
 unaligned segments allowed), non-causal self-attention with ``H_q == H_kv``,
 no mask / bias / window / LSE / dropout, ``softmax_scale`` default
@@ -39,9 +42,10 @@ FlashInfer: pass ``out`` and launch once before CUDA-graph capture.
 E4M3 P and V) or NVFP4 (SageAttention3-style) ``mma.sync`` operands, FP32
 softmax, one BF16 rounding of the output. JIT nvcc flags target major version
 12 only. The host plan is cached per ``(cu_seqlens, heads, device)`` (pass
-``cu_seqlens_host`` to avoid a synchronising ``.tolist()``) and the grow-only
-per-device workspaces are module-internal: warm up with the exact plan before
-CUDA-graph capture.
+``cu_seqlens_host`` to avoid a synchronising ``.tolist()``; most recent 256
+plans kept) and the grow-only workspaces are module-internal, one set per
+``(device, stream)`` (most recent 8 sets kept): warm up with the exact plan
+on the capture stream before CUDA-graph capture.
 
 Not supported here (keep the existing SGLang path): GQA, causal / masked /
 windowed attention, LSE output, head_dim != 128, FP8 KV inputs, SM90 for the

@@ -1,6 +1,6 @@
 """Cake MiniMax-H3 pre-attention projections (SM100a / SM103a) via FlashInfer.
 
-FlashInfer entries (``flashinfer.diffusion_ops``, FlashInfer ``46340689a5ab``):
+FlashInfer entries (``flashinfer.diffusion_ops``, FlashInfer ``e4f94f9484``):
 
 * ``minimax_h3_bf16_pre_attention`` -- fused input RMSNorm + indexed AdaLN +
   BF16 QKV projection + per-head Q/K RMSNorm + partial 3-D split-half NeoX
@@ -9,23 +9,36 @@ FlashInfer entries (``flashinfer.diffusion_ops``, FlashInfer ``46340689a5ab``):
   no allocation, no host sync: CUDA-graph capturable after the first build.
 * ``prepare_minimax_h3_mxfp8_pre_attention`` -> ``PreparedMiniMaxH3Mxfp8PreAttention``
   -- 3-launch chain (norm/AdaLN/MXFP8 quant -> CUTLASS MXFP8 GEMM with a tactic
-  pinned at prepare -> QK-norm/RoPE/MXFP8 pack). Routed by an **exact**
-  ``(M, P)`` table (44 pairs per arch, see :data:`MXFP8_ROUTES`); any other
-  ``M`` raises in FlashInfer. ``__call__()`` zeroes ``out_sf`` /
-  ``activation_sf`` on device and performs no allocation: graph-capturable.
+  pinned at prepare -> QK-norm/RoPE/MXFP8 pack). One JIT loader for both
+  targets, ``flashinfer.jit.cake_minimax_h3_mxfp8`` (FlashInfer ``e6c0d39f6``
+  replaced the ``..._mxfp8_pre_attention{,_sm100a,_sm103a}`` loaders); the
+  stages are compiled per exact ``(M, P)`` from an **exact** route table
+  (44 pairs, see :data:`MXFP8_ROUTES`); any other ``M`` raises in FlashInfer.
+  ``__call__()`` zeroes ``out_sf`` / ``activation_sf`` on device and performs
+  no allocation: graph-capturable.
 * ``prepare_minimax_h3_nvfp4_pre_attention`` -> ``PreparedMiniMaxH3Nvfp4PreAttention``
   -- 2-launch chain (norm/AdaLN/NVFP4 quant -> fused tcgen05 NVFP4 QKV GEMM
-  with QK-norm/RoPE/NVFP4 pack epilogue). Routed by ``P`` only; ``M`` is a
-  runtime parameter. ``alpha = 1 / (x_gs * w_gs)`` and the CTA-pair repack of
-  ``qkv_weight_sf`` are derived once at prepare (new scales => new prepare).
-  Needs a caller-owned 640-byte, 128-byte-aligned ``gemm_descriptor_workspace``.
+  with QK-norm/RoPE/NVFP4 pack epilogue). One JIT loader for both targets,
+  ``flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention`` (FlashInfer
+  ``1fc76f71b`` removed the ``_sm100a`` / ``_sm103a`` split loaders). Routed
+  by ``P`` only; ``M`` is a runtime parameter. ``alpha = 1 / (x_gs * w_gs)``
+  and the CTA-pair repack of ``qkv_weight_sf`` are derived once at prepare
+  (new scales => new prepare).
 * ``prepare_minimax_h3_qkv_quantize_pack`` -> ``PreparedMiniMaxH3QkvQuantizePack``
   and the one-shot ``minimax_h3_qkv_quantize_pack`` -- BF16 ``q, k, v
   [M, 56, 128]`` (or kind slices of one ``[M, 56, 3, 128]`` projection) ->
   Ulysses send buffer ``(out_q, out_sf)``, byte-identical to the MXFP8 / NVFP4
-  pre-attention output. The prepared runner is one launch, no allocation, no
-  host clear. The one-shot form re-prepares and may allocate: **not
-  CUDA-graph safe**.
+  pre-attention output. One JIT loader for both targets,
+  ``flashinfer.jit.cake_minimax_h3_qkv_quantize_pack`` (one program per
+  format, ``P`` a compile-line define). The prepared runner is one launch, no
+  allocation, no host clear. The one-shot form re-prepares and may allocate:
+  **not CUDA-graph safe**.
+
+The generated MXFP8 / NVFP4 stages take their TMA tensor maps by value: there
+is no descriptor workspace. FlashInfer keeps the ``norm_descriptor_workspace``
+/ ``post_descriptor_workspace`` / ``gemm_descriptor_workspace`` keywords and
+raises ``ValueError`` for any non-``None`` value; this adapter does not expose
+them.
 
 Shared contract: BF16 ``x [M, 5376]``, ``x_norm_weight [5376]``, BF16 AdaLN
 tables ``[9, 5376]``, int32 ``adaln_index [M]`` (out-of-range -> zero row,
@@ -60,7 +73,7 @@ if TYPE_CHECKING:
 FI_MODULE = "flashinfer.diffusion_ops.minimax_h3"
 FI_JIT_MODULE = "flashinfer.jit.cake_minimax_h3_bf16_pre_attention"
 FI_MXFP8_MODULE = "flashinfer.diffusion_ops.cake_minimax_h3_mxfp8"
-FI_MXFP8_JIT_MODULE = "flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention"
+FI_MXFP8_JIT_MODULE = "flashinfer.jit.cake_minimax_h3_mxfp8"
 FI_NVFP4_MODULE = "flashinfer.diffusion_ops.cake_minimax_h3_nvfp4"
 FI_NVFP4_JIT_MODULE = "flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention"
 FI_QKV_PACK_MODULE = "flashinfer.diffusion_ops.cake_minimax_h3_qkv_pack"
@@ -77,11 +90,10 @@ ADALN_ROWS = 9
 EPS = 1.0e-5
 ULYSSES_DEGREES = (1, 2, 4, 8)
 PACK_FORMATS = ("nvfp4", "mxfp8")
-NVFP4_GEMM_DESCRIPTOR_BYTES = 640
 
-# Exact (M, P) routes of the MXFP8 pre-attention chain, identical for sm_100a
-# and sm_103a at FlashInfer 46340689a5ab (44 pairs). Mirrors
-# ``flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention_sm10xa``.
+# Exact (M, P) routes of the MXFP8 pre-attention chain, shared by sm_100a and
+# sm_103a at FlashInfer e4f94f9484 (44 pairs). Mirrors
+# ``flashinfer.jit.cake_minimax_h3_mxfp8.MINIMAX_H3_MXFP8_SHAPES``.
 MXFP8_ROUTES: FrozenSet[Tuple[int, int]] = frozenset(
     [(m, 8) for m in (1, 127, 128, 129, 4184, 4816, 4823, 4824, 4825, 4832)]
     + [(m, 8) for m in (6096, 7368, 9280, 13744)]
@@ -361,8 +373,6 @@ def prepare_minimax_h3_mxfp8_pre_attention(
     qkv_bf16: torch.Tensor,
     gemm_workspace: torch.Tensor,
     P: int,
-    norm_descriptor_workspace: Optional[torch.Tensor] = None,
-    post_descriptor_workspace: Optional[torch.Tensor] = None,
     debug_q_bf16: Optional[torch.Tensor] = None,
     debug_k_bf16: Optional[torch.Tensor] = None,
     eps: float = EPS,
@@ -371,7 +381,8 @@ def prepare_minimax_h3_mxfp8_pre_attention(
 
     Call the returned object (``runner() -> (out_q, out_sf)``) to launch the
     prepared chain. Prepare runs the norm stage once and autotunes the CUTLASS
-    MXFP8 GEMM tactic; the runner is allocation-free afterwards.
+    MXFP8 GEMM tactic; the runner is allocation-free afterwards. The stages
+    take their tensor maps by value (no descriptor workspace).
     """
     from flashinfer.diffusion_ops.cake_minimax_h3_mxfp8 import (
         prepare_minimax_h3_mxfp8_pre_attention,
@@ -395,8 +406,6 @@ def prepare_minimax_h3_mxfp8_pre_attention(
         qkv_bf16=qkv_bf16,
         gemm_workspace=gemm_workspace,
         P=P,
-        norm_descriptor_workspace=norm_descriptor_workspace,
-        post_descriptor_workspace=post_descriptor_workspace,
         debug_q_bf16=debug_q_bf16,
         debug_k_bf16=debug_k_bf16,
         eps=eps,
@@ -438,13 +447,12 @@ def supports_prepare_minimax_h3_nvfp4_pre_attention(
     activation_q: torch.Tensor,
     activation_sf: torch.Tensor,
     P: int,
-    gemm_descriptor_workspace: Optional[torch.Tensor] = None,
     eps: float = EPS,
 ) -> bool:
     """Admission check mirroring the FlashInfer contract; never raises.
 
-    The fused GEMM stage needs a caller-owned ``gemm_descriptor_workspace`` of
-    at least 640 bytes whose data pointer is 128-byte aligned.
+    Both stages take their TMA tensor maps by value: no descriptor workspace
+    is required (or accepted).
     """
     import torch
 
@@ -478,10 +486,6 @@ def supports_prepare_minimax_h3_nvfp4_pre_attention(
             and _shape(out_sf, (P, nvfp4_out_sf_numel(m, P)), u8)
             and _shape(activation_q, (m, HIDDEN // 2), u8)
             and _shape(activation_sf, (nvfp4_activation_sf_numel(m),), u8)
-            and gemm_descriptor_workspace is not None
-            and gemm_descriptor_workspace.dtype == u8
-            and gemm_descriptor_workspace.numel() >= NVFP4_GEMM_DESCRIPTOR_BYTES
-            and gemm_descriptor_workspace.data_ptr() % 128 == 0
             and all(
                 t.device == x.device
                 for t in (
@@ -494,7 +498,6 @@ def supports_prepare_minimax_h3_nvfp4_pre_attention(
                     out_sf,
                     activation_q,
                     activation_sf,
-                    gemm_descriptor_workspace,
                 )
             )
         )
@@ -522,8 +525,6 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     activation_q: torch.Tensor,
     activation_sf: torch.Tensor,
     P: int,
-    norm_descriptor_workspace: Optional[torch.Tensor] = None,
-    gemm_descriptor_workspace: Optional[torch.Tensor] = None,
     debug_q_bf16: Optional[torch.Tensor] = None,
     debug_k_bf16: Optional[torch.Tensor] = None,
     debug_adaln_bf16: Optional[torch.Tensor] = None,
@@ -533,7 +534,8 @@ def prepare_minimax_h3_nvfp4_pre_attention(
 
     ``runner() -> (out_q, out_sf)``. Optional debug outputs (post-RoPE BF16 Q
     and K ``[M, 56, 128]`` and the stage-1 AdaLN intermediate ``[M, 5376]``)
-    must be supplied all together or not at all.
+    must be supplied all together or not at all. The stages take their TMA
+    tensor maps by value (no descriptor workspace).
     """
     from flashinfer.diffusion_ops.cake_minimax_h3_nvfp4 import (
         prepare_minimax_h3_nvfp4_pre_attention,
@@ -558,8 +560,6 @@ def prepare_minimax_h3_nvfp4_pre_attention(
         activation_q=activation_q,
         activation_sf=activation_sf,
         P=P,
-        norm_descriptor_workspace=norm_descriptor_workspace,
-        gemm_descriptor_workspace=gemm_descriptor_workspace,
         debug_q_bf16=debug_q_bf16,
         debug_k_bf16=debug_k_bf16,
         debug_adaln_bf16=debug_adaln_bf16,

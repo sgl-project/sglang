@@ -15,9 +15,12 @@ reference at the tolerance of its precision:
 * the destination-major packed ``(out_q, out_sf)`` dequantizes to the packed
   BF16 Q/K/V within FP8 / FP4 tolerance.
 
-The MXFP8 chain is routed by an exact ``(M, P)`` table; this test uses the
-admitted pair ``M=128, P=8`` (route key ``sm10xa:128:8``). Skips when
-FlashInfer lacks the modules or the GPU is not sm_100a / sm_103a.
+The MXFP8 chain is routed by an exact ``(M, P)`` table
+(``flashinfer.jit.cake_minimax_h3_mxfp8.MINIMAX_H3_MXFP8_SHAPES``, FlashInfer
+``e4f94f9484``); this test uses the admitted pair ``M=128, P=8``. Both chains
+take their TMA tensor maps by value: FlashInfer rejects any non-``None``
+``*_descriptor_workspace`` and the adapters do not expose those keywords.
+Skips when FlashInfer lacks the modules or the GPU is not sm_100a / sm_103a.
 """
 
 import sys
@@ -39,7 +42,7 @@ register_cuda_ci(est_time=900, stage="base-b-kernel-unit", runner_config="4-gpu-
 
 HIDDEN, NUM_HEADS, HEAD_DIM, KINDS = 5376, 56, 128, 3
 QKV_WIDTH, ROPE_DIM, ADALN_ROWS, EPS = 21504, 96, 9, 1.0e-5
-M, P = 128, 8  # admitted MXFP8 route "sm10xa:128:8"
+M, P = 128, 8  # admitted MXFP8 route (128, 8)
 ROWS_PER_DEST = M * (NUM_HEADS // P) * KINDS  # 2688, a multiple of 128
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
@@ -208,6 +211,9 @@ def test_mxfp8_prepared_matches_flashinfer_and_reference():
         prepare_minimax_h3_mxfp8_pre_attention as fi_prepare,
     )
     from flashinfer.gemm import gemm_base
+    from flashinfer.jit.cake_minimax_h3_mxfp8 import MINIMAX_H3_MXFP8_SHAPES
+
+    assert cake.MXFP8_ROUTES == frozenset(MINIMAX_H3_MXFP8_SHAPES)
 
     device = torch.device("cuda")
     case = make_case(device, seed=128 + P)
@@ -299,6 +305,17 @@ def test_mxfp8_prepared_matches_flashinfer_and_reference():
     assert (64, P) not in cake.MXFP8_ROUTES
     assert not cake.supports_prepare_minimax_h3_mxfp8_pre_attention(**short, **ours)
 
+    # The stages take their tensor maps by value: FlashInfer rejects a
+    # descriptor workspace, and the adapter does not expose the keyword.
+    with pytest.raises(ValueError, match="descriptor_workspace"):
+        fi_prepare(
+            **inputs,
+            **theirs,
+            norm_descriptor_workspace=torch.empty(
+                640, dtype=torch.uint8, device=device
+            ),
+        )
+
 
 # --- NVFP4 ------------------------------------------------------------------------
 
@@ -327,14 +344,8 @@ def test_nvfp4_prepared_matches_flashinfer_and_reference():
     w_sf = w_sf.view(torch.uint8).reshape(-1).contiguous()
     assert w_sf.numel() == QKV_WIDTH * (HIDDEN // 16)
 
-    def aligned_workspace(nbytes):
-        backing = torch.empty((nbytes + 127,), dtype=torch.uint8, device=device)
-        offset = (-int(backing.data_ptr())) % 128
-        return backing, backing[offset : offset + nbytes]
-
     def buffers():
-        backing, ws = aligned_workspace(cake.NVFP4_GEMM_DESCRIPTOR_BYTES)
-        return backing, dict(
+        return dict(
             out_q=torch.empty(
                 (P, M, NUM_HEADS // P, KINDS, HEAD_DIM // 2),
                 dtype=torch.uint8,
@@ -349,7 +360,6 @@ def test_nvfp4_prepared_matches_flashinfer_and_reference():
             activation_sf=torch.empty(
                 (cake.nvfp4_activation_sf_numel(M),), dtype=torch.uint8, device=device
             ),
-            gemm_descriptor_workspace=ws,
             debug_q_bf16=torch.empty(
                 (M, NUM_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=device
             ),
@@ -377,7 +387,7 @@ def test_nvfp4_prepared_matches_flashinfer_and_reference():
         out_global_scale=out_gs,
         P=P,
     )
-    _keep, ours = buffers()
+    ours = buffers()
     admission = {k: v for k, v in ours.items() if not k.startswith("debug_")}
     assert cake.supports_prepare_minimax_h3_nvfp4_pre_attention(**inputs, **admission)
     runner = cake_prepare_minimax_h3_nvfp4_pre_attention(**inputs, **ours)
@@ -385,7 +395,7 @@ def test_nvfp4_prepared_matches_flashinfer_and_reference():
     torch.cuda.synchronize()
     assert out_q is ours["out_q"] and out_sf is ours["out_sf"]
 
-    _keep_fi, theirs = buffers()
+    theirs = buffers()
     fi_q, fi_sf = fi_prepare(**inputs, **theirs)()
     torch.cuda.synchronize()
     assert torch.equal(out_q, fi_q) and torch.equal(out_sf, fi_sf)
@@ -424,12 +434,25 @@ def test_nvfp4_prepared_matches_flashinfer_and_reference():
             rtol=0.1,
         )
 
-    # Admission refuses an unaligned / undersized GEMM descriptor workspace.
+    # Admission refuses an undersized activation scale buffer.
     bad = dict(
         admission,
-        gemm_descriptor_workspace=torch.empty(639, dtype=torch.uint8, device=device),
+        activation_sf=torch.empty(
+            cake.nvfp4_activation_sf_numel(M) - 1, dtype=torch.uint8, device=device
+        ),
     )
     assert not cake.supports_prepare_minimax_h3_nvfp4_pre_attention(**inputs, **bad)
+
+    # The stages take their tensor maps by value: FlashInfer rejects a
+    # descriptor workspace, and the adapter does not expose the keyword.
+    with pytest.raises(ValueError, match="descriptor_workspace"):
+        fi_prepare(
+            **inputs,
+            **theirs,
+            gemm_descriptor_workspace=torch.empty(
+                640, dtype=torch.uint8, device=device
+            ),
+        )
 
 
 if __name__ == "__main__":

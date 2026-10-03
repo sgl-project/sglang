@@ -1,7 +1,7 @@
 """Cake MiniMax-H3 FC1+SwiGLU and gated-residual out-projection (SM100a / SM103a).
 
 FlashInfer entries (``flashinfer.diffusion_ops.minimax_h3_fc1_swiglu`` and
-``flashinfer.diffusion_ops.minimax_h3_out_proj``, FlashInfer ``46340689a5ab``;
+``flashinfer.diffusion_ops.minimax_h3_out_proj``, FlashInfer ``e4f94f9484``;
 JIT loaders ``flashinfer.jit.minimax_h3_fc1_swiglu`` /
 ``flashinfer.jit.minimax_h3_out_proj`` compile the ``cake_minimax_h3_*_sm100a /
 _sm103a.cu`` sources).

@@ -1,7 +1,7 @@
 """Cake MiniMax-H3 SM120 (GB202: RTX 5090 / RTX PRO 6000 Blackwell) quantized projections.
 
 FlashInfer entries (``flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_*``,
-FlashInfer ``46340689a5ab``; JIT modules
+FlashInfer ``e4f94f9484``; JIT modules
 ``flashinfer.jit.cake_minimax_h3_sm120_quant_{pre_attention,fc1_swiglu,out_proj}``
 built with ``sm120a`` flags only). All compute entries carry
 ``@supported_compute_capability([120])``; the adapters admit cc 12.0 only.
