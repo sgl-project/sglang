@@ -24,17 +24,21 @@ def _parse_gemma4_value(value_str: str) -> object:
     if not value_str:
         return value_str
 
-    # Boolean
+    # Boolean / null
     if value_str == "true":
         return True
     if value_str == "false":
         return False
+    if value_str == "null":
+        return None
 
-    # Number (int or float)
+    # Number (int or float); try float first so exponent notation like
+    # 1e-05 / 1e+21 parses as float instead of falling through to a bare string.
     try:
-        if "." in value_str:
-            return float(value_str)
-        return int(value_str)
+        f = float(value_str)
+        if "." not in value_str and "e" not in value_str and "E" not in value_str:
+            return int(value_str)
+        return f
     except ValueError:
         pass
 
