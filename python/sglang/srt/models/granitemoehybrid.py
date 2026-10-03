@@ -386,7 +386,7 @@ class GraniteMoeHybridModel(nn.Module):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
+                aux_hidden_states.append(hidden_states)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -403,7 +403,7 @@ class GraniteMoeHybridModel(nn.Module):
                 }
             )
         else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = self.norm(hidden_states)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
