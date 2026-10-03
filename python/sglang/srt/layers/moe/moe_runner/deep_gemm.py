@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from types import SimpleNamespace
@@ -403,31 +404,41 @@ class _CakeContigFp8Route:
             self._retired_arenas.append(arena)
             rows = max(m, arena.rows)
         h = n // 2
-        if device.type == "cuda":
-            # Give the long-lived arena its own allocator segments instead of
-            # carving it out of cached large blocks: a 1.4 GB arena split out
-            # of a cached multi-GB block fragments the pool enough that a later
-            # multi-GiB request (DeepGEMM's masked path during graph capture)
-            # fails while ~20 GiB are reserved but unallocated.  Arenas are
-            # allocated rarely (once per (device, K, N), never inside capture).
-            torch.cuda.empty_cache()
         self._arena_serial += 1
-        arena = _CakeArena(
-            serial=self._arena_serial,
-            rows=rows,
-            buffers={
-                "a": torch.empty((rows, k), dtype=torch.float8_e4m3fn, device=device),
-                "a_scale": torch.empty(
-                    (rows, k // _CAKE_SCALE_BLOCK), dtype=torch.float32, device=device
-                ),
-                "m_indices": torch.empty((rows,), dtype=torch.int32, device=device),
-                "act": torch.empty((rows, h), dtype=torch.float8_e4m3fn, device=device),
-                "act_scale": torch.empty(
-                    (rows, h // _CAKE_SCALE_BLOCK), dtype=torch.float32, device=device
-                ),
-                "down_out": torch.empty((rows, k), dtype=torch.bfloat16, device=device),
-            },
-        )
+        # One contiguous allocation (one allocator carve-out instead of seven)
+        # viewed as the individual buffers; every view starts 256-byte aligned.
+        specs = [
+            ("a", (rows, k), torch.float8_e4m3fn),
+            ("a_scale", (rows, k // _CAKE_SCALE_BLOCK), torch.float32),
+            ("m_indices", (rows,), torch.int32),
+            ("act", (rows, h), torch.float8_e4m3fn),
+            ("act_scale", (rows, h // _CAKE_SCALE_BLOCK), torch.float32),
+            ("down_out", (rows, k), torch.bfloat16),
+            ("gateup", (rows, n), torch.bfloat16),
+        ]
+        offsets, total = [], 0
+        for _, shape, dtype in specs:
+            offsets.append(total)
+            total += (
+                -(
+                    -math.prod(shape)
+                    * torch.tensor([], dtype=dtype).element_size()
+                    // 256
+                )
+                * 256
+            )
+        storage = torch.empty((total,), dtype=torch.uint8, device=device)
+        buffers = {
+            name: storage[
+                off : off
+                + math.prod(shape) * torch.tensor([], dtype=dtype).element_size()
+            ]
+            .view(dtype)
+            .view(shape)
+            for (name, shape, dtype), off in zip(specs, offsets)
+        }
+        arena = _CakeArena(serial=self._arena_serial, rows=rows, buffers=buffers)
+        arena.buffers["_storage"] = storage
         self._arenas[key] = arena
         return arena
 
@@ -436,12 +447,7 @@ class _CakeContigFp8Route:
     ) -> Dict[str, torch.Tensor]:
         """Leading-row ``[:m]`` views (contiguous, same base alignment) of the arena."""
         arena = self._arena(device, m, k, n, grow=True)
-        if not fused and "gateup" not in arena.buffers:
-            # Only the plain gate_up route materializes the BF16 (M, N) output.
-            arena.buffers["gateup"] = torch.empty(
-                (arena.rows, n), dtype=torch.bfloat16, device=device
-            )
-        return {name: t[:m] for name, t in arena.buffers.items()}
+        return {name: t[:m] for name, t in arena.buffers.items() if name != "_storage"}
 
     def _build_plan(
         self, req: _CakeContigRequest
