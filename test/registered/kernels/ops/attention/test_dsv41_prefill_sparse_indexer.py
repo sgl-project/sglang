@@ -2,7 +2,9 @@
 block selection and the dense implementation of the same protocol."""
 
 import unittest
+from types import SimpleNamespace
 from typing import NamedTuple
+from unittest.mock import patch
 
 import msgspec
 import torch
@@ -190,11 +192,179 @@ def picks(positions: torch.Tensor, row: int) -> set:
     return set(positions[row].tolist()) - {-1}
 
 
+def assert_same_sparse_selection(tables, outputs, data, k_cache):
+    from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import sparse_logits
+
+    rows, heads = data.q_sf.shape
+    logits = [
+        sparse_logits(
+            data.q_fp4.view(rows, 1, heads, 64),
+            data.q_sf.view(rows, 1, heads),
+            k_cache,
+            data.weights.to(torch.bfloat16),
+            table.schedule,
+            TOPK_BLOCKS,
+        )
+        for table in tables
+    ]
+    for scores, table in zip(logits, tables):
+        scores.masked_fill_(
+            torch.arange(scores.shape[1], device="cuda")[None, :]
+            >= table.valid_lens[:, None],
+            -torch.inf,
+        )
+    torch.testing.assert_close(logits[0], logits[1], rtol=0, atol=0)
+    expected = logits[0].topk(TOPK, dim=1).values.sort().values
+    for table, output in zip(tables, outputs):
+        relative = output - data.request_starts[:, None]
+        active = output >= 0
+        ordinal = torch.searchsorted(table.blocks, relative // BLOCK).long()
+        block = table.blocks.gather(1, ordinal.clamp_max(TOPK_BLOCKS - 1))
+        assert torch.all((block == relative // BLOCK) | ~active)
+        assert torch.all((relative < data.compress_lens[:, None]) | ~active)
+        torch.testing.assert_close(
+            active.sum(1), data.compress_lens.clamp_max(TOPK).long()
+        )
+        ordered = output.sort().values
+        assert not torch.any(
+            (ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)
+        )
+        columns = (ordinal * BLOCK + relative % BLOCK).clamp(0, logits[0].shape[1] - 1)
+        values = logits[0].gather(1, columns).masked_fill(~active, -torch.inf)
+        torch.testing.assert_close(values.sort().values, expected, rtol=0, atol=0)
+
+
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
     "DeepGEMM's paged sparse MQA logits need SM100",
 )
 class TestPrefillSparseIndexer(CustomTestCase):
+    @torch.inference_mode()
+    def test_fused_source_ragged_tiled_replay(self):
+        """Multiple requests preserve both selections through tiling and tail reuse."""
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import amax8_varlen
+        from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
+        from sglang.srt.layers.attention.dsv4.v41_indexer import scoring, sparse_table
+
+        def separate(scores, lens, *, out_offsets, out_indices, out_block_keys):
+            topk_transform_ragged_v2(
+                scores, lens, out_offsets=out_offsets, out_indices=out_indices
+            )
+            amax8_varlen(scores, lens, out=out_block_keys)
+
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                torch.manual_seed(900 + ratio)
+                lengths, row_counts = [513, 20003], [8, 12]
+                rows = sum(row_counts)
+                n_pages = (max(lengths) + PAGE - 1) // PAGE
+                pages = torch.randperm(2 * n_pages, device="cuda").view(2, n_pages)
+                slots = (
+                    pages[:, :, None] * PAGE + torch.arange(PAGE, device="cuda")
+                ).view(2, -1)
+                req_to_token = (
+                    slots[:, :, None] * ratio + torch.arange(ratio, device="cuda")
+                ).view(2, -1)
+                positions = torch.cat(
+                    [
+                        torch.arange(n * ratio - count, n * ratio, device="cuda")
+                        for n, count in zip(lengths, row_counts)
+                    ]
+                )
+                positions[0] = -1
+                q = torch.randn(rows, HEADS, DIM, device="cuda", dtype=torch.bfloat16)
+                weights = torch.rand(rows, HEADS, device="cuda")
+                inputs = SimpleNamespace(
+                    compress_ratio=ratio,
+                    indexer=SimpleNamespace(
+                        queries=lambda *_: q, head_weights=lambda _: weights
+                    ),
+                    positions=positions,
+                    seq_lens_cpu=[n * ratio for n in lengths],
+                    rows_per_request=row_counts,
+                    rows_per_request_device=torch.tensor(row_counts, device="cuda"),
+                    req_pool_indices=torch.arange(2, device="cuda"),
+                    q_lora=None,
+                    freqs_cis=torch.empty(max(lengths) * ratio, device="cuda"),
+                    x=None,
+                )
+                data = scoring.get_deep_gemm_prefill_data(inputs, req_to_token)
+                k, sf = quantize_fp4_indexer_tensor(
+                    torch.randn(
+                        2 * n_pages * PAGE, DIM, device="cuda", dtype=torch.bfloat16
+                    ),
+                    rne=True,
+                )
+                k_cache = torch.cat(
+                    [
+                        k.view(torch.uint8).view(-1, PAGE * 64),
+                        sf.view(torch.uint8).view(-1, PAGE * 4),
+                    ],
+                    dim=1,
+                ).view(-1, PAGE, 1, 68)
+                kv = (k[data.k_slots], sf[data.k_slots])
+                page_table = torch.repeat_interleave(
+                    pages.to(torch.int32), inputs.rows_per_request_device, dim=0
+                )
+                own = [data.empty_selection(TOPK) for _ in range(2)]
+                consumed = [data.empty_selection(TOPK) for _ in range(2)]
+
+                def run(index):
+                    table = sparse_table.publish_prefill_table(
+                        data=data,
+                        kv=kv,
+                        index_page_table=page_table,
+                        index_page_size=PAGE,
+                        topk_blocks=TOPK_BLOCKS,
+                        out_positions=own[index],
+                    )
+                    sparse_table.select_prefill_table(
+                        table=table,
+                        data=data,
+                        k_cache=k_cache,
+                        out_positions=consumed[index],
+                    )
+                    return table
+
+                budget = 4 * ((max(lengths) + 7) // 8 * 8) * 4
+                with patch.object(scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", budget):
+                    with patch.object(
+                        sparse_table, "topk_transform_ragged_amax8", separate
+                    ):
+                        expected = run(0)
+                    actual = run(1)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        sparse_table.select_prefill_table(
+                            table=actual,
+                            data=data,
+                            k_cache=k_cache,
+                            out_positions=consumed[1],
+                        )
+                    graph.replay()
+                    for field in ("blocks", "phys_blocks", "valid_lens"):
+                        torch.testing.assert_close(
+                            getattr(actual, field),
+                            getattr(expected, field),
+                            rtol=0,
+                            atol=0,
+                        )
+                    torch.testing.assert_close(
+                        own[0].sort().values, own[1].sort().values, rtol=0, atol=0
+                    )
+                    assert_same_sparse_selection(
+                        [expected, actual], consumed, data, k_cache
+                    )
+                    tails = [table.tail([2, 3]) for table in (expected, actual)]
+                    idx = torch.tensor([6, 7, 17, 18, 19], device="cuda")
+                    tail_data = msgspec.structs.replace(
+                        rows_of(data, idx), rows_per_request=[2, 3]
+                    )
+                    tail_outputs = [select_sparse(t, tail_data, k_cache) for t in tails]
+                    assert_same_sparse_selection(
+                        tails, tail_outputs, tail_data, k_cache
+                    )
+
     @torch.inference_mode()
     def test_publish_prefill_is_the_torch_block_selection(self):
         """The published blocks equal `select_candidate_block_ids` block for block

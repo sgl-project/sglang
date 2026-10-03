@@ -183,6 +183,11 @@ struct TopKProblem {
   }
 };
 
+struct IgnoreVectorLoad {
+  template <typename Vec>
+  SGL_DEVICE void operator()(const Vec&, uint32_t) const {}
+};
+
 // ---------------------------------------------------------------------------
 // Shared configuration + tie handling (exact radix select on the threshold bin)
 // ---------------------------------------------------------------------------
@@ -539,8 +544,8 @@ struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
   using Smem = typename TopKRadixBase<12>::Smem;
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(const TopKProblem& problem, void* _smem) {
+  template <bool kUsePDL, typename OnLoad = IgnoreVectorLoad>
+  SGL_DEVICE static void forward(const TopKProblem& problem, void* _smem, OnLoad on_load = {}) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -559,7 +564,10 @@ struct TopKRegister : TopKRadixBase<12> {
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
       const auto vi = tx + kBlockSize * i;
-      if (vi < num_full) local_vecs[i].load(problem.in, vi);
+      if (vi < num_full) {
+        local_vecs[i].load(problem.in, vi);
+        on_load(local_vecs[i], vi * kVecSize);
+      }
     }
 
     const auto tail_start = (problem.seq_len - 1) % kVecSize + 1;
@@ -640,8 +648,17 @@ struct TopKStreaming : TopKRadixBase<12> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  struct Histogram {
+    SGL_DEVICE void operator()(const TopKProblem& problem, uint32_t* histogram) const {
+      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
+        const auto bin = extract_coarse_bin<kHistBits>(val);
+        atomicAdd(&histogram[bin], 1);
+      });
+    }
+  };
+
+  template <bool kUsePDL, typename BuildHistogram = Histogram>
+  SGL_DEVICE static void forward(TopKProblem problem, void* _smem, BuildHistogram build_histogram = {}) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -654,10 +671,7 @@ struct TopKStreaming : TopKRadixBase<12> {
     PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram
-    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
-      const auto bin = extract_coarse_bin<kHistBits>(val);
-      atomicAdd(&smem->histogram[bin], 1);
-    });
+    build_histogram(problem, smem->histogram);
     const auto num_padding = problem.input_start;
     if (tx == 0 && num_padding != 0) {
       atomicSub(&smem->histogram[extract_coarse_bin<kHistBits>(padding_value())], num_padding);

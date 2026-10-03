@@ -38,6 +38,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
+    topk_transform_ragged_amax8,
     topk_transform_ragged_v2,
 )
 from sglang.srt.utils import is_hip
@@ -414,6 +415,134 @@ def _assert_topk_values(window, indices, k):
     expected = window.topk(k).values.sort().values
     actual = window[indices].sort().values
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(is_hip(), reason="source amax fusion is CUDA-only")
+@pytest.mark.parametrize("width", [520, 8200, 16392, 65536, 262144])
+@pytest.mark.parametrize("tied", [False, True])
+@torch.inference_mode()
+def test_source_topk_amax8_matches_separate_outputs(width, tied):
+    """Both outputs preserve ragged selection and leave padding untouched."""
+    from sglang.kernels.ops.attention.dsv4.candidate_blocks import amax8_varlen
+
+    torch.manual_seed(width)
+    lengths = sorted(
+        {
+            n
+            for n in (
+                0,
+                1,
+                7,
+                8,
+                9,
+                511,
+                512,
+                513,
+                8191,
+                8192,
+                8193,
+                16383,
+                16384,
+                16385,
+                width - 1,
+                width,
+            )
+            if n <= width
+        }
+    )
+    rows, k = len(lengths), 512
+    if tied:
+        storage = torch.randn(rows, width + 8, device="cuda").round_()
+    else:
+        count = rows * (width + 8)
+        storage = (
+            torch.randperm(count, device="cuda")
+            .reshape(rows, width + 8)
+            .float()
+            .div_(count)
+            .sub_(0.5)
+        )
+    scores = storage[:, :width]
+    lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    offsets = torch.arange(rows, device="cuda", dtype=torch.int32) * (width + 13)
+    scores.masked_fill_(
+        torch.arange(width, device="cuda")[None, :] >= lens[:, None], OUTSIDE_SCORE
+    )
+    original = storage.clone()
+    key_width = ((width // 8 + 3) // 4) * 4
+    key_storage = torch.full((rows, key_width + 4), -1234.0, device="cuda")
+    keys = key_storage[:, :key_width]
+    expected_keys = torch.full_like(keys, -1234.0)
+    expected = torch.empty((rows, k), device="cuda", dtype=torch.int32)
+    actual = torch.full_like(expected, -2)
+    topk_transform_ragged_v2(scores, lens, out_offsets=offsets, out_indices=expected)
+    amax8_varlen(scores, lens, out=expected_keys)
+    topk_transform_ragged_amax8(
+        scores, lens, out_offsets=offsets, out_indices=actual, out_block_keys=keys
+    )
+    torch.testing.assert_close(keys, expected_keys, rtol=0, atol=0)
+    assert torch.all(key_storage[:, key_width:] == -1234)
+    torch.testing.assert_close(storage, original, rtol=0, atol=0)
+    for row, length in enumerate(lengths):
+        valid = actual[row] >= 0
+        count = min(k, length)
+        assert valid.sum().item() == count
+        assert torch.all(actual[row, ~valid] == -1)
+        _assert_topk_values(
+            scores[row, :length], actual[row, valid] - offsets[row], count
+        )
+        if not tied:
+            assert torch.equal(actual[row].sort().values, expected[row].sort().values)
+
+
+@pytest.mark.skipif(is_hip(), reason="source amax fusion is CUDA-only")
+@torch.inference_mode()
+def test_source_topk_amax8_graph_replays_changed_lengths():
+    """Replay rewrites both outputs as rows cross all selection branches."""
+    torch.manual_seed(2026)
+    width, k = 32776, 512
+    scores = torch.randn(6, width, device="cuda")
+    lens = torch.tensor(
+        [0, 7, 512, 8192, 16384, width], device="cuda", dtype=torch.int32
+    )
+    offsets = torch.arange(6, device="cuda", dtype=torch.int32) * width
+    indices = torch.empty((6, k), device="cuda", dtype=torch.int32)
+    keys = torch.empty((6, width // 8), device="cuda")
+
+    def run():
+        topk_transform_ragged_amax8(
+            scores, lens, out_offsets=offsets, out_indices=indices, out_block_keys=keys
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for lengths in (
+        [width - 1, 16385, 8193, 513, 8, 0],
+        [1, 9, 511, 8191, 16383, width],
+    ):
+        scores.normal_()
+        lens.copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
+        keys.fill_(-1234)
+        indices.fill_(-2)
+        graph.replay()
+        for row, length in enumerate(lengths):
+            valid = indices[row] >= 0
+            assert valid.sum().item() == min(k, length)
+            assert torch.all(indices[row, ~valid] == -1)
+            _assert_topk_values(
+                scores[row, :length], indices[row, valid] - offsets[row], min(k, length)
+            )
+            blocks = (length + 7) // 8
+            if blocks:
+                if blocks > 1:
+                    expected = scores[row, : (blocks - 1) * 8].view(-1, 8).amax(dim=1)
+                    torch.testing.assert_close(
+                        keys[row, : blocks - 1], expected, rtol=0, atol=0
+                    )
+                assert torch.isposinf(keys[row, blocks - 1])
+            assert torch.all(keys[row, blocks:] == -1234)
 
 
 @pytest.mark.parametrize("num_ties", [48, 96])
