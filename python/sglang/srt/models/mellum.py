@@ -25,7 +25,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -182,8 +186,6 @@ class MellumAttention(Qwen3MoeAttention):
         rope_params = rope_params or {}
         self.rope_theta = rope_params.get("rope_theta", 10000.0)
         rope_scaling = rope_params if _get_rope_type(rope_params) != "default" else None
-
-        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -394,9 +396,6 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
             alt_stream=alt_stream,
         )
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
         mlp_layer_types = cfg.mlp_layer_types
         num_experts = cfg.num_experts
 
@@ -437,28 +436,30 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
                 hidden_act=cfg.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
 
         is_previous_layer_sparse = _is_sparse(layer_id - 1)
         is_next_layer_sparse = _is_sparse(layer_id + 1)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=cfg.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=rms_norm_eps)
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(layer_id == cfg.num_hidden_layers - 1),
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == cfg.num_hidden_layers - 1,
         )
 
 
@@ -525,7 +526,6 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
         self.capture_aux_hidden_states = False
 
         self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
         self.moe_dp_size = get_parallel().moe_dp_size
 
         assert self.attn_cp_size % self.moe_dp_size == 0, (

@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -48,6 +49,17 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+
+def storage_model_name(
+    model_name: Optional[str], host_pool: HostKVCache | LogicalHostPool
+) -> Optional[str]:
+    """The model name storage backends key pages on, tagged with the host
+    pool's page format when it has one of its own."""
+    tag = host_pool.storage_format_tag
+    if tag is None:
+        return model_name
+    return f"{model_name}-{tag}" if model_name else tag
 
 
 class LayerLoadingEvent:
@@ -730,6 +742,7 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        model_name = storage_model_name(model_name, self.storage_host_pool)
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
@@ -803,10 +816,13 @@ class HiCacheController:
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        extra_pools: Optional[List[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
         """
+        if extra_pools:
+            raise ValueError("Side-pool transfers require HybridCacheController.")
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None

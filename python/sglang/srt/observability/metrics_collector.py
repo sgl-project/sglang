@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
+    FORWARD_OVERLAP_CATEGORIES,
+    FORWARD_OVERLAP_NONE,
     SCHEDULER_STAGE_CATEGORIES,
 )
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
@@ -135,6 +137,7 @@ class SchedulerStats:
     num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_host_receive_queue_reqs: QueueCount = field(default_factory=QueueCount)
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
@@ -518,6 +521,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of requests in the decode transfer queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        self.num_decode_host_receive_queue_reqs = Gauge(
+            name="sglang:num_decode_host_receive_queue_reqs",
+            documentation="Requests in the decode transfer queue receiving into host memory or waiting for device admission.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_decode_host_receive_reqs = Counter(
+            name="sglang:num_decode_host_receive_reqs_total",
+            documentation="Total requests admitted to receive prefill KV in host memory.",
+            labelnames=labels.keys(),
         )
         self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
@@ -938,13 +952,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:scheduler_stage_seconds_total",
             documentation=(
                 "Total scheduler-loop wall time exclusively attributed to each stage."
+                f" forward_overlap ({', '.join(FORWARD_OVERLAP_CATEGORIES)}):"
+                " full=both endpoints active, partial=one, none=no observed overlap"
+                " (including unavailable timing). Not exact overlapped/exposed seconds."
             ),
-            labelnames=list(labels.keys()) + ["category"],
+            labelnames=list(labels.keys()) + ["category", "forward_overlap"],
         )
         self.scheduler_idle_seconds_total.labels(**labels)
         self.scheduler_process_cpu_seconds_total.labels(**labels)
         for category in SCHEDULER_STAGE_CATEGORIES:
-            self.scheduler_stage_seconds_total.labels(**labels, category=category)
+            self.scheduler_stage_seconds_total.labels(
+                **labels, category=category, forward_overlap=FORWARD_OVERLAP_NONE
+            )
         self.estimated_flops_per_gpu_total = Counter(
             name="sglang:estimated_flops_per_gpu_total",
             documentation=(
@@ -1186,6 +1205,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
 
+    def increment_decode_host_receive_reqs(self) -> None:
+        self.num_decode_host_receive_reqs.labels(**self.labels).inc(1)
+
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
@@ -1337,10 +1359,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_scheduler_process_cpu_seconds(self, t: float) -> None:
         self.scheduler_process_cpu_seconds_total.labels(**self.labels).inc(t)
 
-    def increment_scheduler_stage_seconds(self, stage: str, seconds: float) -> None:
-        self.scheduler_stage_seconds_total.labels(**self.labels, category=stage).inc(
-            seconds
-        )
+    def increment_scheduler_stage_seconds(
+        self, stage: str, seconds: float, forward_overlap: str = FORWARD_OVERLAP_NONE
+    ) -> None:
+        self.scheduler_stage_seconds_total.labels(
+            **self.labels, category=stage, forward_overlap=forward_overlap
+        ).inc(seconds)
 
     def increment_estimated_perf(
         self,
@@ -1413,6 +1437,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
+        )
+        self._log_gauge_queue_count(
+            self.num_decode_host_receive_queue_reqs,
+            stats.num_decode_host_receive_queue_reqs,
         )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
@@ -1733,6 +1761,16 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_inter_token_latency,
         )
 
+        self.histogram_request_time_per_output_token = Histogram(
+            name="sglang:request_time_per_output_token_seconds",
+            documentation=(
+                "Per-request TPOT in seconds: (finished_time - "
+                "first_token_time) / (completion_tokens - 1)."
+            ),
+            labelnames=[*labels.keys(), "is_streaming"],
+            buckets=bucket_inter_token_latency,
+        )
+
         self.histogram_e2e_request_latency = Histogram(
             name="sglang:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
@@ -1769,6 +1807,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         cached_tokens_details: Optional[Dict[str, Any]] = None,
         spec_verify_ct: int = 0,
         is_streaming: bool = False,
+        time_per_output_token: Optional[float] = None,
     ):
         stream_labels = {
             **labels,
@@ -1807,6 +1846,10 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.histogram_e2e_request_latency.labels(**stream_labels).observe(
             float(e2e_latency)
         )
+        if time_per_output_token is not None:
+            self.histogram_request_time_per_output_token.labels(
+                **stream_labels
+            ).observe(float(time_per_output_token))
         self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
         self.uncached_prompt_tokens_histogram.labels(**labels).observe(
             float(prompt_tokens - cached_tokens)
@@ -1825,6 +1868,8 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
     def observe_inter_token_latency(
         self, labels: Dict[str, str], internval: float, num_new_tokens: int
     ):
+        if num_new_tokens <= 0:
+            return
         adjusted_interval = internval / num_new_tokens
         his = self.histogram_inter_token_latency.labels(**labels)
 

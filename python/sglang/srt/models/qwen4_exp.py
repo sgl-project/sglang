@@ -21,7 +21,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.attention.linear.utils import (
+    select_verify_intermediate_state_indices,
+)
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_all_reduce,
@@ -37,6 +40,7 @@ from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
@@ -58,6 +62,13 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -71,7 +82,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -97,6 +108,28 @@ def _ple_table_is_fp8(
     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
         return quant_config.resolve_quant_algo(prefix) == "FP8"
     return False
+
+
+@eager_on_graph(True)
+def _breakable_qsa_indexer(layer, hidden_states, positions):
+    # Read the live batch on every replay of this eager break.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    topk = layer._compute_qsa_topk_indices_eager(
+        hidden_states=hidden_states,
+        positions=positions,
+        forward_batch=forward_batch,
+        use_host_prefill_lengths=True,
+    )
+    # Separate buffers cost up to buckets * max_tokens * block_topk * 4B * QSA layers.
+    # For 8 buckets / 16K tokens / topk512 / 12 layers: 3 GiB -> 384 MiB shared.
+    bridge = layer._qsa_prefill_topk_bridge
+    if bridge is None or bridge.shape[0] < hidden_states.shape[0]:
+        bridge = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
+        layer._qsa_prefill_topk_bridge = bridge
+    output = bridge[: hidden_states.shape[0]]
+    output.fill_(0)
+    output[: topk.shape[0]].copy_(topk)
+    return output
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -134,6 +167,55 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+
+
+class _BreakablePLEBatch:
+    # _copy_output needs __dict__ to replace batch on replay; Struct uses slots.
+    def __init__(self, batch: Optional[_PLEBatch]):
+        self.batch = batch
+
+
+@eager_on_graph(True)
+def _breakable_prepare_ple_batch(input_ids, *, ngram_size, ngram_eos_token_id):
+    return _BreakablePLEBatch(
+        batch=_prepare_ple_batch(
+            input_ids=input_ids,
+            forward_batch=get_tc_piecewise_forward_context().forward_batch,
+            ngram_size=ngram_size,
+            ngram_eos_token_id=ngram_eos_token_id,
+        )
+    )
+
+
+@eager_on_graph(True)
+def _breakable_ple_prefetch(ple, batch):
+    ple.start_prefetch(
+        batch=batch.batch,
+        forward_batch=get_tc_piecewise_forward_context().forward_batch,
+    )
+
+
+@eager_on_graph(True)
+def _breakable_ple_forward(ple, hidden_states, batch):
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    if batch.batch is None:
+        # Idle batch replayed as a dummy extend: join the collective, add nothing.
+        ple.forward_idle(forward_batch)
+        return torch.zeros_like(hidden_states)
+    # PLE pads its output to the token bucket after applying the live layout.
+    return ple(
+        hidden_states=hidden_states,
+        forward_batch=forward_batch,
+        batch=batch.batch,
+    )
+
+
+@eager_on_graph(True)
+def _breakable_commit_ple_batch(batch):
+    _commit_ple_batch(
+        batch=batch.batch,
+        forward_batch=get_tc_piecewise_forward_context().forward_batch,
+    )
 
 
 def _prepare_ple_batch(
@@ -314,12 +396,19 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         valid_steps = batch.valid_tokens.reshape(
             batch.lengths.shape[0], batch.row_width
         )
+        dst_indices_raw = select_verify_intermediate_state_indices(
+            None,
+            forward_batch.req_pool_indices,
+            batch.lengths.ne(0),
+            pool.size,
+        )
         pool.set_ngram_intermediate_context(
             torch.where(
                 valid_steps.unsqueeze(-1),
                 step_contexts,
                 torch.full_like(step_contexts, batch.ngram_eos_token_id),
-            )
+            ),
+            dst_indices_raw,
         )
         return
 
@@ -640,7 +729,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         contexts = contexts.to(torch.long)
         if self.enable_ple_fusion and decode_sized:
-            from sglang.kernels.ops.qwen4_ple import (
+            from sglang.kernels.ops.embeddings.qwen4_ngram import (
                 can_fuse_qwen4_ngram_hash,
                 fused_qwen4_ngram_hash,
             )
@@ -1020,7 +1109,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if batch.use_decode_fast_path:
             # With row_width=1 the padded/transpose path is x.unsqueeze(-1),
             # and each state boundary is a one-column shift; conv and SiLU stay native.
-            from sglang.kernels.ops.qwen4_ple import (
+            from sglang.kernels.ops.mamba.qwen4_short_conv import (
                 can_fuse_qwen4_short_conv_state,
                 fused_qwen4_short_conv_state,
             )
@@ -1096,9 +1185,23 @@ class Qwen4ExpPLELayer(nn.Module):
                     intermediate_state,
                     torch.zeros_like(intermediate_state),
                 )
-                intermediate_cache[: batch.lengths.shape[0], : batch.row_width].copy_(
-                    intermediate_state.to(dtype=intermediate_cache.dtype)
+                intermediate_state = intermediate_state.to(
+                    dtype=intermediate_cache.dtype
                 )
+                dst_indices_raw = select_verify_intermediate_state_indices(
+                    None,
+                    forward_batch.req_pool_indices,
+                    batch.lengths.ne(0),
+                    get_req_to_token_pool().size,
+                )
+                if dst_indices_raw is None:
+                    intermediate_cache[
+                        : batch.lengths.shape[0], : batch.row_width
+                    ].copy_(intermediate_state)
+                else:
+                    intermediate_cache[
+                        dst_indices_raw.to(dtype=torch.long), : batch.row_width
+                    ] = intermediate_state
         else:
             state_cols = torch.arange(
                 self.short_conv_state_len, device=x.device, dtype=torch.long
@@ -1142,7 +1245,9 @@ class Qwen4ExpPLELayer(nn.Module):
     def _get_prefetch_buffer(
         self, lookup_tokens: int, lookup_ids: torch.Tensor
     ) -> torch.Tensor:
-        if get_is_capture_mode():
+        # Breakable replays keep capture mode on but prefetch inside an eager
+        # break with live token counts, so only real capture uses graph buffers.
+        if get_is_capture_mode() and not is_in_breakable_cuda_graph():
             buffer = self._graph_prefetch_buffers.get(lookup_tokens)
             if buffer is None:
                 buffer = self._allocate_prefetch_buffer(lookup_tokens, lookup_ids)
@@ -1236,25 +1341,59 @@ class Qwen4ExpPLELayer(nn.Module):
         query = hidden_states.reshape(token_count, hc_count, hidden_size)
         key_normed = self._apply_ple_norm(self.norm_key, key)
         query_normed = self._apply_ple_norm(self.norm_query, query)
-        gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
-        gate = gate / math.sqrt(hidden_size)
-        fused_gate_value = False
-        if batch.use_decode_fast_path:
-            from sglang.kernels.ops.qwen4_ple import (
-                can_fuse_qwen4_gate_value,
-                fused_qwen4_gate_value,
-            )
+        from sglang.kernels.ops.elementwise.qwen4_gate import (
+            can_fuse_qwen4_gate_reduce,
+            fused_qwen4_gate_reduce,
+        )
 
-            fused_gate_value = can_fuse_qwen4_gate_value(gate, value)
-        if fused_gate_value:
-            gated_value = fused_qwen4_gate_value(gate, value)
+        fused_gate_reduce = (
+            self.ple_embedding.enable_ple_fusion
+            and batch.mode.is_target_verify()
+            and can_fuse_qwen4_gate_reduce(key_normed, query_normed, value)
+        )
+        if fused_gate_reduce:
+            gated_value = fused_qwen4_gate_reduce(key_normed, query_normed, value)
         else:
-            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-            gate = torch.sigmoid(gate)
-            gated_value = gate * value.unsqueeze(-2)
+            gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
+            gate = gate / math.sqrt(hidden_size)
+            fused_gate_value = False
+            if batch.use_decode_fast_path:
+                from sglang.kernels.ops.elementwise.qwen4_gate import (
+                    can_fuse_qwen4_gate_value,
+                    fused_qwen4_gate_value,
+                )
+
+                fused_gate_value = can_fuse_qwen4_gate_value(gate, value)
+            if fused_gate_value:
+                gated_value = fused_qwen4_gate_value(gate, value)
+            else:
+                gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+                gate = torch.sigmoid(gate)
+                gated_value = gate * value.unsqueeze(-2)
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
+        if self.ple_embedding.enable_ple_fusion and batch.mode.is_target_verify():
+            from sglang.kernels.ops.mamba.qwen4_short_conv import (
+                can_fuse_qwen4_verify_conv,
+                fused_qwen4_verify_conv,
+            )
+
+            pool = get_req_to_token_pool()
+            conv_args = (
+                gated_value_normed,
+                gated_value,
+                self.conv1d.weight,
+                pool.short_conv_layer_cache(self.layer_id),
+                batch.state_indices,
+                batch.valid_tokens,
+                batch.row_width,
+                self.short_conv_dilation,
+                pool.short_conv_layer_intermediate_cache(self.layer_id),
+            )
+            if can_fuse_qwen4_verify_conv(*conv_args):
+                output = fused_qwen4_verify_conv(*conv_args)
+                return _pad_token_rows(output, batch.physical_tokens)
         conv_output = self._short_conv(
             gated_value_normed,
             forward_batch,
@@ -1271,6 +1410,9 @@ class Qwen4ExpPLELayer(nn.Module):
 
 
 class Qwen4ExpLayerExtensionMixin:
+    # These layers drop the stage boundaries they inherit.
+    _ffn_sums_itself = True
+
     def _init_qwen4_exp_layer_extensions(
         self,
         config: Qwen4ExpTextConfig,
@@ -1285,7 +1427,8 @@ class Qwen4ExpLayerExtensionMixin:
         for attr_name in (
             "input_layernorm",
             "post_attention_layernorm",
-            "layer_communicator",
+            "attn_boundary",
+            "ffn_boundary",
         ):
             if hasattr(self, attr_name):
                 delattr(self, attr_name)
@@ -1331,7 +1474,7 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
         *,
-        ple_batch: Optional[_PLEBatch],
+        ple_batch: Optional[Union[_PLEBatch, _BreakablePLEBatch]],
     ):
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
@@ -1341,7 +1484,14 @@ class Qwen4ExpLayerExtensionMixin:
             )
 
         if self.ple is not None:
-            if ple_batch is None:
+            if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
+                ple_query = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                hidden_states = hidden_states + _breakable_ple_forward(
+                    ple=self.ple, hidden_states=ple_query, batch=ple_batch
+                )
+            elif ple_batch is None:
                 if not _get_ple_forward_mode(forward_batch).is_idle():
                     raise RuntimeError(
                         "non-idle Qwen4 PLE forward is missing its batch"
@@ -1404,14 +1554,16 @@ class Qwen4ExpLayerExtensionMixin:
             attn_tp_chunks = list(hidden_states.tensor_split(attn_tp_size))
             hidden_states = attn_tp_chunks[get_parallel().attn_tp_rank].contiguous()
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        use_reduce_scatterv = use_dp_moe_gather and should_use_dp_reduce_scatterv()
+        with get_forward().scoped(mlp_reduce_scatter=use_reduce_scatterv):
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         if use_dp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
-            if should_use_dp_reduce_scatterv():
+            if use_reduce_scatterv:
                 get_parallel().tp_group.reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
@@ -1495,6 +1647,7 @@ class Qwen4ExpAttentionDecoderLayer(
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
         self.is_qsa = is_qwen_qsa(config)
+        self._qsa_prefill_topk_bridge = None
         if self.is_qsa:
             self.indexer = build_qsa_indexer(
                 config=config,
@@ -1510,6 +1663,24 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
+            return _breakable_qsa_indexer(
+                layer=self, hidden_states=hidden_states, positions=positions
+            )
+        return self._compute_qsa_topk_indices_eager(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+        )
+
+    def _compute_qsa_topk_indices_eager(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        use_host_prefill_lengths: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1528,6 +1699,13 @@ class Qwen4ExpAttentionDecoderLayer(
         indexer_metadata = get_qsa_indexer_metadata(
             backend, self.layer_id, forward_batch
         )
+        if use_host_prefill_lengths:
+            indexer_metadata = msgspec.structs.replace(
+                indexer_metadata,
+                prefill_sequence_lengths_cpu=tuple(
+                    forward_batch.seq_lens_cpu[: forward_batch.batch_size].tolist()
+                ),
+            )
         topk_indices = self.indexer(
             hidden_states,
             positions,
@@ -1553,6 +1731,8 @@ class Qwen4ExpAttentionDecoderLayer(
             self.is_qsa
             and self.alt_stream is not None
             and get_is_capture_mode()
+            # Graph breaks must stay off the decode overlap stream.
+            and not is_in_breakable_cuda_graph()
             and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
         )
         attention_kwargs = {}
@@ -1704,23 +1884,37 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             # there is no separate residual at a PP boundary (hc_hidden_size contract).
             residual = None
 
-        ple_batch = (
-            _prepare_ple_batch(
-                input_ids,
-                forward_batch,
+        breakable_ple = (
+            self.has_ple
+            and is_in_breakable_cuda_graph()
+            and forward_batch.forward_mode.is_extend()
+        )
+        ple_batch = None
+        if breakable_ple:
+            ple_batch = _breakable_prepare_ple_batch(
+                input_ids=input_ids,
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
-            if self.has_ple
-            else None
-        )
-        aux_hidden_states = []
+        elif self.has_ple:
+            ple_batch = _prepare_ple_batch(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                ngram_size=self.ple_ngram_size,
+                ngram_eos_token_id=self.ple_ngram_eos_token_id,
+            )
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
                 next_ple = self.layers[i + 1].ple
                 if next_ple is not None:
-                    next_ple.start_prefetch(ple_batch, forward_batch)
+                    if breakable_ple:
+                        _breakable_ple_prefetch(ple=next_ple, batch=ple_batch)
+                    else:
+                        next_ple.start_prefetch(
+                            batch=ple_batch, forward_batch=forward_batch
+                        )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = layer(
                     positions=positions,
@@ -1735,7 +1929,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     ),
                 )
 
-        _commit_ple_batch(ple_batch, forward_batch)
+        if breakable_ple:
+            _breakable_commit_ple_batch(batch=ple_batch)
+        else:
+            _commit_ple_batch(batch=ple_batch, forward_batch=forward_batch)
 
         if not self.pp_group.is_last_rank:
             proxy_tensors = {"hidden_states": hidden_states}
