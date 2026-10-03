@@ -127,6 +127,62 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
         )
         return backend, layer, forward_batch, q
 
+    def test_cuda_graph_decode_copies_page_size_one_table(self):
+        backend = object.__new__(AiterAttnBackend)
+        backend.use_triton_unified_attention = True
+        backend.use_mla = False
+        backend.use_sliding_window_kv_pool = False
+        backend.dcp_world_size = 1
+        backend.page_size = 1
+        backend.max_context_len = 4
+        backend.req_to_token = torch.tensor(
+            [
+                [11, 12, 13, 14],
+                [21, 22, 23, 24],
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        backend.cuda_graph_page_table = torch.full(
+            (2, 4),
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        backend.qo_indptr_unified_decode = torch.arange(
+            3,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        backend.kv_indptr = torch.zeros(3, dtype=torch.int32, device="cuda")
+        backend.cuda_graph_kv_last_page_len = torch.ones(
+            2,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        seq_lens = torch.tensor([3, 2], dtype=torch.int32, device="cuda")
+        forward_mode = SimpleNamespace(is_decode_or_idle=lambda: True)
+        backend._apply_cuda_graph_metadata(
+            bs=2,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            seq_lens=seq_lens,
+            seq_lens_sum=5,
+            forward_mode=forward_mode,
+            spec_info=None,
+            seq_lens_cpu=seq_lens.cpu(),
+            verify_tokens_per_req=None,
+        )
+
+        torch.testing.assert_close(
+            backend.forward_metadata.kv_indices[:2, :3],
+            backend.req_to_token[:2, :3],
+        )
+        torch.testing.assert_close(
+            backend.forward_metadata.qo_indptr,
+            torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda"),
+        )
+
     def test_q_quantization_is_isolated_to_unified_attention(self):
         for branch in ("mla", "vectorized", "unified", "legacy"):
             with self.subTest(branch=branch):
