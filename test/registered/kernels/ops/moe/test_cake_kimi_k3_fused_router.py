@@ -6,6 +6,14 @@ written by a runner prepared directly through FlashInfer, and that the plan
 matches an FP32 torch reference (selection exact up to 2**-22 ties, weights
 within 1e-2, route plan exact). Skips (with the reason) when FlashInfer lacks
 the Cake module or the GPU is not sm_100a / sm_103a.
+
+``KimiK3RoutePlan`` contract (FlashInfer 46340689a5ab, ``cake_backend``):
+``sorted_token_ids`` and ``expert_ids`` are allocated at worst-case capacity
+with ``torch.empty`` and are defined only up to ``num_tokens_post_padded``
+(resp. ``num_tokens_post_padded // block_m``); capacity beyond that extent is
+left untouched by the kernel. Those two fields are therefore compared on the
+valid extent only (and the untouched tail is checked against a poison fill);
+every other field is fully defined and compared bitwise.
 """
 
 import sys
@@ -32,6 +40,18 @@ OPS = (
 )
 NUM_EXPERTS, TOP_K = adapter.NUM_EXPERTS, adapter.TOP_K
 TIE_TOLERANCE = 2.0**-22
+# Fields the kernel writes completely (compared bitwise against FlashInfer).
+FULLY_DEFINED_FIELDS = (
+    "topk_weights",
+    "topk_ids",
+    "num_tokens_post_padded",
+    "expert_counts",
+    "expert_offsets",
+    "expert_scatter_offsets",
+)
+# Fields defined only up to num_tokens_post_padded (capacity tail untouched).
+SORTED_POISON = -1_234_567
+EXPERT_POISON = -7_654_321
 
 
 @pytest.mark.parametrize("op", OPS)
@@ -130,6 +150,13 @@ def test_matches_flashinfer_and_reference(num_tokens, block_m):
     assert adapter.supports_kimi_k3_fused_router(logits, bias, block_m=block_m)
 
     plan = cake_allocate_kimi_k3_route_plan(num_tokens, block_m, device)
+    assert set(plan._fields) == set(FULLY_DEFINED_FIELDS) | {
+        "sorted_token_ids",
+        "expert_ids",
+    }
+    # The capacity tail of the two extent-bounded fields must be left untouched.
+    plan.sorted_token_ids.fill_(SORTED_POISON)
+    plan.expert_ids.fill_(EXPERT_POISON)
     runner = cake_prepare_kimi_k3_fused_router(logits, bias, block_m=block_m, plan=plan)
     assert runner() is plan
 
@@ -137,17 +164,29 @@ def test_matches_flashinfer_and_reference(num_tokens, block_m):
 
     plan_fi = fi_prepare(logits, bias, block_m=block_m, backend="cake")()
     torch.cuda.synchronize()
-    for field in plan._fields:
+    for field in FULLY_DEFINED_FIELDS:
         assert torch.equal(getattr(plan, field), getattr(plan_fi, field)), field
+    extent = int(plan.num_tokens_post_padded.item())
+    assert extent % block_m == 0
+    assert extent <= plan.sorted_token_ids.numel()
+    blocks = extent // block_m
+    assert torch.equal(
+        plan.sorted_token_ids[:extent], plan_fi.sorted_token_ids[:extent]
+    ), "sorted_token_ids (valid extent)"
+    assert torch.equal(plan.expert_ids[:blocks], plan_fi.expert_ids[:blocks]), (
+        "expert_ids (valid extent)"
+    )
+    assert bool((plan.sorted_token_ids[extent:] == SORTED_POISON).all())
+    assert bool((plan.expert_ids[blocks:] == EXPERT_POISON).all())
 
     _check_selection(plan.topk_ids, logits, bias)
-    weights, sorted_ids, expert_ids, extent, counts, offsets = _reference_plan(
+    weights, sorted_ids, expert_ids, ref_extent, counts, offsets = _reference_plan(
         logits, bias, block_m, plan.topk_ids
     )
     torch.testing.assert_close(plan.topk_weights, weights, atol=1e-2, rtol=1e-2)
-    assert int(plan.num_tokens_post_padded.item()) == extent
+    assert extent == ref_extent
     assert torch.equal(plan.sorted_token_ids[:extent], sorted_ids)
-    assert torch.equal(plan.expert_ids[: extent // block_m], expert_ids)
+    assert torch.equal(plan.expert_ids[:blocks], expert_ids)
     assert torch.equal(plan.expert_counts, counts)
     assert torch.equal(plan.expert_offsets, offsets)
     assert torch.equal(plan.expert_scatter_offsets, counts)

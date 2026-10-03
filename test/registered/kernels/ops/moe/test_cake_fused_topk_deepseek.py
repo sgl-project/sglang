@@ -6,6 +6,12 @@ facade writes outputs bitwise identical to calling FlashInfer directly with
 tolerant on the selection, weights within 1e-2 after scattering to the expert
 axis). Skips (with the reason) when FlashInfer lacks the Cake module or the
 GPU is not sm_100a / sm_103a.
+
+The admitted shapes follow FlashInfer's ``_check_dsv3_fused_routing_supported``
+/ ``_is_cake_dsv3_fused_routing_supported`` (46340689a5ab): among other bounds
+``topk_group * n_group >= topk``, so a single-group configuration
+(``n_group == topk_group == 1``) admits ``topk == 1`` only -- FlashInfer's own
+``test_cake_backend_preserves_source_single_group_topk_constraint`` pins this.
 """
 
 import sys
@@ -49,6 +55,14 @@ def test_contract_mirrors_flashinfer():
     assert not adapter._contract(
         num_tokens=1, num_experts=264, n_group=8, topk_group=4, topk=8
     )
+    # Single group: topk_group * n_group (= 1) must be >= topk, so only topk == 1
+    # is inside the FlashInfer contract (common check and Cake check alike).
+    assert not adapter._contract(
+        num_tokens=16, num_experts=384, n_group=1, topk_group=1, topk=6
+    )
+    assert not adapter._contract(
+        num_tokens=16, num_experts=256, n_group=1, topk_group=1, topk=8
+    )
 
 
 def _skip_unless_supported():
@@ -89,7 +103,7 @@ def _reference(scores, bias, n_group, topk_group, topk, scale):
         (1, (256, 8, 4, 8)),
         (37, (256, 8, 4, 8)),
         (64, (128, 4, 2, 4)),
-        (16, (384, 1, 1, 6)),
+        (16, (384, 1, 1, 1)),
     ],
 )
 def test_matches_flashinfer_and_reference(num_tokens, params, dtype):
@@ -138,6 +152,40 @@ def test_matches_flashinfer_and_reference(num_tokens, params, dtype):
     torch.testing.assert_close(got.sum(-1), ref.sum(-1), atol=1e-2, rtol=1e-2)
     mismatch = (got - ref).abs() > 1e-2
     assert int(mismatch.any(dim=1).sum()) <= max(1, num_tokens // 16)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_single_group_topk_above_one_is_outside_the_contract(dtype):
+    """``(E=384, n_group=1, topk_group=1, topk=6)`` is rejected by FlashInfer itself.
+
+    The adapter must return False (never raise) and FlashInfer's ``backend="cake"``
+    call must raise, so the admission check is exactly as strict as the kernel.
+    """
+    device = _skip_unless_supported()
+    num_tokens, num_experts, n_group, topk_group, topk = 16, 384, 1, 1, 6
+    torch.manual_seed(num_tokens)
+    scores = torch.randn(num_tokens, num_experts, device=device).to(dtype)
+    bias = torch.randn(num_experts, device=device).to(dtype)
+    assert not adapter.supports_fused_topk_deepseek(
+        scores, bias, n_group=n_group, topk_group=topk_group, topk=topk
+    )
+
+    from flashinfer.fused_moe import fused_topk_deepseek as fi_fused_topk_deepseek
+
+    values = torch.empty(num_tokens, topk, dtype=dtype, device=device)
+    indices = torch.empty(num_tokens, topk, dtype=torch.int32, device=device)
+    with pytest.raises(ValueError):
+        fi_fused_topk_deepseek(
+            scores,
+            bias,
+            n_group,
+            topk_group,
+            topk,
+            2.5,
+            values,
+            indices,
+            backend="cake",
+        )
 
 
 if __name__ == "__main__":
