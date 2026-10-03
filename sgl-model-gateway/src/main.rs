@@ -252,6 +252,57 @@ struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
     decode_selector: Vec<String>,
 
+    /// Annotation key for per-pod HTTP serving port override. When set on a
+    /// discovered pod, the router uses its value in place of
+    /// --service-discovery-port. Enables co-locating multiple hostNetwork pods
+    /// on one node with distinct ports.
+    #[arg(
+        long,
+        default_value = "sglang.ai/http-port",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    http_port_annotation: String,
+
+    /// Optional label key for per-pod HTTP port derivation. When set with
+    /// --http-port-label-base, the router computes each pod's HTTP port as
+    /// `base + int(pod.labels[key])`. Useful for controllers such as
+    /// LeaderWorkerSet that expose per-pod index labels but not per-pod
+    /// annotations (e.g. leaderworkerset.sigs.k8s.io/group-index). Empty
+    /// disables the fallback.
+    #[arg(long, default_value = "", help_heading = "Service Discovery (Kubernetes)")]
+    http_port_label_key: String,
+
+    /// Base port to add to the label-derived pod index (used with
+    /// --http-port-label-key). Zero disables the fallback.
+    #[arg(
+        long,
+        default_value_t = 0,
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    http_port_label_base: u16,
+
+    /// Annotation key for per-pod bootstrap port on prefill pods.
+    #[arg(
+        long,
+        default_value = "sglang.ai/bootstrap-port",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    bootstrap_port_annotation: String,
+
+    /// Optional label key for per-pod bootstrap port derivation (prefill only).
+    /// Analogue of --http-port-label-key for the mooncake bootstrap port.
+    #[arg(long, default_value = "", help_heading = "Service Discovery (Kubernetes)")]
+    bootstrap_port_label_key: String,
+
+    /// Base port to add to the label-derived pod index (used with
+    /// --bootstrap-port-label-key). Zero disables the fallback.
+    #[arg(
+        long,
+        default_value_t = 0,
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    bootstrap_port_label_base: u16,
+
     // ==================== Logging ====================
     /// Directory to store log files
     #[arg(long, help_heading = "Logging")]
@@ -936,7 +987,12 @@ impl CliArgs {
                 selector: Self::parse_selector(&self.selector),
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
-                bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
+                bootstrap_port_label_key: self.bootstrap_port_label_key.clone(),
+                bootstrap_port_label_base: self.bootstrap_port_label_base,
+                http_port_annotation: self.http_port_annotation.clone(),
+                http_port_label_key: self.http_port_label_key.clone(),
+                http_port_label_base: self.http_port_label_base,
                 router_selector: HashMap::new(), // Can be set via config file
                 router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
             })
@@ -1077,17 +1133,33 @@ impl CliArgs {
 
     fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
         let service_discovery_config = if self.service_discovery {
-            // Get router discovery config from router_config.discovery if available
-            let (router_selector, router_mesh_port_annotation) = router_config
-                .discovery
-                .as_ref()
-                .map(|d| {
-                    (
-                        d.router_selector.clone(),
-                        d.router_mesh_port_annotation.clone(),
-                    )
-                })
-                .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
+            // Prefer the discovery block from the parsed router config (YAML) when
+            // present; otherwise fall back to CLI flags below.
+            let discovery = router_config.discovery.as_ref();
+            let router_selector = discovery
+                .map(|d| d.router_selector.clone())
+                .unwrap_or_default();
+            let router_mesh_port_annotation = discovery
+                .map(|d| d.router_mesh_port_annotation.clone())
+                .unwrap_or_else(|| "sglang.ai/mesh-port".to_string());
+            let bootstrap_port_annotation = discovery
+                .map(|d| d.bootstrap_port_annotation.clone())
+                .unwrap_or_else(|| self.bootstrap_port_annotation.clone());
+            let bootstrap_port_label_key = discovery
+                .map(|d| d.bootstrap_port_label_key.clone())
+                .unwrap_or_else(|| self.bootstrap_port_label_key.clone());
+            let bootstrap_port_label_base = discovery
+                .map(|d| d.bootstrap_port_label_base)
+                .unwrap_or(self.bootstrap_port_label_base);
+            let http_port_annotation = discovery
+                .map(|d| d.http_port_annotation.clone())
+                .unwrap_or_else(|| self.http_port_annotation.clone());
+            let http_port_label_key = discovery
+                .map(|d| d.http_port_label_key.clone())
+                .unwrap_or_else(|| self.http_port_label_key.clone());
+            let http_port_label_base = discovery
+                .map(|d| d.http_port_label_base)
+                .unwrap_or(self.http_port_label_base);
 
             let selector = Self::parse_selector(&self.selector);
 
@@ -1100,7 +1172,12 @@ impl CliArgs {
                 pd_mode: self.pd_disaggregation,
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
-                bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                bootstrap_port_annotation,
+                bootstrap_port_label_key,
+                bootstrap_port_label_base,
+                http_port_annotation,
+                http_port_label_key,
+                http_port_label_base,
                 router_selector,
                 router_mesh_port_annotation,
                 igw_mode: self.enable_igw,
