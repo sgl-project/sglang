@@ -3,7 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
 from sglang.cli.utils import get_is_diffusion_model
@@ -158,7 +158,16 @@ class TestPlatformLifecycleHooks(unittest.TestCase):
         apply_defaults.assert_called_once_with(server_args)
 
 
-class TestServerArgsPathExpansion(unittest.TestCase):
+class _CudaPlatformTestCase(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        # Residency queries inspect the platform after argument construction too.
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(_mock_cuda_platform())
+
+
+class TestServerArgsPathExpansion(_CudaPlatformTestCase):
     def _from_dict_without_model_resolution(self, kwargs):
         return _from_dict_without_model_resolution(kwargs)
 
@@ -954,7 +963,7 @@ class TestMiniMaxH3Routing(unittest.TestCase):
         )
 
 
-class TestOffloadDefaults(unittest.TestCase):
+class TestOffloadDefaults(_CudaPlatformTestCase):
     def test_wan_decode_precision_defaults(self):
         for pipeline_config in (
             WanT2V480PConfig(),
@@ -2324,14 +2333,18 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
     def test_explicit_multi_gpu_dit_layerwise_only_selects_dit_group(self):
-        args = self._from_dict_with_pipeline_config(
-            MOVAPipelineConfig(),
-            kwargs={
-                "model_path": "OpenMOSS-Team/MOVA-360p",
-                "num_gpus": 2,
-                "dit_layerwise_offload": True,
-            },
-        )
+        with patch(
+            "sglang.multimodal_gen.registry.maybe_download_model_index",
+            return_value={"_class_name": "MOVAPipeline"},
+        ):
+            args = self._from_dict_with_pipeline_config(
+                MOVAPipelineConfig(),
+                kwargs={
+                    "model_path": "OpenMOSS-Team/MOVA-360p",
+                    "num_gpus": 2,
+                    "dit_layerwise_offload": True,
+                },
+            )
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.dit_cpu_offload)
@@ -3182,6 +3195,13 @@ class TestPerRoleParallelism(unittest.TestCase):
 class TestPipelineResolutionCliOverride(unittest.TestCase):
     def setUp(self):
         _get_config_info.cache_clear()
+        model_index = patch(
+            "sglang.multimodal_gen.registry.maybe_download_model_index",
+            return_value={"_class_name": "QwenImageLayeredPipeline"},
+        )
+        model_index.start()
+        self.addCleanup(model_index.stop)
+        self.addCleanup(_get_config_info.cache_clear)
 
     def test_resolution_flag_overrides_qwen_image_layered_pipeline_config(self):
         parser = FlexibleArgumentParser()
@@ -3341,7 +3361,7 @@ class TestNcclNvlsArgs(unittest.TestCase):
         self.assertFalse(disabled_args.enable_nccl_nvls)
 
 
-class TestDirectGpuWeightLoading(unittest.TestCase):
+class TestDirectGpuWeightLoading(_CudaPlatformTestCase):
     def _args(self) -> ServerArgs:
         args = ServerArgs.__new__(ServerArgs)
         args.direct_gpu_weight_loading = True
@@ -3410,6 +3430,87 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
                 fsdp_args._validate_direct_gpu_weight_loading()
             with self.assertRaisesRegex(ValueError, "tp-size 1"):
                 tp_args._validate_direct_gpu_weight_loading()
+
+
+class TestSchedulerEndpointBinding(unittest.TestCase):
+    """The scheduler ingress is an unauthenticated pickle-RPC endpoint; it must
+    never follow a wildcard --host (see ServerArgs.scheduler_endpoint_for)."""
+
+    def _args(self, kwargs):
+        # Endpoint formatting does not need model resolution or port allocation.
+        args = ServerArgs.__new__(ServerArgs)
+        for key, value in kwargs.items():
+            setattr(args, key, value)
+        return args
+
+    def test_wildcard_host_pinned_to_loopback(self):
+        args = self._args(
+            {"model_path": "/fake/model", "host": "0.0.0.0", "scheduler_port": 5555}
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
+
+    def test_ipv6_wildcard_host_pinned_to_loopback(self):
+        args = self._args(
+            {"model_path": "/fake/model", "host": "::", "scheduler_port": 5555}
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
+
+    def test_default_host_stays_loopback(self):
+        args = self._args({"model_path": "/fake/model", "scheduler_port": 5555})
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
+
+    def test_explicit_host_is_honored(self):
+        args = self._args(
+            {
+                "model_path": "/fake/model",
+                "host": "10.1.2.3",
+                "scheduler_port": 5555,
+            }
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://10.1.2.3:5555")
+
+    def test_explicit_ipv6_host_is_bracketed(self):
+        args = self._args(
+            {
+                "model_path": "/fake/model",
+                "host": "::1",
+                "scheduler_port": 5555,
+            }
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://[::1]:5555")
+
+    def test_replica_ports_increment_on_loopback(self):
+        args = self._args(
+            {"model_path": "/fake/model", "host": "0.0.0.0", "scheduler_port": 5555}
+        )
+        self.assertEqual(args.scheduler_endpoint_for(1), "tcp://127.0.0.1:5556")
+
+    def test_explicit_scheduler_ports_on_loopback(self):
+        args = self._args(
+            {
+                "model_path": "/fake/model",
+                "host": "0.0.0.0",
+                "scheduler_port": 5555,
+                "dp_size": 2,
+            }
+        )
+        args.scheduler_ports = [6100, 6200]
+        self.assertEqual(args.scheduler_endpoint, "tcp://127.0.0.1:6100")
+        self.assertEqual(
+            args.scheduler_endpoints,
+            ["tcp://127.0.0.1:6100", "tcp://127.0.0.1:6200"],
+        )
+
+    def test_explicit_scheduler_ports_with_ipv6(self):
+        args = self._args(
+            {
+                "model_path": "/fake/model",
+                "host": "::1",
+                "scheduler_port": 5555,
+            }
+        )
+        args.scheduler_ports = [6100, 6200]
+        self.assertEqual(args.scheduler_endpoint_for(1), "tcp://[::1]:6200")
 
 
 class TestLayerwiseResidencyLifetime(unittest.TestCase):
