@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -81,22 +82,23 @@ def _slice_rows(
     return None if tensor is None else tensor[rows]
 
 
-# One measured budget per device for the process lifetime, as in the DSA indexer.
-# mem_get_info syncs the host, and this indexer runs in every sparse-attention layer.
-_MQA_LOGITS_BUDGET_BYTES: Dict[int, int] = {}
+# Keep one free-memory reading per forward batch and device, because every
+# sparse-attention layer of a forward asks for the budget. The next forward reads
+# again, so the budget follows free memory.
+_MQA_LOGITS_BUDGET_BYTES: Dict[int, Tuple[weakref.ref[ForwardBatch], int]] = {}
 
 
-def _get_mqa_logits_budget_bytes(device_index: int) -> int:
-    cached_budget = _MQA_LOGITS_BUDGET_BYTES.get(device_index)
-    if cached_budget is not None:
-        return cached_budget
+def _get_mqa_logits_budget_bytes(device_index: int, forward_batch: ForwardBatch) -> int:
+    cached = _MQA_LOGITS_BUDGET_BYTES.get(device_index)
+    if cached is not None and cached[0]() is forward_batch:
+        return cached[1]
     budget_bytes = mqa_logits_budget_bytes(device_index=device_index, allow_sync=True)
-    _MQA_LOGITS_BUDGET_BYTES[device_index] = budget_bytes
+    _MQA_LOGITS_BUDGET_BYTES[device_index] = (weakref.ref(forward_batch), budget_bytes)
     return budget_bytes
 
 
 def _mqa_logits_row_chunks(
-    *, num_rows: int, num_cols: int, device: torch.device
+    *, num_rows: int, num_cols: int, device: torch.device, forward_batch: ForwardBatch
 ) -> Tuple[slice, ...]:
     # Real capture records a fixed launch count; breakable-graph replay also sets
     # get_is_capture_mode(), but its eager breaks run here and need the budget.
@@ -109,7 +111,9 @@ def _mqa_logits_row_chunks(
     need_chunk, budget_bytes = mqa_logits_should_chunk(
         num_rows=num_rows,
         num_cols=num_cols,
-        get_budget_bytes=lambda: _get_mqa_logits_budget_bytes(device_index),
+        get_budget_bytes=lambda: _get_mqa_logits_budget_bytes(
+            device_index, forward_batch
+        ),
         rocm=is_hip(),
     )
     rows_per_chunk = (
@@ -1226,7 +1230,10 @@ class IndexerKPool(MultiPlatformOp):
             topk_offsets=topk_offsets_all,
             topk_row_starts=ks_per_q,
             row_chunks=_mqa_logits_row_chunks(
-                num_rows=n_real, num_cols=total_k_rows, device=device
+                num_rows=n_real,
+                num_cols=total_k_rows,
+                device=device,
+                forward_batch=forward_batch,
             ),
             out_rows=total_q,
         )
@@ -1467,7 +1474,10 @@ class IndexerKPool(MultiPlatformOp):
                 topk_offsets=topk_offsets_local,
                 topk_row_starts=None,
                 row_chunks=_mqa_logits_row_chunks(
-                    num_rows=q_len, num_cols=pool_seq_len, device=q_fp8.device
+                    num_rows=q_len,
+                    num_cols=pool_seq_len,
+                    device=q_fp8.device,
+                    forward_batch=forward_batch,
                 ),
                 out_rows=None,
             )
