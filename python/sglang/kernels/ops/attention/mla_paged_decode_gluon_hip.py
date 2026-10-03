@@ -46,21 +46,21 @@ def entrypoint_name(rows: int) -> str | None:
     return None
 
 
-def can_install(backend, model_runner) -> bool:
-    """Admit only the loaded Kimi-K3 1M-context TP8 MLA backend."""
+def qualified_k3_mla_backend(backend, model_runner) -> bool:
+    """Qualify the common loaded Kimi-K3 1M-context TP8 MLA contract."""
     model_config = model_runner.model_config
     hf_config = model_config.hf_config
     architectures = tuple(getattr(hf_config, "architectures", ()) or ())
     server_args = get_server_args()
     return (
-        enabled()
-        and is_hip()
+        is_hip()
         and _has_required_gluon_api()
         and _rocm_arch(model_runner.gpu_id) == "gfx950"
         and any(name.startswith("KimiK3") for name in architectures)
         and backend.use_mla
         and backend.dcp_size == 1
         and backend.page_size == 1
+        and getattr(backend, "_translate_kv_loc", None) is None
         and backend.max_context_len == 1048576
         and not backend.enable_deterministic
         and not model_runner.is_draft_worker
@@ -78,6 +78,11 @@ def can_install(backend, model_runner) -> bool:
         )
         == (128, 64, 512, 128)
     )
+
+
+def can_install(backend, model_runner) -> bool:
+    """Admit only an explicitly enabled qualified decode backend."""
+    return enabled() and qualified_k3_mla_backend(backend, model_runner)
 
 
 def covered(
