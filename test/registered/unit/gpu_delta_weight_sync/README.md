@@ -124,29 +124,36 @@ Miles negotiates the canonical tensor-name union per cache ID and sends it in
 experts outside that union are not decoded.
 
 One creator copies owner files into retained tmpfs mappings and SHA-256 checks
-those exact bytes once. CPU workers decode independent canonical tensors directly
-into one flat shared Snappy arena, and raw targets are copied beside them. Aliased
-bindings and the second engine reuse those bytes. The cache key binds the exact
-manifest path, authenticated digest and host tensor union. It publishes the arena
-index only after all tasks complete and every chunk's bounds, window and exact
-output length pass. GPU Zstd may omit content size; bounded output remains
-mandatory. Every submitted task is joined on failure before ownership is dropped.
+those exact bytes once per publication. CPU workers decode independent canonical
+tensors directly into one shared Snappy arena; raw targets are copied beside them.
+Aliased bindings and a second engine reuse the same physical bytes. The namespace
+binds the original cohort, delta stream and host tensor union; publication metadata
+binds the canonical manifest path, digest, session and versions. READY is published
+only after every task and exact chunk/window/output check passes. Every submitted
+task is joined on failure before ownership is dropped.
 
-Each rank maps the arena with MAP_SHARED, treats its READY contents as immutable,
-and calls `cudaHostRegister` once on its own mapping. Registration happens outside
-the host build mutex, with no inference collectives. The rank retains all mapping
-and tensor references through its final update-stream fence, then unregisters
-before dropping them. Torch's pinned allocator does not own this external memory.
-Normal post-resume cleanup unlinks snapshot names after the complete cohort has
-applied; surviving mappings remain valid. Aborted/failed/crashed snapshots are
-retained for inspection and require explicit cleanup after consumers exit. Small
-lock/identity files persist. There is no automatic eviction, pageable fallback or
-full Snappy HBM residency.
+Each backend retains its MAP_SHARED mapping and CUDA registration across updates.
+The first publication allocates decoded and encoded staging capacities rounded to
+64 MiB. A fitting later publication reuses both allocations and each rank's existing
+registration. Growth allocates a new inode with at least twice the old capacity;
+registered inodes are never resized. Each rank maps/registers the same shared
+physical pages through its own VA; there is no full per-rank Snappy copy. CUDA
+registration/unregistration runs outside the host build mutex. Torch's pinned
+allocator does not own this external memory.
 
-Fresh registration is per publication and may cost more than Torch's warm pinned
-allocator cache. The benchmark measures it separately; sharing does not imply
-zero registration cost, nor free driver work for foreign arena pages. Persistent
-registered arenas and per-rank region registration are deliberately deferred.
+Only successful resume with the complete original APPLIED certificate authorizes
+reuse: all original ranks have finished H2D and their update-stream fences. The
+session queues generation-specific release and view cleanup on its existing FIFO
+executor, off the scheduler thread and ahead of the next local prepare. Local
+apply, abort, failure and ordinary close cannot release a shared generation. A
+late old release cannot release a newer publication. BUILDING is recorded before
+overwriting bytes, so a decode failure cannot expose stale READY metadata.
+
+Capacity and registration remain resident for the backend lifetime. Cold/growth
+registration is measured separately; warm reuse does not register again. Failed
+or aborted generations remain nonreusable, and retained tmpfs files require
+explicit cleanup after consumers exit. There is no automatic eviction, pageable
+fallback, per-rank region registration or full Snappy HBM residency.
 
 Canonical rank-0/rank-1 tensors instead negotiate `raw_bytes`: complete target
 values with no XOR, frames or compression envelope. Unchanged values omit their
@@ -183,19 +190,28 @@ Creator-only `host_outer_zstd_decode_s` is CPU task submission/join wall time
 The `host_outer_zstd_encoded_bytes`, `decoded_bytes`, `tensors` and `frames`
 counters count each reconstructed host tensor/chunk once.
 `host_shared_build_s` is the same cached build duration for all consumers and must
-not be summed across ranks. `host_shared_arena_bytes` is shared physical payload
-size; each rank's `host_shared_registered_bytes`, `host_shared_register_calls` and
-`host_shared_register_s` report its registration work. `host_outer_zstd_cpu_workers`
-records the creator's configured pool size.
+not be summed across ranks. `host_shared_arena_bytes` is the publication's used
+extent; `host_shared_capacity_bytes`, `host_shared_capacity_generation` and
+`host_shared_capacity_inode` identify the retained decoded allocation.
+`host_shared_mapping_reused` and `host_shared_registration_reused` describe each
+rank's reuse. `host_shared_registered_bytes`/`host_shared_register_calls` count only
+new registration (zero on warm reuse), while
+`host_shared_registration_capacity_bytes` reports current registered capacity.
+`host_shared_register_s` measures registration or its reuse check.
+Creator-only `host_shared_allocation_{s,calls,bytes}` and
+`host_encoded_allocation_{s,calls,bytes}` distinguish cold/growth from warm builds;
+`host_encoded_capacity_bytes`/`host_encoded_capacity_generation` identify staging
+capacity. `host_outer_zstd_cpu_workers` records the creator pool size.
 
-These preparation costs occur outside the explicit scheduler pause but can
-contend with serving. Post-resume unregister/disposal is excluded from paused
-apply timing and runs on the session executor before later preparation. The
-manual two-process test checks actual pin recognition, asynchronous H2D bytes,
-completion fences and independent mapping disposal for both 4/8-worker pools.
-CPU tests cover exact reconstruction, truncation/trailing/checksum rejection,
-concurrent creator deduplication, host-union selection, retained verified bytes,
-and draining other workers when one decode fails.
+These costs occur outside explicit scheduler pause but can contend with serving.
+Release/view cleanup runs on the session executor before later preparation;
+unregistration occurs only on capacity replacement or backend teardown. The manual
+two-process oracle exercises cold, fitting and growing updates for both 4/8-worker
+pools: exact asynchronous H2D bytes, unchanged warm VA with zero register calls,
+new inode/registration on growth and final disposal. Its smaller capacity alignment
+keeps the oracle bounded; full-model measurements use production's 64 MiB alignment.
+CPU tests cover corrupt data, creator deduplication, host-union binding, retained
+bytes, worker draining, nonreusable aborts, stale release and scheduler/FIFO ordering.
 
 Runtime updates do not hash weights or build a custom compiled extension. Exact
 weight-content comparisons are confined to tests. State/version checks prevent

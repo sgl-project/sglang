@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host-local, verified immutable publication snapshots for GPU-delta preparation.
+"""Host-local verified publication bytes with reusable CPU/CUDA-pinned capacity.
 
 All engines on a host must share this tmpfs directory. The namespace, rather than
 container hostname, defines sharing. No distributed or inference collectives run.
@@ -22,7 +22,6 @@ import hashlib
 import json
 import mmap
 import os
-import shutil
 import stat
 import time
 import uuid
@@ -55,47 +54,6 @@ def _cache_root():
     return root
 
 
-def _write_snapshot(source, destination, expected_size, expected_sha):
-    """Read directly into the retained snapshot; hash exactly those bytes once."""
-    read_s = hash_s = 0.0
-    with source.open("rb", buffering=0) as incoming, destination.open("xb+") as target:
-        before = os.fstat(incoming.fileno())
-        if before.st_size != expected_size:
-            raise ValueError("delta payload size mismatch")
-        started = time.perf_counter()
-        if expected_size:
-            # Reserve tmpfs pages before writing, so insufficient space raises
-            # ENOSPC rather than SIGBUS while touching a sparse mmap.
-            os.posix_fallocate(target.fileno(), 0, expected_size)
-            with mmap.mmap(target.fileno(), expected_size) as output:
-                view = memoryview(output)
-                try:
-                    position = 0
-                    while position < expected_size:
-                        count = incoming.readinto(view[position:])
-                        if not count:
-                            raise ValueError("truncated delta payload")
-                        position += count
-                    read_s = time.perf_counter() - started
-                    started = time.perf_counter()
-                    actual_sha = hashlib.sha256(view).hexdigest()
-                    hash_s = time.perf_counter() - started
-                finally:
-                    view.release()
-        else:
-            actual_sha = hashlib.sha256(b"").hexdigest()
-        after = os.fstat(incoming.fileno())
-        if (
-            incoming.read(1)
-            or (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-            != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-            or actual_sha != expected_sha
-        ):
-            raise ValueError("delta payload SHA256/size mismatch or source changed")
-    destination.chmod(0o400)
-    return read_s, hash_s
-
-
 def host_cache_id():
     """A shared tmpfs root, not hostname, defines the physical sharing domain."""
     root = _cache_root()
@@ -117,7 +75,74 @@ def _identity(info):
     return [info.st_dev, info.st_ino, info.st_size]
 
 
-def _decode_arena(path, files, entries, pool, metrics):
+# Capacity grows geometrically, rounded to a coarse host-page allocation unit.
+# This is not a publication-format parameter or a tuning surface.
+_CAPACITY_ALIGNMENT = 64 << 20
+
+
+def _reserve(directory, prefix, previous, size, metrics):
+    if previous is not None and size <= previous["capacity"]:
+        return previous
+    capacity = max(size, 2 * previous["capacity"] if previous else 0)
+    capacity = (
+        (capacity + _CAPACITY_ALIGNMENT - 1)
+        // _CAPACITY_ALIGNMENT
+        * _CAPACITY_ALIGNMENT
+    )
+    generation = previous["generation"] + 1 if previous else 1
+    path = directory / f"{prefix}-{generation}.bin"
+    started = time.perf_counter()
+    with path.open("xb+") as target:
+        if capacity:
+            # Reserve pages once per capacity generation. Reusing a registered
+            # mmap never truncates/resizes its inode or frees its backing pages.
+            os.posix_fallocate(target.fileno(), 0, capacity)
+        identity = _identity(os.fstat(target.fileno()))
+    metrics[f"host_{prefix}_allocation_s"] += time.perf_counter() - started
+    metrics[f"host_{prefix}_allocation_calls"] += 1
+    metrics[f"host_{prefix}_allocation_bytes"] += capacity
+    return {
+        "file": path.name,
+        "generation": generation,
+        "capacity": capacity,
+        "identity": identity,
+    }
+
+
+def _write_record(directory, name, record):
+    temporary = directory / (name + ".pending")
+    temporary.write_text(json.dumps(record, sort_keys=True))
+    temporary.replace(directory / (name + ".json"))
+
+
+def _read_verified(source, destination, expected):
+    started = time.perf_counter()
+    with source.open("rb", buffering=0) as incoming:
+        before = os.fstat(incoming.fileno())
+        if before.st_size != expected["nbytes"]:
+            raise ValueError("delta payload size mismatch")
+        position = 0
+        while position < len(destination):
+            count = incoming.readinto(destination[position:])
+            if not count:
+                raise ValueError("truncated delta payload")
+            position += count
+        read_s = time.perf_counter() - started
+        started = time.perf_counter()
+        actual_sha = hashlib.sha256(destination).hexdigest()
+        hash_s = time.perf_counter() - started
+        after = os.fstat(incoming.fileno())
+        if (
+            incoming.read(1)
+            or (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or actual_sha != expected["sha256"]
+        ):
+            raise ValueError("delta payload SHA256/size mismatch or source changed")
+    return read_s, hash_s
+
+
+def _tensor_layout(entries):
     layout, size = {}, 0
     for entry in entries:
         count = (
@@ -129,78 +154,90 @@ def _decode_arena(path, files, entries, pool, metrics):
             size = (size + 15) // 16 * 16
             layout[entry["name"]] = {"offset": size, "nbytes": count}
             size += count
-    futures = []
-    with path.open("xb+") as target:
-        if size:
-            os.posix_fallocate(target.fileno(), 0, size)
-            arena = mmap.mmap(target.fileno(), size)
-            destination = memoryview(arena)
-            started = time.perf_counter()
-            error = None
-            try:
-                for entry in entries:
-                    record = layout.get(entry["name"])
-                    if record is None:
-                        continue
-                    offset, count = record["offset"], record["nbytes"]
-                    selected = destination[offset : offset + count]
-                    if entry["encoding"] == "raw_bytes":
-                        raw = entry["raw"]
-                        start = raw["encoded_offset"]
-                        selected[:] = memoryview(files[raw["file"]])[
-                            start : start + count
-                        ]
-                        continue
-                    outer = entry["outer"]
-                    start, length = outer["encoded_offset"], outer["encoded_bytes"]
-                    payload = memoryview(files[outer["file"]])[start : start + length]
-                    futures.append(
-                        (
-                            outer,
-                            pool.executor.submit(
-                                pool.decode, payload, outer["frames"], selected
-                            ),
-                        )
-                    )
-            except BaseException as exc:
+    return layout, size
+
+
+def _decode_arena(destination, layout, files, entries, pool, metrics):
+    started = time.perf_counter()
+    futures, error = [], None
+    try:
+        for entry in entries:
+            record = layout.get(entry["name"])
+            if record is None:
+                continue
+            offset, count = record["offset"], record["nbytes"]
+            selected = destination[offset : offset + count]
+            if entry["encoding"] == "raw_bytes":
+                raw = entry["raw"]
+                start = raw["encoded_offset"]
+                selected[:] = files[raw["file"]][start : start + count]
+                continue
+            outer = entry["outer"]
+            start, length = outer["encoded_offset"], outer["encoded_bytes"]
+            payload = files[outer["file"]][start : start + length]
+            futures.append(
+                (
+                    outer,
+                    pool.executor.submit(
+                        pool.decode, payload, outer["frames"], selected
+                    ),
+                )
+            )
+    except BaseException as exc:
+        error = exc
+    # A failed task can retain mmap views in its traceback. Drain every task;
+    # keep the failed generation nonreusable rather than invalidating its views.
+    for outer, future in futures:
+        try:
+            validation_s, decode_s = future.result()
+            metrics["host_outer_zstd_validate_s"] += validation_s
+            metrics["host_outer_zstd_worker_decode_sum_s"] += decode_s
+            metrics["host_outer_zstd_encoded_bytes"] += outer["encoded_bytes"]
+            metrics["host_outer_zstd_decoded_bytes"] += outer["decoded_bytes"]
+            metrics["host_outer_zstd_tensors"] += 1
+            metrics["host_outer_zstd_frames"] += len(outer["frames"])
+        except BaseException as exc:
+            if error is None:
                 error = exc
-            # Always join every task before allowing source/destination owners to
-            # disappear. Failed tasks can retain views through their tracebacks.
-            for outer, future in futures:
-                try:
-                    validation_s, decode_s = future.result()
-                    metrics["host_outer_zstd_validate_s"] += validation_s
-                    metrics["host_outer_zstd_worker_decode_sum_s"] += decode_s
-                    metrics["host_outer_zstd_encoded_bytes"] += outer["encoded_bytes"]
-                    metrics["host_outer_zstd_decoded_bytes"] += outer["decoded_bytes"]
-                    metrics["host_outer_zstd_tensors"] += 1
-                    metrics["host_outer_zstd_frames"] += len(outer["frames"])
-                except BaseException as exc:
-                    if error is None:
-                        error = exc
-            metrics["host_outer_zstd_decode_s"] = time.perf_counter() - started
-            if error is not None:
-                raise error
-    return {"tensors": layout, "arena_bytes": size}
+    metrics["host_outer_zstd_decode_s"] = time.perf_counter() - started
+    if error is not None:
+        raise error
 
 
-class HostDecodedSnapshot:
-    """One verified, expanded Snappy/raw arena shared across host-local engines.
+class HostArena:
+    """Backend-owned mapping and CUDA registration, retained across updates.
 
-    The READY arena is logically immutable. Every process maps the same physical
-    tmpfs pages with MAP_SHARED (never COW), registers its own VA for CUDA, and
-    retains the registration until all H2D work completes. No allocator or CUDA
-    operations run on CPU decode threads.
+    A namespace binds the original cohort, delta stream, and host tensor union.
+    Only a successful global-APPLIED resume releases a generation for overwrite.
+    Abort/failure retains its bytes and cannot recycle the slot automatically.
     """
 
-    def __init__(self, manifest_path, manifest_sha256, manifest, names, pool, timings):
+    def __init__(self):
         self.mapping = self.tensor = None
         self.registered = False
-        self.root = _cache_root()
+        self.identity = None
+        self.directory = None
+
+    def prepare(
+        self, manifest_path, manifest_sha256, manifest, names, pool, timings, metadata
+    ):
+        root = _cache_root()
         publication = Path(manifest_path).resolve(strict=True)
-        records = manifest["files"]
+        namespace = {
+            "stream_id": metadata["stream_id"],
+            "cohort": sorted(
+                metadata["cohort"], key=lambda value: json.dumps(value, sort_keys=True)
+            ),
+            "host_tensor_names": names,
+        }
+        key = hashlib.sha256(json.dumps(namespace, sort_keys=True).encode()).hexdigest()
+        directory = root / key
+        if self.directory is not None and self.directory != directory:
+            raise ValueError(
+                "host arena original cohort, stream, or tensor union changed"
+            )
         definitions = {}
-        for record in records:
+        for record in manifest["files"]:
             name, size = record["name"], record["nbytes"]
             if (
                 name in definitions
@@ -214,14 +251,14 @@ class HostDecodedSnapshot:
         expected = {
             "manifest_path": str(publication),
             "manifest_sha256": manifest_sha256,
-            "host_tensor_names": names,
+            "session_id": metadata["session_id"],
+            "base_version": metadata["base_version"],
+            "target_version": metadata["target_version"],
             "files": definitions,
         }
-        key = hashlib.sha256(
-            json.dumps([str(publication), manifest_sha256, names]).encode()
+        token = hashlib.sha256(
+            json.dumps(expected, sort_keys=True).encode()
         ).hexdigest()
-        self.directory = self.root / key
-        self.expected = expected
         metrics = {
             name: 0
             for name in (
@@ -238,117 +275,217 @@ class HostDecodedSnapshot:
                 "host_outer_zstd_decoded_bytes",
                 "host_outer_zstd_tensors",
                 "host_outer_zstd_frames",
+                "host_shared_allocation_s",
+                "host_shared_allocation_calls",
+                "host_shared_allocation_bytes",
+                "host_encoded_allocation_s",
+                "host_encoded_allocation_calls",
+                "host_encoded_allocation_bytes",
             )
         }
         waiting = time.perf_counter()
-        # Only construction/attachment/removal takes this stable lock. Never hold
-        # it while waiting for another scheduler, engine, or GPU stream.
-        with (self.root / ".lock").open("a+b") as lock:
+        # The mutex covers CPU construction/attachment only. Per-process CUDA
+        # registration and inference work never run while holding this mutex.
+        with (root / ".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             metrics["host_payload_cache_wait_s"] = time.perf_counter() - waiting
-            if self.directory.exists():
-                index = json.loads((self.directory / "index.json").read_bytes())
-                if index["publication"] != expected:
-                    raise ValueError("verified host payload identity differs")
+            directory.mkdir(mode=0o700, exist_ok=True)
+            index_path = directory / "index.json"
+            previous = (
+                json.loads(index_path.read_bytes()) if index_path.exists() else None
+            )
+            state = (
+                json.loads((directory / "state.json").read_bytes())
+                if previous
+                else None
+            )
+            if previous and previous["namespace"] != namespace:
+                raise ValueError("host arena namespace differs")
+            if previous and previous["publication"] == expected:
+                if state != {
+                    "token": token,
+                    "state": "READY",
+                    "generation": previous["shared"]["generation"],
+                }:
+                    raise ValueError("host publication is failed or already released")
+                index = previous
                 metrics["host_payload_cache_reused"] = 1
             else:
-                temporary = self.root / f".{key}.{uuid.uuid4().hex}.pending"
-                temporary.mkdir(mode=0o700)
-                encoded_dir = temporary / "encoded"
-                encoded_dir.mkdir()
-                files = {}
+                if previous and (
+                    state["state"] != "REUSABLE"
+                    or state["token"] != previous["token"]
+                    or previous["publication"]["target_version"]
+                    != expected["base_version"]
+                ):
+                    raise ValueError(
+                        "host arena requires prior global APPLIED release "
+                        "before overwrite"
+                    )
                 build_started = time.perf_counter()
-                for name, entry in definitions.items():
+                entries_by_name = {
+                    entry["name"]: entry for entry in manifest["tensors"]
+                }
+                entries = [entries_by_name[name] for name in names]
+                layout, size = _tensor_layout(entries)
+                encoded_size = sum(record["nbytes"] for record in definitions.values())
+                shared = _reserve(
+                    directory,
+                    "shared",
+                    previous["shared"] if previous else None,
+                    size,
+                    metrics,
+                )
+                encoded = _reserve(
+                    directory,
+                    "encoded",
+                    previous["encoded"] if previous else None,
+                    encoded_size,
+                    metrics,
+                )
+                index = {
+                    "namespace": namespace,
+                    "publication": expected,
+                    "token": token,
+                    "shared": shared,
+                    "encoded": encoded,
+                    "arena_bytes": size,
+                    "tensors": layout,
+                }
+                # Publish the nonreusable state before the first overwrite. An
+                # exception leaves this generation poisoned, including on abort.
+                _write_record(directory, "index", index)
+                _write_record(
+                    directory,
+                    "state",
+                    {
+                        "token": token,
+                        "state": "BUILDING",
+                        "generation": shared["generation"],
+                    },
+                )
+                files = {}
+                with (directory / encoded["file"]).open("r+b") as source:
+                    encoded_map = (
+                        mmap.mmap(source.fileno(), 0) if encoded_size else None
+                    )
+                position = 0
+                for name, record in definitions.items():
                     source = (publication.parent / name).resolve(strict=True)
                     if source.parent != publication.parent:
                         raise ValueError("delta payload escapes immutable publication")
-                    destination = encoded_dir / name
-                    read_s, hash_s = _write_snapshot(
-                        source, destination, entry["nbytes"], entry["sha256"]
+                    end = position + record["nbytes"]
+                    view = (
+                        memoryview(encoded_map)[position:end]
+                        if encoded_map is not None
+                        else memoryview(b"")
                     )
+                    read_s, hash_s = _read_verified(source, view, record)
                     metrics["host_payload_read_s"] += read_s
                     metrics["host_payload_sha256_s"] += hash_s
-                    metrics["host_payload_hash_bytes"] += entry["nbytes"]
+                    metrics["host_payload_hash_bytes"] += record["nbytes"]
                     metrics["host_payload_hash_files"] += 1
-                    with destination.open("rb") as payload:
-                        files[name] = (
-                            mmap.mmap(payload.fileno(), 0, access=mmap.ACCESS_READ)
-                            if entry["nbytes"]
-                            else b""
-                        )
-                entries = {entry["name"]: entry for entry in manifest["tensors"]}
-                index = _decode_arena(
-                    temporary / "arena.bin",
+                    files[name] = view
+                    position = end
+                with (directory / shared["file"]).open("r+b") as source:
+                    decoded_map = mmap.mmap(source.fileno(), 0) if size else None
+                _decode_arena(
+                    memoryview(decoded_map)
+                    if decoded_map is not None
+                    else memoryview(b""),
+                    layout,
                     files,
-                    [entries[name] for name in names],
+                    entries,
                     pool,
                     metrics,
                 )
                 files.clear()
-                shutil.rmtree(encoded_dir)
-                # RW mapping is required for portable cudaHostRegister support.
-                # Only construction writes it; consumers treat all bytes as immutable.
-                (temporary / "arena.bin").chmod(0o600)
                 index.update(
-                    publication=expected,
-                    arena_identity=_identity((temporary / "arena.bin").stat()),
                     cpu_workers=pool.workers,
                     build_s=time.perf_counter() - build_started,
                 )
-                (temporary / "index.json").write_text(json.dumps(index, sort_keys=True))
-                (temporary / "index.json").chmod(0o400)
-                temporary.rename(self.directory)
+                _write_record(directory, "index", index)
+                _write_record(
+                    directory,
+                    "state",
+                    {
+                        "token": token,
+                        "state": "READY",
+                        "generation": shared["generation"],
+                    },
+                )
+                # Old registered mappings keep their inodes alive until each
+                # original process attaches the new capacity generation.
+                if previous:
+                    for prefix in ("shared", "encoded"):
+                        if previous[prefix]["file"] != index[prefix]["file"]:
+                            (directory / previous[prefix]["file"]).unlink()
                 metrics["host_payload_cache_created"] = 1
-            arena = self.directory / "arena.bin"
-            with arena.open("r+b") as source:
-                if _identity(os.fstat(source.fileno())) != index["arena_identity"]:
-                    raise ValueError("verified host decoded arena changed")
-                if index["arena_bytes"]:
-                    self.mapping = mmap.mmap(
-                        source.fileno(), 0, access=mmap.ACCESS_WRITE
+            identity = index["shared"]["identity"]
+            reused_mapping = self.identity == identity
+            if not reused_mapping:
+                with (directory / index["shared"]["file"]).open("r+b") as source:
+                    if _identity(os.fstat(source.fileno())) != identity:
+                        raise ValueError("host arena inode/capacity changed")
+                    mapping = (
+                        mmap.mmap(source.fileno(), 0)
+                        if index["shared"]["capacity"]
+                        else None
                     )
-            self.index = index
+        if not reused_mapping:
+            self.close()  # CUDA unregister never holds the shared build mutex.
+            self.mapping, self.identity = mapping, identity
+        self.directory = directory
         metrics.update(
             host_shared_arena_bytes=index["arena_bytes"],
+            host_shared_capacity_bytes=index["shared"]["capacity"],
+            host_shared_capacity_generation=index["shared"]["generation"],
+            host_shared_capacity_inode=index["shared"]["identity"][1],
+            host_shared_mapping_reused=int(reused_mapping),
+            host_encoded_capacity_bytes=index["encoded"]["capacity"],
+            host_encoded_capacity_generation=index["encoded"]["generation"],
             host_shared_build_s=index["build_s"],
             host_outer_zstd_cpu_workers=index["cpu_workers"],
         )
         timings.update(metrics)
+        return HostDecodedSnapshot(self, root, index)
 
     def register(self, device, timings):
         import torch
 
         self.device = device
         started = time.perf_counter()
-        if self.mapping is not None:
-            self.tensor = torch.frombuffer(self.mapping, dtype=torch.uint8)
-            self.pointer = self.tensor.data_ptr()
-            with torch.cuda.device(device):
-                result = torch.cuda.cudart().cudaHostRegister(
-                    self.pointer, self.tensor.numel(), 1
-                )
-                if int(result) != 0:
-                    raise RuntimeError(
-                        f"shared delta cudaHostRegister failed: {result}"
+        calls = 0
+        reused = self.registered
+        if self.tensor is None:
+            if self.mapping is not None:
+                self.tensor = torch.frombuffer(self.mapping, dtype=torch.uint8)
+                self.pointer = self.tensor.data_ptr()
+                with torch.cuda.device(device):
+                    result = torch.cuda.cudart().cudaHostRegister(
+                        self.pointer, self.tensor.numel(), 1
                     )
-                self.registered = True
-                if not self.tensor.is_pinned():
-                    raise RuntimeError(
-                        "registered delta mapping is not recognized as CUDA pinned memory"
-                    )
-        else:
-            self.tensor = torch.empty(0, dtype=torch.uint8, device="cpu")
+                    if int(result) != 0:
+                        raise RuntimeError(
+                            f"shared delta cudaHostRegister failed: {result}"
+                        )
+                    self.registered = True
+                    calls = 1
+                    if not self.tensor.is_pinned():
+                        raise RuntimeError(
+                            "registered delta mapping is not recognized "
+                            "as CUDA pinned memory"
+                        )
+            else:
+                self.tensor = torch.empty(0, dtype=torch.uint8, device="cpu")
         timings.update(
             host_shared_register_s=time.perf_counter() - started,
-            host_shared_registered_bytes=self.tensor.numel(),
-            host_shared_register_calls=int(self.registered),
+            host_shared_registered_bytes=self.tensor.numel() if calls else 0,
+            host_shared_register_calls=calls,
+            host_shared_registration_reused=int(reused),
+            host_shared_registration_capacity_bytes=self.tensor.numel(),
         )
 
-    def get(self, name):
-        record = self.index["tensors"][name]
-        return self.tensor[record["offset"] : record["offset"] + record["nbytes"]]
-
-    def close(self, *, discard=False):
+    def close(self):
         if self.registered:
             import torch
 
@@ -359,16 +496,35 @@ class HostDecodedSnapshot:
                         f"shared delta cudaHostUnregister failed: {result}"
                     )
             self.registered = False
-        # Tensor/memoryview references retain mmap owners; never invalidate a
-        # surviving view or mask the original decode error with BufferError.
         self.tensor = self.mapping = None
-        if discard:
-            with (self.root / ".lock").open("a+b") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                if self.directory.exists():
-                    index = json.loads((self.directory / "index.json").read_bytes())
-                    if index["publication"] != self.expected:
-                        raise ValueError(
-                            "host decoded snapshot identity changed at cleanup"
-                        )
-                    shutil.rmtree(self.directory)
+        self.identity = None
+
+
+class HostDecodedSnapshot:
+    """One immutable publication's views over a backend-owned capacity arena."""
+
+    def __init__(self, arena, root, index):
+        self.arena, self.root, self.index = arena, root, index
+        self.directory = arena.directory
+
+    def get(self, name):
+        record = self.index["tensors"][name]
+        return self.arena.tensor[record["offset"] : record["offset"] + record["nbytes"]]
+
+    def mark_reusable(self):
+        # Called only by queued successful global-resume cleanup. A late release
+        # from the prior generation must never release newly prepared bytes.
+        with (self.root / ".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = json.loads((self.directory / "state.json").read_bytes())
+            if state == {
+                "token": self.index["token"],
+                "state": "READY",
+                "generation": self.index["shared"]["generation"],
+            }:
+                state["state"] = "REUSABLE"
+                _write_record(self.directory, "state", state)
+
+    def close(self):
+        # Backend retains its registration; caller has already fenced H2D.
+        self.arena = None

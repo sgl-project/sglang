@@ -39,6 +39,8 @@ def cpu_host_snapshot(backend, metadata, directory):
         "cpu-host": sorted({binding.name for binding in backend.layout.bindings})
     }
     backend.outer_pool = OuterZstdPool(2)
+    backend.host_arena = host.HostArena()
+    metadata.update(session_id="cpu-1", cohort=[backend.identity])
     cache = Path(directory) / "cache"
     cache.mkdir()
 
@@ -58,10 +60,11 @@ def cpu_host_snapshot(backend, metadata, directory):
                 side_effect=lambda fd, offset, size: os.ftruncate(fd, offset + size),
                 create=True,
             ),
-            patch.object(host.HostDecodedSnapshot, "register", register),
+            patch.object(host.HostArena, "register", register),
         ):
             yield
     finally:
+        backend.host_arena.close()
         backend.outer_pool.close()
 
 
@@ -745,9 +748,19 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         ),
                     )
                     self.assertEqual(prepared.encoded.data_ptr(), pointer)
-                # A completed snapshot retains verified bytes; discard explicitly to
-                # test corruption on a new acquisition before model writes.
-                prepared.host_snapshot.close(discard=True)
+                # A global-proof release permits the next immutable publication;
+                # its corrupt payload must still fail before model writes.
+                prepared.host_snapshot.mark_reusable()
+                prepared.host_snapshot.close()
+                metadata["session_id"] = "cpu-2"
+                metadata["base_version"] = metadata["target_version"]
+                metadata["target_version"] += 1
+                manifest.update(
+                    base_version=metadata["base_version"],
+                    target_version=metadata["target_version"],
+                )
+                content = json.dumps(manifest).encode()
+                path.write_bytes(content)
                 targets[0].zero_()
                 path.with_name("0.bin").write_bytes(
                     blobs["0"][:-1] + bytes([blobs["0"][-1] ^ 1])

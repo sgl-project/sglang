@@ -70,7 +70,9 @@ def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch, fail_fenc
     session = control.session = delta_runtime.DeltaSession(
         who,
         SimpleNamespace(
-            prepare=lambda *args: SimpleNamespace(apply=apply, close=lambda: None)
+            prepare=lambda *args: SimpleNamespace(
+                apply=apply, close=lambda: None, release_and_close=lambda: None
+            )
         ),
     )
     control.identity = who

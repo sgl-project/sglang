@@ -25,6 +25,7 @@ class Payload:
         self.fail = fail
         self.applications = 0
         self.closed = threading.Event()
+        self.released = threading.Event()
 
     def apply(self):
         self.applications += 1
@@ -34,6 +35,10 @@ class Payload:
 
     def close(self):
         self.closed.set()
+
+    def release_and_close(self):
+        self.released.set()
+        self.close()
 
 
 class Backend:
@@ -123,6 +128,41 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
     backend.ready.set()
     assert backend.payload.closed.wait(2)
     assert session.status("publication-1")["state"] == "ABORTED"
+    assert not backend.payload.released.is_set()
+
+
+def test_global_release_runs_off_scheduler_and_before_next_prepare(make_session):
+    session, backend = make_session()
+    receipt = applied(session, backend)
+    entered, release = threading.Event(), threading.Event()
+    caller = threading.get_ident()
+
+    def cleanup():
+        assert threading.get_ident() != caller
+        entered.set()
+        assert release.wait(5)
+        backend.payload.released.set()
+        backend.payload.close()
+
+    backend.payload.release_and_close = cleanup
+    try:
+        assert (
+            session.resume("publication-1", [receipt["certificate"]], lambda _: None)[
+                "state"
+            ]
+            == "RESUMED"
+        )
+        assert entered.wait(2)
+        backend.started.clear()
+        req = request([session.identity]) | dict(
+            session_id="publication-2", base_version=1, target_version=2
+        )
+        assert session.prepare(req)["state"] == "PREPARING"
+        assert not backend.started.is_set()
+    finally:
+        release.set()
+    assert backend.started.wait(2)
+    assert backend.payload.released.is_set()
 
 
 def test_bad_publication_never_mutates(make_session):
@@ -202,6 +242,7 @@ def test_exact_original_applied_cohort_required_before_resume(make_session):
         )
         assert not session.leased and session.version == 1
     assert resumed == [1, 1]
+    assert all(backend.payload.released.wait(2) for _, backend in sessions)
 
 
 @pytest.mark.parametrize("failure", ["fence", "retract", "flush", "apply"])
@@ -254,6 +295,7 @@ def test_resume_failure_retains_ownership(make_session):
             lambda _: (_ for _ in ()).throw(RuntimeError("resume failed")),
         )
     assert session.leased
+    assert not backend.payload.released.is_set()
     with pytest.raises(ValueError, match="cannot abort RESUMING"):
         session.abort("publication-1")
     assert session.status("publication-1")["scheduler_timing"]["blocked_s"] is None

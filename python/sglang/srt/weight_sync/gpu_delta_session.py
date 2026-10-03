@@ -303,7 +303,9 @@ class DeltaSession:
             session.resumed_ns = time.monotonic_ns()
             session.state = "RESUMED"
             prepared, session.prepared = session.prepared, None
-            self._executor.submit(prepared.close)
+            # Keep host release I/O off the scheduler; this FIFO executor runs
+            # it before the next prepare. Only global APPLIED resume releases.
+            self._executor.submit(prepared.release_and_close)
             return self.status(session_id)
 
     def abort(self, session_id: str) -> dict:

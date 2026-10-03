@@ -732,7 +732,10 @@ class GpuDeltaBackend:
         self.device = next(model_runner.model.parameters()).device
         if self.device.type != "cuda" or self.device.index is None:
             raise ValueError("direct GPU deltas require an explicit CUDA device")
+        from sglang.srt.weight_sync.gpu_delta_host import HostArena
+
         self.outer_pool = OuterZstdPool(configured_cpu_workers())
+        self.host_arena = HostArena()
 
     def describe(self):
         self.layout.check_identity()
@@ -758,6 +761,7 @@ class GpuDeltaBackend:
 
     def close(self):
         self.outer_pool.close()
+        self.host_arena.close()
 
 
 @dataclass
@@ -785,7 +789,6 @@ class PreparedDelta:
         self.events = {}
         self.timings = {}
         from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
-        from sglang.srt.weight_sync.gpu_delta_host import HostDecodedSnapshot
         from sglang.srt.weight_sync.gpu_delta_payload import (
             validate_codec,
             validate_outer_entries,
@@ -797,7 +800,6 @@ class PreparedDelta:
         self.units = []
         self.raw_units = []
         self.raw_copies = {}
-        self.apply_succeeded = False
         self.stream = torch.cuda.Stream(device=self.device)
         self.done = None
         self.applied = False
@@ -885,19 +887,20 @@ class PreparedDelta:
         )
         self.timings["host_frames_validate_s"] = time.perf_counter() - frames_started
         payload_started = time.perf_counter()
-        self.host_snapshot = HostDecodedSnapshot(
+        self.host_snapshot = backend.host_arena.prepare(
             path,
             manifest_sha256,
             manifest,
             host_names,
             backend.outer_pool,
             self.timings,
+            metadata,
         )
         self.timings["host_payload_read_sha256_s"] = (
             self.timings["host_payload_read_s"] + self.timings["host_payload_sha256_s"]
         )
         self.timings["host_shared_prepare_s"] = time.perf_counter() - payload_started
-        self.host_snapshot.register(self.device, self.timings)
+        backend.host_arena.register(self.device, self.timings)
 
         tensors_started = time.perf_counter()
         prepared, direct = [], []
@@ -1117,7 +1120,6 @@ class PreparedDelta:
                 name: sum(start.elapsed_time(end) for start, end in pairs)
                 for name, pairs in self.events.items()
             }
-        self.apply_succeeded = True
         return {
             "applied": True,
             "verification": "artifact-sha256-and-decoder-status",
@@ -1146,6 +1148,14 @@ class PreparedDelta:
         with self._phase("layout_apply"):
             binding.xor(torch.where(self.error == 0, unit.payload, 0))
 
+    def release_and_close(self):
+        # Queued only after successful resume with every original APPLIED proof.
+        # Ordinary abort/error close must never authorize a shared overwrite.
+        try:
+            self.host_snapshot.mark_reusable()
+        finally:
+            self.close()
+
     def close(self):
         # Cancellation may race a background upload, but never frees storage
         # while the decoder or CUDA is using it. Only this object's stream is
@@ -1156,7 +1166,7 @@ class PreparedDelta:
         self.raw_units.clear()
         self.raw_copies.clear()
         if getattr(self, "host_snapshot", None) is not None:
-            self.host_snapshot.close(discard=self.apply_succeeded)
+            self.host_snapshot.close()
             self.host_snapshot = None
         self.encoded = self.decoded = self.raw_device = self.raw_pinned = None
         self.workspace = self.decoder = None

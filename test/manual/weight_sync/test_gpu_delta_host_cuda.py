@@ -16,9 +16,10 @@ import pytest
 import zstandard as zstd
 
 
-def _publication(directory):
+def _publication(directory, version, repeat):
     expected = {
-        f"tensor-{i}": bytes((j + i) % 256 for j in range(256)) * 1024 for i in range(8)
+        f"tensor-{i}": bytes((j + i + version) % 256 for j in range(256)) * repeat
+        for i in range(8)
     }
     expected["raw"] = b"unaligned-raw-target"
     blob, entries = bytearray(), []
@@ -76,97 +77,106 @@ def _publication(directory):
     return path, hashlib.sha256(path.read_bytes()).hexdigest(), expected
 
 
-def _consumer(rank, workers, path, digest, expected, cache, barrier, removed, output):
+def _consumer(rank, workers, publications, cache, barrier, output):
     import torch
-    from sglang.srt.weight_sync.gpu_delta_host import HostDecodedSnapshot, host_cache_id
+    from sglang.srt.weight_sync import gpu_delta_host as host
     from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
 
     os.environ["WEIGHT_DELTA_HOST_CACHE_DIR"] = cache
+    # Exercise the exact capacity-growth algorithm with small oracle tensors.
+    # Production's coarser alignment is not a wire/codec requirement.
+    host._CAPACITY_ALIGNMENT = 1 << 20
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
-    pool, snapshot = OuterZstdPool(workers), None
+    pool, arena = OuterZstdPool(workers), host.HostArena()
+    stream = torch.cuda.Stream(device=device)
+    records = []
     try:
-        identity = host_cache_id()
-        barrier.wait(timeout=90)
-        metrics = {}
-        snapshot = HostDecodedSnapshot(
-            path,
-            digest,
-            json.loads(Path(path).read_text()),
-            sorted(expected),
-            pool,
-            metrics,
-        )
-        snapshot.register(device, metrics)
-        assert snapshot.tensor.is_pinned() and snapshot.registered
-        source = snapshot.tensor
-        stream = torch.cuda.Stream(device=device)
-        with torch.cuda.stream(stream):
-            copied = source.to(device=device, non_blocking=True)
-            complete = torch.cuda.Event()
-            complete.record(stream)
-        complete.synchronize()
-        host_copy = copied.cpu()
-        for name, value in expected.items():
-            record = snapshot.index["tensors"][name]
-            actual = host_copy[record["offset"] : record["offset"] + record["nbytes"]]
-            assert bytes(actual.numpy()) == value
-        # All readers and H2D transfers are complete before normal disposal.
-        # One engine can unlink names while another retains its own valid map.
-        barrier.wait(timeout=90)
-        inode = snapshot.index["arena_identity"]
-        if rank == 0:
-            source = None
-            snapshot.close(discard=True)
-            removed.set()
-        else:
-            assert removed.wait(timeout=90)
-            assert not snapshot.directory.exists()
+        identity = host.host_cache_id()
+        for version, (path, digest, expected) in enumerate(publications, 1):
+            metadata = dict(
+                stream_id="native-shared-stream",
+                session_id=f"update-{version}",
+                base_version=version - 1,
+                target_version=version,
+                cohort=[{"engine_id": "a"}, {"engine_id": "b"}],
+            )
+            barrier.wait(timeout=90)
+            metrics = {}
+            snapshot = arena.prepare(
+                path,
+                digest,
+                json.loads(Path(path).read_text()),
+                sorted(expected),
+                pool,
+                metrics,
+                metadata,
+            )
+            arena.register(device, metrics)
+            assert arena.tensor.is_pinned() and arena.registered
+            source = arena.tensor[: snapshot.index["arena_bytes"]]
+            with torch.cuda.stream(stream):
+                copied = source.to(device=device, non_blocking=True)
+                complete = torch.cuda.Event()
+                complete.record(stream)
+            complete.synchronize()
+            host_copy = copied.cpu()
             for name, value in expected.items():
-                assert bytes(snapshot.get(name).numpy()) == value
-            source = None
-            snapshot.close(discard=True)
-        assert not snapshot.registered and snapshot.mapping is None
-        output.put(
-            {
-                "rank": rank,
-                "host_cache_id": identity,
-                "arena_identity": inode,
-                "metrics": metrics,
-                "exact_h2d_bytes": True,
-                "registered_and_unregistered": True,
-            }
-        )
-    finally:
-        if snapshot is not None:
-            stream = locals().get("stream")
-            if stream is not None:
-                stream.synchronize()
+                record = snapshot.index["tensors"][name]
+                actual = host_copy[
+                    record["offset"] : record["offset"] + record["nbytes"]
+                ]
+                assert bytes(actual.numpy()) == value
+            # Substitute the production all-original APPLIED certificate with
+            # an explicit two-process completion barrier in this isolated oracle.
+            barrier.wait(timeout=90)
+            snapshot.mark_reusable()
             snapshot.close()
+            source = None
+            assert arena.registered  # Per-update disposal retains registration.
+            records.append(
+                dict(
+                    version=version,
+                    host_cache_id=identity,
+                    arena_identity=arena.identity,
+                    mapping_pointer=arena.tensor.data_ptr(),
+                    metrics=metrics,
+                    exact_h2d_bytes=True,
+                )
+            )
+        stream.synchronize()
+        arena.close()
+        assert not arena.registered and arena.mapping is None
+        output.put(dict(rank=rank, updates=records, final_unregistered=True))
+    finally:
+        stream.synchronize()
+        arena.close()
         pool.close()
 
 
 @pytest.mark.parametrize("workers", [4, 8])
-def test_two_engines_share_decode_and_register_independent_mappings(workers):
+def test_two_engines_reuse_registered_capacity_and_grow_on_new_inode(workers):
     context = multiprocessing.get_context("spawn")
     with tempfile.TemporaryDirectory(
         prefix="gpu-delta-native-", dir="/dev/shm"
     ) as directory:
         root = Path(directory)
-        path, digest, expected = _publication(root)
-        barrier, removed, output = context.Barrier(2), context.Event(), context.Queue()
+        publications = []
+        for version, repeat in enumerate((1024, 512, 2048), 1):
+            version_dir = root / str(version)
+            version_dir.mkdir()
+            path, digest, expected = _publication(version_dir, version, repeat)
+            publications.append((str(path), digest, expected))
+        barrier, output = context.Barrier(2), context.Queue()
         processes = [
             context.Process(
                 target=_consumer,
                 args=(
                     rank,
                     workers,
-                    str(path),
-                    digest,
-                    expected,
+                    publications,
                     str(root / "cache"),
                     barrier,
-                    removed,
                     output,
                 ),
             )
@@ -175,7 +185,7 @@ def test_two_engines_share_decode_and_register_independent_mappings(workers):
         try:
             for process in processes:
                 process.start()
-            records = [output.get(timeout=180) for _ in processes]
+            records = [output.get(timeout=240) for _ in processes]
             for process in processes:
                 process.join(timeout=90)
                 assert process.exitcode == 0
@@ -184,34 +194,50 @@ def test_two_engines_share_decode_and_register_independent_mappings(workers):
                 if process.is_alive():
                     process.terminate()
                     process.join(timeout=15)
-        assert len({record["host_cache_id"] for record in records}) == 1
-        assert records[0]["arena_identity"] == records[1]["arena_identity"]
-        assert (
-            sum(record["metrics"]["host_payload_cache_created"] for record in records)
-            == 1
-        )
-        assert (
-            sum(record["metrics"]["host_payload_cache_reused"] for record in records)
-            == 1
-        )
-        assert (
-            sum(record["metrics"]["host_payload_hash_files"] for record in records) == 1
-        )
-        assert (
-            sum(record["metrics"]["host_outer_zstd_tensors"] for record in records) == 8
-        )
-        assert all(
-            record["metrics"]["host_shared_register_calls"] == 1 for record in records
-        )
-        assert not list((root / "cache").glob("*/arena.bin"))
+        for version in range(3):
+            rows = [record["updates"][version] for record in records]
+            assert rows[0]["arena_identity"] == rows[1]["arena_identity"]
+            assert (
+                sum(row["metrics"]["host_payload_cache_created"] for row in rows) == 1
+            )
+            assert sum(row["metrics"]["host_payload_hash_files"] for row in rows) == 1
+            assert sum(row["metrics"]["host_outer_zstd_tensors"] for row in rows) == 8
+            assert sum(
+                row["metrics"]["host_shared_allocation_calls"] for row in rows
+            ) == (0 if version == 1 else 1)
+            assert all(
+                row["metrics"]["host_shared_register_calls"]
+                == (0 if version == 1 else 1)
+                for row in rows
+            )
+            assert all(
+                row["metrics"]["host_shared_registration_reused"] == int(version == 1)
+                for row in rows
+            )
+        for record in records:
+            a, b, c = record["updates"]
+            assert a["arena_identity"] == b["arena_identity"] != c["arena_identity"]
+            assert a["mapping_pointer"] == b["mapping_pointer"] != c["mapping_pointer"]
+            assert [
+                row["metrics"]["host_shared_capacity_generation"]
+                for row in record["updates"]
+            ] == [1, 1, 2]
+            assert b["metrics"]["host_shared_registered_bytes"] == 0
+            assert all(
+                row["metrics"]["host_shared_arena_bytes"]
+                <= row["metrics"]["host_shared_capacity_bytes"]
+                for row in record["updates"]
+            )
+            assert record["final_unregistered"]
         print(
             json.dumps(
-                {
-                    "status": "PASS",
-                    "cpu_workers": workers,
-                    "logical_engines": 2,
-                    "records": records,
-                },
+                dict(
+                    status="PASS",
+                    cpu_workers=workers,
+                    logical_engines=2,
+                    updates=3,
+                    records=records,
+                ),
                 sort_keys=True,
             )
         )
