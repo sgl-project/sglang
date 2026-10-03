@@ -8,6 +8,7 @@ from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
+from sglang.srt.layers.attention.qsa import sparse_attn as sparse_attn_module
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
     qsa_fast_topk,
@@ -42,6 +43,71 @@ COMPRESS_RATIO = 4
 TOKEN_TOPK = 2048
 BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
+
+
+def test_fp8_chunk_pipeline_guard(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H20")
+    valid = [8192, 2, torch.float8_e4m3fn, 256, 6, FINAL_TOPK]
+    assert sparse_attn_module._use_fp8_chunk_pipeline(*valid)
+
+    for group_size in (1, 3, 6, 12):
+        supported = valid.copy()
+        supported[4] = group_size
+        supported[5] = 1024
+        assert sparse_attn_module._use_fp8_chunk_pipeline(*supported)
+
+    for index, value in [
+        (0, 8191),
+        (2, torch.bfloat16),
+        (3, 128),
+        (4, 13),
+        (5, 1023),
+    ]:
+        invalid = valid.copy()
+        invalid[index] = value
+        assert not sparse_attn_module._use_fp8_chunk_pipeline(*invalid)
+
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H100")
+    assert not sparse_attn_module._use_fp8_chunk_pipeline(*valid)
+
+
+@pytest.mark.parametrize(
+    ("group_size", "topk"),
+    [(3, 1024), (6, FINAL_TOPK), (8, 1024), (12, 1024)],
+)
+def test_h20_long_chunk_fp8_pipeline_matches_bf16_dot(monkeypatch, group_size, topk):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    q_len, kv_len = 4096, 8192
+    q = torch.randn(q_len, group_size, 256, dtype=torch.bfloat16, device=device)
+    k, v = [
+        torch.randn(kv_len, 1, 256, dtype=torch.bfloat16, device=device).to(
+            torch.float8_e4m3fn
+        )
+        for _ in range(2)
+    ]
+    indices = torch.randint(
+        0, kv_len - q_len + 1, (q_len, topk), dtype=torch.int32, device=device
+    )
+    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
+    kv_lens = torch.tensor([kv_len], dtype=torch.int32, device=device)
+    args = (q, k, v, indices, cu_q, cu_k, kv_lens, 256**-0.5)
+
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H20")
+    monkeypatch.setattr(
+        sparse_attn_module, "_use_fp8_chunk_pipeline", lambda *args: True
+    )
+    actual = sparse_gqa_fwd_interface_triton_ck(*args)
+    monkeypatch.setattr(
+        sparse_attn_module, "_use_fp8_chunk_pipeline", lambda *args: False
+    )
+    expected = sparse_gqa_fwd_interface_triton_ck(*args)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
