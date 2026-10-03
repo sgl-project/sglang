@@ -348,6 +348,9 @@ class Envs:
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
 
+    #Enable thread pool to preapre request. It reduces TTFT for 1 request by 10s for 16x1M requests on
+    SGLANG_ENABLE_CHAT_ENCODE_THREAD_POOL = EnvBool(False)
+
     # ===================================================================
     # Logging
     # ===================================================================
