@@ -14,7 +14,10 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
 )
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     _get_splitk_bufs,
+    _gfx950_sparse_mla_decode_config,
+    _Gfx950DecodeConfig,
     _splitk_bufs,
+    triton_sparse_mla_decode_splitk,
 )
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -53,6 +56,28 @@ def test_page_offset_i32_boundary():
     max_pages = ((1 << 31) - 1) // 576
     assert _page_offsets_fit_i32(max_pages, 576)
     assert not _page_offsets_fit_i32(max_pages + 1, 576)
+
+
+@pytest.mark.parametrize(
+    "base_ctas,heads,topk,expected",
+    [
+        (1, 8, 2048, _Gfx950DecodeConfig(block_k=32)),
+        (2, 8, 2048, None),
+        (1, 16, 2048, _Gfx950DecodeConfig(64, 32, 8, 1, 64, 4)),
+        (2, 16, 2048, None),
+        (4, 16, 2048, None),
+        (8, 16, 2048, None),
+        (10, 16, 2048, None),
+        (12, 16, 2048, None),
+        (16, 16, 2048, _Gfx950DecodeConfig(32, 64, 64, 2, 128, 1)),
+        (24, 16, 2048, _Gfx950DecodeConfig(64, 32, 8, 1, 64, 4)),
+        (32, 16, 2048, _Gfx950DecodeConfig(64, 32, 8, 1, 256, 1)),
+        (40, 16, 2048, None),
+        (1, 16, 1024, None),
+    ],
+)
+def test_gfx950_decode_config(base_ctas, heads, topk, expected):
+    assert _gfx950_sparse_mla_decode_config(base_ctas, heads, topk) == expected
 
 
 def test_gfx950_fp8_gate_supports_tp8_prefill(monkeypatch):
@@ -152,8 +177,69 @@ def test_reduce_d_chunk_is_bitwise_identical(active_splits):
         return out
 
     torch.testing.assert_close(
-        run(_reduce_d_chunk(active_splits, batch * heads)), run(64), rtol=0, atol=0
+        run(_reduce_d_chunk(active_splits, batch * heads)),
+        run(64),
+        rtol=0,
+        atol=0,
     )
+
+
+@pytest.mark.skipif(not _IS_GFX950, reason="decode tuning is gfx950-only")
+def test_tp4_high_concurrency_reduce_tuning_matches_baseline():
+    torch.manual_seed(41)
+    batch, heads, active_splits, value_dim = 8, 16, 16, 512
+    lse = torch.randn(batch, active_splits, heads, device="cuda")
+    acc = torch.randn(
+        batch, active_splits, heads, value_dim, device="cuda", dtype=torch.bfloat16
+    )
+
+    def run(d_chunk, num_warps):
+        out = torch.empty(batch, heads, value_dim, device="cuda", dtype=torch.bfloat16)
+        _sparse_mla_reduce_kernel[(batch, heads, value_dim // d_chunk)](
+            lse,
+            acc,
+            out,
+            H=heads,
+            D_V=value_dim,
+            KV_SPLITS=active_splits,
+            ACTIVE_SPLITS=active_splits,
+            ACTIVE_SPLITS_POW2=active_splits,
+            D_CHUNK=d_chunk,
+            BLOCK_K=64,
+            num_warps=num_warps,
+        )
+        return out
+
+    torch.testing.assert_close(run(128, 1), run(64, 4), rtol=0.01, atol=0.002)
+
+
+@pytest.mark.skipif(not _IS_GFX950, reason="decode tuning is gfx950-only")
+def test_tp8_decode_tuning_matches_prefill_kernel():
+    torch.manual_seed(37)
+    batch, heads, topk, value_dim, tail_dim = 4, 8, 2048, 512, 64
+    q = torch.randn(
+        batch, heads, value_dim + tail_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv = (
+        torch.randn(256, 1, value_dim + tail_dim, device="cuda")
+        .clamp_(-2, 2)
+        .to(torch.float8_e4m3fn)
+    )
+    indices = torch.randint(
+        0, kv.shape[0], (batch, 1, topk), device="cuda", dtype=torch.int32
+    )
+    args = (
+        q[:, :, :value_dim],
+        q[:, :, value_dim:],
+        kv,
+        indices,
+        value_dim**-0.5,
+        value_dim,
+    )
+
+    expected = triton_sparse_mla_fwd(*args)
+    actual = triton_sparse_mla_decode_splitk(*args)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.005)
 
 
 if __name__ == "__main__":
