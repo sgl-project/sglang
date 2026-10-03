@@ -1,9 +1,10 @@
 import logging
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional, Sequence
 
 import torch
 
@@ -21,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
+from sglang.srt.observability.metrics_collector import StorageMetrics
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
@@ -103,6 +105,14 @@ class HiCacheNixl(HiCacheStorage):
         self.is_mla_model = storage_config.is_mla_model
         self.is_zero_copy = False
         self.storage_config = storage_config
+        self.enable_storage_metrics: bool = storage_config.enable_storage_metrics
+        if self.enable_storage_metrics:
+            # Like Mooncake, use unbounded temporary arrays drained by get_stats().
+            self._storage_metrics_lock = threading.Lock()
+            self._prefetch_pgs: List[int] = []
+            self._backup_pgs: List[int] = []
+            self._prefetch_bandwidth: List[float] = []
+            self._backup_bandwidth: List[float] = []
         self.backup_skip = self.is_mla_model and storage_config.tp_rank != 0
 
         model_name = "-".join(model_name.split("/")) if model_name else ""
@@ -802,18 +812,62 @@ class HiCacheNixl(HiCacheStorage):
     def _log_xfer_stats(
         self,
         op_name: str,
+        direction: Literal["READ", "WRITE"],
         num_keys: int,
         host_indices: torch.Tensor,
-        buffer_sizes: List[int],
+        buffer_sizes: Sequence[Optional[int]],
         elapsed_ms: float,
+        successful: bool,
     ) -> None:
         total_bytes = sum(s for s in buffer_sizes if s is not None)
-        bw = total_bytes / (elapsed_ms / 1000) / (1024 * 1024) if elapsed_ms else 0.0
+        elapsed_seconds = elapsed_ms / 1000
+        bw_mb_s = (
+            total_bytes / elapsed_seconds / (1024 * 1024)
+            if elapsed_seconds > 0
+            else 0.0
+        )
         logger.debug(
             f"HiCacheNixl {op_name} transferred: {num_keys} keys (pages), "
             f"{host_indices.numel()} host_indices, {total_bytes} bytes, "
-            f"total time: {elapsed_ms:.3f} ms, effective bandwidth: {bw:.2f} MB/s"
+            f"total time: {elapsed_ms:.3f} ms, effective bandwidth: {bw_mb_s:.2f} MB/s"
         )
+
+        if not self.enable_storage_metrics or not successful:
+            return
+
+        bandwidth_gb_s = (
+            total_bytes / elapsed_seconds / (1 << 30)
+            if total_bytes > 0 and elapsed_seconds > 0
+            else None
+        )
+        with self._storage_metrics_lock:
+            if direction == "READ":
+                self._prefetch_pgs.append(num_keys)
+                if bandwidth_gb_s is not None:
+                    self._prefetch_bandwidth.append(bandwidth_gb_s)
+            elif direction == "WRITE":
+                self._backup_pgs.append(num_keys)
+                if bandwidth_gb_s is not None:
+                    self._backup_bandwidth.append(bandwidth_gb_s)
+            else:
+                raise ValueError(f"Unsupported NIXL transfer direction: {direction}")
+
+    def get_stats(self) -> Optional[StorageMetrics]:
+        if not self.enable_storage_metrics:
+            return None
+
+        with self._storage_metrics_lock:
+            storage_metrics = StorageMetrics(
+                prefetch_pgs=self._prefetch_pgs,
+                backup_pgs=self._backup_pgs,
+                prefetch_bandwidth=self._prefetch_bandwidth,
+                backup_bandwidth=self._backup_bandwidth,
+            )
+            self._prefetch_pgs = []
+            self._backup_pgs = []
+            self._prefetch_bandwidth = []
+            self._backup_bandwidth = []
+        return storage_metrics
 
     def batch_get_v1(
         self,
@@ -835,11 +889,13 @@ class HiCacheNixl(HiCacheStorage):
         results = self._batch_xfer(keys, key_strs, host_buffers, "READ")
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         self._log_xfer_stats(
-            "batch_get_v1",
-            len(keys),
-            host_indices,
-            [s for _, s in host_buffers],
-            elapsed_ms,
+            op_name="batch_get_v1",
+            direction="READ",
+            num_keys=len(keys),
+            host_indices=host_indices,
+            buffer_sizes=[size for _, size in host_buffers],
+            elapsed_ms=elapsed_ms,
+            successful=all(results),
         )
 
         return self._batch_get_postprocess(host_indices, results)
@@ -871,11 +927,13 @@ class HiCacheNixl(HiCacheStorage):
         results = self._batch_xfer(keys, key_strs, host_buffers, "WRITE")
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         self._log_xfer_stats(
-            "batch_set_v1",
-            len(keys),
-            host_indices,
-            [s for _, s in host_buffers],
-            elapsed_ms,
+            op_name="batch_set_v1",
+            direction="WRITE",
+            num_keys=len(keys),
+            host_indices=host_indices,
+            buffer_sizes=[size for _, size in host_buffers],
+            elapsed_ms=elapsed_ms,
+            successful=all(results),
         )
 
         return results
@@ -963,11 +1021,13 @@ class HiCacheNixl(HiCacheStorage):
             )
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self._log_xfer_stats(
-                f"batch_get_v2[{transfer.name}]",
-                len(transfer.keys or []),
-                transfer.host_indices,
-                [size for _, size in host_buffers],
-                elapsed_ms,
+                op_name=f"batch_get_v2[{transfer.name}]",
+                direction="READ",
+                num_keys=len(transfer.keys or []),
+                host_indices=transfer.host_indices,
+                buffer_sizes=[size for _, size in host_buffers],
+                elapsed_ms=elapsed_ms,
+                successful=all(transfer_results),
             )
             ctx = self._hybrid_pool_ctx[transfer.name]
             page_results = self._page_results(transfer_results, key_multiplier)
@@ -1001,11 +1061,13 @@ class HiCacheNixl(HiCacheStorage):
             )
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self._log_xfer_stats(
-                f"batch_set_v2[{transfer.name}]",
-                len(transfer.keys or []),
-                transfer.host_indices,
-                [size for _, size in host_buffers],
-                elapsed_ms,
+                op_name=f"batch_set_v2[{transfer.name}]",
+                direction="WRITE",
+                num_keys=len(transfer.keys or []),
+                host_indices=transfer.host_indices,
+                buffer_sizes=[size for _, size in host_buffers],
+                elapsed_ms=elapsed_ms,
+                successful=all(transfer_results),
             )
             results[transfer.name] = self._page_results(
                 transfer_results, key_multiplier
