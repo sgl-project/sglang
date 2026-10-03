@@ -94,11 +94,13 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         input_config: dict[str, Any],
         is_checkpoint_mxfp4_serialized: bool = True,
         dequantization_config: QuantizationConfig | None = None,
+        quantize_shared_expert_online: bool = False,
     ):
         self.weight_quant = weight_config
         self.input_quant = input_config
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.dequantization_config = dequantization_config
+        self.quantize_shared_expert_online = quantize_shared_expert_online
 
         weight_qscheme = self.weight_quant.get("qscheme")
         input_qscheme = self.input_quant.get("qscheme")
@@ -122,6 +124,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 "Using online MXFP4 quantization for MoE layers from a higher precision checkpoint. "
                 "Beware that this optimization may degrade prediction quality - please validate your model accuracy. "
                 "More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
+            )
+
+        if self.quantize_shared_expert_online:
+            logger.warning_once(
+                "Quantizing the BF16 shared expert to MXFP4 while loading so it can be fused "
+                "into the routed experts. Its weights and its input activations are then both "
+                "quantized to MXFP4 by the shared W4A4 grouped GEMM, where the standalone path "
+                "it replaces ran in BF16. Beware that this optimization may degrade prediction "
+                "quality - please validate your model accuracy. Unset "
+                "SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4 to keep the shared expert standalone."
             )
 
     @classmethod
@@ -229,6 +241,27 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 "weight_padded": weight_padded,
             },
         )
+
+        if self.quantize_shared_expert_online and getattr(
+            layer, "_has_fused_shared", False
+        ):
+            if hidden_size % OCP_MX_BLOCK_SIZE:
+                raise ValueError(
+                    f"Quantizing the shared expert at load time needs a hidden "
+                    f"size that is a multiple of the MX block size "
+                    f"{OCP_MX_BLOCK_SIZE}, got {hidden_size}: it is the K "
+                    f"dimension the gate and up projections are block-scaled "
+                    f"along."
+                )
+            if intermediate_size_per_partition % OCP_MX_BLOCK_SIZE:
+                raise ValueError(
+                    f"Quantizing the shared expert at load time needs an "
+                    f"intermediate size per partition that is a multiple of the "
+                    f"MX block size {OCP_MX_BLOCK_SIZE}, got "
+                    f"{intermediate_size_per_partition}. Otherwise a block of the "
+                    f"down projection would straddle a TP rank boundary and the "
+                    f"fused slot would not match an offline-quantized checkpoint."
+                )
 
         if self.is_checkpoint_mxfp4_serialized:
             weight_loader = original_weight_loader
@@ -622,6 +655,25 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 self._quantize_w2_online(layer, dynamic_mxfp4_quant)
 
         return online_mxfp4_moe_weight_loader
+
+    def quantize_shared_expert(
+        self, loaded_weight: torch.Tensor, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize an unquantized shared-expert projection to MXFP4.
+
+        The whole tensor is quantized and the caller shards the packed result,
+        so every rank produces the bytes an offline-quantized checkpoint would
+        carry for its own shard.  `device` is the load device create_weights
+        recorded: the loader's `with torch.device(...)` only wraps model
+        construction, so torch's default device is back to CPU by the time
+        weights arrive, and it is thread-local besides.
+        """
+        if dynamic_mxfp4_quant is None:
+            raise NotImplementedError(
+                "Fusing an unquantized shared expert into MXFP4 routed experts "
+                "needs aiter's dynamic_mxfp4_quant, which is AMD ROCm only."
+            )
+        return dynamic_mxfp4_quant(loaded_weight.to(device))
 
     def get_online_fp8_to_mxfp4_weight_loader(self, layer, original_weight_loader):
         """
