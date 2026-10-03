@@ -60,7 +60,7 @@ def free_swa_out_of_window_slots(
     page_size: int,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    is_chunk_cache: bool = False,
+    supports_prefix_sharing: bool = True,
     retain_floor: int | None = None,
     component_type: ComponentType = ComponentType.SWA,
     free_segment: Callable[..., None] | None = None,
@@ -85,20 +85,20 @@ def free_swa_out_of_window_slots(
     evicted_seqlen = max(evicted_seqlen, dead_lo)
     req.kv.set_evicted_seqlen(component_type, evicted_seqlen)
 
-    if is_chunk_cache:
-        # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
+    if not supports_prefix_sharing:
+        # Nothing is inserted into a tree, so no tombstone-leaf concern; evict
         # up to the window boundary (the trailing floor keeps it page-aligned).
         evict_threshold = pre_len - sliding_window_size
     else:
-        # Radix cache: keep max(window, page). The trailing floor page-aligns the
+        # Prefix-sharing cache: keep max(window, page). The trailing floor page-aligns the
         # frontier, and subtracting at least one page keeps it below the insert
         # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
         # No extra page margin is needed.
         evict_threshold = pre_len - max(sliding_window_size, page_size)
-    if retain_floor is not None and not is_chunk_cache:
+    if retain_floor is not None and supports_prefix_sharing:
         # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
-        # this only promises not to free past it. Chunk cache has no tree, so a
-        # retained checkpoint could never be matched and holding it is pure cost.
+        # this only promises not to free past it. Without prefix sharing a retained
+        # checkpoint could never be matched, so holding it is pure cost.
         evict_threshold = min(evict_threshold, retain_floor)
 
     new_evicted_seqlen = max(evicted_seqlen, evict_threshold)
@@ -169,17 +169,22 @@ def free_kv_row_segments(
         allocator.free_segments(swa_alive)
 
 
-def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
+def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Publish what the running request has computed so far, unless it is
+    barred from the tree."""
+    # The tree reads req.finished() to tell a checkpoint from the final
+    # insert; a finished request belongs in release_kv_cache.
+    assert not req.finished(), f"checkpointing finished request {req.rid}"
     if req.skip_radix_cache_insert:
         return
 
-    tree_cache.cache_unfinished_req(req, **kwargs)
+    tree_cache.checkpoint(req, up_to=req.extend_range.end)
 
 
 def evict_from_tree_cache(
     tree_cache: BasePrefixCache | None, num_tokens: int
 ) -> bool | None:
-    if tree_cache is not None and not tree_cache.is_chunk_cache():
+    if tree_cache is not None and tree_cache.supports_prefix_sharing():
         return tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
             tree_cache, num_tokens
         )
@@ -313,7 +318,14 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     owned_kv_len = req.owned_kv_len()
     is_insert = is_insert and not req.skip_radix_cache_insert
     if is_insert:
-        tree_cache.insert_req(req, up_to=owned_kv_len)
+        # A tree that takes over component state (mamba) must see the request
+        # finished, or the insert forks the state and the slot leaks.
+        assert req.finished() or not tree_cache.supports_mamba(), (
+            f"releasing unfinished request {req.rid} into a mamba tree"
+        )
+        # The fill-id array lags output_ids until the next prepare_for_decode.
+        req.refresh_fill_ids()
+        tree_cache.checkpoint(req, up_to=owned_kv_len)
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
     tree_cache.unpin(req)
@@ -346,7 +358,12 @@ def _release_overallocated_kv_indices(
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not get_serving().strip_thinking_cache:
-        assert start_p == end_p, (
+        # A stop landing before the last committed token does the same, via
+        # effective_kv_committed_len().
+        assert start_p == end_p or (
+            req.finished_len is not None
+            and len(req.origin_input_ids) + req.finished_len < req.kv.kv_committed_len
+        ), (
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
         )
 

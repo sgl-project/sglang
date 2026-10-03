@@ -214,7 +214,6 @@ class StagePlan:
                 output_move=out.output_move,
                 output_move_completes_sum=out.output_move_completes_sum,
                 returns_over_dp=out.returns_over_dp,
-                complete_output_move=out.complete_output_move,
             )
 
     @property
