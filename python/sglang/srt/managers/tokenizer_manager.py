@@ -110,6 +110,7 @@ from sglang.srt.managers.preprocess_executor import (
     INLINE_PREPROCESS_MAX_CHARS,
     PreprocessExecutor,
     resolve_tokenizer,
+    with_own_backend,
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -628,9 +629,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             get_serving().enable_dynamic_batch_tokenizer
             and not get_serving().skip_tokenizer_init
         ):
-            # A clone: the batcher encodes on its own thread.
+            # Its own backend: the batcher encodes on its own thread.
             self.async_dynamic_batch_tokenizer = AsyncDynamicbatchTokenizer(
-                copy.deepcopy(self.tokenizer),
+                with_own_backend(self.tokenizer),
                 max_batch_size=get_serving().dynamic_batch_tokenizer_batch_size,
                 batch_wait_timeout_s=get_serving().dynamic_batch_tokenizer_batch_timeout,
             )

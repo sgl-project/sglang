@@ -1,11 +1,10 @@
 import asyncio
 import copy
-import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar, copy_context
 from typing import Any, Callable, Optional, TypeVar
 
-logger = logging.getLogger(__name__)
+from transformers import PreTrainedTokenizerFast
 
 T = TypeVar("T")
 
@@ -13,27 +12,40 @@ T = TypeVar("T")
 # millisecond, so preprocessing them inline when idle skips the thread hop.
 INLINE_PREPROCESS_MAX_CHARS = 2048
 
-# (shared tokenizer, the worker's clone of it), bound for the duration of a job.
+# (shared tokenizer, the job's view of it), bound for the duration of a job.
 _job_tokenizer: ContextVar[Optional[tuple[Any, Any]]] = ContextVar(
     "sglang_preprocess_job_tokenizer", default=None
 )
 
 
 def resolve_tokenizer(shared: Any) -> Any:
-    """Return the running job's clone of ``shared``, or ``shared`` outside a job."""
+    """Return the running job's view of ``shared``, or ``shared`` outside a job."""
     binding = _job_tokenizer.get()
     if binding is not None and binding[0] is shared:
         return binding[1]
     return shared
 
 
+def with_own_backend(tokenizer: Any) -> Any:
+    """``tokenizer`` with a private copy of its Rust backend, for use on another
+    thread. A fast tokenizer's backend raises ``Already borrowed`` (or, on newer
+    ``tokenizers``, blocks) when two threads use it at once."""
+    if not isinstance(tokenizer, PreTrainedTokenizerFast):
+        return tokenizer
+    clone = copy.copy(tokenizer)
+    clone._tokenizer = copy.deepcopy(tokenizer.backend_tokenizer)
+    return clone
+
+
 class PreprocessExecutor:
     """Runs blocking request preprocessing (chat templates, tokenization) off the
     event loop.
 
-    Jobs use a clone of the tokenizer: the event loop keeps using the shared one
-    (multimodal processor calls, response parsing), and a fast tokenizer used
-    from two threads at once raises ``Already borrowed``.
+    Jobs never touch the Rust backend the event loop uses (multimodal processor
+    calls, response parsing). Copying a backend takes hundreds of ms and holds the
+    GIL, so it is copied once at construction; each job gets a shallow copy of
+    the shared tokenizer on that backend, so attributes set after startup (e.g.
+    the chat template) stay current.
 
     Requests leave preprocessing in the order they entered it: one FIFO worker
     runs every offloaded job, and a job may run inline only while nothing is
@@ -42,10 +54,9 @@ class PreprocessExecutor:
 
     def __init__(self, get_shared_tokenizer: Callable[[], Any] = lambda: None):
         self._get_shared_tokenizer = get_shared_tokenizer
-        self._tokenizer_binding: Optional[tuple[Any, Any]] = None
-        # Set if the tokenizer cannot be cloned: every job then runs inline, as
-        # it did before preprocessing was offloaded.
-        self._run_inline = False
+        self._worker_backend_source = None
+        self._worker_backend = None
+        self._copy_backend(get_shared_tokenizer())
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="sglang-preprocess"
         )
@@ -62,15 +73,12 @@ class PreprocessExecutor:
         runs on the event loop when no job is outstanding, and queues behind
         the outstanding jobs otherwise.
         """
-        if (inline_if_idle and self._num_outstanding == 0) or self._run_inline:
-            return func(*args)
-        binding = self._bind_tokenizer()
-        if self._run_inline:
+        if inline_if_idle and self._num_outstanding == 0:
             return func(*args)
 
         loop = asyncio.get_running_loop()
         context = copy_context()
-        context.run(_job_tokenizer.set, binding)
+        context.run(_job_tokenizer.set, self._bind_tokenizer())
         self._num_outstanding += 1
         job = self._executor.submit(context.run, func, *args)
         try:
@@ -88,26 +96,22 @@ class PreprocessExecutor:
         self._release()
         return result
 
+    def _copy_backend(self, shared: Any) -> None:
+        if isinstance(shared, PreTrainedTokenizerFast):
+            self._worker_backend_source = shared.backend_tokenizer
+            self._worker_backend = copy.deepcopy(shared.backend_tokenizer)
+
     def _bind_tokenizer(self) -> Optional[tuple[Any, Any]]:
-        # Cloned on first use, after startup has finished editing the tokenizer
-        # (e.g. setting its chat template).
         shared = self._get_shared_tokenizer()
-        if shared is None:
+        if not isinstance(shared, PreTrainedTokenizerFast):
+            # No Rust backend to borrow concurrently.
             return None
-        binding = self._tokenizer_binding
-        if binding is None or binding[0] is not shared:
-            try:
-                binding = (shared, copy.deepcopy(shared))
-            except Exception:
-                logger.warning(
-                    "Unable to clone the tokenizer for the preprocessing worker; "
-                    "preprocessing requests on the event loop.",
-                    exc_info=True,
-                )
-                self._run_inline = True
-                return None
-            self._tokenizer_binding = binding
-        return binding
+        if shared.backend_tokenizer is not self._worker_backend_source:
+            # The tokenizer was replaced after startup; pay the copy once more.
+            self._copy_backend(shared)
+        view = copy.copy(shared)
+        view._tokenizer = self._worker_backend
+        return shared, view
 
     def _release(self) -> None:
         self._num_outstanding -= 1

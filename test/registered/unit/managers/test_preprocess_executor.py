@@ -5,6 +5,10 @@ import threading
 import unittest
 from contextvars import ContextVar
 from types import SimpleNamespace
+from unittest import mock
+
+from tokenizers import Tokenizer, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -26,31 +30,16 @@ SHORT_PROMPT = "hi"
 
 
 class _GatedTokenizer:
-    """Blocks on long prompts until released; records finish order across clones
-    and which threads used each instance."""
+    """Blocks on long prompts until released; records finish order."""
 
     is_fast = True
 
-    def __init__(self, shared_state=None):
-        state = shared_state or SimpleNamespace(
-            long_started=threading.Event(),
-            release_long=threading.Event(),
-            finished=[],
-        )
-        self.state = state
-        self.long_started = state.long_started
-        self.release_long = state.release_long
-        self.finished = state.finished
-        self.chat_template = None
-        self.threads = set()
-
-    def __deepcopy__(self, memo):
-        clone = _GatedTokenizer(self.state)
-        clone.chat_template = self.chat_template
-        return clone
+    def __init__(self):
+        self.long_started = threading.Event()
+        self.release_long = threading.Event()
+        self.finished = []
 
     def __call__(self, texts, **kwargs):
-        self.threads.add(threading.current_thread().name)
         released = True
         if texts[0] == LONG_PROMPT:
             self.long_started.set()
@@ -59,9 +48,12 @@ class _GatedTokenizer:
         return {"input_ids": [[int(released)]]}
 
 
-class _UncloneableTokenizer(_GatedTokenizer):
-    def __deepcopy__(self, memo):
-        raise TypeError("cannot clone")
+def _fast_tokenizer():
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0, "hi": 1}, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]", pad_token="[UNK]"
+    )
 
 
 class _Handler(OpenAIServingBase):
@@ -172,56 +164,55 @@ class TestPreprocessExecutor(CustomTestCase):
         self.assertEqual(asyncio.run(run()), ([1], None))
         self.assertEqual(self.tokenizer.finished, [LONG_PROMPT, SHORT_PROMPT])
 
-    def test_jobs_never_use_the_shared_tokenizer(self):
+    def test_jobs_never_borrow_the_event_loops_backend(self):
         """The event loop keeps calling the shared tokenizer (multimodal processor
-        calls with padding=True) while a job runs. A fast tokenizer raises
-        "Already borrowed" when two threads use one instance, so jobs must use
-        the worker's clone instead."""
-
-        async def run():
-            long_task = asyncio.create_task(self.manager._tokenize_texts(LONG_PROMPT))
-            started = await asyncio.to_thread(self.tokenizer.long_started.wait, 2)
-            self.assertTrue(started)
-            self.manager.tokenizer([SHORT_PROMPT], padding=True)
-            self.tokenizer.release_long.set()
-            await long_task
-
-        asyncio.run(run())
-        self.assertEqual(self.tokenizer.threads, {threading.main_thread().name})
-        clone = self.manager.preprocess_executor._tokenizer_binding[1]
-        self.assertIsNot(clone, self.tokenizer)
-        self.assertEqual(len(clone.threads), 1)
-        self.assertTrue(next(iter(clone.threads)).startswith("sglang-preprocess"))
-
-    def test_clone_sees_tokenizer_edits_made_before_first_job(self):
-        """Startup sets the chat template after TokenizerManager init, so the
-        worker must clone the tokenizer on first use, not at construction."""
-        self.tokenizer.chat_template = "{{ messages }}"
-
-        async def run():
-            return await self.manager.preprocess_executor.run(
-                lambda: self.manager.tokenizer.chat_template
-            )
-
-        self.assertEqual(asyncio.run(run()), "{{ messages }}")
-
-    def test_uncloneable_tokenizer_preprocesses_on_event_loop(self):
-        """Without a clone, the worker would share the tokenizer with the loop;
-        jobs run inline instead."""
-        tokenizer = _UncloneableTokenizer()
+        calls with padding=True) while jobs run. A fast tokenizer's Rust backend
+        raises "Already borrowed", or blocks the loop, when two threads use it at
+        once, so jobs must run on a backend of their own."""
+        tokenizer = _fast_tokenizer()
         manager = _make_manager(tokenizer)
 
         async def run():
             return await manager.preprocess_executor.run(
-                lambda: (threading.current_thread(), manager.tokenizer)
+                lambda: (manager.tokenizer.backend_tokenizer, manager.tokenizer("hi"))
             )
 
-        with self.assertLogs(
-            "sglang.srt.managers.preprocess_executor", level="WARNING"
-        ):
-            thread, job_tokenizer = asyncio.run(run())
-        self.assertIs(thread, threading.main_thread())
-        self.assertIs(job_tokenizer, tokenizer)
+        job_backend, encoded = asyncio.run(run())
+        self.assertIsNot(job_backend, tokenizer.backend_tokenizer)
+        self.assertEqual(encoded["input_ids"], tokenizer("hi")["input_ids"])
+        self.assertIs(manager.tokenizer, tokenizer)
+
+    def test_jobs_see_tokenizer_attributes_set_after_startup(self):
+        """Startup sets the chat template after TokenizerManager init, so a job's
+        tokenizer must not be a snapshot taken at construction."""
+        tokenizer = _fast_tokenizer()
+        manager = _make_manager(tokenizer)
+        tokenizer.chat_template = "{{ messages }}"
+
+        async def run():
+            return await manager.preprocess_executor.run(
+                lambda: manager.tokenizer.chat_template
+            )
+
+        self.assertEqual(asyncio.run(run()), "{{ messages }}")
+
+    def test_requests_never_copy_a_tokenizer_backend(self):
+        """Copying a real backend takes hundreds of ms and holds the GIL; doing it
+        for a request, even only the first one, stalls the event loop."""
+        manager = _make_manager(_fast_tokenizer())
+
+        async def run():
+            return [
+                await manager.preprocess_executor.run(
+                    lambda: threading.current_thread().name
+                )
+                for _ in range(2)
+            ]
+
+        with mock.patch("copy.deepcopy", side_effect=AssertionError("copied")):
+            threads = asyncio.run(run())
+        for name in threads:
+            self.assertTrue(name.startswith("sglang-preprocess"))
 
     def test_only_short_plain_text_chats_skip_the_worker(self):
         """A chat is converted on the loop only when its rendering is cheap; a
