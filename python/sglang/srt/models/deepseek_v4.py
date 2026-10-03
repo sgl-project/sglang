@@ -1856,6 +1856,8 @@ class MQALayer(MqaAttentionBase):
             unified and (is_decode or fuse_verify or fuse_prefill)
         ) or (not unified and self.use_fused_qk_norm_rope)
 
+        # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
+        q_lora_quant = None
         if do_fused_qk_norm_rope:
             if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
@@ -1864,6 +1866,7 @@ class MQALayer(MqaAttentionBase):
                     self.q_norm.variance_epsilon,
                 )
                 q, _ = self.wq_b(q_for_wqb)
+                q_lora_quant = q_for_wqb
             else:
                 q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
                 q, _ = self.wq_b(q_for_wqb)
@@ -2123,6 +2126,7 @@ class MQALayer(MqaAttentionBase):
                         q_lora=q_lora,
                         forward_batch=forward_batch,
                         attn_backend=attn_backend,
+                        q_lora_quant=q_lora_quant,
                     )
             if self.compressor is not None:
                 if use_npu_cp_full_metadata:
