@@ -27,6 +27,7 @@ import socket
 import sys
 import threading
 import time
+import weakref
 from array import array
 from collections import deque
 from contextlib import nullcontext
@@ -47,6 +48,7 @@ from typing import (
 )
 
 import fastapi
+import msgspec
 import numpy as np
 import pybase64
 import torch
@@ -108,6 +110,7 @@ from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
+    MultimodalProcessorOutput,
     get_request_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -1464,13 +1467,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_text: str,
         input_ids: Optional[List[int]],
         input_embeds: Optional[List[List[float]]] = None,
-        mm_inputs=None,
+        mm_inputs: Optional[MultimodalProcessorOutput] = None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
+        if (
+            mm_inputs is not None
+            and envs.SGLANG_MM_STRIP_PROCESSOR_INPUT_IDS.get()
+            and input_ids is not None
+            and input_ids is mm_inputs.input_ids
+            and not mm_inputs.__dict__
+            and not weakref.getweakrefs(mm_inputs)
+        ):
+            # The canonical request array now owns these IDs. Keep the producer
+            # output intact for reuse and retain all modality/padded IDs. An
+            # output with attached state or lifetime callbacks must stay alive
+            # as-is: replacing it could release resources owned by the output.
+            mm_inputs = msgspec.structs.replace(mm_inputs, input_ids=None)
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
