@@ -749,8 +749,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             torch.zeros(8, num_layers, 1, 2, dtype=torch.uint8),
         ]
         host.conv_state_shapes = [(2,)]
-        host.slot_state_device_tensors = []
-        host.slot_state_buffers = []
         host.temporal_staging_buffer = torch.empty(
             4, num_layers, 1, 3, dtype=torch.uint8
         )
@@ -835,8 +833,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host.temporal_state_elem_size = 3
         host.temporal_buffer = torch.zeros(8, num_layers, 1, 3, dtype=torch.float32)
         host.conv_state_shapes = [(2,)]
-        host.slot_state_device_tensors = []
-        host.slot_state_buffers = []
         host.conv_buffer = [torch.zeros(8, num_layers, 1, 2, dtype=torch.bfloat16)]
         host.temporal_staging_buffer = None
         host.conv_staging_buffers = [None]

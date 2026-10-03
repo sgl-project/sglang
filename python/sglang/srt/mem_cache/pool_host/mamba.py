@@ -72,6 +72,11 @@ def _npu_hicache_mamba_io_mode() -> str:
 
 
 class MambaPoolHost(HostKVCache):
+    # Class-level defaults so a model without side state, and the test stubs that
+    # skip __init__, still read an empty pair rather than raising.
+    slot_state_device_tensors: tuple = ()
+    slot_state_buffers: tuple = ()
+
     def __init__(
         self,
         device_pool: MambaPool,
