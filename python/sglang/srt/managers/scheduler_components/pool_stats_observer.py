@@ -244,7 +244,8 @@ class SchedulerPoolStatsObserver:
 
     def _get_mamba_token_info(self):
         is_mamba_radix_cache = (
-            self.tree_cache.supports_mamba() and self.tree_cache.is_tree_cache()
+            self.tree_cache.supports_mamba()
+            and self.tree_cache.supports_prefix_sharing()
         )
         full_available_size = self.token_to_kv_pool_allocator.available_size()
         full_evictable_size = (
