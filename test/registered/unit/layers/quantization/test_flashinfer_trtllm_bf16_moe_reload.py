@@ -1,21 +1,8 @@
 """CPU unit tests for reloading BF16 MoE weights under the TRT-LLM backends.
 
-``UnquantizedFusedMoEMethod`` rewrites BF16 expert weights into the flashinfer
-TRT-LLM BlockMajorK layout after loading, so the weight loader has to undo that
-layout to copy canonical checkpoint tensors in and something has to put it back.
-The disk and checkpoint-engine paths re-run ``process_weights_after_loading``;
-``update_weights_from_tensor`` / ``_from_distributed`` do not.
-
-Pins both halves of issue #27787: the undo was gated on
-``is_flashinfer_trtllm_routed()`` while the rewrite was gated on
-``use_flashinfer_trtllm_moe`` (routed *or* non-routed), and widening that gate
-alone just trades the crash for a parameter left canonical while the kernel
-reads BlockMajorK.
-
-The layout arithmetic lives in flashinfer and needs SM100, so its entry points
-are replaced by a deterministic stand-in that is a genuine reordering. Whether
-the stand-in matches BlockMajorK byte for byte is the kernel's contract and is
-covered on-device.
+Checkpoint copies need canonical values; session finalization restores kernel
+layout. FlashInfer's SM100 layout entry points use an order-changing CPU stand-in;
+these tests verify the lifecycle and inverse, not on-device kernel parity.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -30,11 +17,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA
 from sglang.srt.model_executor.model_runner_components import weight_updater
-from sglang.srt.model_executor.model_runner_components.weight_updater import (
-    _repack_weights_after_hot_update,
-)
 from sglang.srt.runtime_context import get_context, get_server_args
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import CustomTestCase
 
 NUM_EXPERTS = 2
@@ -120,6 +106,56 @@ class _FakeModel(torch.nn.Module):
     def __init__(self, layer: _FakeMoELayer):
         super().__init__()
         self.layer = layer
+        self.attention_weight = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+
+    def load_weights(self, named_tensors):
+        for name, tensor in named_tensors:
+            if name == "attention_weight":
+                self.attention_weight.data.copy_(tensor)
+                continue
+            param_name, _, expert = name.partition(".")
+            param = dict(_weights(self.layer))[param_name]
+            self.layer.quant_method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+                layer=self.layer,
+                param=param,
+                weight_name=f"model.layers.0.mlp.experts.{param_name}",
+            )
+            if expert:
+                param.data[int(expert)].copy_(tensor)
+            else:
+                param.data.copy_(tensor)
+
+
+def _weights(layer):
+    return (("w13_weight", layer.w13_weight), ("w2_weight", layer.w2_weight))
+
+
+def _make_updater(model):
+    return weight_updater.WeightUpdater(
+        tp_rank=0,
+        device="cpu",
+        gpu_id=0,
+        model_config=SimpleNamespace(),
+        custom_weight_loaders={},
+        get_model=lambda: model,
+        update_model_fields=lambda **kwargs: None,
+        recapture_cuda_graph=lambda: None,
+        get_model_runner=lambda: SimpleNamespace(server_args=get_server_args()),
+    )
+
+
+def _update_bucket(updater, named_tensors, load_format):
+    if load_format == "distributed":
+        return updater.load_weights_from_distributed(named_tensors)
+    if load_format == "flattened_bucket":
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        named_tensors = {
+            "flattened_tensor": bucket.get_flattened_tensor(),
+            "metadata": bucket.get_metadata(),
+        }
+    else:
+        load_format = None
+    return updater.update_weights_from_tensor(named_tensors, load_format=load_format)
 
 
 def _make_method(use_flashinfer_trtllm_moe: bool = True):
@@ -150,25 +186,9 @@ class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
                 name = f"{short}_weight"
                 method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
                     layer=layer,
-                    param=getattr(layer, name),
+                    param=dict(_weights(layer))[name],
                     weight_name=f"model.layers.0.mlp.experts.{name}",
                 )
-
-    def test_process_weights_after_loading_applies_block_layout(self):
-        """Pins the wiring: the split-out helper is still called on the load path."""
-        method = _make_method()
-        layer = _FakeMoELayer(method, seed=0)
-        with patch.object(
-            method, "_maybe_apply_flashinfer_trtllm_bf16_block_layout"
-        ) as apply_layout:
-            method.process_weights_after_loading(layer)
-        apply_layout.assert_called_once_with(layer)
-
-    def test_block_layout_changes_shape(self):
-        """Guards the premise of every other test in this file."""
-        _, layer = self._cold_load(seed=0)
-        for name, canonical in _canonical_shapes().items():
-            self.assertNotEqual(tuple(getattr(layer, name).data.shape), canonical)
 
     def test_post_load_preserves_already_packed_weights(self):
         """Repeated post-load processing must preserve the cold-load layout."""
@@ -179,9 +199,11 @@ class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
         with _mock_flashinfer():
             for _ in range(3):
                 method.process_weights_after_loading(layer)
-                for name in _canonical_shapes():
-                    got = getattr(layer, name).data
-                    want = getattr(reference, name).data
+                for (name, param), (_, ref_param) in zip(
+                    _weights(layer), _weights(reference)
+                ):
+                    got = param.data
+                    want = ref_param.data
                     self.assertEqual(tuple(got.shape), tuple(want.shape))
                     self.assertTrue(torch.equal(got, want), name)
 
@@ -200,68 +222,34 @@ class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
         with _mock_flashinfer():
             for _ in range(2):
                 method.process_weights_after_loading(layer)
-                for name, want in expected.items():
-                    got = getattr(layer, name).data
+                for name, param in _weights(layer):
+                    want = expected[name]
+                    got = param.data
                     self.assertEqual(tuple(got.shape), tuple(want.shape))
                     self.assertTrue(torch.equal(got, want), name)
-
-    def test_restore_runs_for_non_routed_backend(self):
-        """Regression for #27787: the undo must fire for plain flashinfer_trtllm.
-
-        No moe-runner-backend global is set, so gating the undo on
-        ``is_flashinfer_trtllm_routed()`` leaves the weights blocked -- the state
-        that made the hot copy raise "size of tensor a (64) ... b (2048)".
-        """
-        method, layer = self._cold_load(seed=0)
-        self._restore_for_load(method, layer)
-        for name, canonical in _canonical_shapes().items():
-            self.assertEqual(tuple(getattr(layer, name).data.shape), canonical)
-
-    def test_reload_reproduces_cold_load_layout(self):
-        """A hot update must leave the weights exactly as a cold load would.
-
-        A gate-widening-only fix does not pass this: the copy succeeds, but
-        without the re-derive the bytes stay canonical.
-        """
-        _, reference = self._cold_load(seed=1)
-
-        method, layer = self._cold_load(seed=0)
-        self._restore_for_load(method, layer)
-
-        new_weights = _FakeMoELayer(method, seed=1)
-        for name in _canonical_shapes():
-            getattr(layer, name).data.copy_(getattr(new_weights, name).data)
-
-        with _mock_flashinfer():
-            _repack_weights_after_hot_update(_FakeModel(layer))
-
-        for name in _canonical_shapes():
-            got, want = getattr(layer, name).data, getattr(reference, name).data
-            self.assertEqual(tuple(got.shape), tuple(want.shape))
-            self.assertTrue(torch.equal(got, want), f"{name} differs from cold load")
 
     def test_repack_is_noop_when_no_weight_was_reverted(self):
         """Re-deriving an intact layout would double-block it."""
         method, layer = self._cold_load(seed=0)
-        before = {n: getattr(layer, n).data.clone() for n in _canonical_shapes()}
+        before = {name: param.data.clone() for name, param in _weights(layer)}
 
         with _mock_flashinfer():
-            method.repack_weights_after_hot_update(layer)
-            method.repack_weights_after_hot_update(layer)
+            method._maybe_apply_flashinfer_trtllm_bf16_block_layout(layer)
+            method._maybe_apply_flashinfer_trtllm_bf16_block_layout(layer)
 
-        for name, want in before.items():
-            self.assertTrue(torch.equal(getattr(layer, name).data, want))
+        for name, param in _weights(layer):
+            self.assertTrue(torch.equal(param.data, before[name]))
 
     def test_repack_is_noop_when_backend_inactive(self):
         method = _make_method(use_flashinfer_trtllm_moe=False)
         layer = _FakeMoELayer(method, seed=0)
-        before = {n: getattr(layer, n).data.clone() for n in _canonical_shapes()}
+        before = {name: param.data.clone() for name, param in _weights(layer)}
 
-        method.repack_weights_after_hot_update(layer)
+        method._maybe_apply_flashinfer_trtllm_bf16_block_layout(layer)
 
-        for name, want in before.items():
-            self.assertEqual(tuple(getattr(layer, name).data.shape), want.shape)
-            self.assertTrue(torch.equal(getattr(layer, name).data, want))
+        for name, param in _weights(layer):
+            self.assertEqual(tuple(param.data.shape), before[name].shape)
+            self.assertTrue(torch.equal(param.data, before[name]))
 
     def test_restore_inverts_the_block_layout(self):
         """The restore must undo the data, not just reinterpret the shape.
@@ -271,59 +259,67 @@ class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
         """
         method = _make_method()
         layer = _FakeMoELayer(method, seed=3)
-        original = {n: getattr(layer, n).data.clone() for n in _canonical_shapes()}
+        original = {name: param.data.clone() for name, param in _weights(layer)}
 
         with _mock_flashinfer():
             method._maybe_apply_flashinfer_trtllm_bf16_block_layout(layer)
         self._restore_for_load(method, layer)
 
-        for name, want in original.items():
-            got = getattr(layer, name).data
+        for name, param in _weights(layer):
+            got, want = param.data, original[name]
             self.assertEqual(tuple(got.shape), tuple(want.shape))
             self.assertTrue(torch.equal(got, want), f"{name} round trip is lossy")
 
     def test_bucketed_update_reproduces_cold_load_layout(self):
-        """A refit split across several update RPCs must still be correct.
-
-        RL callers batch weights (``weight_sync/utils.py``), so one refit is many
-        update calls; expert slots carried by a later bucket must survive the
-        earlier buckets' re-derives untouched.
-        """
-        _, reference = self._cold_load(seed=1)
-        method, layer = self._cold_load(seed=0)
-        new_weights = _FakeMoELayer(method, seed=1)
-
-        # Bucket 1: w13, expert 0 only. Bucket 2: w13 expert 1. Bucket 3: w2.
-        buckets = [
-            ("w13_weight", 0),
-            ("w13_weight", 1),
-            ("w2_weight", None),
-        ]
-        for name, expert in buckets:
-            short = name[: -len("_weight")]
-            self._restore_for_load(method, layer, param_names=(short,))
-            dst, src = getattr(layer, name).data, getattr(new_weights, name).data
-            if expert is None:
-                dst.copy_(src)
-            else:
-                dst[expert].copy_(src[expert])
-            with _mock_flashinfer():
-                _repack_weights_after_hot_update(_FakeModel(layer))
-
-        for name in _canonical_shapes():
-            got, want = getattr(layer, name).data, getattr(reference, name).data
-            self.assertEqual(tuple(got.shape), tuple(want.shape))
-            self.assertTrue(torch.equal(got, want), f"{name} differs from cold load")
-
-        # A session can request final post-load after every bucket was repacked.
-        with _mock_flashinfer():
-            for _ in range(2):
-                method.process_weights_after_loading(layer)
-                for name in _canonical_shapes():
-                    got = getattr(layer, name).data
-                    want = getattr(reference, name).data
-                    self.assertEqual(tuple(got.shape), tuple(want.shape))
-                    self.assertTrue(torch.equal(got, want), name)
+        """Restore each weight once across buckets, then pack once at session end."""
+        for load_format in ("tensor", "flattened_bucket", "distributed"):
+            with self.subTest(load_format=load_format):
+                _, reference = self._cold_load(seed=1)
+                method, layer = self._cold_load(seed=0)
+                new_weights = _FakeMoELayer(method, seed=1)
+                updater = _make_updater(_FakeModel(layer))
+                pointers = {name: param.data_ptr() for name, param in _weights(layer)}
+                buckets = [
+                    ("w13_weight.0", new_weights.w13_weight.data[0]),
+                    ("w13_weight.1", new_weights.w13_weight.data[1]),
+                    ("w2_weight", new_weights.w2_weight.data),
+                ]
+                with (
+                    _mock_flashinfer(),
+                    get_context().override_server_args(weight_cache_mode="off"),
+                    patch.object(
+                        weight_updater, "monkey_patch_torch_reductions", lambda: None
+                    ),
+                    patch.object(
+                        method,
+                        "_restore_trtllm_bf16_canonical_layout",
+                        wraps=method._restore_trtllm_bf16_canonical_layout,
+                    ) as restore,
+                    patch.object(
+                        method,
+                        "_apply_trtllm_bf16_block_layout",
+                        wraps=method._apply_trtllm_bf16_block_layout,
+                    ) as pack,
+                ):
+                    updater.begin_weight_update()
+                    for bucket in buckets:
+                        success, message = _update_bucket(
+                            updater, [bucket], load_format
+                        )
+                        self.assertTrue(success, message)
+                        self.assertEqual(
+                            tuple(layer.w13_weight.shape),
+                            _canonical_shapes()["w13_weight"],
+                        )
+                    self.assertEqual(restore.call_count, 2)
+                    self.assertEqual(pack.call_count, 0)
+                    updater.end_weight_update(run_post_load=False)
+                    self.assertEqual(pack.call_count, 2)
+                    for (name, param), (_, ref_param) in zip(
+                        _weights(layer), _weights(reference)
+                    ):
+                        self.assertTrue(torch.equal(param.data, ref_param.data), name)
+                        self.assertEqual(param.data_ptr(), pointers[name])
 
     def test_restore_rejects_non_bijective_permutation(self):
         """The inverse is an argsort, which is only valid for a bijection.
@@ -349,64 +345,15 @@ class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
             self._restore_for_load(method, layer, param_names=("w13",))
 
 
-class TestRepackRunsOnFailedUpdate(CustomTestCase):
-    """The layout must be re-derived even when a weight update fails.
-
-    With the re-derive on the success path only, a `load_weights` that raised
-    part way through left parameters in load layout while the kernel read the
-    transformed one -- turning a reported failure into silently wrong numerics.
-    """
+class TestWeightUpdateSessionFinalization(CustomTestCase):
+    """Session end restores kernel layout after successful or partial copies."""
 
     class _LoadFailed(RuntimeError):
         pass
 
-    class _FailingModel(torch.nn.Module):
-        def load_weights(self, named_tensors):
-            raise TestRepackRunsOnFailedUpdate._LoadFailed("load failed mid-update")
-
-    def _make_updater(self, model):
-        return weight_updater.WeightUpdater(
-            tp_rank=0,
-            device="cpu",
-            gpu_id=0,
-            model_config=SimpleNamespace(),
-            custom_weight_loaders={},
-            get_model=lambda: model,
-            update_model_fields=lambda **kwargs: None,
-            recapture_cuda_graph=lambda: None,
-            get_model_runner=lambda: SimpleNamespace(server_args=get_server_args()),
-        )
-
-    def test_repack_runs_when_load_weights_raises(self):
-        model = self._FailingModel()
-        repacked = []
-
-        with (
-            get_context().override_server_args(weight_cache_mode="off"),
-            patch.object(
-                weight_updater,
-                "_repack_weights_after_hot_update",
-                lambda m: repacked.append(m),
-            ),
-            patch.object(
-                weight_updater,
-                "_unsupported_derived_weight_cache_error",
-                autospec=True,
-                return_value=None,
-            ),
-            patch.object(weight_updater, "monkey_patch_torch_reductions", lambda: None),
-        ):
-            with self.assertRaises(self._LoadFailed):
-                self._make_updater(model).update_weights_from_tensor(
-                    named_tensors=[("w", torch.zeros(1))]
-                )
-
-        self.assertEqual(repacked, [model], "layout not re-derived on the error path")
-
-    def test_distributed_load_repacks_before_returning(self):
-        """A received bucket must regain kernel layout even if loading reports failure."""
-        for fail_after_copy in (False, True):
-            with self.subTest(fail_after_copy=fail_after_copy):
+    def test_failed_load_repacks_at_session_end(self):
+        for load_format in ("tensor", "flattened_bucket", "distributed"):
+            with self.subTest(load_format=load_format):
                 method = _make_method()
                 layer = _FakeMoELayer(method, seed=0)
                 new_weights = _FakeMoELayer(method, seed=1)
@@ -414,27 +361,18 @@ class TestRepackRunsOnFailedUpdate(CustomTestCase):
 
                 class ReloadModel(_FakeModel):
                     def load_weights(self, named_tensors):
-                        for name, tensor in named_tensors:
-                            param = getattr(self.layer, name)
-                            method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
-                                layer=self.layer,
-                                param=param,
-                                weight_name=f"model.layers.0.mlp.experts.{name}",
-                            )
-                            param.data.copy_(tensor)
-                        if fail_after_copy:
-                            raise RuntimeError("load failed mid-update")
+                        super().load_weights(named_tensors)
+                        raise TestWeightUpdateSessionFinalization._LoadFailed(
+                            "load failed mid-update"
+                        )
 
                 model = ReloadModel(layer)
-                updater = self._make_updater(model)
+                updater = _make_updater(model)
                 with (
                     _mock_flashinfer(),
                     get_context().override_server_args(weight_cache_mode="off"),
                     patch.object(
-                        weight_updater,
-                        "_unsupported_derived_weight_cache_error",
-                        autospec=True,
-                        return_value=None,
+                        weight_updater, "monkey_patch_torch_reductions", lambda: None
                     ),
                 ):
                     method.process_weights_after_loading(layer)
@@ -444,25 +382,54 @@ class TestRepackRunsOnFailedUpdate(CustomTestCase):
                         "w2_weight": layer.w2_weight.data.clone(),
                     }
                     pointers = {
-                        name: getattr(layer, name).data_ptr() for name in expected
+                        name: param.data_ptr() for name, param in _weights(layer)
                     }
                     updater.begin_weight_update()
-                    success, message = updater.load_weights_from_distributed(
-                        [("w13_weight", new_weights.w13_weight.data)]
-                    )
-                    self.assertEqual(success, not fail_after_copy)
-                    if fail_after_copy:
-                        self.assertIn("load failed mid-update", message)
-                    # Finalization must not hide a missing per-bucket repack.
-                    for name, want in expected.items():
-                        self.assertTrue(
-                            torch.equal(getattr(layer, name).data, want), name
+                    named_tensors = [("w13_weight", new_weights.w13_weight.data)]
+                    if load_format == "distributed":
+                        success, message = _update_bucket(
+                            updater, named_tensors, load_format
                         )
+                        self.assertFalse(success)
+                        self.assertIn("load failed mid-update", message)
+                    else:
+                        with self.assertRaisesRegex(
+                            self._LoadFailed, "load failed mid-update"
+                        ):
+                            _update_bucket(updater, named_tensors, load_format)
+                    self.assertTrue(
+                        torch.equal(layer.w13_weight.data, new_weights.w13_weight.data)
+                    )
                     updater.end_weight_update(run_post_load=True)
-                    for name, want in expected.items():
-                        param = getattr(layer, name)
-                        self.assertTrue(torch.equal(param.data, want), name)
+                    for name, param in _weights(layer):
+                        self.assertTrue(torch.equal(param.data, expected[name]), name)
                         self.assertEqual(param.data_ptr(), pointers[name])
+
+    def test_attention_only_update_with_lora_wrapper(self):
+        method = _make_method()
+        layer = _FakeMoELayer(method, seed=0)
+        # Only the wrapper's ownership/traversal matters, not its GPU runner setup.
+        wrapper = FusedMoEWithLoRA.__new__(FusedMoEWithLoRA)
+        BaseLayerWithLoRA.__init__(wrapper, layer, SimpleNamespace())
+        wrapper.quant_method = method
+        model = _FakeModel(wrapper)
+        updater = _make_updater(model)
+        with (
+            _mock_flashinfer(),
+            get_context().override_server_args(weight_cache_mode="off"),
+            patch.object(weight_updater, "monkey_patch_torch_reductions", lambda: None),
+        ):
+            method.process_weights_after_loading(layer)
+            before = {name: param.data.clone() for name, param in _weights(layer)}
+            updater.begin_weight_update()
+            success, message = updater.update_weights_from_tensor(
+                [("attention_weight", torch.ones(1))]
+            )
+            self.assertTrue(success, message)
+            updater.end_weight_update(run_post_load=False)
+            self.assertTrue(torch.equal(model.attention_weight.data, torch.ones(1)))
+            for name, param in _weights(layer):
+                self.assertTrue(torch.equal(param.data, before[name]), name)
 
 
 if __name__ == "__main__":

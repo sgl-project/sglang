@@ -856,22 +856,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     def _maybe_apply_flashinfer_trtllm_bf16_block_layout(
         self, layer: torch.nn.Module
     ) -> None:
-        """Rewrite BF16 expert weights into the flashinfer TRT-LLM block layout.
-
-        Split out so ``repack_weights_after_hot_update`` can re-derive this one
-        layout without re-running the other, non-idempotent post-load transforms.
-        """
+        """Pack canonical BF16 expert weights; already-blocked weights stay intact."""
         if not self.use_flashinfer_trtllm_moe:
             return
 
-        # The cached indices are GPU tensors. Colocated weight offloading
-        # can release their backing memory between reloads, so rebuild them
-        # once per post-processing cycle.
+        # Colocated offloading can release the cached GPU indices' backing memory.
         self._cache_permute_indices.clear()
-
-        # Bucketed updates may already have packed each weight before the final
-        # post-load hook; only canonical weights still need the block layout.
-        self.repack_weights_after_hot_update(layer)
+        for name, param in (
+            ("w13_weight", layer.w13_weight),
+            ("w2_weight", layer.w2_weight),
+        ):
+            if tuple(param.data.shape) == self._canonical_expert_weight_shape(
+                layer, name
+            ):
+                self._apply_trtllm_bf16_block_layout(layer, param, name)
 
     def _trtllm_bf16_row_permutation(
         self, layer: torch.nn.Module, param_name: str, expert_tile: torch.Tensor
@@ -925,15 +923,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     def _restore_trtllm_bf16_canonical_layout(
         self, layer: torch.nn.Module, param: torch.nn.Parameter, param_name: str
     ) -> None:
-        """Block layout -> canonical, in place, for one fused expert weight.
-
-        Exact inverse of ``_apply_trtllm_bf16_block_layout``: the row permutation
-        is a bijection so ``argsort`` inverts it, and ``convert_to_block_layout``'s
-        ``[M, K] -> [K // block_k, M, block_k]`` is undone by moving the block dim
-        back next to K. Inverting the data rather than only the shape is what makes
-        a bucketed update safe -- expert slots this update does not carry keep their
-        real values, so the re-derive blocks each exactly once.
-        """
+        """Undo the block/row permutations in place, preserving untouched experts."""
         canonical_shape = self._canonical_expert_weight_shape(layer, param_name)
         blocked_expert_shape = tuple(param.data[0].shape)
         param.data = param.data.reshape(canonical_shape)
@@ -992,17 +982,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         param: torch.nn.Parameter,
         weight_name: str,
     ) -> None:
-        """Restore the canonical BF16 MoE load layout before a hot weight copy.
-
-        Checkpoint tensors are canonical, so the loader needs the parameter back
-        in its load-time layout; ``repack_weights_after_hot_update`` re-derives
-        the block layout once the copies are done.
-
-        Gated on the same ``use_flashinfer_trtllm_moe`` flag as the rewrite so the
-        two cannot drift apart. That flag covers routed and non-routed alike;
-        keying only off ``is_flashinfer_trtllm_routed()`` left the non-routed
-        backend blocked during a hot update and the copy raised (issue #27787).
-        """
+        """Restore checkpoint layout for both routed and non-routed TRT-LLM backends."""
         if not self.use_flashinfer_trtllm_moe:
             return
 
@@ -1023,36 +1003,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         self._cache_permute_indices.clear()
         self._restore_trtllm_bf16_canonical_layout(layer, param, param_name)
-
-    def repack_weights_after_hot_update(self, layer: torch.nn.Module) -> None:
-        """Re-derive the TRT-LLM block layout the weight loader had to undo.
-
-        The update paths that call ``model.load_weights()`` directly never re-run
-        ``process_weights_after_loading``, so without this the parameters keep the
-        canonical layout while the kernel reads BlockMajorK.
-
-        Driven by shape rather than a dirty flag, so it no-ops when an update
-        touched no expert weight, and each weight is handled independently -- an
-        update carrying w13 and w2 in separate buckets is still correct.
-        """
-        if not self.use_flashinfer_trtllm_moe:
-            return
-
-        reverted = [
-            name
-            for name in _FUSED_EXPERT_WEIGHT_NAMES
-            if tuple(getattr(layer, name).data.shape)
-            == self._canonical_expert_weight_shape(layer, name)
-        ]
-        if not reverted:
-            # No expert weight was reverted, so the block layout is intact.
-            return
-
-        self._cache_permute_indices.clear()
-        for param_name in reverted:
-            self._apply_trtllm_bf16_block_layout(
-                layer, getattr(layer, param_name), param_name
-            )
 
     def _aiter_ck_moe_unsupported_reason(self, layer) -> Optional[str]:
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
