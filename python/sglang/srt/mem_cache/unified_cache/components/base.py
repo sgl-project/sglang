@@ -104,7 +104,6 @@ class LinkerTransferPhase(str, Enum):
 
 class ExternalLinkerLoadPhase(str, Enum):
     PREPARE = "prepare"
-    COMMIT = "commit"
     ABORT = "abort"
 
 
@@ -760,9 +759,6 @@ class TreeComponent(ABC):
         full_transfer: PoolTransfer,
         transfer: PoolTransfer,
         prefix_len: int,
-        *,
-        insert_result: Optional[InsertResult] = None,
-        canonical_full: Optional[torch.Tensor] = None,
     ) -> Optional[PoolTransfer]:
-        """Prepare, commit, or abort this component's direct load."""
+        """Prepare or abort this component's direct load into ``req``'s slots."""
         return transfer
