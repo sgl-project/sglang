@@ -19,7 +19,7 @@ use dynamo_protocols::types::{
 use futures::StreamExt;
 use serde::Serialize;
 
-use super::protocol::{ChatCompletionRequest, lower_chat_request};
+use super::protocol::{ChatCompletionRequest, expand_bootstrap_rooms, lower_chat_request};
 use super::{completion_usage, unix_seconds_u32};
 use crate::engine::response::merge_indexed;
 
@@ -36,8 +36,14 @@ pub(crate) async fn prepare_request(
     renderer: &crate::RendererService,
     request: ChatCompletionRequest,
 ) -> Result<(String, crate::PreparedChat), ResponseError> {
+    let bootstrap_room = request.extensions.bootstrap_room.clone();
     let (response_id, request) = lower_chat_request(renderer.config(), request)?;
-    let chat = renderer.prepare_chat(request).await?;
+    let bootstrap_rooms = expand_bootstrap_rooms(bootstrap_room, 1, request.choice_count)
+        .map_err(crate::RendererError::from)?;
+    let mut chat = renderer.prepare_chat(request).await?;
+    for (request, room) in chat.requests.iter_mut().zip(bootstrap_rooms) {
+        request.metadata.bootstrap_room = room;
+    }
     Ok((response_id, chat))
 }
 
