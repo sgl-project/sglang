@@ -19,15 +19,16 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 transfer_state_per_layer_direct_pf_lf = None
 transfer_state_all_layer_direct_lf_pf = None
 transfer_mamba_state = None
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_direct,
@@ -460,7 +461,9 @@ class MambaPoolHost(HostKVCache):
             )
             dst.index_copy_(0, dst_indices.to(dst.device), staged)
             return
-        if io_backend == "kernel":
+        # XPU: transfer_kv_mamba_{pf_lf,lf_pf} are CUDA-JIT (tvm_ffi + nvcc)
+        # and are not portable; fall through to the sgl_kernel direct path.        
+        if io_backend == "kernel" and not _is_xpu:
             item_size = MambaPoolHost._item_size_per_index(dst)
             # Mamba JIT kernel expects all index tensors on CUDA.
             # host_indices may be on CPU (kept there by start_writing when
@@ -476,7 +479,7 @@ class MambaPoolHost(HostKVCache):
                 item_size=item_size,
                 src_layout_dim=item_size * num_layers,
             )
-        elif io_backend == "direct":
+        elif io_backend == "direct" or (io_backend == "kernel" and _is_xpu):
             transfer_kv_per_layer_direct_pf_lf(
                 src_ptrs=[src],
                 dst_ptrs=[dst],
@@ -543,7 +546,9 @@ class MambaPoolHost(HostKVCache):
                 can_use_jit=can_use_jit,
             )
             return
-        if io_backend == "kernel":
+        # XPU: transfer_kv_mamba_{pf_lf,lf_pf} are CUDA-JIT (tvm_ffi + nvcc)
+        # and are not portable; fall through to the sgl_kernel direct path.
+        if io_backend == "kernel" and not _is_xpu:
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
             transfer_kv_mamba_lf_pf(
                 src_ptrs=src_ptrs,
@@ -554,7 +559,7 @@ class MambaPoolHost(HostKVCache):
                 dst_layout_dim=item_size * num_layers,
                 num_layers=num_layers,
             )
-        elif io_backend == "direct":
+        elif io_backend == "direct" or (io_backend == "kernel" and _is_xpu):
             src_ptrs = [src_layers[i] for i in range(num_layers)]
             transfer_kv_all_layer_direct_lf_pf(
                 src_ptrs=src_ptrs,
