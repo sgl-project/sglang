@@ -72,15 +72,18 @@ class LRUFileEvictor:
         is_mla_model: bool,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
+        owns_key: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.file_path = file_path
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
         self._on_evict = on_evict
 
-        # MLA ranks share the same physical files, so centralize LRU bookkeeping
-        # on rank 0; non-MLA ranks each own their own files via the suffix.
-        self._is_storage_owner = (not is_mla_model) or (tp_rank == 0)
+        # Hybrid MLA models also own TP-local state, selected by owns_key.
+        self._is_storage_owner = (
+            owns_key is not None or not is_mla_model or tp_rank == 0
+        )
+        self._owns_key = owns_key or (lambda key: self._is_storage_owner)
 
         # suffixed_key -> file size in bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()
@@ -175,9 +178,9 @@ class LRUFileEvictor:
         """
         if not self._eviction_configured:
             return True  # unbounded storage: nothing to enforce
-        if not self._is_storage_owner:
+        if not self._owns_key(suffixed_key):
             logger.warning(
-                f"HiCacheFile rank {self._tp_rank} is not the MLA storage owner; "
+                f"HiCacheFile rank {self._tp_rank} does not own this key; "
                 f"not caching new key {key} because file eviction is enabled."
             )
             return False
@@ -240,7 +243,7 @@ class LRUFileEvictor:
 
     def touch(self, suffixed_key: str, tensor_path: str) -> None:
         """Mark key as MRU, adopting an untracked on-disk file if needed."""
-        if not self._eviction_enabled:
+        if not self._eviction_enabled or not self._owns_key(suffixed_key):
             return
         with self._lock:
             if suffixed_key in self._lru:
@@ -307,7 +310,7 @@ class LRUFileEvictor:
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if not stem.endswith(self.config_suffix):
+            if not stem.endswith(self.config_suffix) or not self._owns_key(stem):
                 continue
             fp = os.path.join(self.file_path, fn)
             try:

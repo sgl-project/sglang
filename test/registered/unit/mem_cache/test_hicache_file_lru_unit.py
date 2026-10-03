@@ -30,6 +30,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     MetadataCache,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
 )
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
 from sglang.test.test_utils import CustomTestCase
@@ -303,15 +306,17 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
         self.assertTrue(b._evictor.is_storage_owner)
         self.assertTrue(b._evictor.enabled)
 
-    def test_mla_rank1_skips_eviction(self):
+    def test_mla_rank1_only_owns_sharded_state(self):
         b = self.make_backend(max_size="200", is_mla=True, tp_rank=1, tp_size=2)
-        self.assertFalse(b._evictor.is_storage_owner)
-        self.assertFalse(b._evictor.enabled)
-        # Non-owner MLA ranks must not create new files when eviction is on.
+        self.assertTrue(b._evictor.is_storage_owner)
+        self.assertTrue(b._evictor.enabled)
+        # Replicated pages are still owned by rank 0.
         self.assertFalse(b.set("a", _t(50)))
         self.assertFalse(b.exists("a"))
         self.assertEqual(len(b._evictor._lru), 0)
         self.assertEqual(b._evictor._total_bytes, 0)
+        self.assertTrue(b.set("a.mamba", _t(50)))
+        self.assertEqual(b._evictor._total_bytes, 50)
 
     def test_mla_rank1_can_touch_existing_file(self):
         # Non-owner ranks may still touch existing files, just not create new ones.
@@ -328,6 +333,82 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
         b = self.make_backend(max_size="200", is_mla=False, tp_rank=3, tp_size=4)
         self.assertTrue(b._evictor.is_storage_owner)
         self.assertTrue(b._evictor.enabled)
+
+
+class TestMLAMambaIsolation(HiCacheFileLRUTestBase):
+    def test_rank_local_roundtrip_and_existence(self):
+        for metadata in (False, True):
+            with self.subTest(metadata=metadata):
+                ranks = [
+                    self.make_backend(
+                        is_mla=True,
+                        tp_rank=rank,
+                        tp_size=2,
+                        subdir=f"shared-{metadata}",
+                        enable_metadata_cache=metadata,
+                    )
+                    for rank in range(2)
+                ]
+                transfer = PoolTransfer(
+                    PoolName.MAMBA,
+                    keys=["prefix"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+                ranks[0].set("prefix", _t(16, 99))
+                ranks[0].set("prefix.indexer", _t(16, 77))
+                # Legacy state must not satisfy any rank's lookup.
+                legacy = os.path.join(
+                    ranks[0].file_path, f"prefix.mamba{ranks[0].config_suffix}.bin"
+                )
+                with open(legacy, "wb") as f:
+                    f.write(bytes([255]) * 16)
+                for rank, backend in enumerate(ranks):
+                    self.assertEqual(
+                        backend.batch_exists_v2(["prefix"], [transfer]).kv_hit_pages,
+                        0,
+                    )
+                    self.assertTrue(backend.set("prefix.mamba", _t(16, rank + 17)))
+                for rank, backend in enumerate(ranks):
+                    self.assertEqual(
+                        backend.batch_exists_v2(["prefix"], [transfer]).kv_hit_pages,
+                        1,
+                    )
+                    restored = backend.get("prefix.mamba", _t(16))
+                    self.assertTrue(torch.equal(restored, _t(16, rank + 17)))
+                    self.assertTrue(
+                        torch.equal(backend.get("prefix", _t(16)), _t(16, 99))
+                    )
+                    self.assertTrue(
+                        torch.equal(backend.get("prefix.indexer", _t(16)), _t(16, 77))
+                    )
+
+    def test_restart_and_eviction_preserve_other_ranks(self):
+        def backend(rank):
+            return self.make_backend(
+                is_mla=True,
+                tp_rank=rank,
+                tp_size=2,
+                max_size=100,
+                eviction_ratio=1.0,
+                subdir="shared",
+            )
+
+        r0, r1 = backend(0), backend(1)
+        self.assertTrue(r0.set("prefix", _t(40, 99)))
+        self.assertTrue(r0.set("prefix.mamba", _t(40, 17)))
+        self.assertTrue(r1.set("prefix.mamba", _t(40, 23)))
+        # Startup scans and reads must not adopt files owned by another rank.
+        r0, r1 = backend(0), backend(1)
+        self.assertEqual(r0._evictor._total_bytes, 80)
+        self.assertEqual(r1._evictor._total_bytes, 40)
+        self.assertIsNotNone(r1.get("prefix", _t(40)))
+        self.assertEqual(r1._evictor._total_bytes, 40)
+        self.assertTrue(r1.set("next.mamba", _t(80, 31)))
+        self.assertFalse(r1.exists("prefix.mamba"))
+        self.assertTrue(r0.exists("prefix.mamba"))
+        self.assertTrue(r0.exists("prefix"))
+        self.assertTrue(r0.set("next.mamba", _t(80, 47)))
+        self.assertTrue(r1.exists("next.mamba"))
 
 
 class TestTrackOrTouch(HiCacheFileLRUTestBase):
