@@ -162,8 +162,12 @@ verifies native KV pool exhaustion on single-rank, TP2, PP2 and combined TP2/PP2
 serving. It checks original capture IDs, all-rank retirement and slot reuse,
 fresh admission, and complete Store reads after producer exit. Resuming a
 retracted request does not start a second capture. The verified matrix uses
-16-token KV/teacher D2H batches, synchronous PP, Qwen3-0.6B and TCP Store;
-P/D AR pressure and production SLOs require separate validation.
+16-token KV/teacher D2H batches, synchronous PP, Qwen3-0.6B and TCP Store.
+The [P/D pressure suite](../../../../mooncake-study/experiments/PD_MEMORY_PRESSURE.md)
+also verifies AR across matching single-rank, TP2, PP2 and TP2/PP2 endpoints.
+Every D rank checks exact CPU backup/restore of all local target layers,
+retirement of the original capture and post-exit Store reads. Asymmetric and
+cross-node pressure, production retention and serving SLOs remain separate.
 
 ### Operator Control
 

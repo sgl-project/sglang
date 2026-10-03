@@ -631,8 +631,9 @@ graph 用例覆盖 PP 的一请求/两请求 decode replay，非 PP 覆盖三请
 TP overlap 用例逐 rank 检查 pending-result lookahead。未改变生产 scheduler、
 capture 或 Store 逻辑。详细证据见
 [`experiments/capture-ar-distributed-pressure.json`](experiments/capture-ar-distributed-pressure.json)。
-此扩展仍使用 Qwen3-0.6B、Triton、TCP Store 与 HTTP test Catalog；P/D AR 压力、
-非对称拓扑、跨节点 RDMA 压力、饱和回压和生产 SLO 仍需单独验收。
+此扩展仍使用 Qwen3-0.6B、Triton、TCP Store 与 HTTP test Catalog；P/D AR 的
+后续验收见第 13.3.1 节。非对称拓扑、跨节点 RDMA 压力、饱和回压和生产 SLO
+仍需单独验收。
 
 ## 8. Mooncake 接入与存储协议
 
@@ -1079,6 +1080,23 @@ PP1 覆盖同步/overlap 与 eager/graph 四种组合，TP1/PP2 和 TP2/PP2
 正常存活请求与随后新增请求仍可发布，P/D 进程树退出后再次校验全部样本。
 测试关闭 debug retract，并等待单 rank 后台采样租约准备完毕后才发送初始批次。
 cohort 允许本地撤回与先收到 peer 失败两种时序，但必须对应同一个失败租约。
+
+普通 AR 的 P/D 容量压力也已通过 12 项 H100 验收：单 rank 与 TP2 的
+同步/overlap、eager/Full decode graph，以及 PP2 与 TP2/PP2 的同步
+eager/graph。每个 D rank 都检查四个 capture context 同时存活、相同的原
+capture ID、真实容量不足与回收计数、失败租约及后续新请求准入。测试仅在
+初始 ready queue 等待四条 KV 传输到齐，allocator 和撤回判断不作替换。
+
+这 12 项共撤销 24 份采集，执行 48 次 rank 本地 CPU KV 恢复，覆盖全部
+28 层 K/V 的逐值相等检查。36 份完整样本、1,260 个 tensor object 和
+68,874,144 bytes 在 P/D producer 退出后由新 Store client 校验。AR 使用
+16-token teacher/KV D2H staging，并启用原有 decode radix cache。复现入口见
+[`experiments/PD_MEMORY_PRESSURE.md`](experiments/PD_MEMORY_PRESSURE.md)。
+同一加强后的测试框架还通过 8 项 DSpark 回归；合计 20 项、80 次 rank 本地
+恢复与 60 份完整快照，原始命令、计数及源码摘要见
+[`experiments/pd-ar-memory-pressure.json`](experiments/pd-ar-memory-pressure.json)。
+此结果仍限于匹配 TP/PP、Qwen3-0.6B、Triton、TCP 与测试 Catalog；不证明
+非对称或跨节点压力、生产数据保留、训练质量或服务 SLO。
 详细检查、测试观测的开销和未覆盖范围见
 [P/D memory-pressure runbook](experiments/PD_MEMORY_PRESSURE.md)。
 

@@ -47,7 +47,7 @@ it does not redefine the goal as the modules already implemented.
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | Operator capture control | Authenticated pause/resume/abort management route, distributed readiness gating, P/D teacher epoch fencing, independent pause metrics | Initial HTTP/CPU and single-rank P/D suites pass; matching TP2/PP1, TP1/PP2 and TP2/PP2 AR/static target-KV DSpark add twelve live-control cells with 96 complete post-exit snapshots; asymmetric and cross-node live control remain open |
-| AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes single-rank and TP2 synchronous/overlap, plus PP2 and combined TP2/PP2 synchronous eager/graph combinations; all-rank retirement, slot reuse, admission recovery and 36 complete post-exit Store reads pass; distributed P/D AR pressure, asymmetric topologies and SLOs remain open |
+| AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Colocated 256-token and P/D 512-token KV exhaustion pass single-rank/TP2 synchronous/overlap plus PP2/combined TP2/PP2 synchronous eager/graph; P/D adds 48 all-layer rank restores and 36 post-exit snapshots; asymmetric pressure, saturated backpressure and SLOs remain open |
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes colocated and P/D PP1 synchronous/overlap and eager/graph combinations, plus synchronous TP1/PP2 and TP2/PP2 eager/graph; P/D checks exact all-layer CPU restore and failed Catalog leases |
 | PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2, synchronous P2/D2 and P2/D1, matching TP2/PP2, and cross-node TP1 RDMA pass eager/graph source parity and failure exclusion; wider distributed RDMA remains open |
 | Pipeline draft serving | Synchronous static target-KV PP loop, per-stage graph activations, P/D queue agreement and cohort capture | Qwen3 TP1/PP2 and TP2/PP2 eager/graph colocated and P/D serving pass exact Mooncake readback and memory retraction; asynchronous PP and broader topologies remain open |
@@ -4349,10 +4349,62 @@ its manifest SHA-256 is
 These are Qwen3-0.6B BF16 correctness tests with Triton, TCP Store, an HTTP test
 Catalog, 16-token KV/teacher D2H batches and synchronous PP. Prefill graphs are
 disabled. Source observers verify preservation, not independent attention math
-or serving SLOs. Distributed P/D AR pressure, asymmetric topologies, cross-node
-RDMA pressure, saturated backpressure and production acceptance remain open.
+or serving SLOs. The separate P/D AR pressure matrix is recorded below;
+asymmetric topologies, cross-node RDMA pressure, saturated backpressure and
+production acceptance remain open.
 The temporary four-H100 allocation and worker are gone; the resident worker
 and resumed idle task remain live, with both task queues empty.
+
+## Ordinary AR P/D Pressure And Shared Regression (2026-10-03)
+
+The existing P/D pressure fixture now supports ordinary AR without a draft and
+checks every D rank's capture lifecycle. An admission observer records original
+lease IDs before transfer, and requires four concurrent capture contexts on
+every rank. Native retraction observations record actual capacity shortage and
+release. Nonce-tagged server-info probes check all rank-local reservations,
+failure counters and queues. The full READY count is summed across ranks,
+including the final-stage auxiliary owner. No production source changed.
+
+The workload keeps the existing 512-token KV pool and four disjoint 208-token
+paths. A ready-queue barrier waits for the four initial P/D transfers; it does
+not alter allocator decisions or retract/offload/restore. Retired requests
+finish generation from the ordinary CPU KV backup. Every local layer's K/V
+must exactly match the pre-offload source, the original capture must reach
+Catalog FAILED, and resume must not admit another capture. A fresh request
+must publish after recovery. The existing DSpark projection rebuild checks
+remain active in draft cases. AR keeps decode radix caching enabled and uses
+16-token teacher/KV staging; DSpark retains its one-token teacher setting.
+
+All 12 AR cases passed: single-GPU synchronous/overlap eager/graph (394.650s),
+TP2 synchronous/overlap plus PP2 synchronous eager/graph (777.190s), and combined
+TP2/PP2 synchronous eager/graph (263.045s). They complete 60 requests / 9,264
+output tokens, retire 24 captures and validate 48 rank-local all-layer restores.
+A new Store client reads 36 complete snapshots / 1,260 objects / 68,874,144 bytes
+after both serving processes exit.
+
+The eight existing DSpark pressure cases also pass the strengthened fixture:
+single-GPU four cases in 438.744s, PP2 two in 364.245s, and combined TP2/PP2 two
+in 355.113s. They add 16 retired captures, 32 rank-local KV/projection restores
+and 24 post-exit snapshots. All 20 cases total 100 requests / 15,440 output
+tokens, 40 retired captures, 80 rank-local KV restores, and 60 snapshots /
+1,992 objects / 114,986,848 bytes. Two passing startup probes and synthetic-draft
+seed snapshots are excluded from these totals.
+
+The [runbook](experiments/PD_MEMORY_PRESSURE.md) and
+[report](experiments/pd-ar-memory-pressure.json) retain commands, rank-local
+evidence and limitations. All 5,020 Python source and registered test files
+match the frozen runtime checkout. The 34-artifact archive is
+`/gpfs/user/fuxuanwei/mooncake-lab-archive/pd-ar-pressure-20261003`; its manifest
+SHA-256 is `8db66950e2ec7ce592d0a2f7f4208e163301cb7846d26d16783ecbe718afc768`.
+The temporary four-H100 allocation was deleted after its worker exited, with
+no serving processes or GPU workloads left. The resident worker and resumed
+idle task remain live; both experiment queues are empty.
+
+This validates matching P/D topologies on Qwen3-0.6B BF16 with Triton, TCP
+transfer/Store and the HTTP test Catalog. PP is synchronous and prefill graphs
+are disabled. Source observers and forced response tokens establish preservation,
+not production SLOs or model quality. Asymmetric/cross-node pressure, saturated
+backpressure, production retention and trained checkpoint acceptance remain open.
 
 ## Next Implementation
 
@@ -4360,8 +4412,8 @@ and resumed idle task remain live, with both task queues empty.
    DSpark prefill graph coverage to asymmetric P/D and other speculative modes.
    Extend the passing single-rank, TP2, PP2 and TP2/PP2 mixed-chunk matrix to
    P/D and cross-node transport. Extend distributed pressure beyond passing
-   colocated AR on single-rank, TP2, PP2 and combined TP2/PP2, and colocated/P/D
-   synchronous TP1/PP2 and TP2/PP2 DSpark to distributed P/D AR and asymmetric combined
+   colocated/P/D AR on single-rank, TP2, PP2 and combined TP2/PP2, and colocated/P/D
+   synchronous TP1/PP2 and TP2/PP2 DSpark to asymmetric combined
    topologies. Broaden real-request coverage to speculative cache
    eviction, target weight replacement and
    saturated backpressure.

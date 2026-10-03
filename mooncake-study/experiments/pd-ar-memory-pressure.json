@@ -1,0 +1,6604 @@
+{
+  "status": "completed",
+  "date": "2026-10-03T06:25:36.597Z",
+  "base_commit": "a8557829fedd6386887df8c717f1ced088c7feb0",
+  "feature": "Ordinary AR P/D capture retirement, all-layer CPU KV restore and complete post-exit Store reads",
+  "production_change": "None; shared pressure fixtures now cover AR and strengthen existing DSpark acceptance.",
+  "environment": {
+    "time": "2026-10-03T05:53:26.591Z",
+    "pod": "job-79ad7e46987d-20261003134557-master-0",
+    "node": "node233",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "gpus": "0, NVIDIA H100 80GB HBM3, GPU-a2d3982c-8f40-b4b7-f0be-b76360d2d2da, 81559 MiB, 535.154.05\n1, NVIDIA H100 80GB HBM3, GPU-75674ffd-3a4a-1112-4ec0-7ada74134450, 81559 MiB, 535.154.05\n2, NVIDIA H100 80GB HBM3, GPU-5c1fde0f-12e6-2ec4-0535-c0cf3fd943b3, 81559 MiB, 535.154.05\n3, NVIDIA H100 80GB HBM3, GPU-5add137d-637d-fe59-b106-42f07f8fa947, 81559 MiB, 535.154.05",
+    "runtime": {
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "attention": "Triton",
+    "model": "Qwen3-0.6B BF16",
+    "transfer": "TCP",
+    "store": "TCP",
+    "catalog": "HTTP TestCaptureCatalog",
+    "removed_pod_system_packages": [
+      "flashinfer-cubin==0.6.12",
+      "flashinfer-jit-cache==0.6.12+cu130"
+    ]
+  },
+  "jobs": [
+    {
+      "role": "ar-smoke",
+      "id": "01791006553969923706-bfbd3608efc7",
+      "state": "state",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "methods": 1,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+      "submission": {
+        "job_id": "01791006553969923706-bfbd3608efc7",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_pd_ar_pressure.py",
+          "TestPDARPressure.test_eager",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 840
+      },
+      "result": {
+        "job_id": "01791006553969923706-bfbd3608efc7",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791006670.2938828,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791006553969923706-bfbd3608efc7.log"
+      },
+      "elapsed_seconds": 102.929,
+      "log_sha256": "b8ab2cacd01a1934cc3bf36da46056db81eb0b8cc2ff11fd0b71de844dd41df9"
+    },
+    {
+      "role": "pp-smoke",
+      "id": "01791006627400392029-4f90e3dcbc1c",
+      "state": "state-pd-ar-pressure",
+      "pod": "job-79ad7e46987d-20261003134557-master-0",
+      "methods": 1,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+      "submission": {
+        "job_id": "01791006627400392029-4f90e3dcbc1c",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_pd_ar_distributed_pressure.py",
+          "TestPDARPPPressure.test_graph",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 840
+      },
+      "result": {
+        "job_id": "01791006627400392029-4f90e3dcbc1c",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791006825.3613608,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-ar-pressure/logs/01791006627400392029-4f90e3dcbc1c.log"
+      },
+      "elapsed_seconds": 174.142,
+      "log_sha256": "5406b7d51008fca7a7d34ba4449b1a1358a2a470dbb58787ba6981744712869c"
+    },
+    {
+      "role": "single",
+      "id": "01791006702518203034-7d2b5e1d3586",
+      "state": "state",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "methods": 4,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+      "submission": {
+        "job_id": "01791006702518203034-7d2b5e1d3586",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_pd_ar_pressure.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1560
+      },
+      "result": {
+        "job_id": "01791006702518203034-7d2b5e1d3586",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791007109.8382525,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791006702518203034-7d2b5e1d3586.log"
+      },
+      "elapsed_seconds": 394.65,
+      "log_sha256": "41dfaee03d92f224c611c33df114d3b400d3b87f674eaa3b52be7d11749340bb"
+    },
+    {
+      "role": "dspark-single",
+      "id": "01791006702916317978-0ab4b1da6e30",
+      "state": "state",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "methods": 4,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+      "submission": {
+        "job_id": "01791006702916317978-0ab4b1da6e30",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_pd_dspark_pressure.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1560
+      },
+      "result": {
+        "job_id": "01791006702916317978-0ab4b1da6e30",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791007560.5017865,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791006702916317978-0ab4b1da6e30.log"
+      },
+      "elapsed_seconds": 438.744,
+      "log_sha256": "ceae425553ce4bbf35155ce78ec33e4b9a47b0c355c373a23dc4a9384b7d2854"
+    },
+    {
+      "role": "distributed",
+      "id": "01791006864526131166-88f93e04b476",
+      "state": "state-pd-ar-pressure",
+      "pod": "job-79ad7e46987d-20261003134557-master-0",
+      "methods": 6,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+      "submission": {
+        "job_id": "01791006864526131166-88f93e04b476",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_pd_ar_distributed_pressure.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 2040
+      },
+      "result": {
+        "job_id": "01791006864526131166-88f93e04b476",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791007662.9262414,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-ar-pressure/logs/01791006864526131166-88f93e04b476.log"
+      },
+      "elapsed_seconds": 777.19,
+      "log_sha256": "2d3d024fe6c0204abedffeef2d1fe3f49fc03106bd659ff1ee0534e6911f85d3"
+    },
+    {
+      "role": "combined",
+      "id": "01791006864921153206-12d83e4deafa",
+      "state": "state-pd-ar-pressure",
+      "pod": "job-79ad7e46987d-20261003134557-master-0",
+      "methods": 2,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+      "submission": {
+        "job_id": "01791006864921153206-12d83e4deafa",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_pd_ar_tp_pp_pressure.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1080
+      },
+      "result": {
+        "job_id": "01791006864921153206-12d83e4deafa",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791007946.0424457,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-ar-pressure/logs/01791006864921153206-12d83e4deafa.log"
+      },
+      "elapsed_seconds": 263.045,
+      "log_sha256": "91ec604f19fc5de1eab8702755d976eb119a4a670cd6f4d6557df38faee4f25b"
+    },
+    {
+      "role": "dspark-pp",
+      "id": "01791006865364375351-c3efa278b7e1",
+      "state": "state-pd-ar-pressure",
+      "pod": "job-79ad7e46987d-20261003134557-master-0",
+      "methods": 2,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+      "submission": {
+        "job_id": "01791006865364375351-c3efa278b7e1",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_pd_dspark_pp_pressure.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1080
+      },
+      "result": {
+        "job_id": "01791006865364375351-c3efa278b7e1",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791008330.1378455,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-ar-pressure/logs/01791006865364375351-c3efa278b7e1.log"
+      },
+      "elapsed_seconds": 364.245,
+      "log_sha256": "4ff080b6f4c81570a8fd5bd3cf07dedd87d4598f7600becdb2865043af47e33a"
+    },
+    {
+      "role": "dspark-combined",
+      "id": "01791006865784780735-629437f8d7e7",
+      "state": "state-pd-ar-pressure",
+      "pod": "job-79ad7e46987d-20261003134557-master-0",
+      "methods": 2,
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+      "submission": {
+        "job_id": "01791006865784780735-629437f8d7e7",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_pd_dspark_tp_pp_pressure.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-ar-pressure-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1080
+      },
+      "result": {
+        "job_id": "01791006865784780735-629437f8d7e7",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791008705.89127,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-pd-ar-pressure/logs/01791006865784780735-629437f8d7e7.log"
+      },
+      "elapsed_seconds": 355.113,
+      "log_sha256": "44960269566b5d7201e70f20d8cce236c350450d25cfef5a813b2e73a6938896"
+    }
+  ],
+  "cases": [
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": false,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-1-False-False-2",
+        "pressure-batch-1-1-False-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5727224,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-1-False-False-0": "e91eed058e064ed3a8e4605693440586",
+            "pressure-batch-1-1-False-False-1": "67821cf53be342deaa0193a5721d06b2",
+            "pressure-batch-1-1-False-False-2": "b381ace8eaaf4f7c8f852287b5f62999",
+            "pressure-batch-1-1-False-False-3": "a24d4b51fc09449cb2e33c08512f5910",
+            "pressure-fresh-1-1-False-False": "9e5c9e52019c44259a66ec0bb3ce0751"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-1-False-False-3",
+          "capture_id": "a24d4b51fc09449cb2e33c08512f5910",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-1-False-False-2",
+          "capture_id": "b381ace8eaaf4f7c8f852287b5f62999",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-1-False-False-3": "a24d4b51fc09449cb2e33c08512f5910",
+        "pressure-batch-1-1-False-False-2": "b381ace8eaaf4f7c8f852287b5f62999"
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 5,
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "eager_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 3
+          },
+          "reservations": 3,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": true,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-1-True-False-2",
+        "pressure-batch-1-1-True-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5727224,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-1-True-False-0": "32c2f67613ef41f896754039025e0c30",
+            "pressure-batch-1-1-True-False-1": "87f03190468c4a26960cfd949a446d4d",
+            "pressure-batch-1-1-True-False-2": "b788179724f44ce1a36b72fef206e7cc",
+            "pressure-batch-1-1-True-False-3": "56ead9fec4294fb1a662b9a7893997fc",
+            "pressure-fresh-1-1-True-False": "857c8186e74f43b59eebd7fa4826405b"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 385,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-1-True-False-3",
+          "capture_id": "56ead9fec4294fb1a662b9a7893997fc",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-1-True-False-2",
+          "capture_id": "b788179724f44ce1a36b72fef206e7cc",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-1-True-False-3": "56ead9fec4294fb1a662b9a7893997fc",
+        "pressure-batch-1-1-True-False-2": "b788179724f44ce1a36b72fef206e7cc"
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 5,
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "cuda_graph_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 3
+          },
+          "reservations": 3,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": false,
+      "enable_overlap": true,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-1-False-True-2",
+        "pressure-batch-1-1-False-True-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-1-False-True-0": "fef0c3e30bdb47c2bda9674653d9e217",
+            "pressure-batch-1-1-False-True-1": "efbca80b837746d98170a97a812f51a5",
+            "pressure-batch-1-1-False-True-2": "a311037e728c40cfb7b0e69ea5976b9f",
+            "pressure-batch-1-1-False-True-3": "30940a0fbc364cf7952b81da7b08c9cb",
+            "pressure-fresh-1-1-False-True": "ce31cb32066c41cfa8d92ac670bd4243"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-False-True-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-False-True-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 388,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-1-False-True-3",
+          "capture_id": "30940a0fbc364cf7952b81da7b08c9cb",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 127,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-1-False-True-2",
+          "capture_id": "a311037e728c40cfb7b0e69ea5976b9f",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 169,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-1-False-True-2": "a311037e728c40cfb7b0e69ea5976b9f",
+        "pressure-batch-1-1-False-True-3": "30940a0fbc364cf7952b81da7b08c9cb"
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 5,
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "overlap_forwards": 196,
+            "eager_forwards": 196,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 3
+          },
+          "reservations": 3,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": true,
+      "enable_overlap": true,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-1-True-True-2",
+        "pressure-batch-1-1-True-True-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-1-True-True-0": "9fd0c0b8779a4574bd228b211b294a34",
+            "pressure-batch-1-1-True-True-1": "11a2b7006a1b451ca3b67c68e4b866b5",
+            "pressure-batch-1-1-True-True-2": "c7ba83cd59d44585a060aa661667a3df",
+            "pressure-batch-1-1-True-True-3": "b4d0302f55544087af2b518933bb82ce",
+            "pressure-fresh-1-1-True-True": "bfe879d1e1f6488682f5e2be6a30696d"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-True-True-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-True-True-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 388,
+          "graph_frames": 388,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-1-True-True-3",
+          "capture_id": "b4d0302f55544087af2b518933bb82ce",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 127,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-1-True-True-2",
+          "capture_id": "c7ba83cd59d44585a060aa661667a3df",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 169,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-1-True-True-2": "c7ba83cd59d44585a060aa661667a3df",
+        "pressure-batch-1-1-True-True-3": "b4d0302f55544087af2b518933bb82ce"
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 5,
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "overlap_forwards": 196,
+            "cuda_graph_forwards": 196,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 3
+          },
+          "reservations": 3,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": "target_kv",
+      "replay": false,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-1-False-False-2",
+        "pressure-batch-1-1-False-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-1-False-False-0": "ca6b5487b66b46c580d91590ee27481e",
+            "pressure-batch-1-1-False-False-1": "d366898def1648d89cfd545a60a5a868",
+            "pressure-batch-1-1-False-False-2": "62d431a03ccb4ea3bef452d490a750b8",
+            "pressure-batch-1-1-False-False-3": "5bb113150f2e4997af66fd2a764a374f",
+            "pressure-fresh-1-1-False-False": "16473b92779347ffa7a7c6540892afb9"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-1-False-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-1-False-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 0,
+          "tp_rank": 0
+        }
+      ],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-1-False-False-3",
+          "capture_id": "5bb113150f2e4997af66fd2a764a374f",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-1-False-False-2",
+          "capture_id": "62d431a03ccb4ea3bef452d490a750b8",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-1-False-False-2": "62d431a03ccb4ea3bef452d490a750b8",
+        "pressure-batch-1-1-False-False-3": "5bb113150f2e4997af66fd2a764a374f"
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 5,
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "eager_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 3
+          },
+          "reservations": 3,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": "target_kv",
+      "replay": true,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-1-True-False-2",
+        "pressure-batch-1-1-True-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-1-True-False-0": "9426455d42a040df96accb35a24cb7a5",
+            "pressure-batch-1-1-True-False-1": "84465834d0ee40f2bd2bca2be132b35c",
+            "pressure-batch-1-1-True-False-2": "7b2353ac59b6435d81e81c4fdb72c6b9",
+            "pressure-batch-1-1-True-False-3": "4fbab03ea4db4b35806cd237acb3d8c0",
+            "pressure-fresh-1-1-True-False": "a322070e737b4c2bb88c2b9f6c007abd"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 97,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-1-True-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-1-True-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 0,
+          "tp_rank": 0
+        }
+      ],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-1-True-False-3",
+          "capture_id": "4fbab03ea4db4b35806cd237acb3d8c0",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-1-True-False-2",
+          "capture_id": "7b2353ac59b6435d81e81c4fdb72c6b9",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-1-True-False-3": "4fbab03ea4db4b35806cd237acb3d8c0",
+        "pressure-batch-1-1-True-False-2": "7b2353ac59b6435d81e81c4fdb72c6b9"
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 5,
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "cuda_graph_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 3
+          },
+          "reservations": 3,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": "target_kv",
+      "replay": false,
+      "enable_overlap": true,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-1-False-True-2",
+        "pressure-batch-1-1-False-True-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-1-False-True-0": "a7c6dc5b64494eac86e02f8b2f4c8e57",
+            "pressure-batch-1-1-False-True-1": "324cb9f29ad94254ad2314f17568c096",
+            "pressure-batch-1-1-False-True-2": "5173ad5f000d4286966cc2c1b5d52ffc",
+            "pressure-batch-1-1-False-True-3": "4f1881883b6141c390637b53e42e34ff",
+            "pressure-fresh-1-1-False-True": "2824b895737e4ca98ec0d65a5b370781"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-False-True-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-False-True-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 100,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-1-False-True-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-1-False-True-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 0,
+          "tp_rank": 0
+        }
+      ],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-1-False-True-3",
+          "capture_id": "4f1881883b6141c390637b53e42e34ff",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-1-False-True-2",
+          "capture_id": "5173ad5f000d4286966cc2c1b5d52ffc",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-1-False-True-3": "4f1881883b6141c390637b53e42e34ff",
+        "pressure-batch-1-1-False-True-2": "5173ad5f000d4286966cc2c1b5d52ffc"
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 5,
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 51,
+            "overlap_forwards": 51,
+            "eager_forwards": 51,
+            "speculative_commits_copied": 166,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 3
+          },
+          "reservations": 3,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 1,
+      "draft_kind": "target_kv",
+      "replay": true,
+      "enable_overlap": true,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-1-True-True-2",
+        "pressure-batch-1-1-True-True-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-1-True-True-0": "6bdcc1a4deee433cba47c9726c364a5f",
+            "pressure-batch-1-1-True-True-1": "1973761a18464b2a831d38a41d431ca4",
+            "pressure-batch-1-1-True-True-2": "1c1403b520934f1298a3a786c01365e6",
+            "pressure-batch-1-1-True-True-3": "dfdf7bcf95674267baf82d4b67dffd85",
+            "pressure-fresh-1-1-True-True": "c65cfdfb0fbe4f2c9cfe03a90b98d54a"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-True-True-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-1-True-True-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 100,
+          "graph_frames": 100,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-1-True-True-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-1-True-True-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 0,
+          "tp_rank": 0
+        }
+      ],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-1-True-True-3",
+          "capture_id": "dfdf7bcf95674267baf82d4b67dffd85",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-1-True-True-2",
+          "capture_id": "1c1403b520934f1298a3a786c01365e6",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-1-True-True-3": "dfdf7bcf95674267baf82d4b67dffd85",
+        "pressure-batch-1-1-True-True-2": "1c1403b520934f1298a3a786c01365e6"
+      },
+      "capture_after": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 5,
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 51,
+            "overlap_forwards": 51,
+            "cuda_graph_forwards": 51,
+            "speculative_commits_copied": 166,
+            "failed_request_aborted_or_retracted": 2,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "sealed": 3,
+            "snapshot_built": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 3
+          },
+          "reservations": 3,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 2,
+      "draft_kind": null,
+      "replay": false,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-2-False-False-2",
+        "pressure-batch-1-2-False-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5727224,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-2-False-False-0": "cef4fba0b083460887c6b718193540eb",
+            "pressure-batch-1-2-False-False-1": "906ce279d1d44cf88f879717b4d91ccc",
+            "pressure-batch-1-2-False-False-2": "aa86229b573545d1ae096af503f65c58",
+            "pressure-batch-1-2-False-False-3": "e66c280919db41d48fd78d72d8ba3e14",
+            "pressure-fresh-1-2-False-False": "5a99edee9f874025835987ee841881ba"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "pressure-batch-1-2-False-False-0": "cef4fba0b083460887c6b718193540eb",
+            "pressure-batch-1-2-False-False-1": "906ce279d1d44cf88f879717b4d91ccc",
+            "pressure-batch-1-2-False-False-2": "aa86229b573545d1ae096af503f65c58",
+            "pressure-batch-1-2-False-False-3": "e66c280919db41d48fd78d72d8ba3e14",
+            "pressure-fresh-1-2-False-False": "5a99edee9f874025835987ee841881ba"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-2-False-False-3",
+          "capture_id": "e66c280919db41d48fd78d72d8ba3e14",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-False-False-2",
+          "capture_id": "aa86229b573545d1ae096af503f65c58",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-False-False-3",
+          "capture_id": "e66c280919db41d48fd78d72d8ba3e14",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-False-False-2",
+          "capture_id": "aa86229b573545d1ae096af503f65c58",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-2-False-False-2": "aa86229b573545d1ae096af503f65c58",
+        "pressure-batch-1-2-False-False-3": "e66c280919db41d48fd78d72d8ba3e14"
+      },
+      "capture_after": {
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "eager_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 13654016,
+            "device_allocated_bytes": 590080,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "eager_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 2,
+      "draft_kind": null,
+      "replay": true,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-2-True-False-2",
+        "pressure-batch-1-2-True-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5727224,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-2-True-False-0": "751a04b602ad4fb482f4e70df0eadbab",
+            "pressure-batch-1-2-True-False-1": "6b8add6559b34dbd89989b610e57b7a1",
+            "pressure-batch-1-2-True-False-2": "4176a13199c44a8396a5c251934e7c96",
+            "pressure-batch-1-2-True-False-3": "26af7c6c0380496ebbd6ab5adcfa68e5",
+            "pressure-fresh-1-2-True-False": "6136f1213be24750bab748d5bad06880"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 385,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "pressure-batch-1-2-True-False-0": "751a04b602ad4fb482f4e70df0eadbab",
+            "pressure-batch-1-2-True-False-1": "6b8add6559b34dbd89989b610e57b7a1",
+            "pressure-batch-1-2-True-False-2": "4176a13199c44a8396a5c251934e7c96",
+            "pressure-batch-1-2-True-False-3": "26af7c6c0380496ebbd6ab5adcfa68e5",
+            "pressure-fresh-1-2-True-False": "6136f1213be24750bab748d5bad06880"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 385,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-2-True-False-3",
+          "capture_id": "26af7c6c0380496ebbd6ab5adcfa68e5",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-True-False-2",
+          "capture_id": "4176a13199c44a8396a5c251934e7c96",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-True-False-3",
+          "capture_id": "26af7c6c0380496ebbd6ab5adcfa68e5",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-True-False-2",
+          "capture_id": "4176a13199c44a8396a5c251934e7c96",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-2-True-False-2": "4176a13199c44a8396a5c251934e7c96",
+        "pressure-batch-1-2-True-False-3": "26af7c6c0380496ebbd6ab5adcfa68e5"
+      },
+      "capture_after": {
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "cuda_graph_forwards": 194,
+            "failed_peer_capture_failed": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 13654016,
+            "device_allocated_bytes": 590080,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "cuda_graph_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": false,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-2-1-False-False-2",
+        "pressure-batch-2-1-False-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 132,
+      "tensor_bytes": 5727224,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-2-1-False-False-0": "6e38819acfc346c9a6ef63cc0e78de2c",
+            "pressure-batch-2-1-False-False-1": "17676b6c71464550afd08f4a40390f30",
+            "pressure-batch-2-1-False-False-2": "b45eba82fc8d4602aa437c64e9fdc004",
+            "pressure-batch-2-1-False-False-3": "5970ee46bdf347a4916723a0fefa84be",
+            "pressure-fresh-2-1-False-False": "46968042c87646389166592eb4307577"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "pressure-batch-2-1-False-False-0": "6e38819acfc346c9a6ef63cc0e78de2c",
+            "pressure-batch-2-1-False-False-1": "17676b6c71464550afd08f4a40390f30",
+            "pressure-batch-2-1-False-False-2": "b45eba82fc8d4602aa437c64e9fdc004",
+            "pressure-batch-2-1-False-False-3": "5970ee46bdf347a4916723a0fefa84be",
+            "pressure-fresh-2-1-False-False": "46968042c87646389166592eb4307577"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-2-1-False-False-3",
+          "capture_id": "5970ee46bdf347a4916723a0fefa84be",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-False-False-2",
+          "capture_id": "b45eba82fc8d4602aa437c64e9fdc004",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-False-False-3",
+          "capture_id": "5970ee46bdf347a4916723a0fefa84be",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-False-False-2",
+          "capture_id": "b45eba82fc8d4602aa437c64e9fdc004",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-2-1-False-False-3": "5970ee46bdf347a4916723a0fefa84be",
+        "pressure-batch-2-1-False-False-2": "b45eba82fc8d4602aa437c64e9fdc004"
+      },
+      "capture_after": {
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "eager_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 6291456,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "eager_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 11556864,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": true,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-2-1-True-False-2",
+        "pressure-batch-2-1-True-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 132,
+      "tensor_bytes": 5727224,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-2-1-True-False-0": "ffde3f7cd42f491bbe7638cada8995d0",
+            "pressure-batch-2-1-True-False-1": "1a578e496bb647da981b9ae57cb2b080",
+            "pressure-batch-2-1-True-False-2": "007b22bf1c304953a850252f8a3ed7eb",
+            "pressure-batch-2-1-True-False-3": "d16759e20f3a43b6b1da325116b32755",
+            "pressure-fresh-2-1-True-False": "be625af92e314d5281183c07bc9dfb79"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 385,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "pressure-batch-2-1-True-False-0": "ffde3f7cd42f491bbe7638cada8995d0",
+            "pressure-batch-2-1-True-False-1": "1a578e496bb647da981b9ae57cb2b080",
+            "pressure-batch-2-1-True-False-2": "007b22bf1c304953a850252f8a3ed7eb",
+            "pressure-batch-2-1-True-False-3": "d16759e20f3a43b6b1da325116b32755",
+            "pressure-fresh-2-1-True-False": "be625af92e314d5281183c07bc9dfb79"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 385,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-2-1-True-False-3",
+          "capture_id": "d16759e20f3a43b6b1da325116b32755",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-True-False-2",
+          "capture_id": "007b22bf1c304953a850252f8a3ed7eb",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-True-False-3",
+          "capture_id": "d16759e20f3a43b6b1da325116b32755",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-True-False-2",
+          "capture_id": "007b22bf1c304953a850252f8a3ed7eb",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-2-1-True-False-2": "007b22bf1c304953a850252f8a3ed7eb",
+        "pressure-batch-2-1-True-False-3": "d16759e20f3a43b6b1da325116b32755"
+      },
+      "capture_after": {
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "cuda_graph_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 6291456,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "cuda_graph_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 11556864,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": false,
+      "enable_overlap": true,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-2-1-False-True-2",
+        "pressure-batch-2-1-False-True-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 132,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-2-1-False-True-0": "36375062e49c42058845220a17db59ae",
+            "pressure-batch-2-1-False-True-1": "2d74f9c4548049ce99dee3e211f7a2b4",
+            "pressure-batch-2-1-False-True-2": "0b16da6e5e414e53aeeae89ecbe450eb",
+            "pressure-batch-2-1-False-True-3": "c43213bc25a340d09fcaf91f65f1f3b9",
+            "pressure-fresh-2-1-False-True": "f0e36c37772c4db5b26e89df8130d4f8"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-False-True-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-False-True-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 388,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "pressure-batch-2-1-False-True-0": "36375062e49c42058845220a17db59ae",
+            "pressure-batch-2-1-False-True-1": "2d74f9c4548049ce99dee3e211f7a2b4",
+            "pressure-batch-2-1-False-True-2": "0b16da6e5e414e53aeeae89ecbe450eb",
+            "pressure-batch-2-1-False-True-3": "c43213bc25a340d09fcaf91f65f1f3b9",
+            "pressure-fresh-2-1-False-True": "f0e36c37772c4db5b26e89df8130d4f8"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-False-True-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-False-True-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 388,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-2-1-False-True-3",
+          "capture_id": "c43213bc25a340d09fcaf91f65f1f3b9",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 127,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-False-True-2",
+          "capture_id": "0b16da6e5e414e53aeeae89ecbe450eb",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 169,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-False-True-3",
+          "capture_id": "c43213bc25a340d09fcaf91f65f1f3b9",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 127,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-False-True-2",
+          "capture_id": "0b16da6e5e414e53aeeae89ecbe450eb",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 169,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-2-1-False-True-2": "0b16da6e5e414e53aeeae89ecbe450eb",
+        "pressure-batch-2-1-False-True-3": "c43213bc25a340d09fcaf91f65f1f3b9"
+      },
+      "capture_after": {
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "overlap_forwards": 196,
+            "eager_forwards": 196,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 6291456,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "overlap_forwards": 196,
+            "eager_forwards": 196,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 11556864,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "draft_kind": null,
+      "replay": true,
+      "enable_overlap": true,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-2-1-True-True-2",
+        "pressure-batch-2-1-True-True-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 132,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-2-1-True-True-0": "a3b03b81aee84d5cbb722f8f78dcc894",
+            "pressure-batch-2-1-True-True-1": "edddbabe90044ca9b95416e1050f6d68",
+            "pressure-batch-2-1-True-True-2": "ae635d8ed6c44ed7a0adfea8ed8c2118",
+            "pressure-batch-2-1-True-True-3": "8a641619279a43339a3fa1ba2db7b867",
+            "pressure-fresh-2-1-True-True": "d5a5c8aa4a4146d0a3c341464d4472d2"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-True-True-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-True-True-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 388,
+          "graph_frames": 388,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "pressure-batch-2-1-True-True-0": "a3b03b81aee84d5cbb722f8f78dcc894",
+            "pressure-batch-2-1-True-True-1": "edddbabe90044ca9b95416e1050f6d68",
+            "pressure-batch-2-1-True-True-2": "ae635d8ed6c44ed7a0adfea8ed8c2118",
+            "pressure-batch-2-1-True-True-3": "8a641619279a43339a3fa1ba2db7b867",
+            "pressure-fresh-2-1-True-True": "d5a5c8aa4a4146d0a3c341464d4472d2"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-True-True-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-1-True-True-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 388,
+          "graph_frames": 388,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-2-1-True-True-3",
+          "capture_id": "8a641619279a43339a3fa1ba2db7b867",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 127,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-True-True-2",
+          "capture_id": "ae635d8ed6c44ed7a0adfea8ed8c2118",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 169,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-True-True-3",
+          "capture_id": "8a641619279a43339a3fa1ba2db7b867",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 127,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-1-True-True-2",
+          "capture_id": "ae635d8ed6c44ed7a0adfea8ed8c2118",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 169,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-2-1-True-True-2": "ae635d8ed6c44ed7a0adfea8ed8c2118",
+        "pressure-batch-2-1-True-True-3": "8a641619279a43339a3fa1ba2db7b867"
+      },
+      "capture_after": {
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "overlap_forwards": 196,
+            "cuda_graph_forwards": 196,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 6291456,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "overlap_forwards": 196,
+            "cuda_graph_forwards": 196,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 11556864,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": true,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 2,
+      "draft_kind": null,
+      "replay": false,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-2-2-False-False-2",
+        "pressure-batch-2-2-False-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 132,
+      "tensor_bytes": 5727224,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-2-2-False-False-0": "631e092a8f054fe78e67d6e6d770baf6",
+            "pressure-batch-2-2-False-False-1": "b42d82fe307748f0a001600207a37fef",
+            "pressure-batch-2-2-False-False-2": "aa6a51c9ebc54e998ea0ccc5fb153455",
+            "pressure-batch-2-2-False-False-3": "cd1ba1836a484b49ab628bd340af85b5",
+            "pressure-fresh-2-2-False-False": "0b23bd7c4c014d348a7d2c3d3f6c3a15"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "pressure-batch-2-2-False-False-0": "631e092a8f054fe78e67d6e6d770baf6",
+            "pressure-batch-2-2-False-False-1": "b42d82fe307748f0a001600207a37fef",
+            "pressure-batch-2-2-False-False-2": "aa6a51c9ebc54e998ea0ccc5fb153455",
+            "pressure-batch-2-2-False-False-3": "cd1ba1836a484b49ab628bd340af85b5",
+            "pressure-fresh-2-2-False-False": "0b23bd7c4c014d348a7d2c3d3f6c3a15"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "pressure-batch-2-2-False-False-0": "631e092a8f054fe78e67d6e6d770baf6",
+            "pressure-batch-2-2-False-False-1": "b42d82fe307748f0a001600207a37fef",
+            "pressure-batch-2-2-False-False-2": "aa6a51c9ebc54e998ea0ccc5fb153455",
+            "pressure-batch-2-2-False-False-3": "cd1ba1836a484b49ab628bd340af85b5",
+            "pressure-fresh-2-2-False-False": "0b23bd7c4c014d348a7d2c3d3f6c3a15"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp1": {
+          "admissions": {
+            "pressure-batch-2-2-False-False-0": "631e092a8f054fe78e67d6e6d770baf6",
+            "pressure-batch-2-2-False-False-1": "b42d82fe307748f0a001600207a37fef",
+            "pressure-batch-2-2-False-False-2": "aa6a51c9ebc54e998ea0ccc5fb153455",
+            "pressure-batch-2-2-False-False-3": "cd1ba1836a484b49ab628bd340af85b5",
+            "pressure-fresh-2-2-False-False": "0b23bd7c4c014d348a7d2c3d3f6c3a15"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-2-2-False-False-3",
+          "capture_id": "cd1ba1836a484b49ab628bd340af85b5",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-2",
+          "capture_id": "aa6a51c9ebc54e998ea0ccc5fb153455",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-3",
+          "capture_id": "cd1ba1836a484b49ab628bd340af85b5",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-2",
+          "capture_id": "aa6a51c9ebc54e998ea0ccc5fb153455",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-3",
+          "capture_id": "cd1ba1836a484b49ab628bd340af85b5",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-2",
+          "capture_id": "aa6a51c9ebc54e998ea0ccc5fb153455",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-3",
+          "capture_id": "cd1ba1836a484b49ab628bd340af85b5",
+          "pp_rank": 1,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-2",
+          "capture_id": "aa6a51c9ebc54e998ea0ccc5fb153455",
+          "pp_rank": 1,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-2-2-False-False-2": "aa6a51c9ebc54e998ea0ccc5fb153455",
+        "pressure-batch-2-2-False-False-3": "cd1ba1836a484b49ab628bd340af85b5"
+      },
+      "capture_after": {
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "eager_forwards": 194,
+            "failed_request_aborted_or_retracted": 1,
+            "failed_peer_capture_failed": 1,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 9459712,
+            "device_allocated_bytes": 327936,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "eager_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp1-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "eager_forwards": 194,
+            "failed_request_aborted_or_retracted": 1,
+            "failed_peer_capture_failed": 1,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "eager_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 2,
+      "draft_kind": null,
+      "replay": true,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-2-2-True-False-2",
+        "pressure-batch-2-2-True-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 132,
+      "tensor_bytes": 5727224,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-2-2-True-False-0": "158be6e6a31d45788fee486fa12d4fda",
+            "pressure-batch-2-2-True-False-1": "f95f2391c32447a3a27c25fb7a0a4ed2",
+            "pressure-batch-2-2-True-False-2": "5c6091609d7147a284c4af40a28e0d3c",
+            "pressure-batch-2-2-True-False-3": "495005e0061743128414b5216dd7a477",
+            "pressure-fresh-2-2-True-False": "06d33b08d1404db587d5ebd260a9ee3e"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 385,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "pressure-batch-2-2-True-False-0": "158be6e6a31d45788fee486fa12d4fda",
+            "pressure-batch-2-2-True-False-1": "f95f2391c32447a3a27c25fb7a0a4ed2",
+            "pressure-batch-2-2-True-False-2": "5c6091609d7147a284c4af40a28e0d3c",
+            "pressure-batch-2-2-True-False-3": "495005e0061743128414b5216dd7a477",
+            "pressure-fresh-2-2-True-False": "06d33b08d1404db587d5ebd260a9ee3e"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 385,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "pressure-batch-2-2-True-False-0": "158be6e6a31d45788fee486fa12d4fda",
+            "pressure-batch-2-2-True-False-1": "f95f2391c32447a3a27c25fb7a0a4ed2",
+            "pressure-batch-2-2-True-False-2": "5c6091609d7147a284c4af40a28e0d3c",
+            "pressure-batch-2-2-True-False-3": "495005e0061743128414b5216dd7a477",
+            "pressure-fresh-2-2-True-False": "06d33b08d1404db587d5ebd260a9ee3e"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 385,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp1": {
+          "admissions": {
+            "pressure-batch-2-2-True-False-0": "158be6e6a31d45788fee486fa12d4fda",
+            "pressure-batch-2-2-True-False-1": "f95f2391c32447a3a27c25fb7a0a4ed2",
+            "pressure-batch-2-2-True-False-2": "5c6091609d7147a284c4af40a28e0d3c",
+            "pressure-batch-2-2-True-False-3": "495005e0061743128414b5216dd7a477",
+            "pressure-fresh-2-2-True-False": "06d33b08d1404db587d5ebd260a9ee3e"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 4,
+              "available_after": 112,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 2,
+              "required_next_decode": 3,
+              "available_after": 156,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 385,
+          "graph_frames": 385,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-2-2-True-False-3",
+          "capture_id": "495005e0061743128414b5216dd7a477",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-2",
+          "capture_id": "5c6091609d7147a284c4af40a28e0d3c",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-3",
+          "capture_id": "495005e0061743128414b5216dd7a477",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-2",
+          "capture_id": "5c6091609d7147a284c4af40a28e0d3c",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-3",
+          "capture_id": "495005e0061743128414b5216dd7a477",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-2",
+          "capture_id": "5c6091609d7147a284c4af40a28e0d3c",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-3",
+          "capture_id": "495005e0061743128414b5216dd7a477",
+          "pp_rank": 1,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 128,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-2",
+          "capture_id": "5c6091609d7147a284c4af40a28e0d3c",
+          "pp_rank": 1,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 170,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-2-2-True-False-2": "5c6091609d7147a284c4af40a28e0d3c",
+        "pressure-batch-2-2-True-False-3": "495005e0061743128414b5216dd7a477"
+      },
+      "capture_after": {
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "cuda_graph_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 9459712,
+            "device_allocated_bytes": 327936,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "cuda_graph_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp1-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "cuda_graph_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "cuda_graph_forwards": 194,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 2,
+      "draft_kind": "target_kv",
+      "replay": false,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-2-False-False-2",
+        "pressure-batch-1-2-False-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-2-False-False-0": "a9beb19b6aff4cb3827e7637e56ef97a",
+            "pressure-batch-1-2-False-False-1": "8c1e542242ee4ea99f2709ffd6d2db10",
+            "pressure-batch-1-2-False-False-2": "9307d65097a94c92b9c1ee4665825720",
+            "pressure-batch-1-2-False-False-3": "029d45aeb2284fd5bd42886e6a454460",
+            "pressure-fresh-1-2-False-False": "1a3439facb3048748049d5e9d77e415a"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "pressure-batch-1-2-False-False-0": "a9beb19b6aff4cb3827e7637e56ef97a",
+            "pressure-batch-1-2-False-False-1": "8c1e542242ee4ea99f2709ffd6d2db10",
+            "pressure-batch-1-2-False-False-2": "9307d65097a94c92b9c1ee4665825720",
+            "pressure-batch-1-2-False-False-3": "029d45aeb2284fd5bd42886e6a454460",
+            "pressure-fresh-1-2-False-False": "1a3439facb3048748049d5e9d77e415a"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-2-False-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-2-False-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-2-False-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 1,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-2-False-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 1,
+          "tp_rank": 0
+        }
+      ],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-2-False-False-3",
+          "capture_id": "029d45aeb2284fd5bd42886e6a454460",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-False-False-2",
+          "capture_id": "9307d65097a94c92b9c1ee4665825720",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-False-False-3",
+          "capture_id": "029d45aeb2284fd5bd42886e6a454460",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-False-False-2",
+          "capture_id": "9307d65097a94c92b9c1ee4665825720",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-2-False-False-2": "9307d65097a94c92b9c1ee4665825720",
+        "pressure-batch-1-2-False-False-3": "029d45aeb2284fd5bd42886e6a454460"
+      },
+      "capture_after": {
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "eager_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 13654016,
+            "device_allocated_bytes": 524288,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "eager_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_peer_capture_failed": 1,
+            "failed_request_aborted_or_retracted": 1,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 1,
+      "pp_size": 2,
+      "draft_kind": "target_kv",
+      "replay": true,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-1-2-True-False-2",
+        "pressure-batch-1-2-True-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 78,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-1-2-True-False-0": "e18ba4f26e8a4f4b9e429ddb24cfcc75",
+            "pressure-batch-1-2-True-False-1": "c0560d383c154b048ac294c9d41dcd4a",
+            "pressure-batch-1-2-True-False-2": "a58ee04a7e6e4cc08ba1abdb01fe410d",
+            "pressure-batch-1-2-True-False-3": "a14a15786d804799963a0823e65ff717",
+            "pressure-fresh-1-2-True-False": "ab67165a229944609348a070f2130b06"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 97,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "pressure-batch-1-2-True-False-0": "e18ba4f26e8a4f4b9e429ddb24cfcc75",
+            "pressure-batch-1-2-True-False-1": "c0560d383c154b048ac294c9d41dcd4a",
+            "pressure-batch-1-2-True-False-2": "a58ee04a7e6e4cc08ba1abdb01fe410d",
+            "pressure-batch-1-2-True-False-3": "a14a15786d804799963a0823e65ff717",
+            "pressure-fresh-1-2-True-False": "ab67165a229944609348a070f2130b06"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-1-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 97,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-2-True-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-2-True-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-2-True-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 1,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-1-2-True-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 1,
+          "tp_rank": 0
+        }
+      ],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-1-2-True-False-3",
+          "capture_id": "a14a15786d804799963a0823e65ff717",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-True-False-2",
+          "capture_id": "a58ee04a7e6e4cc08ba1abdb01fe410d",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-True-False-3",
+          "capture_id": "a14a15786d804799963a0823e65ff717",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-1-2-True-False-2",
+          "capture_id": "a58ee04a7e6e4cc08ba1abdb01fe410d",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-1-2-True-False-3": "a14a15786d804799963a0823e65ff717",
+        "pressure-batch-1-2-True-False-2": "a58ee04a7e6e4cc08ba1abdb01fe410d"
+      },
+      "capture_after": {
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "cuda_graph_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 13654016,
+            "device_allocated_bytes": 524288,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "cuda_graph_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_peer_capture_failed": 1,
+            "failed_request_aborted_or_retracted": 1,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 2,
+      "draft_kind": "target_kv",
+      "replay": false,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-2-2-False-False-2",
+        "pressure-batch-2-2-False-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 132,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-2-2-False-False-0": "2f76ec3b96854d5aa176a5cfcb5b6e1e",
+            "pressure-batch-2-2-False-False-1": "0ec3b6ca48b5478fa9330df0d9c56280",
+            "pressure-batch-2-2-False-False-2": "ac24e51e63fe4ac0a50862a103838b77",
+            "pressure-batch-2-2-False-False-3": "93a842aafc8b40839c96417c22e5054a",
+            "pressure-fresh-2-2-False-False": "ad1c5487c5024f35bf20de71270eba6b"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "pressure-batch-2-2-False-False-0": "2f76ec3b96854d5aa176a5cfcb5b6e1e",
+            "pressure-batch-2-2-False-False-1": "0ec3b6ca48b5478fa9330df0d9c56280",
+            "pressure-batch-2-2-False-False-2": "ac24e51e63fe4ac0a50862a103838b77",
+            "pressure-batch-2-2-False-False-3": "93a842aafc8b40839c96417c22e5054a",
+            "pressure-fresh-2-2-False-False": "ad1c5487c5024f35bf20de71270eba6b"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "pressure-batch-2-2-False-False-0": "2f76ec3b96854d5aa176a5cfcb5b6e1e",
+            "pressure-batch-2-2-False-False-1": "0ec3b6ca48b5478fa9330df0d9c56280",
+            "pressure-batch-2-2-False-False-2": "ac24e51e63fe4ac0a50862a103838b77",
+            "pressure-batch-2-2-False-False-3": "93a842aafc8b40839c96417c22e5054a",
+            "pressure-fresh-2-2-False-False": "ad1c5487c5024f35bf20de71270eba6b"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp1": {
+          "admissions": {
+            "pressure-batch-2-2-False-False-0": "2f76ec3b96854d5aa176a5cfcb5b6e1e",
+            "pressure-batch-2-2-False-False-1": "0ec3b6ca48b5478fa9330df0d9c56280",
+            "pressure-batch-2-2-False-False-2": "ac24e51e63fe4ac0a50862a103838b77",
+            "pressure-batch-2-2-False-False-3": "93a842aafc8b40839c96417c22e5054a",
+            "pressure-fresh-2-2-False-False": "ad1c5487c5024f35bf20de71270eba6b"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-False-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 0,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-False-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-False-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-False-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 0,
+          "tp_rank": 1
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-False-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 0,
+          "tp_rank": 1
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-False-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 1,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-False-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 1,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-False-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 1,
+          "tp_rank": 1
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-False-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 1,
+          "tp_rank": 1
+        }
+      ],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-2-2-False-False-3",
+          "capture_id": "93a842aafc8b40839c96417c22e5054a",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-2",
+          "capture_id": "ac24e51e63fe4ac0a50862a103838b77",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-3",
+          "capture_id": "93a842aafc8b40839c96417c22e5054a",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-2",
+          "capture_id": "ac24e51e63fe4ac0a50862a103838b77",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-3",
+          "capture_id": "93a842aafc8b40839c96417c22e5054a",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-2",
+          "capture_id": "ac24e51e63fe4ac0a50862a103838b77",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-3",
+          "capture_id": "93a842aafc8b40839c96417c22e5054a",
+          "pp_rank": 1,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-False-False-2",
+          "capture_id": "ac24e51e63fe4ac0a50862a103838b77",
+          "pp_rank": 1,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-2-2-False-False-3": "93a842aafc8b40839c96417c22e5054a",
+        "pressure-batch-2-2-False-False-2": "ac24e51e63fe4ac0a50862a103838b77"
+      },
+      "capture_after": {
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "eager_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 9459712,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "eager_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp1-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "eager_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "eager_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 2,
+      "draft_kind": "target_kv",
+      "replay": true,
+      "enable_overlap": false,
+      "kv_pool_tokens": 512,
+      "requested_path_tokens": 832,
+      "completed_requests": 4,
+      "output_tokens": 768,
+      "num_retractions": 2,
+      "retired_capture_requests": [
+        "pressure-batch-2-2-True-False-2",
+        "pressure-batch-2-2-True-False-3"
+      ],
+      "post_exit_snapshots": 3,
+      "producers_exited": true,
+      "tensor_objects": 132,
+      "tensor_bytes": 5764088,
+      "rank_observations": {
+        "pp0-tp0": {
+          "admissions": {
+            "pressure-batch-2-2-True-False-0": "bbea2ca90d3f4727b77b19de2fb0ba04",
+            "pressure-batch-2-2-True-False-1": "0df80c6e32a74f0e9c05dfca88510900",
+            "pressure-batch-2-2-True-False-2": "e7a77c0f1e7645eb9bb284921cd9c025",
+            "pressure-batch-2-2-True-False-3": "392bcd565b084a95af6cd594b0e668c5",
+            "pressure-fresh-2-2-True-False": "fdf39fb66b904553bcc50672d839c3d3"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 97,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp0": {
+          "admissions": {
+            "pressure-batch-2-2-True-False-0": "bbea2ca90d3f4727b77b19de2fb0ba04",
+            "pressure-batch-2-2-True-False-1": "0df80c6e32a74f0e9c05dfca88510900",
+            "pressure-batch-2-2-True-False-2": "e7a77c0f1e7645eb9bb284921cd9c025",
+            "pressure-batch-2-2-True-False-3": "392bcd565b084a95af6cd594b0e668c5",
+            "pressure-fresh-2-2-True-False": "fdf39fb66b904553bcc50672d839c3d3"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 97,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp0-tp1": {
+          "admissions": {
+            "pressure-batch-2-2-True-False-0": "bbea2ca90d3f4727b77b19de2fb0ba04",
+            "pressure-batch-2-2-True-False-1": "0df80c6e32a74f0e9c05dfca88510900",
+            "pressure-batch-2-2-True-False-2": "e7a77c0f1e7645eb9bb284921cd9c025",
+            "pressure-batch-2-2-True-False-3": "392bcd565b084a95af6cd594b0e668c5",
+            "pressure-fresh-2-2-True-False": "fdf39fb66b904553bcc50672d839c3d3"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 97,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "pp1-tp1": {
+          "admissions": {
+            "pressure-batch-2-2-True-False-0": "bbea2ca90d3f4727b77b19de2fb0ba04",
+            "pressure-batch-2-2-True-False-1": "0df80c6e32a74f0e9c05dfca88510900",
+            "pressure-batch-2-2-True-False-2": "e7a77c0f1e7645eb9bb284921cd9c025",
+            "pressure-batch-2-2-True-False-3": "392bcd565b084a95af6cd594b0e668c5",
+            "pressure-fresh-2-2-True-False": "fdf39fb66b904553bcc50672d839c3d3"
+          },
+          "peak_active_captures": 4,
+          "metric_retractions": 2,
+          "events": [
+            {
+              "available_before": 0,
+              "required_next_decode": 16,
+              "available_after": 128,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-3"
+              ],
+              "aborted": []
+            },
+            {
+              "available_before": 8,
+              "required_next_decode": 12,
+              "available_after": 176,
+              "debug_retract": false,
+              "retracted": [
+                "pressure-batch-2-2-True-False-2"
+              ],
+              "aborted": []
+            }
+          ],
+          "source_frames": 97,
+          "graph_frames": 97,
+          "batch_sizes": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      },
+      "rebuilt_contexts": [
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-True-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-True-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 0,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-True-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 0,
+          "tp_rank": 1
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-True-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 0,
+          "tp_rank": 1
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-True-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 1,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-True-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 1,
+          "tp_rank": 0
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-True-False-3",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 124,
+          "prefix_end": 124,
+          "pp_rank": 1,
+          "tp_rank": 1
+        },
+        {
+          "kind": "context",
+          "rid": "pressure-batch-2-2-True-False-2",
+          "retraction_ct": 1,
+          "previous_end": null,
+          "projected_end": 164,
+          "prefix_end": 164,
+          "pp_rank": 1,
+          "tp_rank": 1
+        }
+      ],
+      "kv_restores": [
+        {
+          "rid": "pressure-batch-2-2-True-False-3",
+          "capture_id": "392bcd565b084a95af6cd594b0e668c5",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-2",
+          "capture_id": "e7a77c0f1e7645eb9bb284921cd9c025",
+          "pp_rank": 0,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-3",
+          "capture_id": "392bcd565b084a95af6cd594b0e668c5",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-2",
+          "capture_id": "e7a77c0f1e7645eb9bb284921cd9c025",
+          "pp_rank": 0,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-3",
+          "capture_id": "392bcd565b084a95af6cd594b0e668c5",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-2",
+          "capture_id": "e7a77c0f1e7645eb9bb284921cd9c025",
+          "pp_rank": 1,
+          "tp_rank": 0,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-3",
+          "capture_id": "392bcd565b084a95af6cd594b0e668c5",
+          "pp_rank": 1,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 124,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        },
+        {
+          "rid": "pressure-batch-2-2-True-False-2",
+          "capture_id": "e7a77c0f1e7645eb9bb284921cd9c025",
+          "pp_rank": 1,
+          "tp_rank": 1,
+          "retraction_ct": 1,
+          "restored_tokens": 164,
+          "layers": [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "failed_captures": {
+        "pressure-batch-2-2-True-False-3": "392bcd565b084a95af6cd594b0e668c5",
+        "pressure-batch-2-2-True-False-2": "e7a77c0f1e7645eb9bb284921cd9c025"
+      },
+      "capture_after": {
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "cuda_graph_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 3
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 9459712,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "cuda_graph_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp1-tp1": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "cuda_graph_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        },
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "pd_handoff_committed": 5,
+            "speculative_verify_forwards": 49,
+            "cuda_graph_forwards": 49,
+            "speculative_commits_copied": 161,
+            "failed_request_aborted_or_retracted": 2,
+            "sealed": 3,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "reservations": 4,
+          "host_pool": {
+            "allocated_bytes": 2097152,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "enable_overlap": false,
+          "queued": 0
+        }
+      }
+    }
+  ],
+  "totals": {
+    "methods": 20,
+    "completed_requests": 100,
+    "output_tokens": 15440,
+    "retractions": 40,
+    "retired_captures": 40,
+    "snapshots": 60,
+    "rank_kv_restores": 80,
+    "tensor_objects": 1992,
+    "tensor_bytes": 114986848
+  },
+  "ar_totals": {
+    "methods": 12,
+    "completed_requests": 60,
+    "output_tokens": 9264,
+    "retractions": 24,
+    "retired_captures": 24,
+    "snapshots": 36,
+    "rank_kv_restores": 48,
+    "tensor_objects": 1260,
+    "tensor_bytes": 68874144
+  },
+  "dspark_totals": {
+    "methods": 8,
+    "completed_requests": 40,
+    "output_tokens": 6176,
+    "retractions": 16,
+    "retired_captures": 16,
+    "snapshots": 24,
+    "rank_kv_restores": 32,
+    "tensor_objects": 732,
+    "tensor_bytes": 46112704
+  },
+  "source_audit": {
+    "files": 5020,
+    "sha256": "07885b3ea921150793129d1e286cc90ea72bbcbc6b016aff17b299a1e1ded305"
+  },
+  "source_sha256": {
+    "python/sglang/test/pd_capture_pressure.py": "20dea13f326325532de707d0bf10e18f82fe6a22309aa3df8e5bc70f8af91032",
+    "python/sglang/test/pd_capture_pressure_server.py": "66abd37dc23c86e0691a7d0d12de3eb3bfde9f7b66e74c0cb05620f728829632",
+    "test/registered/storage/test_training_capture_pd_ar_pressure.py": "25f4c76c8b93a2741d50833e80c3810426ef9a251cead310611e7a17b0136c7d",
+    "test/registered/storage/test_training_capture_pd_ar_distributed_pressure.py": "1e0b7c61dbbfbd586d741eb9635984483a71c9764514ed76ff81cc4c021a75c1",
+    "test/registered/storage/test_training_capture_pd_ar_tp_pp_pressure.py": "a178b99ab9aa116fa88faf975c51e1b6feeb5def1eb0ff75dbc9fd2f6f107305",
+    "test/registered/storage/test_training_capture_pd_dspark_pressure.py": "67fac24f5af2ad93ccc15b3b3553f0119976bb02e05ac4873d8f692219a53504",
+    "test/registered/storage/test_training_capture_pd_dspark_pp_pressure.py": "1fc5c09d687dad94aa571aa6ea3f3d834ecbfebafeda207824e55a52bdc33e88",
+    "test/registered/storage/test_training_capture_pd_dspark_tp_pp_pressure.py": "523e9f780387b3bd797cf92708207d28ecc98251cc7694ec5ec770c0dc567873"
+  },
+  "cleanup": {
+    "temporary_allocation_deleted": true,
+    "temporary_worker_exited": true,
+    "resident_worker_verified_live": true,
+    "idle_load_resumed": true,
+    "queues_empty": true,
+    "evidence": "cleanup.json"
+  },
+  "limitations": [
+    "BF16 Qwen3-0.6B, Triton, TCP P/D transfer and Store, HTTP TestCaptureCatalog; separate P/D process groups share GPUs.",
+    "Four initial requests are held at the ready queue until all have transferred. Capacity decisions and retract/offload/restore run unchanged.",
+    "PP is synchronous; prefill graphs are disabled. AR uses 16-token teacher D2H batches; DSpark regression retains one-token teacher staging.",
+    "Forced response tokens and synchronized source observers establish preservation, not generation quality, independent attention math or serving SLOs.",
+    "Asymmetric P/D pressure, cross-node RDMA pressure, CUDA allocator/device errors and saturated backpressure remain separate acceptance scopes.",
+    "Production Catalog retention, consumer checkpoint replay and actual trained draft quality are not validated by test doubles or synthetic draft weights."
+  ],
+  "artifact_archive": {
+    "path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/pd-ar-pressure-20261003",
+    "files": 34,
+    "manifest": "artifact-manifest.json",
+    "sha256": "8db66950e2ec7ce592d0a2f7f4208e163301cb7846d26d16783ecbe718afc768"
+  }
+}

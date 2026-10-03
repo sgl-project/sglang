@@ -10,26 +10,54 @@ import requests
 import torch
 from prometheus_client.parser import text_string_to_metric_families
 
+from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.test.dspark_capture_observer import check_capture_snapshot
 from sglang.test.pd_capture_runtime import PDCaptureRuntimeBase
 from sglang.test.training_capture_utils import read_snapshot
 
 
 class PDCapturePressureBase(PDCaptureRuntimeBase):
+    draft_kind = "target_kv"
+    observer_module = "sglang.test.pd_capture_pressure_server"
+
+    def all_capture_states(self):
+        root = self.pressure_root / "decode" / "pressure-states"
+        root.mkdir(exist_ok=True)
+        nonce = str(time.monotonic_ns())
+        (root / "request").write_text(nonce)
+        response = requests.get(self.decode_url + "/server_info", timeout=10)
+        response.raise_for_status()
+        deadline = time.monotonic() + 10
+        states = {}
+        while len(states) != len(self.pressure_ranks):
+            for tp, pp in self.pressure_ranks:
+                rank = f"pp{pp}-tp{tp}"
+                path = root / (rank + ".json")
+                if path.exists():
+                    value = json.loads(path.read_text())
+                    if value["nonce"] == nonce:
+                        states[rank] = value["state"]
+            self.assertLess(time.monotonic(), deadline, states)
+            time.sleep(0.01)
+        return states
+
     def wait_capture_idle(self, *, min_available=0):
         deadline = time.monotonic() + 30
         while True:
-            state = self.capture_state()
-            if (
+            states = self.all_capture_states()
+            if all(
                 state["states"].get("available", 0) == state["reservations"]
                 and state["states"].get("available", 0) >= min_available
                 and state.get("queued", 0) == 0
                 and state.get("cohort_writer", {}).get("pending", 0) == 0
+                for state in states.values()
             ):
-                self.assertEqual(state["host_pool"]["quarantined"], 0)
-                self.assertIsNone(state["disabled_reason"])
-                return state
-            self.assertLess(time.monotonic(), deadline, state)
+                for state in states.values():
+                    self.assertEqual(state["host_pool"]["quarantined"], 0)
+                    self.assertIsNone(state["disabled_reason"])
+                    self.assertFalse(state["admission_paused"])
+                return states
+            self.assertLess(time.monotonic(), deadline, states)
             time.sleep(0.03)
 
     def retraction_metrics(self, tp_size, pp_size):
@@ -48,12 +76,13 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
 
     @patch.dict(os.environ, {"SGLANG_TEST_RETRACT": "0"})
     def exercise_pressure(self, *, replay, enable_overlap=False, tp_size=1, pp_size=1):
-        draft = self.get_draft("target_kv")
+        draft = self.get_draft(self.draft_kind) if self.draft_kind else None
         suffix = f"{tp_size}-{pp_size}-{replay}-{enable_overlap}"
         ranks = {(tp, pp) for tp in range(tp_size) for pp in range(pp_size)}
         distributed = tp_size * pp_size > 1
         root = self.root / f"pressure-{suffix}"
         root.mkdir()
+        self.pressure_root, self.pressure_ranks = root, ranks
         self.bootstrap_port, self.bootstrap_room = self.new_bootstrap_port(), 8000
         extra = [
             "--max-total-tokens",
@@ -61,6 +90,7 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
             "--num-reserved-decode-tokens",
             "16",
             "--enable-metrics",
+            "--enable-metrics-for-all-schedulers",
         ]
         prefill, self.prefill_url = self.launch(
             "prefill",
@@ -106,22 +136,20 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
         metric_after = self.retraction_metrics(tp_size, pp_size)
         for rank in ranks:
             self.assertEqual(metric_after[rank] - metric_before[rank], retractions)
-        self.assertEqual(
-            after["counters"]["admitted"] - before["counters"].get("admitted", 0),
-            4,
-            after,
-        )
-        failures = {
-            name: count - before["counters"].get(name, 0)
-            for name, count in after["counters"].items()
-            if name.startswith("failed_")
-        }
-        allowed = {"failed_request_aborted_or_retracted"}
-        if distributed:
-            # A peer's retraction can invalidate this rank before local release.
-            allowed.add("failed_peer_capture_failed")
-        self.assertLessEqual(failures.keys(), allowed)
-        self.assertEqual(sum(failures.values()), len(retired), failures)
+        for rank, state in after.items():
+            old = before[rank]["counters"]
+            self.assertEqual(state["counters"]["admitted"] - old.get("admitted", 0), 4)
+            failures = {
+                name: count - old.get(name, 0)
+                for name, count in state["counters"].items()
+                if name.startswith("failed_") and count > old.get(name, 0)
+            }
+            allowed = {"failed_request_aborted_or_retracted"}
+            if distributed:
+                # A peer's retraction can invalidate this rank before local release.
+                allowed.add("failed_peer_capture_failed")
+            self.assertLessEqual(failures.keys(), allowed, rank)
+            self.assertEqual(sum(failures.values()), len(retired), (rank, failures))
         self.catalog.wait_publications(first + len(successful), timeout=30)
         self.assertEqual(len(self.catalog.publications), first + len(successful))
 
@@ -133,14 +161,23 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
             first + len(successful), timeout=30
         )[first:]
         final = self.wait_capture_idle()
+        for rank, state in final.items():
+            self.assertEqual(
+                state["counters"]["admitted"]
+                - before[rank]["counters"].get("admitted", 0),
+                5,
+                rank,
+            )
         self.assertEqual(
-            final["counters"]["admitted"] - before["counters"].get("admitted", 0), 5
+            sum(s["counters"].get("ready", 0) for s in final.values())
+            - sum(s["counters"].get("ready", 0) for s in before.values()),
+            len(successful),
         )
         self.assertEqual(len(self.catalog.publications), first + len(successful))
 
         observations = [
             json.loads(line)
-            for path in sorted(draft.glob("observations*.jsonl"))
+            for path in (sorted(draft.glob("observations*.jsonl")) if draft else [])
             for line in path.read_text().splitlines()
         ]
         rebuilt = [
@@ -151,7 +188,7 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
             and item["retraction_ct"] > 0
             and item["previous_end"] is None
         ]
-        for tp, pp in ranks:
+        for tp, pp in ranks if draft else []:
             self.assertEqual(
                 {
                     item["rid"]
@@ -199,19 +236,92 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
                 self.assertNotIn(capture_id, self.catalog.publications)
                 failed_captures[rid] = capture_id
 
+        rank_observations, first_admissions = {}, None
+        for tp, pp in sorted(ranks):
+            rank = f"pp{pp}-tp{tp}"
+            admissions = [
+                json.loads(line)
+                for line in (root / "decode" / f"pressure-admissions-{rank}.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            by_request = {a["rid"]: a["capture_id"] for a in admissions}
+            self.assertEqual(len(admissions), 5, rank)
+            self.assertEqual(set(by_request), {*ids, fresh_id}, rank)
+            self.assertEqual(len(set(by_request.values())), 5, rank)
+            self.assertTrue(
+                any(set(a["active_capture_rids"]) == set(ids) for a in admissions),
+                (rank, "four simultaneous capture contexts required"),
+            )
+            if first_admissions is None:
+                first_admissions = by_request
+            self.assertEqual(by_request, first_admissions, rank)
+            for rid, capture_id in failed_captures.items():
+                self.assertEqual(by_request[rid], capture_id, (rank, rid))
+            for rid in successful:
+                self.assertIn(by_request[rid], self.catalog.publications, (rank, rid))
+            events = [
+                json.loads(line)
+                for line in (root / "decode" / f"pressure-retractions-{rank}.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual({rid for e in events for rid in e["retracted"]}, retired)
+            self.assertEqual(sum(len(e["retracted"]) for e in events), retractions)
+            for event in events:
+                self.assertFalse(event["debug_retract"])
+                self.assertFalse(event["aborted"])
+                self.assertLess(
+                    event["available_before"], event["required_next_decode"]
+                )
+                self.assertGreater(event["available_after"], event["available_before"])
+            rank_observations[rank] = {
+                "admissions": by_request,
+                "peak_active_captures": max(
+                    len(a["active_capture_rids"]) for a in admissions
+                ),
+                "metric_retractions": metric_after[(tp, pp)] - metric_before[(tp, pp)],
+                "events": events,
+            }
+
         references = [
             torch.load(path, weights_only=True)
-            for path in self.reference_paths(root) + sorted(draft.rglob("*.pt"))
+            for path in self.reference_paths(root)
+            + (sorted(draft.rglob("*.pt")) if draft else [])
         ]
         traces = {
             hashlib.sha256(rid.encode()).hexdigest(): tokens
             for rid, tokens in successful.items()
         }
         references = [frame for frame in references if frame["trace_id"] in traces]
-        self.assertTrue(any(frame["batch_size"] == 4 for frame in references))
-        self.assertEqual(any(frame["cuda_graph"] for frame in references), replay)
+        decode_references = [
+            frame
+            for frame in references
+            if frame.get("forward_mode") and frame.get("pd_role") != "prefill"
+        ]
+        for tp, pp in ranks:
+            local = [
+                f
+                for f in decode_references
+                if f["tp_rank"] == tp and f["pp_rank"] == pp
+            ]
+            self.assertTrue(any(f["batch_size"] == 4 for f in local))
+            self.assertEqual(any(f["cuda_graph"] for f in local), replay)
+            if enable_overlap and not draft:
+                self.assertTrue(any(f["result_lag"] == 1 for f in local))
+            self.assertEqual(any(f["predictions"] for f in local), pp == pp_size - 1)
+            rank_observations[f"pp{pp}-tp{tp}"].update(
+                source_frames=len(local),
+                graph_frames=sum(f["cuda_graph"] for f in local),
+                batch_sizes=sorted({f["batch_size"] for f in local}),
+            )
+        self.stop_process(prefill)
+        self.stop_process(decode)
+        reader = MooncakeSnapshotStore.connect(self.store_setup)
+        self.addCleanup(reader.close)
+        objects, tensor_bytes = 0, 0
         for publication in publications:
-            manifest, tensors = read_snapshot(self.reader, publication)
+            manifest, tensors = read_snapshot(reader, publication)
             self.assertEqual(
                 (manifest.topology.tp_size, manifest.topology.pp_size),
                 (tp_size, pp_size),
@@ -224,20 +334,21 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
                 manifest,
                 tensors,
                 references,
-                capture_mode="pd_speculative_accepted_target_path",
+                capture_mode="pd_speculative_accepted_target_path"
+                if draft
+                else "pd_autoregressive",
             )
+            objects += len(manifest.objects)
+            tensor_bytes += sum(t.nbytes for t in manifest.objects)
         self.assertFalse(traces)
         self.assertFalse(self.catalog.errors)
-        self.stop_process(prefill)
-        self.stop_process(decode)
-        for publication in publications:
-            read_snapshot(self.reader, publication)
         print(
             json.dumps(
                 {
                     "pd_memory_pressure": {
                         "tp_size": tp_size,
                         "pp_size": pp_size,
+                        "draft_kind": self.draft_kind,
                         "replay": replay,
                         "enable_overlap": enable_overlap,
                         "kv_pool_tokens": 512,
@@ -247,6 +358,11 @@ class PDCapturePressureBase(PDCaptureRuntimeBase):
                         "num_retractions": retractions,
                         "retired_capture_requests": sorted(retired),
                         "post_exit_snapshots": len(publications),
+                        "producers_exited": prefill.poll() is not None
+                        and decode.poll() is not None,
+                        "tensor_objects": objects,
+                        "tensor_bytes": tensor_bytes,
+                        "rank_observations": rank_observations,
                         "rebuilt_contexts": rebuilt,
                         "kv_restores": restored,
                         "failed_captures": failed_captures,

@@ -1,4 +1,4 @@
-# P/D Target-KV Draft Capture Under Memory Pressure
+# P/D AR And Target-KV Draft Capture Under Memory Pressure
 
 Run each complete file with matching SGLang dependencies, the Mooncake SDK and
 `mooncake_master` on `PATH`. The pipeline file requires two CUDA devices:
@@ -18,6 +18,22 @@ an independent Store segment and reader, and an HTTP Catalog test double. Both
 serving sides load the synthetic target-KV DSpark draft. PP1 crosses synchronous
 and overlap scheduling with eager and full verify CUDA graphs. PP2 runs
 synchronous eager and graph execution with matching P/D stage counts.
+
+The same fixture also covers ordinary AR without constructing or loading a
+draft. These suites use 16-token teacher D2H batches as well as the existing
+16-token KV staging, and keep decode radix caching enabled:
+
+```bash
+python test/registered/storage/test_training_capture_pd_ar_pressure.py -v -f
+python test/registered/storage/test_training_capture_pd_ar_distributed_pressure.py -v -f
+python test/registered/storage/test_training_capture_pd_ar_tp_pp_pressure.py -v -f
+```
+
+They require one, two and four visible GPUs respectively. P and D are distinct
+process groups sharing those GPUs, with matching topologies. Single-rank and
+TP2 AR cross synchronous/overlap scheduling with eager/full decode graphs;
+PP2 and combined TP2/PP2 AR use synchronous eager/graph execution. Prefill
+graphs remain disabled.
 
 ## Natural Capacity Exhaustion
 
@@ -63,8 +79,20 @@ The suite also requires:
 - Surviving and fresh samples match the independent online source observations
   for selected KV, raw top-128 logits and vocab IDs, full-vocabulary LSE, token
   IDs, positions, masks, teacher alignment and terminal KV validity.
-- Both producer process trees exit before the independent Store reader checks
-  every published snapshot again, including object digests and contents.
+- Both producer process trees exit before a new independent Store client checks
+  every published snapshot, including object digests and online source parity.
+
+The shared pressure observer now records admission IDs before transfer,
+requires four simultaneous capture contexts on every D rank, and observes
+the real allocator capacity around every retraction. All ranks must agree on
+the five request-to-capture mappings, including the fresh recovery request;
+resumed requests must not create another capture. Original failed IDs are
+matched to both CPU restore records and the Catalog. Nonce-tagged server-info
+probes check each D rank's counters, reservations and queues; publication READY
+is summed across ranks because only the auxiliary owner publishes it. All
+selected snapshot tensors are now checked by a new Store client after both
+producers exit. The DSpark-specific projection rebuild check remains enabled
+only for draft cases.
 
 The first test version treated an empty scheduler as a ready lease pool. Two
 early PP1 runs exposed intermittent 3-of-4 capture admission. Waiting for the
@@ -109,6 +137,41 @@ observations and all earlier attempts are retained in
 No production source changes were needed for these invariants. The temporary
 two-H100 job was deleted after its model and Store processes exited. The
 resident H100 has no queued experiment and resumed its 60% idle workload.
+
+## AR And Shared Fixture Regression (2026-10-03)
+
+The final frozen source passed all 20 cases with the strengthened shared
+observer and a new Store client created only after both producers exited:
+
+| Suite | Tests | Seconds | Post-exit snapshots |
+| --- | ---: | ---: | ---: |
+| AR single GPU | 4 | 394.650 | 12 |
+| AR TP2 and PP2 | 6 | 777.190 | 18 |
+| AR combined TP2/PP2 | 2 | 263.045 | 6 |
+| DSpark single GPU regression | 4 | 438.744 | 12 |
+| DSpark PP2 regression | 2 | 364.245 | 6 |
+| DSpark combined TP2/PP2 regression | 2 | 355.113 | 6 |
+| Total | 20 | | 60 |
+
+The AR matrix completes 60 requests / 9,264 output tokens, retires 24 capture
+attempts and checks 48 rank-local all-layer KV restores. Its 36 snapshots
+contain 1,260 tensor objects / 68,874,144 bytes. The eight DSpark regression
+cases add 40 requests / 6,176 output tokens, 16 retired captures, 32 rank-local
+KV restores and 24 snapshots / 732 objects / 46,112,704 bytes. All DSpark
+restores rebuild their projected context. The combined total is 80 rank-local
+restores and 1,992 objects / 114,986,848 bytes checked after producer exit.
+Two successful startup probes and the synthetic-draft seed snapshots are
+retained in the logs but excluded from these totals. No production changes
+were required.
+
+The [machine-readable report](pd-ar-memory-pressure.json) records exact jobs,
+per-rank admission/retraction/restore evidence, recovered state and source
+hashes. All 5,020 Python source and registered test files match the frozen
+checkout. The 34-artifact archive is
+`/gpfs/user/fuxuanwei/mooncake-lab-archive/pd-ar-pressure-20261003`, with manifest
+SHA-256 `8db66950e2ec7ce592d0a2f7f4208e163301cb7846d26d16783ecbe718afc768`.
+The temporary four-H100 worker exited and its allocation was deleted; the
+resident worker and resumed idle task were verified live, with both queues empty.
 
 ## Scope
 
