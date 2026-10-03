@@ -145,6 +145,11 @@ class ContextParallelStrategy(ABC):
     ) -> Any:
         """Gather rank-local KV payloads back to full token order."""
 
+    def local_q_indices(self, num_tokens: int, forward_batch: ForwardBatch) -> Any:
+        raise NotImplementedError(
+            f"{self.name} strategy does not support local q indices"
+        )
+
     def shard_per_request(
         self,
         extend_seqs_cpu: List[int],
@@ -180,9 +185,9 @@ class ContextParallelStrategy(ABC):
         positions: Any,
         input_embeds: Optional[Any] = None,
     ) -> Optional[Any]:
-        """Shard model inputs before model.forward in CP-v2 paths."""
+        """Shard model inputs before model.forward in CP paths."""
         if input_ids is not None:
-            forward_batch.cp_v2_input_ids = self.shard_hidden_states(
+            forward_batch.cp_input_ids = self.shard_hidden_states(
                 input_ids, forward_batch
             )
         forward_batch.positions = self.shard_position_ids(positions, forward_batch)
