@@ -357,9 +357,11 @@ class NvidiaKDAKernel(LinearAttnKernelBase):
         alog_flat = self._flat_param(A_log)
         dtb_flat = self._flat_param(dt_bias)
 
-        all_slot_indices = torch.where(
-            cache_indices >= 0, cache_indices, ssm_states.shape[0] - 1
-        ).to(torch.int64)
+        # Slot 0 is reserved for padded rows; MambaSlotAllocator only allocates
+        # 1..size, so the trailing row is a valid request/checkpoint slot.
+        all_slot_indices = torch.where(cache_indices >= 0, cache_indices, 0).to(
+            torch.int64
+        )
         state_backup = ssm_states.index_select(0, all_slot_indices).clone()
         packed_output = torch.empty_like(v)
 
