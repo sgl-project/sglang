@@ -28,7 +28,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary.residual.access import (
-    finish_layer_stack,
+    export_output,
     from_pp,
     snapshot,
 )
@@ -55,7 +55,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Qwen2Config = None
@@ -353,7 +353,7 @@ class Qwen2Model(nn.Module):
             self.pp_group.rank_in_group,
             self.pp_group.world_size,
         )
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
@@ -363,8 +363,6 @@ class Qwen2Model(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -427,9 +425,7 @@ class Qwen2Model(nn.Module):
                 residual,
             )
 
-        hidden_states, residual = finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = export_output(hidden_states, residual, forward_batch)
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

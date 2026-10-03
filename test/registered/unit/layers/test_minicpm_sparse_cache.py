@@ -1,3 +1,4 @@
+import functools
 import sys
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -240,13 +242,13 @@ def test_streaming_session_release_frees_compressed_slots():
     compressed_cache = pool._aux_cache
     assert len(compressed_cache.free_slots) < len(compressed_cache.reserved_slots)
 
-    session = StreamingSession(
-        SimpleNamespace(
-            req_to_token_pool=pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=1,
-        )
+    cache = SimpleNamespace(
+        req_to_token_pool=pool,
+        token_to_kv_pool_allocator=allocator,
+        page_size=1,
     )
+    cache.free_kv_row = functools.partial(BasePrefixCache.free_kv_row, cache)
+    session = StreamingSession(cache)
     session.slots["session-a"] = SessionSlot(
         kv=ReqKvInfo(req_pool_idx=req_pool_idx, kv_allocated_len=16),
     )
