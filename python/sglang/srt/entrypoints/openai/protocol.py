@@ -888,6 +888,7 @@ class ChatCompletionRequest(BaseModel):
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
+    return_outputs_via_store: bool = False
     return_cached_tokens_details: bool = False
     return_spec_tokens_details: bool = False
     return_prompt_token_ids: bool = False

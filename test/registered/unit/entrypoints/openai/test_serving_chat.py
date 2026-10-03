@@ -30,6 +30,7 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
     MessageProcessingResult,
     ToolChoice,
     ToolChoiceFuncName,
@@ -612,6 +613,7 @@ class ServingChatTestCase(CustomTestCase):
             self.basic_req.return_sampling_mask = True
             self.basic_req.sampling_logprobs_mode = "support"
             self.basic_req.return_indexer_topk = True
+            self.basic_req.return_outputs_via_store = True
             self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
@@ -619,6 +621,7 @@ class ServingChatTestCase(CustomTestCase):
             self.assertTrue(adapted.return_sampling_mask)
             self.assertEqual(adapted.sampling_logprobs_mode, "support")
             self.assertTrue(adapted.return_indexer_topk)
+            self.assertTrue(adapted.return_outputs_via_store)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
@@ -703,6 +706,49 @@ class ServingChatTestCase(CustomTestCase):
             self.chat._validate_request(req),
             "return_indexer_topk requires return_meta_info=true.",
         )
+
+    def test_validate_request_rejects_output_store_without_meta_info(self):
+        """meta_info is the only place a chat response can carry the ref; without it
+        the stored object would leak."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_outputs_via_store=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_outputs_via_store requires return_meta_info=true.",
+        )
+
+    def test_undelivered_chat_response_removes_output_store_refs(self):
+        ret = {"meta_info": {"output_store_ref": {"handle": {"h": 1}}}}
+
+        async def generate(*args, **kwargs):
+            yield ret
+
+        self.tm.generate_request = generate
+        error = self.chat.create_error_response(
+            "Failed to parse reasoning content", status_code=500
+        )
+        cases = {
+            "error response": (error, [ret]),
+            "delivered response": (Mock(spec=ChatCompletionResponse), []),
+        }
+        for name, (built, expected_removed) in cases.items():
+            with self.subTest(name):
+                removed = []
+                self.tm.cleanup_output_store_refs = removed.extend
+                with patch.object(
+                    self.chat, "_build_chat_response", return_value=built
+                ):
+                    response = asyncio.run(
+                        self.chat._handle_non_streaming_request(
+                            Mock(), self.basic_req, Mock()
+                        )
+                    )
+                self.assertIs(response, built)
+                self.assertEqual(removed, expected_removed)
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(

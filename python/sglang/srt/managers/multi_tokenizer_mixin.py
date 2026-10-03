@@ -376,6 +376,12 @@ def _handle_output_by_index(output, i):
                 output, "indexer_topk", i, check_length=False
             ),
             indexer_topk_num_layers=getattr(output, "indexer_topk_num_layers", None),
+            routed_experts_raw=_extract_field_by_index(
+                output, "routed_experts_raw", i, check_length=False
+            ),
+            indexer_topk_raw=_extract_field_by_index(
+                output, "indexer_topk_raw", i, check_length=False
+            ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
             ),
