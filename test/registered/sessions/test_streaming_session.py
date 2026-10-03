@@ -33,6 +33,12 @@ class TestStreamingSession(StreamingSessionServerBase, StreamingSessionKitMixin)
     extra_args = ["--chunked-prefill-size", "512"]
 
 
+class TestStreamingSessionDisableRadixCache(TestStreamingSession):
+    """--disable-radix-cache keeps streaming sessions on UnifiedRadixCache."""
+
+    extra_args = ["--chunked-prefill-size", "512", "--disable-radix-cache"]
+
+
 class TestStreamingSessionEagleV2RetractLargePage(TestStreamingSession):
     """EAGLE3 spec v2 + retract + page=256."""
 

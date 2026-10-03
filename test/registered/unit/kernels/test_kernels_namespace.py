@@ -306,6 +306,13 @@ def test_reclassified_public_entry_points_are_inventoried():
         ("attention.deep_select_topk", (10, 1), False),
         ("attention.deep_select_topk", (10, 3), True),
         ("attention.deep_select_topk", (12, 0), False),
+        ("gemm.convrot_int8_fused_linear", (8, 9), False),
+        ("gemm.convrot_int8_fused_linear", (9, 0), True),
+        ("gemm.convrot_int8_fused_linear", (10, 0), True),
+        ("gemm.convrot_int8_fused_linear", (10, 3), False),
+        ("gemm.convrot_int8_fused_linear", (12, 0), True),
+        ("gemm.convrot_int8_fused_linear", (12, 1), True),
+        ("gemm.convrot_int8_fused_linear", (12, 2), False),
     ],
 )
 def test_registered_architecture_boundaries(op, sm, expected):
@@ -315,6 +322,23 @@ def test_registered_architecture_boundaries(op, sm, expected):
     )
     assert K.capabilities_satisfied(spec.capabilities, platform) is expected
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
+def test_convrot_int8_specs_match_wrapper_capabilities():
+    """The gemm group cannot import the wrapper, so this pins its three registry
+    entries to the wrapper's SUPPORTED_CAPABILITIES table."""
+    from sglang.kernels.ops.gemm import convrot_int8
+
+    expected = frozenset(
+        Cap.cuda(min_sm=sm, max_sm=sm) for sm in convrot_int8.SUPPORTED_CAPABILITIES
+    )
+    for op in (
+        "gemm.convrot_rotate_quantize_activation",
+        "gemm.convrot_int8_fused_linear",
+        "gemm.convrot_int8_linear_prequant",
+    ):
+        spec = K.registry.get_backend(op, KernelBackend.JIT)
+        assert spec.capabilities == expected, op
 
 
 def test_deep_select_spec_matches_wrapper_architectures():

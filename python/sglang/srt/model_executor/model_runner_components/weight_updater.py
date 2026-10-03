@@ -42,14 +42,18 @@ def _unsupported_derived_weight_cache_error(
 ) -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
-    The HPC-Ops bf16xfp32 GEMM caches the fp32 weight split; in-place loader
-    writes are invisible to it, so an update would silently keep serving the
-    old weights. The check is startup-determined and rank-uniform, so an
-    update never proceeds on some workers while rejected on others.
+    Compensated mHC projections and HPC-Ops bf16xfp32 GEMM retain derived
+    weight splits that in-place loader writes do not refresh. Model-owned
+    caches can also declare this constraint via ``_derived_weight_cache_error``.
+    Reject before writing weights to avoid serving stale cached values,
+    including references retained by captured CUDA graphs. These constraints
+    must be startup-determined and rank-uniform so all workers reject together.
     """
     if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None
+        or getattr(module, "_hc_attn_bf16_parts", None) is not None
+        or getattr(module, "_hc_ffn_bf16_parts", None) is not None
         for module in model.modules()
     ):
         return (

@@ -396,3 +396,14 @@ register_kernel(
         ),
     )
 )
+
+for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.fp4_indexer:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.CUDA}),
+        )
+    )
+del _fn
