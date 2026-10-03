@@ -1,0 +1,2902 @@
+{
+ "rows": [
+  {
+   "name": "decode.sink_gate_up.tokens_le16.n_le4096",
+   "kinds": [
+    "sink_gate_up"
+   ],
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_out_features": 4096,
+   "spec": {
+    "a_family": "all_slots",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "decode.sink_down.tokens_le16.k_le2048",
+   "kinds": [
+    "sink_down"
+   ],
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_in_features": 2048,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "decode.sink_gate_up.tokens_le32.n_le4096",
+   "kinds": [
+    "sink_gate_up"
+   ],
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_out_features": 4096,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "decode.sink_gate_up.tokens_le32.n_ge4097",
+   "kinds": [
+    "sink_gate_up"
+   ],
+   "phase": "decode",
+   "max_tokens": 32,
+   "min_out_features": 4097,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "serial"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "decode.sink_down.tokens_le32.k_le2048",
+   "kinds": [
+    "sink_down"
+   ],
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_in_features": 2048,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "decode.sink_down.tokens_le32.k_ge2049",
+   "kinds": [
+    "sink_down"
+   ],
+   "phase": "decode",
+   "max_tokens": 32,
+   "min_in_features": 2049,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "serial"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.sink_gate_up.rank_le16.tokens_le1024.n_le4096",
+   "kinds": [
+    "sink_gate_up"
+   ],
+   "phase": "prefill",
+   "max_tokens": 1024,
+   "max_rank": 16,
+   "max_out_features": 4096,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 64,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 8,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.sink_gate_up.rank_le16.n_le4096",
+   "kinds": [
+    "sink_gate_up"
+   ],
+   "phase": "prefill",
+   "max_rank": 16,
+   "max_out_features": 4096,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 64,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.sink_gate_up.n_le4096",
+   "kinds": [
+    "sink_gate_up"
+   ],
+   "phase": "prefill",
+   "max_out_features": 4096,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 64,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 2,
+     "SPLIT_MODE": "serial"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 8,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.sink_gate_up.rank_le16.tokens_le512.n_ge4097",
+   "kinds": [
+    "sink_gate_up"
+   ],
+   "phase": "prefill",
+   "max_tokens": 512,
+   "max_rank": 16,
+   "min_out_features": 4097,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 16,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 32,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.sink_gate_up.n_ge4097",
+   "kinds": [
+    "sink_gate_up"
+   ],
+   "phase": "prefill",
+   "min_out_features": 4097,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 64,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 8,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.sink_down",
+   "kinds": [
+    "sink_down"
+   ],
+   "phase": "prefill",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 64,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 8,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "decode.vocab",
+   "kinds": [
+    "embedding",
+    "lm_head"
+   ],
+   "phase": "decode",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.vocab",
+   "kinds": [
+    "embedding",
+    "lm_head"
+   ],
+   "phase": "prefill",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 64,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 8,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "decode.tokens_le1.k_le1024",
+   "phase": "decode",
+   "max_in_features": 1024,
+   "max_tokens": 1,
+   "spec": {
+    "a_family": "all_slots",
+    "b_family": "per_row",
+    "overlap": "a",
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "decode.tokens_le1.n_le1024",
+   "phase": "decode",
+   "max_out_features": 1024,
+   "spec": {
+    "a_family": "all_slots",
+    "b_family": "per_row",
+    "overlap": "a",
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   },
+   "max_tokens": 1
+  },
+  {
+   "name": "decode.rank_le128.tokens_le1.n_ge8192",
+   "phase": "decode",
+   "max_tokens": 1,
+   "min_out_features": 8192,
+   "max_rank": 128,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 8,
+     "num_stages": 2,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "decode.tokens_le1.n_ge8192",
+   "phase": "decode",
+   "max_tokens": 1,
+   "min_out_features": 8192,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "decode.tokens_le1",
+   "phase": "decode",
+   "max_tokens": 1,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 8,
+     "num_stages": 2,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 8,
+   "max_in_features": 2290,
+   "max_out_features": 1173,
+   "name": "decode.rank_le8.tokens_le8.k_le2290.n_le1173",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 16,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 8,
+   "max_in_features": 2290,
+   "min_out_features": 7095,
+   "max_out_features": 15864,
+   "name": "decode.rank_le8.tokens_le8.k_le2290.n_ge7095_le15864",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 8,
+   "name": "decode.rank_le8.tokens_le8",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 8,
+   "max_in_features": 2290,
+   "min_out_features": 7095,
+   "max_out_features": 15864,
+   "name": "decode.rank_le8.tokens_le16.k_le2290.n_ge7095_le15864",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 8,
+   "min_in_features": 1255,
+   "max_in_features": 3547,
+   "max_out_features": 4344,
+   "name": "decode.rank_le8.tokens_le16.k_ge1255_le3547.n_le4344",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 8,
+   "name": "decode.rank_le8.tokens_le16",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 8,
+   "max_in_features": 2290,
+   "min_out_features": 7095,
+   "max_out_features": 9715,
+   "name": "decode.rank_le8.tokens_le32.k_le2290.n_ge7095_le9715",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 8,
+   "max_in_features": 627,
+   "max_out_features": 2290,
+   "name": "decode.rank_le8.tokens_le32.k_le627.n_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 8,
+   "name": "decode.rank_le8.tokens_le32",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 16,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 8,
+   "max_in_features": 2290,
+   "max_out_features": 9715,
+   "name": "decode.rank_le8.k_le2290.n_le9715",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 8,
+   "name": "decode.rank_le8",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 16,
+   "min_in_features": 628,
+   "max_in_features": 2804,
+   "min_out_features": 1438,
+   "max_out_features": 15864,
+   "name": "decode.rank_le16.tokens_le8.k_ge628_le2804.n_ge1438_le15864",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 16,
+   "max_in_features": 887,
+   "max_out_features": 5609,
+   "name": "decode.rank_le16.tokens_le8.k_le887.n_le5609",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 16,
+   "name": "decode.rank_le16.tokens_le8",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 16,
+   "max_in_features": 2290,
+   "min_out_features": 4345,
+   "max_out_features": 9715,
+   "name": "decode.rank_le16.tokens_le16.k_le2290.n_ge4345_le9715",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 16,
+   "min_in_features": 2805,
+   "max_out_features": 2290,
+   "name": "decode.rank_le16.tokens_le16.k_ge2805.n_le2290",
+   "spec": {
+    "a_family": "all_slots",
+    "b_family": "per_row",
+    "overlap": "ab_delta",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 16,
+   "name": "decode.rank_le16.tokens_le16",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 16,
+   "max_in_features": 627,
+   "max_out_features": 2290,
+   "name": "decode.rank_le16.tokens_le32.k_le627.n_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 16,
+   "min_in_features": 628,
+   "max_in_features": 5609,
+   "min_out_features": 654,
+   "max_out_features": 2804,
+   "name": "decode.rank_le16.tokens_le32.k_ge628_le5609.n_ge654_le2804",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 16,
+   "name": "decode.rank_le16.tokens_le32",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 16,
+   "max_in_features": 4579,
+   "max_out_features": 1437,
+   "name": "decode.rank_le16.k_le4579.n_le1437",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 16,
+   "max_in_features": 627,
+   "max_out_features": 2290,
+   "name": "decode.rank_le16.k_le627.n_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 16,
+   "name": "decode.rank_le16",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 32,
+   "name": "decode.rank_le32.tokens_le8",
+   "spec": {
+    "a_family": "all_slots",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 32,
+   "min_in_features": 628,
+   "max_in_features": 4579,
+   "min_out_features": 1174,
+   "max_out_features": 2290,
+   "name": "decode.rank_le32.tokens_le16.k_ge628_le4579.n_ge1174_le2290",
+   "spec": {
+    "a_family": "all_slots",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 32,
+   "max_in_features": 2290,
+   "min_out_features": 2291,
+   "max_out_features": 15864,
+   "name": "decode.rank_le32.tokens_le16.k_le2290.n_ge2291_le15864",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 32,
+   "name": "decode.rank_le32.tokens_le16",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 32,
+   "max_in_features": 2290,
+   "min_out_features": 1174,
+   "max_out_features": 9715,
+   "name": "decode.rank_le32.tokens_le32.k_le2290.n_ge1174_le9715",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 32,
+   "name": "decode.rank_le32.tokens_le32",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 16,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 32,
+   "max_in_features": 2290,
+   "min_out_features": 2291,
+   "max_out_features": 9715,
+   "name": "decode.rank_le32.k_le2290.n_ge2291_le9715",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 16,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 32,
+   "name": "decode.rank_le32",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 64,
+   "max_in_features": 2290,
+   "min_out_features": 7095,
+   "max_out_features": 9715,
+   "name": "decode.rank_le64.tokens_le8.k_le2290.n_ge7095_le9715",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 64,
+   "min_in_features": 888,
+   "max_in_features": 4579,
+   "min_out_features": 1847,
+   "max_out_features": 2290,
+   "name": "decode.rank_le64.tokens_le8.k_ge888_le4579.n_ge1847_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 64,
+   "name": "decode.rank_le64.tokens_le8",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 64,
+   "max_in_features": 2290,
+   "min_out_features": 654,
+   "max_out_features": 1599,
+   "name": "decode.rank_le64.tokens_le16.k_le2290.n_ge654_le1599",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 64,
+   "max_in_features": 362,
+   "max_out_features": 2290,
+   "name": "decode.rank_le64.tokens_le16.k_le362.n_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 64,
+   "name": "decode.rank_le64.tokens_le16",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 64,
+   "min_in_features": 2291,
+   "max_in_features": 4579,
+   "min_out_features": 1847,
+   "max_out_features": 2290,
+   "name": "decode.rank_le64.tokens_le32.k_ge2291_le4579.n_ge1847_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 64,
+   "max_in_features": 2290,
+   "min_out_features": 7095,
+   "max_out_features": 9715,
+   "name": "decode.rank_le64.tokens_le32.k_le2290.n_ge7095_le9715",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 64,
+   "name": "decode.rank_le64.tokens_le32",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 64,
+   "max_in_features": 2290,
+   "min_out_features": 7095,
+   "max_out_features": 9715,
+   "name": "decode.rank_le64.k_le2290.n_ge7095_le9715",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 64,
+   "max_in_features": 627,
+   "max_out_features": 2290,
+   "name": "decode.rank_le64.k_le627.n_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 64,
+   "name": "decode.rank_le64",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 128,
+   "max_in_features": 2290,
+   "min_out_features": 9716,
+   "max_out_features": 15864,
+   "name": "decode.rank_le128.tokens_le8.k_le2290.n_ge9716_le15864",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 128,
+   "max_in_features": 2290,
+   "min_out_features": 1174,
+   "max_out_features": 15864,
+   "name": "decode.rank_le128.tokens_le8.k_le2290.n_ge1174_le15864",
+   "spec": {
+    "a_family": "all_slots",
+    "b_family": "per_row",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "max_rank": 128,
+   "name": "decode.rank_le128.tokens_le8",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 128,
+   "max_in_features": 2290,
+   "min_out_features": 9716,
+   "max_out_features": 15864,
+   "name": "decode.rank_le128.tokens_le16.k_le2290.n_ge9716_le15864",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 8
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 128,
+   "max_in_features": 2290,
+   "min_out_features": 1174,
+   "max_out_features": 9715,
+   "name": "decode.rank_le128.tokens_le16.k_le2290.n_ge1174_le9715",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_rank": 128,
+   "name": "decode.rank_le128.tokens_le16",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 128,
+   "max_in_features": 2290,
+   "max_out_features": 1173,
+   "name": "decode.rank_le128.tokens_le32.k_le2290.n_le1173",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "serial"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 128,
+   "max_in_features": 627,
+   "max_out_features": 2290,
+   "name": "decode.rank_le128.tokens_le32.k_le627.n_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_rank": 128,
+   "name": "decode.rank_le128.tokens_le32",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 128,
+   "max_in_features": 2290,
+   "min_out_features": 9716,
+   "max_out_features": 15864,
+   "name": "decode.rank_le128.k_le2290.n_ge9716_le15864",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 128,
+   "max_in_features": 2290,
+   "max_out_features": 2290,
+   "name": "decode.rank_le128.k_le2290.n_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_rank": 128,
+   "name": "decode.rank_le128",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "min_in_features": 628,
+   "max_in_features": 4579,
+   "min_out_features": 1174,
+   "max_out_features": 2290,
+   "name": "decode.tokens_le8.k_ge628_le4579.n_ge1174_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "per_row",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "planes"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 8,
+   "name": "decode.tokens_le8",
+   "spec": {
+    "a_family": "all_slots",
+    "b_family": "per_row",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_in_features": 2290,
+   "min_out_features": 1174,
+   "max_out_features": 9715,
+   "name": "decode.tokens_le16.k_le2290.n_ge1174_le9715",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "max_in_features": 2290,
+   "max_out_features": 2290,
+   "name": "decode.tokens_le16.k_le2290.n_le2290",
+   "spec": {
+    "a_family": "all_slots",
+    "b_family": "per_row",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 16,
+   "name": "decode.tokens_le16",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_in_features": 2290,
+   "max_out_features": 1173,
+   "name": "decode.tokens_le32.k_le2290.n_le1173",
+   "spec": {
+    "a_family": "all_slots",
+    "b_family": "per_row",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "max_in_features": 627,
+   "max_out_features": 2290,
+   "name": "decode.tokens_le32.k_le627.n_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_tokens": 32,
+   "name": "decode.tokens_le32",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "serial"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "max_in_features": 627,
+   "max_out_features": 2290,
+   "name": "decode.k_le627.n_le2290",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "min_in_features": 628,
+   "max_in_features": 4579,
+   "min_out_features": 1174,
+   "max_out_features": 15864,
+   "name": "decode.k_ge628_le4579.n_ge1174_le15864",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4,
+     "SPLIT_MODE": "serial"
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "phase": "decode",
+   "name": "decode",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3,
+     "SPLIT_K": 4
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.rank_le8.tokens_le512",
+   "phase": "prefill",
+   "max_tokens": 512,
+   "max_rank": 8,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 16,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 32,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.rank_le8.tokens_le2048.k4096.n2048",
+   "phase": "prefill",
+   "max_tokens": 2048,
+   "max_rank": 8,
+   "min_in_features": 4096,
+   "max_in_features": 4096,
+   "min_out_features": 2048,
+   "max_out_features": 2048,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 16,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 32,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.rank_le8.tokens_le2048.n_le4096",
+   "max_out_features": 4096,
+   "phase": "prefill",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "block_size": 32,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   },
+   "max_tokens": 2048,
+   "max_rank": 8
+  },
+  {
+   "name": "prefill.rank_le8.tokens_le2048.n_le10240",
+   "max_out_features": 10240,
+   "phase": "prefill",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "block_size": 64,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 8,
+     "num_stages": 2
+    }
+   },
+   "max_tokens": 2048,
+   "max_rank": 8
+  },
+  {
+   "name": "prefill.rank_le8.tokens_le2048",
+   "phase": "prefill",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "block_size": 128,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 1
+    }
+   },
+   "max_tokens": 2048,
+   "max_rank": 8
+  },
+  {
+   "name": "prefill.rank_le16.tokens_le512",
+   "phase": "prefill",
+   "max_tokens": 512,
+   "max_rank": 16,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 16,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 32,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.rank_le16.tokens_le2048",
+   "phase": "prefill",
+   "max_tokens": 2048,
+   "max_rank": 16,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 32,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.rank_le32.tokens_le512",
+   "phase": "prefill",
+   "max_tokens": 512,
+   "max_rank": 32,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 16,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 32,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.rank_le64.tokens_le512.k2048.n12288",
+   "phase": "prefill",
+   "max_tokens": 512,
+   "max_rank": 64,
+   "min_in_features": 2048,
+   "max_in_features": 2048,
+   "min_out_features": 12288,
+   "max_out_features": 12288,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 16,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 32,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.rank_le64.tokens_le512.k4096.n2048",
+   "phase": "prefill",
+   "max_tokens": 512,
+   "max_rank": 64,
+   "min_in_features": 4096,
+   "max_in_features": 4096,
+   "min_out_features": 2048,
+   "max_out_features": 2048,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 16,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 32,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.rank_le64.tokens_le512.n_le4096",
+   "phase": "prefill",
+   "max_tokens": 512,
+   "max_rank": 64,
+   "max_out_features": 4096,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 16,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 32,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.rank_le64.tokens_le2048.n_le2048",
+   "phase": "prefill",
+   "max_tokens": 2048,
+   "max_rank": 64,
+   "max_out_features": 2048,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "a",
+    "block_size": 64,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.rank_le64.tokens_le2048.n_ge2049_le4096",
+   "phase": "prefill",
+   "max_tokens": 2048,
+   "max_rank": 64,
+   "min_out_features": 2049,
+   "max_out_features": 4096,
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "overlap": "none",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 16,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 32,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.tokens_le512.n_le4096",
+   "max_tokens": 512,
+   "max_out_features": 4096,
+   "phase": "prefill",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 32,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.tokens_le512",
+   "max_tokens": 512,
+   "phase": "prefill",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "block_size": 16,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 8,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.n_le4096",
+   "max_out_features": 4096,
+   "phase": "prefill",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "block_size": 32,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 256,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill.n_le10240",
+   "max_out_features": 10240,
+   "phase": "prefill",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "block_size": 64,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 128,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 8,
+     "num_stages": 2
+    }
+   }
+  },
+  {
+   "name": "prefill",
+   "phase": "prefill",
+   "spec": {
+    "a_family": "grouped",
+    "b_family": "grouped",
+    "block_size": 128,
+    "a_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 128,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 3
+    },
+    "b_tiles": {
+     "BLOCK_SIZE_N": 64,
+     "BLOCK_SIZE_K": 64,
+     "GROUP_SIZE_M": 8,
+     "num_warps": 4,
+     "num_stages": 1
+    }
+   }
+  }
+ ]
+}
