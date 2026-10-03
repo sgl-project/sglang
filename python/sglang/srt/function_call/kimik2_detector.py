@@ -4,6 +4,7 @@ import re
 from typing import List, Literal, Optional, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import (
     BaseFormatDetector,
     StructuralTag,
@@ -177,6 +178,7 @@ class KimiK2Detector(BaseFormatDetector):
             logger.debug("function_call_tuples: %s", function_call_tuples)
 
             tool_calls = []
+            tool_indices = self._get_tool_indices(tools)
             # ``tool_index`` is the per-response 0-based position of the call
             # (OpenAI spec); enumerate parsed calls locally and ignore the
             # model's ``:N`` suffix, which is a conversation-level counter.
@@ -190,6 +192,12 @@ class KimiK2Detector(BaseFormatDetector):
                 )
                 if function_name is None:
                     continue
+                if function_name not in tool_indices:
+                    logger.warning(
+                        f"Model attempted to call undefined function: {function_name}"
+                    )
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        continue  # Skip unknown tools (default legacy behavior)
 
                 logger.debug(f"function_name {function_name}")
 
