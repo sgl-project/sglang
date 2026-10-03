@@ -133,9 +133,9 @@ only after every task and exact chunk/window/output check passes. Every submitte
 task is joined on failure before ownership is dropped.
 
 Each backend retains its MAP_SHARED mapping and CUDA registration across updates.
-The first publication allocates decoded and encoded staging capacities rounded to
-64 MiB. A fitting later publication reuses both allocations and each rank's existing
-registration. Growth allocates a new inode with at least twice the old capacity;
+Cold and growth allocations reserve twice the needed decoded/encoded extent,
+rounded to 64 MiB. A fitting later publication reuses both allocations and each
+rank's existing registration. Growth allocates a new inode;
 registered inodes are never resized. Each rank maps/registers the same shared
 physical pages through its own VA; there is no full per-rank Snappy copy. CUDA
 registration/unregistration runs outside the host build mutex. Torch's pinned

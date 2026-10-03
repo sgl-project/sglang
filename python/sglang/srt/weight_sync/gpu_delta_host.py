@@ -75,7 +75,7 @@ def _identity(info):
     return [info.st_dev, info.st_ino, info.st_size]
 
 
-# Capacity grows geometrically, rounded to a coarse host-page allocation unit.
+# Cold/growth capacity reserves twice the needed extent, rounded to host pages.
 # This is not a publication-format parameter or a tuning surface.
 _CAPACITY_ALIGNMENT = 64 << 20
 
@@ -83,7 +83,7 @@ _CAPACITY_ALIGNMENT = 64 << 20
 def _reserve(directory, prefix, previous, size, metrics):
     if previous is not None and size <= previous["capacity"]:
         return previous
-    capacity = max(size, 2 * previous["capacity"] if previous else 0)
+    capacity = 2 * size
     capacity = (
         (capacity + _CAPACITY_ALIGNMENT - 1)
         // _CAPACITY_ALIGNMENT

@@ -223,6 +223,9 @@ class TestSharedHostSnapshot(unittest.TestCase):
             metadata(),
         )
         original_inode = first.index["shared"]["identity"]
+        self.assertGreaterEqual(
+            first.index["shared"]["capacity"], 2 * first.index["arena_bytes"]
+        )
         first.mark_reusable()  # Oracle substitutes the production global proof.
         first.close()
         warm = {}
@@ -267,6 +270,9 @@ class TestSharedHostSnapshot(unittest.TestCase):
         self.assertNotEqual(third.index["shared"]["identity"], original_inode)
         self.assertEqual(third.index["shared"]["generation"], 2)
         self.assertEqual(growth["host_shared_allocation_calls"], 1)
+        self.assertGreaterEqual(
+            third.index["shared"]["capacity"], 2 * third.index["arena_bytes"]
+        )
         self.assertEqual(original_inode[-1], before_capacity)
         self.assertLessEqual(
             third.index["arena_bytes"], third.index["shared"]["capacity"]

@@ -162,7 +162,7 @@ def test_two_engines_reuse_registered_capacity_and_grow_on_new_inode(workers):
     ) as directory:
         root = Path(directory)
         publications = []
-        for version, repeat in enumerate((1024, 512, 2048), 1):
+        for version, repeat in enumerate((1024, 512, 4096), 1):
             version_dir = root / str(version)
             version_dir.mkdir()
             path, digest, expected = _publication(version_dir, version, repeat)
