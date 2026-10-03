@@ -510,7 +510,7 @@ struct MoeFinalizeAllReduceKernel {
   }
 
   /// Finalize + all-reduce + HC=4 post; original reduced output is retained.
-  static void run_mhc(
+  static void run_mhc_post(
       CommunicatorRef ref,
       TensorView out,
       TensorView gemm2_out,
@@ -538,41 +538,7 @@ struct MoeFinalizeAllReduceKernel {
         comb);
   }
 
-  // Keep the original RMSNorm as a separate kernel, while reusing the
-  // BF16-rounded post values for the next sublayer's pre-combine.
-  static void run_mhc_combine(
-      CommunicatorRef ref,
-      TensorView out,
-      TensorView gemm2_out,
-      TensorView permuted_idx,
-      TensorView expert_weights,
-      std::optional<TensorView> shared_output,
-      TensorView mhc_out,
-      TensorView residual,
-      TensorView post,
-      TensorView comb,
-      TensorView pre,
-      TensorView combined) {
-    static_assert(kMhc && kCollapse && !kQuant);
-    run_impl(
-        ref,
-        out,
-        gemm2_out,
-        permuted_idx,
-        expert_weights,
-        shared_output,
-        std::nullopt,
-        0.0,
-        false,
-        mhc_out,
-        residual,
-        post,
-        comb,
-        pre,
-        combined);
-  }
-
-  static void run_mhc_norm(
+  static void run_mhc_post_combine_norm(
       CommunicatorRef ref,
       TensorView out,
       TensorView gemm2_out,
@@ -606,7 +572,7 @@ struct MoeFinalizeAllReduceKernel {
         normalized);
   }
 
-  static void run_mhc_quant(
+  static void run_mhc_post_combine_norm_quant(
       CommunicatorRef ref,
       TensorView out,
       TensorView gemm2_out,

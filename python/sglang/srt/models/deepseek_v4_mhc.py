@@ -365,64 +365,67 @@ def combine(
 ) -> torch.Tensor:
     """The sublayer's input: ``norm(sum_k pre[k] * R[k])``, short-circuited by
     whatever the previous post left in ``state.input``."""
+    shortcut = state.input
+    if isinstance(shortcut, HcQuantized):
+        assert quantized is not None
+        quantized.append(shortcut.swizzled)
+        return shortcut.rows
+    if isinstance(shortcut, HcNormed):
+        return shortcut.rows
+    return _combine(hc, state, quantized)
+
+
+def _combine(
+    hc: HcSubLayer,
+    state: HcState,
+    quantized: Optional[list],
+) -> torch.Tensor:
+    """The combine computed from the residual's rows."""
     from sglang.kernels.ops.layernorm.mhc import hc_combine
 
     cfg, norm = hc.cfg, hc.norm
-    x, apply_pre, shortcut = state.residual, state.pre, state.input
+    x, apply_pre = state.residual, state.pre
     quantize = quantized is not None
     x_flat = x.flatten(1)
 
-    def combine_and_norm():
-        if isinstance(shortcut, HcQuantized):
-            assert quantized is not None
-            quantized.append(shortcut.swizzled)
-            return shortcut.rows
-        if isinstance(shortcut, HcNormed):
-            # Prefill projections still quantize the BF16 input themselves; the
-            # optional fused-quantization list stays empty for this case.
-            return shortcut.rows
-        if apply_pre is None:
-            return norm(x[:, 0, :].contiguous())
-        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    if apply_pre is None:
+        return norm(x[:, 0, :])
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
-        hopper_fused = (
-            get_platform().is_sm90
-            and not quantize
-            and (0 < x.shape[0] <= 96 or 4096 <= x.shape[0] <= 65536)
-            and not is_batch_invariant_mode_enabled()
-        )
-        if (
-            x.is_cuda
-            and (get_platform().is_blackwell or hopper_fused)
-            and x.dtype == torch.bfloat16
-            and apply_pre.stride(1) == 1
-            and cfg.mult == 4
-            and cfg.hidden == 5120
-            and norm.weight.dtype == torch.bfloat16
-            and not norm.cast_x_before_out_mul
-            and norm.variance_size_override is None
-        ):
-            # One fused form for every row count. Each row's reduction order is
-            # fixed regardless of the grid split, so this holds under
-            # batch-invariant mode too.
-            if quantize and x.shape[0] <= 128:
-                from sglang.kernels.ops.layernorm.hc_combine_norm import (
-                    hc_combine_norm_mxfp8,
-                )
+    hopper_fused = (
+        get_platform().is_sm90
+        and not quantize
+        and (0 < x.shape[0] <= 96 or 4096 <= x.shape[0] <= 65536)
+        and not is_batch_invariant_mode_enabled()
+    )
+    if (
+        x.is_cuda
+        and (get_platform().is_blackwell or hopper_fused)
+        and x.dtype == torch.bfloat16
+        and apply_pre.stride(1) == 1
+        and cfg.mult == 4
+        and cfg.hidden == 5120
+        and norm.weight.dtype == torch.bfloat16
+        and not norm.cast_x_before_out_mul
+        and norm.variance_size_override is None
+    ):
+        # One fused form for every row count. Each row's reduction order is
+        # fixed regardless of the grid split, so this holds under
+        # batch-invariant mode too.
+        if quantize and x.shape[0] <= 128:
+            from sglang.kernels.ops.layernorm.hc_combine_norm import (
+                hc_combine_norm_mxfp8,
+            )
 
-                y, y_q, y_sf = hc_combine_norm_mxfp8(
-                    x_flat, apply_pre, norm.weight, norm.variance_epsilon
-                )
-                quantized.append(Mxfp8SwizzledInput(y_q, y_sf))
-                return y
-            from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
-
-            return hc_combine_norm(
+            y, y_q, y_sf = hc_combine_norm_mxfp8(
                 x_flat, apply_pre, norm.weight, norm.variance_epsilon
             )
-        return norm(hc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
+            quantized.append(Mxfp8SwizzledInput(y_q, y_sf))
+            return y
+        from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
 
-    return combine_and_norm()
+        return hc_combine_norm(x_flat, apply_pre, norm.weight, norm.variance_epsilon)
+    return norm(hc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -516,40 +519,6 @@ def post(
     return post_torch_impl(x, residual, post_mix, comb)
 
 
-def post_with_combine(
-    cfg: HcConfig,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_mix: torch.Tensor,
-    comb: torch.Tensor,
-    pre: torch.Tensor,
-    next: Optional[HcNextBoundary],
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Step 4, folding the next combine + norm in where the wide-tile kernel serves
-    this seam; ``normalized`` is None when the next combine must run itself."""
-    if (
-        next is not None
-        and next.norm_fusable
-        and cfg.pre_from_prev
-        and get_platform().is_blackwell
-        and 4096 <= x.shape[0] <= 65536
-        and cfg.hidden == 5120
-        and cfg.mult == 4
-        and get_parallel().attn_dp_size == 1
-        and not cfg.cp_prefill
-    ):
-        from sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill import (
-            mhc_post_combine_norm_prefill,
-        )
-
-        norm = next.norm
-        updated, normalized = mhc_post_combine_norm_prefill(
-            x, residual, post_mix, comb, pre, norm.weight, norm.variance_epsilon
-        )
-        return updated, normalized
-    return post(cfg, x, residual, post_mix, comb), None
-
-
 # ---------------------------------------------------------------------------
 # Planning the post
 # ---------------------------------------------------------------------------
@@ -590,20 +559,44 @@ def _compute_triplet(
     return coefficients
 
 
-def _plain_post(
+def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
     residual: torch.Tensor,
     coefficients: HcTriplet,
-    *,
     next: Optional[HcNextBoundary],
 ) -> HcState:
-    """Step 4 without a collective; the next seam may still fold in."""
+    """Step 4 without a collective: the wide-tile kernel folds the next combine +
+    norm in where it serves this seam, otherwise the pure post runs and the next
+    combine computes itself."""
+    cfg = hc.cfg
     pre, post_mix, comb = coefficients
-    updated, normalized = post_with_combine(
-        hc.cfg, y, residual, post_mix, comb, pre, next
-    )
-    return HcState(updated, pre, None if normalized is None else HcNormed(normalized))
+    if (
+        next is not None
+        and next.norm_fusable
+        and cfg.pre_from_prev
+        and get_platform().is_blackwell
+        and 4096 <= y.shape[0] <= 65536
+        and cfg.hidden == 5120
+        and cfg.mult == 4
+        and get_parallel().attn_dp_size == 1
+        and not cfg.cp_prefill
+    ):
+        from sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill import (
+            mhc_post_combine_norm_prefill,
+        )
+
+        updated, normalized = mhc_post_combine_norm_prefill(
+            y,
+            residual,
+            post_mix,
+            comb,
+            pre,
+            next.norm.weight,
+            next.norm.variance_epsilon,
+        )
+        return HcState(updated, pre, HcNormed(normalized))
+    return HcState(post(cfg, y, residual, post_mix, comb), pre)
 
 
 def run_attn_post(
@@ -619,11 +612,13 @@ def run_attn_post(
     folds ``next``'s norm); the attention may decline the handover even when asked,
     so the type is the ground truth."""
     if isinstance(out, AttnOutput):
-        from sglang.kernels.ops.communication.all_reduce_mhc import all_reduce_mhc_norm
+        from sglang.kernels.ops.communication.all_reduce_mhc import (
+            all_reduce_mhc_post_combine_norm,
+        )
 
         assert next is not None
         pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream)
-        _, updated, normalized = all_reduce_mhc_norm(
+        _, updated, normalized = all_reduce_mhc_post_combine_norm(
             out.partial,
             residual,
             post_mix,
@@ -635,7 +630,7 @@ def run_attn_post(
         )
         return HcState(updated, pre, HcNormed(normalized))
     coefficients = _compute_triplet(hc, residual, stats_stream)
-    return _plain_post(hc, out, residual, coefficients, next=next)
+    return _post_fusion(hc, out, residual, coefficients, next)
 
 
 def run_moe_post(
@@ -681,24 +676,26 @@ def run_moe_post(
             and out.routed.expert_weights.shape[0] <= 128
         ):
             from sglang.kernels.ops.communication.all_reduce_mhc import (
-                moe_finalize_all_reduce_mhc_quant,
+                moe_finalize_all_reduce_mhc_post_combine_norm_quant,
             )
 
-            _, updated, normalized, q, sf = moe_finalize_all_reduce_mhc_quant(
-                *args,
-                pre,
-                next.norm.weight,
-                next.norm.variance_epsilon,
-                world_size=world_size,
+            _, updated, normalized, q, sf = (
+                moe_finalize_all_reduce_mhc_post_combine_norm_quant(
+                    *args,
+                    pre,
+                    next.norm.weight,
+                    next.norm.variance_epsilon,
+                    world_size=world_size,
+                )
             )
             return HcState(
                 updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
             )
         from sglang.kernels.ops.communication.all_reduce_mhc import (
-            moe_finalize_all_reduce_mhc,
+            moe_finalize_all_reduce_mhc_post,
         )
 
-        _, updated = moe_finalize_all_reduce_mhc(*args, world_size=world_size)
+        _, updated = moe_finalize_all_reduce_mhc_post(*args, world_size=world_size)
         return HcState(updated, pre)
     if isinstance(out, MoEOutput):
         from sglang.srt.layers.moe import post_experts_all_reduce
@@ -715,4 +712,4 @@ def run_moe_post(
         ):
             out += pieces.shared
     coefficients = _compute_triplet(hc, residual, stats_stream)
-    return _plain_post(hc, out, residual, coefficients, next=next)
+    return _post_fusion(hc, out, residual, coefficients, next)
