@@ -9,6 +9,7 @@ from transformers import PretrainedConfig
 from triton.language.extra import libdevice
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -295,6 +296,12 @@ class IQuestQ1Attention(nn.Module):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
+        )
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__, shard_tp_size=attn_tp_size, reduces_over_attn_tp=False
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
