@@ -493,11 +493,14 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "")
 
-        # Tool interruption should still work - flushes buffered reasoning. The
-        # opening tag is stripped from `self._buffer` as well as from the local
-        # view, so the flush matches detect_and_parse instead of carrying the raw
-        # <think> tag into reasoning_content.
+        # A tool start inside reasoning is held until </think> or the end of the
+        # stream decides it, as in detect_and_parse. The opening tag is stripped
+        # from `self._buffer` as well as from the local view, so the flush does
+        # not carry the raw <think> tag into reasoning_content.
         result = detector.parse_streaming_increment("<tool_call>tool call")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "")
+        result = detector.finish()
         self.assertEqual(result.reasoning_text, "thinking")
         self.assertEqual(result.normal_text, "<tool_call>tool call")
 
@@ -505,8 +508,45 @@ class TestGlm45Detector(CustomTestCase):
         """Test empty reasoning block followed by tool call."""
         result1 = self.detector.parse_streaming_increment("<think>")
         result2 = self.detector.parse_streaming_increment("<tool_call>tool call")
-        self.assertEqual(result2.reasoning_text, "")
-        self.assertEqual(result2.normal_text, "<tool_call>tool call")
+        self.assertEqual(result2.normal_text, "")
+        result3 = self.detector.finish()
+        self.assertEqual(result3.reasoning_text, "")
+        self.assertEqual(result3.normal_text, "<tool_call>tool call")
+
+    def test_streaming_tool_call_quoted_in_reasoning(self):
+        """A <tool_call> the model writes while reasoning stays reasoning once
+        </think> arrives; the real call after it reaches normal_text intact.
+        Before, streaming ended the block at the quote, so the tool parser read
+        the rest of the reasoning and </think> as the function name."""
+        chunks = [
+            'The form is: "The GLM parser looks for ',
+            "<tool_call>",
+            ' followed by the function name."',
+            "</think>",
+            "The GLM parser looks for ",
+            "<tool_call>",
+            "bash<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>",
+        ]
+        detector = Glm45Detector(force_reasoning=True)
+        reasoning = normal = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk)
+            reasoning += result.reasoning_text
+            normal += result.normal_text
+            if chunk == "</think>":
+                # The held quote is released as reasoning when </think> arrives.
+                self.assertEqual(
+                    reasoning,
+                    'The form is: "The GLM parser looks for <tool_call>'
+                    ' followed by the function name."',
+                )
+        result = detector.finish()
+        self.assertEqual(result.reasoning_text + result.normal_text, "")
+        self.assertEqual(
+            normal,
+            "The GLM parser looks for <tool_call>bash<arg_key>command</arg_key>"
+            "<arg_value>ls</arg_value></tool_call>",
+        )
 
     def test_forced_reasoning_mode(self):
         """Test GLM45 with force_reasoning=True."""
@@ -909,7 +949,7 @@ class TestReasoningParser(CustomTestCase):
         self.assertEqual(reasoning, "thinking")
         self.assertEqual(normal, "<tool_call>tool call")
 
-        # Streaming: tool interrupt
+        # Streaming: tool interrupt, decided once the stream ends without </think>
         parser = ReasoningParser("glm45")
         chunks = ["<think>", "reasoning", "<tool_call>", "tool args"]
         all_reasoning = ""
@@ -920,6 +960,10 @@ class TestReasoningParser(CustomTestCase):
                 all_reasoning += reasoning
             if normal:
                 all_normal += normal
+        self.assertEqual(all_normal, "")
+        reasoning, normal = parser.parse_stream_end()
+        all_reasoning += reasoning or ""
+        all_normal += normal or ""
 
         self.assertEqual(all_reasoning, "reasoning")
         self.assertEqual(all_normal, "<tool_call>tool args")
@@ -1197,6 +1241,79 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
         one_shot = Qwen3Detector().detect_and_parse(text)
         self.assertEqual(
             (one_shot.reasoning_text, one_shot.normal_text), ("lead<think>r", "tail")
+        )
+
+    # GLM's chat template ends the prompt with <think>, so served output starts
+    # inside reasoning (force_reasoning). The quote below is the shape that
+    # produced malformed tool names on streaming deployments.
+    GLM_QUOTE = (
+        "The user wants one sentence quoting the GLM tool-call opening marker"
+        ' literally, in the form: "The GLM parser looks for <tool_call> followed'
+        ' by the function name."'
+    )
+    GLM_CALL = (
+        "<tool_call>bash<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>"
+    )
+
+    def test_glm45_reasoning_quoting_tool_call_is_chunk_invariant(self):
+        answer = "The GLM parser looks for " + self.GLM_CALL
+        self._assert_invariant(
+            lambda: Glm45Detector(force_reasoning=True),
+            f"{self.GLM_QUOTE}</think>{answer}",
+            (self.GLM_QUOTE, answer),
+        )
+        self._assert_invariant(
+            Glm45Detector,
+            f"<think>{self.GLM_QUOTE}</think>{answer}",
+            (self.GLM_QUOTE, answer),
+        )
+
+    def test_glm45_reasoning_quoting_tool_call_buffered_mode(self):
+        self._assert_invariant(
+            lambda: Glm45Detector(force_reasoning=True, stream_reasoning=False),
+            f"{self.GLM_QUOTE}</think>answer",
+            (self.GLM_QUOTE, "answer"),
+        )
+
+    def test_glm45_reasoning_with_tool_markup_then_real_call(self):
+        """Several markers in reasoning, including a closing tag, before </think>."""
+        reasoning = (
+            "Wrap it as <tool_call>name<arg_key>k</arg_key>"
+            "<arg_value>v</arg_value></tool_call>, then <tool_call> again."
+        )
+        self._assert_invariant(
+            lambda: Glm45Detector(force_reasoning=True),
+            f"{reasoning}</think>\n{self.GLM_CALL}",
+            (reasoning, f"\n{self.GLM_CALL}"),
+        )
+
+    def test_qwen3_reasoning_quoting_tool_call_is_chunk_invariant(self):
+        """Qwen3-family templates (Qwen3, MiMo) share the <tool_call> start."""
+        quote = "The call opens with <tool_call> and closes with </tool_call>."
+        call = (
+            "<tool_call>\n<function=bash>\n<parameter=command>\nls\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+        self._assert_invariant(
+            Qwen3Detector, f"<think>{quote}</think>\n\n{call}", (quote, f"\n\n{call}")
+        )
+        self._assert_invariant(
+            Qwen3Detector, f"<think>Need a tool{call}", ("Need a tool", call)
+        )
+
+    def test_glm45_tool_call_without_think_end_still_ends_reasoning(self):
+        """With no </think> at all, the first <tool_call> still ends reasoning
+        (the GLM-4.5 case the tool start token exists for); streaming now
+        reaches the same split at the end of the stream."""
+        self._assert_invariant(
+            Glm45Detector,
+            f"<think>I need a tool{self.GLM_CALL}",
+            ("I need a tool", self.GLM_CALL),
+        )
+        self._assert_invariant(
+            lambda: Glm45Detector(force_reasoning=True, stream_reasoning=False),
+            f"I need a tool{self.GLM_CALL}",
+            ("I need a tool", self.GLM_CALL),
         )
 
     def test_dsv4_reasoning_quoting_dsml_is_chunk_invariant(self):
