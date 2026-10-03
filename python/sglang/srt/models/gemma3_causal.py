@@ -629,7 +629,11 @@ class Gemma3TextModel(PreTrainedModel):
         if _is_cpu and _is_cpu_amx_available:
             for i, layer in enumerate(self.layers):
                 if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states)
+                    aux_hidden_states.append(
+                        hidden_states.clone()
+                        if residual is None
+                        else hidden_states + residual
+                    )
                 hidden_states, residual = layer(
                     positions=positions,
                     position_embeddings_global=None,
@@ -647,7 +651,11 @@ class Gemma3TextModel(PreTrainedModel):
             position_embeddings_local = self.rotary_emb_local(hidden_states, positions)
             for i, layer in enumerate(self.layers):
                 if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states)
+                    aux_hidden_states.append(
+                        hidden_states.clone()
+                        if residual is None
+                        else hidden_states + residual
+                    )
                 hidden_states, residual = layer(
                     positions=positions,
                     position_embeddings_global=position_embeddings_global,
@@ -662,7 +670,9 @@ class Gemma3TextModel(PreTrainedModel):
         # layers_to_capture uses +1 offset (captures input of layer i = output of i-1),
         # so index num_layers means the output of the final layer.
         if num_layers in self.layers_to_capture:
-            aux_hidden_states.append(hidden_states)
+            aux_hidden_states.append(
+                hidden_states.clone() if residual is None else hidden_states + residual
+            )
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
