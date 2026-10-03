@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
@@ -19,6 +20,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsCostTable,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -223,6 +225,31 @@ class TestBudgetDecisionLifecycle(CustomTestCase):
         planner.last_decision = VerifyBudgetDecision(budget=1)
         planner.note_non_decode_step()
         self.assertIsNone(planner.take_last_decision())
+
+
+class TestVerifyBudgetTpSync(CustomTestCase):
+    class _FakeTpSync:
+        def __init__(self, rank0_budget):
+            self.rank0_budget = rank0_budget
+            self.site = None
+
+        def sync_cpu(self, site, values):
+            self.site = site
+            values.fill_(-1 if self.rank0_budget is None else self.rank0_budget)
+            return values
+
+    def test_uses_rank0_budget_for_graph_tier_selection(self):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._tp_sync = self._FakeTpSync(rank0_budget=7)
+
+        self.assertEqual(planner._sync_verify_token_budget(3), 7)
+        self.assertEqual(planner._tp_sync.site, SpecTpSyncSite.DSPARK_PLAN)
+
+    def test_preserves_none_with_wire_sentinel(self):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._tp_sync = self._FakeTpSync(rank0_budget=None)
+
+        self.assertIsNone(planner._sync_verify_token_budget(3))
 
 
 class TestScheduleVerifyLensTopk(CustomTestCase):
