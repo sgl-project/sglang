@@ -6,12 +6,12 @@ use axum::http::{Request, StatusCode};
 use serde_json::json;
 use sgl_router::discovery::{ModelId, WorkerMode};
 use sgl_router::policies::request_tokens_for;
-use sgl_router::state::kv_events::{compute_block_hashes, HashTree, KvWorkerId};
+use sgl_router::state::kv_events::{compute_block_hashes, HashTree, KvEventIndex, KvWorkerId};
 use sgl_router::tokenizer::TokenizerRegistry;
 use std::time::Duration;
 use tower::ServiceExt;
 
-use crate::common::cache_aware_fixture::{config, radix_router, MODEL};
+use crate::common::cache_aware_fixture::{config, radix_router, reorg_radix_router, MODEL};
 use crate::common::mock_worker::MockWorker;
 
 #[tokio::test]
@@ -49,21 +49,15 @@ async fn radix_tree_routes_cache_aware_request_to_cached_worker() {
     assert!(uncached.captured.lock().unwrap().last_body.is_none());
 }
 
-#[tokio::test]
-async fn pending_prefix_keeps_a_cold_burst_on_one_worker() {
-    let a = MockWorker::start(vec![]).await;
-    let b = MockWorker::start(vec![]).await;
-    let tree = HashTree::new();
-    tree.pending().enable(Duration::from_secs(60));
-    let router = radix_router(&[(&a, WorkerMode::Plain), (&b, WorkerMode::Plain)], tree);
+/// Route eight identical cold requests and return, per request, whether `a` got it.
+async fn burst_picks(router: axum::Router, a: &MockWorker, b: &MockWorker) -> Vec<bool> {
     let body = json!({
         "model": MODEL,
         "messages": [{"role": "user", "content": "shared cold prefix"}],
     });
-
     let mut picks = Vec::new();
     for _ in 0..8 {
-        for worker in [&a, &b] {
+        for worker in [a, b] {
             worker.captured.lock().unwrap().last_body = None;
         }
         let response = router
@@ -81,6 +75,31 @@ async fn pending_prefix_keeps_a_cold_burst_on_one_worker() {
         assert_eq!(response.status(), StatusCode::OK);
         picks.push(a.captured.lock().unwrap().last_body.is_some());
     }
+    picks
+}
+
+#[tokio::test]
+async fn pending_prefix_keeps_a_cold_burst_on_one_worker() {
+    let a = MockWorker::start(vec![]).await;
+    let b = MockWorker::start(vec![]).await;
+    let tree = HashTree::new();
+    tree.pending().enable(Duration::from_secs(60));
+    let router = radix_router(&[(&a, WorkerMode::Plain), (&b, WorkerMode::Plain)], tree);
+    let picks = burst_picks(router, &a, &b).await;
+    assert!(
+        picks.iter().all(|&p| p == picks[0]),
+        "burst scattered: {picks:?}"
+    );
+}
+
+#[tokio::test]
+async fn pending_prefix_keeps_a_cold_burst_on_one_worker_under_reorg() {
+    let a = MockWorker::start(vec![]).await;
+    let b = MockWorker::start(vec![]).await;
+    let state = KvEventIndex::new();
+    state.tree().pending().enable(Duration::from_secs(60));
+    let router = reorg_radix_router(&[(&a, WorkerMode::Plain), (&b, WorkerMode::Plain)], &state);
+    let picks = burst_picks(router, &a, &b).await;
     assert!(
         picks.iter().all(|&p| p == picks[0]),
         "burst scattered: {picks:?}"

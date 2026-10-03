@@ -778,6 +778,10 @@ impl CacheArgs {
             "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
         );
         ensure!(
+            self.cache_pending_prefix_ttl_ms != Some(0),
+            "--cache-pending-prefix-ttl-ms must be greater than zero"
+        );
+        ensure!(
             self.cache_pending_prefix_ttl_ms.is_none()
                 || (policy == PolicyKind::CacheAware
                     && cache_prefix_provider == CachePrefixProvider::RadixTree),
@@ -2803,6 +2807,7 @@ mod tests {
             .unwrap();
         assert_eq!(cache.pending_prefix_ttl_ms, 500);
         for args in [
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 0",
             "--policy power_of_two --cache-pending-prefix-ttl-ms 500",
             "--policy cache_aware --kv-indexer-endpoint http://i:1 --cache-pending-prefix-ttl-ms 500",
         ] {

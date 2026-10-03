@@ -1474,12 +1474,14 @@ impl HashTree {
     ///
     /// Fans out: a worker can hold chains in many shards. Also the
     /// scale-down path (`KvEventIndex::remove_worker`), which runs off the
-    /// pump task — hence [`Self::writer`].
+    /// pump task — hence [`Self::writer`]. Pending prefixes are per URL, so
+    /// clearing any rank drops the whole worker's.
     pub fn clear_worker(&self, worker: &KvWorkerId) {
         let _writer = self.writer.lock();
         for shard in &self.shards {
             shard.write().clear_worker(worker);
         }
+        self.pending.forget_worker(&worker.url);
     }
 
     /// Find the longest path from the root that matches a prefix of
