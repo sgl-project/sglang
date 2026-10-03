@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 def _jit_topk_softmax_pack_module() -> Module:
     return load_jit(
         "topk_softmax_pack",
-        cuda_files=["trtllm_lora_temp/topk_softmax_pack.cuh"],
+        cuda_files=["lora/trtllm_lora_temp/topk_softmax_pack.cuh"],
         cuda_wrappers=[("topk_softmax_pack", "topk_softmax_pack")],
     )
 

@@ -10,7 +10,7 @@ from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 def get_sgl_trtllm_moe_sm100_module():
     import flashinfer.fused_moe.core as fi_core
 
-    from sglang.kernels.ops.moe.trtllm_lora_temp.jit import (
+    from sglang.kernels.ops.lora.moe.trtllm_lora_temp.jit import (
         gen_sgl_trtllm_gen_fused_moe_sm100_module,
     )
 
@@ -30,7 +30,7 @@ def get_sgl_trtllm_moe_sm100_module():
 def get_sgl_trtllm_moe_sm100_raw_module():
     from flashinfer.fused_moe.core import setup_cubin_loader
 
-    from sglang.kernels.ops.moe.trtllm_lora_temp.jit import (
+    from sglang.kernels.ops.lora.moe.trtllm_lora_temp.jit import (
         gen_sgl_trtllm_gen_fused_moe_sm100_module,
     )
 

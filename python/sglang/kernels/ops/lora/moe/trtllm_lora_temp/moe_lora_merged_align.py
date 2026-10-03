@@ -16,7 +16,7 @@ def _jit_module(dtype: torch.dtype) -> Module:
     return load_jit(
         "moe_lora_merged_align",
         *args,
-        cuda_files=["trtllm_lora_temp/moe_lora_merged_align_kernel.cu"],
+        cuda_files=["lora/trtllm_lora_temp/moe_lora_merged_align_kernel.cu"],
         cuda_wrappers=[
             ("moe_lora_merged_align", f"MoeLoraMergedAlignKernel<{args}>::run"),
         ],
