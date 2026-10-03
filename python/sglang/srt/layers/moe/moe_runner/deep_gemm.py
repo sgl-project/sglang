@@ -509,6 +509,14 @@ class _CakeContigFp8Route:
             buffers["m_indices"],
             buffers["down_out"],
         )
+        if device.type == "cuda":
+            # The prepared runners' first launch() initializes their private TMA
+            # descriptor storage with a synchronous host-to-device copy.  That
+            # storage is a caching-allocator block; a kernel still queued on this
+            # stream that writes the block's previous tenant would overwrite the
+            # descriptors behind the copy.  Drain the stream once per plan so
+            # every kernel queued before the storage was allocated has finished.
+            torch.cuda.current_stream(device).synchronize()
         plan = _CakeContigPlan(
             fused=fused,
             buffers=buffers,
