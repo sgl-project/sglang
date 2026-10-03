@@ -1229,6 +1229,23 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
+def deepgemm_ue8m0_mn_major(scale: torch.Tensor) -> torch.Tensor:
+    """``[m, ceil(groups / 4)]`` packed UE8M0 scales in DeepGEMM's A layout.
+
+    That is MN-major with the row stride padded to four, the layout DeepGEMM's
+    own quantization writes; row-major input, as a producer that gathers its
+    scales by rows keeps them, is transposed into it, which at 4 bytes per
+    four groups of 128 costs nothing next to the GEMM it feeds.
+    """
+    m, packs = scale.shape
+    stride = ceil_align(m, 4)
+    if scale.stride() == (1, stride):
+        return scale
+    mn_major = scale.new_empty((packs, stride))
+    mn_major[:, :m].copy_(scale.t())
+    return mn_major.t()[:m]
+
+
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1236,7 +1253,32 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if input_scale is not None and input_scale.dtype == torch.int32:
+        # Pre-quantized activation with packed UE8M0 scales, the pair
+        # DeepGEMM's own quantization writes where it scales in UE8M0 (SM100,
+        # SM120): ``input`` is the fp8 per-token-group-128 q, ``input_scale``
+        # its exponents four groups to an int32, row-major or already
+        # DeepGEMM's MN-major. ``out``, if given, takes the rows.
+        assert deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        assert input.dtype == torch.float8_e4m3fn
+        input_2d = input.view(-1, input.shape[-1])
+        output_shape = [*input.shape[:-1], weight.shape[0]]
+        if out is None:
+            out = input_2d.new_empty(
+                (input_2d.shape[0], weight.shape[0]), dtype=torch.bfloat16
+            )
+        deep_gemm_wrapper.gemm_nt_f8f8bf16(
+            (input_2d, deepgemm_ue8m0_mn_major(input_scale)),
+            (weight, weight_scale),
+            out,
+        )
+        if bias is not None:
+            out += bias
+        return out.view(*output_shape)
+    assert out is None, "out= is only wired for a UE8M0 pre-quantized input"
+
     if input_scale is not None:
         # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): ``input`` is
         # the fp8 per-token-group-128 q with rows padded to a multiple of 4

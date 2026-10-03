@@ -449,6 +449,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Indexed adaLN modulation + MXFP8 quant for the online mxfp8 qkv/fc1 inputs.",
     ),
     (
+        "diffusion.indexed_scale_shift_block_fp8",
+        KernelBackend.TRITON,
+        "quantization.block_fp8_triton:indexed_scale_shift_block_fp8",
+        _CUDA,
+        "Indexed adaLN modulation + per-token-group FP8 quant (UE8M0) for block-FP8 qkv/fc1 inputs.",
+    ),
+    (
         "diffusion.group_limited_topk",
         KernelBackend.TRITON,
         "routing.group_limited_topk_triton:group_limited_topk",
@@ -694,6 +701,8 @@ _EXPORTS: dict[str, str] = {
     "vdn_frame_stats_prep": "attention.vdn_linear_branch_triton",
     "vdn_gather_linear_state": "attention.vdn_linear_branch_triton",
     "vdn_linear_epilogue": "attention.vdn_linear_branch_triton",
+    "can_use_indexed_scale_shift_block_fp8": "quantization.block_fp8_triton",
+    "indexed_scale_shift_block_fp8": "quantization.block_fp8_triton",
     "can_use_mxfp8_swizzled": "quantization.mxfp8_swizzled_triton",
     "can_use_silu_mul_mxfp8": "quantization.mxfp8_swizzled_triton",
     "indexed_scale_shift_mxfp8_": "quantization.mxfp8_swizzled_triton",

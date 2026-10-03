@@ -7,6 +7,7 @@ contract accepts packed inference keyword arguments and returns packed logits.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 from collections import defaultdict
@@ -23,12 +24,14 @@ from sglang.kernels.ops.activation.activation import (
 )
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_indexed_scale_shift_block_fp8,
     can_use_mxfp8_swizzled,
     can_use_silu_mul_mxfp8,
     fused_inplace_qknorm_rope,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
+    indexed_scale_shift_block_fp8,
     indexed_scale_shift_mxfp8_,
     silu_mul_mxfp8,
 )
@@ -93,6 +96,15 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     native_adaln_weight_files,
 )
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_row_shard import (
+    comm_lane,
+    gemms_beside_collectives,
+    prequantized_linear,
+    row_chunks,
+    shard_rows,
+    unreduced_linear,
+    unshard_rows,
+)
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
     MiniMaxH3VDNHybridAttention,
 )
@@ -102,6 +114,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -428,6 +441,37 @@ def _modulate_scale_shift(
     ).to(dtype)
 
 
+def _modulate_quantize_block_fp8(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    linear: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_modulate_scale_shift`` then ``linear``'s own block-FP8 input quant.
+
+    Returns the ``(fp8 rows, row-major packed UE8M0 scales)`` pair ``linear``
+    would build from the modulated rows for DeepGEMM, in one kernel where the
+    modulation would have taken its fused kernel.
+    """
+    group_size = linear.quant_method.quant_config.weight_block_size[1]
+    if can_use_indexed_scale_shift_block_fp8(x, shift, scale, group_size=group_size):
+        return indexed_scale_shift_block_fp8(
+            x, shift, scale, indices, group_size=group_size
+        )
+    modulated = _modulate_scale_shift(x, shift, scale, indices, dtype=_BF16_DTYPE)
+    # DeepGEMM's own quantizer, scales made row-major for the all-gather.
+    q, q_scale = fp8_utils.sglang_per_token_group_quant_fp8(
+        modulated,
+        group_size,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
+    return q, q_scale.contiguous()
+
+
 def _modulate_gate(
     x: torch.Tensor,
     gate: torch.Tensor,
@@ -452,6 +496,18 @@ def _modulate_gate(
             return indexed_gate_bf16_(x, gate, other, indices)
         return indexed_gate_bf16(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(dtype)
+
+
+def _modulate_gate_rows_(
+    rows: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    indices: torch.Tensor,
+) -> None:
+    """``_modulate_gate`` into ``rows``, a view of a larger residual."""
+    out = _modulate_gate(rows, gate, other, indices, dtype=_BF16_DTYPE)
+    if out.data_ptr() != rows.data_ptr():
+        rows.copy_(out)
 
 
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
@@ -1108,15 +1164,12 @@ class MiniMaxH3Attention(nn.Module):
 
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
-        q, k, v = qkv.split(self.local_inner_dim, dim=-1)
-        q = q.view(total, self.num_heads, self.head_dim)
-        k = k.view(total, self.num_heads, self.head_dim)
-        v = v.view(total, self.num_heads, self.head_dim)
         if (
             self.hybrid is not None
             and self._attention_backend_enum
             is AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
         ):
+            q, k, v = self._split_qkv(qkv)
             return self.hybrid(
                 self,
                 x,
@@ -1130,6 +1183,60 @@ class MiniMaxH3Attention(nn.Module):
                 ulysses_active=ulysses_active,
                 ring_active=ring_active,
             )
+
+        gate_compress = None
+        if (
+            self._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+            and self.to_gate_compress is not None
+        ):
+            gate_flat, _ = self.to_gate_compress(x)
+            gate_compress = gate_flat.view(total, self.num_heads, self.head_dim)
+
+        out = self.attend(
+            qkv,
+            rope_cache=rope_cache,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+            gate_compress=gate_compress,
+        )
+        out, _ = self.out_proj(out)
+        return out
+
+    def _split_qkv(
+        self, qkv: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        total = qkv.shape[0]
+        q, k, v = qkv.split(self.local_inner_dim, dim=-1)
+        return (
+            q.view(total, self.num_heads, self.head_dim),
+            k.view(total, self.num_heads, self.head_dim),
+            v.view(total, self.num_heads, self.head_dim),
+        )
+
+    def attend(
+        self,
+        qkv: torch.Tensor,
+        *,
+        rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+        max_seqlen: int,
+        subblock_sparse_query_block_mask: torch.Tensor | None = None,
+        ulysses_active: bool = False,
+        ring_active: bool = False,
+        gate_compress: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Projected qkv [T, 3 * local inner] -> attention output [T, local inner].
+
+        Everything between the two projections, split out so the row-sharded
+        block stack can run both projections a chunk of rows at a time.
+        """
+        total = qkv.shape[0]
+        q, k, v = self._split_qkv(qkv)
         if rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
@@ -1164,14 +1271,6 @@ class MiniMaxH3Attention(nn.Module):
                 )
                 q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
 
-        gate_compress = None
-        if (
-            self._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
-            and self.to_gate_compress is not None
-        ):
-            gate_flat, _ = self.to_gate_compress(x)
-            gate_compress = gate_flat.view(total, self.num_heads, self.head_dim)
-
         attention_core = (
             _minimax_h3_attention_core_bcg
             if self.bcg_breakpoint
@@ -1190,9 +1289,7 @@ class MiniMaxH3Attention(nn.Module):
             ring_active=ring_active,
             gate_compress=gate_compress,
         )
-        out = out.reshape(total, self.num_heads * self.head_dim)
-        out, _ = self.out_proj(out)
-        return out
+        return out.reshape(total, self.num_heads * self.head_dim)
 
 
 class MiniMaxH3MLP(nn.Module):
@@ -1250,6 +1347,17 @@ class MiniMaxH3MLP(nn.Module):
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
+
+    def partial_sums(
+        self, x_prequant: tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        """``forward`` over a gathered block-FP8 input, before the TP reduction.
+
+        For the row-sharded block stack; see minimax_h3_row_shard.
+        """
+        hidden = prequantized_linear(self.fc1, x_prequant)
+        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        return unreduced_linear(self.fc2, hidden)
 
 
 class MiniMaxH3AdalnProj(nn.Module):
@@ -1440,9 +1548,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
+        row_chunks: int = 0,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
+
+        With ``row_chunks``, ``x`` and ``combined_indices`` hold only this TP
+        rank's rows, laid out as minimax_h3_row_shard describes; see
+        ``_forward_row_sharded``.
 
         Each block computes AdaLN parameters once, then applies
         norm1 -> scale/shift -> attention -> gated residual, followed by
@@ -1452,6 +1565,18 @@ class MiniMaxH3DiTBlock(nn.Module):
             if self.adaln_proj is None:
                 raise ValueError("MiniMax H3 AdaLN cache parameters are required")
             adaln_params = self.adaln_proj(adaln_input)
+        if row_chunks:
+            return self._forward_row_sharded(
+                x,
+                adaln_params=adaln_params,
+                indices=combined_indices,
+                chunks=row_chunks,
+                rope_cache=rope_cache,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+                subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+            )
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
         # Cache-DiT retains the inputs to its Fn and Mn block ranges. Only the
         # first gated residual writes to that tensor; the second one operates on
@@ -1531,6 +1656,104 @@ class MiniMaxH3DiTBlock(nn.Module):
             combined_indices,
             dtype=_BF16_DTYPE,
         )
+
+    def _forward_row_sharded(
+        self,
+        x: torch.Tensor,
+        *,
+        adaln_params: tuple[torch.Tensor, ...],
+        indices: torch.Tensor,
+        chunks: int,
+        rope_cache: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_host: tuple[int, ...] | None,
+        max_seqlen: int,
+        subblock_sparse_query_block_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """The block over this rank's rows, collectives overlapped with GEMMs.
+
+        Every stage runs over all ``chunks`` before the next one starts, so
+        while the compute stream works on one chunk the side stream moves
+        another: the QKV GEMM of chunk c runs under the all-gather of chunk
+        c + 1, the output projection under the reduce-scatter of the chunk
+        before, and the MLP under both. Attention itself is the one step that
+        needs every row, so it is where the chunks meet. The same arithmetic
+        as ``forward`` and bit-exact against it; see minimax_h3_row_shard.
+        """
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
+        qkv_proj, out_proj = self.attn.qkv_proj, self.attn.out_proj
+        fc1, fc2 = self.mlp.fc1, self.mlp.fc2
+        lane = comm_lane(x.device)
+        mine = x.shape[0] // chunks
+        spans = [slice(c * mine, (c + 1) * mine) for c in range(chunks)]
+        whole = mine * out_proj.tp_size
+        rows = [slice(c * whole, (c + 1) * whole) for c in range(chunks)]
+
+        # QKV: quantize each chunk of this rank's rows and gather it while the
+        # previous chunk's projection runs, into one buffer attention reads.
+        gathered = [
+            lane.gather(
+                _modulate_quantize_block_fp8(
+                    self.norm1(x[span]),
+                    shift_msa,
+                    scale_msa,
+                    indices[span],
+                    linear=qkv_proj,
+                ),
+                group=qkv_proj.tp_group,
+            )
+            for span in spans
+        ]
+        qkv = x.new_empty((whole * chunks, qkv_proj.output_size_per_partition))
+        for span, pending in zip(rows, gathered):
+            prequantized_linear(qkv_proj, pending.result(), out=qkv[span])
+        attended = self.attn.attend(
+            qkv,
+            rope_cache=rope_cache,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+        )
+        del qkv
+
+        # Output projection, reduce-scattered a chunk at a time.
+        reduced = [
+            lane.reduce_scatter(
+                unreduced_linear(out_proj, attended[span]), group=out_proj.tp_group
+            )
+            for span in rows
+        ]
+        del attended
+
+        # Gated residual, then the MLP's input, quantized and gathered.
+        gathered = []
+        for span, pending in zip(spans, reduced):
+            _modulate_gate_rows_(x[span], gate_msa, pending.result(), indices[span])
+            gathered.append(
+                lane.gather(
+                    _modulate_quantize_block_fp8(
+                        self.norm2(x[span]),
+                        shift_mlp,
+                        scale_mlp,
+                        indices[span],
+                        linear=fc1,
+                    ),
+                    group=fc1.tp_group,
+                )
+            )
+
+        # The MLP is row-local end to end, so each chunk runs it whole and is
+        # reduce-scattered while the next chunk's runs.
+        reduced = [
+            lane.reduce_scatter(
+                self.mlp.partial_sums(pending.result()), group=fc2.tp_group
+            )
+            for pending in gathered
+        ]
+        for span, pending in zip(spans, reduced):
+            _modulate_gate_rows_(x[span], gate_mlp, pending.result(), indices[span])
+        return x
 
 
 class MiniMaxH3FinalLayer(nn.Module):
@@ -1887,6 +2110,46 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             and not hasattr(self, "_sglang_cache_dit_adapter")
             and not is_layerwise_offloaded_module(self)
             and all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
+        )
+
+    def _row_chunks(self, *, rows: int, sp_ws: int, device: torch.device) -> int:
+        """Chunks to run the block stack row-sharded in, or 0 for all rows.
+
+        Sequence parallelism already shards the rows its own way, and Cache-DiT
+        compares whole block-stack tensors to decide what to skip, so handed
+        one rank's rows it could decide differently on each rank. VDN's hybrid
+        branch and VSA's compression gate project the bf16 block input, which
+        this path never gathers, and a captured graph would record the side
+        stream's collectives. The rest is minimax_h3_row_shard's to judge.
+        """
+        if (
+            sp_ws > 1
+            or device.type != "cuda"
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or hasattr(self, "_sglang_cache_dit_adapter")
+            or not all(
+                type(block) is MiniMaxH3DiTBlock
+                and block.attn.hybrid is None
+                and block.attn.to_gate_compress is None
+                for block in self.blocks
+            )
+        ):
+            return 0
+        return row_chunks(
+            column_linears=tuple(
+                linear
+                for block in self.blocks
+                for linear in (block.attn.qkv_proj, block.mlp.fc1)
+            ),
+            row_linears=tuple(
+                linear
+                for block in self.blocks
+                for linear in (block.attn.out_proj, block.mlp.fc2)
+            ),
+            tp_size=get_tp_world_size(),
+            rows=rows,
         )
 
     def _validate_tp_config(
@@ -2783,23 +3046,58 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             # (Ulysses) and/or ring-rotates KV across ring ranks; everything
             # else, including the final layer, is row-local. Only the narrow
             # video/audio logits are gathered after the final layer.
-            for index, block in enumerate(self.blocks):
-                hidden = block(
-                    hidden,
-                    adaln_input=adaln_input,
-                    combined_indices=block_combined,
-                    rope_cache=rope_cache,
-                    cu_seqlens=cu_seqlens,
-                    cu_seqlens_host=cu_seqlens_host,
-                    max_seqlen=max_seqlen,
-                    subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
-                    ulysses_active=ulysses_ws > 1,
-                    ring_active=ring_ws > 1,
-                    adaln_params=(
-                        None
-                        if block_adaln_params is None
-                        else block_adaln_params[index]
-                    ),
+            # Under TP alone the residual can live one rank's rows at a time
+            # between the block stack's GEMMs, gathered back once at the end,
+            # with each block's collectives overlapped with its GEMMs;
+            # bit-exact, see minimax_h3_row_shard.
+            chunks = self._row_chunks(
+                rows=hidden.shape[0], sp_ws=sp_ws, device=hidden.device
+            )
+            stack_indices = block_combined
+            if chunks:
+                logger.info_once(
+                    "MiniMax-H3 block stack runs row-sharded across TP ranks: "
+                    "reduce-scatter + FP8 all-gather in place of all-reduce, "
+                    f"overlapped with the GEMMs over {chunks} row chunks"
+                )
+                reference = self.blocks[0].attn.out_proj
+                hidden, stack_indices = (
+                    shard_rows(
+                        full,
+                        chunks=chunks,
+                        rank=reference.tp_rank,
+                        world=reference.tp_size,
+                    )
+                    for full in (hidden, block_combined)
+                )
+            beside_collectives = (
+                gemms_beside_collectives(self.blocks[0].attn.qkv_proj, hidden.device)
+                if chunks
+                else contextlib.nullcontext()
+            )
+            with beside_collectives:
+                for index, block in enumerate(self.blocks):
+                    hidden = block(
+                        hidden,
+                        adaln_input=adaln_input,
+                        combined_indices=stack_indices,
+                        rope_cache=rope_cache,
+                        cu_seqlens=cu_seqlens,
+                        cu_seqlens_host=cu_seqlens_host,
+                        max_seqlen=max_seqlen,
+                        subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+                        ulysses_active=ulysses_ws > 1,
+                        ring_active=ring_ws > 1,
+                        adaln_params=(
+                            None
+                            if block_adaln_params is None
+                            else block_adaln_params[index]
+                        ),
+                        row_chunks=chunks,
+                    )
+            if chunks:
+                hidden = unshard_rows(
+                    hidden, chunks=chunks, group=self.blocks[0].attn.out_proj.tp_group
                 )
             if spectrum_on:
                 self._h3_spectrum_record_targets(
