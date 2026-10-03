@@ -2278,7 +2278,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
         self.deepstack_visual_indexes = (
-            self.visual.deepstack_visual_indexes if self.visual is not None else []
+            []
+            if self.language_model_only
+            else config.vision_config.deepstack_visual_indexes
         )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
@@ -2466,7 +2468,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
         self.deepstack_visual_indexes = (
-            self.visual.deepstack_visual_indexes if self.visual is not None else []
+            []
+            if self.language_model_only
+            else config.vision_config.deepstack_visual_indexes
         )
 
         self.num_fused_shared_experts = 0
