@@ -121,6 +121,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_parallel,
     get_platform,
 )
@@ -142,6 +143,7 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_whole_kda_prepare_logged = False
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -1816,6 +1818,8 @@ class KimiK3DeltaAttention(nn.Module):
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
+        self._kda_whole_layer_gluon_ready = False
+        self._kda_gluon_prefill_ready = False
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1935,7 +1939,35 @@ class KimiK3DeltaAttention(nn.Module):
         unfused chain. Called once from load_weights (after all weights are
         loaded, before cuda graph capture)."""
         if _is_hip:
-            from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+            global _whole_kda_prepare_logged
+
+            from sglang.kernels.ops.attention import (
+                kda_fused_decode_aiter_hip,
+                kda_prefill_gluon_hip,
+                kda_whole_layer_gluon_hip,
+            )
+
+            if kda_whole_layer_gluon_hip.enabled():
+                self._kda_whole_layer_gluon_ready = (
+                    kda_whole_layer_gluon_hip.can_prepare(self)
+                )
+                self._kda_gluon_prefill_ready = kda_prefill_gluon_hip.can_prepare(self)
+                if self._kda_whole_layer_gluon_ready:
+                    kda_whole_layer_gluon_hip.bind_output_projection(self.o_proj)
+                if not _whole_kda_prepare_logged:
+                    enabled_paths = []
+                    if self._kda_whole_layer_gluon_ready:
+                        enabled_paths.append("decode M=1..256")
+                    if self._kda_gluon_prefill_ready:
+                        enabled_paths.append("prefill M=1024..8192, sequences=1..32")
+                    rank0_log(
+                        "K3 Gluon KDA enabled: " + ", ".join(enabled_paths)
+                        if enabled_paths
+                        else "K3 Gluon KDA disabled: the static model/device "
+                        "contract is not covered."
+                    )
+                    _whole_kda_prepare_logged = True
+                return
 
             layer = self.attn
             w = layer.conv_weights
@@ -2025,6 +2057,183 @@ class KimiK3DeltaAttention(nn.Module):
         )
         self._kda_fused_decode_ready = True
 
+    def _try_whole_layer_kda_decode(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        """Run the stateful whole-layer KDA kernel only on its exact contract.
+
+        All checks happen before the kernel mutates the convolution and temporal
+        caches. Once launched, an error is propagated instead of retrying the
+        native path against already-updated state.
+        """
+        if (
+            not self._kda_whole_layer_gluon_ready
+            or not forward_batch.forward_mode.is_decode()
+            or get_forward().sp_active
+        ):
+            return None
+
+        from sglang.kernels.ops.attention import kda_whole_layer_gluon_hip
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        if type(backend).__name__ != "KDAAttnBackend":
+            return None
+
+        cache = backend.req_to_token_pool.mamba2_layer_cache(self.attn.layer_id)
+        conv_state = cache.conv[0]
+        state = cache.temporal
+        state_indices = backend.forward_metadata.mamba_cache_indices
+        if cache.replayssm_d is not None or not kda_whole_layer_gluon_hip.covered(
+            hidden_states, conv_state, state, state_indices
+        ):
+            return None
+
+        args = dict(
+            hidden_states=hidden_states,
+            qkvg_weight=self.fused_qkvg_proj.weight,
+            beta_forget_weight=self._bfa_w,
+            output_weight=self.o_proj.weight,
+            forget_weight=self._bfa_f_b_w,
+            conv_weight=self.attn.conv_weights,
+            A_log=self.attn.A_log.detach().view(-1),
+            dt_bias=self.attn.dt_bias,
+            norm_weight=self.o_norm.weight,
+            conv_state=conv_state,
+            state=state,
+            state_indices=state_indices,
+            lower_bound=float(self.attn.lower_bound),
+            norm_eps=float(self.o_norm.eps),
+        )
+        layer_id = self.attn.layer_id
+
+        def invoke(output_tensor):
+            result = kda_whole_layer_gluon_hip.run(**args, output_tensor=output_tensor)
+            if (
+                not isinstance(result, tuple)
+                or len(result) != 3
+                or result[1].data_ptr() != conv_state.data_ptr()
+                or result[2].data_ptr() != state.data_ptr()
+            ):
+                raise RuntimeError("whole-layer KDA changed the state-pool ABI")
+            backend._track_mamba_state_decode(
+                forward_batch,
+                conv_state,
+                state,
+                state_indices,
+                layer_id,
+            )
+            return result[0]
+
+        return kda_whole_layer_gluon_hip.project_output(
+            self.o_proj, hidden_states[:, : 12 * 128], invoke
+        )
+
+    def _try_gluon_kda_prefill(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        """Run component KDA prefill only on the qualified final-state path."""
+        if not self._kda_gluon_prefill_ready or get_forward().sp_active:
+            return None
+
+        from sglang.kernels.ops.attention import kda_prefill_gluon_hip
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        if (
+            forward_batch.forward_mode != ForwardMode.EXTEND
+            or getattr(forward_batch, "spec_info", None) is not None
+        ):
+            return None
+        rows = hidden_states.shape[0]
+        if self._bfa_alt_stream is not None and rows <= self._bfa_bs_limit:
+            return None
+
+        lengths = forward_batch.extend_seq_lens_cpu
+        prefixes = forward_batch.extend_prefix_lens_cpu
+        prefix_tensor = forward_batch.extend_prefix_lens
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        if type(backend).__name__ != "KDAAttnBackend":
+            return None
+        metadata = backend.forward_metadata
+        if not kda_prefill_gluon_hip.final_state_tracking(metadata):
+            return None
+        # Speculative servers also stage the final state for accept-length
+        # bookkeeping, which this component adapter does not yet implement.
+        if getattr(backend, "accept_lens_pool", None) is not None:
+            return None
+
+        cache = backend.req_to_token_pool.mamba2_layer_cache(self.attn.layer_id)
+        if cache.replayssm_d is not None or len(cache.conv) != 1:
+            return None
+        conv_state = cache.conv[0]
+        state = cache.temporal
+        state_indices = metadata.mamba_cache_indices
+        cu_seqlens = metadata.query_start_loc
+        if not kda_prefill_gluon_hip.covered(
+            hidden_states,
+            lengths,
+            prefixes,
+            state_indices,
+            cu_seqlens,
+            prefix_tensor,
+            conv_state,
+            state,
+        ):
+            return None
+
+        wide, _ = self.fused_qkvg_proj(hidden_states)
+        from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+
+        bfa = kimi_k3_tiny_gemm(hidden_states, self._bfa_w)
+        expected_wide = (rows, 4 * 12 * 128)
+        expected_bfa = (rows, 128 + 12 + 4)
+        if (
+            tuple(wide.shape) != expected_wide
+            or wide.dtype != torch.bfloat16
+            or wide.device != hidden_states.device
+            or wide.stride(1) != 1
+            or tuple(bfa.shape) != expected_bfa
+            or bfa.dtype != torch.bfloat16
+            or bfa.device != hidden_states.device
+            or bfa.stride(1) != 1
+        ):
+            return None
+
+        qkv, gate = torch.split(wide, self.split_sizes, dim=-1)
+        result = kda_prefill_gluon_hip.run(
+            qkv,
+            gate,
+            bfa[:, :128],
+            bfa[:, 128:140],
+            self._bfa_f_b_w,
+            self.attn.conv_weights,
+            self.attn.A_log.view(-1),
+            self.attn.dt_bias,
+            self.o_norm.weight,
+            conv_state,
+            state,
+            state_indices,
+            cu_seqlens,
+            prefix_tensor > 0,
+            lower_bound=float(self.attn.lower_bound),
+            norm_eps=float(self.o_norm.eps),
+        )
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 3
+            or result[1].data_ptr() != conv_state.data_ptr()
+            or result[2].data_ptr() != state.data_ptr()
+            or tuple(result[0].shape) != (rows, 12 * 128)
+            or result[0].dtype != torch.bfloat16
+            or result[0].device != hidden_states.device
+            or not result[0].is_contiguous()
+        ):
+            raise RuntimeError("Gluon KDA prefill changed its output/state ABI")
+        return self.o_proj(result[0])[0]
+
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
@@ -2107,6 +2316,16 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        whole_layer_output = self._try_whole_layer_kda_decode(
+            hidden_states, forward_batch
+        )
+        if whole_layer_output is not None:
+            return whole_layer_output
+
+        prefill_output = self._try_gluon_kda_prefill(hidden_states, forward_batch)
+        if prefill_output is not None:
+            return prefill_output
+
         defer_f_b = (
             self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
         )
@@ -2184,6 +2403,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         split_gguf_kv_b = _uses_split_gguf_kv_b(quant_config)
         self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
+        self._mla_gluon_vc_ready = False
+        self._mla_gluon_vc_active = False
+        self._mla_gluon_kc_ready = False
+        self._mla_gluon_kc_active = False
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
         # Kimi-K3. Other MLA models retain the existing fused fast path.
         self._disable_npu_fused_split_qk_norm = True
@@ -2372,6 +2595,32 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         torch.cuda.current_stream().wait_stream(alt)
         return gate
 
+    def _absorb_v_bmm(self, attn_output: torch.Tensor) -> torch.Tensor:
+        if self._mla_gluon_vc_active:
+            from sglang.kernels.ops.attention import mla_vc_gate_gluon_hip
+
+            if mla_vc_gate_gluon_hip.covered(self, attn_output):
+                return mla_vc_gate_gluon_hip.apply(self, attn_output)
+        return super()._absorb_v_bmm(attn_output)
+
+    def _prepare_kc_cache(
+        self,
+        query: torch.Tensor,
+        latent: torch.Tensor,
+        key_tail: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if self._mla_gluon_kc_active:
+            from sglang.kernels.ops.attention import mla_kc_cache_gluon_hip
+
+            if mla_kc_cache_gluon_hip.covered(
+                self, query, latent, key_tail, forward_batch
+            ):
+                return mla_kc_cache_gluon_hip.apply(
+                    self, query, latent, key_tail, forward_batch
+                )
+        return super()._prepare_kc_cache(query, latent, key_tail, forward_batch)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -2383,9 +2632,31 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
             self._fork_output_gate(hidden_states)
-        return super().forward(
-            positions, hidden_states, forward_batch, zero_allocator, **kwargs
-        )
+        vc_ready = getattr(self, "_mla_gluon_vc_ready", False)
+        kc_ready = getattr(self, "_mla_gluon_kc_ready", False)
+        if vc_ready or kc_ready:
+            from sglang.srt.model_executor.forward_batch_info import ForwardMode
+            from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+                is_in_tc_piecewise_cuda_graph,
+            )
+
+            active = (
+                forward_batch.forward_mode in (ForwardMode.DECODE, ForwardMode.EXTEND)
+                and getattr(forward_batch, "spec_info", None) is None
+                and not get_forward().sp_active
+                and not torch.compiler.is_compiling()
+                and not is_in_tc_piecewise_cuda_graph()
+                and not is_in_breakable_cuda_graph()
+            )
+            self._mla_gluon_vc_active = vc_ready and active
+            self._mla_gluon_kc_active = kc_ready and active
+        try:
+            return super().forward(
+                positions, hidden_states, forward_batch, zero_allocator, **kwargs
+            )
+        finally:
+            self._mla_gluon_vc_active = False
+            self._mla_gluon_kc_active = False
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -3512,6 +3783,49 @@ class KimiK3LinearForCausalLM(nn.Module):
                 pass
             elif hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+
+            if _is_hip:
+                from sglang.kernels.ops.attention import (
+                    mla_kc_cache_gluon_hip,
+                    mla_vc_gate_gluon_hip,
+                )
+                from sglang.srt.runtime_context import get_server_args
+
+                no_experimental_lora = not envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+                self_attn._mla_gluon_vc_ready = (
+                    no_experimental_lora
+                    and mla_vc_gate_gluon_hip.can_prepare(
+                        self_attn, get_parallel(), get_server_args()
+                    )
+                )
+                self_attn._mla_gluon_kc_ready = (
+                    no_experimental_lora
+                    and mla_kc_cache_gluon_hip.can_prepare(
+                        self_attn, get_parallel(), get_server_args()
+                    )
+                )
+
+        if (
+            _is_hip
+            and os.environ.get("SGLANG_ROCM_K3_MLA_VC_FUSED_BACKEND", "").lower()
+            == "gluon"
+        ):
+            ready = sum(
+                getattr(getattr(layer, "self_attn", None), "_mla_gluon_vc_ready", False)
+                for layer in self.model.layers
+            )
+            rank0_log(f"K3 Gluon MLA value/gate enabled on {ready} layers.")
+
+        if (
+            _is_hip
+            and os.environ.get("SGLANG_ROCM_K3_MLA_KC_FUSED_BACKEND", "").lower()
+            == "gluon"
+        ):
+            ready = sum(
+                getattr(getattr(layer, "self_attn", None), "_mla_gluon_kc_ready", False)
+                for layer in self.model.layers
+            )
+            rank0_log(f"K3 Gluon MLA key/cache enabled on {ready} layers.")
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the
