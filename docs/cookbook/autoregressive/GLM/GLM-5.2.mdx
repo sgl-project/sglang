@@ -306,7 +306,7 @@ python3 -m sglang.launch_server \
 
 **GB300 (TP4, single node):** one 4-GPU GB300 node serves the whole model. All three commands offload KV cache to host DRAM with `--hicache-size 135` (GB of host memory per rank, 540 GB per node). GLM-5.2 is a DSA model, so on Blackwell SGLang already defaults to an FP8 E4M3 KV cache and TRT-LLM DSA attention; the commands do not need to set them.
 
-Low-latency (TP4, MTP 4-1-5, up to 16 concurrent requests):
+Low-latency (TP4, MTP 5-1-6, up to 16 concurrent requests):
 ```bash Command
 sglang serve \
   --model-path nvidia/GLM-5.2-NVFP4 \
@@ -322,9 +322,9 @@ sglang serve \
   --tool-call-parser glm47 \
   --reasoning-parser glm45 \
   --speculative-algorithm EAGLE \
-  --speculative-num-steps 4 \
+  --speculative-num-steps 5 \
   --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 5 \
+  --speculative-num-draft-tokens 6 \
   --enable-hierarchical-cache \
   --hicache-size 135 \
   --hicache-write-policy write_back \
