@@ -103,6 +103,12 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
                     batch.mix_running_indices,
                 )
             batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
+            if batch.penalty_update_pending:
+                # mix_with_running appends the running rows after the prefill rows.
+                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                    decode_gpu, row_start=len(batch.reqs) - decode_gpu.shape[0]
+                )
+                batch.penalty_update_pending = False
         else:
             batch.input_ids = prefill_gpu
         batch.prefill_input_ids_cpu = None
@@ -113,6 +119,12 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
             _assert_nonneg_and_invalidate(
                 batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
             )
+        if batch.penalty_update_pending:
+            # Penalizers are reqs-aligned; rows past len(reqs) are a beam tail.
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                batch.input_ids[: len(batch.reqs)]
+            )
+            batch.penalty_update_pending = False
 
     # Only the overlap path relays spec extras through the future_map; the
     # synchronous (non-overlap) V2 path installs next_draft_input directly.
