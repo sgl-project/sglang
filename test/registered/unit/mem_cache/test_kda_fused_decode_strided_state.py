@@ -125,6 +125,33 @@ def _addressing_samples(heads: int):
 
 
 class TestKdaFusedDecodeStridedState(unittest.TestCase):
+    def test_covered_accepts_tp4_heads_and_rejects_other_head_counts(self):
+        def make_args(heads: int):
+            seg = heads * _K
+            mixed_qkv = torch.zeros((2, 3 * seg), dtype=torch.bfloat16)
+            a = torch.zeros((2, seg), dtype=torch.bfloat16)
+            b = torch.zeros((2, heads), dtype=torch.bfloat16)
+            conv_states = torch.zeros(
+                (_SLOTS, _CONV_STATE_W, 3 * seg), dtype=torch.bfloat16
+            )
+            ssm_states = torch.zeros(
+                (_SLOTS, heads, _V, _K), dtype=torch.float32
+            )
+            cache_indices = torch.zeros((2,), dtype=torch.int32)
+            onorm_g = torch.zeros((2, seg), dtype=torch.bfloat16)
+            return (
+                mixed_qkv,
+                a,
+                b,
+                conv_states,
+                ssm_states,
+                cache_indices,
+                onorm_g,
+            )
+
+        self.assertTrue(covered(*make_args(24)))
+        self.assertFalse(covered(*make_args(16)))
+
     def test_covered_accepts_envelope_strided_and_rejects_noncontiguous_inner(self):
         for heads in _KDA_HEADS:
             with self.subTest(kda_heads=heads):
