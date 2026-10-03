@@ -18,6 +18,9 @@ SIMULATOR_SERVER_ARG_OVERRIDES = {
     "attention_backend": "torch_native",
     "prefill_attention_backend": "torch_native",
     "decode_attention_backend": "torch_native",
+    # Predictor batches represent one ordinary forward, not speculative
+    # draft/verify substeps.
+    "speculative_algorithm": None,
 }
 
 

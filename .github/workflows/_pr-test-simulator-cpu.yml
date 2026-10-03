@@ -95,3 +95,11 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_predictor_contract.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_infercast_predictor.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_run_infercast_open_loop.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_run_infercast_real_open_loop.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_device_timer_fpm_flush.py
+          python3 tools/sglang-simulator/scripts/run_infercast_benchmark.py --help
+          python3 tools/sglang-simulator/scripts/run_infercast_open_loop.py --help
+          python3 tools/sglang-simulator/scripts/run_infercast_real_open_loop.py --help
