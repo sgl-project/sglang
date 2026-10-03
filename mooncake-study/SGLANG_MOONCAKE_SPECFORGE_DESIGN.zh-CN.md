@@ -534,8 +534,17 @@ prefill chunk 和已有请求的 decode。采集沿用逐请求 `extend_seq_lens
 发布协议，不新增 Store 字段。单 H100/Qwen3-0.6B 验收覆盖同步与 overlap、
 decode CUDA graph，以及 Full/Breakable/piecewise prefill graph；逐配置比较
 关闭/开启采集的输出，并在服务退出后校验完整 Store 样本。测试还包含同批
-超长排除请求、单 token 回复和 prefix cache 命中。混合 speculative 仍由启动
-检查拒绝，混合 TP/PP、P/D 与生产性能需单独验证。复现与证据见
+超长排除请求、单 token 回复和 prefix cache 命中。
+
+后续真实 H100 验收加入 TP2/PP1、TP1/PP2、TP2/PP2，新增 14 个分布式配置，
+并重新运行 7 个单卡配置。各 rank 的 mixed batch 请求顺序、prefix/extend 长度
+必须一致，分别检查 partial/final prompt chunk、graph replay、teacher 归属和
+Host 资源回收；前级 PP 不得产生 teacher 行。全部 21 个配置通过，服务退出后
+读回 105 份完整快照，126 个 capture-off 请求的输出与 capture-on 完全一致。
+这轮复用现有生产采集、分片发布与 Store 实现，增加逐 rank 观测和 CI 回归。
+PP 使用同步调度，piecewise 使用 eager compile debug mode，Store 使用 TCP 和
+HTTP 测试 Catalog。混合 speculative 仍由启动检查拒绝，混合 P/D、RDMA 与
+生产性能需单独验证。复现与证据见
 [`experiments/MIXED_CHUNK_CAPTURE.md`](experiments/MIXED_CHUNK_CAPTURE.md)。
 
 ### 7.4 选层 KV 导出

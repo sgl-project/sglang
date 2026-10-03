@@ -39,7 +39,7 @@ it does not redefine the goal as the modules already implemented.
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Prefill graph collection | Live request lengths, owned teacher/KV staging, resolved hidden capture, stable PP activations and P/D teacher handoff | Qwen3 AR/static target-KV DSpark pass Full, Breakable and piecewise in colocated/P/D single-rank, TP2, PP2 and TP2/PP2 serving with eager output comparison; Qwen2.5 TP4 colocated graphs pass same-execution capture-on/off equality and post-exit Store parity while retaining a no-capture cross-backend output difference; distributed piecewise uses eager compile debug mode; asymmetric P/D and other speculative prefill graphs remain open |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
-| Mixed-chunk collection | Ordinary AR admits native mixed prefill/decode; per-request offsets reuse owned staging and overlap ledgers | Single-H100 Qwen3 eager/graph tests check selected/unselected rows, partial prompt chunks, prefix hits, capture-off output equality and post-exit Store reads; mixed speculative remains rejected and distributed mixed coverage remains open |
+| Mixed-chunk collection | Ordinary AR admits native mixed prefill/decode; per-request offsets reuse owned staging and overlap ledgers | Qwen3 single-rank, TP2, PP2 and TP2/PP2 eager/graph matrices check rank-local request order, KV shards, teacher ownership, selected/unselected rows, prefix hits and output equality; 105 complete post-exit snapshots pass; mixed speculative remains rejected, and mixed P/D, RDMA and SLO coverage remain open |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production checkpoint-manager integration and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
 | Draft checkpoint export | SGLang API/CLI packages consolidated training state, resolved HF config and pinned validation artifacts | Split/native packed weights, all Markov heads, optimizer-step export/reload and a retained BF16 export pass; SpecForge checkpoint-manager adapter and trained-quality validation remain open |
@@ -4276,15 +4276,50 @@ The [runbook](experiments/MIXED_CHUNK_CAPTURE.md) and
 registration differs from the final GPU test source; its exact replacement
 and CI parser result are checked. Tests use one H100, TCP and the test Catalog;
 the receiver barrier and source observations are not performance evidence.
-Mixed TP/PP, P/D and SLO acceptance remain open. The resident H100's existing
-idle workload resumes after all jobs finish.
+The distributed follow-up is recorded below; mixed P/D and SLO acceptance remain
+open. The resident H100's existing idle workload resumes after all jobs finish.
+
+## Distributed Native Mixed Capture
+
+The mixed runtime fixture now shares its workload across single-GPU, TP2/PP1,
+TP1/PP2 and TP2/PP2 tests. No production scheduler, capture or Store code changes
+were needed. Each rank records native mixed batches independently, and request
+order, decode membership and prefix/extend lengths must agree across ranks.
+Each rank also checks partial/final prompt chunks, cached prefixes and graph
+replay. Only the final PP stage observes teacher predictions. Nonce-tagged
+observations of the real server-info request verify admissions, publication
+counts and resource return on every rank.
+
+The final single-GPU regression passes seven methods in 620.415 seconds;
+the TP2/PP1 and TP1/PP2 suite passes nine in 1035.322 seconds; TP2/PP2 passes
+five in 566.268 seconds. These 21 configurations validate 105 complete
+post-exit snapshots, 3,336 tensor objects and 173,516,850 tensor bytes.
+All 126 capture-off requests have identical capture-on output tokens.
+The observer records 562 mixed request/rank frames, including 298 prefill
+replay frames. Each configuration has five complete publications, four
+available reservations per rank, no quarantined Host buffers or capture
+failures, and excludes the over-limit request. A separate PP2 eager smoke
+passes in 252.277 seconds and is excluded from these totals.
+
+The [runbook](experiments/MIXED_CHUNK_CAPTURE.md) and
+[report](experiments/mixed-distributed-capture.json) retain per-rank results,
+25 archived artifacts and exact agreement with all 5,014 Python source and
+registered test files in the frozen runtime checkout. The new suites register
+with the configured two- and four-GPU CI runners. All tests use Qwen3-0.6B,
+FlashInfer, TCP Store and the HTTP test Catalog. PP is synchronous; piecewise
+uses eager compile debug mode; Full prefill remains experimental. These source
+observers verify preservation and are not independent attention implementations
+or serving performance measurements. Mixed P/D, RDMA, production Catalog/SLO
+acceptance and trained draft quality remain open. The temporary four-H100 job
+is deleted after verifying no live serving processes or GPU workloads; the
+resident worker and resumed idle load remain live.
 
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2, PP2 and combined TP2/PP2 AR/static target-KV
-   DSpark prefill graph coverage to asymmetric P/D, other speculative and
-   distributed mixed-chunk execution beyond the single-H100 AR matrix. Extend distributed
-   pressure beyond passing
+   DSpark prefill graph coverage to asymmetric P/D and other speculative modes.
+   Extend the passing single-rank, TP2, PP2 and TP2/PP2 mixed-chunk matrix to
+   P/D and cross-node transport. Extend distributed pressure beyond passing
    colocated and P/D synchronous TP1/PP2 and TP2/PP2 DSpark to AR and asymmetric
    combined topologies. Broaden real-request coverage to speculative cache
    eviction, target weight replacement and

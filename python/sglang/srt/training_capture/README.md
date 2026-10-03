@@ -88,8 +88,13 @@ synchronous/overlap eager, decode graphs and all three prefill graph backends,
 with exact capture-on/off output equality and post-exit Store checks. Oversized
 unselected requests must not shift the captured rows. See
 [mixed-chunk capture](../../../../mooncake-study/experiments/MIXED_CHUNK_CAPTURE.md).
-Mixed speculative execution remains unsupported by the serving scheduler;
-mixed TP/PP and P/D require their own runtime validation.
+The distributed matrix adds TP2/PP1, TP1/PP2 and TP2/PP2 with per-rank mixed
+batch agreement, graph replay, teacher ownership and resource-return checks.
+Together with the single-GPU regression, 21 configurations validate 105 complete
+snapshots and 126 capture-off output comparisons through TCP Store and the test
+Catalog. PP uses synchronous scheduling and piecewise uses eager compile debug
+mode. Mixed speculative execution remains unsupported by the serving scheduler;
+mixed P/D, RDMA and serving SLOs require their own validation.
 The configuration is checked before weights load; unsupported DP/context
 parallelism, non-DSpark speculative algorithms, non-Mooncake or optimistic PD,
 mixed-chunk speculative, LoRA, quantized or embedding execution is rejected. Model/pool

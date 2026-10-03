@@ -1,0 +1,4886 @@
+{
+  "status": "completed",
+  "date": "2026-10-03T04:45:35.010Z",
+  "feature": "Native AR mixed-chunk capture with distributed rank validation",
+  "base_commit": "858d6f9cf9440ea0faaf22bfeaedb70434e86f58",
+  "production_change": "None; shared capture, scheduler and Store code exercised unchanged.",
+  "environment": {
+    "observed_at": "2026-10-03T04:17:26.320Z",
+    "pod": "job-1c19d5e7f9fb-20261003120225-master-0",
+    "node": "node199",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "gpus": "0, NVIDIA H100 80GB HBM3, GPU-9a2310f8-4162-b824-638e-95729f284b28, 81559 MiB, 535.154.05\n1, NVIDIA H100 80GB HBM3, GPU-776781c5-2156-1fae-4763-7fdba75de0d4, 81559 MiB, 535.154.05\n2, NVIDIA H100 80GB HBM3, GPU-cbb33d72-ecf6-a5c7-d747-e11663842649, 81559 MiB, 535.154.05\n3, NVIDIA H100 80GB HBM3, GPU-ba8dcfbf-4408-a5f3-86bb-310df1785097, 81559 MiB, 535.154.05",
+    "runtime": {
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "transport": "TCP",
+    "catalog": "HTTP TestCaptureCatalog",
+    "discarded_allocation": "job-6b2fdcf046fb-20261003120114",
+    "discarded_reason": "Northjob retained the command separator in bash -c; deleted before experiments and resubmitted with sleep 7200."
+  },
+  "jobs": [
+    {
+      "role": "pp-smoke",
+      "state": "state-mixed-distributed",
+      "id": "01791000633149135998-5d661d0fe3dc",
+      "methods": 1,
+      "result": {
+        "job_id": "01791000633149135998-5d661d0fe3dc",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791000907.2693985,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-mixed-distributed/logs/01791000633149135998-5d661d0fe3dc.log"
+      },
+      "submission": null,
+      "log_sha256": "6bdde20f2ad46526572e082650d38918727e79dd415bc1e2a35718fff5e45786",
+      "elapsed_seconds": 252.277
+    },
+    {
+      "role": "single",
+      "state": "state",
+      "id": "01791000731197009956-d2d79b8e9647",
+      "methods": 7,
+      "result": {
+        "job_id": "01791000731197009956-d2d79b8e9647",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791001364.9528189,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791000731197009956-d2d79b8e9647.log"
+      },
+      "submission": {
+        "job_id": "01791000731197009956-d2d79b8e9647",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_mixed.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-distributed-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-distributed-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1200
+      },
+      "log_sha256": "7002687678aae2734024c4eae288c5bd0c09680e54c9655be0dcda94f5640fe6",
+      "elapsed_seconds": 620.415
+    },
+    {
+      "role": "distributed",
+      "state": "state-mixed-distributed",
+      "id": "01791001014477497117-1115826e11f1",
+      "methods": 9,
+      "result": {
+        "job_id": "01791001014477497117-1115826e11f1",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791002069.648152,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-mixed-distributed/logs/01791001014477497117-1115826e11f1.log"
+      },
+      "submission": {
+        "job_id": "01791001014477497117-1115826e11f1",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_mixed_distributed.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-distributed-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-distributed-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 2400
+      },
+      "log_sha256": "fdf06ac10731bc0ee25319883d8769bd75526f1743b26a96b2875daf2ee582f5",
+      "elapsed_seconds": 1035.322
+    },
+    {
+      "role": "tppp",
+      "state": "state-mixed-distributed",
+      "id": "01791001014830748264-b2602582e939",
+      "methods": 5,
+      "result": {
+        "job_id": "01791001014830748264-b2602582e939",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791002656.1231737,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-mixed-distributed/logs/01791001014830748264-b2602582e939.log"
+      },
+      "submission": {
+        "job_id": "01791001014830748264-b2602582e939",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_mixed_tppp.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-distributed-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-mixed-distributed-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1600
+      },
+      "log_sha256": "5ab53b129ecfabf07a71f8320b30fc03c6992581f071ffb2dfe457a07a2aafb3",
+      "elapsed_seconds": 566.268
+    }
+  ],
+  "cases": [
+    {
+      "mixed_capture": "mixed-tp1-pp1-True-breakable-full",
+      "overlap": true,
+      "tp_size": 1,
+      "pp_size": 1,
+      "prefill": "breakable",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 18,
+      "mixed_replay_frames": 18,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 7,
+            "excluded_health_check": 1,
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "cuda_graph_forwards": 34,
+            "excluded_length": 1,
+            "sealed": 5,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "snapshot_built": 5,
+            "ready": 5,
+            "eager_forwards": 1
+          },
+          "states": {
+            "available": 4
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 31502336,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 18,
+          "mixed_replay_frames": 18,
+          "decode_replay_frames": 25,
+          "teacher_rows": 44
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 7
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp1-pp1-True-full-full",
+      "overlap": true,
+      "tp_size": 1,
+      "pp_size": 1,
+      "prefill": "full",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 18,
+      "mixed_replay_frames": 18,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 7,
+            "excluded_health_check": 1,
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "cuda_graph_forwards": 34,
+            "excluded_length": 1,
+            "sealed": 5,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "snapshot_built": 5,
+            "ready": 5,
+            "eager_forwards": 1
+          },
+          "states": {
+            "available": 4
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 31502336,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 18,
+          "mixed_replay_frames": 18,
+          "decode_replay_frames": 25,
+          "teacher_rows": 44
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp1-pp1-True-disabled-full",
+      "overlap": true,
+      "tp_size": 1,
+      "pp_size": 1,
+      "prefill": "disabled",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 18,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 7,
+            "excluded_health_check": 1,
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "eager_forwards": 11,
+            "cuda_graph_forwards": 24,
+            "excluded_length": 1,
+            "sealed": 5,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "snapshot_built": 5,
+            "ready": 5
+          },
+          "states": {
+            "available": 4
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 31502336,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 18,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 25,
+          "teacher_rows": 44
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp1-pp1-True-disabled-disabled",
+      "overlap": true,
+      "tp_size": 1,
+      "pp_size": 1,
+      "prefill": "disabled",
+      "decode": "disabled",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 16,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 7,
+            "excluded_health_check": 1,
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "eager_forwards": 35,
+            "sealed": 5,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "snapshot_built": 5,
+            "excluded_length": 1,
+            "ready": 5
+          },
+          "states": {
+            "available": 4
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 31502336,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 16,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 44
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 7
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp1-pp1-True-tc_piecewise-full",
+      "overlap": true,
+      "tp_size": 1,
+      "pp_size": 1,
+      "prefill": "tc_piecewise",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 18,
+      "mixed_replay_frames": 18,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 7,
+            "excluded_health_check": 1,
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "cuda_graph_forwards": 34,
+            "excluded_length": 1,
+            "sealed": 5,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "snapshot_built": 5,
+            "ready": 5,
+            "eager_forwards": 1
+          },
+          "states": {
+            "available": 4
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 31502336,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 18,
+          "mixed_replay_frames": 18,
+          "decode_replay_frames": 25,
+          "teacher_rows": 44
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp1-pp1-False-disabled-full",
+      "overlap": false,
+      "tp_size": 1,
+      "pp_size": 1,
+      "prefill": "disabled",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 17,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 7,
+            "excluded_health_check": 1,
+            "admitted": 5,
+            "eager_forwards": 11,
+            "cuda_graph_forwards": 21,
+            "sealed": 5,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "snapshot_built": 5,
+            "excluded_length": 1,
+            "ready": 5
+          },
+          "states": {
+            "available": 4
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 31502336,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 17,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 21,
+          "teacher_rows": 39
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 7
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp1-pp1-False-disabled-disabled",
+      "overlap": false,
+      "tp_size": 1,
+      "pp_size": 1,
+      "prefill": "disabled",
+      "decode": "disabled",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 17,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "considered": 7,
+            "excluded_health_check": 1,
+            "admitted": 5,
+            "eager_forwards": 32,
+            "sealed": 5,
+            "writer_started": 5,
+            "copies_completed": 5,
+            "snapshot_built": 5,
+            "excluded_length": 1,
+            "ready": 5
+          },
+          "states": {
+            "available": 4
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 31502336,
+            "device_allocated_bytes": 852224,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 17,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 39
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp1-pp2-False-full-full",
+      "overlap": false,
+      "tp_size": 1,
+      "pp_size": 2,
+      "prefill": "full",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 18,
+      "mixed_replay_frames": 18,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 8388608,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 23113728,
+            "device_allocated_bytes": 590080,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 0
+        },
+        "pp1-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 39
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp1-tp0": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp1-tp0": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp1-pp2-False-tc_piecewise-full",
+      "overlap": false,
+      "tp_size": 1,
+      "pp_size": 2,
+      "prefill": "tc_piecewise",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 18,
+      "mixed_replay_frames": 18,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 8388608,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 23113728,
+            "device_allocated_bytes": 590080,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 0
+        },
+        "pp1-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 39
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp1-tp0": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp1-tp0": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp1-pp2-False-disabled-disabled",
+      "overlap": false,
+      "tp_size": 1,
+      "pp_size": 2,
+      "prefill": "disabled",
+      "decode": "disabled",
+      "samples": 5,
+      "tensor_objects": 118,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 18,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 33,
+            "sealed": 5,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 8388608,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 33,
+            "sealed": 5,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 23113728,
+            "device_allocated_bytes": 590080,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 0
+        },
+        "pp1-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 39
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp1-tp0": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp1-tp0": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp2-pp1-True-breakable-full",
+      "overlap": true,
+      "tp_size": 2,
+      "pp_size": 1,
+      "prefill": "breakable",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 196,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 36,
+      "mixed_replay_frames": 36,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "cuda_graph_forwards": 34,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 18919424,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "cuda_graph_forwards": 34,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 12582912,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 18,
+          "mixed_replay_frames": 18,
+          "decode_replay_frames": 25,
+          "teacher_rows": 44
+        },
+        "pp0-tp1": {
+          "mixed_source_frames": 18,
+          "mixed_replay_frames": 18,
+          "decode_replay_frames": 25,
+          "teacher_rows": 44
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 8,
+            "pp0-tp1": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 8,
+            "pp0-tp1": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp2-pp1-True-full-full",
+      "overlap": true,
+      "tp_size": 2,
+      "pp_size": 1,
+      "prefill": "full",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 196,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 32,
+      "mixed_replay_frames": 32,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "cuda_graph_forwards": 34,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 18919424,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "cuda_graph_forwards": 34,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 12582912,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 16,
+          "mixed_replay_frames": 16,
+          "decode_replay_frames": 27,
+          "teacher_rows": 44
+        },
+        "pp0-tp1": {
+          "mixed_source_frames": 16,
+          "mixed_replay_frames": 16,
+          "decode_replay_frames": 27,
+          "teacher_rows": 44
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 8,
+            "pp0-tp1": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 7,
+            "pp0-tp1": 7
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp2-pp1-True-disabled-full",
+      "overlap": true,
+      "tp_size": 2,
+      "pp_size": 1,
+      "prefill": "disabled",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 196,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 36,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "eager_forwards": 11,
+            "cuda_graph_forwards": 24,
+            "sealed": 5,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 18919424,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "eager_forwards": 11,
+            "cuda_graph_forwards": 24,
+            "sealed": 5,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 12582912,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 18,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 25,
+          "teacher_rows": 44
+        },
+        "pp0-tp1": {
+          "mixed_source_frames": 18,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 25,
+          "teacher_rows": 44
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 8,
+            "pp0-tp1": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 8,
+            "pp0-tp1": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp2-pp1-True-disabled-disabled",
+      "overlap": true,
+      "tp_size": 2,
+      "pp_size": 1,
+      "prefill": "disabled",
+      "decode": "disabled",
+      "samples": 5,
+      "tensor_objects": 196,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 36,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "eager_forwards": 35,
+            "sealed": 5,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 18919424,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "eager_forwards": 35,
+            "sealed": 5,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 12582912,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 18,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 44
+        },
+        "pp0-tp1": {
+          "mixed_source_frames": 18,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 44
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 8,
+            "pp0-tp1": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 8,
+            "pp0-tp1": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp2-pp1-True-tc_piecewise-full",
+      "overlap": true,
+      "tp_size": 2,
+      "pp_size": 1,
+      "prefill": "tc_piecewise",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 196,
+      "tensor_bytes": 8294890,
+      "mixed_source_frames": 32,
+      "mixed_replay_frames": 32,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "cuda_graph_forwards": 34,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 18919424,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "overlap_forwards": 35,
+            "cuda_graph_forwards": 34,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 12582912,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 16,
+          "mixed_replay_frames": 16,
+          "decode_replay_frames": 27,
+          "teacher_rows": 44
+        },
+        "pp0-tp1": {
+          "mixed_source_frames": 16,
+          "mixed_replay_frames": 16,
+          "decode_replay_frames": 27,
+          "teacher_rows": 44
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 8,
+            "pp0-tp1": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 7,
+            "pp0-tp1": 7
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp2-pp1-False-disabled-disabled",
+      "overlap": false,
+      "tp_size": 2,
+      "pp_size": 1,
+      "prefill": "disabled",
+      "decode": "disabled",
+      "samples": 5,
+      "tensor_objects": 196,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 34,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 32,
+            "sealed": 5,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 18919424,
+            "device_allocated_bytes": 459008,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 32,
+            "sealed": 5,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 12582912,
+            "device_allocated_bytes": 393216,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 17,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 39
+        },
+        "pp0-tp1": {
+          "mixed_source_frames": 17,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 39
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 8,
+            "pp0-tp1": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 8,
+            "pp0-tp1": 8
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp2-pp2-False-breakable-full",
+      "overlap": false,
+      "tp_size": 2,
+      "pp_size": 2,
+      "prefill": "breakable",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 196,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 36,
+      "mixed_replay_frames": 36,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 14725120,
+            "device_allocated_bytes": 327936,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp1": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 8388608,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 0
+        },
+        "pp0-tp1": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 0
+        },
+        "pp1-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 39
+        },
+        "pp1-tp1": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 39
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp0-tp1": 4,
+            "pp1-tp0": 4,
+            "pp1-tp1": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp0-tp1": 4,
+            "pp1-tp0": 4,
+            "pp1-tp1": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp2-pp2-False-full-full",
+      "overlap": false,
+      "tp_size": 2,
+      "pp_size": 2,
+      "prefill": "full",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 196,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 36,
+      "mixed_replay_frames": 36,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 14725120,
+            "device_allocated_bytes": 327936,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp1": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 8388608,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 0
+        },
+        "pp0-tp1": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 0
+        },
+        "pp1-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 39
+        },
+        "pp1-tp1": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 39
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp0-tp1": 4,
+            "pp1-tp0": 4,
+            "pp1-tp1": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp0-tp1": 4,
+            "pp1-tp0": 4,
+            "pp1-tp1": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp2-pp2-False-tc_piecewise-full",
+      "overlap": false,
+      "tp_size": 2,
+      "pp_size": 2,
+      "prefill": "tc_piecewise",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 196,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 36,
+      "mixed_replay_frames": 36,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 14725120,
+            "device_allocated_bytes": 327936,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp1": {
+          "counters": {
+            "admitted": 5,
+            "cuda_graph_forwards": 32,
+            "sealed": 5,
+            "eager_forwards": 1,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 8388608,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 0
+        },
+        "pp0-tp1": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 0
+        },
+        "pp1-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 39
+        },
+        "pp1-tp1": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 9,
+          "decode_replay_frames": 28,
+          "teacher_rows": 39
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp0-tp1": 4,
+            "pp1-tp0": 4,
+            "pp1-tp1": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp0-tp1": 4,
+            "pp1-tp0": 4,
+            "pp1-tp1": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp2-pp2-False-disabled-full",
+      "overlap": false,
+      "tp_size": 2,
+      "pp_size": 2,
+      "prefill": "disabled",
+      "decode": "full",
+      "samples": 5,
+      "tensor_objects": 196,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 36,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 8,
+            "cuda_graph_forwards": 25,
+            "sealed": 5,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 8,
+            "cuda_graph_forwards": 25,
+            "sealed": 5,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 8,
+            "cuda_graph_forwards": 25,
+            "sealed": 5,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 14725120,
+            "device_allocated_bytes": 327936,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp1": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 8,
+            "cuda_graph_forwards": 25,
+            "sealed": 5,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 8388608,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 28,
+          "teacher_rows": 0
+        },
+        "pp0-tp1": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 28,
+          "teacher_rows": 0
+        },
+        "pp1-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 28,
+          "teacher_rows": 39
+        },
+        "pp1-tp1": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 28,
+          "teacher_rows": 39
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp0-tp1": 4,
+            "pp1-tp0": 4,
+            "pp1-tp1": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp0-tp1": 4,
+            "pp1-tp0": 4,
+            "pp1-tp1": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mixed_capture": "mixed-tp2-pp2-False-disabled-disabled",
+      "overlap": false,
+      "tp_size": 2,
+      "pp_size": 2,
+      "prefill": "disabled",
+      "decode": "disabled",
+      "samples": 5,
+      "tensor_objects": 196,
+      "tensor_bytes": 8233450,
+      "mixed_source_frames": 36,
+      "mixed_replay_frames": 0,
+      "teacher_fingerprint": "c51ef74bd1b817a0ce6c820f621bf2b63362c74018b2979d22f34895580f59a7",
+      "capture": {
+        "pp0-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 33,
+            "sealed": 5,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "considered": 7,
+            "excluded": 2,
+            "selected": 5,
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp0-tp1": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 33,
+            "sealed": 5,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 4194304,
+            "device_allocated_bytes": 131072,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp0": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 33,
+            "sealed": 5,
+            "ready": 5
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 14725120,
+            "device_allocated_bytes": 327936,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        },
+        "pp1-tp1": {
+          "counters": {
+            "admitted": 5,
+            "eager_forwards": 33,
+            "sealed": 5,
+            "ready": 0
+          },
+          "states": {
+            "available": 4,
+            "writing": 0,
+            "pending_publication": 0
+          },
+          "disabled_reason": null,
+          "admission_paused": false,
+          "host_pool": {
+            "allocated_bytes": 8388608,
+            "device_allocated_bytes": 262144,
+            "device_limit_bytes": 8388608,
+            "kv_export_host_enqueued_bytes": 0,
+            "kv_export_device_enqueued_bytes": 0,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "queued": 0,
+          "request_router": {
+            "attached": 5,
+            "bound": 5
+          }
+        }
+      },
+      "rank_frames": {
+        "pp0-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 0
+        },
+        "pp0-tp1": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 0
+        },
+        "pp1-tp0": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 39
+        },
+        "pp1-tp1": {
+          "mixed_source_frames": 9,
+          "mixed_replay_frames": 0,
+          "decode_replay_frames": 0,
+          "teacher_rows": 39
+        }
+      },
+      "runs": [
+        {
+          "capture": false,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp0-tp1": 4,
+            "pp1-tp0": 4,
+            "pp1-tp1": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        },
+        {
+          "capture": true,
+          "mixed_batches": {
+            "pp0-tp0": 4,
+            "pp0-tp1": 4,
+            "pp1-tp0": 4,
+            "pp1-tp1": 4
+          },
+          "outputs": {
+            "partial": [
+              101,
+              101,
+              101,
+              101,
+              101,
+              101
+            ],
+            "one": [
+              262
+            ],
+            "excluded": [
+              102
+            ],
+            "decode": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "cached": [
+              103,
+              103,
+              103,
+              103
+            ],
+            "fresh": [
+              82,
+              13,
+              220,
+              17
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "methods": 21,
+    "snapshots": 105,
+    "tensor_objects": 3336,
+    "tensor_bytes": 173516850,
+    "capture_off_requests": 126,
+    "mixed_source_frames": 562,
+    "mixed_replay_frames": 298
+  },
+  "source_audit": {
+    "files": 5014,
+    "sha256": "33b17b5c378b53ce86d9522622bac7610975a6206dbc65b4ad14236f45a816e3"
+  },
+  "source_sha256": {
+    "python/sglang/test/training_capture_mixed_runtime.py": "8f2fb1419e9188d38971663035da1726b5b79e2e7b335df33b4fddaebf8257f1",
+    "python/sglang/test/training_capture_mixed_server.py": "55644c8c01541a2d6eb1fbbd2515949f9212aa5134372c8c321f3f598d66f854",
+    "test/registered/storage/test_training_capture_mixed.py": "307d5632b845f85df9c1258c5c79c25237eae59f0d2c2daa85dac5679b83d00f",
+    "test/registered/storage/test_training_capture_mixed_distributed.py": "8a6e6c9f1ec6b5bca9bf24bdd85a1a388431b67210191b80dbfe8459b68b4af2",
+    "test/registered/storage/test_training_capture_mixed_tppp.py": "5d520f90a76b12c08767164102577709161bda8fe51223f5d560f0e90105b96b"
+  },
+  "cleanup": {
+    "temporary_allocation_deleted": true,
+    "temporary_worker_exited": true,
+    "resident_worker_verified_live": true,
+    "idle_load_resumed": true,
+    "queues_empty": true,
+    "evidence": "cleanup.json"
+  },
+  "limitations": [
+    "Qwen3-0.6B BF16 FlashInfer on H100 with TCP Store and HTTP TestCaptureCatalog; not a production Catalog acceptance.",
+    "PP uses synchronous scheduling. Piecewise uses eager compile debug mode; Full prefill remains experimental.",
+    "Source-pool and raw-logit observers verify preservation, not independent attention-write correctness.",
+    "Receiver barriers and synchronous observers invalidate performance conclusions.",
+    "No certification of mixed P/D, RDMA, speculative mixed execution, other models/topologies, saturated load, SLOs or trained draft quality."
+  ],
+  "artifact_archive": {
+    "path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/mixed-distributed-20261003",
+    "files": 25,
+    "manifest": "artifact-manifest.json",
+    "sha256": "d56598cc321253c59b3dc72191f8588e5a164d0d3f0a23fa019397599a3638e4"
+  }
+}

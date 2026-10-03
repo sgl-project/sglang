@@ -1,22 +1,21 @@
-"""Single-GPU native mixed prefill/decode collection through Mooncake."""
+"""Native mixed collection with tensor or pipeline parallel serving."""
 
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.training_capture_mixed_runtime import MixedCaptureRuntimeBase
 
-register_cuda_ci(est_time=1000, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=1600, stage="extra-a", runner_config="2-gpu-large")
 
 
-class TestMixedCapture(MixedCaptureRuntimeBase):
+class TestMixedTP(MixedCaptureRuntimeBase):
+    tp_size = 2
+
     def test_synchronous_eager(self):
         self.exercise_mixed(overlap=False)
 
     def test_overlap_eager(self):
         self.exercise_mixed(overlap=True)
-
-    def test_synchronous_decode_graph(self):
-        self.exercise_mixed(overlap=False, decode="full")
 
     def test_overlap_decode_graph(self):
         self.exercise_mixed(overlap=True, decode="full")
@@ -29,6 +28,19 @@ class TestMixedCapture(MixedCaptureRuntimeBase):
 
     def test_piecewise_prefill(self):
         self.exercise_mixed(overlap=True, prefill="tc_piecewise", decode="full")
+
+
+class TestMixedPP(MixedCaptureRuntimeBase):
+    pp_size = 2
+
+    def test_synchronous_eager(self):
+        self.exercise_mixed(overlap=False)
+
+    def test_full_prefill(self):
+        self.exercise_mixed(overlap=False, prefill="full", decode="full")
+
+    def test_piecewise_prefill(self):
+        self.exercise_mixed(overlap=False, prefill="tc_piecewise", decode="full")
 
 
 if __name__ == "__main__":
