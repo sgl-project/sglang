@@ -127,10 +127,23 @@ def assert_special_values_match(
 ) -> None:
     """Both paths agree on NaN, Inf, empty and non-contiguous inputs.
 
-    Agreement means the same NaN and Inf positions and the same finite values,
-    or the same exception type: a fast path that swallows a NaN (``fmaxf``),
-    returns zeros where the reference returns NaN, or ignores a stride is a
-    defect rather than a tier.
+    Agreement is structural: the same NaN positions, the same infinities with
+    the same signs, finite where the reference is finite, or the same
+    exception type. A fast path that swallows a NaN (``fmaxf``), returns zeros
+    where the reference returns NaN, or lets a NaN leak into rows it should
+    not reach is a defect rather than a tier.
+
+    A kernel that ignores a stride or aliases its inputs reads the wrong
+    elements, which is a magnitude error rather than a structural one: pass a
+    non-contiguous input to :func:`assert_error_no_worse_than_reference` as
+    well, where it shows up as an error far outside the budget.
+
+    It deliberately does not compare the magnitude of the finite values. A
+    lossless-tier path differs from the reference there by construction, and
+    judging that difference is :func:`assert_error_no_worse_than_reference`'s
+    job, on real activations rather than on these edge-case inputs. An earlier
+    version compared them with ``torch.allclose`` defaults, which rejected
+    every bf16 fast path this gate exists to admit.
     """
     for name, inputs in cases.items():
         try:
@@ -161,13 +174,19 @@ def assert_special_values_match(
                 f"{label} returned a tensor on {name!r} where the reference "
                 f"path raised {expected_error.__name__}"
             )
+        if actual.shape != expected.shape:
+            raise AssertionError(
+                f"{label} returns {tuple(actual.shape)} on {name!r} where the "
+                f"reference path returns {tuple(expected.shape)}"
+            )
         if not torch.equal(actual.isnan(), expected.isnan()):
             raise AssertionError(f"{label} moves NaNs on {name!r}")
-        if not torch.equal(actual.isinf(), expected.isinf()):
-            raise AssertionError(f"{label} moves Infs on {name!r}")
-        finite = expected.isfinite()
-        if not torch.allclose(actual[finite], expected[finite], equal_nan=True):
-            raise AssertionError(f"{label} changes finite values on {name!r}")
+        # Signed, so an inf that flips direction is caught too.
+        for sign, what in ((1, "+Inf"), (-1, "-Inf")):
+            if not torch.equal(
+                actual == sign * torch.inf, expected == sign * torch.inf
+            ):
+                raise AssertionError(f"{label} moves {what}s on {name!r}")
 
 
 def discrete_flip_rate(baseline: torch.Tensor, candidate: torch.Tensor) -> float:

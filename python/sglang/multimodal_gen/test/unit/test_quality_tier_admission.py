@@ -106,15 +106,35 @@ class TestSpecialValues(unittest.TestCase):
             )
 
     def test_a_fast_path_that_ignores_strides_is_rejected(self):
-        strided = torch.randn(8, 8)[:, ::2]
-        cases = {"non-contiguous": (strided,)}
+        # Reading the wrong elements is a magnitude error, not a structural
+        # one, so it is the operator-level gate that has to catch it.
+        torch.manual_seed(0)
+        strided = torch.randn(8, 16)[:, ::2]
+        reference = (strided.double() * 2).contiguous()
+        baseline = strided * 2
+        ignores_stride = strided.flatten()[: strided.numel()].view_as(strided) * 2
 
-        with self.assertRaisesRegex(AssertionError, "changes finite values"):
-            assert_special_values_match(
-                baseline=lambda x: x * 2,
-                candidate=lambda x: x.contiguous().flatten()[: x.numel()].view_as(x),
-                cases=cases,
+        with self.assertRaisesRegex(AssertionError, "not lossless-tier"):
+            assert_error_no_worse_than_reference(
+                reference_fp64=reference,
+                baseline=baseline,
+                candidate=ignores_stride,
+                label="stride-ignoring kernel",
             )
+
+    def test_a_rounding_level_difference_is_not_a_special_value_failure(self):
+        # The gate asks whether the special values behave the same, not
+        # whether the numbers match: a lossless-tier path differs there by
+        # construction, and judging that is the operator gate's job.
+        torch.manual_seed(0)
+        x = torch.randn(32, 8)
+        cases = {"plain": (x,), "with a NaN": (torch.cat([x[:1] * float("nan"), x]),)}
+
+        assert_special_values_match(
+            baseline=lambda t: t * 3.0,
+            candidate=lambda t: (t.to(torch.bfloat16) * 3.0).to(t.dtype),
+            cases=cases,
+        )
 
     def test_raising_where_the_reference_returns_is_rejected(self):
         cases = {"empty": (torch.zeros(0),)}
