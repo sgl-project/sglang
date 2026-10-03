@@ -12,6 +12,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_hybrid_swa_model,
     is_multimodal_model,
     register_model_config_factory,
     resolve_spec_hidden_size,
@@ -47,6 +48,46 @@ class TestHybridLayerIds(CustomTestCase):
                     get_hybrid_layer_ids([architecture], config),
                     ([0, 2], [1, 3]),
                 )
+
+    def test_exaone4_splits_layers_by_its_sliding_window_pattern(self):
+        config = SimpleNamespace(
+            num_hidden_layers=8, sliding_window=4096, sliding_window_pattern="LLLG"
+        )
+        self.assertTrue(is_hybrid_swa_model(["Exaone4ForCausalLM"], config))
+        self.assertEqual(
+            get_hybrid_layer_ids(["Exaone4ForCausalLM"], config),
+            ([0, 1, 2, 4, 5, 6], [3, 7]),
+        )
+
+    def test_exaone4_layer_split_follows_the_model_not_layer_types(self):
+        config = SimpleNamespace(
+            num_hidden_layers=4,
+            sliding_window=4096,
+            sliding_window_pattern="LLLG",
+            layer_types=["full_attention"] * 4,
+        )
+        self.assertEqual(
+            get_hybrid_layer_ids(["Exaone4ForCausalLM"], config), ([0, 1, 2], [3])
+        )
+
+    def test_exaone4_without_window_and_pattern_is_not_hybrid(self):
+        # Exaone4Config loads EXAONE-4.0-1.2B's null pattern as 0.
+        cases = {
+            "EXAONE-4.0-1.2B": {"sliding_window": None, "sliding_window_pattern": 0},
+            "pattern only": {"sliding_window": None, "sliding_window_pattern": "LLLG"},
+            "window only": {"sliding_window": 4096, "sliding_window_pattern": None},
+            "window, pattern 0": {"sliding_window": 4096, "sliding_window_pattern": 0},
+        }
+        for name, fields in cases.items():
+            with self.subTest(name):
+                config = SimpleNamespace(num_hidden_layers=4, **fields)
+                self.assertFalse(is_hybrid_swa_model(["Exaone4ForCausalLM"], config))
+
+    def test_exaone_moe_is_not_hybrid(self):
+        config = SimpleNamespace(
+            num_hidden_layers=4, sliding_window=128, sliding_window_pattern="LLLG"
+        )
+        self.assertFalse(is_hybrid_swa_model(["ExaoneMoEForCausalLM"], config))
 
 
 class TestEmbeddingGemmaConfig(CustomTestCase):
