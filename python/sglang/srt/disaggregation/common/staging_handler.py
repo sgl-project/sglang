@@ -291,7 +291,7 @@ class DecodeStagingHandler:
         num_pages: int,
         writer_id: str,
     ) -> bool:
-        """Process a staging chunk arrival from any transport (NIXL RDMA notif or ZMQ CHUNK_READY).
+        """Process a staging chunk arrival reported by a ZMQ CHUNK_READY message.
 
         Accumulates writer arrivals and submits scatter once all writers for
         this chunk have reported in. Returns True if scatter was submitted.
