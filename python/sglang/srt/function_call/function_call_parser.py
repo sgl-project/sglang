@@ -234,8 +234,9 @@ class FunctionCallParser:
         Args:
             at_least_one: If True, the grammar forces at least one tool call
                 (no free text allowed). Used for required/named tool_choice.
-            tool_name: If set, the grammar accepts only this tool. Used for a
-                named tool_choice.
+            tool_name: If set, only this tool gets a structure, so the first
+                call must be this tool. Text after a call stays free. Used
+                for a named tool_choice.
 
         Raises:
             ValueError: If tools have conflicting $defs schemas.
