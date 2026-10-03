@@ -31,9 +31,6 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe import (
-    reduce_moe_output,
-)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
@@ -323,7 +320,6 @@ class InternS2MobiusRoutedExpertBank(nn.Module):
     ) -> None:
         super().__init__()
         self.bank_id = bank_id
-        self.tp_size = get_parallel().tp_size
         self.num_experts = config.num_experts
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -423,7 +419,7 @@ class _InternS2MobiusDecoderMixin:
         routed = _get_mobius_routed_bank(meta_mlp, self.layer_id).forward_routed(
             hidden_states, forward_batch
         )
-        return reduce_moe_output(routed + shared)
+        return routed + shared
 
     def _forward_after_attention(
         self,
@@ -433,11 +429,8 @@ class _InternS2MobiusDecoderMixin:
     ) -> torch.Tensor:
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self._forward_mobius_mlp(
-                hidden_states, forward_batch, meta_mlp
-            )
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self._forward_mobius_mlp(hidden_states, forward_batch, meta_mlp)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
         return hidden_states
 
 

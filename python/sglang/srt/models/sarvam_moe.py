@@ -34,7 +34,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe import reduce_moe_output
+from sglang.srt.layers.moe import post_experts_output_is_complete
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -47,6 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -72,7 +73,7 @@ from sglang.srt.utils import (
     bind_or_assign,
     is_cuda,
     is_nvidia_cublas_version_ge_12_9,
-    make_layers,
+    make_pp_layers,
     next_power_of_2,
 )
 
@@ -297,10 +298,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
             and config.num_shared_experts > 0
         ):
             intermediate_size = config.moe_intermediate_size * config.num_shared_experts
-            if is_dense_ffn_fully_dp():
-                shared_tp_rank, shared_tp_size = 0, 1
-            else:
-                shared_tp_rank, shared_tp_size = None, None
             self.shared_experts = SarvamMoEMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -308,8 +305,13 @@ class SarvamMoESparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("shared_experts", prefix),
                 reduce_results=False,
-                tp_rank=shared_tp_rank,
-                tp_size=shared_tp_size,
+                # The shared output joins the routed output's TP sum; where that
+                # output is already complete on each rank, it is not TP-sharded.
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if post_experts_output_is_complete(is_tp_path=True)
+                    else {}
+                ),
             )
         else:
             self.shared_experts = None
@@ -367,7 +369,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
                 final_hidden_states = final_hidden_states * self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_out
-        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_normal(
@@ -401,8 +402,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
             final_hidden_states = shared_out
         elif self.routed_scaling_factor != 1.0:
             final_hidden_states = final_hidden_states * self.routed_scaling_factor
-
-        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -650,7 +649,7 @@ class SarvamMoEMLAAttention(nn.Module):
 
         get_token_to_kv_pool().set_mla_kv_buffer(
             self.attn_mha,
-            forward_batch.out_cache_loc,
+            KVWriteLoc.for_batch(forward_batch),
             k_nope,
             k_pe,
         )
@@ -1037,6 +1036,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                reduce_results=False,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1080,9 +1080,8 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
         return hidden_states
 
 
@@ -1111,7 +1110,7 @@ class SarvamMLAModel(nn.Module):
         else:
             self.embed_tokens = nn.Identity()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: SarvamMoEMLADecoderLayer(
                 config=config,
@@ -1120,8 +1119,6 @@ class SarvamMLAModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix="model.layers",
         )
 

@@ -541,10 +541,10 @@ IONIC_EOF
 # and the generated argv is byte-identical. Oren's wide-EP recipes set decode
 # EP/DP=16 while prefill stays EP8.
 PREFILL_DPEP=""
-(( PDP > 1 )) && PREFILL_DPEP="$PREFILL_DPEP --enable-dp-attention --dp-size $PDP"
+(( PDP > 1 )) && PREFILL_DPEP="$PREFILL_DPEP --attn-dp-size $PDP"
 (( PEP > 1 )) && PREFILL_DPEP="$PREFILL_DPEP --ep-size $PEP"
 DECODE_DPEP=""
-(( DDP > 1 )) && DECODE_DPEP="$DECODE_DPEP --enable-dp-attention --dp-size $DDP"
+(( DDP > 1 )) && DECODE_DPEP="$DECODE_DPEP --attn-dp-size $DDP"
 (( DEP > 1 )) && DECODE_DPEP="$DECODE_DPEP --ep-size $DEP"
 # Flags shared by both roles (a2a backend, mtp). --max-total-tokens stays here for
 # non-wide recipes; wide recipes carry a per-role prefill_max_total via wide_ep.
@@ -688,10 +688,10 @@ DENV_ARG=""; [[ -n "$DENV" ]] && DENV_ARG=" $DENV"
 # port and stays under the 32768 ephemeral floor. These recipes place at most
 # one single-node engine per node, so two engines cannot collide.
 #
-# Pinning is safe here because --dp-size is only emitted together with
-# --enable-dp-attention, and that path gives every DP rank the same nccl port.
-# launch_dp_schedulers(), which needs a distinct port per worker, is never
-# reached by these recipes.
+# Pinning is safe here because these recipes only emit attention DP
+# (--attn-dp-size), never --dp-size replicas, and the attention-DP path gives
+# every DP rank the same nccl port. launch_dp_schedulers(), which needs a
+# distinct port per worker, is never reached by these recipes.
 PNCCL_ARG=""
 DNCCL_ARG=""
 if [[ "$CLUSTER" == "spur" ]]; then

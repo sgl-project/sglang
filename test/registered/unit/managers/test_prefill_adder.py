@@ -149,22 +149,22 @@ class TestPrefillAdder(CustomTestCase):
     def create_shared_adder(self, *, num_mixed_decode_tokens=0):
         self.mock_tree_cache.supports_mamba.return_value = False
         self.mock_tree_cache.sliding_window_size = 8
-        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
         allocator = init_unified_swa_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
             head_num=1,
-            head_dim=4,
-            v_head_dim=4,
+            head_dim=8,
+            v_head_dim=8,
             swa_head_num=1,
-            swa_head_dim=4,
-            swa_v_head_dim=4,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
             page_size=4,
             start_layer=0,
             end_layer=2,
             swa_attention_layer_ids=[1],
             full_attention_layer_ids=[0],
-            total_bytes=1024,
+            total_bytes=2048,
             enable_memory_saver=False,
             need_sort=False,
             lazy_compaction=True,
@@ -197,7 +197,7 @@ class TestPrefillAdder(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         self.mock_tree_cache.supports_mamba.return_value = False
-        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
         self.mock_token_allocator.available_size.return_value = 32768
         return self.create_adder(
             self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
@@ -281,6 +281,29 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_range.length, 4096)
+
+    def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
+        # A Mamba checkpoint only lands on a page-aligned chunk end, so an
+        # off-grid chunk leaves the rest of the prompt uncacheable.
+        self.mock_token_allocator.available_size.return_value = 32768
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        for supports_mamba, expected in ((False, 100), (True, 64)):
+            with (
+                self.subTest(supports_mamba=supports_mamba),
+                patch.object(
+                    schedule_policy, "_use_exact_chunk_fill", return_value=True
+                ),
+            ):
+                self.mock_tree_cache.supports_mamba.return_value = supports_mamba
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=64, rem_chunk_tokens=100
+                )
+                req = self.create_shared_req("chunked")
+                req.full_untruncated_fill_ids = list(range(300))
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(req.extend_range.length, expected)
 
     def test_shared_admission_reserves_all_pending_requests(self):
         adder = self.create_shared_adder()
@@ -802,7 +825,7 @@ class TestPrefillAdder(CustomTestCase):
         **kwargs,
     ):
         self.mock_tree_cache.supports_mamba.return_value = False
-        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
         if shard_spec is None:
             shard_spec = PageShardSpec(
                 shard_rank=0,
@@ -1132,7 +1155,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_token_allocator.full_available_size.return_value = 100_000
         self.mock_token_allocator.available_size.return_value = 100_000
         self.mock_tree_cache.sliding_window_size = WINDOW
-        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
         adder = self.create_adder(self.create_running_batch(), page_size=PAGE)
         adder.is_hybrid_swa = True
         adder.memory_budget = SWAPrefillBudget(
@@ -1181,7 +1204,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_token_allocator.full_available_size.return_value = 100_000
         self.mock_token_allocator.available_size.return_value = 100_000
         self.mock_tree_cache.sliding_window_size = WINDOW
-        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
 
         def run(delivered: int, remaining_after_load: int = 100_000):
             self.mock_token_allocator.full_available_size.return_value = 100_000

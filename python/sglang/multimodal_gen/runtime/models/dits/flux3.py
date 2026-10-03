@@ -56,6 +56,7 @@ from sglang.kernels.ops.diffusion import (
     is_plain_layer_norm,
     residual_gate_add,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3ArchConfig,
     Flux3DiTConfig,
@@ -306,6 +307,16 @@ class Flux3Fp8RowwiseLinear(nn.Module):
             raise ValueError(
                 "expected an E4M3 weight with one fp32 scale per output row"
             )
+        if is_fp8_fnuz():
+            from sglang.srt.layers.quantization.fp8_utils import (
+                normalize_e4m3fn_to_e4m3fnuz,
+            )
+
+            # MI300 scaled_mm requires FNUZ. Preserve the dequantized checkpoint
+            # values and do not mutate checkpoint tensors shared by the loader.
+            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight.clone(), weight_scale
+            )
         self.out_features, self.in_features = weight.shape
         self.tuple_output = tuple_output
         # Parameters (not buffers) so that layerwise offload streams them.
@@ -325,6 +336,16 @@ class Flux3Fp8RowwiseLinear(nn.Module):
             if pad:
                 flat = F.pad(flat, (0, 0, 0, pad))
             activation, activation_scale = quantize_fp8_rowwise(flat)
+            # ROCm-only: can_use_fp8_rowwise() requires torch.version.hip is None,
+            # so the fnuz weights only ever reach this branch.
+            if self.weight.dtype == torch.float8_e4m3fnuz:
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    normalize_e4m3fn_to_e4m3fnuz,
+                )
+
+                activation, activation_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    activation, activation_scale
+                )
         out = torch._scaled_mm(
             activation,
             self.weight.T,

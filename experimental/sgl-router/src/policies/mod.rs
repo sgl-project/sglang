@@ -5,6 +5,7 @@ pub mod admission;
 pub mod buckets;
 pub mod cache_aware;
 pub mod decode;
+pub mod dp_rank;
 pub mod factory;
 pub mod load_based;
 pub mod power_of_two;
@@ -572,6 +573,13 @@ impl PolicyRegistry {
         self.by_model.get(model).map(|p| p.clone())
     }
 
+    /// Whether any registered policy reads request tokens; startup rejects this under `--no-tokenizer`.
+    pub fn needs_request_tokens(&self) -> bool {
+        self.by_model
+            .iter()
+            .any(|entry| entry.value().needs_request_tokens())
+    }
+
     /// Attaches metrics to each registered policy.
     pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
         for entry in self.by_model.iter() {
@@ -616,7 +624,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("model".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 
