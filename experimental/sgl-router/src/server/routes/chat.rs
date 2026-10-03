@@ -34,8 +34,9 @@ use std::time::Instant;
 const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
 const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
-/// Maximum buffered request body, including base64 multimodal inputs (32 MiB).
-/// Enforced by the `DefaultBodyLimit` layer in app.rs, which returns 413.
+/// Default maximum buffered request body, including base64 multimodal inputs
+/// (32 MiB); an API profile's `limits.max_body_bytes` replaces it. Enforced by
+/// the `DefaultBodyLimit` layer in app.rs, which returns 413.
 pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
 
 /// Validate, select workers, and forward a chat-completions request.
@@ -46,12 +47,14 @@ pub async fn chat_completions(
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let mut fields = parse_routing_fields(&body)?;
-    let model = ModelId(
-        fields
-            .model
-            .take()
-            .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
-    );
+    let mut model = fields
+        .model
+        .take()
+        .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
+    if ctx.config.model.profile.is_alias(&model) {
+        model.clone_from(&ctx.config.model.id);
+    }
+    let model = ModelId(model);
     let routing = ModelRouting::lookup(&ctx, &model)?;
     let request = PreparedRequest::chat(
         &ctx,

@@ -296,6 +296,70 @@ queue slot and no engine round-trip — the `sampling_contract_violation` code
 and per-parameter counter, bands, and one contract applied at a shared ingress
 across engines whose own flags the router operator may not control.
 
+### API profiles
+
+A hosted endpoint often has to match a vendor's API contract, not just its
+sampling defaults: the largest output it allows, how big a request may be, the
+model names it answers to, the error type its 400s carry. An API profile
+declares that contract in one YAML file, so a deployment selects a contract
+instead of assembling flags, and a vendor's contract is written once and
+reused.
+
+```bash
+sgl-router --model-id kimi --worker-urls http://10.0.0.1:30000 --api-profile moonshot-kimi
+sgl-router ... --api-profile-file /etc/router/profile.yaml
+sgl-router ... --api-profile-file /etc/router/profile.yaml --print-profile   # merged result, then exit
+```
+
+```yaml
+name: my-endpoint
+extends: moonshot-kimi           # a preset, or a file path relative to this file
+
+sampling:                        # --override-sampling-params as a section
+  conflict: reject               # reject (default) | allow
+  params:
+    top_p: 0.95
+    temperature: { min: 0, max: 1 }
+
+output:
+  max_tokens:
+    cap: 64000
+    on_exceed: clamp             # reject (default): 400 above cap | clamp: lower it to cap
+    default: 8192                # injected when a request sets no budget (cap if unset)
+
+limits:
+  max_body_bytes: 128MiB         # B, KiB, MiB, GiB or a byte count; 413 above it (default 32MiB)
+  max_images: 60                 # image_url parts per request; 400 above it
+
+models:
+  aliases: [kimi-preview]        # accepted besides --model-id and routed as it
+
+errors:
+  bad_request_type: request_params_invalid   # replaces `type` in every 400 body
+```
+
+Every key is optional, and an unknown key fails startup. `sampling` is parsed
+and enforced exactly like `--override-sampling-params`; that flag, when given,
+replaces the profile's `sampling` section as a whole. The output budget is read
+with the engine's precedence (`max_completion_tokens`, then `max_tokens`).
+`output`, `limits`, `models` and `errors` apply to `/v1/chat/completions`; the
+body size limit applies to every inference route.
+
+The first source that is set wins: `--api-profile-file`, `--api-profile`,
+`SGLANG_ROUTER_API_PROFILE` (a preset name, or a path containing `/` or ending
+in `.yaml`), `/etc/sgl-router/profile.yaml` if it exists, then the built-in
+`openai-compatible`, which enforces nothing. A child file is merged onto what
+it `extends`: maps merge key by key, scalars and lists replace, and `null`
+deletes an inherited key.
+
+| Preset | Contract |
+|---|---|
+| `openai-compatible` | Nothing enforced (the default) |
+| `moonshot-kimi` | Moonshot's immutable sampling: `top_p`, `top_k`, penalties and `n` pinned, `temperature` in [0, 1] |
+
+Presets live in `profiles/` and are compiled into the binary; adding a vendor
+is a new YAML file and one line in `PRESETS` (`src/profile/load.rs`).
+
 ## Chat rendering
 
 The router renders chat requests with dynamo-render (`dynamo-renderer`): the model's

@@ -182,7 +182,37 @@ async fn log_413(req: Request, next: Next) -> Response {
     resp
 }
 
+/// Applies the API profile's `errors.bad_request_type` to 400 bodies.
+async fn retype_bad_request(
+    State(ctx): State<Arc<AppContext>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let resp = next.run(req).await;
+    let profile = &ctx.config.model.profile;
+    if resp.status() != StatusCode::BAD_REQUEST || profile.errors.bad_request_type.is_none() {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    // 400 bodies are small error objects.
+    let Ok(bytes) = axum::body::to_bytes(body, 1 << 20).await else {
+        return Response::from_parts(parts, axum::body::Body::empty());
+    };
+    let body = profile
+        .retype_bad_request(&bytes)
+        .unwrap_or_else(|| bytes.to_vec());
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(body))
+}
+
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
+    let body_limit = ctx
+        .config
+        .model
+        .profile
+        .limits
+        .max_body_bytes
+        .unwrap_or(MAX_CHAT_BODY_BYTES);
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
@@ -202,33 +232,37 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
-                .layer(middleware::from_fn(log_413)),
+                .layer(DefaultBodyLimit::max(body_limit))
+                .layer(middleware::from_fn(log_413))
+                .layer(middleware::from_fn_with_state(
+                    ctx.clone(),
+                    retype_bad_request,
+                )),
         )
         .route(
             "/generate",
             post(crate::server::routes::chat::generate)
                 .put(crate::server::routes::chat::generate)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(body_limit))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/embeddings",
             post(crate::server::routes::chat::embeddings)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(body_limit))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/classify",
             post(crate::server::routes::chat::classify)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(body_limit))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/rerank",
             post(crate::server::routes::chat::rerank)
                 .put(crate::server::routes::chat::rerank)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(body_limit))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
