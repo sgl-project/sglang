@@ -742,6 +742,14 @@ impl TokenizerRegistry {
             adapter::note_k3_encoder(adapter::K3EncoderState::Active);
             return Some(ChatEncoder::KimiK3(tk));
         }
+        // Also before the template: the engine encodes DeepSeek-V4 in code and
+        // ignores any shipped template (a checkpoint may carry a
+        // `chat_template.jinja`, which the template branch would pick up).
+        if is_deepseek_v4(model_id) {
+            tracing::info!(model = %model_id,
+                "DeepSeek-V4 routing enabled; chat requests route via the built-in V4 encoder");
+            return Some(ChatEncoder::DeepSeekV4);
+        }
         // A sibling `chat_template.jinja` overrides the config's `chat_template`
         // (transformers' precedence); it may also be the only template source.
         let cfg = adapter::load_tokenizer_config(tokenizer_path);
@@ -777,18 +785,13 @@ impl TokenizerRegistry {
                     };
                     return Some(ChatEncoder::Jinja(Box::new(tmpl)));
                 }
-                Ok(None) => {} // no template — fall through to built-in detection
+                Ok(None) => {}
                 Err(e) => tracing::warn!(model = %model_id, error = %e,
-                    "failed to compile chat template; falling back to built-in detection"),
+                    "failed to compile chat template; chat traffic routes via raw prompt text"),
             },
             Ok(None) => {}
             Err(e) => tracing::warn!(model = %model_id, error = %e,
-                "failed to load tokenizer_config.json; falling back to built-in detection"),
-        }
-        if is_deepseek_v4(model_id) {
-            tracing::info!(model = %model_id,
-                "DeepSeek-V4 routing enabled; chat requests route via the built-in V4 encoder");
-            return Some(ChatEncoder::DeepSeekV4);
+                "failed to load tokenizer_config.json; chat traffic routes via raw prompt text"),
         }
         tracing::info!(model = %model_id,
             "no chat template or built-in encoder; chat traffic routes via raw prompt text");
@@ -1832,6 +1835,28 @@ mod tests {
 
     /// transformers' precedence: a sibling `chat_template.jinja` wins over the
     /// config field (here the config's template would not even compile).
+    #[test]
+    fn deepseek_v4_ignores_a_shipped_template() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            "tests/fixtures/tiny_tokenizer.json",
+            dir.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"{{ bos_token }}C","bos_token":"<s>"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("chat_template.jinja"), "{{ bos_token }}J").unwrap();
+        let mut c = cfg();
+        c.model.id = "deepseek-ai/DeepSeek-V4".into();
+        c.model.tokenizer_path = dir.path().to_str().unwrap().to_owned();
+        let reg = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert_eq!(reg.forward_parity(&c.model.id), ForwardParity::Dsv4Full);
+        assert!(!reg.has_jinja_encoder(&c.model.id));
+    }
+
     #[test]
     fn chat_template_jinja_overrides_tokenizer_config_template() {
         let dir = tempfile::tempdir().unwrap();
