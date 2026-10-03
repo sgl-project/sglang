@@ -9,6 +9,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
     MambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+    ForwardMetadata,
+    Mamba2Metadata,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -72,6 +76,31 @@ def make_metadata_backend():
         translate_mamba_indices=lambda slots: slots,
     )
     return backend
+
+
+def make_relabeled_decode_batch(seq_lens, track_mask=None):
+    """A decoding DP rank after MAX_LEN padding: EXTEND, one token per decode row."""
+    bs = len(seq_lens)
+    batch = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=bs,
+        input_ids=torch.zeros(bs, dtype=torch.int64),
+        req_pool_indices=torch.arange(bs),
+        seq_lens=torch.tensor(seq_lens),
+        seq_lens_sum=sum(seq_lens),
+        out_cache_loc=torch.zeros(bs, dtype=torch.int64),
+        extend_num_tokens=bs,
+        extend_start_loc=torch.arange(bs, dtype=torch.int32),
+        extend_seq_lens=torch.ones(bs, dtype=torch.int32),
+        extend_prefix_lens=torch.tensor(seq_lens) - 1,
+        extend_seq_lens_cpu=[1] * bs,
+        extend_prefix_lens_cpu=[n - 1 for n in seq_lens],
+        # Decode sets the mask on track boundaries but never mamba_track_seqlens.
+        mamba_track_mask=None if track_mask is None else torch.tensor(track_mask),
+        mamba_track_indices=None if track_mask is None else torch.arange(bs) + 10,
+    )
+    batch._original_forward_mode = ForwardMode.DECODE
+    return batch
 
 
 class TestMambaPrefillTrackMetadata(unittest.TestCase):
@@ -296,6 +325,60 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                 self.assertEqual(snapshot.mamba_prefill_track_mask_cpu, [True])
                 self.assertEqual(snapshot.mamba_track_seqlens_cpu, [65])
                 self.assertIsNone(snapshot.mamba_track_mask_cpu)
+
+
+class TestDpDecodeRelabel(unittest.TestCase):
+    """Decode rows relabeled as 1-token extends for DP MAX_LEN padding must keep
+    decode semantics on the mamba side."""
+
+    def test_forward_metadata_on_a_track_boundary_stays_decode(self):
+        backend = make_metadata_backend()
+        backend.conv_states_shape = (1, 8, 4)
+        batch = make_relabeled_decode_batch([256, 9], track_mask=[True, False])
+        metadata = backend._forward_metadata(batch)
+        torch.testing.assert_close(
+            metadata.query_start_loc, torch.arange(3, dtype=torch.int32)
+        )
+        self.assertIsNone(metadata.logical_num_tokens)
+        self.assertIsNone(metadata.track_conv_indices)
+
+    def test_prepare_mixed_builds_decode_metadata(self):
+        metadata = Mamba2Metadata.prepare_mixed(
+            ForwardMetadata(
+                query_start_loc=torch.arange(4, dtype=torch.int32),
+                mamba_cache_indices=torch.arange(3, dtype=torch.int32),
+            ),
+            64,
+            make_relabeled_decode_batch([8, 8, 8]),
+        )
+        self.assertEqual(metadata.num_decodes, 3)
+        self.assertEqual(metadata.num_prefills, 0)
+        self.assertIsNone(metadata.mixed_metadata)
+
+    def test_prepare_mixed_keeps_real_extends_as_prefills(self):
+        batch = make_forward_batch([4, 3], [0, 4], [4, 3])
+        batch.extend_num_tokens = 7
+        batch.extend_prefix_lens = torch.zeros(2, dtype=torch.int64)
+        metadata = Mamba2Metadata.prepare_mixed(
+            ForwardMetadata(
+                query_start_loc=torch.tensor([0, 4, 7], dtype=torch.int32),
+                mamba_cache_indices=torch.arange(2, dtype=torch.int32),
+            ),
+            64,
+            batch,
+        )
+        self.assertEqual(metadata.num_prefills, 2)
+        self.assertEqual(metadata.num_decodes, 0)
+        self.assertIsNotNone(metadata.mixed_metadata)
+
+    def test_logical_mode_ignores_idle_relabels(self):
+        # Idle ranks also set _original_forward_mode; their fabricated rows stay
+        # in the relabeled mode.
+        for mode in (ForwardMode.EXTEND, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                batch = make_forward_batch([1], [0], [1], mode)
+                batch._original_forward_mode = ForwardMode.IDLE
+                self.assertEqual(batch.logical_forward_mode, mode)
 
 
 if __name__ == "__main__":
