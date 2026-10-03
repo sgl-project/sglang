@@ -478,6 +478,13 @@ def reject_attn_tp_shard_with_tp_reduce(
     tp_size = get_parallel().tp_size
     if reduces_over_attn_tp or not 1 < shard_tp_size < tp_size:
         return
+    from sglang.srt.runtime_context import get_disagg
+
+    # A language-only instance builds its multimodal tower but never forwards
+    # it; the encoder runs on the encoder instance instead.
+    disagg = get_disagg()
+    if disagg.language_only or disagg.language_model_only:
+        return
     raise ValueError(
         f"{layer} shards over the attention TP group ({shard_tp_size} ranks) "
         f"but all-reduces over the full TP group ({tp_size} ranks), so it does "

@@ -7,6 +7,7 @@ is not installed or the GPU is not SM90 (the kernels ship sm90a only).
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -91,6 +92,10 @@ class TestHpcOpsMoeBlockwise(CustomTestCase):
             activation="silu",
             is_gated=True,
             inplace=False,
+            # The fused func reads the layer's MoE placement off the config.
+            layer=SimpleNamespace(
+                moe_tp_size=1, moe_tp_rank=0, moe_ep_size=1, moe_ep_rank=0
+            ),
         )
 
     def _run_hpc_ops(self, x, w13, w2, w13_scale, w2_scale, topk_weights, topk_ids):
