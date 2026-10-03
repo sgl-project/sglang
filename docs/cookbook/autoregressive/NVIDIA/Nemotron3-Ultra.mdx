@@ -64,7 +64,7 @@ The generator only emits a runnable command for combinations that NVIDIA / SGLan
 
 - **Mamba backend**:
 
-    The Mamba layers use the Triton SSM kernels by default. For better performance, set `--mamba-backend flashinfer` to use the FlashInfer Mamba kernels instead.
+    The deployment generator selects FlashInfer's selective-state-update backend for MTP decode and verification; Mamba prefill remains Triton. Triton remains SGLang's runtime default and is still selectable.
 
 - **Mamba SSM precision**:
 
