@@ -111,7 +111,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import (
     get_exec,
-    get_forward,
     get_parallel,
     get_stream,
 )
@@ -822,13 +821,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return router_output, shared_output
 
-    def _use_fused_shared_gate(self) -> bool:
-        return (
-            self.shared_expert_gate is not None
-            and not use_intel_amx_backend(self.shared_expert_gate)
-            and not is_npu()
-        )
-
     def forward_cp(
         self,
         hidden_states: torch.Tensor,
@@ -838,20 +830,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         """Route local rows, gather them for TP experts, and return partial output.
 
-        The gather zero-pads every tensor into the same rank-major row blocks.
-        The FFN boundary owns the output reduction and return to local rows.
+        The ``gathers_cp_input`` boundary validates the TP-only topology and
+        owns reduction and return to local rows. The gather zero-pads every
+        tensor into the same rank-major row blocks.
         """
-        parallel = get_parallel()
         moe = get_exec().moe
         cfg = self.topk.topk_config
-        if (
-            not _is_cuda
-            or not get_moe_a2a_backend().is_none()
-            or parallel.moe_ep_size != 1
-            or parallel.moe_dp_size != 1
-            or parallel.dwdp_size > 1
-        ):
-            raise NotImplementedError("CP routing requires CUDA TP-only MoE experts")
+        if not _is_cuda:
+            raise NotImplementedError("CP routing requires CUDA")
         if (
             moe.enable_eplb
             or moe.init_expert_location != "trivial"
@@ -866,14 +852,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 "CP routing requires trivial expert placement without expert recording"
             )
         if (
-            cfg.custom_routing_function is not None
-            or cfg.num_fused_shared_experts > 0
-            or self.topk.enable_waterfill
-            or envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
             or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-            or get_forward().defer_moe_finalize
         ):
-            raise NotImplementedError("CP routing requires token-wise standard top-k")
+            raise NotImplementedError("CP routing does not support simulated routing")
 
         with symmetric_memory():
             if hidden_states.shape[0]:
@@ -899,7 +881,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         topk_output = StandardTopKOutput(weights, ids, None)
         if self.enable_shared_expert_fusion:
             topk_output = self._append_shared_to_topk_output(topk_output, gathered)
-        use_fused_gate = self._use_fused_shared_gate()
+        use_fused_gate = self.shared_expert_gate is not None
         shared_output = self._forward_shared_experts(
             gathered, apply_gate=not use_fused_gate
         )
@@ -937,7 +919,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ):
             return self._forward_deepep(hidden_states, forward_batch)
 
-        use_fused_gate = self._use_fused_shared_gate()
+        use_fused_gate = (
+            self.shared_expert_gate is not None
+            and not use_intel_amx_backend(self.shared_expert_gate)
+            and not is_npu()
+        )
 
         if hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate

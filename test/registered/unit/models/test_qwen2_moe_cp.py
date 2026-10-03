@@ -1,7 +1,7 @@
 """CP routes local rows, then returns full-row partial expert output."""
 
 import unittest
-from contextlib import ExitStack, nullcontext
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -13,7 +13,7 @@ from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.topk import TopKConfig
 from sglang.srt.models import qwen2_moe as qwen
-from sglang.srt.runtime_context import ForwardFlags
+from sglang.srt.runtime_context import get_forward
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -32,9 +32,6 @@ def expert_output(hidden, topk):
 
 class TestQwen2MoeCp(CustomTestCase):
     def setUp(self):
-        self.parallel = SimpleNamespace(
-            tp_size=2, moe_tp_size=2, moe_ep_size=1, moe_dp_size=1, dwdp_size=1
-        )
         self.moe = SimpleNamespace(
             enable_eplb=False,
             init_expert_location="trivial",
@@ -42,21 +39,18 @@ class TestQwen2MoeCp(CustomTestCase):
             expert_distribution_recorder_mode=None,
         )
         self.features = SimpleNamespace(enable_return_routed_experts=False)
-        self.flags = ForwardFlags()
+        self.flags = get_forward()
         self.recorder = Mock()
         self.all_reduce = Mock(
             side_effect=AssertionError("CP reduction belongs to the boundary")
         )
         for module, name, value in [
             (qwen, "_is_cuda", True),
-            (qwen, "get_parallel", lambda: self.parallel),
             (
                 qwen,
                 "get_exec",
                 lambda: SimpleNamespace(moe=self.moe, features=self.features),
             ),
-            (qwen, "get_forward", lambda: self.flags),
-            (qwen, "get_moe_a2a_backend", lambda: moe_utils.MoeA2ABackend.NONE),
             (topk_module, "_is_cuda", True),
             (
                 topk_module,
@@ -70,7 +64,6 @@ class TestQwen2MoeCp(CustomTestCase):
                 lambda: self.recorder,
             ),
             (topk_module, "fused_topk_native", topk_module.fused_topk_torch_native),
-            (topk_module, "grouped_topk", topk_module.grouped_topk_gpu.__wrapped__),
             (
                 topk_module,
                 "biased_grouped_topk",
@@ -89,9 +82,7 @@ class TestQwen2MoeCp(CustomTestCase):
         block = qwen.Qwen2MoeSparseMoeBlock.__new__(qwen.Qwen2MoeSparseMoeBlock)
         nn.Module.__init__(block)
         block.layer_id, block.num_experts = 3, 3
-        block.topk = SimpleNamespace(
-            topk_config=TopKConfig(top_k=2, torch_native=True), enable_waterfill=False
-        )
+        block.topk = SimpleNamespace(topk_config=TopKConfig(top_k=2, torch_native=True))
         block.gate = Mock(side_effect=lambda value: (value @ GATE_WEIGHT.T, None))
         block.experts = Mock(side_effect=expert_output)
         block.enable_shared_expert_fusion = False
@@ -107,8 +98,8 @@ class TestQwen2MoeCp(CustomTestCase):
     def test_local_selection_and_full_partial_output_ignore_reduction_flags(self):
         local = torch.tensor([[1.0, 2.0], [-2.0, 1.0]])
         gathered = torch.cat((local, torch.tensor([[3.0, -1.0], [-1.0, -2.0]])))
-        for rs, ar in ((False, False), (True, False), (False, True), (True, True)):
-            with self.subTest(reduce_scatter=rs, fuse_allreduce=ar):
+        for rs in (False, True):
+            with self.subTest(reduce_scatter=rs):
                 block = self.block()
                 expected = self.reference(block, gathered)
                 self.recorder.reset_mock()
@@ -133,7 +124,7 @@ class TestQwen2MoeCp(CustomTestCase):
                     ]
 
                 with (
-                    self.flags.scoped(mlp_reduce_scatter=rs, fuse_mlp_allreduce=ar),
+                    self.flags.scoped(mlp_reduce_scatter=rs),
                     patch.object(
                         qwen, "select_experts", wraps=qwen.select_experts
                     ) as selector,
@@ -211,22 +202,24 @@ class TestQwen2MoeCp(CustomTestCase):
     def test_unsupported_configuration_fails_before_gate_or_gather(self):
         block = self.block()
         cases = [
-            (self.parallel, "moe_ep_size", 2),
             (self.moe, "enable_eplb", True),
             (self.moe, "expert_distribution_recorder_mode", "stat"),
             (self.features, "enable_return_routed_experts", True),
-            (block.topk, "enable_waterfill", True),
-            (block.topk.topk_config, "custom_routing_function", Mock()),
         ]
         for target, name, value in cases:
             with self.subTest(setting=name), patch.object(target, name, value):
                 self.assert_rejected(block)
-        with patch.object(
-            qwen, "get_moe_a2a_backend", return_value=moe_utils.MoeA2ABackend.DEEPEP
+        with patch.object(qwen, "_is_cuda", False):
+            self.assert_rejected(block)
+        for name in (
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS",
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
         ):
-            self.assert_rejected(self.block())
-        with self.flags.scoped(defer_moe_finalize=True):
-            self.assert_rejected(self.block())
+            with (
+                self.subTest(setting=name),
+                patch.object(getattr(qwen.envs, name), "get", return_value=True),
+            ):
+                self.assert_rejected(block)
 
     def assert_rejected(self, block):
         gather = Mock()
@@ -254,36 +247,33 @@ class TestQwen2MoeCp(CustomTestCase):
 
     def test_shared_expert_and_gate_contributions_remain_unreduced(self):
         hidden = torch.tensor([[1.0, 2.0], [-2.0, 1.0]])
-        for fusion in ("none", "gate"):
-            with self.subTest(fusion=fusion), ExitStack() as stack:
+        for gated in (False, True):
+            with self.subTest(gated=gated):
                 block = self.block()
-                block.shared_expert_gate = nn.Linear(2, 1, bias=False)
-                block.shared_expert_gate.weight.data.copy_(SHARED_WEIGHT)
                 block.shared_expert = Mock(side_effect=lambda value: value * 4)
+                expected_shared = hidden * 4
+                if gated:
+                    block.shared_expert_gate = nn.Linear(2, 1, bias=False)
+                    block.shared_expert_gate.weight.data.copy_(SHARED_WEIGHT)
+                    expected_shared *= (hidden @ SHARED_WEIGHT.T).sigmoid()
 
                 def fused_add(value, gate, shared, output):
                     output.add_(shared * (value @ gate).sigmoid().unsqueeze(-1))
 
-                stack.enter_context(
-                    patch.object(
-                        block, "_use_fused_shared_gate", return_value=fusion == "gate"
-                    )
-                )
-                stack.enter_context(
-                    patch.object(
-                        qwen, "fused_gate_sigmoid_mul_add", side_effect=fused_add
-                    )
-                )
                 expected = (
                     expert_output(hidden, self.reference(block, hidden))
-                    + hidden * 4 * (hidden @ SHARED_WEIGHT.T).sigmoid()
+                    + expected_shared
                 )
-                output = block.forward_cp(
-                    hidden,
-                    all_gather_rows=lambda *values: list(values),
-                    symmetric_memory=nullcontext,
-                )
+                with patch.object(
+                    qwen, "fused_gate_sigmoid_mul_add", side_effect=fused_add
+                ) as fused:
+                    output = block.forward_cp(
+                        hidden,
+                        all_gather_rows=lambda *values: list(values),
+                        symmetric_memory=nullcontext,
+                    )
                 torch.testing.assert_close(output, expected)
+                self.assertEqual(fused.call_count, int(gated))
                 self.all_reduce.assert_not_called()
 
     def test_empty_rank_still_gathers_and_skips_only_empty_compute(self):

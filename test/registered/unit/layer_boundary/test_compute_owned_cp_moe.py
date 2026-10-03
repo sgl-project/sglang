@@ -254,7 +254,6 @@ class TestComputeOwnedCpMoe(CustomTestCase):
             stream = fb.residual_stream
             torch.testing.assert_close(local, expected_input, rtol=0, atol=0)
             self.assertNotIn("gather", state.events, "routing must see local rows")
-            state.events.append("route")
             routing = local.sum(-1, keepdim=True)
             with ffn.exit(fb) as exit_:
                 skip = state.flags.mlp_reduce_scatter
@@ -271,7 +270,6 @@ class TestComputeOwnedCpMoe(CustomTestCase):
                 if cp:
                     self.assertNotIn("all_reduce", state.events)
                     self.assertNotIn("reduce_scatter", state.events)
-                state.events.append("compute_done")
             self.assertFalse(state.flags.mlp_reduce_scatter)
             output = (
                 ffn.finish_complete_output(output, fb)

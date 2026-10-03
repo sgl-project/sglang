@@ -207,11 +207,9 @@ with self.ffn_boundary.exit(forward_batch) as output:
 hidden_states = output.finish(hidden_states)
 ```
 
-When migrating an older `forward_cp()` caller, remove its `reduce_scatter_rows` callback. The gather callback must run even on empty local ranks and zero-pad hidden states, routing weights, and expert IDs to the same rank-block size. The CUDA Qwen helper calls the existing `select_experts()` on local rows and gathers its STANDARD IDs and weights. It requires a runner accepting that format, such as the FlashInfer TRT-LLM routed kernels. Normal token-wise scoring, bias, expert grouping, and scaling remain available without a separate CP router implementation.
+The gather callback must run even on empty local ranks and zero-pad hidden states, routing weights, and expert IDs to the same rank-block size. The CUDA Qwen helper calls the existing `select_experts()` on local rows and gathers its STANDARD IDs and weights. It requires a runner accepting that format, such as the FlashInfer TRT-LLM routed kernels. Normal token-wise scoring, bias, expert grouping, and scaling remain available without a separate CP router implementation.
 
-This path requires trivial expert placement with no redundant experts, EPLB, expert-distribution recording, or routed-expert capture. Custom routing callbacks, Waterfill, simulated routing, and deferred MoE finalization are also excluded. These features need additional token-scope or dispatch handling outside the TP-only path.
-
-Sequence sharding determines token ownership; TP determines weight ownership. The replicated router computes only local rows, while TP-sharded routed and shared experts compute every gathered row. The boundary combines their partial outputs and returns each rank's local rows.
+This path requires trivial expert placement with no redundant experts, EPLB, expert-distribution recording, or routed-expert capture. The Qwen constructor supplies a token-wise router; simulated routing is excluded because it depends on global row indices. Topology validation and reduction policy belong to the boundary.
 
 ### Enter and leave the layer stack
 
