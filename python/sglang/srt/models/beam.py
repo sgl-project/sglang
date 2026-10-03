@@ -18,6 +18,8 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.ops.elementwise import BeamAttentionGateOp
+from sglang.kernels.ops.layernorm import BeamSandwichResidualRMSNormOp
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
@@ -62,15 +64,6 @@ def apply_ssmax(q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     """Scale Q using absolute positions, rounding only after multiplication."""
     scale = torch.exp(0.1 * torch.log1p((positions.float() + 1) / 2048))
     return (q.float() * scale.unsqueeze(-1)).to(q.dtype)
-
-
-def apply_attention_gate(
-    attention_output: torch.Tensor, gate: torch.Tensor, gate_bias: torch.Tensor
-) -> torch.Tensor:
-    # Bias addition, sigmoid, and multiplication use the activation dtype.
-    # The bias has one entry per local query head, broadcast over head_dim.
-    multiplier = torch.sigmoid(gate + gate_bias[None, :, None])
-    return attention_output * multiplier
 
 
 def depth_scaled_residual(
@@ -218,10 +211,16 @@ class BeamMoE(nn.Module):
             ),
             prefix=add_prefix("experts", prefix),
         )
+        # Offloading replaces parameters, but TopKConfig keeps an alias.
+        self.refresh_correction_bias = get_exec().offload.cpu_offload_gb > 0
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             router_logits, _ = self.gate(hidden_states.float())
+            if self.refresh_correction_bias:
+                self.topk.topk_config.correction_bias = (
+                    self.gate.e_score_correction_bias
+                )
             topk_output = self.topk(hidden_states, router_logits)
         else:
             topk_output = self.topk.empty_topk_output(
@@ -307,6 +306,7 @@ class BeamAttention(nn.Module):
                 tp_size=self.tp_size,
                 prefix=add_prefix("gate_proj", prefix),
             )
+        self.attention_gate = BeamAttentionGateOp()
         self.gate_bias = nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
         set_weight_attrs(self.gate_bias, {"weight_loader": self.load_gate_bias})
         self.o_proj = RowParallelLinear(
@@ -367,11 +367,12 @@ class BeamAttention(nn.Module):
         attention_output = self.attn(q, k, v, forward_batch)
         if not self.use_packed_projection:
             gate, _ = self.gate_proj(hidden_states)
-        attention_output = apply_attention_gate(
-            attention_output.view(-1, self.num_heads, self.head_dim),
-            gate.view(-1, self.num_heads, self.head_dim),
+        attention_output = self.attention_gate(
+            attention_output.view(-1, self.q_size),
+            gate.view(-1, self.q_size),
             self.gate_bias,
-        ).view(-1, self.q_size)
+            self.head_dim,
+        )
         output, _ = self.o_proj(attention_output)
         return output
 
@@ -387,6 +388,8 @@ class BeamDecoderLayer(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
+        self.rms_norm_eps = config.rms_norm_eps
+        self.sandwich_residual_norm = BeamSandwichResidualRMSNormOp()
         attn_depth = 2 * (layer_id + 1)
         mlp_depth = attn_depth + 1
         attn_denominator = math.sqrt(attn_depth)
@@ -450,6 +453,40 @@ class BeamDecoderLayer(nn.Module):
             self.mlp_residual_scales,
         )
 
+    def forward_fused(
+        self,
+        positions: torch.Tensor,
+        normed: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        next_norm_weight: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Same arithmetic as `forward` with the two norm/residual transitions fused.
+
+        `normed` is this layer's `input_layernorm(residual)`, produced by the
+        previous transition. Returns the next layer's normalized input (or None
+        when `next_norm_weight` is None, on the last layer of a pipeline stage
+        that does not own the final norm) and the new residual stream.
+        """
+        attn = self.self_attn(positions, normed, forward_batch)
+        normed, residual = self.sandwich_residual_norm(
+            attn,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.pre_feedforward_layernorm.weight,
+            self.rms_norm_eps,
+            self.attn_residual_scales,
+        )
+        mlp = self.mlp(normed)
+        return self.sandwich_residual_norm(
+            mlp,
+            residual,
+            self.post_feedforward_layernorm.weight,
+            next_norm_weight,
+            self.rms_norm_eps,
+            self.mlp_residual_scales,
+        )
+
 
 class BeamModel(nn.Module):
     def __init__(
@@ -490,6 +527,16 @@ class BeamModel(nn.Module):
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
+        # Decoder layers whose outputs feed a speculative drafter (DFlash).
+        self.layers_to_capture = ()
+        # Offload wrappers load weights through each layer's regular forward.
+        # Fusing across layer boundaries would bypass those wrappers.
+        # A custom PP partition can leave a stage with no layer to fuse from.
+        self.fuse_layers = (
+            get_exec().offload.cpu_offload_gb <= 0
+            and get_exec().offload.offload_group_size <= 0
+            and self.start_layer < self.end_layer
+        )
 
     def forward(
         self,
@@ -505,13 +552,54 @@ class BeamModel(nn.Module):
             )
         else:
             hidden_states = pp_proxy_tensors["hidden_states"]
+        aux_hidden_states = []
+        if self.fuse_layers:
+            return self._forward_fused(
+                positions, hidden_states, forward_batch, aux_hidden_states
+            )
         for layer_id in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[layer_id](
                 positions, hidden_states, forward_batch
             )
+            if layer_id in self.layers_to_capture:
+                # The post-layer residual stream, before the final norm.
+                aux_hidden_states.append(hidden_states)
         if not self.pp_group.is_last_rank:
             return PPProxyTensors({"hidden_states": hidden_states})
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if self.layers_to_capture:
+            return hidden_states, aux_hidden_states
+        return hidden_states
+
+    def _forward_fused(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        aux_hidden_states: list,
+    ):
+        # Each fused transition also produces the next layer's normalized input,
+        # so the first norm of this stage is the only standalone one.
+        residual = hidden_states
+        normed = self.layers[self.start_layer].input_layernorm(residual)
+        for layer_id in range(self.start_layer, self.end_layer):
+            if layer_id + 1 < self.end_layer:
+                next_norm_weight = self.layers[layer_id + 1].input_layernorm.weight
+            elif self.pp_group.is_last_rank:
+                next_norm_weight = self.norm.weight
+            else:
+                next_norm_weight = None
+            normed, residual = self.layers[layer_id].forward_fused(
+                positions, normed, residual, forward_batch, next_norm_weight
+            )
+            if layer_id in self.layers_to_capture:
+                aux_hidden_states.append(residual)
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors({"hidden_states": residual})
+        # `normed` already holds `self.norm(residual)`.
+        if self.layers_to_capture:
+            return normed, aux_hidden_states
+        return normed
 
 
 def is_serialized_w4a4_nvfp4(quant_config: QuantizationConfig) -> bool:
@@ -580,6 +668,7 @@ class BeamForCausalLM(nn.Module):
         # The default head projection returns BF16; LogitsProcessor promotes
         # its output to FP32 before softcap and logprobs.
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     @torch.no_grad()
     def forward(
@@ -595,9 +684,28 @@ class BeamForCausalLM(nn.Module):
         )
         if not self.model.pp_group.is_last_rank:
             return hidden_states
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
+
+    def set_dflash_layers_to_capture(self, layer_ids):
+        """Capture the listed decoder layers' outputs for the DFlash drafter."""
+        if self.model.pp_group.world_size != 1:
+            raise ValueError("Beam DFlash capture currently requires PP=1")
+        layer_ids = tuple(layer_ids)
+        if (
+            not layer_ids
+            or list(layer_ids) != sorted(set(layer_ids))
+            or any(i < 0 or i >= self.config.num_hidden_layers for i in layer_ids)
+        ):
+            raise ValueError(
+                "DFlash capture layers must be sorted, unique, and in range"
+            )
+        self.model.layers_to_capture = layer_ids
+        self.capture_aux_hidden_states = True
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
