@@ -44,7 +44,7 @@ def _fused_attention_gate_kernel(
     attn = tl.load(attn_ptr + off, mask=mask, other=0.0).to(tl.float32)
     g = tl.load(gate_ptr + off, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(bias_ptr + head, mask=mask, other=0.0).to(tl.float32)
-    # Eager: (gate + bias) rounds to bf16, sigmoid rounds to bf16, product rounds.
+    # As in eager, gate + bias, its sigmoid, and the product round to act_dtype.
     g = (g + b).to(act_dtype).to(tl.float32)
     if act_dtype == tl.float16:
         # Approximate exp/div can cross an FP16 rounding boundary near zero.
