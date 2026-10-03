@@ -63,8 +63,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.kernels.cake_kernels._support import (
-    SM103,
     BLACKWELL_DATACENTER,
+    SM103,
     cuda_tensor_on,
     device_capability,
     flashinfer_module_available,
