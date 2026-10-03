@@ -6,6 +6,7 @@ import torch
 import triton
 
 from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -19,6 +20,44 @@ DTYPE = torch.bfloat16
 MAX_SEQ_LEN = 131072  # common seq length
 ROPE_BASE = 10000.0
 CACHE_SIZE = 1024 * 128
+
+
+@pytest.mark.skipif(is_hip(), reason="Gemma3n zero-head K path is CUDA-only")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("rotary_dim", [128, 256])
+@pytest.mark.parametrize("use_graph", [False, True])
+def test_rope_zero_k_heads(dtype, rotary_dim, use_graph):
+    """Shared-KV consumers must preserve Q and partial-RoPE tails without K."""
+    rope = RotaryEmbedding(
+        head_size=256,
+        rotary_dim=rotary_dim,
+        max_position_embeddings=1024,
+        base=10000,
+        is_neox_style=True,
+        dtype=dtype,
+    ).cuda()
+    positions = torch.tensor([0, 511, 512, 1023], device="cuda")
+    source = torch.randn(4, 3072, dtype=dtype, device="cuda")
+    expected = source.clone()[:, :2048]
+    storage = source.clone()
+    actual = storage[:, :2048]
+    rope(positions, expected, torch.zeros_like(expected[:, :512]))
+    rope(positions, actual, actual[:, :0])
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            rope(positions, actual, actual[:, :0])
+        storage.copy_(source)
+        graph.replay()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(storage[:, 2048:], source[:, 2048:], rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual.view(4, 8, 256)[..., rotary_dim:],
+        source[:, :2048].view(4, 8, 256)[..., rotary_dim:],
+        rtol=0,
+        atol=0,
+    )
+    assert rope.cos_sin_cache.dtype == torch.float32
 
 
 def create_cos_sin_cache(
