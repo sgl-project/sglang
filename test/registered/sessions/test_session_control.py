@@ -57,6 +57,46 @@ class TestSessionControl(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    def test_replace_without_rid_clears_branches(self):
+        session_id = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 1000},
+            timeout=30,
+        ).json()
+
+        def generate(rid=None, replace=False):
+            return requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": "Name a city.",
+                    "session_params": {
+                        "id": session_id,
+                        "rid": rid,
+                        "replace": replace,
+                    },
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+                },
+                timeout=30,
+            )
+
+        root = generate()
+        self.assertEqual(root.status_code, 200, root.text)
+        root_rid = root.json()["meta_info"]["id"]
+        child = generate(rid=root_rid)
+        self.assertEqual(child.status_code, 200, child.text)
+        self.assertEqual(generate().status_code, 200)
+
+        replacement = generate(replace=True)
+        self.assertEqual(replacement.status_code, 200, replacement.text)
+        self.assertNotEqual(generate(rid=root_rid).status_code, 200)
+
+        closed = requests.post(
+            self.base_url + "/close_session",
+            json={"session_id": session_id},
+            timeout=30,
+        )
+        self.assertEqual(closed.status_code, 200)
+
     def test_session_control(self, gen_len=12):
         chunks = [
             "Let me tell you something about France.",
