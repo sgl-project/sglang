@@ -98,10 +98,14 @@ def depth_scaled_residual(
 
 
 def _can_fuse_qk_norm_rope(head_dim: int) -> bool:
+    cuda_graph_config = get_exec().graph.cuda_graph_config
     return (
         _is_cuda
         and not get_exec().deterministic.enable_deterministic_inference
-        and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
+        and (
+            cuda_graph_config is None
+            or cuda_graph_config.prefill.tc_compiler != "inductor"
+        )
         and can_use_fused_inplace_qknorm_rope(
             head_dim=head_dim,
             rope_dim=head_dim,
