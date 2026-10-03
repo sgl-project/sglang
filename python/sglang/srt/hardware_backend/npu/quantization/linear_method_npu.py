@@ -372,8 +372,8 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
         layer.weight_offset.data = layer.weight_offset.data.flatten()
+        layer.weight.data = npu_format_cast(layer.weight.data)
         if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
             layer.weight.data = layer.weight.data.view(torch.int32).contiguous()
         else:
