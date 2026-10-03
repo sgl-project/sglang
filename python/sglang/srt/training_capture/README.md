@@ -450,6 +450,33 @@ and Catalog WRITTEN/seal/publication cannot advance after a payload failure.
 The [batch-write experiment](../../../../mooncake-study/experiments/BATCH_STORE_WRITES.md)
 records the native SDK checks and serving measurements.
 
+`MooncakeSnapshotStore.get_tensors(objects)` accepts an ordered sequence of
+`(key, shape, torch_dtype, sha256)` descriptors and returns independent CPU
+tensors in that order. Before allocating or issuing reads, it validates every
+shape and requires the sum of destination bytes plus quarantined bytes to fit
+`max_receive_bytes`. Native `batch_get_into` results must contain exactly one
+integer byte count per object, equal to its declared size; each digest is then
+checked. A negative result quarantines that destination, while exceptions or
+malformed result lists quarantine every submitted destination. Successfully
+completed destinations are unregistered even when another item or cleanup
+fails. An SDK without the optional batch method uses checked single reads;
+transport errors never trigger a fallback retry.
+
+`verify_tensors(objects)` discards each verified batch before allocating the
+next, with at most 64 objects per batch and the same byte budget. Immutable
+batch-write retries and both journal and partition publication recovery use
+this path. Failed verification keeps the journal and cannot publish READY.
+Missing objects reported by native reads conservatively retain their receive
+buffers until client close, so repeated failures consume the quarantine budget.
+
+These synchronous transport methods run on the Store owner thread. Consumers
+still need a Catalog read lease and their own total prefetch/retained-tensor
+budget; producer recovery uses its fenced capture authority. Returned tensors
+are no longer registered, and this API provides neither asynchronous H2D
+ownership nor a trainer receive pool. The SpecForge manifest/window loader
+remains a separate integration. See the
+[batch-read runbook](../../../../mooncake-study/experiments/BATCH_STORE_READS.md).
+
 ## Global Target Identity
 
 `bind_rank_target_contract` inspects one loaded target rank at startup. Supply

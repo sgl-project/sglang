@@ -252,11 +252,14 @@ class TestMooncakeTransferContract(CustomTestCase):
             [0, 0, 0],
             OSError("lookup"),
         ):
-            with self.subTest(result=result), patch.object(
-                self.client,
-                "batch_is_exist",
-                side_effect=result if isinstance(result, Exception) else None,
-                return_value=result,
+            with (
+                self.subTest(result=result),
+                patch.object(
+                    self.client,
+                    "batch_is_exist",
+                    side_effect=result if isinstance(result, Exception) else None,
+                    return_value=result,
+                ),
             ):
                 with self.assertRaises(TransportError):
                     self.store.put_registered_batch(objects)
@@ -357,6 +360,177 @@ class TestMooncakeTransferContract(CustomTestCase):
         self.store.put_registered_batch([])
         self.assertFalse(self.client.put_batches)
         self.assertFalse(self.client.exists_batches)
+
+    def receive_objects(self):
+        objects = self.batch_objects()
+        self.store.put_registered_batch(objects)
+        return [
+            (key, list(tensor.shape), tensor.dtype, digest)
+            for key, tensor, digest in objects
+        ]
+
+    def test_batch_reads_return_owned_ordered_tensors_including_duplicate_keys(self):
+        objects = self.receive_objects()
+        baseline = set(self.store.registered)
+        outputs = self.store.get_tensors([objects[1], objects[0], objects[1]])
+        self.assertEqual(self.client.get_batches, [["second", "first", "second"]])
+        self.assertEqual(set(self.store.registered), baseline)
+        self.assertEqual(len({out.data_ptr() for out in outputs}), 3)
+        self.assertFalse(self.store.quarantined)
+        torch.testing.assert_close(outputs[1], self.tensor)
+        torch.testing.assert_close(outputs[0], outputs[2])
+        outputs[0].zero_()
+        self.assertGreater(outputs[2].sum().item(), 0)
+        self.assertEqual(self.store.get_tensors([]), [])
+        self.store.verify_tensors([])
+        self.assertEqual(len(self.client.get_batches), 1)
+
+    def test_batch_read_validates_all_shapes_and_aggregate_budget_before_sdk(self):
+        objects = self.receive_objects()
+        baseline = set(self.store.registered)
+        invalid_shapes = ([], [0], [-1], [True], [1.5])
+        for shape in invalid_shapes:
+            with self.subTest(shape=shape), self.assertRaises(ContractError):
+                self.store.get_tensors(
+                    [objects[0], ("second", shape, torch.float32, "")]
+                )
+        self.store.max_receive_bytes = self.tensor.nbytes
+        with self.assertRaisesRegex(ContractError, "budget"):
+            self.store.get_tensors(objects)
+        with (
+            patch.object(self.client, "batch_get_into", None),
+            self.assertRaisesRegex(ContractError, "budget"),
+        ):
+            self.store.get_tensors(objects)
+        self.assertEqual(set(self.store.registered), baseline)
+        self.assertFalse(self.client.get_batches)
+
+    def test_batch_read_partial_failure_retains_only_failed_destinations(self):
+        objects = self.receive_objects()
+        baseline = set(self.store.registered)
+        del self.client.data["second"]
+        with self.assertRaises(TransportError):
+            self.store.get_tensors(objects)
+        self.assertEqual(len(self.store.quarantined), 1)
+        self.assertEqual(set(self.store.registered) - baseline, self.store.quarantined)
+        pointer = next(iter(self.store.quarantined))
+        self.assertEqual(self.store.registered[pointer].nbytes, 64)
+        with self.assertRaises(TransportError):
+            self.store.unregister(self.store.registered[pointer])
+        self.store.max_receive_bytes = self.tensor.nbytes
+        with self.assertRaisesRegex(ContractError, "budget"):
+            self.store.get_tensors(objects[:1])
+        self.assertEqual(len(self.client.get_batches), 1)
+
+    def test_batch_unknown_read_completion_retains_every_destination(self):
+        objects = self.receive_objects()
+        for result in (None, 0, [], [512], [512, None], [512, True], OSError("lost")):
+            with self.subTest(result=result):
+                client = BufferStore()
+                store = MooncakeSnapshotStore(client, FakeReplicateConfig())
+                try:
+                    with (
+                        patch.object(
+                            client,
+                            "batch_get_into",
+                            side_effect=result
+                            if isinstance(result, Exception)
+                            else None,
+                            return_value=result,
+                        ) as read,
+                        self.assertRaisesRegex(TransportError, "uncertain"),
+                    ):
+                        store.get_tensors(objects)
+                    self.assertEqual(store.quarantined, set(read.call_args.args[1]))
+                    self.assertEqual(set(store.registered), store.quarantined)
+                    self.assertEqual(len(store.registered), 2)
+                finally:
+                    store.close()
+                self.assertFalse(store.registered)
+
+    def test_batch_completed_wrong_lengths_and_digests_release_all_destinations(self):
+        objects = self.receive_objects()
+        baseline = set(self.store.registered)
+        for counts in ([0, 64], [511, 64], [513, 64]):
+            with self.subTest(counts=counts):
+                with (
+                    patch.object(self.client, "batch_get_into", return_value=counts),
+                    self.assertRaisesRegex(ContractError, "byte count"),
+                ):
+                    self.store.get_tensors(objects)
+                self.assertEqual(set(self.store.registered), baseline)
+                self.assertFalse(self.store.quarantined)
+        self.client.data["second"] = b"\x00" * 64
+        with self.assertRaisesRegex(ContractError, "digest"):
+            self.store.get_tensors(objects)
+        self.assertEqual(set(self.store.registered), baseline)
+        self.assertFalse(self.store.quarantined)
+
+    def test_batch_read_registration_failure_releases_unsubmitted_destinations(self):
+        objects = self.receive_objects()
+        baseline = set(self.store.registered)
+        register = self.client.register_buffer
+        calls = []
+
+        def partial(pointer, size):
+            calls.append(pointer)
+            return register(pointer, size) if len(calls) == 1 else -1
+
+        with (
+            patch.object(self.client, "register_buffer", partial),
+            self.assertRaises(TransportError),
+        ):
+            self.store.get_tensors(objects)
+        self.assertFalse(self.client.get_batches)
+        self.assertEqual(self.store.quarantined, {calls[1]})
+        self.assertEqual(set(self.store.registered) - baseline, {calls[1]})
+
+    def test_batch_read_cleanup_attempts_every_successful_destination(self):
+        objects = self.receive_objects()
+        baseline = set(self.store.registered)
+        unregister = self.client.unregister_buffer
+        calls = []
+
+        def partial(pointer):
+            calls.append(pointer)
+            return -1 if len(calls) == 1 else unregister(pointer)
+
+        with (
+            patch.object(self.client, "unregister_buffer", partial),
+            self.assertRaises(TransportError),
+        ):
+            self.store.get_tensors(objects)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.store.quarantined, {calls[0]})
+        self.assertEqual(set(self.store.registered) - baseline, {calls[0]})
+
+    def test_batch_read_fallback_preserves_order_and_quarantine_rules(self):
+        objects = self.receive_objects()
+        baseline = set(self.store.registered)
+        with patch.object(self.client, "batch_get_into", None):
+            outputs = self.store.get_tensors(objects)
+            torch.testing.assert_close(outputs[0], self.tensor)
+            self.assertEqual(set(self.store.registered), baseline)
+            self.client.get_count = -1
+            with self.assertRaises(TransportError):
+                self.store.get_tensors(objects)
+        self.assertFalse(self.client.get_batches)
+        self.assertEqual(len(self.store.quarantined), 1)
+
+    def test_verification_batches_respect_byte_and_object_limits(self):
+        objects = self.receive_objects()
+        self.store.max_receive_bytes = 512
+        self.store.verify_tensors(objects)
+        self.assertEqual(self.client.get_batches, [["first"], ["second"]])
+        self.client.get_batches.clear()
+        self.store.max_receive_bytes = 1 << 20
+        self.store.verify_tensors(objects[1:2] * 65)
+        self.assertEqual([len(batch) for batch in self.client.get_batches], [64, 1])
+        self.assertEqual(len(self.store.registered), 2)
+        self.store.max_receive_bytes = 63
+        with self.assertRaisesRegex(ContractError, "budget"):
+            self.store.verify_tensors(objects[1:2])
+        self.assertEqual(len(self.client.get_batches), 2)
 
 
 if __name__ == "__main__":

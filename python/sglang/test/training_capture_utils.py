@@ -380,6 +380,7 @@ class BufferStore:
         self.unregister_status = 0
         self.put_keys = []
         self.put_batches = []
+        self.get_batches = []
         self.exists_batches = []
         self.closed = False
 
@@ -410,6 +411,14 @@ class BufferStore:
 
     def is_exist(self, key):
         return int(key in self.data)
+
+    def batch_get_into(self, keys, pointers, sizes):
+        assert len(keys) == len(pointers) == len(sizes)
+        self.get_batches.append(list(keys))
+        return [
+            self.get_into(key, pointer, size)
+            for key, pointer, size in zip(keys, pointers, sizes)
+        ]
 
     def batch_is_exist(self, keys):
         self.exists_batches.append(list(keys))

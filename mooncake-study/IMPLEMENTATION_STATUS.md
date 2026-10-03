@@ -30,7 +30,7 @@ it does not redefine the goal as the modules already implemented.
 | KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H, optional HiCache JIT mapped Host writes | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode; optional JIT lowers local export cost but has mixed serving results |
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Coordinator admission, renewal, expiry, retract, shutdown and publication tests pass; traffic-scale stress remains open |
 | Teacher D2H batching | Optional bounded aux-owner staging shares the existing device budget with KV | Source reuse, cross-stream tail fencing, CPU P/D handoff and real AR/DSpark/P/D pass; decode transfer work falls, but no serving throughput improvement is established |
-| Mooncake adapter | Required hard pin, registered raw buffers, optional native payload batching, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including complete reads after producer exit; native batching passes TCP correctness and fault tests without a measured serving speedup; batch RDMA and production retention remain open |
+| Mooncake adapter | Required hard pin, registered raw buffers, optional native payload batching, bounded native reads, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including complete reads after producer exit; native batch writes and reads pass TCP correctness/fault tests, including post-close publication recovery, without a measured serving speedup; batch RDMA and production retention remain open |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Independent writers and real TP2/PP1, TP1/PP2 and TP2/PP2 serving/P/D tests publish complete snapshots through TCP Store; production retention and saturated load remain open |
 | Cohort adaptive admission | Background rank-local pressure observations and minimum-probability voting | Peer publisher stalls pause new tickets and reservations while existing ownership drains; see distributed backpressure evidence below; saturated transport and production SLOs remain open |
@@ -4592,6 +4592,48 @@ This is AR TP1/PP1 P/D on one H100. It does not certify multi-rank or cross-node
 weight rollout, distributed/tensor/IPC weight transport, target-KV DSpark
 replacement deployment, production Catalog retention or serving SLOs.
 
+## Bounded Native Store Reads
+
+The adapter now provides ordered `get_tensors` and bounded `verify_tensors`
+using the SDK's optional `batch_get_into`. Shapes and aggregate bytes are checked
+before allocation; each result must have the exact byte count and digest.
+Partial failures retain only uncertain destinations, while ambiguous whole-batch
+completion retains all submitted destinations. Cleanup still runs for every
+completed destination. The byte budget includes quarantined registrations;
+verification also caps each batch at 64 objects and discards it before the next.
+
+Immutable write retries and both journal/partition publication recovery now use
+bounded native verification. Incomplete reads cannot publish READY or erase the
+journal. The new real-Store recovery case closes the producer and overwrites
+all original buffers before a fresh client reads payloads and retries identical
+publication metadata, without rewriting the existing manifest.
+
+- `01791019705588503515-2479bbe33942`: 118 unit methods pass in 65.409 seconds,
+  covering transport ownership, publication faults, cohort writers, resources
+  and direct/staged coordinators.
+- `01791019940014690001-68cc07684e78`: all seven real TCP Store methods pass
+  in 196.806 seconds. Five recorded independent native batch readers validate
+  148 objects and 22,660 payload bytes; another native batch verifies the
+  post-close recovery payload. The suite also checks four-rank ownership,
+  committed history, resource rollback and out-of-order completion.
+- The archive retains the initial unit-runner import failure and the stale
+  inactive-ingress fixture failure. That fixture now asserts zero reservations
+  and admission while recovery is held, matching current readiness gating.
+  No production readiness policy was changed.
+- All 5,031 Python files match the final storage snapshot; the production and
+  unit changes also match the passing unit snapshot. Ruff adds no diagnostics
+  to the three existing touched-test findings. The H100 queue is empty and its
+  worker and idle load are live.
+
+The [runbook](experiments/BATCH_STORE_READS.md) and
+[evidence JSON](experiments/batch-store-reads.json) record the interfaces and
+reproduction. The 28-artifact archive at
+`/gpfs/user/fuxuanwei/mooncake-lab-archive/batch-read-20261003` has manifest SHA-256
+`a5198150a33b349e8f66416ec5b03d3c2d88521ad71e73084ab6e5de6205e1a2`.
+This is a transport API, not the SpecForge manifest/window loader or receive
+pool. TCP synthetic snapshots and test Catalogs do not certify batch RDMA,
+production retention, serving throughput or draft training quality.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2, PP2 and combined TP2/PP2 AR/static target-KV
@@ -4605,6 +4647,9 @@ replacement deployment, production Catalog retention or serving SLOs.
    saturated backpressure.
 2. Connect P8's SGLang export API to the SpecForge checkpoint manager and validate
    trained checkpoints, including artifact compatibility and quality acceptance.
+   The current SpecForge DSpark provider/model uses hidden-state supervision;
+   it first needs the design's KV-input training model and feature contract.
+   Renaming its stock checkpoint architecture cannot satisfy this integration.
 3. Extend P9's real TP2/PP1, TP1/PP2 and TP2/PP2 Qwen3 capture validation and
    Qwen2.5 TP4 replicated-head validation to saturated distributed backpressure,
    broader replica/topology combinations and additional model identities.

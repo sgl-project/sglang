@@ -370,8 +370,7 @@ class SnapshotWriter:
         data = canonical_bytes(manifest)
         self._check_receipts(manifest, receipts, lease, data)
         with self.timings.measure("recovery_read"):
-            for obj in manifest.objects:
-                self.store.get_tensor(obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
+            self._verify_payloads(manifest)
         with self._recovery_buffer(data) as buffer:
             return self.publish_partitions(manifest, receipts, buffer, lease)
 
@@ -418,6 +417,12 @@ class SnapshotWriter:
         self.timings.call("journal_complete", self.journal.complete, lease.capture_id)
         return receipt
 
+    def _verify_payloads(self, manifest):
+        self.store.verify_tensors(
+            (obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
+            for obj in manifest.objects
+        )
+
     def recover(self) -> list[dict]:
         """Retry prepared publications without rerunning target inference.
 
@@ -432,10 +437,7 @@ class SnapshotWriter:
             # A journal survives producer/data-node loss. Confirm every immutable
             # object still exists before making the recovered reference visible.
             with self.timings.measure("recovery_read"):
-                for obj in manifest.objects:
-                    self.store.get_tensor(
-                        obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256
-                    )
+                self._verify_payloads(manifest)
             with self._recovery_buffer(data) as buffer:
                 receipts.append(self._publish(manifest, data, buffer, lease))
         return receipts

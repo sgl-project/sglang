@@ -688,6 +688,18 @@ V1 strict retention 要求 hard pin 可用。SpecForge 现有 Store 对旧客户
 沿用原单对象路径，hard pin 要求不变。所有 payload 成功之后才报告 WRITTEN，
 manifest 仍单独最后写入；批量 RPC 本身不提供跨对象发布事务。
 
+适配层新增 `get_tensors([(key, shape, dtype, sha256), ...])`，使用原生
+`batch_get_into` 读取到各自拥有的 CPU tensor。提交前校验全部 shape 和整批
+接收字节预算，逐项要求返回字节数精确匹配，再校验摘要。负值结果隔离对应
+接收区；整批异常、缺项或返回类型错误隔离所有未确认接收区。其余已完成
+接收区即使遇到其他项失败也执行注销。仅缺少批量方法时回退到单项读取。
+
+`verify_tensors` 按接收预算和每批最多 64 个对象分组，校验后立即丢弃该批，
+用于幂等写入读回和 journal/分区发布恢复；任何一项失败都不能发布 READY。
+消费者仍负责 Catalog read lease、跨调用的预取总预算与后续 H2D 生命周期。
+这不替代第 10 节的 SpecForge manifest/window loader；接口和传输验收见
+[批量读取记录](experiments/BATCH_STORE_READS.md)。
+
 ### 8.2 RDMA 路径
 
 ```text

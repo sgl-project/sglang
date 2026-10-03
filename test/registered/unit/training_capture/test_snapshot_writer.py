@@ -193,6 +193,9 @@ class TestSnapshotPublication(CustomTestCase):
         self.assertEqual(len(receipts), 1)
         self.assertEqual(self.catalog.published, original_published)
         self.assertEqual(self.client.put_keys, original_puts)
+        self.assertEqual(
+            self.client.get_batches, [[obj.key for obj in self.manifest.objects]]
+        )
         self.assertFalse(list(self.journal.pending()))
 
     def test_partial_payload_batch_never_records_written_or_publishes(self):
@@ -247,7 +250,8 @@ class TestSnapshotPublication(CustomTestCase):
         original = self.client.data.pop(key)
         with self.assertRaises(TransportError):
             self.writer.recover()
-        self.assertFalse(self.store.quarantined)
+        self.assertEqual(len(self.store.quarantined), 1)
+        quarantined = set(self.store.quarantined)
         self.client.data[key] = bytes(len(original))
         with self.assertRaises(ContractError):
             self.writer.recover()
@@ -256,6 +260,26 @@ class TestSnapshotPublication(CustomTestCase):
         self.client.data[key] = original
         self.writer.recover()
         self.assertIsNotNone(self.catalog.published)
+        self.assertEqual(self.store.quarantined, quarantined)
+
+    def test_recovery_batch_failure_preserves_journal_and_never_publishes(self):
+        self.catalog.fail_seal = True
+        with self.assertRaises(CatalogUnavailable):
+            self.write()
+        baseline = set(self.store.registered)
+        with (
+            patch.object(self.client, "batch_get_into", side_effect=OSError("lost")),
+            self.assertRaises(TransportError),
+        ):
+            self.writer.recover()
+        self.assertIsNone(self.catalog.published)
+        self.assertTrue(self.journal.has_pending(self.lease.capture_id))
+        self.assertNotIn(self.manifest.key_prefix + "manifest", self.client.data)
+        self.assertEqual(len(self.store.quarantined), len(self.manifest.objects))
+        self.assertEqual(set(self.store.registered) - baseline, self.store.quarantined)
+        self.writer.recover()
+        self.assertIsNotNone(self.catalog.published)
+        self.assertFalse(self.journal.has_pending(self.lease.capture_id))
 
     def test_journal_ownership_and_namespace(self):
         with self.assertRaises(BlockingIOError):

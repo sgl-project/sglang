@@ -293,7 +293,9 @@ def _run_case(rank, root, master, endpoint, case):
                 assert recovery_entered.wait(10)
             dist.barrier()
             if rank == 0:
-                _wait(coordinator, lambda: coordinator.stats()["reservations"] == 2)
+                state = coordinator.stats()
+                assert state["reservations"] == 0, state
+                assert state["admission"]["effective_ratio"] == 0, state
                 raw = _incoming("not-ready")
                 coordinator.request_router.prepare([raw])
                 assert raw.training_capture_ticket is None

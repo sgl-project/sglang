@@ -22,7 +22,11 @@ import msgspec
 import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
-from sglang.srt.training_capture.catalog import CaptureLease, HTTPCaptureCatalog
+from sglang.srt.training_capture.catalog import (
+    CaptureLease,
+    CatalogUnavailable,
+    HTTPCaptureCatalog,
+)
 from sglang.srt.training_capture.cohort import CaptureCohortAllocator
 from sglang.srt.training_capture.cohort_service import CaptureCohortService
 from sglang.srt.training_capture.cohort_writer import CohortSnapshotWriter
@@ -90,20 +94,27 @@ def connect(master, *, segment_bytes):
 
 def read_sample(master, key, size, digest):
     store = connect(master, segment_bytes=0)
+    store.client = MagicMock(wraps=store.client)
     try:
         manifest_buffer = store.get_tensor(key, [size], torch.uint8, digest)
         manifest = decode_manifest(bytes(tensor_bytes(manifest_buffer)))
-        tensors = {
-            obj.key: store.get_tensor(obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
-            for obj in manifest.objects
-        }
+        outputs = store.get_tensors(
+            [
+                (obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
+                for obj in manifest.objects
+            ]
+        )
+        tensors = dict(zip((obj.key for obj in manifest.objects), outputs, strict=True))
         validate_tensors(manifest, tensors)
+        assert store.client.batch_get_into.call_count == 1
+        assert not store.registered and not store.quarantined
         print(
             json.dumps(
                 {
                     "sample_id": manifest.sample_id,
                     "objects": len(tensors),
                     "validated_tensor_bytes": manifest.total_tensor_bytes,
+                    "native_read_batches": store.client.batch_get_into.call_count,
                 }
             ),
             flush=True,
@@ -933,6 +944,7 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
             )
             store.put_registered_batch(mixed)
             self.assertEqual(store.client.batch_put_from.call_count, 2)
+            self.assertEqual(store.client.batch_get_into.call_count, 2)
             # A separate process has no access to producer tensor pointers.
             result = subprocess.run(
                 [
@@ -972,6 +984,88 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
             if journal is not None:
                 journal.close()
             journal_directory.cleanup()
+
+    def test_batch_recovery_after_producer_close_uses_only_store_payloads(self):
+        manifest, tensors = make_snapshot(response_length=4)
+        data = canonical_bytes(manifest)
+        data_node = connect(self.master_address, segment_bytes=64 << 20)
+        producer = None
+        recovery = None
+        journal = None
+        try:
+            producer = connect(self.master_address, segment_bytes=0)
+            with tempfile.TemporaryDirectory() as directory:
+                journal = PublicationJournal(directory)
+                buffer = torch.empty(1 << 20, dtype=torch.uint8)
+                producer.register(buffer)
+                for tensor in tensors.values():
+                    producer.register(tensor)
+                catalog = MagicMock()
+                catalog.seal.return_value = {
+                    "state": "PREPARED",
+                    "manifest_sha256": digest_bytes(data),
+                }
+                receipt = {
+                    "state": "AVAILABLE",
+                    "publication_id": "batch-recovery",
+                    "catalog_cursor": "batch-recovery",
+                }
+                catalog.publish.side_effect = [
+                    CatalogUnavailable("lost reply"),
+                    receipt,
+                ]
+                lease = CaptureLease(
+                    capture_id="batch-recovery",
+                    fencing_token=1,
+                    dataset_id=manifest.dataset_id,
+                    sample_id=manifest.sample_id,
+                    generation_id=manifest.generation_id,
+                    expires_in_seconds=120,
+                    renew_after_seconds=20,
+                )
+                with self.assertRaises(CatalogUnavailable):
+                    SnapshotWriter(producer, catalog, journal).write(
+                        manifest, tensors, buffer, lease
+                    )
+                original_publication = catalog.publish.call_args
+                journal.close()
+                producer.close()
+                for tensor in tensors.values():
+                    tensor.zero_()
+                buffer.zero_()
+                recovery = connect(self.master_address, segment_bytes=0)
+                recovery.client = MagicMock(wraps=recovery.client)
+                journal = PublicationJournal(directory)
+                writer = SnapshotWriter(recovery, catalog, journal)
+                self.assertEqual(writer.recover(), [receipt])
+                self.assertEqual(catalog.publish.call_args, original_publication)
+                self.assertEqual(recovery.client.batch_get_into.call_count, 1)
+                self.assertEqual(
+                    recovery.client.batch_get_into.call_args.args[0],
+                    [obj.key for obj in manifest.objects],
+                )
+                self.assertFalse(recovery.client.put_from.called)
+                self.assertFalse(recovery.registered)
+                self.assertFalse(recovery.quarantined)
+                self.assertFalse(list(journal.pending()))
+                read_snapshot(recovery, original_publication.args[0])
+                print(
+                    json.dumps(
+                        {
+                            "native_recovery_batches": 1,
+                            "recovery_tensor_bytes": manifest.total_tensor_bytes,
+                        }
+                    ),
+                    flush=True,
+                )
+        finally:
+            if journal is not None:
+                journal.close()
+            if recovery is not None:
+                recovery.close()
+            if producer is not None:
+                producer.close()
+            data_node.close()
 
     def test_independent_owner_processes_publish_only_after_all_receipts(self):
         manifest, tensors = make_partitioned_snapshot()

@@ -1,0 +1,249 @@
+{
+  "status": "completed",
+  "scope": "Registered native batch reads, immutable retry verification and fenced publication recovery",
+  "base_commit": "f354089a73b0168e0891d6187b252a15884a7be6",
+  "archive": "/gpfs/user/fuxuanwei/mooncake-lab-archive/batch-read-20261003",
+  "artifact_count": 28,
+  "artifact_manifest_sha256": "a5198150a33b349e8f66416ec5b03d3c2d88521ad71e73084ab6e5de6205e1a2",
+  "source_audit": {
+    "python_files": 5031,
+    "sha256": "a0ca370fe703a6143064674416cafbfbfe7b4615d0e1d1d755f2763c3234a4aa"
+  },
+  "jobs": [
+    {
+      "role": "unit",
+      "id": "01791019653073659952-00985dcf42d9",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v1",
+      "submission": {
+        "job_id": "01791019653073659952-00985dcf42d9",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "-m",
+          "unittest",
+          "test/registered/unit/training_capture/test_buffers.py",
+          "test/registered/unit/training_capture/test_snapshot_writer.py",
+          "test/registered/unit/training_capture/test_cohort_writer.py",
+          "test/registered/unit/training_capture/test_resources.py",
+          "test/registered/unit/training_capture/test_coordinator.py",
+          "-v"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v1/python"
+        },
+        "timeout_seconds": 1200
+      },
+      "result": {
+        "job_id": "01791019653073659952-00985dcf42d9",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791019654.0315914,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791019653073659952-00985dcf42d9.log"
+      },
+      "methods": 5,
+      "elapsed_seconds": 0,
+      "observations": [],
+      "log_sha256": "a474183978f2dd97812cd7fa950c0001d78d6168f42ddb52f7d97f5ad734301a"
+    },
+    {
+      "role": "storage",
+      "id": "01791019653471878857-7b9de272d384",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v1",
+      "submission": {
+        "job_id": "01791019653471878857-7b9de272d384",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_snapshot_mooncake.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v1/python"
+        },
+        "timeout_seconds": 1200
+      },
+      "result": {
+        "job_id": "01791019653471878857-7b9de272d384",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791019755.0528736,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791019653471878857-7b9de272d384.log"
+      },
+      "methods": 3,
+      "elapsed_seconds": 85.891,
+      "observations": [
+        {
+          "sample_id": "8e147fec7b514e17ab0cd167060ecb4d",
+          "objects": 32,
+          "validated_tensor_bytes": 4532,
+          "native_read_batches": 1
+        },
+        {
+          "native_recovery_batches": 1,
+          "recovery_tensor_bytes": 4532
+        }
+      ],
+      "log_sha256": "5cdd8318067655f48fcf1e45c3af07dd24c90d9dde484a392d46dd0b376703ae"
+    },
+    {
+      "role": "unit_fixed",
+      "id": "01791019705588503515-2479bbe33942",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v1",
+      "submission": {
+        "job_id": "01791019705588503515-2479bbe33942",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "-m",
+          "unittest",
+          "test_buffers",
+          "test_snapshot_writer",
+          "test_cohort_writer",
+          "test_resources",
+          "test_coordinator",
+          "-v"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v1/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v1/test/registered/unit/training_capture"
+        },
+        "timeout_seconds": 1200
+      },
+      "result": {
+        "job_id": "01791019705588503515-2479bbe33942",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791019832.1601117,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791019705588503515-2479bbe33942.log"
+      },
+      "methods": 118,
+      "elapsed_seconds": 65.409,
+      "observations": [],
+      "log_sha256": "d4e70d6af1ef716376b31ba13adccc15d7b827695d9829c85520a2a70ce706a9"
+    },
+    {
+      "role": "storage_fixed",
+      "id": "01791019940014690001-68cc07684e78",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v2",
+      "submission": {
+        "job_id": "01791019940014690001-68cc07684e78",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_snapshot_mooncake.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v2",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v2/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-batch-read-v2/test/registered/unit/training_capture"
+        },
+        "timeout_seconds": 1200
+      },
+      "result": {
+        "job_id": "01791019940014690001-68cc07684e78",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791020153.1641212,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791019940014690001-68cc07684e78.log"
+      },
+      "methods": 7,
+      "elapsed_seconds": 196.806,
+      "observations": [
+        {
+          "sample_id": "e547cb5da03c43c98be8a799a72f72f9",
+          "objects": 32,
+          "validated_tensor_bytes": 4532,
+          "native_read_batches": 1
+        },
+        {
+          "native_recovery_batches": 1,
+          "recovery_tensor_bytes": 4532
+        },
+        {
+          "sample_id": "04e304ac58dc4063b6228fde5d986f26",
+          "objects": 32,
+          "validated_tensor_bytes": 4532,
+          "native_read_batches": 1
+        },
+        {
+          "sample_id": "test-sample",
+          "objects": 20,
+          "validated_tensor_bytes": 4532,
+          "native_read_batches": 1
+        },
+        {
+          "sample_id": "1e769ffa444b400cb4f32f06436165cb",
+          "objects": 32,
+          "validated_tensor_bytes": 4532,
+          "native_read_batches": 1
+        },
+        {
+          "sample_id": "93076ea3aa25434d8f5b58c9ec196e3b",
+          "objects": 32,
+          "validated_tensor_bytes": 4532,
+          "native_read_batches": 1
+        }
+      ],
+      "log_sha256": "c0ec35882618f6fc4fccafa6b2701968163831b2a27ce1c96508bbac373e52e5"
+    }
+  ],
+  "environment": {
+    "time": "2026-10-03T09:36:51.871Z",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "gpu": "0, NVIDIA H100 80GB HBM3, GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495, 81559 MiB, 535.154.05",
+    "runtime": {
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "mooncake": "0.3.11.post1"
+    },
+    "store": "TCP",
+    "catalog": "Mock and HTTP TestCaptureCatalog",
+    "state": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1791020211.104807,
+      "idle_pid": 12558,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.2904386520385742
+    },
+    "processes": "PID  PPID STAT COMMAND\n    1     0 Ss   python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60\n12558     1 Ssl  /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6"
+  },
+  "totals": {
+    "unit_methods": 118,
+    "storage_methods": 7,
+    "independent_native_batch_readbacks": 5,
+    "readback_objects": 148,
+    "readback_tensor_bytes": 22660,
+    "native_recovery_batches": 1
+  },
+  "corrections": [
+    "Initial unit command imported the standard-library test package; fixed module search path before executing tests.",
+    "The existing inactive-ingress fixture expected reservations during held writer recovery, contrary to current cohort readiness gating; it now asserts zero reservations and zero admission before release."
+  ],
+  "limitations": [
+    "TCP Store with synthetic captures; batch RDMA and serving throughput are not established.",
+    "Catalog calls use test doubles; production retention, trainer prefetch and SpecForge consumer integration remain separate.",
+    "Receive budget covers one call plus quarantine, not tensors retained by callers across calls."
+  ]
+}

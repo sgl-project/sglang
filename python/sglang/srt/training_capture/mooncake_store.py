@@ -10,7 +10,8 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from contextlib import ExitStack
 from typing import ClassVar
 
 import torch
@@ -205,16 +206,13 @@ class MooncakeSnapshotStore:
             or any(type(value) is not int or value not in (0, 1) for value in exists)
         ):
             raise TransportError("invalid Mooncake batch existence results")
-        pending = []
-        for index, ((key, tensor, digest), present) in enumerate(zip(objects, exists)):
-            if present:
-                # Existence alone never proves an immutable retry is identical.
-                existing = self.get_tensor(
-                    key, list(tensor.shape), tensor.dtype, digest
-                )
-                del existing
-            else:
-                pending.append(index)
+        # Existence alone never proves an immutable retry is identical.
+        self.verify_tensors(
+            (key, list(tensor.shape), tensor.dtype, digest)
+            for (key, tensor, digest), present in zip(objects, exists)
+            if present
+        )
+        pending = [index for index, present in enumerate(exists) if not present]
         if not pending:
             return
         try:
@@ -243,21 +241,30 @@ class MooncakeSnapshotStore:
                 "sources quarantined"
             )
 
-    def get_tensor(
-        self, key: str, shape: list[int], dtype: torch.dtype, expected_digest: str
-    ) -> torch.Tensor:
+    @staticmethod
+    def _receive_size(shape, dtype):
         if not shape or any(type(d) is not int or d <= 0 for d in shape):
             raise ContractError("invalid receive shape")
-        nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        return (
+            math.prod(shape) * torch.empty((), dtype=dtype, device="cpu").element_size()
+        )
+
+    def _receive_budget(self):
         retained = sum(
             self.registered[p].numel() * self.registered[p].element_size()
             for p in self.quarantined
         )
-        if nbytes + retained > self.max_receive_bytes:
+        return self.max_receive_bytes - retained
+
+    def get_tensor(
+        self, key: str, shape: list[int], dtype: torch.dtype, expected_digest: str
+    ) -> torch.Tensor:
+        nbytes = self._receive_size(shape, dtype)
+        if nbytes > self._receive_budget():
             raise ContractError("receive/quarantine budget exceeded")
         if self.client.is_exist(key) != 1:
             raise TransportError("Mooncake object is missing or unavailable")
-        out = torch.empty(shape, dtype=dtype)
+        out = torch.empty(shape, dtype=dtype, device="cpu")
         self.register(out)
         pointer = out.data_ptr()
         try:
@@ -277,6 +284,81 @@ class MooncakeSnapshotStore:
         if digest_bytes(tensor_bytes(out)) != expected_digest:
             raise ContractError("Mooncake object digest mismatch")
         return out
+
+    def get_tensors(
+        self, objects: Sequence[tuple[str, list[int], torch.dtype, str]]
+    ) -> list[torch.Tensor]:
+        """Read an ordered batch into owned CPU tensors within one receive budget.
+
+        The caller holds the Catalog read lease. This synchronous transport API
+        does not grant retention or bound tensors retained by previous calls.
+        """
+        if not objects:
+            return []
+        sizes = [self._receive_size(shape, dtype) for _, shape, dtype, _ in objects]
+        if sum(sizes) > self._receive_budget():
+            raise ContractError("receive/quarantine budget exceeded")
+        batch_get = getattr(self.client, "batch_get_into", None)
+        if not callable(batch_get):
+            return [self.get_tensor(*obj) for obj in objects]
+        with ExitStack() as cleanup:
+            outputs = []
+            for _, shape, dtype, _ in objects:
+                out = torch.empty(shape, dtype=dtype, device="cpu")
+                self.register(out)
+                outputs.append(out)
+                cleanup.callback(self._release_receive, out)
+            pointers = [out.data_ptr() for out in outputs]
+            try:
+                counts = batch_get([obj[0] for obj in objects], pointers, sizes)
+                if (
+                    not isinstance(counts, (list, tuple))
+                    or len(counts) != len(objects)
+                    or any(type(count) is not int for count in counts)
+                ):
+                    raise TransportError("invalid Mooncake batch read results")
+            except Exception as error:
+                self.quarantined.update(pointers)
+                raise TransportError(
+                    "Mooncake batch read completion is uncertain; destinations quarantined"
+                ) from error
+            failed = [i for i, count in enumerate(counts) if count < 0]
+            if failed:
+                self.quarantined.update(pointers[i] for i in failed)
+                raise TransportError(
+                    f"Mooncake batch get_into failed for {len(failed)} objects; "
+                    "destinations quarantined"
+                )
+            if list(counts) != sizes:
+                raise ContractError("Mooncake batch read byte count mismatch")
+            for out, (_, _, _, digest) in zip(outputs, objects):
+                if digest_bytes(tensor_bytes(out)) != digest:
+                    raise ContractError("Mooncake object digest mismatch")
+            return outputs
+
+    def _release_receive(self, tensor):
+        if tensor.data_ptr() not in self.quarantined:
+            self.unregister(tensor)
+
+    def verify_tensors(
+        self, objects: Iterable[tuple[str, list[int], torch.dtype, str]]
+    ) -> None:
+        """Verify immutable objects, discarding each bounded batch before the next."""
+        batch = []
+        nbytes = 0
+        budget = self._receive_budget()
+        for obj in objects:
+            size = self._receive_size(obj[1], obj[2])
+            if size > budget:
+                raise ContractError("receive/quarantine budget exceeded")
+            if batch and (nbytes + size > budget or len(batch) == 64):
+                self.get_tensors(batch)
+                batch.clear()
+                nbytes = 0
+            batch.append(obj)
+            nbytes += size
+        if batch:
+            self.get_tensors(batch)
 
     def remove(self, key: str) -> None:
         """Only the retention authority may call this, after lease/checkpoint checks."""
