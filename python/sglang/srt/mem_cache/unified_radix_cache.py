@@ -242,12 +242,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
-        # Streaming session: embedded StreamingSession with self as inner.
-        # Always on -- zero overhead when no streaming session is open (the
-        # try_* entries short-circuit on non-streaming reqs / real TreeNodes).
-        # Dispatch methods below pre-check conditions so the session's
-        # internal fall-through to self.inner.xxx never fires -- no recursion.
-        self.session = StreamingSession(inner=self)
+        # Always on; the try_* entries short-circuit on non-streaming reqs.
+        self.session = StreamingSession(self)
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -1003,172 +999,22 @@ class UnifiedRadixCache(BasePrefixCache):
             comp.cleanup_after_caching_req(req, is_finished=True)
 
     @rank_consensus(same_params=["req.rid", "up_to"])
-    def insert_req(self, req: Req, *, up_to: int, **kwargs) -> None:
-        if self.disable:
-            for comp in self._components_tuple:
-                comp.cleanup_after_caching_req(req, is_finished=True)
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
-
-        token_ids = (req.origin_input_ids + req.output_ids)[:up_to]
-        kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :up_to]
-
-        insert_params = InsertParams(
-            prev_prefix_len=req.kv.cache_protected_len,
-            priority=req.priority or 0,
-            session_id=req.session_id,
-            rotation_base=req.kv_rotation_base,
-        )
-
-        # components prepare insert data + return effective cache_len
-        effective_cache_len = len(token_ids)
-        for comp in self._components_tuple:
-            cl = comp.prepare_for_caching_req(
-                req=req,
-                insert_params=insert_params,
-                token_ids_len=len(token_ids),
-                is_finished=True,
-            )
-            if cl is not None:
-                effective_cache_len = min(effective_cache_len, cl)
-        for comp in self._components_tuple:
-            effective_cache_len = comp.floor_cache_len(effective_cache_len)
-
-        # Truncate if needed; the tail free is deferred and batched with
-        # the unaligned tail below so a shared boundary page is emitted once.
-        kv_indices_full = kv_indices
-        tail_free_start = None
-        if effective_cache_len < len(token_ids):
-            tail_free_start = max(effective_cache_len, req.kv.cache_protected_len)
-            token_ids = token_ids[:effective_cache_len]
-            kv_indices = kv_indices[:effective_cache_len]
-
-        radix_key = RadixKey(
-            token_ids,
-            req.extra_key,
-            is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
-        ).page_aligned(self.page_size)
-        page_aligned_len = len(radix_key)
-        values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
-
-        insert_params.key = radix_key
-        insert_params.value = values
-        result = self.insert(insert_params)
-
-        # Split the leaf at the prompt boundary so eviction can drop the output
-        # KV without the prompt. prev_prefix_len keeps the overlapping indices
-        # from being freed as duplicates; skipped after a declined rotation,
-        # whose rows are freed below.
-        prompt_key = RadixKey(
-            req.origin_input_ids,
-            req.extra_key,
-            is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
-        ).page_aligned(self.page_size)
-        if (
-            not result.rotation_tail_declined
-            and len(self._components_tuple) == 1
-            and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
-            and 0 < len(prompt_key) < len(radix_key)
-        ):
-            self.insert(
-                replace(
-                    insert_params,
-                    key=prompt_key,
-                    value=values[: len(prompt_key)],
-                    prev_prefix_len=len(prompt_key),
-                    priority=insert_params.priority + 1,
-                    # The request created these nodes moments ago; another
-                    # hit_count bump would promote every prompt node.
-                    chunked=True,
-                )
-            )
-
-        # Everything past the inserted key goes back to the caller, the
-        # protected prefix never does. After a rotation decline nothing was
-        # inserted.
-        free_from = (
-            min(req.kv.cache_protected_len, len(kv_indices))
-            if result.rotation_tail_declined
-            else page_aligned_len
-        )
-        if tail_free_start is not None and tail_free_start > len(kv_indices):
-            # Truncated below the protected prefix: only an untracked mamba
-            # request gets here, with an empty key, and owns nothing before it.
-            assert free_from == len(kv_indices), (
-                f"{free_from=} {len(kv_indices)=} {req.kv.cache_protected_len=}"
-            )
-            free_from = tail_free_start
-        req.kv.cache_protected_len = free_from
-
-        # cleanup
-        for comp in self._components_tuple:
-            comp.cleanup_after_caching_req(
-                req, is_finished=True, insert_result=result, insert_params=insert_params
-            )
-
-        if self.enable_session_radix_cache and result is not None:
-            from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
-            if req.finished_reason is not None and not isinstance(
-                req.finished_reason, FINISH_ABORT
-            ):
-                self.session_refs.register_session_ref(
-                    req, leaf=result.last_device_node
-                )
-
-    @rank_consensus(same_params=["req.rid", "chunked"])
-    def advance_unpublished_req(self, req: Req, chunked: bool = False) -> None:
-        assert not self.supports_mamba()
-        token_ids = req.get_fill_ids()
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : len(token_ids)
-        ]
-        insert_params = InsertParams(
-            prev_prefix_len=req.kv.cache_protected_len,
-            chunked=chunked,
-            priority=req.priority or 0,
-            rotation_base=req.kv_rotation_base,
-        )
-        effective_cache_len = len(token_ids)
-        for comp in self._components_tuple:
-            cache_len = comp.prepare_for_caching_req(
-                req=req,
-                insert_params=insert_params,
-                token_ids_len=len(token_ids),
-                is_finished=False,
-            )
-            if cache_len is not None:
-                effective_cache_len = min(effective_cache_len, cache_len)
-
-        radix_key = RadixKey(
-            token_ids[:effective_cache_len],
-            req.extra_key,
-            is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
-        )
-        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
-            for comp in self._components_tuple:
-                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
-
-        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
-        for comp in self._components_tuple:
-            comp.cleanup_after_caching_req(
-                req, is_finished=False, insert_params=insert_params
-            )
-
-    @rank_consensus(same_params=["req.rid", "chunked"])
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
-            return
-
-        token_ids = req.get_fill_ids()
+        # A finished request hands its component state (mamba) to the tree
+        # instead of forking it, and the tree frees what the request still held.
+        is_finished = req.finished()
+        token_ids = req.full_untruncated_fill_ids[:up_to]
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, : len(token_ids)
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            if is_finished:
+                for comp in self._components_tuple:
+                    comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
@@ -1178,7 +1024,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
-            chunked=chunked,
+            inserted_len=req.kv.cache_inserted_len,
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
@@ -1189,7 +1035,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req=req,
                 insert_params=insert_params,
                 token_ids_len=len(token_ids),
-                is_finished=False,
+                is_finished=is_finished,
             )
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
@@ -1204,7 +1050,10 @@ class UnifiedRadixCache(BasePrefixCache):
             cache_salt=req.cache_salt,
         )
 
-        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+        if (
+            not is_finished
+            and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
+        ):
             # The frontier lands a page below page_floor(pre_len + 1), which has to
             # be where the insert stops, or the leaf it creates keeps less than a
             # sliding window of live SWA and the match after the insert rejects it.
@@ -1217,7 +1066,7 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
-                    req, is_finished=False, insert_params=insert_params
+                    req, is_finished=is_finished, insert_params=insert_params
                 )
             return
 
@@ -1244,9 +1093,35 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
-                    req, is_finished=False, insert_params=insert_params
+                    req, is_finished=is_finished, insert_params=insert_params
                 )
             return
+        req.kv.cache_inserted_len = max(req.kv.cache_inserted_len, page_aligned_len)
+
+        # Split the leaf at the prompt boundary so eviction can drop the output
+        # KV without the prompt. prev_prefix_len keeps the overlapping indices
+        # from being freed as duplicates.
+        prompt_key = RadixKey(
+            req.origin_input_ids,
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        if (
+            len(self._components_tuple) == 1
+            and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
+            and 0 < len(prompt_key) < len(radix_key)
+        ):
+            self.insert(
+                replace(
+                    insert_params,
+                    key=prompt_key,
+                    value=values[: len(prompt_key)],
+                    prev_prefix_len=len(prompt_key),
+                    inserted_len=len(prompt_key),
+                    priority=insert_params.priority + 1,
+                )
+            )
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
@@ -1299,9 +1174,56 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req,
-                is_finished=False,
+                is_finished=is_finished,
                 insert_result=result,
                 insert_params=insert_params,
+            )
+
+        if self.enable_session_radix_cache and is_finished:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            if not isinstance(req.finished_reason, FINISH_ABORT):
+                self.session_refs.register_session_ref(
+                    req, leaf=result.last_device_node
+                )
+
+    @rank_consensus(same_params=["req.rid"])
+    def advance_unpublished_req(self, req: Req) -> None:
+        assert not self.supports_mamba()
+        token_ids = req.get_fill_ids()
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : len(token_ids)
+        ]
+        insert_params = InsertParams(
+            prev_prefix_len=req.kv.cache_protected_len,
+            priority=req.priority or 0,
+            rotation_base=req.kv_rotation_base,
+        )
+        effective_cache_len = len(token_ids)
+        for comp in self._components_tuple:
+            cache_len = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=len(token_ids),
+                is_finished=False,
+            )
+            if cache_len is not None:
+                effective_cache_len = min(effective_cache_len, cache_len)
+
+        radix_key = RadixKey(
+            token_ids[:effective_cache_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        )
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            for comp in self._components_tuple:
+                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(
+                req, is_finished=False, insert_params=insert_params
             )
 
     # ---- Internal Helpers ----
@@ -3533,25 +3455,19 @@ class UnifiedRadixCache(BasePrefixCache):
         return 0
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
-        """Return True after the local load-back event is complete.
-
-        Lets the disagg decode restore state machine
-        (``DecodeHiCacheTransferMixin``) gate on load-back completion; the
-        controller-level ``layer_done_counter`` event is shared across cache
-        implementations, while the tree-side bookkeeping runs in
-        ``loading_check``.
-        """
+        """Return True after this rank's load-back event is complete."""
         if consumer_index < 0 or self.cache_controller is None:
             return True
 
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
-            return False
+        return finish_event.query()
 
-        self.loading_check()
-        return True
+    def has_free_load_back_slot(self) -> bool:
+        """Acks are reaped in lockstep, so every rank agrees on this."""
+        cc = self.cache_controller
+        return len(cc.ack_load_queue) < cc.layer_done_counter.num_counters
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
@@ -3611,10 +3527,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)
 
-    # ---- Streaming session API (delegates to composed StreamingSession) ----
-
-    def supports_streaming_session(self) -> bool:
-        return True
+    # ---- Streaming session API (delegates to self.session) ----
 
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)
