@@ -91,14 +91,14 @@ def _make_pools(with_side_state: bool):
     host.conv_dtype = conv[0].dtype
     host.temporal_dtype = temporal.dtype
     host.dtype = host.conv_dtype
-    host.slot_state_entries = [
-        entry
+    host.slot_state_device_tensors = [
+        state
         for sibling in device_pool._slot_siblings
-        for entry in sibling.iter_transfer_state_entries()
+        for _, state, _, _ in sibling.iter_transfer_state_entries()
     ]
     host.slot_state_buffers = [
         torch.zeros((NUM_HOST_SLOTS,) + tuple(state.shape[1:]), dtype=state.dtype)
-        for _, state, _, _ in host.slot_state_entries
+        for state in host.slot_state_device_tensors
     ]
     host.temporal_buffer = torch.zeros(
         (NUM_HOST_SLOTS, NUM_LAYERS, 1) + TEMPORAL_SHAPE, dtype=temporal.dtype
@@ -199,7 +199,7 @@ class TestHiCacheMambaSlotSideStates(CustomTestCase):
 
     def test_model_without_side_state_is_unaffected(self):
         host, device_pool = _make_pools(False)
-        self.assertEqual(host.slot_state_entries, [])
+        self.assertEqual(host.slot_state_device_tensors, [])
         self.assertEqual(host.slot_state_buffers, [])
         page = host.get_data_page(0)
         self.assertEqual(page.numel(), host.page_size * host.size_per_token)
