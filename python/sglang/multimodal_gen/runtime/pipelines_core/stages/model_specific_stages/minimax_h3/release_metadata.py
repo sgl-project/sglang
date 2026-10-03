@@ -169,7 +169,7 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                 f"slab holds {gpu_plans}; raise "
                 "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS"
             )
-        quality = getattr(batch.sampling_params, "quality", "lossless")
+        quality = getattr(batch.sampling_params, "quality", "exact")
         if quality not in QUALITY_LEVELS:
             raise ValueError(
                 f"quality must be one of {list(QUALITY_LEVELS)}, got {quality!r}"

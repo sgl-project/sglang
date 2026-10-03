@@ -316,7 +316,7 @@ for (const path of walk(CONFIGS)) {
         { hw: "gb200" },
         { hw: "gb300", mode: "i2va" },
         { hw: "gb300", weights: "ref2va", mode: "v2v" },
-        { hw: "gb300", quality: "extra-high" },
+        { hw: "gb300", quality: "lossless" },
         { hw: "gb300", outputs: "2" },
         { hw: "gb300", precision: "fp8" },
         { hw: "gb300", attention: "sage" },

@@ -53,12 +53,15 @@ def generate_request_id() -> str:
     return str(uuid.uuid4())
 
 
-# Validated request-level quality levels, ordered from the strictest numerical
-# contract to the broadest optimization set. "lossless" keeps the exact
-# reference path; "extra-high" adds only request-gated kernel fusions; "high"
-# is cumulative and may also enable model-owned approximate optimizations.
-QUALITY_LEVELS: tuple[str, ...] = ("lossless", "extra-high", "high")
-KERNEL_FUSION_QUALITY_LEVELS = frozenset({"extra-high", "high"})
+# Request-level quality levels, ordered from the strictest numerical contract to
+# the broadest optimization set; each level includes the fast paths of the ones
+# before it:
+# - "exact": bit-identical to the reference path in the same environment
+# - "lossless": the same math; fast paths may change rounding order or position
+# - "high": may also change what is computed (precision, sparsity, reuse)
+QUALITY_LEVELS: tuple[str, ...] = ("exact", "lossless", "high")
+# "extra-high" is the pre-rename name of "lossless"
+QUALITY_ALIASES: dict[str, str] = {"extra-high": "lossless"}
 
 
 @dataclass(frozen=True)
@@ -112,9 +115,20 @@ def resolve_skip_softmax_params(
     return SkipSoftmaxParams(float(threshold), start_step)
 
 
-def quality_allows_kernel_fusions(quality: str) -> bool:
-    """Return whether a quality level includes request-gated kernel fusions."""
-    return quality in KERNEL_FUSION_QUALITY_LEVELS
+def normalize_quality(quality: str) -> str:
+    """Return the canonical quality level for ``quality``, resolving aliases."""
+    level = QUALITY_ALIASES.get(quality, quality)
+    if level not in QUALITY_LEVELS:
+        raise ValueError(
+            f"quality must be one of {[*QUALITY_LEVELS, *QUALITY_ALIASES]}, "
+            f"got {quality!r}"
+        )
+    return level
+
+
+def quality_allows(quality: str, tier: str) -> bool:
+    """Whether a request at ``quality`` may run a fast path of class ``tier``."""
+    return QUALITY_LEVELS.index(quality) >= QUALITY_LEVELS.index(tier)
 
 
 def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:
@@ -232,21 +246,20 @@ class SamplingParams:
     )
     output_quality: str | None = "default"
     output_compression: int | None = None
-    # Model-owned, request-scoped quality level.
+    # Model-owned, request-scoped quality level (see QUALITY_LEVELS).
     #
-    # - "lossless" (default): the exact reference path. Output is expected to
-    #   be bit-identical to the HF reference implementation and to pass the
-    #   CI golden/ground-truth comparisons.
-    # - "extra-high": add only validated kernel fusions. These may change
-    #   half-precision rounding order, so output is not bit-exact versus the
-    #   reference, but this tier does not itself enable sparse or approximate
-    #   optimizations.
-    # - "high": include every "extra-high" fusion and allow model-owned
-    #   approximate optimizations such as sparse computation or feature
-    #   caching. These paths require model-specific quality validation.
+    # - "exact" (default): the reference path. Output is bit-identical to it
+    #   in the same environment and passes the CI ground-truth comparisons.
+    # - "lossless": add fast paths that keep the math and the precision of
+    #   every operand, changing only rounding order or position (fusions,
+    #   other kernels); output matches the reference to rounding error, not
+    #   bit for bit.
+    # - "high": also allow model-owned approximate optimizations (lower
+    #   precision, sparse computation, feature caching), which need
+    #   model-specific quality validation.
     #
     # It intentionally participates in the dynamic-batch signature.
-    quality: str = "lossless"
+    quality: str = "exact"
 
     # Frame interpolation
     enable_frame_interpolation: bool = False
@@ -581,10 +594,7 @@ class SamplingParams:
                 f"prompt_path must be a txt file, got {self.prompt_path!r}"
             )
 
-        if self.quality not in QUALITY_LEVELS:
-            raise ValueError(
-                f"quality must be one of {list(QUALITY_LEVELS)}, got {self.quality!r}"
-            )
+        self.quality = normalize_quality(self.quality)
 
         resolve_skip_softmax_params(self.skip_softmax_params)
 
@@ -1218,16 +1228,16 @@ class SamplingParams:
         add_argument(
             "--quality",
             type=str,
-            choices=list(QUALITY_LEVELS),
+            choices=[*QUALITY_LEVELS, *QUALITY_ALIASES],
             help=(
-                "Request-level quality: 'lossless' (default) keeps the exact "
-                "reference path, bit-exact against the reference "
-                "implementation; 'extra-high' adds only request-gated kernel "
-                "fusions and does not itself enable sparse or approximate "
-                "optimization; 'high' includes every extra-high fusion and "
-                "may also enable "
-                "model-owned approximate paths. Support and validated "
-                "deployment constraints are model-specific."
+                "Request-level quality: 'exact' (default) runs the reference "
+                "path, bit-identical to it in the same environment; "
+                "'lossless' adds fast paths that keep the math and operand "
+                "precision and change only rounding order, so output matches "
+                "to rounding error; 'high' may also enable model-owned "
+                "approximate paths. 'extra-high' is accepted as the former "
+                "name of 'lossless'. Support and validated deployment "
+                "constraints are model-specific."
             ),
         )
         add_argument(

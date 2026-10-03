@@ -536,7 +536,7 @@ return {
           description: "Reference-exact denoising without Cache-DiT approximation.",
         },
         {
-          id: "extra-high",
+          id: "lossless",
           label: "Extra high",
           description: "Includes fusion-only request paths but not Cache-DiT; MiniMax-H3 currently follows its lossless denoise path at this tier.",
         },
@@ -717,7 +717,7 @@ return {
         && precisionVerified && executionVerified && checkpointVerified;
       const requestCovered = s.hw !== "gb300" || (serveVerified && s.weights === "fl2va"
         && s.mode === "t2va" && s.quality === "lossless" && Number(s.outputs) === 1);
-      const requestVerified = topologyVerified && requestCovered && (["lossless", "extra-high"].includes(s.quality)
+      const requestVerified = topologyVerified && requestCovered && (["lossless", "lossless"].includes(s.quality)
         || (s.quality === "high" && highAudited && s.execution === "eager"));
 
       const topologyParts = [];

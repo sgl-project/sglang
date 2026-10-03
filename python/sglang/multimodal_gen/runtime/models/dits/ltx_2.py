@@ -204,7 +204,7 @@ def _ltx2_rms_norm_modulate(
 
     Folds the weightless RMSNorm and the modulate into one kernel when the
     request-gated fusion is mounted on ``block`` and the per-call guard
-    passes; otherwise the verbatim eager reference chain (the ``lossless``
+    passes; otherwise the verbatim eager reference chain (the ``exact``
     default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
     on the request-scoped mount rather than a runtime self-check.
     """
