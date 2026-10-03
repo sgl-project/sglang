@@ -9,7 +9,6 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_silu_mul,
     fused_gate_rmsnorm_active,
     fused_rmsnorm_scale,
     fused_rmsnorm_tanh_residual,
@@ -54,8 +53,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+_is_cuda = current_platform.is_cuda()
 
 logger = init_logger(__name__)
 
@@ -144,7 +148,9 @@ def _ideogram_swiglu(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     verified = _IDEOGRAM_SWIGLU.verified
     if (
         not _IDEOGRAM_SWIGLU.disabled
-        and can_use_fused_silu_mul(a, b)
+        and _is_cuda
+        and a.is_cuda
+        and a.dtype is torch.bfloat16
         and (verified or _IDEOGRAM_SWIGLU.can_attempt_once())
     ):
         try:

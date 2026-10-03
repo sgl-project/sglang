@@ -8,12 +8,8 @@ from torch import nn
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_complex_rope,
     can_use_fused_layernorm_modulate,
-    can_use_fused_silu_mul,
     can_use_qknorm_complex_rope_cuda,
-    can_use_qknorm_complex_rope_pack,
-    can_use_rmsnorm_preserve_reduction,
     fused_complex_rope,
     fused_layernorm_modulate,
     fused_silu_mul_bitexact,
@@ -24,11 +20,9 @@ from sglang.kernels.ops.diffusion import (
     tensors_equal,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
-    can_use_qknorm_complex_rope_kv,
     qknorm_complex_rope_kv,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
-    can_use_qknorm_complex_rope,
     qknorm_complex_rope,
 )
 from sglang.multimodal_gen.runtime.distributed import (
@@ -51,9 +45,14 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.layernorm import RMSNorm
+
+_is_cuda = current_platform.is_cuda()
 
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
@@ -130,7 +129,7 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
 
 def apply_rope(x, rope):
     fused = None
-    if can_use_fused_complex_rope(x, rope) and _ROPE_FUSION.can_attempt_once():
+    if _is_cuda and x.is_cuda and _ROPE_FUSION.can_attempt_once():
         fused = fused_complex_rope(x, rope)
         if _ROPE_FUSION.verified:
             return fused
@@ -144,7 +143,9 @@ def apply_rope(x, rope):
 def apply_qk_norm(x, norm):
     fused = None
     if (
-        can_use_rmsnorm_preserve_reduction(x, norm.weight)
+        _is_cuda
+        and x.is_cuda
+        and x.dtype in (torch.float16, torch.bfloat16)
         and _QK_NORM_FUSION.can_attempt_once()
     ):
         fused = rmsnorm_preserve_reduction(x, norm.weight, norm.variance_epsilon)
@@ -159,22 +160,28 @@ def apply_qk_norm(x, norm):
 def apply_qk_norm_rope(x, norm, rope):
     fused = None
     if (
-        can_use_qknorm_complex_rope_cuda(x, norm.weight, rope)
+        _is_cuda
+        and x.is_cuda
+        and not torch.compiler.is_compiling()
+        and can_use_qknorm_complex_rope_cuda(x.dtype, x.shape[-1])
         and _QK_ROPE_CUDA_FUSION.can_attempt_once()
     ):
         fused = qknorm_complex_rope_cuda(x, norm.weight, rope, norm.variance_epsilon)
         if _QK_ROPE_CUDA_FUSION.verified:
             return fused
-        out = apply_rope(apply_qk_norm(x, norm), rope)
+        out = apply_rope(norm(x), rope)
         return _QK_ROPE_CUDA_FUSION.accept_or_fallback(fused, out, logger=logger)
     if (
-        can_use_qknorm_complex_rope(x, norm.weight, rope)
+        _is_cuda
+        and x.is_cuda
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x.shape[-1] == 128
         and _QK_ROPE_FUSION.can_attempt_once()
     ):
         fused = qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon)
         if _QK_ROPE_FUSION.verified:
             return fused
-    out = apply_rope(apply_qk_norm(x, norm), rope)
+    out = apply_rope(norm(x), rope)
     if fused is not None:
         return _QK_ROPE_FUSION.accept_or_fallback(fused, out, logger=logger)
     return out
@@ -218,7 +225,8 @@ def cat_outputs(outputs, dim=0):
 def apply_modulation(x, norm, scale):
     fused = None
     if (
-        can_use_fused_layernorm_modulate(x, scale.squeeze(1), None)
+        x.is_cuda
+        and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
         and _MODULATION_FUSION.can_attempt_once()
     ):
         fused = fused_layernorm_modulate(x, scale.squeeze(1), None, norm.eps)
@@ -305,7 +313,11 @@ class QwenImage21FeedForward(nn.Module):
     def forward(self, x):
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
         fused = None
-        if can_use_fused_silu_mul(gate, value) and _SILU_MUL_FUSION.can_attempt_once():
+        if (
+            _is_cuda
+            and gate.dtype is torch.bfloat16
+            and _SILU_MUL_FUSION.can_attempt_once()
+        ):
             fused = fused_silu_mul_bitexact(gate, value)
             if _SILU_MUL_FUSION.verified:
                 return self.out(fused)[0]
@@ -443,9 +455,16 @@ class QwenImage21Attention(nn.Module):
         With ``k_out``/``v_out`` the projection already wrote the raw K/V into
         rows ``[P:]`` (``k``/``v`` are those views), so K is normalized in place
         and V is not copied. Returns ``(q, k_out, v_out)`` or ``None`` when the
-        layout is unsupported. The first call also runs the eager chain and
+        dtype/head dimension is unsupported. The first call also runs the eager chain and
         keeps its result on a mismatch.
         """
+        if not (
+            _is_cuda
+            and q.is_cuda
+            and not torch.compiler.is_compiling()
+            and can_use_qknorm_complex_rope_cuda(q.dtype, self.head_dim)
+        ):
+            return None
         eps = self.norm_k.variance_epsilon
         if self.norm_q.variance_epsilon != eps:
             return None
@@ -456,24 +475,11 @@ class QwenImage21Attention(nn.Module):
             k_src, v_src = k, v
         else:
             k_src, v_src = None, None
-        if not can_use_qknorm_complex_rope_pack(
-            q,
-            k_out,
-            v_out,
-            self.norm_q.weight,
-            self.norm_k.weight,
-            rope,
-            kp,
-            vp,
-            k_src,
-            v_src,
-        ):
-            return None
         reference = None
         if not _KV_PACK_CUDA_FUSION.verified:
             reference = (
-                apply_rope(apply_qk_norm(q, self.norm_q), rope),
-                torch.cat([kp, apply_rope(apply_qk_norm(k, self.norm_k), rope)], 1),
+                apply_rope(self.norm_q(q), rope),
+                torch.cat([kp, apply_rope(self.norm_k(k), rope)], 1),
                 torch.cat([vp, v], 1),
             )
         qknorm_complex_rope_pack_(
@@ -612,7 +618,10 @@ class QwenImage21Attention(nn.Module):
         packed = None
         if (
             get_sp_world_size() == 1
-            and can_use_qknorm_complex_rope_kv(k, self.norm_k.weight, rope, v, kp, vp)
+            and _is_cuda
+            and k.is_cuda
+            and k.dtype in (torch.float16, torch.bfloat16)
+            and self.head_dim == 128
             and _KV_ROPE_FUSION.can_attempt_once()
         ):
             packed = qknorm_complex_rope_kv(
@@ -620,7 +629,7 @@ class QwenImage21Attention(nn.Module):
             )
             if not _KV_ROPE_FUSION.verified:
                 reference = (
-                    torch.cat([kp, apply_rope(apply_qk_norm(k, self.norm_k), rope)], 1),
+                    torch.cat([kp, apply_rope(self.norm_k(k), rope)], 1),
                     torch.cat([vp, v], 1),
                 )
                 packed = _KV_ROPE_FUSION.accept_or_fallback(
