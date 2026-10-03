@@ -176,6 +176,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "ming-image-0.1-design": "MingImagePipeline",
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
+    "m-a-p/yue2-3b": "YuE2Pipeline",
     "fastvideo/fastvideo-fasth3-4-step-preview-v1-vsa-datafree": "FastH3Pipeline",
     "openvdn/vdn-minimax-h3": "VDNH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
