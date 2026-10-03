@@ -118,7 +118,7 @@ class TestDcpSharedPrefix(unittest.TestCase):
         self.assertEqual(got.union_rows, 128)
 
     def test_a_chunked_request_keeps_a_private_partial_page(self):
-        # cache_unfinished_req leaves a partial page in prefix_indices that is
+        # checkpoint leaves a partial page in prefix_indices that is
         # not in the tree. The walk must match cache_protected_len, NOT
         # len(prefix_indices) -- under page_size > 1 that is every chunked
         # request, which is most of a 1M prefill.

@@ -18,7 +18,7 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageKind
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
-from sglang.srt.layers.layer_boundary.residual.access import add_to_output
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import (
     DeclaredSum,
@@ -354,12 +354,13 @@ class TestResidualStream(CustomTestCase):
         torch.testing.assert_close(outputs[0], torch.full((2, 4), 5.0))
 
     def test_deepstack_adds_once_after_completing_the_sum(self):
-        hidden, stream = add_to_output(
-            self.hidden, self.stream, torch.full((2, 4), 7.0)
+        hidden = residual_batch.add_to_output(
+            self.hidden,
+            SimpleNamespace(residual_stream=self.stream),
+            torch.full((2, 4), 7.0),
         )
-        self.assertIs(stream, self.stream)
-        self.assertIs(stream.pending.value, hidden)
-        self.assertIs(stream.residual, self.residual)
+        self.assertIs(self.stream.pending.value, hidden)
+        self.assertIs(self.stream.residual, self.residual)
         torch.testing.assert_close(hidden, torch.full((2, 4), 9.0))
         self.group.all_reduce.assert_called_once()
 

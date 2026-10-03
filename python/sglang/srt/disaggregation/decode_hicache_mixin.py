@@ -288,13 +288,8 @@ class DecodeHiCacheTransferMixin:
             ):
                 dr.hicache_restore_status = HiCacheRestoreResult.READY
 
-        # Phase B: queue new load_back ops if the next slot is free.
-        # The (producer_index + 1) check ensures we never overwrite a still-in-flight slot:
-        # if a previous req holds that slot and isn't done, its event won't be signaled.
-        counter = self.tree_cache.cache_controller.layer_done_counter
-        if not self.tree_cache.is_load_back_event_done(
-            (counter.producer_index + 1) % counter.num_counters
-        ):
+        # Phase B: queue new load_back ops if the next slot is free on every rank.
+        if not self.tree_cache.has_free_load_back_slot():
             return
         queued = [
             dr

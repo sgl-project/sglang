@@ -343,7 +343,7 @@ def dcp_shared_prefix(
     Duck-typed on ``.parent``/``.value`` to stay import-free and CPU-testable.
 
     Only the tree-owned part is shareable. Under ``page_size > 1`` a chunked
-    request also carries a partial page that ``cache_unfinished_req`` keeps in
+    request also carries a partial page that ``checkpoint`` keeps in
     ``prefix_indices`` but not in the tree; it belongs to that request alone, so
     it is outside both ``walked`` and ``union_rows`` and a dedup must still send
     it per request.

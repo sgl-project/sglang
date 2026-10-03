@@ -461,7 +461,7 @@ class AscendAttnBackend(AttentionBackend):
             self.is_dllm_model = True
             self.dllm_block_size = self.dllm_config.block_size
 
-        self.attn_cp_size = model_runner.attn_cp_size
+        self.attn_cp_size = get_parallel().attn_cp_size
 
         # sgl-kernel-npu's operator: CANN refuses return_softmax_lse under
         # PA_BSND, so DCP decode has no other LSE source. Checked at startup so a
