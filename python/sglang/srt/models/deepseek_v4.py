@@ -114,6 +114,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    can_fuse_all_reduce,
+)
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -3245,18 +3248,14 @@ class DeepseekV4DecoderLayer(nn.Module):
 
     @functools.cached_property
     def _can_fuse_attn_mhc(self) -> bool:
-        """Whether the attention post may ride the fused collective (dsv4.1 only);
-        load-time facts, dropped by `refresh_mhc_norm_weight_cache`."""
-        from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
-            can_fuse_all_reduce,
-        )
-
+        """The static half of the attention fuse gate (dsv4.1 only); load-time
+        facts, dropped by `refresh_mhc_norm_weight_cache`. Row capacity is the
+        dynamic half, checked per forward via `can_fuse_all_reduce`."""
         return (
             get_parallel().tp_size == self.self_attn.attn_tp_size == 4
             and self.self_attn.wo_b.reduce_results
             and self.local_boundary.norm_fusable
             and mhc.can_fuse_post(self.hc_cfg)
-            and can_fuse_all_reduce()
         )
 
     @functools.cached_property
@@ -3287,22 +3286,27 @@ class DeepseekV4DecoderLayer(nn.Module):
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
 
-        tiny = 0 < state.residual.shape[0] <= 8
-
         def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.attn_hc is not None
             residual = state.residual
             quantized = [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
-            x = mhc.combine(self.attn_hc, state, stats_stream, quantized)
+            mhc.fork_stats_stream(stats_stream)
+            x = mhc.combine(self.attn_hc, state, quantized)
+            state.release()
+            del state
             world_size = self.self_attn.attn_tp_size
+            fuse_all_reduce_mhc = self._can_fuse_attn_mhc and can_fuse_all_reduce(
+                x.shape[0], self.hc_cfg.hidden
+            )
             with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
                 y = self.self_attn(
                     x=x,
                     positions=positions,
                     forward_batch=forward_batch,
                     x_quant=quantized[0] if quantized else None,
-                    defer_all_reduce=tiny and self._can_fuse_attn_mhc,
+                    defer_all_reduce=fuse_all_reduce_mhc,
                 )
+            del x
             return mhc.run_attn_post(
                 self.attn_hc,
                 y,
@@ -3315,15 +3319,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.ffn_hc is not None
             residual = state.residual
-            x = mhc.combine(self.ffn_hc, state, stats_stream)
+            mhc.fork_stats_stream(stats_stream)
+            x = mhc.combine(self.ffn_hc, state)
+            state.release()
+            del state
             nxt = self.next_boundary if seam_open else None
+            fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
+                x.shape[0], self.hc_cfg.hidden
+            )
             y = self._run_moe_ffn_dp_sync(
                 x,
                 forward_batch,
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
-                return_moe_output=tiny and self._can_fuse_ffn_mhc,
+                return_moe_output=fuse_all_reduce_mhc,
             )
+            del x
             return mhc.run_moe_post(
                 self.ffn_hc,
                 y,
