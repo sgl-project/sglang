@@ -36,6 +36,7 @@ from sglang.srt.arg_groups.hicache_hook import (
 from sglang.srt.arg_groups.hisparse_hook import (
     validate_hisparse_dsa_backend,
     validate_hisparse_kv_cache_dtype,
+    validate_hisparse_spec_verify_backend,
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
@@ -1344,6 +1345,37 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "flashmla_sparse"):
             validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    def test_hisparse_spec_verify_accepts_scratch_backends(self):
+        for backend in ("tilelang", "triton", "flashmla_sparse"):
+            with self.subTest(backend=backend):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    speculative_algorithm="EAGLE",
+                    dsa_decode_backend=backend,
+                )
+                validate_hisparse_spec_verify_backend(server_args)
+
+    def test_hisparse_spec_verify_rejects_other_decode_backends(self):
+        for backend in ("flashmla_kv", "flashinfer_sparse_mla", "aiter"):
+            with self.subTest(backend=backend):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    speculative_algorithm="EAGLE",
+                    dsa_decode_backend=backend,
+                )
+                with self.assertRaisesRegex(ValueError, "target verification"):
+                    validate_hisparse_spec_verify_backend(server_args)
+
+    def test_hisparse_without_spec_keeps_decode_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            dsa_decode_backend="flashmla_kv",
+        )
+        validate_hisparse_spec_verify_backend(server_args)
 
     def test_hisparse_accepts_bfloat16_kv_cache_dtype(self):
         server_args = ServerArgs(

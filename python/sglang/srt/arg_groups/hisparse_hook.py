@@ -21,6 +21,8 @@ HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE = {
 }
 HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "triton", "aiter"}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
+# Kernels that can read HiSparse target-verify scratch (gather_for_verify).
+HISPARSE_SPEC_VERIFY_DSA_BACKENDS = {"tilelang", "triton", "flashmla_sparse"}
 
 
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
@@ -58,6 +60,20 @@ def validate_hisparse_dsa_backend(
             f"but got --dsa-{label}-backend={backend}. "
             f"Please use one of {sorted(allowed_backends)}, or omit the option "
             "to let SGLang pick a backend for this platform."
+        )
+
+
+def validate_hisparse_spec_verify_backend(server_args: ServerArgs) -> None:
+    """Speculative target verification runs on the DSA decode backend."""
+    view = resolved_view(server_args)
+    if view.speculative_algorithm is None:
+        return
+    backend = view.dsa_decode_backend
+    if backend is not None and backend not in HISPARSE_SPEC_VERIFY_DSA_BACKENDS:
+        raise ValueError(
+            "HiSparse with speculative decoding supports DSA decode backend(s) "
+            f"{sorted(HISPARSE_SPEC_VERIFY_DSA_BACKENDS)} for target verification, "
+            f"but got --dsa-decode-backend={backend}."
         )
 
 
@@ -151,3 +167,4 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         ("dsa_decode_backend", "decode"),
     ]:
         validate_hisparse_dsa_backend(server_args, attr, label)
+    validate_hisparse_spec_verify_backend(server_args)

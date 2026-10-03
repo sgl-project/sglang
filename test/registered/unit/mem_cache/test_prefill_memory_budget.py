@@ -171,6 +171,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = 16 * page_size
         scheduler.max_total_num_tokens = allocator.size_full
+        scheduler.request_token_capacity = allocator.size_full
         scheduler.page_size = page_size
         scheduler.max_new_tokens_limit = None
         scheduler.sliding_window_size = page_size
