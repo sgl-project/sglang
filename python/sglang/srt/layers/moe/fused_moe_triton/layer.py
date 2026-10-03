@@ -464,10 +464,7 @@ class FusedMoE(torch.nn.Module):
             is_gated=is_gated,
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
-            moe_tp_size=self.moe_tp_size,
-            moe_tp_rank=self.moe_tp_rank,
-            moe_ep_size=self.moe_ep_size,
-            moe_ep_rank=self.moe_ep_rank,
+            layer=self,
         )
 
         self.quant_method = quant_method
@@ -592,8 +589,6 @@ class FusedMoE(torch.nn.Module):
         self._num_local_routed = self._num_global_routed
         self.num_local_experts = self.num_experts
         self.moe_runner_config.num_local_experts = self.num_local_experts
-        self.moe_runner_config.moe_ep_size = 1
-        self.moe_runner_config.moe_ep_rank = 0
 
         self.dispatcher.moe_ep_size = 1
         self.dispatcher.moe_ep_rank = 0
