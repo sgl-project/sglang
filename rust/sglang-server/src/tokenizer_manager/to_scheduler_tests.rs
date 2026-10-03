@@ -748,13 +748,16 @@ fn tokenized_return_pushes_without_deregister() {
 /// deregistered, not silently dropped.
 #[test]
 fn tokenize_pool_gone_deregisters() {
-    let (mut intake, detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
-    let mut req = generate_req(21, SamplingParams::default());
-    if let RequestKind::Generate(g) = &mut req.kind {
-        g.input_ids = None;
-    }
+    let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let (req, mut response) = tokenizer_text_req(21, "hello");
     intake.drive(req);
 
+    assert!(
+        matches!(response.try_recv(), Ok(ResponseItem::Error(Error::Internal(message)))
+        if message == "tokenizer pool gone")
+    );
+    assert!(intake.request_states.is_empty());
+    assert!(consumer.drain(16).is_empty());
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "21"),
         "expected Register for rid 21",
@@ -764,6 +767,170 @@ fn tokenize_pool_gone_deregisters() {
         "pool-gone hand-off must deregister rid 21",
     );
     assert!(detok_rx.try_recv().is_err(), "no further shard messages");
+}
+
+fn tokenizer_text_req(id: u64, text: &str) -> (Request, mpsc::Receiver<ResponseItem>) {
+    let (tx, rx) = mpsc::channel(8);
+    let mut req = generate_req(id, SamplingParams::default());
+    req.sink = ResponseSink::Local(tx);
+    let RequestKind::Generate(g) = &mut req.kind else {
+        unreachable!()
+    };
+    g.input_ids = None;
+    g.text = Some(text.into());
+    (req, rx)
+}
+
+#[test]
+fn tokenizer_queue_full_rejects_and_recovers() {
+    use std::time::Duration;
+
+    let (mut intake, _unused_rx, _mm_rx, consumer, detok_rx) = make_intake_with_tokenizer(false);
+    let (tok_tx, tok_rx) = flume::bounded(1);
+    intake.senders.tokenizer_tx = tok_tx;
+    let (first, _first_response) = tokenizer_text_req(31, "first");
+    intake.drive(first);
+    assert!(tok_rx.is_full());
+
+    let (rejected, mut response) = tokenizer_text_req(32, "rejected");
+    let (done_tx, done_rx) = flume::bounded(1);
+    let driver = std::thread::spawn(move || {
+        intake.drive(rejected);
+        let _ = done_tx.send(());
+        intake
+    });
+    let completed = done_rx.recv_timeout(Duration::from_secs(5));
+    // Unblock the old blocking-send implementation before asserting, so a
+    // regression fails this test without leaving a stuck intake thread.
+    let mut tok_rx = Some(tok_rx);
+    if completed.is_err() {
+        drop(tok_rx.take());
+    }
+    let mut intake = driver.join().unwrap();
+    assert!(completed.is_ok(), "full tokenizer queue blocked intake");
+    let tok_rx = tok_rx.unwrap();
+    assert!(matches!(
+        response.try_recv(),
+        Ok(ResponseItem::Error(Error::QueueFull))
+    ));
+    assert!(response.try_recv().is_err(), "one terminal error");
+    assert!(!intake.request_states.contains_key(&"32".into()));
+    assert!(intake.request_states.contains_key(&"31".into()));
+    assert!(
+        matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "31")
+    );
+    assert!(
+        matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "32")
+    );
+    assert!(
+        matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "32")
+    );
+    assert!(detok_rx.try_recv().is_err());
+    assert!(consumer.drain(16).is_empty());
+
+    let mut first = tok_rx.try_recv().unwrap();
+    assert_eq!(first.rid.as_str(), "31", "the queued request was preserved");
+    let (next, mut next_response) = tokenizer_text_req(33, "next");
+    intake.drive(next);
+    assert_eq!(tok_rx.try_recv().unwrap().rid.as_str(), "33");
+    assert!(intake.request_states.contains_key(&"33".into()));
+    assert!(next_response.try_recv().is_err(), "admission recovered");
+
+    if let RequestKind::Generate(g) = &mut first.kind {
+        g.input_ids = Some(vec![1]);
+    }
+    first.state.apply(Event::TokenizeDone).unwrap();
+    intake.drive(first);
+    assert!(!intake.request_states.contains_key(&"31".into()));
+    assert_eq!(consumer.drain(16).len(), 1);
+}
+
+/// Reproduce both bounded edges of the real intake/tokenizer wait cycle. The
+/// worker has finished encoding but cannot return its result to the full TM
+/// inbox; intake must reject a new request instead of waiting for that worker.
+#[test]
+fn tokenizer_queue_and_return_inbox_do_not_deadlock() {
+    use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
+    use crate::tokenizer_manager::wiring::RequestAdmission;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct GatedTokenizer {
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+        finished: flume::Sender<()>,
+    }
+    impl TextTokenizer for GatedTokenizer {
+        fn encode(&self, text: &str) -> Result<Vec<i64>, Error> {
+            if text == "first" {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+                self.finished.send(()).unwrap();
+            }
+            Ok(vec![1])
+        }
+    }
+
+    let (mut intake, _unused_rx, _mm_rx, _consumer, _detok_rx) = make_intake_with_tokenizer(false);
+    let (tok_tx, tok_rx) = flume::bounded(1);
+    let (tm_tx, tm_rx) = flume::bounded(1);
+    intake.senders.tokenizer_tx = tok_tx;
+    intake.senders.tok_manager_tx = tm_tx.clone();
+    intake.tok_manager_rx = tm_rx.clone();
+    let (entered_tx, entered_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let (finished_tx, finished_rx) = flume::bounded(1);
+    let worker = TokenizerWorker::new(
+        tok_rx,
+        tm_tx.clone(),
+        Arc::new(GatedTokenizer {
+            entered: entered_tx,
+            release: release_rx,
+            finished: finished_tx,
+        }),
+    );
+    let worker = std::thread::spawn(move || worker.run());
+    let (first, _first_response) = tokenizer_text_req(41, "first");
+    intake.drive(first);
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (queued, _queued_response) = tokenizer_text_req(42, "queued");
+    intake.drive(queued);
+    tm_tx
+        .send(TmEvent::Intake {
+            request: generate_req(40, SamplingParams::default()),
+            admission: RequestAdmission::pending(),
+        })
+        .unwrap();
+    drop(tm_tx);
+    release_tx.send(()).unwrap();
+    finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(intake.senders.tokenizer_tx.is_full());
+    assert!(tm_rx.is_full());
+
+    let (rejected, mut response) = tokenizer_text_req(43, "rejected");
+    let (done_tx, done_rx) = flume::bounded(1);
+    let driver = std::thread::spawn(move || {
+        intake.drive(rejected);
+        let _ = done_tx.send(());
+        intake
+    });
+    let completed = done_rx.recv_timeout(Duration::from_secs(5));
+
+    // Break the cycle even on the old implementation before making assertions.
+    // Dropping intake then closes the worker queue; draining TM lets the real
+    // worker return every outstanding request and exit, closing its last sender.
+    let drainer = std::thread::spawn(move || while tm_rx.recv().is_ok() {});
+    let intake = driver.join().unwrap();
+    let rejected_is_tracked = intake.request_states.contains_key(&"43".into());
+    drop(intake);
+    worker.join().unwrap();
+    drainer.join().unwrap();
+    assert!(completed.is_ok(), "bounded tokenizer/TM queues deadlocked");
+    assert!(!rejected_is_tracked);
+    assert!(matches!(
+        response.try_recv(),
+        Ok(ResponseItem::Error(Error::QueueFull))
+    ));
 }
 
 /// The mm pool gone (receiver dropped) hands the request back: rejected with
