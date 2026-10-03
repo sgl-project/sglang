@@ -62,17 +62,23 @@ class TestOperatorLevelGate(unittest.TestCase):
             )
 
     def test_rejects_a_rounding_that_always_leans_one_way(self):
-        # Truncation instead of round-to-nearest-even: each element's error
-        # keeps its sign, so it accumulates over layers instead of cancelling.
+        # A one-sided error small enough to stay inside the magnitude budget:
+        # the shape of truncation instead of round-to-nearest-even, or of an
+        # approximate transcendental whose error keeps its sign. It cannot be
+        # caught by a tolerance, because per-element it is tiny -- but it
+        # accumulates over layers and steps where a symmetric error cancels.
         baseline = _row_sums(self.x, torch.float32)
-        step = 2.0**-8
-        truncated = (baseline / step).floor() * step
+        leaning = baseline + 5e-5
+
+        base = score_against(self.reference_fp64, baseline)
+        cand = score_against(self.reference_fp64, leaning)
+        self.assertLess(cand.rms, base.rms * 1.5, "stays inside the magnitude budget")
 
         with self.assertRaisesRegex(AssertionError, "biased rounding"):
             assert_error_no_worse_than_reference(
                 reference_fp64=self.reference_fp64,
                 baseline=baseline,
-                candidate=truncated,
+                candidate=leaning,
             )
 
     def test_score_reports_signed_mean_separately_from_magnitude(self):

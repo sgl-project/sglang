@@ -104,7 +104,7 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
 
         self.assertEqual(self.stage._mounted_quality, "high")
 
-    def test_exact_requests_mount_no_fusion(self):
+    def test_an_exact_request_unmounts_what_a_faster_tier_left_behind(self):
         self.stage.server_args.enable_breakable_cuda_graph = False
         mounted, unmounted = [], []
         handlers = (
@@ -117,10 +117,15 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
         )
 
         with patch.object(denoising_module, "_QUALITY_FUSION_HANDLERS", handlers):
+            self.stage._maybe_toggle_quality_fusions(self._batch("lossless"))
+            self.assertEqual(mounted, [self.stage.transformer])
+
+            # Back to the default at the next batch boundary: the fusion has
+            # to come off, or an exact request silently keeps running it.
             self.stage._maybe_toggle_quality_fusions(self._batch("exact"))
 
-        self.assertEqual(mounted, [])
         self.assertEqual(unmounted, [self.stage.transformer])
+        self.assertEqual(self.stage._mounted_quality, "exact")
 
     def test_a_fusion_runs_only_from_the_tier_that_declares_it(self):
         self.stage.server_args.enable_breakable_cuda_graph = False
