@@ -1,0 +1,402 @@
+name: Release Test (Intel XPU)
+
+# Validates published Intel XPU images against the SGLang XPU suites and the
+# sgl-kernel-xpu kernel + benchmark suites.
+#
+# sglang and sgl-kernel-xpu are separate repos on independent release cadences,
+# and each has its own nightly image, so this workflow takes a ref per repo:
+#
+#   rel_version         -> sglang ref; selects the intel/sglang-dev image built
+#                          by release-docker-intel-xpu-nightly.yml.
+#   kernel_rel_version  -> sgl-kernel-xpu ref; the kernel source built and
+#                          tested inside intel/sgl-kernel-xpu-dev.
+#
+# The two are deliberately not coupled: an intel/sglang-dev image ships whatever
+# kernel wheel its own ref pins in python/pyproject_xpu.toml, which need not be
+# the sgl-kernel-xpu ref under test. Set kernel_wheel to override that pin inside
+# the sglang container and validate a specific sglang x kernel combination.
+#
+# Intended flow:
+#   1. Run release-docker-intel-xpu-nightly.yml with `branch` set to the sglang
+#      release ref. It publishes
+#      intel/sglang-dev:nightly-dev-xpu-bmg-{ref_slug}-{date}-{sha}.
+#   2. Run this workflow with the same ref as rel_version. It resolves the newest
+#      image published for that ref, pulls it, and runs the suites inside it.
+#
+# Unlike pr-test-xpu.yml, this does NOT reinstall sglang from a checkout: the
+# point is to test the image exactly as users pull it, so the suites run against
+# the sglang baked into the image at /sgl-workspace/sglang.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rel_version:
+        description: 'sglang ref that was built, e.g. main, release/v0.5.20, v0.5.20.'
+        required: false
+        default: 'main'
+      image_tag:
+        description: 'Exact intel/sglang-dev tag to test. Empty = resolve the newest tag published for rel_version.'
+        required: false
+        default: ''
+      suites:
+        description: 'SGLang suites to run (comma-separated).'
+        required: false
+        default: 'stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu'
+      kernel_wheel:
+        description: 'Override the sglang-kernel-xpu wheel inside the sglang container. A version (0.2.0) or a full wheel URL. Empty = keep the image pin.'
+        required: false
+        default: ''
+      run_sglang_tests:
+        description: 'Run the SGLang XPU suites.'
+        required: false
+        type: boolean
+        default: true
+      run_kernel_tests:
+        description: 'Run the sgl-kernel-xpu kernel + benchmark suites.'
+        required: false
+        type: boolean
+        default: true
+      kernel_rel_version:
+        description: 'sgl-kernel-xpu ref to build and test, e.g. main, release/v0.2.0, v0.2.0. Independent of rel_version.'
+        required: false
+        default: 'main'
+      kernel_image_tag:
+        description: 'intel/sgl-kernel-xpu-dev tag used as the kernel build/test environment.'
+        required: false
+        default: 'latest'
+
+concurrency:
+  # Keyed on both refs so independent sglang x kernel combinations can queue
+  # separately instead of serializing behind one another.
+  group: release-test-xpu-${{ inputs.rel_version }}-${{ inputs.kernel_rel_version }}
+  # Never cancel: a release validation run is expensive and its result is wanted.
+  cancel-in-progress: false
+
+env:
+  # The kernel suites live in a different repo from this workflow. It is public,
+  # so the container fetches it directly and no cross-repo token is needed.
+  KERNEL_REPO: sgl-project/sgl-kernel-xpu
+
+jobs:
+  # ==================== Preflight ==================== #
+  resolve-image:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.rel_version }}
+
+      - name: Resolve intel/sglang-dev image for the release ref
+        id: resolve
+        env:
+          REL_VERSION: ${{ inputs.rel_version }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          image="$(python3 scripts/ci/xpu/resolve_xpu_image_tag.py \
+            --ref "${REL_VERSION}" \
+            --explicit-tag "${IMAGE_TAG}")"
+          echo "Resolved image: ${image}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "### Testing \`${image}\` (ref \`${REL_VERSION}\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate the sgl-kernel-xpu ref
+        # kernel_rel_version names a ref in KERNEL_REPO, not in this repo. Check
+        # it here so a typo fails in seconds instead of after the kernel rebuild
+        # has already burned an hour of GPU runner time.
+        if: inputs.run_kernel_tests
+        env:
+          KERNEL_REF: ${{ inputs.kernel_rel_version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${KERNEL_REPO}.git"
+          if ! git ls-remote --exit-code "${url}" \
+                 "refs/heads/${KERNEL_REF}" "refs/tags/${KERNEL_REF}" >/dev/null 2>&1; then
+            echo "::error::Ref '${KERNEL_REF}' not found in ${KERNEL_REPO}. Note this is a separate repo from sglang, versioned independently: its release branches look like release/v0.2.0, not release/v0.5.20."
+            exit 1
+          fi
+          echo "Found ${KERNEL_REF} in ${KERNEL_REPO}"
+
+  # ==================== SGLang suites ==================== #
+  sglang-suite:
+    needs: resolve-image
+    if: github.repository == 'sgl-project/sglang' && inputs.run_sglang_tests
+    runs-on: intel-bmg
+    env:
+      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+      CI_IMAGE: ${{ needs.resolve-image.outputs.image }}
+      SUITES: ${{ inputs.suites }}
+    steps:
+      - name: Reset workspace ownership
+        run: |
+          # Prior runs install as root inside the CI container against the
+          # bind-mounted workspace; actions/checkout cannot unlink root-owned
+          # files as the runner user, so reset ownership before checkout.
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.rel_version }}
+
+      - name: Start CI container from the released image
+        run: |
+          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --custom-image "${CI_IMAGE}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Report image provenance
+        run: |
+          docker image inspect "${CI_IMAGE}" \
+            --format 'image={{.Id}} created={{.Created}}' || true
+          docker exec ci_sglang_xpu /bin/bash -c \
+            'cd /sgl-workspace/sglang && git log -1 --format="baked sglang commit=%H %s"' || true
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
+            'import sglang; print("sglang", sglang.__version__, sglang.__file__)' || true
+          # The kernel version here comes from this sglang ref's pyproject_xpu.toml
+          # pin, not from kernel_rel_version.
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip show sglang-kernel-xpu \
+            2>/dev/null | grep -E '^(Name|Version):' || \
+            echo "sglang-kernel-xpu not installed in image"
+
+      - name: Override the sglang-kernel-xpu wheel
+        if: inputs.kernel_wheel != ''
+        env:
+          KERNEL_WHEEL: ${{ inputs.kernel_wheel }}
+        run: |
+          set -euo pipefail
+          # Accept a full URL or a bare version; the wheel is published to
+          # sgl-project/whl by release-whl-kernel-xpu.yml, not to PyPI.
+          if [[ "${KERNEL_WHEEL}" == http* ]]; then
+            spec="${KERNEL_WHEEL}"
+          else
+            v="${KERNEL_WHEEL#v}"
+            spec="https://github.com/sgl-project/whl/releases/download/v${v}+xpu/sglang_kernel_xpu-${v}-cp310-abi3-manylinux_2_38_x86_64.whl"
+          fi
+          echo "Installing kernel wheel: ${spec}"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install \
+            --no-cache-dir --force-reinstall --no-deps "${spec}"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip show sglang-kernel-xpu \
+            | grep -E '^(Name|Version):'
+
+      - name: Install test-only dependencies
+        timeout-minutes: 30
+        run: |
+          # The image ships sglang[dev,diffusion], which covers pytest /
+          # expecttest / tabulate. ray and lmcache are separate extras that a
+          # few registered XPU tests import; best-effort so a resolver hiccup
+          # does not fail the whole release validation.
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install \
+            --no-cache-dir ray huggingface_hub "lmcache>=0.3.9" || \
+            echo "::warning::Optional test deps failed to install; dependent tests may skip or fail"
+          docker exec ci_sglang_xpu /bin/bash -c \
+            '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+
+      - name: Run SGLang XPU suites against the image
+        # Matches pr-test-xpu.yml's 180-minute budget for stage-a + stage-b.
+        timeout-minutes: 210
+        run: |
+          # --continue-on-error: a release report should list every failure, not
+          # stop at the first one.
+          docker exec -e SUITES="${SUITES}" ci_sglang_xpu bash -c \
+            'source /opt/venv/bin/activate && cd /sgl-workspace/sglang/test && \
+             python3 run_suite.py --hw xpu --suite "${SUITES}" --enable-retry --continue-on-error'
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+          find . -type f -name "*.pyc" -delete || true
+          # SIGTERM sglang and drain the GPU context before `docker rm -f`;
+          # SIGKILL leaves the xe/GuC exec queue registered and triggers a GT
+          # reset (+ devcoredump) on B580.
+          if docker ps --format '{{.Names}}' | grep -qx ci_sglang_xpu; then
+            docker exec ci_sglang_xpu bash -c '
+              pkill -TERM -f "sglang|run_suite|python3.*test_" 2>/dev/null || true
+              for _ in $(seq 1 30); do
+                pgrep -f "sglang::|sglang.launch_server" >/dev/null || break
+                sleep 1
+              done
+              pkill -KILL -f "sglang|run_suite" 2>/dev/null || true
+            ' || true
+          fi
+          docker rm -f ci_sglang_xpu || true
+          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
+            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
+          fi
+
+  # ==================== sgl-kernel-xpu suites ==================== #
+  kernel-suite:
+    needs: sglang-suite
+    # always(): the kernel result is wanted even when the SGLang suites fail.
+    # Serialized after sglang-suite so the two do not contend for the same GPU.
+    # always() also bypasses the skip that a fork would get from `needs`, so the
+    # repository guard has to be repeated here.
+    if: always() && github.repository == 'sgl-project/sglang' && inputs.run_kernel_tests
+    runs-on: intel-bmg
+    env:
+      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+      # Environment image only: it is built from sgl-kernel-xpu main, and the
+      # rebuild step below replaces its baked kernel with KERNEL_REF.
+      KERNEL_IMAGE: intel/sgl-kernel-xpu-dev:${{ inputs.kernel_image_tag }}
+      # sgl-kernel-xpu versions independently of sglang, so this is its own input.
+      KERNEL_REF: ${{ inputs.kernel_rel_version }}
+    steps:
+      - name: Pull the sgl-kernel-xpu dev image
+        run: |
+          set -euo pipefail
+          if [[ -n "${DOCKERHUB_INTEL_USERNAME:-}" && -n "${DOCKERHUB_INTEL_TOKEN:-}" ]]; then
+            echo "${DOCKERHUB_INTEL_TOKEN}" | \
+              docker login -u "${DOCKERHUB_INTEL_USERNAME}" --password-stdin || \
+              echo "::warning::Docker Hub login failed; falling back to anonymous pull"
+          fi
+          docker pull "${KERNEL_IMAGE}"
+
+      - name: Start kernel container
+        run: |
+          docker rm -f ci_sglkernel_xpu || true
+          docker run -dt \
+            --device /dev/dri/ \
+            --name ci_sglkernel_xpu \
+            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
+            "${KERNEL_IMAGE}"
+
+      - name: Rebuild sgl-kernel from the release ref
+        # The dev image is built from sgl-kernel-xpu main, so for a release ref
+        # the baked kernel has to be replaced. Mirrors the rebuild step in
+        # sgl-project/sgl-kernel-xpu .github/workflows/pr-test-xpu.yml.
+        timeout-minutes: 60
+        run: |
+          docker exec -e KERNEL_REF="${KERNEL_REF}" -e KERNEL_REPO="${KERNEL_REPO}" \
+            ci_sglkernel_xpu /bin/bash -c '
+              set -exo pipefail
+              . /miniforge3/bin/activate
+              conda activate py3.12
+              cd /root/sglang/sgl-kernel-xpu
+              # Re-point origin at the kernel repo: the image bakes a clone, but
+              # its remote/ref is not guaranteed to be what we want to test.
+              git remote set-url origin "https://github.com/${KERNEL_REPO}.git"
+              git fetch --depth=1 origin "${KERNEL_REF}"
+              git checkout FETCH_HEAD
+              # Nuke the image-baked build/ tree so Ninja recompiles against the
+              # checked-out source instead of relinking prebuilt .o files.
+              rm -rf build
+              pip uninstall -y sgl-kernel || true
+              pip install --force-reinstall -v .
+              python -c "import sgl_kernel; print(sgl_kernel.__file__)"
+            '
+
+      - name: Install kernel test dependencies
+        timeout-minutes: 20
+        run: |
+          docker exec ci_sglkernel_xpu /miniforge3/envs/py3.12/bin/python3 -m pip install \
+            --upgrade pip
+          docker exec ci_sglkernel_xpu /miniforge3/envs/py3.12/bin/python3 -m pip install \
+            pytest expecttest ray huggingface_hub scipy tabulate
+          docker exec ci_sglkernel_xpu /bin/bash -c \
+            '/miniforge3/envs/py3.12/bin/hf auth login --token ${HF_TOKEN}'
+          docker exec ci_sglkernel_xpu /bin/bash -c \
+            "ln -sf /miniforge3/envs/py3.12/bin/python3 /usr/bin/python3"
+
+      - name: Run kernel tests
+        timeout-minutes: 70
+        run: |
+          docker exec -w /root/sglang/sgl-kernel-xpu/tests ci_sglkernel_xpu \
+            /bin/bash -c 'python3 run_suite.py --suite per-commit'
+
+      - name: Run kernel benchmarks
+        # Benchmarks are informational for a release check: a perf regression
+        # should not mask the pass/fail signal from the suites above.
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          docker exec -w /root/sglang/sgl-kernel-xpu/benchmark ci_sglkernel_xpu \
+            /bin/bash -c 'set -exo pipefail && python3 run_suite.py --suite per-commit'
+
+      - name: Collect benchmark logs
+        if: always()
+        run: |
+          mkdir -p kernel-logs
+          for log in fused_moe.log flash.log; do
+            docker cp "ci_sglkernel_xpu:/root/sglang/sgl-kernel-xpu/benchmark/${log}" \
+              "kernel-logs/${log}" || echo "No ${log} produced"
+          done
+
+      - name: Upload benchmark logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpu-kernel-benchmark-logs-${{ github.run_id }}
+          path: kernel-logs/
+          if-no-files-found: ignore
+
+      - name: Cleanup kernel container
+        if: always()
+        run: |
+          if docker ps --format '{{.Names}}' | grep -qx ci_sglkernel_xpu; then
+            docker exec ci_sglkernel_xpu bash -c '
+              pkill -TERM -f "run_suite|python3.*test_" 2>/dev/null || true
+              sleep 5
+              pkill -KILL -f "run_suite" 2>/dev/null || true
+            ' || true
+          fi
+          docker rm -f ci_sglkernel_xpu || true
+          docker rmi -f "${KERNEL_IMAGE}" || true
+
+  # ==================== Finish ==================== #
+  finish:
+    if: always()
+    needs: [resolve-image, sglang-suite, kernel-suite]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate results
+        env:
+          RESOLVE: ${{ needs.resolve-image.result }}
+          SGLANG: ${{ needs.sglang-suite.result }}
+          KERNEL: ${{ needs.kernel-suite.result }}
+          IMAGE: ${{ needs.resolve-image.outputs.image }}
+          REL_VERSION: ${{ inputs.rel_version }}
+          KERNEL_REL_VERSION: ${{ inputs.kernel_rel_version }}
+          KERNEL_WHEEL: ${{ inputs.kernel_wheel }}
+        run: |
+          {
+            echo "## Release test (Intel XPU)"
+            echo ""
+            echo "| What | Value |"
+            echo "| --- | --- |"
+            echo "| sglang ref | \`${REL_VERSION}\` |"
+            echo "| sglang image | \`${IMAGE:-unresolved}\` |"
+            echo "| sgl-kernel-xpu ref | \`${KERNEL_REL_VERSION}\` |"
+            echo "| kernel wheel override | \`${KERNEL_WHEEL:-none (image pin)}\` |"
+            echo ""
+            echo "| Job | Result |"
+            echo "| --- | --- |"
+            echo "| resolve-image | ${RESOLVE} |"
+            echo "| sglang-suite | ${SGLANG} |"
+            echo "| kernel-suite | ${KERNEL} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=0
+          for pair in "resolve-image:${RESOLVE}" "sglang-suite:${SGLANG}" "kernel-suite:${KERNEL}"; do
+            name="${pair%%:*}"
+            result="${pair##*:}"
+            if [ "${result}" != "success" ] && [ "${result}" != "skipped" ]; then
+              echo "::error::${name} finished with result: ${result}"
+              failed=1
+            fi
+          done
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
+          fi
+          echo "All release test jobs passed"
