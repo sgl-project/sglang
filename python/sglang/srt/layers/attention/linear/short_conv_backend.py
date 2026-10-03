@@ -117,13 +117,12 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         # Refilled in place per step so a captured graph reads a stable address.
         # Grow-only, never reallocated at the same size: the cuda- and cpu-graph
         # hooks can both run, in either order, after another phase captured.
+        # This backend may have init_cuda_graph_state called more than once (prefill
+        # and decode graph runners share the same backend instance), so only grow
+        # the buffer.
         buf = self._cache_indices_buf
         if buf is not None and buf.shape[0] >= max_bs:
             return
-        assert buf is None, (
-            f"cache-indices buffer must be sized before any graph capture: have "
-            f"{buf.shape[0]}, need {max_bs}"
-        )
         self._cache_indices_buf = torch.empty(
             max_bs, dtype=self.cache_indices_dtype, device=self.device
         )
