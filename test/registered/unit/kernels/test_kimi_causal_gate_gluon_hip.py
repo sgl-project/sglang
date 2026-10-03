@@ -22,6 +22,11 @@ def make_attn(rows=1024):
 
 
 class TestKimiCausalGate(unittest.TestCase):
+    def test_native_runtime_uses_current_mla_cp_predicate(self):
+        from sglang.srt.layers.cp.utils import is_mla_cp_active
+
+        self.assertIs(adapter.native_runtime().mla_cp, is_mla_cp_active)
+
     def test_shape_table_keeps_losses_native(self):
         for requests in (1, 2, 4, 8, 16, 32):
             self.assertTrue(adapter.supported_shape(1024, requests))

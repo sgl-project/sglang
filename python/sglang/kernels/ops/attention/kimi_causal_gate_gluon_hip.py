@@ -90,8 +90,8 @@ def native_runtime():
     from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
         resolve_attn_backend,
     )
-    from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
     from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+    from sglang.srt.layers.cp.utils import is_mla_cp_active
     from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 
     return SimpleNamespace(
@@ -105,7 +105,7 @@ def native_runtime():
         parallel=get_parallel,
         server_args=get_server_args,
         execution=get_exec,
-        mla_cp=mla_use_prefill_cp,
+        mla_cp=is_mla_cp_active,
         dsa_cp=dsa_use_prefill_cp,
         wait_stream=lambda stream: torch.cuda.current_stream().wait_stream(stream),
     )
