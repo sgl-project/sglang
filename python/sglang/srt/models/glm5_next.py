@@ -41,7 +41,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
     ColumnParallelLinear,
-    LinearBase,
     MergedColumnParallelLinear,
     MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
@@ -55,7 +54,6 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -363,10 +361,10 @@ class Glm5NextLinearAttention(nn.Module):
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "quark",
         }:
             return False
 
-        probe = LinearBase(1, 1)
         source_projs = [
             proj
             for fused_proj in fused_projs
@@ -375,10 +373,7 @@ class Glm5NextLinearAttention(nn.Module):
         if "fused_qkvbfg_a_proj" in fused_projs:
             source_projs.append("qkv_proj")
         return all(
-            isinstance(
-                quant_config.get_quant_method(probe, prefix=f"{prefix}.{proj}"),
-                UnquantizedLinearMethod,
-            )
+            quant_config.is_linear_unquantized(f"{prefix}.{proj}")
             for proj in source_projs
         )
 
@@ -1381,6 +1376,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "HIP shared experts fusion requires the validated "
                     "clamped SiLU G1U1 activation."
                 )
+            if quant_config is not None and quant_config.get_name() == "quark":
+                return cls._quark_mxfp4_shared_fusion_disable_reason(
+                    text_config, quant_config
+                )
             if (
                 quant_config is None
                 or quant_config.get_name() != "fp8"
@@ -1406,6 +1405,51 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         "HIP shared experts fusion requires routed and shared "
                         "experts to use the same block-FP8 layout."
                     )
+        return None
+
+    @staticmethod
+    def _quark_mxfp4_shared_fusion_disable_reason(text_config, quant_config):
+        from sglang.srt.layers.quantization.quark.utils import (
+            deep_compare,
+            should_ignore_layer,
+        )
+
+        reason = (
+            "HIP shared experts fusion requires routed and shared experts to "
+            "use the same Quark MXFP4 layout."
+        )
+        if not quant_config.can_fuse_shared_expert():
+            return reason
+        lookup_stub = torch.nn.Module()
+        first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
+        for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
+            moe_prefix = f"model.layers.{layer_id}.mlp"
+            routed_name = f"{moe_prefix}.experts"
+            shared_names = [
+                f"{moe_prefix}.shared_experts.{proj}"
+                for proj in ("gate_up_proj", "down_proj")
+            ]
+            if any(
+                should_ignore_layer(
+                    name,
+                    ignore=quant_config.exclude_layers,
+                    fused_mapping=quant_config.packed_modules_mapping,
+                )
+                for name in (routed_name, *shared_names)
+            ):
+                return reason
+            try:
+                routed = quant_config._find_matched_config(routed_name, lookup_stub)
+                shared = [
+                    quant_config._find_matched_config(name, lookup_stub)
+                    for name in shared_names
+                ]
+            except ValueError:
+                return reason
+            if not quant_config._is_mx_fp4(
+                routed.get("weight"), routed.get("input_tensors")
+            ) or not all(deep_compare(routed, cfg) for cfg in shared):
+                return reason
         return None
 
     def determine_num_fused_shared_experts(self):

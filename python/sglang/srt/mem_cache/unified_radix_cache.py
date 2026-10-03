@@ -242,12 +242,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
-        # Streaming session: embedded StreamingSession with self as inner.
-        # Always on -- zero overhead when no streaming session is open (the
-        # try_* entries short-circuit on non-streaming reqs / real TreeNodes).
-        # Dispatch methods below pre-check conditions so the session's
-        # internal fall-through to self.inner.xxx never fires -- no recursion.
-        self.session = StreamingSession(inner=self)
+        # Always on; the try_* entries short-circuit on non-streaming reqs.
+        self.session = StreamingSession(self)
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -1041,8 +1037,8 @@ class UnifiedRadixCache(BasePrefixCache):
             comp.cleanup_after_caching_req(req, is_finished=True)
 
     @rank_consensus(same_params=["req.rid", "up_to"])
-    def insert_req(self, req: Req, *, up_to: int, **kwargs) -> None:
-        if self.session.try_insert_req(req, up_to=up_to, **kwargs):
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
@@ -3591,10 +3587,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)
 
-    # ---- Streaming session API (delegates to composed StreamingSession) ----
-
-    def supports_streaming_session(self) -> bool:
-        return True
+    # ---- Streaming session API (delegates to self.session) ----
 
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)

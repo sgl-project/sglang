@@ -1051,8 +1051,8 @@ class MambaPool:
         ReplaySSM invariant: the SOURCE must be a fully-flushed checkpoint
         (``write_pos[src] == 0``). Only ``temporal`` is copied, not the ring, so
         an un-flushed source would drop its last ``write_pos`` updates. Callers
-        comply: COW copies radix checkpoints; a checkpoint ``insert_req`` copies an
-        active slot only during prefill (ring empty); ``insert_req``
+        comply: COW copies radix checkpoints; a ``checkpoint`` copies an
+        active slot only during prefill (ring empty); ``checkpoint``
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
