@@ -53,6 +53,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_forward
 from sglang.test.boundary_fixtures import (
     finish_exit,
     make_test_stages,
@@ -415,7 +416,9 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                     with communicator.ffn.plan.output.ffn_exit(
                         forward_batch, stream=ResidualStream()
                     ) as ffn_exit:
-                        self.assertTrue(ffn_exit.mlp_reduce_scatter)
+                        # The reduce-scatter on the way back completes the sum;
+                        # the FFN never runs or skips it.
+                        self.assertFalse(get_forward().mlp_reduce_scatter)
                     hidden, residual = finish_exit(
                         ffn_exit, torch.ones(4, 4), torch.full((2, 4), 2.0)
                     )
@@ -1420,7 +1423,11 @@ class TestBranchRows(CustomTestCase):
             branch_output = branch.branch_output
             merge_branch = branch.merge_branch
 
-        moe = Communicator(branch_rows=lambda fb: (self.local, self.local, self.local))
+        moe = Communicator(
+            branch_rows=lambda fb: (self.local, self.local, self.local),
+            # The a2a combine already summed the MoE output.
+            path_for=lambda fb: SimpleNamespace(output=comm.OutputContract(self.local)),
+        )
         dense = Communicator(
             branch_rows=lambda fb: (self.full, self.attention, self.attention)
         )
@@ -1642,6 +1649,12 @@ def running(*, reduce_scatterv, a2a=False, use_reduce_scatter=True):
         "attention_tensor_model_parallel_all_reduce": lambda x: (
             state().parallel.attn_tp_group.all_reduce(x)
         ),
+        "tensor_model_parallel_all_reduce": lambda x: (
+            state().parallel.tp_group.all_reduce(x)
+        ),
+        "sum_post_experts_output": lambda x: (
+            comm_layout.post_experts_reduction_group().all_reduce(x)
+        ),
         "get_global_dp_buffer": lambda g: torch.zeros(
             state().global_rows, HIDDEN, dtype=torch.double
         ),
@@ -1709,21 +1722,15 @@ def attention(x, state):
 
 
 def dense_mlp(x, state):
-    """A dense MLP on the TP group: 5 * x, reduced unless a published flag asks
-    it to leave the sum, as RowParallelLinear does."""
-    partial_sum = 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
-    if state.flags.fuse_mlp_allreduce or state.flags.mlp_reduce_scatter:
-        return partial_sum
-    return state.parallel.tp_group.all_reduce(partial_sum)
+    """A dense MLP on the TP group: 5 * x, as this rank's partial sum; the
+    stage boundary completes it."""
+    return 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
 
 
 def moe(x, state):
-    """A MoE block not dispatched per DP shard: 5 * x, reduced over the MoE
-    output's group unless a published flag asks it to leave the sum."""
-    partial_sum = 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
-    if state.flags.fuse_mlp_allreduce or state.flags.mlp_reduce_scatter:
-        return partial_sum
-    return comm_layout.post_experts_reduction_group().all_reduce(partial_sum)
+    """A MoE block not dispatched per DP shard: 5 * x, as this rank's partial
+    sum over the MoE output's group; the stage boundary completes it."""
+    return 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
 
 
 def reference(x):

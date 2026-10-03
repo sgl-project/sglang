@@ -28,9 +28,6 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
 )
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -315,15 +312,10 @@ class MiniMaxM3MLP(nn.Module):
         self,
         x,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -432,22 +424,13 @@ class MiniMaxM3MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if get_moe_a2a_backend().is_deepep():
             return self.forward_deepep(hidden_states, forward_batch)
         else:
-            return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+            return self.forward_normal(hidden_states)
 
-    def forward_normal(
-        self,
-        hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             if (
                 self.alt_stream is not None
@@ -470,9 +453,6 @@ class MiniMaxM3MoE(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1325,6 +1305,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 intermediate_size=config.dense_intermediate_size,
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                reduce_results=False,
             )
 
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
@@ -1395,12 +1376,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if self.is_layer_sparse or hidden_states.shape[0] != 0:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch=forward_batch,
-                    should_allreduce_fusion=ffn_exit.fuse_mlp_allreduce,
-                    use_reduce_scatter=ffn_exit.mlp_reduce_scatter,
-                )
+                hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return ffn_exit.finish(hidden_states)
 
 

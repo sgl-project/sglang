@@ -290,7 +290,7 @@ class SDARBlock(nn.Module):
         self.mlp = SDARMLP(
             config=config,
             quant_config=quant_config,
-            reduce_results=True,
+            reduce_results=False,
             prefix=add_prefix("mlp", prefix),
         )
 

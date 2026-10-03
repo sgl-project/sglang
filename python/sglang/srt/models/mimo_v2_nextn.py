@@ -113,6 +113,7 @@ class MiMoV2MTPLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             tp_rank=mlp_tp_rank,
             tp_size=mlp_tp_size,
+            reduce_results=False,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.post_attention_layernorm = RMSNorm(

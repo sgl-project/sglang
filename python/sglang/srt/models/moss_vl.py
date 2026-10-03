@@ -849,6 +849,7 @@ class MossVLTextMLP(nn.Module):
         hidden_act: str = "silu",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -863,6 +864,7 @@ class MossVLTextMLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
@@ -996,6 +998,7 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            reduce_results=False,
         )
         norm_kwargs = (
             dict(

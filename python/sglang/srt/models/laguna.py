@@ -37,11 +37,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import should_add_replicated_moe_output
+from sglang.srt.layers.moe.utils import adds_replicated_output_to_partial
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -226,8 +225,7 @@ class LagunaMoE(nn.Module):
         else:
             final = routed_out + shared_out
 
-        final = reduce_moe_output(final)
-        if self._shared_expert_tp1 and should_add_replicated_moe_output():
+        if self._shared_expert_tp1 and adds_replicated_output_to_partial():
             final = final + shared_out
         return final
 
@@ -448,7 +446,7 @@ class LagunaDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=True,
+                reduce_results=False,
                 prefix=add_prefix("mlp", prefix),
             )
 

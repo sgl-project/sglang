@@ -524,6 +524,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
                 enable_cuda_shared_expert_fusion=True,
+                reduce_results=False,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -532,6 +533,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                reduce_results=False,
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -688,6 +690,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
                 enable_cuda_shared_expert_fusion=True,
+                reduce_results=False,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -696,6 +699,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                reduce_results=False,
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(

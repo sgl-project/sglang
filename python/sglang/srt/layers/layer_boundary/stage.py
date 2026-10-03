@@ -187,7 +187,8 @@ class StageBoundary:
             forward_batch: Active batch whose stream receives the compute result.
 
         Returns:
-            A context manager publishing reduction/finalize flags during compute.
+            A context manager publishing the producer's finalize choice during
+            compute.
             Call its finish(output) exactly once after successful compute, including
             when compute is skipped for an empty input. It completes or carries work
             using the same decision rather than selecting a second path.
@@ -253,11 +254,11 @@ class StageBoundary:
             hidden_states = stream.complete(hidden_states)
         return hidden_states, stream.snapshot(hidden_states)
 
-    def finish_complete_output(self, hidden_states, forward_batch):
-        """Move an FFN output that compute already completed outside exit()
-        (the operation-scheduled TBO path) onto the rows the layer hands on;
-        it chooses no reduction step."""
-        return self.plan.output.finish_complete_output(
+    def complete_now(self, hidden_states, forward_batch):
+        """Complete an FFN output outside exit() (the operation-scheduled TBO
+        path, which never defers): the sum it owes, then the move onto the
+        rows the layer hands on."""
+        return self.plan.output.complete_now(
             hidden_states, stream_of(forward_batch), forward_batch
         )
 
@@ -379,3 +380,26 @@ class StageBoundary:
                 ),
             )
         return hidden_states, stream
+
+
+def check_stage_producers(model: torch.nn.Module) -> None:
+    """Reject a model whose stage producers complete their own output sums.
+
+    In a layer built from stage boundaries, the boundary completes every sum a
+    stage output owes. A submodule there constructed with
+    ``reduce_results=True`` (a row-parallel projection, a MoE block) would
+    have its output summed twice. Called once, after the model is built.
+    """
+    offenders = [
+        f"{name}.{child_name}"
+        for name, layer in model.named_modules()
+        if any(isinstance(v, StageBoundary) for v in vars(layer).values())
+        for child_name, child in layer.named_modules()
+        if child_name and getattr(child, "reduce_results", False) is True
+    ]
+    if offenders:
+        raise ValueError(
+            "stage boundaries complete their producers' output sums, but these "
+            f"submodules sum their own output: {', '.join(offenders[:8])}"
+            + (f" (and {len(offenders) - 8} more)" if len(offenders) > 8 else "")
+        )

@@ -25,9 +25,6 @@ import torch
 from torch import nn
 from transformers import MixtralConfig
 
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
@@ -118,8 +115,6 @@ class MixtralMoE(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(orig_shape)
 
 
@@ -269,8 +264,9 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self.block_sparse_moe(hidden_states)
-        return self.ffn_boundary.finish_complete_output(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            hidden_states = self.block_sparse_moe(hidden_states)
+        return ffn_exit.finish(hidden_states)
 
 
 class MixtralModel(nn.Module):

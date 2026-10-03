@@ -74,6 +74,7 @@ class Exaone4GatedMLP(nn.Module):
             hidden_size,
             bias=bias,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
@@ -312,8 +313,9 @@ class Exaone4DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self.mlp(hidden_states)
-        return self.ffn_boundary.finish_complete_output(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp(hidden_states)
+        return ffn_exit.finish(hidden_states)
 
 
 class Exaone4Model(nn.Module):
