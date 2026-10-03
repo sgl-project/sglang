@@ -446,7 +446,7 @@ jobs:
         if: steps.source-run.outputs.run_id != ''
         uses: actions/download-artifact@v4
         with:
-          pattern: nightly-xpu-*-metrics
+          pattern: nightly-A-xpu-*-metrics
           path: metrics/
           run-id: ${{ steps.source-run.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -465,13 +465,13 @@ jobs:
           import os
 
           SUITES = [
-              ("1x", "nightly-xpu-1-gpu-metrics"),
-              ("2x", "nightly-xpu-2-gpu-metrics"),
-              ("4x", "nightly-xpu-4-gpu-metrics"),
+              ("1x", "nightly-A-xpu-1-gpu-metrics"),
+              ("2x", "nightly-A-xpu-2-gpu-metrics"),
+              ("4x", "nightly-A-xpu-4-gpu-metrics"),
               # 8x is here for future readiness. Until nightly-test-intel.yml
               # adds an 8-GPU suite + upload step, its artifact directory is
               # missing and the section renders "No metrics recorded".
-              ("8x", "nightly-xpu-8-gpu-metrics"),
+              ("8x", "nightly-A-xpu-8-gpu-metrics"),
           ]
 
           def load(subdir: str):
