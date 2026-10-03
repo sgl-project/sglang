@@ -328,9 +328,10 @@ def test_hopper_mhc_stats_stream_graph(num_tokens):
     stream = layer.hc_stats_stream
 
     def run(stats_stream):
-        combined = model_mhc.combine(
-            layer.attn_hc, model_mhc.HcState(x, pre), stats_stream
-        )
+        # The layer forks the side stream right before each combine; the combine
+        # itself no longer takes a stream.
+        model_mhc.fork_stats_stream(stats_stream)
+        combined = model_mhc.combine(layer.attn_hc, model_mhc.HcState(x, pre))
         coefficients = model_mhc.mix_stats(layer.attn_hc, x, stats_stream)
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
@@ -417,7 +418,7 @@ def test_moe_post_reduces_before_adding_replicated_shared(
     monkeypatch.setattr(moe, "post_experts_all_reduce", reduce)
     monkeypatch.setattr(model_mhc, "_compute_triplet", lambda *args: None)
     monkeypatch.setattr(
-        model_mhc, "_plain_post", lambda hc, value, residual, triplet, **kwargs: value
+        model_mhc, "_post_fusion", lambda hc, value, residual, triplet, *args: value
     )
     actual = model_mhc.run_moe_post(
         None, pieces, None, stats_stream=None, next=None, world_size=2
