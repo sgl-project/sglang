@@ -22,7 +22,6 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import torch
@@ -206,110 +205,126 @@ def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor
     decode_like = forward_batch.forward_mode.is_decode() or (
         forward_batch.forward_mode.is_target_verify() and x.shape[0] > 0
     )
-    return decode_like and (not get_platform().is_sm90 or x.shape[0] == 1)
+    return decode_like and (
+        not get_platform().is_sm90
+        or x.shape[0] == 1
+        or (forward_batch.forward_mode.is_decode() and 1 < x.shape[0] <= 64)
+    )
 
 
 def mix_stats(
     hc: HcSubLayer, x: torch.Tensor, stats_stream: Optional[torch.cuda.Stream] = None
 ) -> HcTriplet:
-    """One fp32 GEMM over the flattened streams, split into ``(pre, post, comb)``."""
+    """Predict the triplet on the caller's stream or the stats stream."""
+    if stats_stream is None:
+        return _mix_stats_impl(hc, x)
+    main_stream = torch.cuda.current_stream()
+    x.record_stream(stats_stream)
+    with torch.cuda.stream(stats_stream):
+        coefficients = _mix_stats_impl(hc, x)
+    for coefficient in coefficients:
+        coefficient.record_stream(main_stream)
+    return coefficients
+
+
+def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
         hc_mix_stats_sinkhorn,
         hc_split_sinkhorn,
     )
-    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
     cfg = hc.cfg
+
     x_flat = x.flatten(1)
 
-    if x.is_cuda and (
-        # gfx950: the fused Triton port wins at every row count (MI350X)
-        _is_gfx95_supported
-        or (
-            torch.version.cuda is not None
-            and (
-                get_platform().is_blackwell
-                or (get_platform().is_sm90 and x.shape[0] == 1)
-            )
-        )
+    from sglang.srt.batch_invariant_ops import (
+        is_batch_invariant_mode_enabled,
+    )
+
+    parts = bf16_parts = None
+    hopper_medium = get_platform().is_sm90 and 32 <= x_flat.shape[0] < 4096
+    if (
+        x.is_cuda
+        and (x_flat.shape[0] >= 128 or hopper_medium)
+        and x_flat.is_contiguous()
+        and (get_platform().is_sm100 or get_platform().is_sm90)
+        and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+        and not is_batch_invariant_mode_enabled()
     ):
-        # Fusing the split-K reduction with sinkhorn keeps it batch-invariant.
-        main_stream = torch.cuda.current_stream()
-        # x is not record_stream'ed: each consumer joins stats_stream on the main
-        # stream before x is freed, so x's block is reusable right at its free.
-        side = (
-            torch.cuda.stream(stats_stream)
-            if stats_stream is not None
-            else nullcontext()
-        )
-        with side:
-            splits_usable = (
-                x_flat.shape[0] >= 128
-                and x_flat.is_contiguous()
-                and get_platform().is_sm100
-                and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
-                and not is_batch_invariant_mode_enabled()
+        parts, bf16_parts = hc.tf32_parts, hc.bf16_parts
+
+    use_bf16_projection = bf16_parts is not None and (
+        hopper_medium or 4096 <= x_flat.shape[0] <= 65536
+    )
+    hopper_fused_stats = get_platform().is_sm90 and (
+        x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
+    )
+    # gfx950 uses the fused Triton port at every row count (MI350X).
+    use_fused_stats = _is_gfx95_supported or (
+        torch.version.cuda is not None
+        and (get_platform().is_blackwell or hopper_fused_stats)
+    )
+    if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
+        # The default split-K/Sinkhorn fusion preserves batch invariance;
+        # compensated projections above are disabled in batch-invariant mode.
+        if use_bf16_projection:
+            from sglang.kernels.ops.layernorm.mhc import (
+                hc_mix_stats_sinkhorn_bf16x3,
             )
-            bf16_parts = hc.bf16_parts if splits_usable else None
-            tf32_parts = hc.tf32_parts if splits_usable else None
-            if bf16_parts is not None and 4096 <= x_flat.shape[0] <= 65536:
-                from sglang.kernels.ops.layernorm.mhc import (
-                    hc_mix_stats_sinkhorn_bf16x3,
-                )
 
-                triplet = hc_mix_stats_sinkhorn_bf16x3(
-                    x_flat,
-                    bf16_parts,
-                    hc.scale,
-                    hc.base,
-                    cfg.sinkhorn_iters,
-                    cfg.rms_eps,
-                    cfg.eps,
-                )
-            elif tf32_parts is not None:
-                from sglang.kernels.ops.layernorm.mhc import (
-                    hc_mix_stats_sinkhorn_deepgemm,
-                )
+            pre, post, comb = hc_mix_stats_sinkhorn_bf16x3(
+                x_flat,
+                bf16_parts,
+                hc.scale,
+                hc.base,
+                cfg.sinkhorn_iters,
+                cfg.rms_eps,
+                cfg.eps,
+            )
+        elif parts is not None:
+            from sglang.kernels.ops.layernorm.mhc import (
+                hc_mix_stats_sinkhorn_deepgemm,
+            )
 
-                triplet = hc_mix_stats_sinkhorn_deepgemm(
-                    x_flat,
-                    tf32_parts,
-                    hc.scale,
-                    hc.base,
-                    cfg.sinkhorn_iters,
-                    cfg.rms_eps,
-                    cfg.eps,
-                )
-            else:
-                triplet = hc_mix_stats_sinkhorn(
-                    x_flat,
-                    hc.fn,
-                    hc.scale,
-                    hc.base,
-                    cfg.mult,
-                    cfg.sinkhorn_iters,
-                    cfg.rms_eps,
-                    cfg.eps,
-                )
-        if stats_stream is not None:
-            # Allocated on the side stream, read on the main stream after the join.
-            for coefficient in triplet:
-                coefficient.record_stream(main_stream)
-        return triplet
-
+            pre, post, comb = hc_mix_stats_sinkhorn_deepgemm(
+                x_flat,
+                parts,
+                hc.scale,
+                hc.base,
+                cfg.sinkhorn_iters,
+                cfg.rms_eps,
+                cfg.eps,
+            )
+        else:
+            pre, post, comb = hc_mix_stats_sinkhorn(
+                x_flat,
+                hc.fn,
+                hc.scale,
+                hc.base,
+                cfg.mult,
+                cfg.sinkhorn_iters,
+                cfg.rms_eps,
+                cfg.eps,
+            )
+        return pre, post, comb
     if x.is_cuda and torch.version.cuda is not None:
-        # cuBLAS/torch reductions can change order with num_tokens; this kernel keeps
-        # the mixing and RMS reductions batch-invariant.
+        # cuBLAS/torch reductions can change order with num_tokens; this kernel
+        # keeps the mixing and RMS reductions batch-invariant.
         mixes = hc_mix_stats(x_flat, hc.fn, cfg.rms_eps).unsqueeze(1)
     else:
         x_flat = x_flat.float()
         rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + cfg.rms_eps)
         mixes = (F.linear(x_flat, hc.fn) * rsqrt).unsqueeze(1)
-    pre, post_mix, comb = hc_split_sinkhorn(
-        mixes, hc.scale, hc.base, cfg.mult, cfg.sinkhorn_iters, cfg.eps
+    pre, post, comb = hc_split_sinkhorn(
+        mixes,
+        hc.scale,
+        hc.base,
+        cfg.mult,
+        cfg.sinkhorn_iters,
+        cfg.eps,
     )
-    return pre.squeeze(1), post_mix.squeeze(1), comb.squeeze(1)
+    return pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
 
 
 # ---------------------------------------------------------------------------
@@ -346,8 +361,19 @@ def combine(
             return shortcut.rows
         if apply_pre is None:
             return norm(x[:, 0, :].contiguous())
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        hopper_fused = (
+            get_platform().is_sm90
+            and not quantize
+            and (0 < x.shape[0] <= 96 or 4096 <= x.shape[0] <= 65536)
+            and not is_batch_invariant_mode_enabled()
+        )
         if (
-            get_platform().is_blackwell
+            x.is_cuda
+            and (get_platform().is_blackwell or hopper_fused)
+            and x.dtype == torch.bfloat16
+            and apply_pre.stride(1) == 1
             and cfg.mult == 4
             and cfg.hidden == 5120
             and norm.weight.dtype == torch.bfloat16
