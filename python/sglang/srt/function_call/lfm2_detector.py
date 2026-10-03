@@ -785,78 +785,54 @@ class Lfm2Detector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        """
-        Streaming incremental parsing for LFM2 tool calls.
-
-        This implementation properly handles Pythonic format by:
-        1. Buffering until we see complete <|tool_call_start|>[...]<|tool_call_end|>
-        2. Emitting normal text before tool calls immediately
-        3. Parsing complete tool call blocks using detect_and_parse
-
-        Based on PythonicDetector streaming logic.
-        """
+        """Consume all complete blocks, buffering only incomplete input."""
         self._buffer += new_text
+        normal_text = []
+        calls = []
 
-        # Check for partial bot_token at the end
-        partial_bot = self._ends_with_partial_token(self._buffer, self.bot_token)
-        partial_eot = self._ends_with_partial_token(self._buffer, self.eot_token)
+        while self._buffer:
+            bot_pos = self._buffer.find(self.bot_token)
+            if bot_pos == -1:
+                partial_bot = self._ends_with_partial_token(
+                    self._buffer, self.bot_token
+                )
+                if partial_bot:
+                    normal_text.append(
+                        self._strip_special_tokens(self._buffer[:-partial_bot])
+                    )
+                    self._buffer = self._buffer[-partial_bot:]
+                else:
+                    normal_text.append(self._strip_special_tokens(self._buffer))
+                    self._buffer = ""
+                break
 
-        # Find bot_token position
-        bot_pos = self._buffer.find(self.bot_token)
+            normal_text.append(self._buffer[:bot_pos])
+            self._buffer = self._buffer[bot_pos:]
+            eot_pos = self._buffer.find(self.eot_token, len(self.bot_token))
+            if eot_pos == -1:
+                break
 
-        if bot_pos == -1:
-            # No tool call start found
-            if partial_bot:
-                # Might be partial bot_token, hold back that part
-                safe_text = self._buffer[:-partial_bot]
-                self._buffer = self._buffer[-partial_bot:]
-                return StreamingParseResult(normal_text=safe_text)
-            else:
-                # No tool call, emit all as normal text
-                normal_text = self._strip_special_tokens(self._buffer)
-                self._buffer = ""
-                return StreamingParseResult(normal_text=normal_text)
+            parsed_calls = self._parse_tool_calls_content(
+                self._buffer[len(self.bot_token) : eot_pos], tools
+            )
+            for call in parsed_calls:
+                # A tool may be called repeatedly, including in separate blocks.
+                self.current_tool_id += 1
+                call.tool_index = self.current_tool_id
+                calls.append(call)
+            self._buffer = self._buffer[eot_pos + len(self.eot_token) :]
 
-        # We have bot_token - extract any normal text before it
-        normal_text_before = self._buffer[:bot_pos] if bot_pos > 0 else ""
+        return StreamingParseResult(normal_text="".join(normal_text), calls=calls)
 
-        # Look for the end token
-        eot_pos = self._buffer.find(self.eot_token, bot_pos + len(self.bot_token))
-
-        if eot_pos == -1:
-            # No end token yet - check if we might have a partial one
-            if partial_eot:
-                # Hold back the partial token, but we need to keep buffering
-                # Just emit any normal text before the tool call
-                if normal_text_before:
-                    self._buffer = self._buffer[bot_pos:]
-                    return StreamingParseResult(normal_text=normal_text_before)
-                # Keep buffering
-                return StreamingParseResult(normal_text="")
-
-            # No end token and no partial - keep buffering but emit normal text
-            if normal_text_before:
-                self._buffer = self._buffer[bot_pos:]
-                return StreamingParseResult(normal_text=normal_text_before)
-
-            # Just keep buffering
-            return StreamingParseResult(normal_text="")
-
-        # We have a complete tool call block
-        tool_call_block = self._buffer[bot_pos : eot_pos + len(self.eot_token)]
-        remaining = self._buffer[eot_pos + len(self.eot_token) :]
-
-        # Parse the complete block
-        result = self.detect_and_parse(tool_call_block, tools)
-
-        # Update buffer with remaining text
-        self._buffer = remaining
-
-        # Add any normal text before the tool call
-        if normal_text_before:
-            result.normal_text = normal_text_before + (result.normal_text or "")
-
-        return result
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release a held text prefix, but never complete a truncated call."""
+        normal_text = (
+            ""
+            if self._buffer.startswith(self.bot_token)
+            else self._strip_special_tokens(self._buffer)
+        )
+        self._buffer = ""
+        return StreamingParseResult(normal_text=normal_text)
 
     def supports_structural_tag(self) -> bool:
         """
