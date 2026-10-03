@@ -588,6 +588,23 @@ Store: WRITTEN -> SAMPLE_READY -> LEASED/RETAINED -> GC_ELIGIBLE -> REMOVED
 这不保证 `sample_ratio=1` 能采集所有请求：写入速度、池容量和服务负载仍决定
 实际采集率。分布式 cohort 的集体准入循环独立运行，性能结论需分别测量。
 
+TP/PP cohort 的每个 rank 在后台持续观测本地 Host 占用、writer 阻塞和
+adaptive cooldown，再通过现有控制组投票取最低采样比例。最后一个 PP stage
+的 publisher 阻塞时，入口 rank 即使已写完自己的 KV 分片，也必须暂停新请求
+采集和新 Catalog 配额申请。恢复同样不依赖新请求；不能把全组最低比例作为
+本地压力反馈，否则全组降到零后可能无法恢复。已发出的 ticket 在 adaptive
+暂停期间仍可绑定；在途采集、续租和传输完成回收继续进行。
+内部 cohort 控制协议升至 v5，在现有 int64 状态帧中携带精确 binary64
+采样概率；非法、非有限或高于配置上限的值进入全组失败投票。所有 rank
+必须运行相同协议版本，snapshot manifest 格式不变。
+观测接口增加 `local_effective_ratio` 与 `cohort_effective_ratio`，
+`effective_ratio` 和对应 Prometheus 指标反映全组门控后的实际准入概率。
+TP2、PP2 和 TP2/PP2 的真实 Store 可控 manifest 阻塞验证已通过：33 个请求中
+24 个在发布阻塞期间正常完成，解除阻塞后无需新流量即可恢复采样，服务退出后
+读回 9 份完整快照。另有 284 项单元测试和 AR/DSpark P/D 控制回归通过。
+这不代表饱和 RDMA 吞吐或生产 SLO 验收；复现与证据见
+[分布式背压验证](experiments/COHORT_BACKPRESSURE.md)。
+
 网络错误或 CUDA 错误后，只有确认传输停止才可回收注册 buffer。不能仅因 Future 抛错就假设 DMA/RDMA 不再访问内存；需要 transport completion 或 quarantine 队列。
 
 紧凑 teacher 回传可通过 `teacher_d2h_batch_tokens` 单独启用批量 D2H，

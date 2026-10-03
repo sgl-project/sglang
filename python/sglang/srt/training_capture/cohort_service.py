@@ -11,10 +11,13 @@ from typing import ClassVar, Literal
 import msgspec
 import torch
 from sglang.srt.training_capture.cohort import (
+    ADMISSION_RATIO_COLUMN,
     STATE_COLUMNS,
     CaptureCohort,
     CaptureCohortAllocator,
     CaptureCohortError,
+    decode_admission_ratio,
+    encode_admission_ratio,
 )
 from sglang.srt.training_capture.cohort_exchange import (
     agree_receipts,
@@ -105,6 +108,8 @@ class CaptureCohortService:
         self.records: dict[str, CaptureHandle] = {}
         self.stopping = False
         self.admission_ready = True
+        self.local_admission_ratio = allocator.config.sample_ratio
+        self.agreed_admission_ratio = 0.0
         self.error: Exception | None = None
         self.thread: threading.Thread | None = None
         self.activation: threading.Event | None = None
@@ -133,6 +138,8 @@ class CaptureCohortService:
                 or self.stopping
                 or self.error is not None
                 or not self.admission_ready
+                or self.local_admission_ratio == 0
+                or self.agreed_admission_ratio == 0
             ):
                 return None
             now = time.monotonic()
@@ -155,13 +162,23 @@ class CaptureCohortService:
                     return ticket
         return None
 
-    def set_admission_ready(self, ready: bool):
+    def set_admission_ready(self, ready: bool, *, sample_ratio=None):
         """Pause new tickets until every rank's writer/supervisor is ready."""
         if type(ready) is not bool:
             raise ContractError("admission readiness must be boolean")
+        if sample_ratio is not None:
+            encode_admission_ratio(sample_ratio, self.allocator.config.sample_ratio)
         with self.lock:
             self.admission_ready = ready
+            if sample_ratio is not None:
+                self.local_admission_ratio = sample_ratio
             self.wake.set()
+
+    def sampling_ratio(self):
+        with self.lock:
+            if not self.admission_ready or self.stopping or self.error is not None:
+                return 0.0
+            return min(self.local_admission_ratio, self.agreed_admission_ratio)
 
     def bind(self, ticket: CaptureTicket, request_sha256: str) -> CaptureHandle | None:
         ticket = msgspec.convert(msgspec.to_builtins(ticket), type=CaptureTicket)
@@ -367,6 +384,9 @@ class CaptureCohortService:
             self.frame.zero_()
             self.frame[0, 0] = int(self.stopping)
             self.frame[0, 1] = int(self.admission_ready)
+            self.frame[0, ADMISSION_RATIO_COLUMN] = encode_admission_ratio(
+                self.local_admission_ratio, self.allocator.config.sample_ratio
+            )
             ledger = []
             for index, handle in enumerate(self.records.values(), start=1):
                 cohort = handle.cohort
@@ -428,10 +448,21 @@ class CaptureCohortService:
 
     def _cycle(self):
         frames = self.allocator.synchronize(self._build_frame)
+        agreed_ratio = (
+            min(
+                decode_admission_ratio(
+                    frame[0][ADMISSION_RATIO_COLUMN], self.allocator.config.sample_ratio
+                )
+                for frame in frames
+            )
+            if all(frame[0][1] and not frame[0][0] for frame in frames)
+            else 0.0
+        )
         # Only the background thread inserts/removes records. Foreground calls
         # can bind during the exchange, so retirement needs a prior invalid vote
         # from EVERY rank or a completed, bound owner on the success path.
         with self.lock:
+            self.agreed_admission_ratio = agreed_ratio
             handles = list(self.records.values())
             self.stopping |= any(frame[0][0] for frame in frames)
             for index, handle in enumerate(handles, start=1):
@@ -459,7 +490,7 @@ class CaptureCohortService:
                     handle.ticket is None
                     and handle.invalid_reason is None
                     and not self.stopping
-                    and all(frame[0][1] for frame in frames)
+                    and agreed_ratio > 0
                 )
 
         for index, handle in enumerate(handles, start=1):
@@ -515,8 +546,7 @@ class CaptureCohortService:
         # Admission/stop changes during the exchange are applied on the NEXT
         # exchange. Every rank must choose reserve using the same voted state.
         if (
-            not any(frame[0][0] for frame in frames)
-            and all(frame[0][1] for frame in frames)
+            agreed_ratio > 0
             and len(self.records) < self.allocator.config.max_inflight_samples
         ):
             cohort = self.allocator.reserve()

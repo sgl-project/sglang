@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import struct
 import threading
 import time
 import uuid
@@ -20,9 +21,10 @@ from sglang.srt.training_capture.protocol import (
     digest_bytes,
 )
 
-_VERSION = 4
+_VERSION = 5
 _LEASE_BYTES = 4096
 STATE_COLUMNS = 14
+ADMISSION_RATIO_COLUMN = 6
 _PHASES = (
     "policy",
     "slots",
@@ -61,6 +63,23 @@ def _digest_words(payload):
         int.from_bytes(digest[offset : offset + 8], "little", signed=True)
         for offset in range(0, 32, 8)
     )
+
+
+def encode_admission_ratio(ratio, ceiling):
+    if (
+        type(ratio) not in (int, float)
+        or not math.isfinite(ratio)
+        or not 0 <= ratio <= ceiling
+    ):
+        raise ContractError("invalid cohort admission ratio")
+    # Preserve tiny sampling probabilities in the existing int64 control frame.
+    return struct.unpack("!q", struct.pack("!d", ratio))[0]
+
+
+def decode_admission_ratio(word, ceiling):
+    ratio = struct.unpack("!d", struct.pack("!q", word))[0]
+    encode_admission_ratio(ratio, ceiling)
+    return ratio
 
 
 class CaptureCohortError(ContractError):
@@ -415,6 +434,10 @@ class CaptureCohortAllocator:
             error, values = None, None
             try:
                 values = [output.tolist() for output in outputs]
+                for rows in values:
+                    decode_admission_ratio(
+                        rows[0][ADMISSION_RATIO_COLUMN], self.config.sample_ratio
+                    )
                 if any(
                     value not in (0, 1)
                     for rows in values

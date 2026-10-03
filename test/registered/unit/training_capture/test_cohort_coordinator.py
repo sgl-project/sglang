@@ -10,10 +10,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch.distributed as dist
+from sglang.srt.training_capture.admission import CaptureAdmission
 from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
 from sglang.srt.training_capture.cohort import CaptureCohortAllocator
 from sglang.srt.training_capture.cohort_coordinator import CohortCaptureCoordinator
-from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
+from sglang.srt.training_capture.config import (
+    AdaptiveCaptureConfig,
+    CaptureConfig,
+    StoreSetup,
+)
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.protocol import ContractError
 from sglang.srt.training_capture.resources import CaptureResources
@@ -138,6 +143,38 @@ class TestCohortCaptureCoordinator(CustomTestCase):
         )
         self.assertEqual(coordinator.records, {})
         self.assertFalse(self.catalog.publications)
+
+    def test_background_pressure_pauses_and_recovers_without_requests(self):
+        coordinator = self.coordinator
+        coordinator.admission = CaptureAdmission(
+            1.0,
+            AdaptiveCaptureConfig(
+                interval_seconds=0.02,
+                writer_stall_seconds=0.02,
+                cooldown_seconds=0.05,
+            ),
+        )
+        pressure = [0.0, 1.0]
+        with patch.object(
+            coordinator, "_pressure", side_effect=lambda now: tuple(pressure)
+        ):
+            self.wait_until(
+                lambda: (
+                    coordinator.stats()["admission"]["effective_ratio"] == 0
+                    and coordinator.stats()["states"]["available"] == 0
+                )
+            )
+            self.assertIsNone(coordinator.service.claim("cd" * 32))
+            self.assertIsNone(coordinator.disabled_reason)
+            pressure[1] = 0.0
+            self.wait_until(
+                lambda: (
+                    coordinator.stats()["admission"]["effective_ratio"] == 1
+                    and coordinator.stats()["states"]["available"] == 1
+                )
+            )
+        self.assertGreater(coordinator.admission.pauses, 0)
+        self.assertGreater(coordinator.admission.recoveries, 0)
 
     def test_pause_preserves_issued_ticket_but_stops_new_claims(self):
         coordinator = self.coordinator

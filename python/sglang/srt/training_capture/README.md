@@ -285,11 +285,30 @@ cannot release an uncertain transfer or reuse a quarantined slot. Existing hard
 Host limits, unsupported-request exclusions and permanent disable reasons still
 apply.
 
+For TP/PP cohorts, every rank observes its own pressure in the background, even
+when it receives no new capture request. The existing control exchange votes
+the minimum rank-local probability and writer readiness. A stalled publisher on
+the final PP stage therefore pauses ingress admission and new Catalog
+reservations across the cohort. Pressure recovery also runs without requests;
+the agreed probability is never fed back as a local pressure measurement.
+Previously issued tickets remain bindable during an adaptive pause. Lease
+renewals, publication and transfer completion continue independently.
+
+The internal cohort control protocol is version 5; all ranks must run matching
+code. This adds a validated binary64 probability to the existing int64 state
+frame and does not change the snapshot manifest schema. Invalid, nonfinite or
+above-ceiling peer probabilities fail the voted control phase before ranks
+choose a collective action.
+
 `training_capture.admission` exposes configured/target/effective ratios, the last
 control reason, cooldown remaining, observed occupancy/writer age, and decrease,
 recovery, failure and pause counters. `adaptive_sampled_out` counts requests that
-fixed sampling would have selected but the controller excluded. Without the
-optional latency configuration below, these are local pressure signals only.
+fixed sampling would have selected but the controller excluded. Cohorts also
+expose `local_effective_ratio` and `cohort_effective_ratio`; `effective_ratio`
+and its Prometheus gauge include the cohort gate. The reason and target fields
+remain local, so another rank can pause admission while the local writer is
+healthy. Without the optional latency configuration below, admission uses
+Host/writer pressure rather than scheduler latency.
 
 ### Scheduler Latency Protection
 

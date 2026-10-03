@@ -179,6 +179,15 @@ class CohortCaptureCoordinator(CaptureCoordinator):
             states["pending_publication"] += writer["states"].get("recovering", 0)
             counters = dict(self.counters)
             counters["ready"] = writer["counters"].get("published", 0)
+            admission = self.admission.stats(
+                time.monotonic(),
+                disabled=self.disabled_reason is not None or self.admission_paused,
+            )
+            admission["local_effective_ratio"] = admission["effective_ratio"]
+            admission["cohort_effective_ratio"] = self.service.sampling_ratio()
+            admission["effective_ratio"] = min(
+                admission["local_effective_ratio"], admission["cohort_effective_ratio"]
+            )
             return {
                 "counters": counters,
                 "disabled_reason": self.disabled_reason,
@@ -191,15 +200,12 @@ class CohortCaptureCoordinator(CaptureCoordinator):
                 "writer_age_seconds": age,
                 "stage_timings": writer["stage_timings"],
                 "host_pool": self._host_stats(),
-                "admission": self.admission.stats(
-                    time.monotonic(),
-                    disabled=self.disabled_reason is not None or self.admission_paused,
-                ),
+                "admission": admission,
                 "cohort_writer": writer,
                 "request_router": dict(self.request_router.counters),
             }
 
-    def _admission_ratio(self):
+    def _local_admission_ratio(self):
         writer = self.writer_actor.stats(include_timings=False)
         if (
             self.disabled_reason
@@ -209,6 +215,9 @@ class CohortCaptureCoordinator(CaptureCoordinator):
         ):
             return 0.0
         return super()._admission_ratio()
+
+    def _admission_ratio(self):
+        return min(self._local_admission_ratio(), self.service.sampling_ratio())
 
     def _admit(self, req):
         req.training_capture_attempted = True
@@ -374,7 +383,8 @@ class CohortCaptureCoordinator(CaptureCoordinator):
                             and not writer["error"]
                             and not writer["stopping"]
                             and not writer["states"].get("recovering", 0)
-                        )
+                        ),
+                        sample_ratio=self._local_admission_ratio(),
                     )
                 try:
                     record = self.work.get(timeout=0.05)

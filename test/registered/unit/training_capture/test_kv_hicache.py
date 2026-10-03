@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import msgspec
@@ -207,8 +208,9 @@ class TestHiCacheKVExport(CustomTestCase):
                 (slot.tensors, -1, 1),
                 (slot.tensors, 0, 1),
             ):
-                with self.subTest(start=start, end=end), self.assertRaises(
-                    ContractError
+                with (
+                    self.subTest(start=start, end=end),
+                    self.assertRaises(ContractError),
                 ):
                     slot.kv_exporter.export(indices, mapping, start, end)
             tiny = make_kv_spec()
@@ -234,9 +236,10 @@ class TestHiCacheKVExport(CustomTestCase):
         )
         metadata = slot.device_storage
         try:
-            with patch(
-                "torch.cuda.Event", side_effect=RuntimeError("fence failed")
-            ), self.assertRaisesRegex(RuntimeError, "fence failed"):
+            with (
+                patch("torch.cuda.Event", side_effect=RuntimeError("fence failed")),
+                self.assertRaisesRegex(RuntimeError, "fence failed"),
+            ):
                 context.export_kv(
                     exporter, torch.tensor([0], device="cuda", dtype=torch.int32), end=1
                 )
@@ -262,6 +265,7 @@ torch.cuda.synchronize()
 """
             result = subprocess.run(
                 [sys.executable, "-c", script],
+                cwd=Path(__file__).resolve().parent,
                 check=False,
                 capture_output=True,
                 text=True,

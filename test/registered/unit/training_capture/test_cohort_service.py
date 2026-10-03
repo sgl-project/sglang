@@ -2,6 +2,7 @@
 
 import json
 import multiprocessing as mp
+import struct
 import tempfile
 import threading
 import time
@@ -15,7 +16,10 @@ import msgspec
 import torch
 import torch.distributed as dist
 from sglang.srt.training_capture.catalog import CatalogUnavailable, HTTPCaptureCatalog
-from sglang.srt.training_capture.cohort import CaptureCohortAllocator
+from sglang.srt.training_capture.cohort import (
+    ADMISSION_RATIO_COLUMN,
+    CaptureCohortAllocator,
+)
 from sglang.srt.training_capture.cohort_service import CaptureCohortService
 from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
 from sglang.srt.training_capture.host_pool import HostBufferPool
@@ -97,7 +101,7 @@ def prepare(rank, root, endpoint, case):
             local_hostname=f"rank-{rank}", master_server_addr="localhost:1"
         ),
         max_sample_tokens=8,
-        max_inflight_samples=2 if case == "multiple" else 1,
+        max_inflight_samples=2 if case in ("multiple", "sampling_pressure") else 1,
         max_host_bytes=4 << 20,
     )
     resources = CaptureResources()
@@ -210,7 +214,39 @@ def run_case(rank, root, endpoint, case):
     assert service.claim("cd" * 32) is None
     result = {"case": case, "capture_id": ticket.capture_id}
 
-    if case in ("operator_abort_unbound", "operator_abort_mixed"):
+    if case == "sampling_pressure":
+        ceiling = service.allocator.config.sample_ratio
+        if rank == 2:
+            service.set_admission_ready(True, sample_ratio=ceiling / 4)
+        assert not service._cycle()
+        assert service.sampling_ratio() == ceiling / 4
+        assert sum(h.available for h in service.records.values()) == 1
+        if rank == 2:
+            service.set_admission_ready(True, sample_ratio=0.0)
+        assert not service._cycle()
+        assert service.sampling_ratio() == 0
+        assert service.claim("cd" * 32) is None
+        assert not any(h.available for h in service.records.values())
+        assert service.status(handle)[1] is None
+        assert len(service.records) == 2
+        if rank == 2:
+            service.set_admission_ready(True, sample_ratio=ceiling / 2)
+        assert not service._cycle()
+        assert service.sampling_ratio() == ceiling / 2
+        second_ticket = claim(service, rank)
+        if rank == 3:
+            service.set_admission_ready(True, sample_ratio=0.0)
+        assert not service._cycle()
+        assert service.sampling_ratio() == 0
+        second = service.bind(second_ticket, _FINGERPRINT)
+        assert second is not None, "issued tickets survive a pressure pause"
+        finish_failed(service, handle)
+        finish_failed(service, second)
+        service.stopping = True
+        assert service._cycle()
+        assert service.close(timeout=0)
+        result["captures"] = [ticket.capture_id, second_ticket.capture_id]
+    elif case in ("operator_abort_unbound", "operator_abort_mixed"):
         if rank == 0:
             service.set_admission_ready(False)
             service.cancel_unbound("operator_aborted")
@@ -277,7 +313,15 @@ def run_case(rank, root, endpoint, case):
         assert service.close(timeout=15)
         assert service.error is None
         result["inference_sum"] = inference.item()
-    elif case in ("control_failure", "frame_shape", "ledger_mismatch", "state_flag"):
+    elif case in (
+        "control_failure",
+        "frame_shape",
+        "ledger_mismatch",
+        "state_flag",
+        "ratio_nan",
+        "ratio_negative",
+        "ratio_above_limit",
+    ):
         build = service._build_frame
 
         def corrupt_frame():
@@ -291,6 +335,15 @@ def run_case(rank, root, endpoint, case):
                     ledger = []
                 elif case == "state_flag":
                     frame[1, 0] = 7
+                elif case.startswith("ratio_"):
+                    value = {
+                        "ratio_nan": float("nan"),
+                        "ratio_negative": -0.1,
+                        "ratio_above_limit": service.allocator.config.sample_ratio * 2,
+                    }[case]
+                    frame[0, ADMISSION_RATIO_COLUMN] = struct.unpack(
+                        "!q", struct.pack("!d", value)
+                    )[0]
             return ledger, frame, outputs
 
         with patch.object(service, "_build_frame", corrupt_frame):
@@ -440,9 +493,13 @@ def lifecycle_worker(rank, root, endpoint):
         "frame_shape",
         "ledger_mismatch",
         "state_flag",
+        "ratio_nan",
+        "ratio_negative",
+        "ratio_above_limit",
         "fail_uncertain",
         "inactive_leader",
         "multiple",
+        "sampling_pressure",
         "empty_stop",
         "background",
     )
@@ -499,14 +556,14 @@ class TestCaptureCohortService(CustomTestCase):
                     self.assertTrue(all(row["begins"] == 0 for row in rows))
                     continue
                 aux = 3 if case == "inactive_leader" else 1
+                capture_count = (
+                    3 if case == "multiple" else 2 if case == "sampling_pressure" else 1
+                )
                 self.assertEqual(len({row["capture_id"] for row in rows}), 1)
                 record = catalog.captures[rows[0]["capture_id"]]
                 self.assertEqual(
                     [row["begins"] for row in rows],
-                    [
-                        (3 if case == "multiple" else 1) * int(rank == aux)
-                        for rank in range(4)
-                    ],
+                    [capture_count * int(rank == aux) for rank in range(4)],
                 )
                 self.assertTrue(all(row["filling"] == 0 for row in rows))
                 failed_control = case in (
@@ -514,6 +571,9 @@ class TestCaptureCohortService(CustomTestCase):
                     "frame_shape",
                     "ledger_mismatch",
                     "state_flag",
+                    "ratio_nan",
+                    "ratio_negative",
+                    "ratio_above_limit",
                 )
                 self.assertEqual(
                     [row["quarantined"] for row in rows],
@@ -526,7 +586,7 @@ class TestCaptureCohortService(CustomTestCase):
                     else "FAILED"
                 )
                 self.assertEqual(record["state"], expected_state)
-                if case == "multiple":
+                if case in ("multiple", "sampling_pressure"):
                     self.assertTrue(
                         all(row["captures"] == rows[0]["captures"] for row in rows)
                     )
@@ -538,7 +598,7 @@ class TestCaptureCohortService(CustomTestCase):
                     )
                 self.assertEqual(
                     sum(row["fails"] for row in rows),
-                    (3 if case == "multiple" else 1)
+                    capture_count
                     * int(
                         not failed_control
                         and case not in ("published", "inactive_draining")

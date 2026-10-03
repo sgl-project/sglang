@@ -33,6 +33,7 @@ it does not redefine the goal as the modules already implemented.
 | Mooncake adapter | Required hard pin, registered raw buffers, optional native payload batching, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including complete reads after producer exit; native batching passes TCP correctness and fault tests without a measured serving speedup; batch RDMA and production retention remain open |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Independent writers and real TP2/PP1, TP1/PP2 and TP2/PP2 serving/P/D tests publish complete snapshots through TCP Store; production retention and saturated load remain open |
+| Cohort adaptive admission | Background rank-local pressure observations and minimum-probability voting | Peer publisher stalls pause new tickets and reservations while existing ownership drains; see distributed backpressure evidence below; saturated transport and production SLOs remain open |
 | Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact source-reuse checks and distributed serving publication pass; real Qwen2.5 TP4 P/D checks canonical owners 0/2 and zero payload allocation on replica ranks 1/3; broader replicas/topologies remain open |
 | Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture, real Qwen3 TP2/PP1, TP1/PP2 and TP2/PP2, and Qwen2.5-1.5B TP4 binding pass; broader deployed models remain open |
 | Startup identity exchange | Bounded JSON over the existing CPU group, phase failure votes and final digest agreement | Four-process Gloo failure/finite-wait tests and real distributed identity, resource readiness and activation pass; broader deployment combinations remain open |
@@ -4405,6 +4406,63 @@ transfer/Store and the HTTP test Catalog. PP is synchronous and prefill graphs
 are disabled. Source observers and forced response tokens establish preservation,
 not production SLOs or model quality. Asymmetric/cross-node pressure, saturated
 backpressure, production retention and trained checkpoint acceptance remain open.
+
+## Cohort Adaptive Backpressure (2026-10-03)
+
+The production coordinator now observes adaptive pressure on every rank in its
+background handoff loop. Previously, the ingress request router observed only
+its own writer, so a final PP-stage publisher could stall after the other owners
+had finished and still leave ingress at full sampling probability. The retained
+pre-fix regression fails with writer age one second and an available capture
+ticket, despite a 20 ms stall threshold. Recovery also previously depended on
+new requests or optional latency callbacks.
+
+The existing control exchange now validates and votes the minimum local
+probability together with writer readiness. New claims, spare-ticket availability
+and Catalog reservations honor that vote; issued tickets remain bindable during
+adaptive pauses. Local recovery continues without requests and never uses the
+agreed probability as its input pressure. Existing lease renewal, in-flight
+publication and transfer-safe buffer ownership remain active. Internal cohort
+protocol v5 requires matching ranks; the snapshot schema does not change.
+The admission state exposes local and cohort effective probabilities, and the
+existing effective Prometheus gauge includes the cohort gate.
+
+All 284 training-capture unit tests pass in 230.618s. The four-process lifecycle
+suite includes fractional, zero and recovering peer votes, binding an issued
+ticket during a pause, and collective rejection of NaN, negative and
+above-ceiling ratios while preserving uncertain-transfer quarantine. The CUDA
+bounds subprocess now sets its module directory so unittest discovery works
+from the repository root.
+
+Final real-runtime backpressure tests pass TP2 and PP2 in 113.412s and combined
+TP2/PP2 in 58.975s. All three complete 33 requests, including 24 while manifest
+publication is blocked. Every non-publisher retains local probability one with
+an empty writer, while every rank's effective admission is zero. After gate
+release, all ranks recover to probability one without new traffic and the held
+capture publishes. A new client reads nine complete snapshots, 162 tensor objects
+and 2,177,784 bytes after producer exit; selected K/V, token IDs, masks,
+positions/validity and raw teacher top128/LSE match online observations.
+
+The two combined TP2/PP2 P/D graph control regressions, ordinary AR and static
+target-KV DSpark, also pass in 362.728s. They validate pause/resume/fenced abort,
+ten failed request captures and sixteen complete post-exit snapshots. PP remains
+synchronous. The initial TP metrics assertion was corrected to wait for the
+existing asynchronous one-second refresh, preserving the all-rank zero check.
+
+All 5,024 Python source and registered test files match the final frozen checkout.
+The 56-artifact archive at
+`/gpfs/user/fuxuanwei/mooncake-lab-archive/cohort-pressure-20261003` retains failed
+baseline/harness runs and passing final results; manifest SHA-256 is
+`c65c17ff0564cb7aaa45921029050ba16b1b1209c7846e1862f5bbcc44f2dc60`.
+The temporary four-H100 allocation was deleted after its worker exited. The
+resident worker and idle task are live, with both queues empty.
+
+The [runbook](experiments/COHORT_BACKPRESSURE.md) documents the controlled
+manifest-stall workload, compatibility requirements and exact test commands.
+Final runtime evidence is recorded in [the report](experiments/cohort-backpressure.json).
+This uses the real TCP Store with an HTTP test Catalog and online source
+observers; it is not saturated RDMA, serving SLO or production retention
+acceptance.
 
 ## Next Implementation
 
