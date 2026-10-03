@@ -11,7 +11,7 @@ import torch
 
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.quantization.awq import AWQConfig
+from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -23,7 +23,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_device_capability, set_weight_attrs
+from sglang.srt.utils import get_device_capability, is_ppu, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,9 @@ class MoeWNA16Config(QuantizationConfig):
                     f"Minimum capability: {awq_min_capability}. "
                     f"Current capability: {device_capability}."
                 )
+            self.use_marlin = (
+                AWQMarlinConfig.is_awq_marlin_compatible(full_config) and is_ppu()
+            )
         else:
             raise ValueError("moe_wna16 only support gptq and awq.")
 
@@ -212,6 +215,10 @@ class MoeWNA16Config(QuantizationConfig):
                         layer, prefix
                     )
             elif self.linear_quant_method == "awq":
+                if self.use_marlin:
+                    return AWQMarlinConfig.from_config(
+                        self.full_config
+                    ).get_quant_method(layer, prefix)
                 return AWQConfig.from_config(self.full_config).get_quant_method(
                     layer, prefix
                 )

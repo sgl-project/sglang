@@ -23,6 +23,8 @@
 
 #include <sgl_kernel/tensor.h>
 
+#include <sgl_kernel/runtime.cuh>
+
 #include <sgl_kernel/scalar_type.hpp>
 
 #include "kernel.h"
@@ -958,7 +960,10 @@ void gptq_marlin_gemm(
   cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
 
   int sms = -1;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+
+  // ppu 810e num of tensorcore != sms, use helper here
+  // RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  sms = host::runtime::get_num_tensor_core(dev);
 
   RuntimeCheck(
       workspace.size(0) >= sms, "workspace.size(0) = ", workspace.size(0), " is below min_workspace_size = ", sms);

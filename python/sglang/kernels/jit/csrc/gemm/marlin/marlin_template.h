@@ -241,7 +241,8 @@ __device__ inline void barrier_release(int* lock, bool reset = false) {
   __syncthreads();
   if (threadIdx.x == 0) {
     if (reset) {
-      lock[0] = 0;
+      // lock[0] = 0;
+      __stcg(&lock[0], 0);
       return;
     }
     int val = 1;
@@ -439,7 +440,9 @@ __global__ void Marlin(
       // the negative value, and then atomicAdd 1 to it.
       // After all SMs are processed, the lock value would back to 0 again.
       __syncthreads();
-      if (threadIdx.x == 0) locks[locks_off] = 1 - slice_count;
+      // ppu: use __stcg to ensure ld.global.acquire.gpu.b32 can read new value
+      // if (threadIdx.x == 0) locks[locks_off] = 1 - slice_count;
+      if (threadIdx.x == 0) __stcg(&locks[locks_off], 1 - slice_count);
     }
 
     if (slice_col == n_tiles) {

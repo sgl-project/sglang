@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     get_scalar_types,
 )
+from sglang.srt.utils import is_ppu
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
@@ -444,6 +445,13 @@ class GPTQMarlinConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
+            if layer.num_experts > 32 and is_ppu():
+                from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+
+                # For MoEs with many experts the moe_wna16 kernel is faster
+                return MoeWNA16Config.from_config(self.full_config).get_quant_method(
+                    layer, prefix
+                )
             return GPTQMarlinMoEMethod(self)
         return get_linear_quant_method(
             self, layer, prefix=prefix, linear_method_cls=GPTQMarlinLinearMethod

@@ -42,12 +42,13 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_ppu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
+_is_ppu = is_ppu()
 
 if not (_is_cuda or _is_hip or _is_xpu or _is_npu):
     warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
@@ -365,7 +366,7 @@ class AWQMarlinConfig(QuantizationConfig):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
             # Check if the layer is supported by AWQMarlin.
-            if not check_marlin_supports_layer(layer, self.group_size):
+            if not check_marlin_supports_layer(layer, self.group_size) and not _is_ppu:
                 logger.warning_once(
                     "Layer '%s' is not supported by AWQMarlin. Falling back to unoptimized AWQ kernels.",  # noqa: E501
                     prefix,
@@ -380,7 +381,10 @@ class AWQMarlinConfig(QuantizationConfig):
                 return None
             from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
-            if not check_moe_marlin_supports_layer(layer, self.group_size):
+            # For MoEs with many experts the moe_wna16 kernel is faster
+            if not check_moe_marlin_supports_layer(layer, self.group_size) or (
+                is_ppu() and layer.num_experts > 32
+            ):
                 logger.warning_once(
                     f"Layer '{prefix}' is not supported by AWQMoeMarlin. "
                     "Falling back to Moe WNA16 kernels."

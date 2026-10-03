@@ -51,6 +51,7 @@ else:
     )
     from sgl_kernel.gemm import (
         fp8_scaled_mm,
+        gptq_dequantize,
         int8_scaled_mm,
         sgl_per_token_group_quant_8bit,
         sgl_per_token_group_quant_fp8,

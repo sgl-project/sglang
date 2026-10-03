@@ -20,6 +20,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import tqdm
+from sgl_kernel import gptq_dequantize
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -62,7 +63,7 @@ from sglang.srt.models.deepseek_common.utils import (
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
-from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
+from sglang.srt.utils import bind_or_assign, get_bool_env_var, is_ppu, log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
@@ -413,6 +414,10 @@ class DeepseekV2WeightLoaderMixin:
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
+                            # Skip loading g_idx for GPTQ models.
+                            if name.endswith(".g_idx"):
+                                continue
+
                             cached_a_proj[name] = _clone_if_runai_streamed_tensor(
                                 loaded_weight
                             )
@@ -445,6 +450,8 @@ class DeepseekV2WeightLoaderMixin:
                                         self.quant_config.get_name() == "awq"
                                         or self.quant_config.get_name() == "awq_marlin"
                                         or self.quant_config.get_name() == "moe_wna16"
+                                        or self.quant_config.get_name() == "gptq"
+                                        or self.quant_config.get_name() == "gptq_marlin"
                                     ):
                                         cat_dim = 1
 
@@ -586,17 +593,36 @@ class DeepseekV2WeightLoaderMixin:
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
-                awq_dequantize_f = awq_dequantize_func()
-                if awq_dequantize_f is not None:
-                    w = awq_dequantize_f(
+                if is_ppu() and (
+                    self.quant_config.get_name()
+                    in [
+                        "gptq",
+                        "gptq_marlin",
+                    ]
+                    or (
+                        self.quant_config.get_name() == "moe_wna16"
+                        and self.quant_config.linear_quant_method == "gptq"
+                    )
+                ):
+                    w = None
+                    w = gptq_dequantize(
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,
                         self_attn.kv_b_proj.qzeros,
                     ).T
+                    assert w is not None
                 else:
-                    raise ValueError(
-                        "AWQ dequantize function is not supported for the current device"
-                    )
+                    awq_dequantize_f = awq_dequantize_func()
+                    if awq_dequantize_f is not None:
+                        w = awq_dequantize_f(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                        ).T
+                    else:
+                        raise ValueError(
+                            "AWQ dequantize function is not supported for the current device"
+                        )
             else:
                 w = self_attn.kv_b_proj.weight
 
