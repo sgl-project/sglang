@@ -4,10 +4,21 @@ Checks: the registry resolves the explicit FlashInfer backend for the one-shot
 entry, the prepared runner and the weight preparation; the facade results are
 bitwise identical to calling FlashInfer directly (and the prepared runner is
 bitwise identical to the one-shot form across a CUDA-graph replay); and the
-tower output matches the pure-torch FP32 HF chain (patch embed + positional
-rows, per-layer RMSNorm / QKV / 2-D RoPE / segment attention / out-proj /
-GELU-tanh MLP, final RMSNorm, 2x2 temporal-pool merge, GELU merger, projector
-RMSNorm) within BF16 tolerance on a one-layer stack and the smallest grid.
+tower output passes FlashInfer's oracle-fairness gate for the complete call
+on a one-layer stack and the smallest grid.
+
+Oracle and bound (FlashInfer ``tests/experimental/test_cake_kimi_k3_vision_tower.py``
+and ``flashinfer/experimental/kimi_k3_vision_tower/README.md`` at
+``46340689a5ab``): FlashInfer checks every *stage* against the FP32 oracle of
+its operator at ``atol = rtol = 1e-2``, but validates the *complete call*
+with the oracle-fairness gate of the Cake evaluation contract -- the error
+against the pure-torch FP32 HF chain (patch embed + positional rows,
+per-layer RMSNorm / QKV / 2-D RoPE / segment attention / out-proj / GELU-tanh
+MLP, final RMSNorm, 2x2 temporal-pool merge, GELU merger, projector RMSNorm)
+must be no worse than the HF BF16 chain's: ``violations(1e-2 band) <= 1.1 x
+chain + 16``, ``mean error <= 1.05 x chain``, ``max error <= 1.5 x chain``,
+all outputs finite. A ~10-round-point BF16 chain cannot meet a flat 1e-2
+band against FP32 on every element, so the flat band is not the gate here.
 Skips when FlashInfer lacks the module, the GPU is not sm_100a / sm_103a, or
 the generated program is not registered for the arch.
 """
@@ -35,6 +46,8 @@ PATCH, PATCH_DIM, HIDDEN, QKV_HIDDEN, HEADS = 14, 588, 1024, 1536, 12
 HEAD_DIM, FFN, MERGED_DIM, TEXT_HIDDEN = 128, 4096, 4096, 7168
 NORM_EPS, PROJECTOR_EPS = 2.0**-7, 1e-5
 SOFTMAX_SCALE = 1.0 / math.sqrt(HEAD_DIM)
+# Per-operator band of the Cake evaluation contract (FlashInfer ATOL/RTOL).
+ATOL = RTOL = 1e-2
 SMALL_GRID = [(1, 2, 2)]
 MIXED_GRIDS = [(1, 2, 6), (1, 10, 4), (2, 4, 4), (1, 6, 30)]
 
@@ -139,29 +152,56 @@ def _inputs(grids, layers, seed):
     return device, weights, pixels, cos, sin, pos_rows, out, tuple(cu_seqlens_of(grids))
 
 
-# --- FP32 oracle (the HF chain with every parameter and activation in FP32) ---
+# --- FP32 oracle and the HF BF16 reference chain (FlashInfer's _tower) ---------
 
 
 def _rms_norm(x, weight, eps):
-    rstd = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-    return x * rstd * weight
+    xf = x.float()
+    rstd = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (xf * rstd * weight.float()).to(x.dtype)
 
 
-def _rope(x, cos, sin):
-    xf = x.reshape(*x.shape[:-1], HEAD_DIM // 2, 2)
-    a, b = xf[..., 0], xf[..., 1]
-    c = cos.reshape(cos.shape[0], 1, HEAD_DIM // 2)
-    s = sin.reshape(sin.shape[0], 1, HEAD_DIM // 2)
-    return torch.stack([a * c - b * s, a * s + b * c], dim=-1).reshape(x.shape)
+def _apply_rope(q, k, cos, sin):
+    def rot(x):
+        xf = x.float().reshape(*x.shape[:-1], HEAD_DIM // 2, 2)
+        a, b = xf[..., 0], xf[..., 1]
+        c = cos.reshape(cos.shape[0], 1, HEAD_DIM // 2)
+        s = sin.reshape(sin.shape[0], 1, HEAD_DIM // 2)
+        return (
+            torch.stack([a * c - b * s, a * s + b * c], dim=-1)
+            .reshape(x.shape)
+            .to(x.dtype)
+        )
+
+    return rot(q), rot(k)
 
 
-def _attention(q, k, v, cu):
+def _attention_fp32(q, k, v, cu, out_dtype):
+    """Exact FP32 noncausal segment attention."""
+    out = torch.empty(q.shape, dtype=out_dtype, device=q.device)
+    for a, b in zip(cu, cu[1:]):
+        if b <= a:
+            continue
+        logits = (
+            torch.einsum("qhd,khd->hqk", q[a:b].float(), k[a:b].float()) * SOFTMAX_SCALE
+        )
+        probs = torch.softmax(logits, dim=-1)
+        out[a:b] = torch.einsum("hqk,khd->qhd", probs, v[a:b].float()).to(out_dtype)
+    return out
+
+
+def _attention_bf16(q, k, v, cu, out_dtype=None):
+    """BF16 tensor-core attention per segment (P rounded to BF16 before PV)."""
     out = torch.empty_like(q)
     for a, b in zip(cu, cu[1:]):
         if b <= a:
             continue
-        logits = torch.einsum("qhd,khd->hqk", q[a:b], k[a:b]) * SOFTMAX_SCALE
-        out[a:b] = torch.einsum("hqk,khd->qhd", torch.softmax(logits, -1), v[a:b])
+        qs, ks, vs = (t[a:b].transpose(0, 1).unsqueeze(0) for t in (q, k, v))
+        out[a:b] = (
+            F.scaled_dot_product_attention(qs, ks, vs, scale=SOFTMAX_SCALE)
+            .squeeze(0)
+            .transpose(0, 1)
+        )
     return out
 
 
@@ -182,29 +222,48 @@ def _tpool_merge(x, grids):
     return torch.cat(outputs, dim=0)
 
 
-def _oracle(pixels, grids, weights, cos, sin, pos_rows, cu):
-    f = lambda t: t.float()  # noqa: E731
+def _tower(pixels, grids, weights, cos, sin, pos_rows, cu, *, fp32, attention):
+    """The HF chain; ``fp32=True`` keeps every parameter and activation in FP32."""
+    cast = (lambda t: t.float()) if fp32 else (lambda t: t)  # noqa: E731
     x = F.linear(
-        f(pixels).reshape(pixels.shape[0], PATCH_DIM), f(weights["patch_proj"])
-    )
-    x = x + f(pos_rows)
+        cast(pixels).reshape(pixels.shape[0], PATCH_DIM), cast(weights["patch_proj"])
+    ) + cast(pos_rows)
     for lw in weights["layers"]:
-        n = _rms_norm(x, f(lw["norm0"]), NORM_EPS)
-        qkv = F.linear(n, f(lw["wqkv"])).view(x.shape[0], 3, HEADS, HEAD_DIM)
+        n = _rms_norm(x, cast(lw["norm0"]), NORM_EPS)
+        qkv = F.linear(n, cast(lw["wqkv"])).view(x.shape[0], 3, HEADS, HEAD_DIM)
         q, k, v = qkv.unbind(dim=1)
-        q, k = _rope(q, f(cos), f(sin)), _rope(k, f(cos), f(sin))
-        a = _attention(q.contiguous(), k.contiguous(), v.contiguous(), cu)
-        x = x + F.linear(a.reshape(x.shape[0], QKV_HIDDEN), f(lw["wo"]))
-        n = _rms_norm(x, f(lw["norm1"]), NORM_EPS)
+        q, k = _apply_rope(q, k, cos, sin)
+        a = attention(q.contiguous(), k.contiguous(), v.contiguous(), cu, x.dtype)
+        x = x + F.linear(a.reshape(x.shape[0], QKV_HIDDEN), cast(lw["wo"]))
+        n = _rms_norm(x, cast(lw["norm1"]), NORM_EPS)
         x = x + F.linear(
-            F.gelu(F.linear(n, f(lw["fc0"])), approximate="tanh"), f(lw["fc1"])
+            F.gelu(F.linear(n, cast(lw["fc0"])), approximate="tanh"), cast(lw["fc1"])
         )
-    x = _rms_norm(x, f(weights["final_norm"]), NORM_EPS)
+    x = _rms_norm(x, cast(weights["final_norm"]), NORM_EPS)
     m = _tpool_merge(x, grids)
     y = F.linear(
-        F.gelu(F.linear(m, f(weights["merger_proj0"]))), f(weights["merger_proj1"])
+        F.gelu(F.linear(m, cast(weights["merger_proj0"]))),
+        cast(weights["merger_proj1"]),
     )
-    return _rms_norm(y, f(weights["post_norm"]), PROJECTOR_EPS)
+    return _rms_norm(y, cast(weights["post_norm"]), PROJECTOR_EPS)
+
+
+def _fairness(actual, chain, oracle):
+    """Oracle-fairness gate of the Cake contract: no worse than the BF16 chain."""
+    tol = ATOL + RTOL * oracle.abs()
+    err_a = (actual.float() - oracle).abs()
+    err_c = (chain.float() - oracle).abs()
+    viol_a, viol_c = int((err_a > tol).sum()), int((err_c > tol).sum())
+    return dict(
+        finite=bool(torch.isfinite(actual.float()).all()),
+        violations=(viol_a, viol_c),
+        mean=(float(err_a.mean()), float(err_c.mean())),
+        max=(float(err_a.max()), float(err_c.max())),
+        passed=bool(torch.isfinite(actual.float()).all())
+        and viol_a <= 1.1 * viol_c + 16
+        and float(err_a.mean()) <= 1.05 * max(float(err_c.mean()), 1e-12)
+        and float(err_a.max()) <= 1.5 * max(float(err_c.max()), 1e-6),
+    )
 
 
 def test_matches_flashinfer_and_fp32_oracle():
@@ -225,8 +284,30 @@ def test_matches_flashinfer_and_fp32_oracle():
         torch.cuda.synchronize()
         assert direct.shape == out.shape and torch.equal(out, direct)
         assert torch.isfinite(out.float()).all()
-        expected = _oracle(pixels, grids, weights, cos, sin, pos_rows, cu)
-        torch.testing.assert_close(out.float(), expected, atol=1e-2, rtol=1e-2)
+        oracle = _tower(
+            pixels,
+            grids,
+            weights,
+            cos,
+            sin,
+            pos_rows,
+            cu,
+            fp32=True,
+            attention=_attention_fp32,
+        )
+        chain = _tower(
+            pixels,
+            grids,
+            weights,
+            cos,
+            sin,
+            pos_rows,
+            cu,
+            fp32=False,
+            attention=_attention_bf16,
+        )
+        report = _fairness(out, chain, oracle)
+        assert report["passed"], report
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
 

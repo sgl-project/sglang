@@ -3,12 +3,25 @@
 Checks that the registry resolves the explicit FlashInfer backend; that the
 facade output and the in-place state pool are bitwise identical to
 ``flashinfer.mamba.selective_state_update(backend="cake")``; that the result
-matches a pure-torch step within BF16 tolerance (FP32 state at 1e-3); and that
-``supports_selective_state_update`` agrees with FlashInfer's own promotion
-decision (``try_cake_selective_state_update`` returned ``True``) on the
-promoted T=1 rows and refuses the un-promoted forms (stochastic rounding,
-int32 indices). FlashInfer silently runs its non-Cake kernel outside the
-promoted rows, so the predicate is the only Cake-ran signal SGLang has.
+matches FlashInfer's own validated oracle for this kernel -- the non-Cake
+``selective_state_update(backend="flashinfer")`` kernel on identical inputs at
+``atol = rtol = 1e-2`` (``tests/mamba/test_cake_selective_state_update.py`` at
+FlashInfer ``46340689a5ab``) -- and a pure-torch step within BF16 tolerance
+(FP32 state at 1e-3); and that ``supports_selective_state_update`` agrees with
+FlashInfer's own promotion decision (``try_cake_selective_state_update``
+returned ``True``) on the promoted T=1 rows and refuses the un-promoted forms
+(stochastic rounding, int32 indices). FlashInfer silently runs its non-Cake
+kernel outside the promoted rows, so the predicate is the only Cake-ran signal
+SGLang has.
+
+Input conditioning: ``dt`` is a Mamba time step and must be positive. On the
+BF16 rows the kernel applies ``softplus(dt + dt_bias)`` itself, so a Gaussian
+``dt`` with the usual ``dt_bias in [-4, -3)`` is fine (FlashInfer's own
+distribution). The ``stp_fp32_identity`` row is promoted only with
+``dt_softplus=False``, i.e. the caller has already applied softplus; feeding
+it the raw Gaussian ``dt`` makes ``exp(dt * A)`` reach ``e^14`` and the BF16
+output of a cancelling 128-term sum is then not comparable to any oracle at
+1e-2. That row therefore receives an already-positive step.
 
 Skips with the reason when FlashInfer lacks the module or the GPU is outside
 sm_100a / sm_103a. The first call per program compiles the source-built
@@ -31,6 +44,9 @@ register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="4-gpu-
 
 OP = "mamba.selective_state_update"
 DIM = DSTATE = 128
+# FlashInfer's bound for Cake vs its non-Cake kernel on identical inputs
+# (tests/mamba/test_cake_selective_state_update.py at 46340689a5ab).
+FI_ATOL = FI_RTOL = 1e-2
 
 
 def test_registry_resolves_flashinfer_backend():
@@ -55,24 +71,34 @@ def _skip_unless_supported():
         )
 
 
-def _make(batch, nheads, ngroups, state_dtype, device, seed):
-    """sglang's decode convention: per-head dt/A/D/dt_bias broadcast views."""
+def _make(batch, nheads, ngroups, state_dtype, device, seed, *, dt_softplus):
+    """sglang's decode convention: per-head dt/A/D/dt_bias broadcast views.
+
+    With ``dt_softplus`` the kernel positivises ``dt + dt_bias`` itself and the
+    raw Gaussian step is used; without it the step is supplied already
+    positive (``softplus`` of the same Gaussian) with a small positive bias.
+    """
     torch.manual_seed(seed)
     slots = batch + 4
     state = (torch.randn(slots, nheads, DIM, DSTATE, device=device) * 0.05).to(
         state_dtype
     )
     x = (torch.randn(batch, nheads, DIM, device=device) * 0.1).bfloat16()
-    dt = torch.randn(batch, nheads, device=device)[:, :, None].expand(
-        batch, nheads, DIM
-    )
+    dt_raw = torch.randn(batch, nheads, device=device)
+    bias_raw = torch.rand(nheads, device=device) - 4.0
+    if dt_softplus:
+        dt_head, bias_head = dt_raw, bias_raw
+    else:
+        dt_head = F.softplus(dt_raw + bias_raw)
+        bias_head = torch.rand(nheads, device=device) * 0.05
+    dt = dt_head[:, :, None].expand(batch, nheads, DIM)
     A = (-torch.rand(nheads, device=device) - 1.0)[:, None, None].expand(
         nheads, DIM, DSTATE
     )
     B = (torch.randn(batch, ngroups, DSTATE, device=device) * 0.1).bfloat16()
     C = (torch.randn(batch, ngroups, DSTATE, device=device) * 0.1).bfloat16()
     D = torch.randn(nheads, device=device)[:, None].expand(nheads, DIM)
-    dt_bias = (torch.rand(nheads, device=device) - 4.0)[:, None].expand(nheads, DIM)
+    dt_bias = bias_head[:, None].expand(nheads, DIM)
     indices = torch.randperm(slots, device=device)[:batch].to(torch.int64)
     out = torch.empty_like(x)
     return dict(
@@ -108,6 +134,32 @@ def _reference(t, state_before, dt_softplus):
     return y, s
 
 
+def _flashinfer_reference(t, state_before, kwargs):
+    """FlashInfer's non-Cake kernel on the identical inputs (FI's own oracle)."""
+    from flashinfer.mamba import selective_state_update as fi_direct
+
+    state = state_before.clone()
+    out = fi_direct(
+        state,
+        t["x"],
+        t["dt"],
+        t["A"],
+        t["B"],
+        t["C"],
+        t["D"],
+        backend="flashinfer",
+        **kwargs,
+    )
+    return out, state
+
+
+def _assert_matches_flashinfer_oracle(t, state_before, kwargs):
+    out_ref, state_ref = _flashinfer_reference(t, state_before, kwargs)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(t["out"], out_ref, atol=FI_ATOL, rtol=FI_RTOL)
+    torch.testing.assert_close(t["state"], state_ref, atol=FI_ATOL, rtol=FI_RTOL)
+
+
 def _strict_cake(monkeypatch):
     """Record FlashInfer's own Cake promotion decision for the call."""
     import flashinfer.jit.mamba.cake_selective_state_update as fi_cake
@@ -128,7 +180,9 @@ def _strict_cake(monkeypatch):
 def test_bf16_t1_row_matches_flashinfer_and_reference(nheads, ngroups, monkeypatch):
     _skip_unless_supported()
     device = torch.device("cuda")
-    t = _make(16, nheads, ngroups, torch.bfloat16, device, seed=nheads)
+    t = _make(
+        16, nheads, ngroups, torch.bfloat16, device, seed=nheads, dt_softplus=True
+    )
     kwargs = dict(dt_bias=t["dt_bias"], dt_softplus=True, state_batch_indices=t["idx"])
     assert cake_mamba.supports_selective_state_update(
         t["state"], t["x"], t["dt"], t["A"], t["B"], t["C"], t["D"], **kwargs
@@ -164,6 +218,7 @@ def test_bf16_t1_row_matches_flashinfer_and_reference(nheads, ngroups, monkeypat
     torch.cuda.synchronize()
     assert torch.equal(t["out"], out_fi)
     assert torch.equal(t["state"], state_fi)
+    _assert_matches_flashinfer_oracle(t, state_ref, kwargs)
     expected_out, expected_state = _reference(t, state_ref, dt_softplus=True)
     torch.testing.assert_close(
         t["state"].index_select(0, t["idx"]).float(),
@@ -183,7 +238,9 @@ def test_fp32_identity_row_matches_flashinfer_and_reference(monkeypatch):
     nheads, ngroups = 16, 2
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     batch = (8 * sms + nheads - 1) // nheads  # B * nheads >= 8 * SMs
-    t = _make(batch, nheads, ngroups, torch.float32, device, seed=99)
+    # The identity row is promoted without softplus: the caller supplies the
+    # positive step (see the module docstring).
+    t = _make(batch, nheads, ngroups, torch.float32, device, seed=99, dt_softplus=False)
     kwargs = dict(dt_bias=t["dt_bias"], dt_softplus=False, state_batch_indices=t["idx"])
     assert cake_mamba.supports_selective_state_update(
         t["state"], t["x"], t["dt"], t["A"], t["B"], t["C"], t["D"], **kwargs
@@ -218,6 +275,7 @@ def test_fp32_identity_row_matches_flashinfer_and_reference(monkeypatch):
     torch.cuda.synchronize()
     assert torch.equal(t["out"], out_fi)
     assert torch.equal(t["state"], state_fi)
+    _assert_matches_flashinfer_oracle(t, state_ref, kwargs)
     expected_out, expected_state = _reference(t, state_ref, dt_softplus=False)
     torch.testing.assert_close(
         t["state"].index_select(0, t["idx"]), expected_state, atol=1e-3, rtol=1e-3
@@ -228,7 +286,7 @@ def test_fp32_identity_row_matches_flashinfer_and_reference(monkeypatch):
 def test_supports_refuses_unpromoted_forms():
     _skip_unless_supported()
     device = torch.device("cuda")
-    t = _make(4, 16, 2, torch.bfloat16, device, seed=5)
+    t = _make(4, 16, 2, torch.bfloat16, device, seed=5, dt_softplus=True)
     base = dict(dt_bias=t["dt_bias"], dt_softplus=True, state_batch_indices=t["idx"])
     args = (t["state"], t["x"], t["dt"], t["A"], t["B"], t["C"], t["D"])
     assert cake_mamba.supports_selective_state_update(*args, **base)

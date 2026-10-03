@@ -7,8 +7,30 @@ that the registry resolves the explicit FlashInfer backends; that the facade
 output and final states are bitwise identical to constructing the FlashInfer
 runner directly and to the functional ``cake_ssd_combined_fwd``; and that
 output, final states and selective checkpoint rows (PR #35444's compact
-checkpoints) match a pure-torch SSD recurrence within BF16 tolerance, in
+checkpoints) match FlashInfer's own validated oracle for this kernel, in
 batched mode and in packed-varlen mode (``seq_idx`` + chunk metadata).
+
+Oracle and bound (FlashInfer ``tests/mamba/test_cake_ssd_combined.py`` at
+``46340689a5ab``): the Cake route is validated against FlashInfer's CuTe SSD
+backend (``SSDCombined(backend="cute")``) on identical inputs. Both backends
+run the chunked SSD algorithm with the inter-chunk state carried in the state
+dtype (BF16 here), which a per-token FP32 recurrence does not model; the bound
+is FlashInfer's ``_assert_cute_parity``: ``rtol = 1e-2`` and ``atol =
+max(1e-2, 5e-4 * amax(|reference|))`` per returned tensor ("cancellation ties
+the error to the head's magnitude rather than the entry's"). Checkpoint states
+are compared at ``atol = rtol = 1e-2`` against the CuTe final state of the
+sequence prefix, as FlashInfer does.
+
+Checkpoint contract (``flashinfer/mamba/ssd_combined.py`` docstring + the
+generated kernels ``mamba_ssd_q_tmem_alias_*``): ``checkpoint_token_indices``
+holds one *exclusive* token boundary per sequence -- sequence-relative in
+batched mode, absolute in the packed token axis for varlen -- and the state
+is captured only when that boundary is the end of a logical chunk
+(``checkpoint_token == segment_end``): a multiple of ``chunk_size`` in
+batched mode, or a boundary exposed through ``chunk_indices`` /
+``chunk_offsets`` in varlen mode (the packed shape SGLang builds). Boundaries
+anywhere else, negative entries and negative slots capture nothing and leave
+the slot untouched.
 
 The runner materializes strided inputs into graph-stable storage and owns its
 workspaces, so one runner per stream; preparation (first ``run`` per shape)
@@ -20,7 +42,6 @@ import sys
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from sglang.kernels import KernelBackend, select_kernel
 from sglang.kernels.cake_kernels import mamba as cake_mamba
@@ -34,6 +55,8 @@ CHUNK = cake_mamba.SSD_CHUNK_SIZE
 HEADDIM = cake_mamba.SSD_HEADDIM
 DSTATE = cake_mamba.SSD_DSTATE
 NHEADS, NGROUPS = 16, 8
+# Unused checkpoint slot: must stay untouched (NaN-filled) after the launch.
+UNTOUCHED_SLOT = 1
 
 
 @pytest.mark.parametrize("op", ["mamba.ssd_combined", "mamba.ssd_combined_fwd"])
@@ -53,18 +76,26 @@ def _skip_unless_supported():
         pytest.skip(f"Cake SSDCombined is built for sm_100a/sm_103a, device is {cc}")
 
 
-def _varlen_metadata(lengths, device):
+def _varlen_metadata(lengths, device, extra_boundaries=()):
+    """``seq_idx`` plus the logical-chunk metadata of a packed batch.
+
+    A logical chunk starts at every physical chunk start and at every
+    sequence start; ``extra_boundaries`` (absolute packed token indices) add
+    further logical boundaries, which is how a caller exposes a checkpoint
+    inside a physical chunk.
+    """
     total = sum(lengths)
     seq_idx = torch.empty((1, total), dtype=torch.int32, device=device)
-    start = 0
+    starts, start = [], 0
     for seq, n in enumerate(lengths):
         seq_idx[0, start : start + n] = seq
+        starts.append(start)
         start += n
+    boundaries = set(starts) | set(int(b) for b in extra_boundaries)
     chunk_indices, chunk_offsets = [], []
     for chunk in range(total // CHUNK):
-        values = seq_idx[0, chunk * CHUNK : (chunk + 1) * CHUNK]
-        previous = torch.cat((values[:1] - 1, values[:-1]))
-        for offset in (values != previous).nonzero(as_tuple=True)[0].tolist():
+        lo, hi = chunk * CHUNK, (chunk + 1) * CHUNK
+        for offset in sorted({0} | {b - lo for b in boundaries if lo < b < hi}):
             chunk_indices.append(chunk)
             chunk_offsets.append(offset)
     return (
@@ -136,62 +167,55 @@ def _case(device, *, varlen, seed):
     )
 
 
-def _reference(case, checkpoint_boundaries=None):
-    """FP32 per-token SSD recurrence over packed sequences.
+def _cute_reference(case):
+    """FlashInfer's validated oracle for the Cake route: its CuTe SSD backend."""
+    from flashinfer.mamba import SSDCombined
 
-    Returns token-major output, final states and, when
-    ``checkpoint_boundaries`` (exclusive token counts per sequence) is given,
-    the state after that many tokens of each sequence.
-    """
+    return SSDCombined(**case["ctor"], backend="cute").run(
+        *case["tensors"], **case["run"]
+    )
+
+
+def _assert_cute_parity(actual, expected):
+    """FlashInfer's bound (tests/mamba/test_cake_ssd_combined.py, 46340689a5ab)."""
+    for index in (0, 1):
+        reference = expected[index]
+        # Cancellation ties the error to the head's magnitude rather than the
+        # entry's; the tensor max is a coarse bound on that.
+        atol = max(1e-2, 5e-4 * reference.abs().amax().item())
+        torch.testing.assert_close(actual[index], reference, atol=atol, rtol=1e-2)
+
+
+def _cute_prefix_final_state(case, *, batch_index, start, length, sequence):
+    """CuTe final state after ``length`` tokens of one sequence (batched run)."""
+    from flashinfer.mamba import SSDCombined
+
     x, dt, A, B, C = case["tensors"]
     run = case["run"]
-    batch, seqlen = x.shape[:2]
-    heads_per_group = NHEADS // NGROUPS
-    dt_p = F.softplus(dt.float() + run["dt_bias"].float())
-    out = torch.empty(batch, seqlen, NHEADS, HEADDIM, device=x.device)
-    finals, checkpoints = [], []
-    seq = 0
-    for b in range(batch):
-        start = 0
-        for n in case["lengths"] if run["seq_idx"] is not None else (seqlen,):
-            h = run["initial_states"][seq].float()  # [H, D, N]
-            for t in range(start, start + n):
-                xt, Bt, Ct = x[b, t].float(), B[b, t].float(), C[b, t].float()
-                Bg = Bt.repeat_interleave(heads_per_group, dim=0)
-                Cg = Ct.repeat_interleave(heads_per_group, dim=0)
-                dA = torch.exp(dt_p[b, t] * A)
-                h = h * dA[:, None, None] + dt_p[b, t][:, None, None] * (
-                    xt[:, :, None] * Bg[:, None, :]
-                )
-                y = torch.einsum("hdn,hn->hd", h, Cg) + run["D"].float()[:, None] * xt
-                out[b, t] = y * F.silu(run["z"][b, t].float())
-                if checkpoint_boundaries is not None and t - start + 1 == int(
-                    checkpoint_boundaries[seq]
-                ):
-                    checkpoints.append(h.clone())
-            finals.append(h)
-            start += n
-            seq += 1
-    return out, torch.stack(finals), checkpoints
+    sl = slice(start, start + length)
+    prefix = {
+        **run,
+        "z": run["z"][batch_index : batch_index + 1, sl].contiguous(),
+        "initial_states": run["initial_states"][sequence : sequence + 1].contiguous(),
+        "seq_idx": None,
+        "chunk_indices": None,
+        "chunk_offsets": None,
+    }
+    ctor = {**case["ctor"], "has_varlen": False}
+    _, final = SSDCombined(**ctor, backend="cute").run(
+        x[batch_index : batch_index + 1, sl].contiguous(),
+        dt[batch_index : batch_index + 1, sl].contiguous(),
+        A,
+        B[batch_index : batch_index + 1, sl].contiguous(),
+        C[batch_index : batch_index + 1, sl].contiguous(),
+        **prefix,
+    )
+    return final[0]
 
 
-def _assert_reference(case, out, final, checkpoint_states=None, boundaries=None):
-    expected_out, expected_final, expected_cp = _reference(case, boundaries)
-    torch.testing.assert_close(out.float(), expected_out, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(final.float(), expected_final, atol=1e-2, rtol=1e-2)
-    if checkpoint_states is not None:
-        torch.testing.assert_close(
-            checkpoint_states.float(), torch.stack(expected_cp), atol=1e-2, rtol=1e-2
-        )
-
-
-@pytest.mark.parametrize("varlen", [False, True], ids=["batched", "varlen"])
-def test_runner_matches_flashinfer_functional_and_reference(varlen):
-    _skip_unless_supported()
-    device = torch.device("cuda")
-    case = _case(device, varlen=varlen, seed=int(varlen))
+def _supports(case, **extra):
     x, dt, A, B, C = case["tensors"]
-    assert cake_mamba.supports_ssd_combined(
+    return cake_mamba.supports_ssd_combined(
         x,
         dt,
         A,
@@ -202,10 +226,19 @@ def test_runner_matches_flashinfer_functional_and_reference(varlen):
         dt_bias=case["run"]["dt_bias"],
         initial_states=case["run"]["initial_states"],
         seq_idx=case["run"]["seq_idx"],
-        chunk_indices=case["run"]["chunk_indices"],
-        chunk_offsets=case["run"]["chunk_offsets"],
-        out=case["out"],
+        chunk_indices=extra.pop("chunk_indices", case["run"]["chunk_indices"]),
+        chunk_offsets=extra.pop("chunk_offsets", case["run"]["chunk_offsets"]),
+        **extra,
     )
+
+
+@pytest.mark.parametrize("varlen", [False, True], ids=["batched", "varlen"])
+def test_runner_matches_flashinfer_functional_and_reference(varlen):
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    case = _case(device, varlen=varlen, seed=int(varlen))
+    x, dt, A, B, C = case["tensors"]
+    assert _supports(case, out=case["out"])
     runner = cake_ssd_combined(**case["ctor"])
     out, final = runner.run(*case["tensors"], out=case["out"], **case["run"])
     assert out.untyped_storage().data_ptr() == case["out"].untyped_storage().data_ptr()
@@ -218,14 +251,15 @@ def test_runner_matches_flashinfer_functional_and_reference(varlen):
     torch.cuda.synchronize()
     assert torch.equal(out, out_fi) and torch.equal(final, final_fi)
     assert torch.equal(out, out_fn) and torch.equal(final, final_fn)
-    _assert_reference(case, out, final)
+    assert torch.isfinite(out.float()).all() and torch.isfinite(final.float()).all()
+    _assert_cute_parity((out, final), _cute_reference(case))
 
     # Second run: new activations in the same storage, same out buffer.
     x.copy_(torch.randn_like(x.float()).bfloat16())
     case["run"]["z"].copy_(torch.randn_like(x.float()).bfloat16())
     out2, final2 = runner.run(*case["tensors"], out=case["out"], **case["run"])
     torch.cuda.synchronize()
-    _assert_reference(case, out2, final2)
+    _assert_cute_parity((out2, final2), _cute_reference(case))
 
 
 @pytest.mark.parametrize("varlen", [False, True], ids=["batched", "varlen"])
@@ -233,51 +267,84 @@ def test_runner_writes_selective_checkpoint_states(varlen):
     _skip_unless_supported()
     device = torch.device("cuda")
     case = _case(device, varlen=varlen, seed=7 + int(varlen))
-    num_seqs = len(case["lengths"])
-    # Exclusive per-sequence boundaries (sequence-relative in batched mode,
-    # absolute in the packed token axis for varlen), one chunk-unaligned.
-    relative = [128, 72] if not varlen else [72, 96 + 128]
-    boundaries = torch.tensor(relative, device=device, dtype=torch.int32)
-    slots = torch.tensor([1, 0], device=device, dtype=torch.int32)
+    lengths = case["lengths"]
+    if varlen:
+        # Packed [0, 96) + [96, 256). Sequence 0 checkpoints at its end (96,
+        # a logical boundary because sequence 1 starts there); sequence 1
+        # after 128 of its tokens (absolute 224), a boundary inside physical
+        # chunk 1 that the caller exposes through the chunk metadata.
+        boundaries = [96, 224]
+        seq_idx, chunk_indices, chunk_offsets = _varlen_metadata(
+            lengths, device, extra_boundaries=(224,)
+        )
+        assert torch.equal(
+            chunk_indices.cpu(), torch.tensor([0, 0, 1, 1], dtype=torch.int32)
+        )
+        assert torch.equal(
+            chunk_offsets.cpu(), torch.tensor([0, 96, 0, 96], dtype=torch.int32)
+        )
+        metadata = dict(chunk_indices=chunk_indices, chunk_offsets=chunk_offsets)
+        prefix = [(0, 0, 96), (0, 96, 128)]  # (batch index, start, length)
+    else:
+        # Sequence-relative: sequence 0 after one chunk, sequence 1 at its end.
+        boundaries = [128, 256]
+        metadata = {}
+        prefix = [(0, 0, 128), (1, 0, 256)]
+    slots = [2, 0]
+    token_indices = torch.tensor(boundaries, device=device, dtype=torch.int32)
+    slot_indices = torch.tensor(slots, device=device, dtype=torch.int32)
     checkpoint_states = torch.full(
-        (num_seqs, NHEADS, HEADDIM, DSTATE), float("nan"), device=device
+        (3, NHEADS, HEADDIM, DSTATE), float("nan"), device=device
     ).bfloat16()
-    x, dt, A, B, C = case["tensors"]
-    assert cake_mamba.supports_ssd_combined(
-        x,
-        dt,
-        A,
-        B,
-        C,
-        D=case["run"]["D"],
-        z=case["run"]["z"],
-        dt_bias=case["run"]["dt_bias"],
-        initial_states=case["run"]["initial_states"],
-        seq_idx=case["run"]["seq_idx"],
-        chunk_indices=case["run"]["chunk_indices"],
-        chunk_offsets=case["run"]["chunk_offsets"],
-        checkpoint_token_indices=boundaries,
-        checkpoint_state_slots=slots,
+    assert _supports(
+        case,
+        checkpoint_token_indices=token_indices,
+        checkpoint_state_slots=slot_indices,
         checkpoint_states=checkpoint_states,
+        **metadata,
     )
     runner = cake_ssd_combined(**case["ctor"])
     out, final = runner.run(
         *case["tensors"],
-        checkpoint_token_indices=boundaries,
-        checkpoint_state_slots=slots,
+        checkpoint_token_indices=token_indices,
+        checkpoint_state_slots=slot_indices,
         checkpoint_states=checkpoint_states,
-        **case["run"],
+        **{**case["run"], **metadata},
     )
     torch.cuda.synchronize()
-    assert torch.isfinite(checkpoint_states).all()
-    sequence_relative = [72, 128] if varlen else relative
-    _assert_reference(
-        case,
-        out,
-        final,
-        checkpoint_states[slots.long()],
-        boundaries=sequence_relative,
+    # The exposed logical boundary does not change the result.
+    expected = _cute_reference(case)
+    _assert_cute_parity((out, final), expected)
+    # Written slots: CuTe final state of the sequence prefix (a checkpoint at
+    # the sequence end is its final state); the unused slot stays untouched.
+    for seq, (slot, (b, start, length)) in enumerate(zip(slots, prefix)):
+        assert torch.isfinite(checkpoint_states[slot].float()).all()
+        seq_end = sum(lengths[: seq + 1]) if varlen else lengths[seq]
+        if start + length == seq_end:
+            reference = expected[1][seq]
+        else:
+            reference = _cute_prefix_final_state(
+                case, batch_index=b, start=start, length=length, sequence=seq
+            )
+        torch.testing.assert_close(
+            checkpoint_states[slot], reference, atol=1e-2, rtol=1e-2
+        )
+    assert torch.isnan(checkpoint_states[UNTOUCHED_SLOT]).all()
+
+    # A boundary that is not a logical chunk end (72) and a negative entry
+    # capture nothing: the NaN fill survives in every slot.
+    unaligned = torch.full_like(checkpoint_states, float("nan"))
+    runner.run(
+        *case["tensors"],
+        checkpoint_token_indices=torch.tensor(
+            [72, -1], device=device, dtype=torch.int32
+        ),
+        checkpoint_state_slots=slot_indices,
+        checkpoint_states=unaligned,
+        **{**case["run"], **metadata},
     )
+    torch.cuda.synchronize()
+    assert torch.isnan(unaligned).all()
 
 
 if __name__ == "__main__":
