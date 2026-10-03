@@ -333,6 +333,16 @@ Selectors match exact loaded component keys from `model_index.json`, including n
 
 The existing `--dit-cpu-offload`, `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, and `--cpu-offload-components` options remain supported. New and legacy options may be mixed: `--component-residency` wins only for components it matches, while unmatched legacy settings remain effective. Legacy layerwise selectors take precedence over legacy component-offload selectors for the same component. Explicit `--dit-layerwise-offload false` makes the DiT resident unless another explicit DiT selector, such as `--dit-cpu-offload true` or `--component-residency dit=component-offload`, selects a different mode.
 
+Explicit component placement also applies during warmup and request cleanup. Pipeline
+preferences cannot keep or reload an explicitly offloaded component merely to
+prepare for the next request. An explicitly `resident` component remains resident.
+This applies to matching exact, group, and `all` selectors, as well as legacy
+offload options. Components without an explicit placement may still use the
+pipeline's warmup retention and request-end preload preferences. Selecting one component does
+not disable those preferences for other components. On-demand loading and
+prefetch for upcoming uses within a request are unchanged; explicit offload may
+therefore add weight-transfer latency to the first real request after warmup.
+
 Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. Explicit non-resident placement also requires a request-time component-use declaration, so it cannot silently select a module that the pipeline does not manage. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
 
 #### Snapshot offload

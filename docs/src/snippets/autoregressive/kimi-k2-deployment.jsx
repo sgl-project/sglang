@@ -75,7 +75,7 @@ export const KimiK2Deployment = () => {
     const strategyArray = Array.isArray(strategy) ? strategy : [];
     cmd += ` \\\n  --tp 8`;
     if (strategyArray.includes('dp')) {
-      cmd += ` \\\n  --dp 4 \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size 4`;
     }
     if (strategyArray.includes('ep')) {
       cmd += ` \\\n  --ep 4`;

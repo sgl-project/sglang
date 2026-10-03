@@ -358,7 +358,7 @@ def test_fused_pool_eligibility(dtype, quantized, wrapped):
     "mode_name", ["DECODE", "TARGET_VERIFY", "DRAFT_EXTEND_V2", "EXTEND"]
 )
 @pytest.mark.parametrize("ratio,budget", [(4, 2048), (2, 1024), (4, 8192)])
-def test_defer_expansion_metadata(mode_name, ratio, budget):
+def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
     from types import SimpleNamespace
 
     from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
@@ -390,12 +390,17 @@ def test_defer_expansion_metadata(mode_name, ratio, budget):
     runner = SimpleNamespace(
         token_to_kv_pool=pool,
         device="cuda",
+        is_draft_worker=False,
         req_to_token_pool=SimpleNamespace(req_to_token=table),
         model_config=SimpleNamespace(hf_config=config, context_len=64),
     )
     backend = QwenSparseAttnBackend(runner)
     mode = getattr(ForwardMode, mode_name)
     width = 1 if mode.is_decode() else 2
+    monkeypatch.setattr(
+        "sglang.srt.layers.attention.qwen_sparse_attn_backend.get_spec",
+        lambda: SimpleNamespace(speculative_num_draft_tokens=width),
+    )
     lengths = torch.tensor([8], device="cuda", dtype=torch.int32)
     batch = SimpleNamespace(
         forward_mode=mode,
@@ -421,6 +426,9 @@ def test_defer_expansion_metadata(mode_name, ratio, budget):
     assert metadata.indexer_metadata.defer_block_expansion == expected
     if not mode.is_extend_without_speculative():
         backend.init_cuda_graph_state(1, width)
+        assert backend.verify_mask is not None
+        assert not backend.verify_mask.is_read
+        assert backend.verify_mask.buffer.numel() == width * width
         backend.token_to_kv_pool = None
         backend._fused_kv_pool_eligible = False
         backend._capture_cuda_graph_metadata(
