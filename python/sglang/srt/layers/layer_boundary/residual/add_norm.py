@@ -280,6 +280,26 @@ class PlainAdd:
         return attn_tp_gather(residual)
 
 
+class ReplaceAtExit:
+    """The producer computes the next stream itself (its own add, norms and
+    scaling, in whatever kernels it uses) and writes it at its exit; the
+    previous residual is dropped. The stream is complete: the producer has its
+    boundary complete each part's sum first (StageBoundary.sum_part)."""
+
+    is_plain_add = False
+    applied_at_exit = True
+    outlives_layer = True
+
+    def update(self, hidden_states, residual):
+        return hidden_states
+
+    def slice_residual_attn_tp(self, residual):
+        return attn_tp_slice(residual)
+
+    def gather_residual_attn_tp(self, residual):
+        return attn_tp_gather(residual)
+
+
 class Fp8Input(Enum):
     """Additional input forms a projection can consume after a fused norm."""
 
@@ -390,6 +410,7 @@ class UnfusedNormReadout(NormReadout):
 
 
 PLAIN_ADD = PlainAdd()
+REPLACE_AT_EXIT = ReplaceAtExit()
 NORM_QUANT_READOUT = NormQuantReadout()
 NORM_READOUT = NormReadout()
 UNFUSED_NORM_READOUT = UnfusedNormReadout()

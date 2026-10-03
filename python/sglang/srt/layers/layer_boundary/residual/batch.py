@@ -35,6 +35,12 @@ def stream_of(forward_batch):
     return stream
 
 
+def written_residual(forward_batch):
+    """The residual the last prepare wrote, for a stage whose compute reads it
+    too (e.g. to write the next stream at its exit). Borrowed: do not modify."""
+    return stream_of(forward_batch).residual
+
+
 def complete_output(hidden_states, forward_batch):
     """Complete the contribution while retaining its pending residual update."""
     return stream_of(forward_batch).complete(hidden_states)
