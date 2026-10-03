@@ -1,0 +1,22 @@
+---
+title: Clef
+description: Cloudflare's joint decision models in SGLang, with API semantics and current integration limits.
+---
+
+Clef is Cloudflare's family of joint decision models, available as [`Cloudflare/clef`](https://huggingface.co/Cloudflare/clef) and the smaller [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash).
+
+SGLang loads Clef's `joint_head_config.json` and `joint_head.safetensors` strictly and runs the trained head inside the GPU model worker, using the SGLang Qwen backbone. Both `/v1/decisions` and `/v1/systemone` encode all questions into one native Clef prompt and answer them together in one complete prefill. No checkpoint Python code or Transformers inference fallback is used.
+
+## Current integration limits
+
+The current SGLang integration requires text-only, unquantized BF16 inference on one CUDA GPU. The head consumes final hidden states for the entire joint prompt. Cached-prefix reconstruction, accumulation across prefill chunks, and batched record handling are not implemented, so only one eager, complete, uncached prefill at a time is supported. The Python HTTP server is required because the Rust HTTP server does not expose these decision routes.
+
+## API semantics
+
+Use the [decision API request formats](/docs/supported-models/decision_models#example-request) or the [System One API](/docs/supported-models/decision_models#system-one-compatible-api) with the model name served by your server.
+
+- `temperature` must be `1`; `prompt_format_version` must be absent or `1`.
+- Empty structured input such as `input: {}` is accepted when the question carries the content. Choice questions can contain more than 26 options because the joint head does not assign vocabulary answer labels. Existing question, identifier, duplicate-option, and score-level validation still applies.
+- `label_mass`, `label_token_ids`, and System One `x_label_mass` are absent: the probabilities come from the trained head, not a vocabulary readout. `/v1/decisions` returns full-precision probabilities; `/v1/systemone` follows native Clef's four-decimal answer formatting.
+- `usage.prompt_tokens` (or System One `usage.input_tokens`) counts the complete joint prompt once. Generated/output tokens are zero. Overlength prompts are rejected rather than truncated.
+- `return_prompt_token_ids` returns the same joint prompt for each answer. These IDs are useful for inspection but cannot reproduce the head's probabilities through `/v1/score`.

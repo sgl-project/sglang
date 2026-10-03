@@ -198,10 +198,10 @@ class TestClefDecisions(CustomTestCase):
     def test_unsupported_and_overlength_requests(self):
         valid = decisions_request(self.fixture["cases"][0]["request"])
         before = self.post("/v1/decisions", valid)["execution"]["forward_count"]
-        for field, value in (
-            ("temperature", 0.5),
-            ("images", ["unused.png"]),
-            ("input", "overflow " * 5000),
+        for field, value, reason in (
+            ("temperature", 0.5, "temperature=1"),
+            ("images", ["unused.png"], "text only"),
+            ("input", "overflow " * 5000, "exceeds context length"),
         ):
             with self.subTest(field=field):
                 body = copy.deepcopy(valid)
@@ -210,6 +210,7 @@ class TestClefDecisions(CustomTestCase):
                     self.base_url + "/v1/decisions", json=body, timeout=120
                 )
                 self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn(reason, response.json()["message"])
         after = self.post("/v1/decisions", valid)["execution"]["forward_count"]
         self.assertEqual(after, before + 1)
 

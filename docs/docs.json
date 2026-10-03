@@ -1479,6 +1479,12 @@
                     ]
                   },
                   {
+                    "group": "Cloudflare",
+                    "pages": [
+                      "cookbook/autoregressive/Cloudflare/Clef"
+                    ]
+                  },
+                  {
                     "group": "Perplexity",
                     "pages": [
                       "cookbook/autoregressive/Perplexity/pplx-decider-v1-27b"

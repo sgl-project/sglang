@@ -3,7 +3,7 @@ title: Decision models
 description: Answer typed choice, score, and yes or no questions with a probability for every option from a chat model, without generating text.
 ---
 
-`/v1/decisions` answers typed questions with a probability for every option, without generating text. For ordinary chat models, it reads next-token scores at the answer position. [Clef-flash](#clef-flash) instead uses its trained joint decision head. The ordinary chat-model path needs no special checkpoint: any generation model served with a Jinja chat template can answer, as long as the checks below pass for it.
+`/v1/decisions` answers typed questions with a probability for every option, without generating text. For ordinary chat models, it reads next-token scores at the answer position. [Clef](/cookbook/autoregressive/Cloudflare/Clef) instead uses its trained joint decision head. The ordinary chat-model path needs no special checkpoint: any generation model served with a Jinja chat template can answer, as long as the checks below pass for it.
 
 <Note>
   `/v1/decisions` is an SGLang extension under `/v1`, like `/v1/score` and `/v1/rerank`. It is not part of the OpenAI API, so call it over HTTP rather than through an OpenAI SDK method. Until a release contains it, install a [nightly build](/docs/get-started/install#nightly-builds), which is built from the main branch.
@@ -15,23 +15,9 @@ description: Answer typed choice, score, and yes or no questions with a probabil
 | --- | --- | --- |
 | **Qwen3.8-27B** | `Qwen/Qwen3.8-27B` | Validated on one H200 in BF16, with and without NEXTN speculative decoding. See the [model page](/cookbook/autoregressive/Qwen/Qwen3.8-27B). |
 | **Qwen3.5-35B-A3B** | `Qwen/Qwen3.5-35B-A3B` | Validated on one H200 in BF16. See the [model page](/cookbook/autoregressive/Qwen/Qwen3.5). |
-| **Clef-flash** | `Cloudflare/clef-flash` | Trained joint head on the Qwen3.5 backbone; text-only BF16 on one CUDA GPU. See [Clef-flash](#clef-flash) for API semantics and support constraints. |
+| **Clef** | `Cloudflare/clef-flash` | Trained joint head; text-only BF16 on one CUDA GPU. See [Clef](/cookbook/autoregressive/Cloudflare/Clef) for API semantics and support constraints. |
 
 Other chat models are served when the answer labels are single tokens at the answer position and the answer does not start inside a reasoning block. The server checks these per request and returns a 400 that names the reason when one fails, see [Errors](#errors). It does not check how the chat template renders the question or where the template itself would put an answer, so inspect `prompt_token_ids` from `return_prompt_token_ids` before relying on a new model.
-
-## Clef-flash
-
-SGLang loads Clef's `joint_head_config.json` and `joint_head.safetensors` strictly and runs the trained head inside the GPU model worker, using the SGLang Qwen3.5 backbone. Both `/v1/decisions` and `/v1/systemone` encode all questions into one native Clef prompt and answer them together in one complete prefill. No checkpoint Python code or Transformers inference fallback is used.
-
-Only Python HTTP serving with one eager, complete, uncached prefill at a time is supported.
-
-You can use the [example request](#example-request) below with `"model": "clef-flash"`. Clef-specific semantics are:
-
-- `temperature` must be `1`; `prompt_format_version` must be absent or `1`.
-- Empty structured input such as `input: {}` is accepted when the question carries the content. Choice questions can contain more than 26 options because the joint head does not assign vocabulary answer labels. Existing question, identifier, duplicate-option, and score-level validation still applies.
-- `label_mass`, `label_token_ids`, and System One `x_label_mass` are absent: the probabilities come from the trained head, not a vocabulary readout. `/v1/decisions` returns full-precision probabilities; `/v1/systemone` follows native Clef's four-decimal answer formatting.
-- `usage.prompt_tokens` (or System One `usage.input_tokens`) counts the complete joint prompt once. Generated/output tokens are zero. Overlength prompts are rejected rather than truncated.
-- `return_prompt_token_ids` returns the same joint prompt for each answer. These IDs are useful for inspection but cannot reproduce the head's probabilities through `/v1/score`.
 
 The remaining sections describe ordinary chat-model scoring unless they explicitly mention Clef.
 

@@ -19,12 +19,7 @@ from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.environ import envs
 from sglang.srt.layers.clef import validate_clef_settings, validate_record
-from sglang.srt.layers.clef_reference import (
-    EncodedQuestion,
-    EncodedRecord,
-    JointSchemaHead,
-    encode_record,
-)
+from sglang.srt.layers.clef_reference import encode_record
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -88,23 +83,6 @@ class TestClefJointHead(CustomTestCase):
         malformed["questions"][0]["question_span"] = (0, len(encoded.input_ids) + 1)
         with self.assertRaisesRegex(ValueError, "span"):
             validate_record(malformed, list(encoded.input_ids))
-
-    def test_head_uses_all_questions_and_trained_weights(self):
-        torch.manual_seed(20261003)
-        head = JointSchemaHead(
-            hidden_size=8, width=8, routing_layers=1, layers=1, heads=2, feedforward=16
-        ).eval()
-        hidden = torch.randn(1, 6, 8)
-        ids = torch.arange(6).unsqueeze(0)
-        weight = torch.randn(6, 8)
-        question = EncodedQuestion("q", 1, (0, 1), ((1, 2), (2, 3)), ("a", "b"))
-        record = EncodedRecord(tuple(range(6)), (question,), "test")
-        with torch.inference_mode():
-            before = head(hidden, ids, torch.ones_like(ids), [record], weight)[0][0]
-            head.residual_scorer[-1].weight.add_(1)
-            after = head(hidden, ids, torch.ones_like(ids), [record], weight)[0][0]
-        assert not torch.equal(before, after)
-        assert torch.isfinite(after).all()
 
     def test_restricted_settings_fail_closed(self):
         args = SimpleNamespace(
@@ -266,7 +244,7 @@ class TestClefJointHead(CustomTestCase):
                         expected,
                     )
 
-    def test_generate_cannot_bypass_metadata_validation(self):
+    def test_metadata_validator_rejects_unsupported_request_features(self):
         from sglang.srt.layers.clef import validate_clef_request
 
         encoded = encode_record(

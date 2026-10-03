@@ -246,13 +246,22 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                 )
         response = await handler.handle_request(
             _request(
-                "s", {"q": _question("choice", {str(i): None for i in range(77)})}
+                "s", {"q": _question("choice", {str(i): None for i in range(27)})}
             ),
             None,
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("at most 26 options", json.loads(response.body)["message"])
         self.assertEqual(manager.requests, [])
+        options = {str(i): None for i in range(26)}
+        response = await handler.handle_request(
+            _request("s", {"q": _question("choice", options)}), None
+        )
+        self.assertEqual(response.status_code, 200, response.body)
+        probabilities = json.loads(response.body)["answers"]["q"]["probabilities"]
+        self.assertEqual(len(probabilities), 26)
+        self.assertEqual(set(probabilities), set(options))
+        self.assertEqual(len(manager.requests), 1)
 
     def test_request_limits_follow_the_label_alphabets(self):
         options = {name: None for name in string.ascii_lowercase}
