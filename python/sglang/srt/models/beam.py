@@ -66,15 +66,6 @@ def apply_ssmax(q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     return (q.float() * scale.unsqueeze(-1)).to(q.dtype)
 
 
-def apply_attention_gate(
-    attention_output: torch.Tensor, gate: torch.Tensor, gate_bias: torch.Tensor
-) -> torch.Tensor:
-    # Bias addition, sigmoid, and multiplication use the activation dtype.
-    # The bias has one entry per local query head, broadcast over head_dim.
-    multiplier = torch.sigmoid(gate + gate_bias[None, :, None])
-    return attention_output * multiplier
-
-
 def depth_scaled_residual(
     branch: torch.Tensor, residual: torch.Tensor, scales: Tuple[float, float]
 ) -> torch.Tensor:

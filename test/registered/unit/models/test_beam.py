@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.kernels.ops.elementwise import BeamAttentionGateOp
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.configs.model_config import (
     _get_and_verify_dtype,
@@ -24,7 +25,6 @@ from sglang.srt.models.beam import (
     BeamForCausalLM,
     BeamModel,
     BeamMoE,
-    apply_attention_gate,
     apply_ssmax,
     depth_scaled_residual,
 )
@@ -349,7 +349,7 @@ class TestBeamNumerics(CustomTestCase):
             output.float() * torch.sigmoid(gate.float() + bias.float()[None, :, None])
         ).bfloat16()
 
-        actual = apply_attention_gate(output, gate, bias)
+        actual = BeamAttentionGateOp().forward_native(output, gate, bias, 8)
 
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         self.assertEqual(actual.dtype, torch.bfloat16)
