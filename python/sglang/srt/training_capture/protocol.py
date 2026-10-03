@@ -456,6 +456,7 @@ def validate_tensors(
     *,
     max_tensor_bytes: int = 2 << 30,
     owner_id: str | None = None,
+    payload_hasher=None,
 ) -> None:
     """Validate all payloads, or exactly one owner's payloads of a complete manifest."""
     nv = validate_manifest(manifest, max_tensor_bytes=max_tensor_bytes)
@@ -467,12 +468,20 @@ def validate_tensors(
     if set(tensors) != {o.key for o in objects}:
         raise ContractError("tensor object set differs from the manifest")
     aux = {}
+    payloads = []
     for obj in objects:
         tensor = tensors[obj.key]
         if list(tensor.shape) != obj.shape or tensor.dtype != DTYPES[obj.dtype]:
             raise ContractError("received tensor shape/dtype mismatch")
-        data = tensor_bytes(tensor)
-        if digest_bytes(data) != obj.sha256:
+        payloads.append(tensor_bytes(tensor))
+    digests = (
+        payload_hasher.digests(payloads)
+        if payload_hasher is not None
+        else [digest_bytes(data) for data in payloads]
+    )
+    for obj, data, digest in zip(objects, payloads, digests, strict=True):
+        tensor = tensors[obj.key]
+        if digest != obj.sha256:
             raise ContractError("tensor checksum mismatch")
         if tensor.is_floating_point() and not _all_finite(data, obj.dtype):
             raise ContractError("nonfinite captured values")

@@ -196,7 +196,9 @@ class SnapshotWriter:
     ) -> dict:
         self._check_identity(manifest, lease)
         with self.timings.measure("validation"):
-            validate_tensors(manifest, tensors)
+            validate_tensors(
+                manifest, tensors, payload_hasher=self.store.payload_hasher
+            )
             if check_current is not None:
                 check_current()
         data = canonical_bytes(manifest)
@@ -256,7 +258,12 @@ class SnapshotWriter:
         if owner_id not in manifest.topology.owners:
             raise ContractError("unregistered tensor partition owner")
         self.timings.call(
-            "validation", validate_tensors, manifest, tensors, owner_id=owner_id
+            "validation",
+            validate_tensors,
+            manifest,
+            tensors,
+            owner_id=owner_id,
+            payload_hasher=self.store.payload_hasher,
         )
         data = canonical_bytes(manifest)
         descriptor = self._manifest_object(manifest, data)

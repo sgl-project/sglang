@@ -15,6 +15,7 @@ from contextlib import ExitStack
 from typing import ClassVar
 
 import torch
+from sglang.srt.training_capture.payload_hash import PayloadHasher
 from sglang.srt.training_capture.protocol import (
     CaptureError,
     ContractError,
@@ -32,7 +33,14 @@ class TransportError(CaptureError):
 class MooncakeSnapshotStore:
     _retained: ClassVar[set[MooncakeSnapshotStore]] = set()
 
-    def __init__(self, client, replicate_config, *, max_receive_bytes: int = 2 << 30):
+    def __init__(
+        self,
+        client,
+        replicate_config,
+        *,
+        max_receive_bytes: int = 2 << 30,
+        payload_hash_workers: int = 1,
+    ):
         try:
             # Capability checks are intentional at this external SDK boundary.
             required = (
@@ -62,10 +70,16 @@ class MooncakeSnapshotStore:
         self.registered: dict[int, torch.Tensor] = {}
         self.quarantined: set[int] = set()
         self.closed = False
+        self.payload_hasher = PayloadHasher(payload_hash_workers)
 
     @classmethod
     def connect(
-        cls, setup: dict, *, replica_num: int = 1, max_receive_bytes: int = 2 << 30
+        cls,
+        setup: dict,
+        *,
+        replica_num: int = 1,
+        max_receive_bytes: int = 2 << 30,
+        payload_hash_workers: int = 1,
     ):
         from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
@@ -73,7 +87,12 @@ class MooncakeSnapshotStore:
         config.replica_num = replica_num
         client = MooncakeDistributedStore()
         try:
-            adapter = cls(client, config, max_receive_bytes=max_receive_bytes)
+            adapter = cls(
+                client,
+                config,
+                max_receive_bytes=max_receive_bytes,
+                payload_hash_workers=payload_hash_workers,
+            )
         except Exception:
             client.close()
             raise
@@ -186,9 +205,14 @@ class MooncakeSnapshotStore:
         if len(set(keys)) != len(keys):
             raise ContractError("duplicate keys in a registered Store batch")
         registrations = []
-        for _, tensor, expected_digest in objects:
+        buffers = []
+        for _, tensor, _ in objects:
             registrations.append(self._registration(tensor))
-            if digest_bytes(tensor_bytes(tensor)) != expected_digest:
+            buffers.append(tensor_bytes(tensor))
+        for actual, (_, _, expected_digest) in zip(
+            self.payload_hasher.digests(buffers), objects, strict=True
+        ):
+            if actual != expected_digest:
                 raise ContractError("immutable source changed before Store write")
         batch_exists = getattr(self.client, "batch_is_exist", None)
         batch_put = getattr(self.client, "batch_put_from", None)
@@ -331,8 +355,11 @@ class MooncakeSnapshotStore:
                 )
             if list(counts) != sizes:
                 raise ContractError("Mooncake batch read byte count mismatch")
-            for out, (_, _, _, digest) in zip(outputs, objects):
-                if digest_bytes(tensor_bytes(out)) != digest:
+            digests = self.payload_hasher.digests(
+                [tensor_bytes(out) for out in outputs]
+            )
+            for actual, (_, _, _, digest) in zip(digests, objects, strict=True):
+                if actual != digest:
                     raise ContractError("Mooncake object digest mismatch")
             return outputs
 
@@ -371,6 +398,7 @@ class MooncakeSnapshotStore:
         if self.closed:
             return
         try:
+            self.payload_hasher.close()
             rc = self.client.close()
             if rc not in (None, 0):
                 raise TransportError(f"Mooncake close failed: status={rc}")

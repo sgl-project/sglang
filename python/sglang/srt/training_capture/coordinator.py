@@ -1142,6 +1142,7 @@ class CaptureCoordinator:
                     manifest, tensors = self.writer.timings.call(
                         "snapshot_build",
                         record.context.prepare_snapshot,
+                        payload_hasher=self.store.payload_hasher,
                         dataset_id=record.lease.dataset_id,
                         sample_id=record.lease.sample_id,
                         generation_id=record.lease.generation_id,

@@ -78,7 +78,7 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def connect(master, *, segment_bytes):
+def connect(master, *, segment_bytes, payload_hash_workers=1):
     return MooncakeSnapshotStore.connect(
         {
             "local_hostname": f"127.0.0.1:{free_port()}",
@@ -88,7 +88,8 @@ def connect(master, *, segment_bytes):
             "protocol": "tcp",
             "rdma_devices": "",
             "master_server_addr": master,
-        }
+        },
+        payload_hash_workers=payload_hash_workers,
     )
 
 
@@ -1061,15 +1062,30 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
     def test_prepared_recovery_after_unlinked_journal_and_producer_close(self):
         self.exercise_batch_recovery_after_producer_close(cleanup_failure=True)
 
-    def exercise_batch_recovery_after_producer_close(self, *, cleanup_failure):
-        manifest, tensors = make_snapshot(response_length=4)
+    def test_parallel_hash_recovery_after_producer_close(self):
+        self.exercise_batch_recovery_after_producer_close(
+            cleanup_failure=True, payload_hash_workers=4
+        )
+
+    def exercise_batch_recovery_after_producer_close(
+        self, *, cleanup_failure, payload_hash_workers=1
+    ):
+        manifest, tensors = (
+            make_snapshot(128, kv_heads=32, head_dim=128, storage_chunk_tokens=64)
+            if payload_hash_workers > 1
+            else make_snapshot(response_length=4)
+        )
         data = canonical_bytes(manifest)
         data_node = connect(self.master_address, segment_bytes=64 << 20)
         producer = None
         recovery = None
         journal = None
         try:
-            producer = connect(self.master_address, segment_bytes=0)
+            producer = connect(
+                self.master_address,
+                segment_bytes=0,
+                payload_hash_workers=payload_hash_workers,
+            )
             with tempfile.TemporaryDirectory() as directory:
                 journal = PublicationJournal(directory)
                 buffer = torch.empty(1 << 20, dtype=torch.uint8)
@@ -1131,10 +1147,17 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                 original_publication = catalog.publish.call_args
                 journal.close()
                 producer.close()
+                self.assertTrue(producer.payload_hasher.closed)
+                if payload_hash_workers > 1:
+                    self.assertIsNotNone(producer.payload_hasher.executor)
                 for tensor in tensors.values():
                     tensor.zero_()
                 buffer.zero_()
-                recovery = connect(self.master_address, segment_bytes=0)
+                recovery = connect(
+                    self.master_address,
+                    segment_bytes=0,
+                    payload_hash_workers=payload_hash_workers,
+                )
                 recovery.client = MagicMock(wraps=recovery.client)
                 journal = PublicationJournal(directory)
                 writer = SnapshotWriter(recovery, catalog, journal)
@@ -1159,6 +1182,7 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                             "native_recovery_batches": 1,
                             "recovery_tensor_bytes": manifest.total_tensor_bytes,
                             "journal_absent_after_cleanup": cleanup_failure,
+                            "payload_hash_workers": payload_hash_workers,
                         }
                     ),
                     flush=True,

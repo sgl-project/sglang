@@ -27,6 +27,7 @@ it does not redefine the goal as the modules already implemented.
 | --- | --- | --- |
 | Wire contract | Typed manifest, raw tensor descriptors, shape/byte/digest/coverage/content validation | Generated fixtures pass the design's JSON Schema; malformed metadata and contents are rejected |
 | Payload finite scan | Exact BF16/FP16/FP32 exponent checks over existing Host bytes, bounded scratch arrays | Exhaustive BF16/FP16 and FP32 boundary tests pass; mandatory writer validation falls 50.56% per sample in one real-model pair, with no established serving speedup |
+| Payload hashing | Optional bounded owner-local CPU workers, exact independent SHA-256 at every existing boundary, failure/join barriers | All 337 capture unit methods and 10 native TCP Store methods pass; four serving brackets validate 249 post-exit snapshots and lower background stage time, without an established capture-throughput improvement; default remains one worker |
 | KV coverage validation | Token-endpoint sweep with disjoint active head intervals | Independent grid-oracle comparisons and 123 shared/Store tests pass; 32K metadata validation falls 69.4%, with 16 complete long-context post-exit snapshots and no established serving speedup |
 | Manifest capacity admission | Conservative global Host/HTTP seal bounds before capture context/copies, with a dedicated rejection counter | 176 shared/Store regressions pass, including four-process rejection/drain/reuse; prior real-model serving continuity and post-exit readback pass; conservative early-response exclusion and production workload acceptance remain explicit |
 | Raw teacher capture | Unpadded top-128 IDs/values and full-vocabulary LSE before serving processors | Independent online logits observer validates every captured row; serving bias does not leak into teacher scores |
@@ -4935,6 +4936,56 @@ The [runbook](experiments/PUBLICATION_CLEANUP.md) and
 introduced. The resident H100 idle load has resumed, with no additional GPU
 allocation. This is fault/transport validation with test Catalogs; new serving,
 RDMA, production integration and trained-quality acceptance remain unproven.
+
+## Optional Parallel Payload Hashing
+
+`payload_hash_workers` assigns 1-8 CPU workers per active Store owner, defaulting
+to one. A lazy pool is shared across snapshot construction, mandatory writer
+validation, batched writes and reads, including recovery. It starts only for
+at least two objects and 1 MiB of payload. Byte-balanced groups submit at most
+one task per configured worker. No payload copy, cached digest, skipped content
+check or wire-format change is introduced. Failed submission or hashing waits
+for every submitted source reader before propagation; Store shutdown joins the
+pool before releasing transport ownership. SDK and CUDA work remain outside
+the hash workers. The worker count participates in startup policy agreement.
+
+The complete capture unit suite passes **337 methods in 282.321s**, including
+seven new hashing cases for ordering, partition assembly, immutable bytes,
+nonfinite rejection, bounded submissions and held-reader failure barriers. The
+full native Mooncake TCP suite passes **10 methods in 243.400s**. The new native
+case publishes a multi-megabyte sample, injects post-unlink journal cleanup
+failure, closes its producer, destroys old buffers and recovers with a fresh
+four-worker Store connection without rewriting payloads.
+
+A production builder/validator CPU probe checks exact serial/parallel object
+descriptors over 512-token and 32K prompts. With 270 MB of long-context Host data,
+median construction falls **227.016 to 87.815 ms**, and content validation falls
+**261.773 to 122.131 ms**. CPU time rises slightly and observed outliers remain in
+the evidence. This resident process has 192 affinity CPUs and no container CPU
+limit; production owners need their own aggregate CPU budget.
+
+Four Qwen3-0.6B off/on/off brackets use one frozen source and worker counts
+**1, 4, 4, 1** with 512 input tokens, 128 output tokens, concurrency four and four
+capture slots.
+The 256 capture-on requests all complete inference; **249 admitted samples /
+16,932 tensor objects / 1,993,338,624 bytes** pass full post-exit readback.
+Seven requests hit admission backpressure. No admitted sample fails, no stage or
+Catalog error occurs, and no slot is quarantined or journal left pending.
+Live stage metrics agree with status counters.
+
+Across each setting's two runs, elapsed construction falls **10.195 to 5.964
+ms/sample**, mandatory validation **13.811 to 9.359 ms/sample**, and Store payload
+write **12.763 to 8.341 ms/sample**. Aggregate captured throughput is **5.220
+versus 5.212 samples/s**, so this does not establish end-to-end serving/capture
+throughput or tail-latency improvement. Default workers remain one; the real
+serving comparison does not validate long-context or multi-GPU contention.
+
+The [runbook](experiments/PAYLOAD_HASHING.md) and
+[evidence](experiments/payload-hashing.json) bind nine successful terminal jobs,
+a 5,626-file source audit and 109 archived artifacts. All 14 changed Python
+files add no Ruff findings. The resident H100 has resumed its idle load, with
+no additional GPU allocation. Production Catalog, distributed CPU contention,
+representative MaaS SLOs and trained-draft acceptance remain open.
 
 ## Next Implementation
 

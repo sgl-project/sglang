@@ -227,6 +227,7 @@ class CohortSnapshotWriter:
                     prepared, job.tensors = self.timings.call(
                         "snapshot_build",
                         job.context.prepare_partition,
+                        payload_hasher=self.resources.store.payload_hasher,
                         **{
                             name: getattr(metadata, name)
                             for name in SnapshotMetadata.__struct_fields__

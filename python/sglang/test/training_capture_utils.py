@@ -4,6 +4,7 @@ import ctypes
 import time
 from types import SimpleNamespace
 
+import msgspec
 import requests
 import torch
 
@@ -325,7 +326,7 @@ def make_kv_spec():
     )
 
 
-def make_snapshot(response_length=3):
+def make_snapshot(response_length=3, *, kv_heads=2, head_dim=4, storage_chunk_tokens=2):
     p, r = 2, response_length
     n = p + r
     generator = torch.Generator().manual_seed(42)
@@ -342,10 +343,23 @@ def make_snapshot(response_length=3):
         "teacher_logsumexp": teacher.logsumexp,
     }
     kv = make_kv_spec()
+    kv = msgspec.structs.replace(
+        kv,
+        storage_chunk_tokens=storage_chunk_tokens,
+        layers=[
+            msgspec.structs.replace(
+                layer,
+                num_kv_heads=kv_heads,
+                key_head_dim=head_dim,
+                value_head_dim=head_dim,
+            )
+            for layer in kv.layers
+        ],
+    )
     for layer in kv.layers:
         for component in ("k", "v"):
             buffers[f"target_{component}.{layer.layer_id}"] = torch.randn(
-                n - 1, 2, 4, generator=generator
+                n - 1, kv_heads, head_dim, generator=generator
             ).bfloat16()
     metadata = SnapshotMetadata(
         dataset_id="test-dataset",

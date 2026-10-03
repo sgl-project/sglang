@@ -1380,6 +1380,15 @@ recovery_hold_bytes >= ingestion_bytes_per_second * checkpoint_interval
 
 `TV128` 只需要 draft 在 128 IDs 的分子，但 draft 全词表分母仍需计算，CE 也需完整归一化。不能声称保存 top128 后 draft lm_head 计算自动只剩 128 类。
 
+producer 可通过 `payload_hash_workers` 为每个 active Store owner 配置 1-8 个
+CPU 哈希线程，默认 1。仅在至少两个对象、总量至少 1 MiB 时启用并行；每轮最多
+提交与线程数相等的任务，不为每个 chunk 创建一个 future。选层快照构造、内容校验
+和批量 Store 写入/读回分别计算实际字节的 SHA-256，各校验边界保持独立。
+线程或任务提交失败时须等待全部已开始的读取结束，才能传播异常并回收源缓冲；
+Store 关闭先 join 哈希线程，再解除传输内存所有权。哈希线程不调用 Store SDK
+或 CUDA。CPU 预算需按 TP/PP owner 数累计；孤立哈希加速不代表 MaaS 吞吐或尾延迟
+改善，启用前需做相同请求集的 capture-on/off 对照和完整读回验证。
+
 ## 16. 配置与兼容性握手
 
 下列为拟新增配置示例，不能直接传给当前上游 CLI。`REQUIRED` 字段必须在实施前填入具体不可变版本；数值是试验起点，不是性能结论。

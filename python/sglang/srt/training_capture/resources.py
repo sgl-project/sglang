@@ -11,6 +11,7 @@ from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
 from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
+from sglang.srt.training_capture.protocol import ContractError
 from sglang.srt.training_capture.snapshot_writer import PublicationJournal
 
 
@@ -50,6 +51,7 @@ class CaptureResources:
                 msgspec.to_builtins(config.store),
                 replica_num=config.replica_num,
                 max_receive_bytes=config.max_host_bytes,
+                payload_hash_workers=config.payload_hash_workers,
             )
             resources._allocate(
                 config,
@@ -73,6 +75,10 @@ class CaptureResources:
             exporter,
         )
         try:
+            if store.payload_hasher.workers != config.payload_hash_workers:
+                raise ContractError(
+                    "connected Store hash workers differ from capture config"
+                )
             resources._allocate(config, kv, None, pin_memory)
         except Exception:
             resources.close()

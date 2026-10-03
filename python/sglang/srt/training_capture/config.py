@@ -101,6 +101,7 @@ class CaptureConfig(StrictStruct):
     kv_export_backend: Literal["torch", "hicache"] = "torch"
     teacher_d2h_batch_tokens: Positive = 1
     teacher_topk_backend: Literal["torch", "flashinfer"] = "torch"
+    payload_hash_workers: Annotated[int, msgspec.Meta(ge=1, le=8)] = 1
     max_device_bytes: Nonnegative = 0
     manifest_buffer_bytes: Positive = 1 << 20
     storage_chunk_tokens: Positive = 256

@@ -353,7 +353,7 @@ class RequestCaptureContext:
         self._sealed()
         return result
 
-    def prepare_snapshot(self, **metadata):
+    def prepare_snapshot(self, *, payload_hasher=None, **metadata):
         """Prepare owned views for mandatory validation by SnapshotWriter."""
         if self.partition is not None:
             raise ContractError(
@@ -365,11 +365,12 @@ class RequestCaptureContext:
             SnapshotMetadata(sequence=self.sequence, **metadata),
             self.slot.tensors,
             valid_kv_tokens=self.kv_end,
+            payload_hasher=payload_hasher,
         )
         self._sealed()
         return result
 
-    def prepare_partition(self, **metadata):
+    def prepare_partition(self, *, payload_hasher=None, **metadata):
         if self.partition is None or not self.partition.active:
             raise ContractError(
                 "partition preparation requires an active partitioned request"
@@ -382,6 +383,7 @@ class RequestCaptureContext:
             valid_kv_tokens=self.kv_end,
             partition=self.partition,
             token_ids=self.token_ids,
+            payload_hasher=payload_hasher,
         )
         self._sealed()
         return result

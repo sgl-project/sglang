@@ -65,6 +65,11 @@ metadata when journal creation or post-publication cleanup fails, checks READY
 accounting and quarantine, and recovers through native Store reads after closing
 the original producer.
 
+[Optional Parallel Payload Hashing](PAYLOAD_HASHING.md) preserves SHA-256 and
+every validation boundary while assigning bounded CPU workers to construction,
+validation and batch transfer checks. It includes source-reader failure barriers
+and single-versus-four-worker serving comparisons.
+
 [Host-Known Teacher Row Selection](TEACHER_SELECTION.md) covers contiguous
 teacher-row views, independent compact output ownership, and microbenchmark and
 serving comparisons against the index-upload/gather path.

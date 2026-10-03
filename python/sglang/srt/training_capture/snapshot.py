@@ -171,6 +171,7 @@ def prepare_snapshot(
     buffers: dict[str, torch.Tensor],
     *,
     valid_kv_tokens: int,
+    payload_hasher=None,
 ) -> tuple[Manifest, dict[str, torch.Tensor]]:
     """Describe completed Host views; the writer must validate their contents.
 
@@ -188,6 +189,7 @@ def prepare_snapshot(
         buffers,
         valid_kv_tokens=valid_kv_tokens,
         partition=layout.partition(OWNER),
+        payload_hasher=payload_hasher,
     )
     manifest = assemble_snapshot(metadata, [part], layout=layout)
     return manifest, tensors
@@ -200,9 +202,12 @@ def prepare_snapshot_partition(
     valid_kv_tokens: int,
     partition: CapturePartition,
     token_ids: Sequence[int] | None = None,
+    payload_hasher=None,
 ) -> tuple[PreparedSnapshotPartition, dict[str, torch.Tensor]]:
     """Describe only owner-local completed Host views, without copying payloads."""
     sequence, kv = metadata.sequence, metadata.kv
+    if payload_hasher is not None and payload_hasher.workers == 1:
+        payload_hasher = None
     layers = partition.local_layers(kv)
     if (
         not partition.active
@@ -253,7 +258,11 @@ def prepare_snapshot_partition(
             dtype=str(tensor.dtype).removeprefix("torch."),
             shape=list(tensor.shape),
             nbytes=tensor.numel() * tensor.element_size(),
-            sha256=digest_bytes(tensor_bytes(tensor)),
+            sha256=(
+                digest_bytes(tensor_bytes(tensor))
+                if payload_hasher is None
+                else "0" * 64
+            ),
             owner_id=partition.owner_id,
             byte_order="little",
             contiguous=True,
@@ -283,6 +292,14 @@ def prepare_snapshot_partition(
                     token_range=(start, end),
                     head_range=heads[layer.layer_id],
                 )
+    if payload_hasher is not None:
+        digests = payload_hasher.digests(
+            [tensor_bytes(tensors[obj.key]) for obj in objects]
+        )
+        objects = [
+            msgspec.structs.replace(obj, sha256=digest)
+            for obj, digest in zip(objects, digests, strict=True)
+        ]
     return (
         PreparedSnapshotPartition(
             owner_id=partition.owner_id,

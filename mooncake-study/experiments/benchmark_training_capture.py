@@ -297,6 +297,7 @@ def capture_config(args, directory, address, catalog, ratio):
         "kv_export_backend": getattr(args, "kv_export_backend", "torch"),
         "teacher_d2h_batch_tokens": args.teacher_d2h_batch_tokens,
         "teacher_topk_backend": getattr(args, "teacher_topk_backend", "torch"),
+        "payload_hash_workers": getattr(args, "payload_hash_workers", 1),
         "max_device_bytes": args.device_mib << 20,
         "storage_chunk_tokens": 64,
     }
@@ -685,6 +686,9 @@ def main():
     parser.add_argument("--capture-slots", type=int, default=16)
     parser.add_argument("--host-mib", type=int, default=256)
     parser.add_argument("--manifest-mib", type=int, default=1)
+    parser.add_argument(
+        "--payload-hash-workers", type=int, choices=range(1, 9), default=1
+    )
     parser.add_argument("--kv-d2h-batch-tokens", type=int, default=1)
     parser.add_argument(
         "--kv-export-backend", choices=("torch", "hicache"), default="torch"

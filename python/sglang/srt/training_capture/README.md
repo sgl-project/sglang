@@ -54,6 +54,22 @@ paths check the exact seal size before object registration, payload writes or
 journal creation. These checks do not certify payload contents or replace
 publication, and do not discard journals left by earlier writer versions.
 
+`payload_hash_workers` optionally assigns 1-8 CPU threads per active Store owner
+to payload SHA-256 work; the default is 1. At least two objects and 1 MiB of
+aggregate data are required before a parallel pool is created. One pool serves
+snapshot construction, mandatory content validation and batched Store checksum
+checks, with at most one task per configured worker. Each boundary hashes the
+actual bytes again; this is not a digest cache or a relaxation of validation.
+Submission/worker failure waits for every source reader before propagating, and
+Store shutdown joins the pool before releasing transport registrations.
+
+Budget these CPU workers across TP/PP owners along with inference and transport
+threads. Hash workers do not call the Store SDK or access CUDA. For manual
+`MooncakeSnapshotStore.connect()` / `CaptureResources.from_connected()` callers,
+the Store's `payload_hash_workers` must match the capture config. The benchmark
+accepts `--payload-hash-workers`; serving and post-exit readback remain part of
+acceptance. See [payload hashing](../../../../mooncake-study/experiments/PAYLOAD_HASHING.md).
+
 Synchronous and normal overlap scheduling are supported for ordinary AR and
 DSpark verification. Ordinary AR can use TP/PP with DP=1;
 the complete worker group must participate in capture startup. Real-model
