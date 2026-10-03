@@ -1844,8 +1844,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 return_dict=False,
                 **template_kwargs,
             )
-            segment_cache = getattr(self, "_prompt_segment_cache", None)
-            if segment_cache is not None and segment_cache.enabled:
+            segment_cache = self._prompt_segment_cache
+            if segment_cache is not None:
                 prompt_ids = segment_cache.encode(rendered_prompt, encode_kwargs)
             else:
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(
