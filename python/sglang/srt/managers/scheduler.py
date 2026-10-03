@@ -2719,7 +2719,7 @@ class Scheduler(
         if (
             get_exec().moe.elastic_ep_backend is None
             or self.disable_radix_cache
-            or not self.tree_cache.is_tree_cache()
+            or not self.tree_cache.supports_prefix_sharing()
         ):
             return
 
