@@ -287,7 +287,9 @@ register_kernel(
     )
 )
 
-# --- DeepGEMM-family exported plans (SM100a 148 SMs / SM103a 152 SMs) --------
+# --- DeepGEMM-family prepared plans (batched / fp4: exported routes pinned to
+# SM100a 148 SMs / SM103a 152 SMs; fp8 1d1d, k-grouped fp4, mixed fp8 x fp4:
+# runtime shapes since FlashInfer e4f94f948) ------------------------------------
 register_kernel(
     _spec(
         "prepare_fp8_batched_gemm",
@@ -320,9 +322,9 @@ register_kernel(
         "prepare_fp8_gemm_1d1d",
         _SM100_SM103,
         ("uint8", "uint32", "bfloat16", "float32"),
-        "prepared plan: M4096/N7168/K4096 E4M3 bytes with MN-major packed UE8M0 words -> "
-        "BF16 out, or accumulate=True FP32 D += A @ B^T; PTX assembled into cache_dir",
-        "Cake/DeepGEMM FP8 1D1D GEMM (prepared PTX-source plan) distributed by FlashInfer.",
+        "prepared plan: any M/N, K % 128 == 0, E4M3 bytes with MN-major packed UE8M0 "
+        "words -> BF16 out, or accumulate=True FP32 D += A @ B^T; JIT-built CUDA source",
+        "Cake/DeepGEMM FP8 1D1D GEMM (prepared runtime-shape plan) distributed by FlashInfer.",
     )
 )
 register_kernel(
@@ -334,7 +336,7 @@ register_kernel(
         ("uint8", "int8", "int32", "uint32", "bfloat16", "float32"),
         "prepared plan: independent K-group products A_g @ B_g.T over packed E2M1 with "
         "packed UE8M0 scales -> out[groups,physical_M,N] bf16/fp32 (optional in-place "
-        "accumulate); exported routes only",
+        "accumulate); any group layout, num_stages must be 7",
         "Cake/DeepGEMM K-grouped FP4 GEMM (prepared plan) distributed by FlashInfer.",
     )
 )
@@ -346,7 +348,7 @@ register_kernel(
         _SM100_SM103,
         ("float8_e4m3fn", "uint8", "int8", "int32", "uint32", "bfloat16"),
         "prepared plan: E4M3 A[storage_M,K] x packed E2M1 B[N,K/2] with packed UE8M0 "
-        "scales -> BF16 [m,N]; exported (M,N,K,variant,block_n,gran_k_a) routes only",
+        "scales -> BF16 [m,N]; runtime shapes, gran_k_a 32 or 128",
         "Cake/DeepGEMM mixed FP8 x FP4 GEMM (prepared plan) distributed by FlashInfer.",
     )
 )
@@ -654,12 +656,9 @@ def cake_prepare_fp8_gemm_1d1d(
     out: torch.Tensor,
     *,
     accumulate: bool = False,
-    cache_dir: str,
 ) -> Any:
-    """Explicit Cake entry point; returns an ``Fp8GemmPlan``."""
-    return _cake("prepare_fp8_gemm_1d1d")(
-        a, b, sfa, sfb, out, accumulate=accumulate, cache_dir=cache_dir
-    )
+    """Explicit Cake entry point; returns an ``Fp8GemmPlan`` (``run()`` writes ``out``)."""
+    return _cake("prepare_fp8_gemm_1d1d")(a, b, sfa, sfb, out, accumulate=accumulate)
 
 
 def cake_prepare_fp4_k_grouped_gemm(
@@ -676,10 +675,8 @@ def cake_prepare_fp4_k_grouped_gemm(
     accumulate: bool = False,
     num_stages: int = 7,
     out: Optional[torch.Tensor] = None,
-    grouped_layout: Optional[torch.Tensor] = None,
-    descriptor_workspace: Optional[torch.Tensor] = None,
 ) -> Any:
-    """Explicit Cake entry point; returns a ``GroupedFP4Plan``."""
+    """Explicit Cake entry point; returns a ``GroupedFP4Plan`` (``run()`` -> ``plan.output``)."""
     return _cake("prepare_fp4_k_grouped_gemm")(
         a,
         b,
@@ -693,8 +690,6 @@ def cake_prepare_fp4_k_grouped_gemm(
         accumulate=accumulate,
         num_stages=num_stages,
         out=out,
-        grouped_layout=grouped_layout,
-        descriptor_workspace=descriptor_workspace,
     )
 
 
@@ -704,25 +699,13 @@ def cake_prepare_fp8_fp4_gemm(
     a_scales: torch.Tensor,
     b_scales: torch.Tensor,
     *,
-    m: int,
+    m: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
-    block_n: int = 128,
     gran_k_a: int = 32,
-    variant: Optional[str] = None,
-    descriptor_workspace: Optional[torch.Tensor] = None,
 ) -> Any:
-    """Explicit Cake entry point; returns a ``MixedGemmPlan``."""
+    """Explicit Cake entry point; returns a ``MixedGemmPlan`` (``run()`` -> ``plan.output``)."""
     return _cake("prepare_fp8_fp4_gemm")(
-        a,
-        b,
-        a_scales,
-        b_scales,
-        m=m,
-        out=out,
-        block_n=block_n,
-        gran_k_a=gran_k_a,
-        variant=variant,
-        descriptor_workspace=descriptor_workspace,
+        a, b, a_scales, b_scales, m=m, out=out, gran_k_a=gran_k_a
     )
 
 

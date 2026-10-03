@@ -183,10 +183,10 @@ DeepGEMM-family plans and the dense/sparse MQA plans pin the physical SM count
 | `mm_m1_16_k7168_n256` | `gemm.routergemm:mm_M1_16_K7168_N256` | 10.0-10.3 | one-shot; operands on the current device |
 | `mm_nvfp4_svdquant` | `gemm:mm_nvfp4_svdquant` | 10.0-10.3 | `backend="cake"`; one-shot |
 | `prepare_fp4_gemm` | `fp4_gemm:prepare_fp4_gemm` | 10.0-10.3 | prepare once; pins 148/152 SMs |
-| `prepare_fp4_k_grouped_gemm` | `fp4_k_grouped_gemm:prepare_fp4_k_grouped_gemm` | 10.0-10.3 | prepare once; pins 148/152 SMs |
+| `prepare_fp4_k_grouped_gemm` | `fp4_k_grouped_gemm:prepare_fp4_k_grouped_gemm` | 10.0-10.3 | prepare once; runtime shapes (any group layout, `num_stages` 7) |
 | `prepare_fp8_batched_gemm` | `fp8_batched_gemm:prepare_fp8_batched_gemm` | 10.0-10.3 | prepare once; pins 148/152 SMs |
-| `prepare_fp8_fp4_gemm` | `fp8_fp4_gemm:prepare_fp8_fp4_gemm` | 10.0-10.3 | prepare once; pins 148/152 SMs |
-| `prepare_fp8_gemm_1d1d` | `experimental.deepgemm_fp8_gemm:prepare_fp8_gemm_1d1d` | 10.0-10.3 | prepare once; needs ptxas/toolkit at first use |
+| `prepare_fp8_fp4_gemm` | `fp8_fp4_gemm:prepare_fp8_fp4_gemm` | 10.0-10.3 | prepare once; runtime shapes (`gran_k_a` 32/128) |
+| `prepare_fp8_gemm_1d1d` | `experimental.deepgemm_fp8_gemm:prepare_fp8_gemm_1d1d` | 10.0-10.3 | prepare once; any M/N, K % 128; JIT-built at first use |
 | `prepare_group_gemm_fp8_nt_groupwise_contiguous` | `gemm.cake_grouped_fp8_gemm:prepare_group_gemm_fp8_nt_groupwise_contiguous` | 10.0 | prepare once; first launch NOT capturable |
 | `prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant` | `gemm.cake_grouped_fp8_fused_silu_quant:prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant` | 10.0 | prepare once; first launch NOT capturable |
 | `prepare_grouped_gemm_fwd` | `experimental.cake_moe_grouped_gemm.cake_backend:prepare_grouped_gemm_fwd` | 10.0-10.7 | prepare once; adapter pins {10.0,10.3,10.7} |
