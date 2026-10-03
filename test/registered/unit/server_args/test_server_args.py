@@ -333,6 +333,18 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
+    def test_prefill_max_requests_rejects_non_positive_values(self):
+        for value in (0, -1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError, "--prefill-max-requests must be positive"
+                ),
+            ):
+                ServerArgs(
+                    model_path="dummy", prefill_max_requests=value
+                ).resolve_once()
+
     def test_sampling_mask_max_tokens(self):
         self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)
         self.assertEqual(
