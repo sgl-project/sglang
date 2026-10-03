@@ -652,7 +652,9 @@ class PrefillAdder:
         self.exact_chunk_fill = (
             _use_exact_chunk_fill()
             and dllm_config is None
-            and not (tree_cache.supports_mamba() and tree_cache.is_tree_cache())
+            and not (
+                tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing()
+            )
         )
 
         if self.dllm_config is not None:
