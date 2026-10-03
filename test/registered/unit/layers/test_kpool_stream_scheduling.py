@@ -322,18 +322,44 @@ class TestKPoolStreamScheduling(unittest.TestCase):
 _LARGE_ROWS, _LARGE_COLS = 16384, 229376
 
 
-def _plan_chunks(*, num_rows, num_cols, budget_bytes, capture_mode=False):
+class _Batch:
+    """Stands in for ForwardBatch. The budget cache holds a weak reference to it."""
+
+
+@contextmanager
+def _budget_planner(*, budgets, capture_mode=False):
+    """Yield (plan, budget). plan() runs the real planner on the mocked budget."""
     with (
         patch.object(
-            indexer_module, "mqa_logits_budget_bytes", return_value=budget_bytes
+            indexer_module, "mqa_logits_budget_bytes", side_effect=list(budgets)
         ) as budget,
         patch.object(indexer_module, "is_hip", return_value=False),
         patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
         patch.object(indexer_module.capture_mode, "is_capture_mode", capture_mode),
+        patch.dict(indexer_module._MQA_LOGITS_BUDGET_BYTES, clear=True),
     ):
-        chunks = indexer_module._mqa_logits_row_chunks(
-            num_rows=num_rows, num_cols=num_cols, device=torch.device("cuda", 0)
-        )
+
+        def plan(
+            *,
+            forward_batch,
+            num_rows=_LARGE_ROWS,
+            num_cols=_LARGE_COLS,
+            device_index=0,
+        ):
+            return indexer_module._mqa_logits_row_chunks(
+                num_rows=num_rows,
+                num_cols=num_cols,
+                device=torch.device("cuda", device_index),
+                forward_batch=forward_batch,
+            )
+
+        yield plan, budget
+
+
+def _plan_chunks(*, num_rows, num_cols, budget_bytes, capture_mode=False):
+    planner = _budget_planner(budgets=[budget_bytes], capture_mode=capture_mode)
+    with planner as (plan, budget):
+        chunks = plan(forward_batch=_Batch(), num_rows=num_rows, num_cols=num_cols)
     return chunks, budget
 
 
@@ -342,6 +368,29 @@ class TestKPoolMqaLogitsRowChunks(CustomTestCase):
         chunks, budget = _plan_chunks(num_rows=64, num_cols=1024, budget_bytes=1 << 20)
         self.assertEqual(chunks, (slice(0, 64),))
         budget.assert_not_called()
+
+    def test_one_forward_batch_reads_the_budget_once_per_device(self):
+        """Every sparse-attention layer of one forward plans with the same batch."""
+        batch = _Batch()
+        with _budget_planner(budgets=[6 << 30] * 4) as (plan, budget):
+            for _ in range(3):
+                plan(forward_batch=batch)
+            plan(forward_batch=batch, device_index=1)
+        self.assertEqual(
+            [call.kwargs["device_index"] for call in budget.call_args_list], [0, 1]
+        )
+
+    def test_the_next_forward_batch_reads_the_budget_again(self):
+        """Free memory can fall between forwards (#40854), so a reading must
+        not serve a later batch."""
+        first, second = _Batch(), _Batch()
+        with _budget_planner(budgets=[6 << 30, 2 << 30]) as (plan, budget):
+            before = plan(forward_batch=first)
+            after = plan(forward_batch=second)
+        self.assertEqual(budget.call_count, 2)
+        self.assertGreater(len(after), len(before))
+        for rows in after:
+            self.assertLessEqual((rows.stop - rows.start) * _LARGE_COLS * 4, 2 << 30)
 
     def test_chunks_cover_every_row_once_and_fit_the_budget(self):
         budget_bytes = 6 << 30
@@ -388,7 +437,7 @@ class TestKPoolMqaLogitsRowChunks(CustomTestCase):
         self.assertGreater(len(chunks), 1)
 
 
-def _row_chunks(*, rows_per_chunk, num_rows, num_cols, device):
+def _row_chunks(*, rows_per_chunk, num_rows, num_cols, device, forward_batch):
     if rows_per_chunk is None:
         return (slice(0, num_rows),)
     return tuple(
