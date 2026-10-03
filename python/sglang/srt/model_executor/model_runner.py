@@ -228,6 +228,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.cuda_event_pool import prewarm_cuda_event_pool
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -421,6 +422,8 @@ class ModelRunner:
                 f"Context: {self.device=} {get_device().gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {get_parallel().tp_rank=} {get_parallel().tp_size=}"
             )
             raise
+
+        self.init_cuda_event_pool()
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
@@ -1173,6 +1176,14 @@ class ModelRunner:
             moe_ep_size=get_parallel().moe_ep_size,
             moe_dp_size=get_parallel().moe_dp_size,
         )
+
+    def init_cuda_event_pool(self):
+        # Prewarm before CUDA graph capture and serving; devices without a pool
+        # keep PyTorch's wait_stream path.
+        if current_platform.is_cuda() and envs.SGLANG_ENABLE_CUDA_EVENT_POOL.get():
+            gpu_id = get_device().gpu_id
+            prewarm_cuda_event_pool(gpu_id)
+            logger.info("Enabled the CUDA event pool on device %d.", gpu_id)
 
     def init_torch_distributed(self):
         self.pre_model_load_memory = bootstrap.measure_pre_model_load_memory(
