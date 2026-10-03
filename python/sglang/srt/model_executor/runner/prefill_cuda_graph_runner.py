@@ -77,6 +77,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.managers.cache_controller import LayerDoneCounter
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
@@ -2168,12 +2169,28 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"capture mode ({self.capture_hidden_mode.name})."
             )
 
+    def _wait_for_hicache_load_back(self) -> None:
+        """Order the forward stream behind the pending HiCache load-back.
+
+        The pools' per-layer ``layer_transfer_counter.wait_until`` calls are
+        Python-side and only run on replay inside eager graph breaks. The full
+        backend replays the whole transformer body as one graph, so wait once
+        on the load op's final event before replay.
+        """
+        counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
+        if isinstance(counter, LayerDoneCounter) and counter.consumer_index >= 0:
+            self.device_module.current_stream().wait_event(
+                counter.events[counter.consumer_index].finish_event
+            )
+
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         self._validate_capture_hidden_mode(forward_batch)
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
+            if self._is_full_backend:
+                self._wait_for_hicache_load_back()
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
