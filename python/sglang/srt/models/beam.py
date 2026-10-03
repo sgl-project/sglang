@@ -397,14 +397,18 @@ class BeamAttention(nn.Module):
         if self.use_fused_qk_norm_rope and not force_torch:
             self._fused_qk_norm_rope(positions, q, k)
         else:
-            q, k = apply_qk_norm(
-                q=q,
-                k=k,
-                q_norm=self.q_norm,
-                k_norm=self.k_norm,
-                head_dim=self.head_dim,
-                allow_inplace=_is_cuda and not force_torch,
-            )
+            if force_torch:
+                q = self.q_norm(q.reshape(-1, self.head_dim)).view(q.shape)
+                k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)
+            else:
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    head_dim=self.head_dim,
+                    allow_inplace=_is_cuda,
+                )
             if self.rotary_emb is not None:
                 q, k = self.rotary_emb(positions, q, k)
             else:

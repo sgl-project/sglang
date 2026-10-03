@@ -28,6 +28,7 @@ from sglang.kernels.fused_op import (
 from sglang.kernels.ops.attention.fused_qknorm_rope import fused_qk_norm_rope
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.models.beam import (
@@ -305,7 +306,9 @@ class TestBeamNumerics(CustomTestCase):
         try:
             set_fused_op_backend(None)
             with (
-                get_context().override_server_args(),
+                get_context().override_server_args(
+                    cuda_graph_config=default_cuda_graph_config()
+                ),
                 get_parallel().override(
                     tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0, attn_dp_size=1
                 ),
@@ -385,7 +388,19 @@ class TestBeamNumerics(CustomTestCase):
                                 None,
                                 compute_ssmax_scale(positions),
                             )
+                            with get_context().override_server_args(
+                                cuda_graph_config=None
+                            ):
+                                unconfigured = attention(
+                                    positions,
+                                    torch.zeros(2, self.config.hidden_size),
+                                    None,
+                                    compute_ssmax_scale(positions),
+                                )
                         torch.testing.assert_close(actual, q * 0.5, atol=0, rtol=0)
+                        torch.testing.assert_close(
+                            unconfigured, q * 0.5, atol=0, rtol=0
+                        )
         finally:
             set_fused_op_backend(previous_backend)
 
