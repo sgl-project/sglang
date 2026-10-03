@@ -771,12 +771,13 @@ class RMSNorm(BaseFusedOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            # in place: out <- norm(x + residual), residual_out <- x + residual
+            out = x.clone()
+            residual_out = residual.clone(memory_format=torch.contiguous_format)
             fused_add_rms_norm(
-                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
+                out, residual_out, self.weight.data, self.variance_epsilon
             )
             return out, residual_out
         out = torch.empty_like(x)
@@ -1179,18 +1180,16 @@ class GemmaRMSNorm(BaseFusedOp):
             return self.forward_native(x, residual, post_residual_addition)
         else:
             w = self.gemma_weight
-            # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
-            #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
+            # vllm API: rms_norm(out, input, weight, eps) -> None
+            #           fused_add_rms_norm(input, residual, weight, eps), in place
             if not x.is_contiguous():
                 x = x.contiguous()
             if residual is not None:
-                out = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                fused_add_rms_norm(
-                    out, x, residual_out, residual, w, self.variance_epsilon
-                )
+                out = x.clone()
+                residual_out = residual.clone(memory_format=torch.contiguous_format)
+                fused_add_rms_norm(out, residual_out, w, self.variance_epsilon)
                 return out, residual_out
             out = torch.empty_like(x)
             rms_norm(out, x, w, self.variance_epsilon)
