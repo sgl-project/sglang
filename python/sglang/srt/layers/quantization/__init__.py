@@ -15,9 +15,6 @@ from sglang.srt.layers.quantization.awq import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
@@ -57,6 +54,41 @@ from sglang.srt.utils import (
 )
 
 _is_gfx95_supported = is_gfx95_supported()
+
+
+class _LazyQuantConfig:
+    """Defers importing a quantization config class until it is first used.
+
+    ``compressed_tensors`` (a third-party dependency) eagerly imports
+    torch.ao.quantization.fx at import time, even for models that never use
+    this quantization method.
+    """
+
+    def __init__(self, module_name: str, class_name: str):
+        self._module_name = module_name
+        self._class_name = class_name
+        self._cls = None
+
+    def _resolve(self) -> Type[QuantizationConfig]:
+        if self._cls is None:
+            import importlib
+
+            self._cls = getattr(
+                importlib.import_module(self._module_name), self._class_name
+            )
+        return self._cls
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+    def __call__(self, *args, **kwargs):
+        return self._resolve()(*args, **kwargs)
+
+
+CompressedTensorsConfig: Type[QuantizationConfig] = _LazyQuantConfig(
+    "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors",
+    "CompressedTensorsConfig",
+)  # type: ignore[assignment]
 
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
