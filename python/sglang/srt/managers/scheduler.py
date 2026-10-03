@@ -298,6 +298,10 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.multimodal.processors.kimi_cache_config import (
+    uses_kimi_wide_image_pads,
+    validate_kimi_wide_pad_config,
+)
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -5107,6 +5111,18 @@ class Scheduler(
                 success=False,
                 message="Current tree_cache implementation does not support dynamic attach.",
             )
+
+        if uses_kimi_wide_image_pads(
+            self.model_config.hf_config.architectures,
+            get_resolved_model_impl(self.model_config),
+        ):
+            try:
+                validate_kimi_wide_pad_config(
+                    self.server_args,
+                    hicache_storage_backend=recv_req.hicache_storage_backend,
+                )
+            except ValueError as e:
+                return AttachHiCacheStorageReqOutput(success=False, message=str(e))
 
         try:
             ok, msg = self.tree_cache.attach_storage_backend(

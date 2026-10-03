@@ -47,7 +47,10 @@ from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
+from sglang.srt.multimodal.processors.kimi_common import (
+    KimiGridMMDataMixin,
+    kimi_image_identity,
+)
 from sglang.srt.multimodal.processors.kimi_k3 import (
     KimiK3GPUProcessorWrapper,
     KimiK3ImageProcessor,
@@ -650,6 +653,9 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         base_gpu_id=0,
         rl_on_policy_target=None,
         tp_size=1,
+        kv_events_config=None,
+        hicache_storage_backend=None,
+        disaggregation_mode="null",
     )
     with get_context().override_server_args(
         mm_feature_transport="cpu",
@@ -783,7 +789,7 @@ def test_kimi_k3_cached_artifact_is_composed_per_prompt():
     processor._tokenizer = _Tokenizer()
     processor.mm_feature_transport = "cpu"
     processor.use_cuda_ipc = False
-    artifact = _cached_k3_artifact("sha256:" + "ab" * 32, "artifact")
+    artifact = _cached_k3_artifact("sha256:" + "ab" * 32, "sha256:" + "cd" * 32)
 
     first = processor.compose_request([1, 99, 2], [artifact])
     second = processor.compose_request([3, 4, 99, 5], [artifact])
@@ -791,7 +797,10 @@ def test_kimi_k3_cached_artifact_is_composed_per_prompt():
     assert first.input_ids != second.input_ids
     assert first.mm_items[0].offsets == [(3, 5)]
     assert second.mm_items[0].offsets == [(4, 6)]
-    assert first.mm_items[0].hash == second.mm_items[0].hash == 123
+    identity = kimi_image_identity(artifact.artifact_key, artifact.grid_thw)
+    assert first.mm_items[0].identity == second.mm_items[0].identity == identity
+    assert first.mm_items[0].hash == second.mm_items[0].hash
+    assert first.mm_items[0].pad_values == second.mm_items[0].pad_values
     torch.testing.assert_close(first.mm_items[0].feature, second.mm_items[0].feature)
 
 
@@ -1107,10 +1116,59 @@ def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
         existing_hash=direct_item.hash,
         namespace=artifact.artifact_key,
     )
-    expected_item = MultimodalDataItem(modality=Modality.IMAGE, hash=expected_hash)
-    expected_item.set_pad_value()
-    assert artifact.feature_hash == composed_item.hash == expected_hash
-    assert composed_item.pad_value == expected_item.pad_value
+    assert artifact.feature_hash == expected_hash
+    expected_item = MultimodalDataItem(modality=Modality.IMAGE)
+    expected_item.set_identity(
+        kimi_image_identity(artifact.artifact_key, artifact.grid_thw)
+    )
+    assert composed_item.identity == expected_item.identity
+    assert composed_item.hash == expected_item.hash
+    assert composed_item.pad_values == expected_item.pad_values
+
+    # A freshly preprocessed image and the same image served from the
+    # preprocess cache must resolve to the same identity.
+    image = torch.arange(3 * 2 * 4, dtype=torch.uint8).reshape(3, 2, 4)
+    resize_config = {
+        "num_tokens": 2,
+        "new_width": 4,
+        "new_height": 2,
+        "pad_width": 0,
+        "pad_height": 2,
+    }
+    deferred = functools.partial(
+        KimiK3DeferredPreprocessing,
+        backend="gpu",
+        image_mean=[0.5, 0.5, 0.5],
+        image_std=[0.5, 0.5, 0.5],
+        transparent_bg_config=None,
+    )
+    processor._processor = SimpleNamespace(
+        preprocess_config=_k3_preprocess_config(patch_size=2),
+        prepare_deferred=Mock(
+            return_value=(torch.tensor([[1, 99, 99, 2]]), [resize_config], deferred)
+        ),
+    )
+    processor.processor_fingerprint = "sha256:" + "ef" * 32
+    fresh_item = processor._build_deferred_output(
+        SimpleNamespace(input_text="prompt", images=[image], input_ids=[1, 99, 2])
+    ).mm_items[0]
+
+    cached_artifact = processor._make_artifact(
+        content_digest=snapshot_media(image).content_digest,
+        artifact_key=processor._artifact_key(
+            snapshot_media(image).content_digest, image
+        ),
+        original_size=(4, 2),
+        resize_config=resize_config,
+        grid_thw=tuple(fresh_item.image_grid_thw.flatten().tolist()),
+        feature=fresh_item.feature,
+        deferred=deferred(resize_config=resize_config),
+    )
+    cached_item = processor.compose_request([1, 99, 2], [cached_artifact]).mm_items[0]
+    assert fresh_item.identity is not None
+    assert cached_item.identity == fresh_item.identity
+    assert cached_item.hash == fresh_item.hash
+    assert cached_item.pad_values == fresh_item.pad_values
 
 
 def test_kimi_k3_untrusted_path_change_is_a_cache_miss():
@@ -1294,10 +1352,15 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
         input_text="prompt", images=images, input_ids=[1, 99, 2, 99, 3]
     )
 
+    processor.processor_fingerprint = "sha256:" + "ef" * 32
+
     output = processor._build_deferred_output(base_output)
 
     assert output.input_ids == [1, 99, 99, 2, 99, 3]
     assert [item.offsets for item in output.mm_items] == [[(1, 2)], [(4, 4)]]
+    first, second = output.mm_items
+    assert len(first.identity) == len(second.identity) == 32
+    assert set(first.pad_values).isdisjoint(second.pad_values)
     assert [item.feature.dtype for item in output.mm_items] == [
         torch.uint8,
         torch.uint8,
