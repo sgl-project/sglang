@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, cast
 
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
@@ -61,6 +62,9 @@ def free_swa_out_of_window_slots(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     is_chunk_cache: bool = False,
     retain_floor: int | None = None,
+    component_type: ComponentType = ComponentType.SWA,
+    free_segment: Callable[..., None] | None = None,
+    eviction_interval: int = 1,
 ) -> None:
     if not req.kv.holds_kv:
         return
@@ -69,9 +73,17 @@ def free_swa_out_of_window_slots(
     assert req.kv.cache_protected_len % page_size == 0, (
         "cache_protected_len must be page aligned"
     )
-    req.kv.swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen, req.kv.swa_dead_lo(page_size)
+    # Protected rows limit what can be freed, not where the interval starts.
+    evicted_seqlen = req.kv.get_evicted_seqlen(component_type)
+    if pre_len - sliding_window_size < evicted_seqlen + eviction_interval:
+        return
+    dead_lo = (
+        req.kv.swa_dead_lo(page_size)
+        if component_type == ComponentType.SWA
+        else req.kv.cache_protected_len
     )
+    evicted_seqlen = max(evicted_seqlen, dead_lo)
+    req.kv.set_evicted_seqlen(component_type, evicted_seqlen)
 
     if is_chunk_cache:
         # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
@@ -89,22 +101,20 @@ def free_swa_out_of_window_slots(
         # retained checkpoint could never be matched and holding it is pure cost.
         evict_threshold = min(evict_threshold, retain_floor)
 
-    new_swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen,
-        evict_threshold,
-    )
+    new_evicted_seqlen = max(evicted_seqlen, evict_threshold)
 
     if page_size > 1:
-        new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
+        new_evicted_seqlen = (new_evicted_seqlen // page_size) * page_size
 
-    if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
+    if new_evicted_seqlen > evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
+            req.kv.req_pool_idx, evicted_seqlen:new_evicted_seqlen
         ]
-        token_to_kv_pool_allocator.free_swa_segment(
-            free_slots, start_pos=req.kv.swa_evicted_seqlen
-        )
-        req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
+        if free_segment is None:
+            assert component_type == ComponentType.SWA
+            free_segment = token_to_kv_pool_allocator.free_swa_segment
+        free_segment(free_slots, start_pos=evicted_seqlen)
+        req.kv.set_evicted_seqlen(component_type, new_evicted_seqlen)
 
 
 def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -159,11 +169,16 @@ def free_kv_row_segments(
         allocator.free_segments(swa_alive)
 
 
-def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
+def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Publish what the running request has computed so far, unless it is
+    barred from the tree."""
+    # The tree reads req.finished() to tell a checkpoint from the final
+    # insert; a finished request belongs in release_kv_cache.
+    assert not req.finished(), f"checkpointing finished request {req.rid}"
     if req.skip_radix_cache_insert:
         return
 
-    tree_cache.cache_unfinished_req(req, **kwargs)
+    tree_cache.checkpoint(req, up_to=req.extend_range.end)
 
 
 def evict_from_tree_cache(
@@ -303,11 +318,17 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     owned_kv_len = req.owned_kv_len()
     is_insert = is_insert and not req.skip_radix_cache_insert
     if is_insert:
-        tree_cache.cache_finished_req(req, owned_kv_len=owned_kv_len)
-    else:
-        # The protected prefix is not this req's to free.
-        tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-        tree_cache.unpin(req)
+        # A tree that takes over component state (mamba) must see the request
+        # finished, or the insert forks the state and the slot leaks.
+        assert req.finished() or not tree_cache.supports_mamba(), (
+            f"releasing unfinished request {req.rid} into a mamba tree"
+        )
+        # The fill-id array lags output_ids until the next prepare_for_decode.
+        req.refresh_fill_ids()
+        tree_cache.checkpoint(req, up_to=owned_kv_len)
+    # The protected prefix is not this req's to free.
+    tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+    tree_cache.unpin(req)
     _release_overallocated_kv_indices(
         req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
     )
@@ -337,7 +358,12 @@ def _release_overallocated_kv_indices(
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not get_serving().strip_thinking_cache:
-        assert start_p == end_p, (
+        # A stop landing before the last committed token does the same, via
+        # effective_kv_committed_len().
+        assert start_p == end_p or (
+            req.finished_len is not None
+            and len(req.origin_input_ids) + req.finished_len < req.kv.kv_committed_len
+        ), (
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
         )
 
@@ -350,7 +376,7 @@ def _release_overallocated_kv_indices(
 
     if start_p < end_p:
         # start_p is aligned to the allocator's page above, so it never shares a
-        # page with cache_finished_req's tail free in this group.
+        # page with the tail free_kv_row in this group.
         tree_cache.free_kv_row(req.kv, [(start_p, end_p)])
 
 

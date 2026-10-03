@@ -66,7 +66,7 @@ def _unsupported_derived_weight_cache_error(
             reason = getattr(module, "_derived_weight_cache_error", None)
             if reason is not None:
                 return reason
-    from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
+    from sglang.kernels.ops.gemm.bf16_fp32 import hpc_bf16xfp32_gemm_enabled
 
     if hpc_bf16xfp32_gemm_enabled():
         return (

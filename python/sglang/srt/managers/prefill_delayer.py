@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -105,9 +106,9 @@ class PrefillDelayer:
             f"queue_trigger_enabled={self._queue_trigger_enabled}"
         )
         parallel = get_parallel()
-        self.dp_size = parallel.dp_size
-        self.enable_dp_attention = parallel.enable_dp_attention
-        dp_size_dim = self.dp_size if self.enable_dp_attention else 1
+        self.num_dp_ranks = parallel.num_dp_ranks
+        self.attn_dp_enabled = parallel.attn_dp_enabled
+        dp_size_dim = self.num_dp_ranks if self.attn_dp_enabled else 1
 
         # Mirror scheduler_dp_attn_mixin's NCCL all-gather path: when the
         # env flag is on (or overlap scheduling is disabled), ride the NCCL
@@ -128,9 +129,10 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len.
+        # waiting_queue_len. The gather spans the TP group, whose ranks are
+        # laid out DP-major over attn_cp_size * attn_tp_size.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, parallel.attn_tp_size, 5),
+            (dp_size_dim, parallel.attn_cp_size * parallel.attn_tp_size, 5),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -236,10 +238,10 @@ class PrefillDelayer:
                     **wait_info,
                 )
 
-            if not self.enable_dp_attention:
+            if not self.attn_dp_enabled:
                 max_running_requests = (
-                    max_running_requests + self.dp_size - 1
-                ) // self.dp_size
+                    max_running_requests + self.num_dp_ranks - 1
+                ) // self.num_dp_ranks
 
             global_running_batch_max = int(global_running_batch.max().item())
             global_max_prefill_bs_max = int(global_max_prefill_bs.max().item())
@@ -369,7 +371,7 @@ class PrefillDelayer:
             device=self._gather_device,
             dtype=torch.int64,
         )
-        torch.distributed.all_gather_into_tensor(
+        all_gather_single(
             self._global_info_buffer.flatten(),
             local_info,
             group=self._gather_group,
@@ -409,10 +411,10 @@ class PrefillDelayerSinglePassExecutor:
         waiting_queue_len: int,
     ) -> int:
         local_max_running_requests = max_running_requests
-        if not self._prefill_delayer.enable_dp_attention:
+        if not self._prefill_delayer.attn_dp_enabled:
             local_max_running_requests = (
-                max_running_requests + self._prefill_delayer.dp_size - 1
-            ) // self._prefill_delayer.dp_size
+                max_running_requests + self._prefill_delayer.num_dp_ranks - 1
+            ) // self._prefill_delayer.num_dp_ranks
 
         # The delayer negotiates before PrefillAdder materializes can_run_list,
         # so a rejected pass has no exact batch size. This upper bound is exact

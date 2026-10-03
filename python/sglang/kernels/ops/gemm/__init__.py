@@ -422,3 +422,184 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="gemm.linear_bf16_fp32",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.gemm.bf16_fp32:_linear_bf16_fp32_cublas",
+        description=(
+            "Torch/cuBLAS implementation. The direct linear_bf16_fp32 entry also "
+            "retains its environment-controlled HPC-Ops, AITER and DeepGEMM dispatch."
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.wo_a_bf16_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a:wo_a_bf16_gemv",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.wo_a_bf16_small_batch",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a:wo_a_bf16_small_batch",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.wo_a_bf16_small_batch_mxfp8",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a:wo_a_bf16_small_batch_mxfp8",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.hopper_bf16_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.fp8_blockwise_scaled_mm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.fp8_blockwise_gemm:fp8_blockwise_scaled_mm",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
+        ),
+    )
+)
+# Mirrors SUPPORTED_CAPABILITIES in ops.gemm.convrot_int8 (pinned by a test).
+_CONVROT_INT8 = frozenset(
+    CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
+    for sm in ((9, 0), (10, 0), (12, 0), (12, 1))
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.convrot_rotate_quantize_activation",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.convrot_int8:convrot_rotate_quantize_activation",
+        capabilities=_CONVROT_INT8,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="group-wise regular Hadamard rotation + per-row INT8 quant of BF16 [M, K] -> (int8 [M, K], fp32 [M])",
+        ),
+        description="ConvRot INT8 activation / weight quantizer (sglang.kernels.jit).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.convrot_int8_fused_linear",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.convrot_int8:convrot_int8_fused_linear",
+        capabilities=_CONVROT_INT8,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16", "int8"),
+            description="BF16 [M, K] x int8 [N, K] -> BF16 [M, N] with in-kernel rotation, INT8 quant and fused per-row x per-column dequant (+ bias)",
+        ),
+        description="ConvRot INT8 W8A8 linear (sglang.kernels.jit).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.convrot_int8_linear_prequant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.convrot_int8:convrot_int8_linear_prequant",
+        capabilities=_CONVROT_INT8,
+        format_signature=FormatSignature(
+            supported_dtypes=("int8", "float32", "bfloat16"),
+            description="int8 [M, K] x int8 [N, K] with per-row / per-column fp32 scales -> BF16 [M, N] (+ bias); for linears sharing one rotated input",
+        ),
+        description="ConvRot INT8 GEMM on a pre-quantized activation (sglang.kernels.jit).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm120_fp8_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_fp8_gemv:sm120_fp8_gemv",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.gptq_marlin_gemm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.gptq_marlin:gptq_marlin_gemm",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.rel_proj_small_t",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.inkling_rel_proj:rel_proj_small_t",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.fused_hc_mix",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.hc_mix:fused_hc_mix",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.w8a8_block_fp8_matmul",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.fp8_kernel:w8a8_block_fp8_matmul",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.w8a8_block_fp8_matmul_triton",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.fp8_kernel:w8a8_block_fp8_matmul_triton",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.w8a8_block_fp8_matmul_deepgemm",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.gemm.fp8_kernel:w8a8_block_fp8_matmul_deepgemm",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.w8a8_mxfp8_matmul_deepgemm",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.gemm.fp8_kernel:w8a8_mxfp8_matmul_deepgemm",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.triton_scaled_mm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.fp8_kernel:triton_scaled_mm",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.w8a8_block_int8_matmul",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.int8_kernel:w8a8_block_int8_matmul",
+    )
+)

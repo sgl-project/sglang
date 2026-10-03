@@ -82,6 +82,7 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
         )
         args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+            hf_text_config=SimpleNamespace(model_type="deepseek_v3"),
             is_multimodal=False,
         )
 
@@ -99,6 +100,7 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
         )
         args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+            hf_text_config=SimpleNamespace(model_type="deepseek_v4"),
             is_multimodal=False,
         )
 
@@ -128,8 +130,41 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
             nnodes=2,
             attention_backend="dsv4",
         )
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v4")
+        )
 
         with self.assertRaisesRegex(AssertionError, "only supports one node"):
+            validate_deepseek_v4_cp(args)
+
+    @override_platform(is_hip=True, is_npu=False, is_musa=False)
+    def test_hip_deepseek_v4_cp_rejects_decoder_swa_bounded_replay(self):
+        args = ServerArgs(
+            model_path="local-deepseek-v4",
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            tp_size=2,
+            attention_backend="dsv4",
+            enable_decoder_swa_bounded_replay=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "decoder-swa-bounded-replay"):
+            validate_deepseek_v4_cp(args)
+
+    @override_platform(is_hip=True, is_npu=False, is_musa=False)
+    def test_hip_deepseek_v41_cp_is_rejected(self):
+        args = ServerArgs(
+            model_path="local-deepseek-v41",
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            tp_size=2,
+            attention_backend="dsv4",
+        )
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        )
+
+        with self.assertRaisesRegex(ValueError, "V4.1 prefill CP on HIP"):
             validate_deepseek_v4_cp(args)
 
     def test_non_cp_and_decode_cp_are_not_rejected(self):

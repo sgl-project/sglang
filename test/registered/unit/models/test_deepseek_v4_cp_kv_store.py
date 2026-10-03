@@ -36,6 +36,18 @@ class TestDeepseekV4CPKVStore(unittest.TestCase):
 
         with (
             mock.patch.object(deepseek_v4, "_is_hip", True),
+            # CPU CI never imports the ROCm helpers; keep q_b on the plain path.
+            mock.patch.object(
+                deepseek_v4,
+                "_hip",
+                SimpleNamespace(
+                    compute_q_b=lambda attn, q_lora, q_for_wqb, positions, q_out, *_: (
+                        attn._compute_q_b(q_for_wqb, positions, q_out),
+                        q_lora,
+                        False,
+                    )
+                ),
+            ),
             mock.patch.object(deepseek_v4, "_is_npu", False),
             mock.patch.object(deepseek_v4, "is_cp_active", return_value=True),
             mock.patch.object(
@@ -74,6 +86,7 @@ class TestDeepseekV4CPKVStore(unittest.TestCase):
         layer.q_lora_rank = 2
         layer.dsa_enable_prefill_cp = True
         layer.use_fused_qk_norm_rope = True
+        layer.fused_rmsnorm_fake_quant = False
         layer.layer_id = 3
         layer.eps = 1e-6
         layer.qk_rope_head_dim = 2

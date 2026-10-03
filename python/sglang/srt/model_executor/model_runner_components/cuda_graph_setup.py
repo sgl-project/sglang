@@ -15,6 +15,7 @@ from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
@@ -252,7 +253,7 @@ def sync_elastic_cuda_graph_config(
     gathered_hashes = torch.empty(
         dist.get_world_size(world_group), dtype=torch.int64, device=device
     )
-    dist.all_gather_into_tensor(gathered_hashes, local_hash, group=world_group)
+    all_gather_single(gathered_hashes, local_hash, group=world_group)
     hashes = gathered_hashes.cpu().tolist()
     if any(value != hashes[0] for value in hashes[1:]):
         raise RuntimeError(

@@ -106,6 +106,7 @@ class TestFusedMOE(CustomTestCase):
 
         topk_op = TopK(
             top_k=topk,
+            layer_id=0,
             renormalize=False,
             use_grouped_topk=False,
         )

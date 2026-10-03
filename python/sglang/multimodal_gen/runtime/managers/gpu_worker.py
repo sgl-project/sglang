@@ -85,6 +85,10 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutTrajectoryData,
+    concat_rollout_trajectory_data,
+)
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.realtime.video import (
     RAW_RGB_CONTENT_TYPE,
@@ -141,6 +145,9 @@ class _ExpandedOutputParts:
     output_file_paths: list[str] = field(default_factory=list)
     metrics_list: list[Any] = field(default_factory=list)
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
+    rollout_trajectory_data: list[RolloutTrajectoryData | None] = field(
+        default_factory=list
+    )
 
 
 def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
@@ -751,18 +758,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
 
-            # dump per-request perf report to the server-mode file path.
-            if (
-                req.perf_dump_path is not None
-                and not req.is_warmup
-                and output_batch.metrics is not None
-            ):
-                PerformanceLogger.dump_benchmark_report(
-                    file_path=req.perf_dump_path,
-                    metrics=output_batch.metrics,
-                    meta={"model": self.server_args.model_path},
-                    tag="server_perf_dump",
-                )
+            self._dump_perf_report(req, output_batch)
         except Exception as e:
             if propagate_forward_errors and forward_failed:
                 if isinstance(e, StopIteration):
@@ -1097,6 +1093,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if self.is_output_rank:
             output_batch.peak_memory_mb = snapshot.peak_reserved_mb
 
+    def _dump_perf_report(self, req: Req, output_batch: OutputBatch) -> None:
+        """Write the per-request perf report to the server-mode file path."""
+        # one writer per replica, or ranks sharing the path clobber each other
+        if (
+            req.perf_dump_path is None
+            or req.is_warmup
+            or output_batch.metrics is None
+            or not self.is_output_rank
+        ):
+            return
+        PerformanceLogger.dump_benchmark_report(
+            file_path=req.perf_dump_path,
+            metrics=output_batch.metrics,
+            meta={"model": self.server_args.model_path},
+            tag="server_perf_dump",
+        )
+
     def _record_replica_peak_memory(self, output_metrics: list[Any]) -> None:
         """Record replica-wide loading and runtime allocator peaks."""
         if not current_platform.is_cuda():
@@ -1111,9 +1124,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 self._runtime_peak_allocated_mb,
             ],
             dtype=torch.float64,
-            device=current_platform.get_device(self.local_rank),
         )
-        peaks = get_replica_group().all_reduce(peaks, op=torch.distributed.ReduceOp.MAX)
+        replica = get_replica_group()
+        if replica.world_size > 1:
+            # Host counters over gloo: the device group's first collective
+            # sets up NCCL connections, which cost the first dumped request
+            # 0.15 s of latency.
+            torch.distributed.all_reduce(
+                peaks, op=torch.distributed.ReduceOp.MAX, group=replica.cpu_group
+            )
         if not self.is_output_rank:
             return
 
@@ -1335,11 +1354,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             and output_batch.trajectory_timesteps is not None
         ):
             merged.trajectory_timesteps = output_batch.trajectory_timesteps
-        if (
-            merged.rollout_trajectory_data is None
-            and output_batch.rollout_trajectory_data is not None
-        ):
-            merged.rollout_trajectory_data = output_batch.rollout_trajectory_data
 
     @staticmethod
     def _collect_expanded_parts(
@@ -1359,6 +1373,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             parts.trajectory_latents.append(output_batch.trajectory_latents)
         if isinstance(output_batch.noise_pred, torch.Tensor):
             parts.noise_preds.append(output_batch.noise_pred)
+        parts.rollout_trajectory_data.append(output_batch.rollout_trajectory_data)
         if output_batch.trajectory_decoded:
             GPUWorker._collect_trajectory_decoded(
                 parts, output_batch.trajectory_decoded
@@ -1408,6 +1423,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 torch.cat(decoded_step, dim=0)
                 for decoded_step in parts.trajectory_decoded_parts
             ]
+        if any(data is not None for data in parts.rollout_trajectory_data):
+            merged.rollout_trajectory_data = concat_rollout_trajectory_data(
+                parts.rollout_trajectory_data
+            )
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
