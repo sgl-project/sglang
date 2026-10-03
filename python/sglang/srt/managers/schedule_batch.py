@@ -1854,15 +1854,31 @@ class Req(ReqDllmMixin):
 
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
+                matched_stop_str = None
+                matched_finished_len = None
                 for stop_str in self.sampling_params.stop_strs:
-                    stop_str_in_tail = stop_str in tail_str
-                    if stop_str_in_tail or stop_str in self.decoded_text:
-                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        if stop_str_in_tail:
-                            self.finished_len = self._locate_str_stop_finished_len(
-                                new_accepted_len, stop_str=stop_str
-                            )
-                        return True
+                    if stop_str in tail_str:
+                        finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_str=stop_str
+                        )
+                        # Match sequential decoding: earliest completing token wins;
+                        # stops completing in the same token keep list priority.
+                        if (
+                            matched_finished_len is None
+                            or finished_len < matched_finished_len
+                        ):
+                            matched_stop_str = stop_str
+                            matched_finished_len = finished_len
+                        if new_accepted_len <= 1:
+                            break
+                    elif matched_stop_str is None and stop_str in self.decoded_text:
+                        matched_stop_str = stop_str
+                        break
+                if matched_stop_str is not None:
+                    self.finished_reason = FINISH_MATCHED_STR(matched=matched_stop_str)
+                    if matched_finished_len is not None:
+                        self.finished_len = matched_finished_len
+                    return True
 
             # Check stop regex
             if len(self.sampling_params.stop_regex_strs) > 0:
