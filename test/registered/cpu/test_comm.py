@@ -54,11 +54,28 @@ def all_reduce_fn(rank, world_size):
         torch.testing.assert_close(tensor, tensor_shm)
 
 
+def _sample(dtype):
+    if dtype.is_floating_point:
+        return torch.randn(2, 10, dtype=dtype)
+    return torch.randint(-1000, 1000, (2, 10), dtype=dtype)
+
+
+# Gather moves bytes instead of reducing, so it is not limited to the float
+# dtypes shm_allreduce supports.
+GATHER_DTYPES = [
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+    torch.int64,
+    torch.int32,
+]
+
+
 def all_gather_fn(rank, world_size):
     dim = -1
 
-    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
-        tensor = torch.randn(2, 10, dtype=dtype)
+    for dtype in GATHER_DTYPES:
+        tensor = _sample(dtype)
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -82,8 +99,8 @@ def all_gather_fn(rank, world_size):
 
 
 def all_gather_into_tensor_fn(rank, world_size):
-    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
-        tensor = torch.randn(2, 10, dtype=dtype)
+    for dtype in GATHER_DTYPES:
+        tensor = _sample(dtype)
 
         input_size = tensor.size()
         output_size = (input_size[0] * world_size,) + input_size[1:]
