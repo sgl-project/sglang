@@ -2,13 +2,28 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import re
 from pathlib import Path, PurePosixPath
 
 import psutil
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
+
+_BUDGET_ENV = "SGLANG_HICACHE_HOST_MEMORY_BYTES"
+
+
+@functools.cache
+def _warn_no_cgroup_mount() -> None:
+    logger.warning(
+        "The process belongs to a cgroup but no cgroup filesystem is mounted; "
+        "sizing HiCache against host available memory. If the process runs "
+        "under a memory limit, set %s to its host memory budget.",
+        _BUDGET_ENV,
+    )
 
 
 def _unescape_mount_path(value: str) -> str:
@@ -32,9 +47,11 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
 
     headroom = None
     resolved = False
+    cgroup_mounted = False
     for line in mounts.splitlines():
         before, after = line.split(" - ", 1)
         filesystem, _, options = after.split()[:3]
+        cgroup_mounted |= filesystem in ("cgroup", "cgroup2")
         if filesystem not in memberships:
             continue
         if filesystem == "cgroup" and "memory" not in options.split(","):
@@ -84,14 +101,30 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
                 break
             directory = directory.parent
     if memberships and not resolved:
+        if not cgroup_mounted:
+            # E.g. a container sharing the host cgroup namespace without
+            # cgroupfs: no limit is visible, so size against host memory.
+            _warn_no_cgroup_mount()
+            return None
+        # A mounted but unmatched hierarchy may hide a real limit.
         raise RuntimeError(
-            "Cannot locate the process memory cgroup in mounted cgroup filesystems"
+            "Cannot locate the process memory cgroup in mounted cgroup "
+            f"filesystems; set {_BUDGET_ENV} to the host memory budget to skip "
+            "cgroup discovery"
         )
     return headroom
 
 
 def available_host_memory_bytes() -> int:
-    """Conservative allocatable RAM; charged file cache is not assumed reclaimable."""
+    """Conservative allocatable RAM; charged file cache is not assumed reclaimable.
+
+    An explicit SGLANG_HICACHE_HOST_MEMORY_BYTES replaces both probes.
+    """
+    budget = envs.SGLANG_HICACHE_HOST_MEMORY_BYTES.get()
+    if budget is not None:
+        if budget <= 0:
+            raise ValueError(f"{_BUDGET_ENV} must be positive, got {budget}")
+        return budget
     available = psutil.virtual_memory().available
     cgroup_headroom = _cgroup_memory_headroom()
     if cgroup_headroom is not None:
