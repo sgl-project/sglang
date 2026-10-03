@@ -378,6 +378,7 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
     )
 
     tree_context = TreeCacheBuildContext(
