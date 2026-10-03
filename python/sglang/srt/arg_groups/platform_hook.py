@@ -45,6 +45,9 @@ def handle_ppu_backends(server_args: Any):
     # DSA FlashMLA decode compute stays non-FP8 on PPU by default.
     if not envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.is_set():
         envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.set(False)
+    # Use CUDA FLA fast path by default on PPU.
+    if not envs.SGLANG_SAIL_FLA_CUDA.is_set():
+        envs.SGLANG_SAIL_FLA_CUDA.set(True)
     # Disable custom allreduce by default on PPU (use pccl allreduce for perf).
     if not cfg.disable_custom_all_reduce:
         declare_resolution(

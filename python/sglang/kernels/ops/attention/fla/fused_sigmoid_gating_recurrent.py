@@ -5,7 +5,8 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx95_supported, is_hip, logger
 
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
@@ -491,6 +492,40 @@ def fused_sigmoid_gating_delta_rule_update(
     # KDA and GDN recurrent paths.
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
+    if envs.SGLANG_SAIL_FLA_CUDA.get():
+        from fla import fused_sigmoid_gating_delta_rule_forward_k_last
+
+        logger.info_once(
+            f"USE PPU SAIL CUDA FLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last"
+        )
+
+        output = fused_sigmoid_gating_delta_rule_forward_k_last(
+            A_log,
+            a,
+            dt_bias,
+            softplus_beta,
+            softplus_threshold,
+            q,
+            k,
+            v,
+            b,
+            initial_state_source,
+            initial_state_indices,
+            scale,
+            use_qk_l2norm_in_kernel,
+            cu_seqlens,
+            is_kda,
+            disable_state_update,
+            intermediate_states_buffer,
+            intermediate_state_indices,
+            cache_steps,
+            retrieve_parent_token,
+        )
+        return output
+
+    logger.info_once(
+        f"USE Community SGLang Triton Kernel: fused_sigmoid_gating_delta_rule_update_kernel"
+    )
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,

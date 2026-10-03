@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
+from sglang.srt.environ import envs
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -372,6 +373,40 @@ def fused_recurrent_gated_delta_rule_packed_decode(
 
     NV = triton.cdiv(V, BV)
     grid = (NV, B * HV)
+    from sglang.srt.utils import logger
+
+    if envs.SGLANG_SAIL_FLA_CUDA.get():
+        from fla import (
+            fused_sigmoid_gating_delta_rule_forward_k_last_packed,
+        )
+
+        out = fused_sigmoid_gating_delta_rule_forward_k_last_packed(
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            1.0,
+            20.0,
+            (K**-0.5),
+            initial_state,
+            ssm_state_indices,
+            out,
+            True,
+            torch.arange(B + 1, device=a.device, dtype=torch.int32),
+            False,
+        )
+        logger.info_once(
+            f"USE PPU SAIL CUDA FLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last_packed"
+        )
+        logger.warning_once(
+            f"Note: SAIL FLA kernel use HARD-CODE Softplus value:20!! Check if the community Triton implementation modifies softplus numerical values."
+        )
+        return out, initial_state
+
+    logger.info_once(
+        f"USE Community SGLang Triton Kernel: fused_recurrent_gated_delta_rule_packed_decode_kernel"
+    )
     fused_recurrent_gated_delta_rule_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
         a=a,

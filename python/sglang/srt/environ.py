@@ -1944,6 +1944,7 @@ class Envs:
     SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
+    SGLANG_SAIL_FLA_CUDA = EnvBool(False)
 
 
 envs = Envs()
