@@ -530,10 +530,17 @@ class DiffGenerator:
             return
         if self.server_args.warmup_mode != "off":
             total_duration_ms = results[0].metrics.get("total_duration_ms", 0)
-            logger.info(
-                f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
-                total_duration_ms / 1000.0,
-            )
+            if results[0].metrics.get("warmup_failed"):
+                logger.warning(
+                    "Warmup failed, so this request ran cold: %.2f seconds "
+                    "includes first-use cost and is not a warmed-up timing",
+                    total_duration_ms / 1000.0,
+                )
+            else:
+                logger.info(
+                    f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
+                    total_duration_ms / 1000.0,
+                )
 
         peak_memories = [r.peak_memory_mb for r in results if r.peak_memory_mb]
         if peak_memories:
