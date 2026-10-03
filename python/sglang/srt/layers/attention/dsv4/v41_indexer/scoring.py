@@ -10,9 +10,18 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
-from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    finish_paged_indexer_topk,
+    fp4_index_logits_decode,
+    fp4_index_logits_paged,
+)
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+from sglang.kernels.ops.attention.dsv4.topk import (
+    plan_topk_v2,
+    topk_transform_paged_v2,
+)
+from sglang.srt.runtime_context import get_platform
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
 from sglang.srt.utils.common import async_h2d
 
 from .types import DecodeInputs, PrefillInputs
@@ -343,23 +352,44 @@ def write_prefill(
     inputs.out_raw_indices[chunk.tok, :k] = torch.where(reach, idx, -1).to(torch.int32)
 
 
+class PagedDecodeScores(msgspec.Struct, frozen=True):
+    """Paged decode scores with graph-stable capacity ``lmax``.
+
+    Only positions below each device-side ``lens`` are initialized. Top-k
+    consumers must respect those lengths. With ``has_candidate_mask``, masked
+    positions have -inf scores and must be discarded during selection writeback.
+    """
+
+    bs: int
+    lmax: int
+    lens: torch.Tensor
+    scores: torch.Tensor
+    req: torch.Tensor
+    req_to_token: torch.Tensor
+    ratio: int
+    plan: torch.Tensor
+    has_candidate_mask: bool
+
+
 def decode_scores(
     *,
     inputs: DecodeInputs,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
-) -> Optional[DecodeScores]:
+    candidate_mask: Optional[torch.Tensor] = None,
+) -> Optional[DecodeScores | PagedDecodeScores]:
     """None when there is no row, or nothing visible yet."""
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    inputs.reset_outputs()
+    paged = get_platform().is_sm90
     bs = req.shape[0]
-    assert pos.shape[0] == bs, (
-        f"decode expects one token per request, {pos.shape=} {bs=}"
-    )
+    assert (
+        pos.shape[0] == bs
+    ), f"decode expects one token per request, {pos.shape=} {bs=}"
     if bs == 0:
+        inputs.reset_outputs()
         return None
     lens = (pos + 1) // ratio
     metadata = inputs.paged_metadata
@@ -367,18 +397,69 @@ def decode_scores(
     # A capture-time length read would both synchronize and truncate replay.
     lmax = min(metadata.max_compressed_seq_len, req_to_token.shape[1] // ratio)
     if lmax == 0:
+        inputs.reset_outputs()
         return None
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
+    table = pool.get_index_k_with_scale_buffer(inputs.layer_id)
+    if paged:
+        lens = lens.to(torch.int32)
+        # Prepare the device-side plan before scoring, away from its top-k consumer.
+        plan = plan_topk_v2(lens)
+        scores = fp4_index_logits_paged(
+            q,
+            weights,
+            req,
+            req_to_token,
+            lens,
+            table,
+            table.shape[1] // 68,
+            lmax,
+            ratio,
+            candidate_mask,
+        )
+        return PagedDecodeScores(
+            bs=bs,
+            lmax=lmax,
+            lens=lens,
+            scores=scores,
+            req=req,
+            req_to_token=req_to_token,
+            ratio=ratio,
+            plan=plan,
+            has_candidate_mask=candidate_mask is not None,
+        )
+    inputs.reset_outputs()
     j = torch.arange(lmax, device=pos.device)
     valid = j[None, :] < lens[:, None]
     slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
     slots = slots.masked_fill(~valid, 0)
-    table = pool.get_index_k_with_scale_buffer(inputs.layer_id)
     scores = fp4_index_logits_decode(
         q, weights, slots, lens, table, table.shape[1] // 68
     )
     return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
+
+
+def select_decode(
+    inputs: DecodeInputs, d: DecodeScores | PagedDecodeScores, topk: int
+) -> None:
+    k = min(topk, d.lmax)
+    if isinstance(d, PagedDecodeScores):
+        idx = torch.empty((d.bs, k), dtype=torch.int32, device=d.scores.device)
+        topk_transform_paged_v2(d.scores, d.lens, None, idx, 1, d.plan)
+        finish_paged_indexer_topk(
+            idx,
+            d.scores,
+            d.lens,
+            d.req,
+            d.req_to_token,
+            inputs.out_page_indices,
+            None,
+            d.ratio,
+            d.has_candidate_mask,
+        )
+    else:
+        write_decode(inputs, d, d.scores.topk(k, dim=-1, sorted=False).indices)
 
 
 def write_decode(inputs: DecodeInputs, d: DecodeScores, idx: torch.Tensor) -> None:

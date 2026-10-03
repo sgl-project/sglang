@@ -224,6 +224,7 @@ class TestKPoolStreamScheduling(unittest.TestCase):
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            seq_lens=torch.tensor([8192 + num_tokens]),
             seq_lens_cpu=torch.tensor([8192 + num_tokens]),
         )
         prepare_qk = Mock(return_value=(x, x, None, None))

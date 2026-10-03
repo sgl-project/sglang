@@ -150,6 +150,7 @@ def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     req.best_match_node = req.last_node
     req.lock_receipt = DecLockRefParams()
     req.kv.cache_protected_len = 0
+    req.kv.cache_inserted_len = 0
     req.num_matched_prefix_tokens = 0
     req.host_hit_length = 0
 
@@ -405,8 +406,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
         self.tp_rank = parallel.tp_rank
-        self.tp_size = parallel.tp_size
-        self.dp_size = parallel.dp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
@@ -1713,6 +1712,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.pending_reqs = [
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
+            for decode_req in failed_reqs:
+                if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -2199,7 +2201,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_loc,
         )
 
-        # Truncate fill_len to kv_committed_len so cache_unfinished_req only
+        # Truncate fill_len to kv_committed_len so checkpoint only
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (output_ids is 1 ahead).
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
@@ -3123,7 +3125,7 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
-                # Truncate fill_len to kv_committed_len so cache_unfinished_req
+                # Truncate fill_len to kv_committed_len so checkpoint
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv.kv_committed_len is not None:

@@ -21,7 +21,7 @@ from .scoring import (
     get_index_k_cache,
     prefill_requests,
     quantize_index_q,
-    write_decode,
+    select_decode,
     write_prefill,
 )
 from .types import (
@@ -134,9 +134,7 @@ class FullTopKIndexer:
         )
         if d is None:
             return
-        k = min(inputs.indexer.index_topk, d.lmax)
-        idx = d.scores.topk(k, dim=-1, sorted=False).indices
-        write_decode(inputs, d, idx)
+        select_decode(inputs, d, inputs.indexer.index_topk)
 
     def _deep_gemm_prefill_captured(self, inputs: CapturedPrefillInputs) -> None:
         indexer = inputs.indexer
