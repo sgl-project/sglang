@@ -24,6 +24,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 @pytest.fixture
 def validator(monkeypatch):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
+    # AMD relaxes perf checks to warnings; these tests cover the strict path
+    monkeypatch.setattr(utils.current_platform, "is_hip", lambda: False)
     scenario = ScenarioConfig.from_dict(
         {
             "stages_ms": {},

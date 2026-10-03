@@ -46,6 +46,7 @@ sys.modules.setdefault(
 )
 sys.modules.setdefault("partial_json_parser.core.options", partial_json_parser_options)
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     ReplicatedLinear,
@@ -199,12 +200,22 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         method.process_weights_after_loading(layer)
 
-        torch.testing.assert_close(layer.weight, weight.t(), rtol=0, atol=0)
+        # gfx94x reinterprets the e4m3fn bits as e4m3fnuz (half the value) and
+        # doubles the static scales, so the dequantized weight is unchanged.
+        fp8_dtype, factor = (
+            (torch.float8_e4m3fnuz, 2.0)
+            if is_fp8_fnuz()
+            else (torch.float8_e4m3fn, 1.0)
+        )
+        self.assertEqual(layer.weight.dtype, fp8_dtype)
+        torch.testing.assert_close(
+            layer.weight.float() * factor, weight.t().float(), rtol=0, atol=0
+        )
         torch.testing.assert_close(
             layer.weight_scale,
-            torch.tensor([[0.1], [0.1], [0.2], [0.2], [0.3], [0.3]]),
+            factor * torch.tensor([[0.1], [0.1], [0.2], [0.2], [0.3], [0.3]]),
         )
-        torch.testing.assert_close(layer.input_scale, torch.tensor(1.0))
+        torch.testing.assert_close(layer.input_scale, torch.tensor(factor))
 
     def test_modelopt_fp8_packed_cutlass_requantizes_incomplete_shard_scales(self):
         method = ModelOptFp8LinearMethod(

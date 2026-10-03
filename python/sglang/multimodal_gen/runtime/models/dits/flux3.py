@@ -54,6 +54,11 @@ from sglang.kernels.ops.diffusion import (
     is_plain_layer_norm,
     residual_gate_add,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dtype,
+    fp8_max,
+    is_fp8_fnuz,
+)
 from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3ArchConfig,
     Flux3DiTConfig,
@@ -273,12 +278,16 @@ class Flux3Modulation(nn.Module):
 FP8_E4M3_MAX = 448.0
 
 
-def quantize_fp8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(M, K)`` -> E4M3 values and one fp32 scale per row (amax / 448)."""
+def quantize_fp8_rowwise(
+    x: torch.Tensor,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+    max_value: float = FP8_E4M3_MAX,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(M, K)`` -> E4M3 values and one fp32 scale per row (amax / max_value)."""
     rows = x.float()
-    scale = (rows.abs().amax(dim=1) / FP8_E4M3_MAX).clamp(min=1e-12)
-    quantized = (rows / scale[:, None]).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-    return quantized.to(torch.float8_e4m3fn), scale
+    scale = (rows.abs().amax(dim=1) / max_value).clamp(min=1e-12)
+    quantized = (rows / scale[:, None]).clamp(-max_value, max_value)
+    return quantized.to(dtype), scale
 
 
 class Flux3Fp8RowwiseLinear(nn.Module):
@@ -306,6 +315,13 @@ class Flux3Fp8RowwiseLinear(nn.Module):
             )
         self.out_features, self.in_features = weight.shape
         self.tuple_output = tuple_output
+        if is_fp8_fnuz():
+            # gfx94x _scaled_mm only takes e4m3fnuz. The same bits are half
+            # the e4m3fn value, so double the scale; 0x80 (-0 in e4m3fn) is
+            # NaN in e4m3fnuz and becomes 0.
+            bits = weight.view(torch.int8)
+            weight = bits.masked_fill(bits == -128, 0).view(torch.float8_e4m3fnuz)
+            weight_scale = weight_scale * 2.0
         # Parameters (not buffers) so that layerwise offload streams them.
         self.weight = nn.Parameter(weight.contiguous(), requires_grad=False)
         self.weight_scale = nn.Parameter(
@@ -319,7 +335,7 @@ class Flux3Fp8RowwiseLinear(nn.Module):
         pad = -rows % self.ROW_ALIGNMENT
         if pad:
             flat = F.pad(flat, (0, 0, 0, pad))
-        activation, activation_scale = quantize_fp8_rowwise(flat)
+        activation, activation_scale = quantize_fp8_rowwise(flat, fp8_dtype, fp8_max)
         out = torch._scaled_mm(
             activation,
             self.weight.T,

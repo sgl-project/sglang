@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
@@ -125,25 +126,36 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
                 # Both paths rebind the runtime weight transposed. CUTLASS can
                 # consume a channelwise scale, so it preserves the checkpoint's
                 # FP8 shards; the fallback requantizes them to one max scale.
+                # gfx94x reinterprets the e4m3fn bits as e4m3fnuz (half the
+                # value) and doubles every static scale.
+                fp8_dtype, factor = (
+                    (torch.float8_e4m3fnuz, 2.0)
+                    if is_fp8_fnuz()
+                    else (torch.float8_e4m3fn, 1.0)
+                )
                 weight = model.qkv.weight
-                self.assertEqual(weight.dtype, torch.float8_e4m3fn)
+                self.assertEqual(weight.dtype, fp8_dtype)
                 self.assertEqual(tuple(weight.shape), (_IN_FEATURES, 2 * _SHARD_OUT))
                 weight_scale = model.qkv.weight_scale.flatten()
                 if cutlass_supported:
                     expected_scales = torch.repeat_interleave(
                         checkpoint_scales, _SHARD_OUT
                     )
-                    self.assertTrue(torch.equal(weight.t(), checkpoint_weight))
+                    self.assertTrue(
+                        torch.equal(
+                            weight.t().float() * factor, checkpoint_weight.float()
+                        )
+                    )
                 else:
                     expected_scales = expected_max_scale.expand(weight_scale.numel())
                 torch.testing.assert_close(
                     weight_scale,
-                    expected_scales,
+                    expected_scales * factor,
                     check_device=False,
                 )
                 torch.testing.assert_close(
                     model.qkv.input_scale.flatten().max(),
-                    torch.tensor(0.5),
+                    torch.tensor(0.5 * factor),
                     check_device=False,
                 )
 
