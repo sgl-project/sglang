@@ -675,6 +675,19 @@ class HummingConfig(QuantizationConfig):
             fp8_config.is_fp4_experts = True
             return fp8_config.get_quant_method(layer, prefix)
 
+        # CP decode slices these projections along logical dimensions. Humming's
+        # packed-K layout is not sliceable, so keep their standard FP8 layout.
+        if (
+            isinstance(layer, LinearBase)
+            and self._w4afp8_config is not None
+            and prefix.endswith((".self_attn.q_b_proj", ".self_attn.o_proj"))
+        ):
+            from sglang.srt.runtime_context import get_parallel
+
+            parallel = get_parallel()
+            if parallel.enable_cp_decode_attn_tp and parallel.attn_cp_size > 1:
+                return self._w4afp8_config.get_quant_method(layer, prefix)
+
         quant_config = self.get_quant_config_for_layer(prefix, layer_type)
         if quant_config is None:
             if isinstance(layer, FusedMoE):
