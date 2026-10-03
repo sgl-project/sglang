@@ -82,6 +82,19 @@ from sglang.srt.runtime_context import (
 
 logger = logging.getLogger(__name__)
 
+# Buffer-cache cap when SGLANG_MLX_CACHE_LIMIT_GB is unset: MLX's own default
+# is the memory limit, and the runner wires MLX allocations.
+DEFAULT_CACHE_LIMIT_FRACTION = 0.10
+MIN_DEFAULT_CACHE_LIMIT_BYTES = 1024**3
+
+
+def default_cache_limit_bytes(device_info: dict) -> int:
+    """Default MLX buffer-cache cap for a device, in bytes."""
+    working_set = int(device_info.get("max_recommended_working_set_size", 0))
+    return max(
+        MIN_DEFAULT_CACHE_LIMIT_BYTES, int(working_set * DEFAULT_CACHE_LIMIT_FRACTION)
+    )
+
 
 @dataclass
 class MlxPendingPrefill:
@@ -202,18 +215,8 @@ class MlxModelRunner:
         # modules directly.
         self._quantization: str | None = quantization
 
-        # Optionally cap the buffer cache (recycled GPU buffers). MLX never
-        # returns freed buffers to the OS, so without a cap the process
-        # footprint ratchets up to the worst transient — which is model
-        # load/quantization itself, so the cap must be in place before it.
-        cache_limit_gb = envs.SGLANG_MLX_CACHE_LIMIT_GB.get()
-        if cache_limit_gb is not None:
-            if cache_limit_gb < 0:
-                raise ValueError(
-                    f"SGLANG_MLX_CACHE_LIMIT_GB must be >= 0, got {cache_limit_gb}"
-                )
-            mx.set_cache_limit(int(cache_limit_gb * (1024**3)))
-            logger.info(f"MLX buffer cache limit set to {cache_limit_gb:.1f} GB")
+        # Before model load: that is the largest transient the cache retains.
+        self._apply_cache_limit()
 
         self._load_model()
 
@@ -664,6 +667,24 @@ class MlxModelRunner:
                     "Heterogeneous attention KV needs per-layer pools."
                 )
         return first_config
+
+    def _apply_cache_limit(self) -> None:
+        """Cap MLX's buffer cache: SGLANG_MLX_CACHE_LIMIT_GB if set, else the default."""
+        cache_limit_gb = envs.SGLANG_MLX_CACHE_LIMIT_GB.get()
+        if cache_limit_gb is None:
+            limit = default_cache_limit_bytes(mx.device_info())
+            source = "default"
+        else:
+            if cache_limit_gb < 0:
+                raise ValueError(
+                    f"SGLANG_MLX_CACHE_LIMIT_GB must be >= 0, got {cache_limit_gb}"
+                )
+            limit = int(cache_limit_gb * (1024**3))
+            source = "SGLANG_MLX_CACHE_LIMIT_GB"
+        mx.set_cache_limit(limit)
+        logger.info(
+            f"MLX buffer cache limit set to {limit / (1024**3):.2f} GB ({source})"
+        )
 
     def _compute_pool_size(self, explicit_size: int | None) -> int:
         """Determine pool slot count (auto-size from available memory if needed)."""
