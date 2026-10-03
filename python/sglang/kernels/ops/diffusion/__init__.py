@@ -50,6 +50,13 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     (
+        "diffusion.fp8_rowwise",
+        KernelBackend.TRITON,
+        "quantization.fp8_rowwise_triton:fp8_rowwise",
+        frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+        "FLUX.3 dynamic rowwise E4M3 quantization and zero row padding.",
+    ),
+    (
         "diffusion.gelu_tanh_cat",
         KernelBackend.JIT,
         "activation.gelu_tanh_cat_jit:fused_gelu_tanh_cat",
@@ -555,6 +562,8 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "can_use_fp8_rowwise": "quantization.fp8_rowwise_triton",
+    "fp8_rowwise": "quantization.fp8_rowwise_triton",
     "can_use_fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
     "fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
     "load_extension_with_recovery": "sglang.srt.utils.cpp_extension_loader",
