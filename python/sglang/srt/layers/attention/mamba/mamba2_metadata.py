@@ -22,6 +22,8 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.cake_kernels._routes import cake_route_enabled
+from sglang.srt.layers.attention.mamba import cake_routes
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -102,6 +104,12 @@ class Mamba2Metadata(ForwardMetadata):
         chunk_offsets: torch.Tensor
 
         extend_seq_lens_cpu: list[int]
+
+        # Chunk-128 logical-chunk metadata for the opt-in Cake SSD prefill
+        # route (``SGLANG_CAKE_ROUTES=mamba_ssd_prefill``); ``None`` when the
+        # route is off or the batch cannot take it. See ``cake_routes``.
+        cake_chunk_indices: Optional[torch.Tensor] = None
+        cake_chunk_offsets: Optional[torch.Tensor] = None
 
     mixed_metadata: MixedMetadata | None = None
     """`mixed_metadata` is used for extend/mixed requests"""
@@ -280,6 +288,22 @@ class Mamba2Metadata(ForwardMetadata):
                 )
             )
 
+        # The Cake SSD runner is a chunk-128 kernel: it needs its own logical
+        # chunk metadata (always, not only with initial states) for a batch
+        # whose token count is a 128-multiple. Built once per forward here so
+        # the per-layer route check does no host work.
+        cake_chunk_indices = cake_chunk_offsets = None
+        if (
+            extend_seq_lens_cpu is not None
+            and num_prefill_tokens % cake_routes.SSD_CHUNK_SIZE == 0
+            and cake_route_enabled(cake_routes.CAKE_ROUTE_SSD_PREFILL)
+        ):
+            cake_chunk_indices, cake_chunk_offsets = (
+                cake_routes.cake_ssd_chunk_metadata(
+                    extend_seq_lens_cpu, query_start_loc.device
+                )
+            )
+
         draft_token_num = (
             getattr(forward_batch.spec_info, "draft_token_num", 1)
             if forward_batch.spec_info is not None
@@ -326,5 +350,7 @@ class Mamba2Metadata(ForwardMetadata):
                 chunk_indices=chunk_indices,
                 chunk_offsets=chunk_offsets,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
+                cake_chunk_indices=cake_chunk_indices,
+                cake_chunk_offsets=cake_chunk_offsets,
             ),
         )
