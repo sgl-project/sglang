@@ -39,6 +39,36 @@ class TestNemotronHOmniModel(CustomTestCase):
         self.assertIs(model_class, NemotronH_Omni_Reasoning_V3)
         self.assertEqual(architecture, "NemotronH_Omni_Reasoning_V3")
 
+    def test_lora_scope_excludes_the_vision_tower(self):
+        """RADIO qkv_proj under a layers.<i>. path is outside the LoRA scope."""
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+
+        self.assertTrue(
+            model.should_apply_lora("language_model.model.layers.7.mixer.qkv_proj")
+        )
+        self.assertFalse(
+            model.should_apply_lora(
+                "vision_model.radio_model.model.encoder.layers.7.attn.attn.qkv_proj"
+            )
+        )
+
+    def test_lora_shape_hooks_reach_the_language_model(self):
+        """The LoRA shape hooks forward to the inner language model."""
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+        model.language_model = SimpleNamespace(
+            get_hidden_dim=lambda module_name, layer_idx: (module_name, layer_idx),
+            get_stacked_multiply=lambda module_name: (module_name, "mult"),
+        )
+
+        self.assertEqual(model.get_hidden_dim("out_proj", 5), ("out_proj", 5))
+        self.assertEqual(
+            model.get_stacked_multiply("gate_up_proj_moe"),
+            ("gate_up_proj_moe", "mult"),
+        )
+        self.assertIn("in_proj", NemotronH_Omni_Reasoning_V3.supported_lora_modules)
+
     def test_vision_final_layernorm_is_loaded_and_applied(self):
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
         nn.Module.__init__(model)
