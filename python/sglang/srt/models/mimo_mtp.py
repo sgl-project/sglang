@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -69,13 +70,14 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
             )
         )
 
-        hidden_states, residual = self.mtp_block(
+        residual_batch.start(forward_batch)
+        hidden_states = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            residual=None,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
+        hidden_states = residual_batch.take_output(hidden_states, forward_batch)
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
 

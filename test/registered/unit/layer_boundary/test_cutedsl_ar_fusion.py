@@ -35,7 +35,7 @@ from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     prepare_cutedsl_fusion,
 )
 from sglang.srt.layers.layer_boundary.prepare import _run_entry, _update_read
-from sglang.srt.layers.layer_boundary.residual.access import export_output
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -434,9 +434,9 @@ def test_the_layer_stack_hands_a_handoff_only_to_a_final_norm_that_takes_it():
     for takes, completed in ((True, 0), (False, 1)):
         finish = MagicMock(return_value=torch.ones(2, 8))
         handoff = _handoff(finish)
-        hidden, _ = export_output(
-            handoff, torch.zeros(2, 8), _DECODE, final_norm_takes_handoff=takes
-        )
+        stream = ResidualStream(torch.zeros(2, 8))
+        owed = stream.record(handoff, PLAIN_ADD)
+        hidden, _ = stream.export(owed, takes_handoff=takes)
         assert finish.call_count == completed
         assert (hidden is handoff) == takes
 

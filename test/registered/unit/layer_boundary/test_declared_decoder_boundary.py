@@ -45,7 +45,6 @@ from sglang.srt.layers.layer_boundary.ops import (
     update_attn_tp_gather_output,
 )
 from sglang.srt.layers.layer_boundary.residual import mhc as mhc_module
-from sglang.srt.layers.layer_boundary.residual.access import export_output
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_READOUT,
     PLAIN_RESIDUAL_OPS,
@@ -1860,7 +1859,7 @@ class TestTwoLayers(CustomTestCase):
                         hidden = moe(hidden, s)
                 hidden, residual = finish_exit(ffn_exit, hidden, residual)
                 handed_on.append(type(hidden))
-            hidden, residual = export_output(hidden, residual, forward_batch)
+            hidden, residual = residual.export(hidden)
             # The last a2a layer folds the residual into its output.
             if residual is not None:
                 residual = residual[: s.rows]
