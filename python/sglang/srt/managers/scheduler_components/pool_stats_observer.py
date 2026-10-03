@@ -55,13 +55,18 @@ class PoolStats:
     hisparse_host_token_usage: Optional[float] = None
 
     def get_kv_token_stats(self) -> Tuple[int, float]:
-        # NOTE: mamba pool is not included in the "token usage" calculation.
         if self.is_hybrid_swa:
             num_used = max(self.full_num_used, self.swa_num_used)
             token_usage = max(self.full_token_usage, self.swa_token_usage)
         else:
             num_used = self.full_num_used
             token_usage = self.full_token_usage
+
+        # Mamba occupancy is measured in request slots rather than KV tokens, so
+        # it must affect capacity pressure without changing the absolute token
+        # count reported by /v1/loads.
+        if self.is_hybrid_ssm:
+            token_usage = max(token_usage, self.mamba_usage)
 
         return num_used, token_usage
 
