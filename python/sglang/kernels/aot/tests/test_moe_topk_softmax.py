@@ -20,9 +20,14 @@ def compare_topk_values(gating_output, topk_indices_ref, topk_indices):
             [512],  # num_experts
             [1, 2, 3, 4, 5, 8, 10],  # topk
         )
-    ),
+    )
+    # num_tokens * num_experts > INT_MAX
+    + [(2**31 // 512 + 1, 512, 1)],
 )
 def test_topkfast_softmax(num_tokens, num_experts, topk):
+    if torch.cuda.mem_get_info()[0] < num_tokens * num_experts * 4 * 3:
+        pytest.skip("not enough GPU memory")
+
     gating_output = torch.randn(
         (num_tokens, num_experts), dtype=torch.float32, device="cuda"
     )
