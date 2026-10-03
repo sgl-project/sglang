@@ -1875,6 +1875,7 @@ class DeepseekV4AttnBackend(
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
+            low_ratio_req_indices=req_pool_indices_repeated,
             c1_indexer_metadata=(
                 self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=1)
                 if 1 in low
@@ -1935,6 +1936,7 @@ class DeepseekV4AttnBackend(
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
+            low_ratio_req_indices=req_pool_indices,
             c1_indexer_metadata=c1_indexer_metadata,
             c2_indexer_metadata=c2_indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4) if self.has_c4 else None,
@@ -2109,6 +2111,31 @@ class DeepseekV4AttnBackend(
                 )
                 metadata.core_attn_metadata.swa_page_indices = swa_page_indices
                 metadata.core_attn_metadata.swa_topk_lengths = swa_topk_lengths
+
+        # Rebuild once per forward before any low-ratio layer. Recording this
+        # here makes graph replay consume live lengths/IDs, including ragged
+        # verify rows materialized by make_forward_metadata_from_raw_verify.
+        mode = forward_batch.forward_mode
+        litetopk = self.full_topk_indexer.litetopk
+        if (
+            litetopk is not None
+            and isinstance(metadata, DSV4Metadata)
+            and (mode.is_decode() or mode.is_target_verify())
+            and metadata.core_metadata.low_ratios
+        ):
+            request_indices = metadata.low_ratio_req_indices
+            if request_indices is None:
+                request_indices = token_req_indices(forward_batch)
+            tokens_per_request = (
+                int(forward_batch.spec_info.draft_token_num)
+                if mode.is_target_verify()
+                else 1
+            )
+            for paged in (metadata.c1_indexer_metadata, metadata.c2_indexer_metadata):
+                if paged is not None:
+                    litetopk.prepare_metadata(
+                        paged, request_indices, tokens_per_request
+                    )
 
     def _dspark_seq_lens_casual(
         self, *, seq_lens: torch.Tensor, block_size: int

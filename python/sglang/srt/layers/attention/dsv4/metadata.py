@@ -202,6 +202,11 @@ class PagedIndexerMetadata:
     topk_metadata_chunks: Optional[List[torch.Tensor]] = field(
         init=False, repr=False, default=None
     )
+    # Built once per decode/verify forward by LiteTopK inside the graph. This
+    # split-384 schedule is separate from the legacy DeepGEMM metadata.
+    bf16_schedule: Optional[torch.Tensor] = field(init=False, repr=False, default=None)
+    bf16_indices: Optional[torch.Tensor] = field(init=False, repr=False, default=None)
+    bf16_tokens_per_request: int = field(init=False, default=1)
 
     def __post_init__(self):
         if (
@@ -365,7 +370,13 @@ class PagedIndexerMetadata:
             "rows_per_chunk",
             "mqa_logits_budget_bytes",
             "topk_metadata_chunks",
+            "bf16_tokens_per_request",
         ]
+        for name in ("bf16_schedule", "bf16_indices"):
+            if getattr(self, name) is not None and getattr(other, name) is not None:
+                copy_fields.append(name)
+            else:
+                assign_fields.append(name)
         copy_metadata(
             src=other,
             dst=self,
