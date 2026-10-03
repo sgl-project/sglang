@@ -29,6 +29,7 @@ from transformers import (
 )
 
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -106,11 +107,17 @@ class Gemma3MLP(nn.Module):
                 "`gelu_pytorch_tanh`."
             )
         self.act_fn = GeluAndMul()
+        self.dual_gemm = DualGemm(
+            self.gate_up_proj, self.down_proj, hidden_size, activation="gelu_tanh"
+        )
         self.prefix = prefix
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.dual_gemm.can_run(x):
+            x = self.dual_gemm(x)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -376,9 +383,13 @@ class Gemma3DecoderLayer(nn.Module):
         # residual layout and is safe to capture in a breakable CUDA graph.
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.input_layernorm(
+                hidden_states, quant_linear=self.self_attn.qkv_proj
+            )
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, quant_linear=self.self_attn.qkv_proj
+            )
 
         # apply global RoPE to non-sliding layer only
         if self.self_attn.is_sliding:
@@ -395,7 +406,7 @@ class Gemma3DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states, residual = self.pre_feedforward_layernorm(
-            hidden_states, residual
+            hidden_states, residual, quant_linear=self.mlp.gate_up_proj
         )
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)

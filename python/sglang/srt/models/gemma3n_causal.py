@@ -6,6 +6,7 @@ from torch import nn
 from transformers import AutoModel, Gemma3nTextConfig, PretrainedConfig, PreTrainedModel
 
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -96,6 +97,9 @@ class Gemma3nTextMLP(nn.Module):
             )
         # Use proper GELU with tanh approximation as specified
         self.act_fn = GeluAndMul()
+        self.dual_gemm = DualGemm(
+            self.gate_up_proj, self.down_proj, hidden_size, activation="gelu_tanh"
+        )
         self.activation_sparsity = activation_sparsity
         self.register_buffer(
             "target_sparsity_tensor",
@@ -104,6 +108,11 @@ class Gemma3nTextMLP(nn.Module):
         )  # moved from _gaussian_topk for cuda graph
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation_sparsity == 0.0 and self.dual_gemm.can_run(x):
+            x = self.dual_gemm(x)
+            x, _ = self.down_proj(x)
+            return x
+
         gate_up, _ = self.gate_up_proj(x)
 
         # Split gate and up projections
@@ -601,7 +610,7 @@ class Gemma3nDecoderLayer(nn.Module):
         attn_laurel = (attn_gated + laurel_output) / torch.sqrt(torch.tensor(2.0))
 
         attn_norm = self.pre_feedforward_layernorm(
-            attn_laurel
+            attn_laurel, quant_linear=self.mlp.gate_up_proj
         )  # [num_tokens, hidden_size]
         attn_ffw = self.mlp(attn_norm)  # [num_tokens, hidden_size]
         attn_ffw_norm = self.post_feedforward_layernorm(

@@ -17,10 +17,16 @@ from sglang.kernels.spec import (
 if TYPE_CHECKING:
     import torch
 
+    from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
+        DualGemmActivationType,
+        DualGemmQuantMode,
+    )
+
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
 _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
+_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
 
@@ -166,6 +172,35 @@ _FP8_SCALED_MM = register_fused_op(Fp8ScaledMMOp(), __name__, "_FP8_SCALED_MM")
 
 register_kernel(
     KernelSpec(
+        op="gemm.dual_gemm_swiglu",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.cutedsl_dual_gemm:dual_gemm_swiglu",
+        capabilities=_SM10X,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16", "float16"),
+            description="BF16/FP16 gate/up dual GEMM followed by gated activation",
+        ),
+        description="Blackwell TMA/tcgen05 fused dual GEMM and activation.",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.dual_gemm_swiglu_fp8",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.cutedsl_dual_gemm:dual_gemm_swiglu_fp8",
+        capabilities=_SM10X,
+        format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn",),
+            description=(
+                "FP8 gate/up dual GEMM, gated activation, and static or dynamic "
+                "per-tensor or per-token FP8 activation quantization"
+            ),
+        ),
+        description="Blackwell TMA/tcgen05 fused dual GEMM and quantization.",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.bmm_fp8",
         backend=KernelBackend.FLASHINFER,
         target="sglang.srt.layers.quantization.fp8_utils:bmm_fp8",
@@ -286,6 +321,49 @@ def fp8_scaled_mm(
     return _FP8_SCALED_MM(mat_a, mat_b, scales_a, scales_b, out_dtype, bias)
 
 
+def dual_gemm_swiglu_fp8(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    output_scale: Optional[torch.Tensor] = None,
+    quant_mode: Optional["DualGemmQuantMode"] = None,
+    activation_type: Optional["DualGemmActivationType"] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse FP8 gate/up projections, gated activation, and quantization."""
+    if quant_mode is None or activation_type is None:
+        from .cutedsl_dual_gemm import DualGemmActivationType, DualGemmQuantMode
+
+        if quant_mode is None:
+            quant_mode = DualGemmQuantMode.DYNAMIC_PER_TOKEN
+        if activation_type is None:
+            activation_type = DualGemmActivationType.SILU
+    return get_kernel("gemm.dual_gemm_swiglu_fp8", KernelBackend.CUTE_DSL)(
+        x,
+        gate_up_weight,
+        x_scale,
+        gate_up_weight_scale,
+        output_scale,
+        quant_mode,
+        activation_type,
+    )
+
+
+def dual_gemm_swiglu(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    activation_type: Optional["DualGemmActivationType"] = None,
+) -> torch.Tensor:
+    """Fuse BF16/FP16 gate/up projections followed by a gated activation."""
+    if activation_type is None:
+        from .cutedsl_dual_gemm import DualGemmActivationType
+
+        activation_type = DualGemmActivationType.SILU
+    return get_kernel("gemm.dual_gemm_swiglu", KernelBackend.CUTE_DSL)(
+        x, gate_up_weight, activation_type
+    )
+
+
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -384,11 +462,13 @@ def kimi_k3_tiny_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
-    "kimi_k3_tiny_gemm",
     "Fp8ScaledMMOp",
     "bmm_fp8",
     "dsv3_fused_a_gemm",
+    "dual_gemm_swiglu",
+    "dual_gemm_swiglu_fp8",
     "fp8_scaled_mm",
+    "kimi_k3_tiny_gemm",
     "n128k512_gemm_bf16",
     "n32k5120_gemm_bf16",
     "tiny_gemm_bf16",

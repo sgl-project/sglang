@@ -23,6 +23,7 @@ from transformers import PreTrainedModel
 
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma_qkv_rmsnorm
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -224,10 +225,21 @@ class DiffusionGemmaSelfConditioning(nn.Module):
             prefix=add_prefix("down_proj", prefix),
         )
         self.act_fn = GeluAndMul()
+        self.dual_gemm = DualGemm(
+            self.gate_up_proj,
+            self.down_proj,
+            config.hidden_size,
+            activation="gelu_tanh",
+        )
 
     def forward(self, inputs_embeds, signal):
-        gate_up, _ = self.gate_up_proj(self.pre_norm(signal))
-        h, _ = self.down_proj(self.act_fn(gate_up))
+        signal = self.pre_norm(signal, quant_linear=self.gate_up_proj)
+        if self.dual_gemm.can_run(signal):
+            h = self.dual_gemm(signal)
+        else:
+            gate_up, _ = self.gate_up_proj(signal)
+            h = self.act_fn(gate_up)
+        h, _ = self.down_proj(h)
         return self.post_norm(inputs_embeds + h)
 
 
@@ -304,15 +316,18 @@ class DiffusionGemmaDecoderLayer(nn.Module):
 
     def forward(self, positions, hidden_states, forward_batch):
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(
+            hidden_states, quant_linear=self.self_attn.qkv_proj
+        )
         hidden_states = self.self_attn(positions, hidden_states, forward_batch)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        h1 = self.post_feedforward_layernorm_1(
-            self.mlp(self.pre_feedforward_layernorm(residual))
+        dense_input = self.pre_feedforward_layernorm(
+            residual, quant_linear=self.mlp.gate_up_proj
         )
+        h1 = self.post_feedforward_layernorm_1(self.mlp(dense_input))
         # MoE branch: the router gates on the RAW residual (the router's input
         # norm is with_scale=False, so ln2's learned per-channel weights would
         # change the routed direction). Experts still get the ln2-normed input.

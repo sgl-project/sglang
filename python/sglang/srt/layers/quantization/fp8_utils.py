@@ -2179,9 +2179,9 @@ def apply_fp8_linear(
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
     # A pre-quantized fp8 activation (e.g. from a fused RMSNorm+quant kernel)
-    # carries no original dtype: skip re-quant, reuse the supplied per-tensor
-    # input_scale, and emit ``pre_quant_output_dtype`` (the model's activation
-    # dtype, propagated by the producer) or bf16 if it was not provided.
+    # carries no original dtype: skip re-quant, reuse its supplied per-tensor
+    # or per-token input scale, and emit ``pre_quant_output_dtype`` (the model's
+    # activation dtype, propagated by the producer) or bf16 if omitted.
     input_prequantized = input_2d.dtype in (
         torch.float8_e4m3fn,
         torch.float8_e4m3fnuz,
@@ -2209,9 +2209,16 @@ def apply_fp8_linear(
     )
 
     if input_prequantized:
-        assert input_scale is not None and input_scale.numel() == 1
+        assert input_scale is not None and input_scale.numel() in (
+            1,
+            input_2d.shape[0],
+        )
         qinput = input_2d
-        if channelwise_cutlass and not native_scalar_a_scale:
+        if (
+            input_scale.numel() == 1
+            and channelwise_cutlass
+            and not native_scalar_a_scale
+        ):
             # Unsupported CUTLASS epilogues require one A scale per row.
             x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
         else:

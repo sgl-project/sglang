@@ -675,7 +675,9 @@ class Gemma4DecoderLayer(nn.Module):
         residual = hidden_states
 
         # Apply input layernorm
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(
+            hidden_states, quant_linear=self.self_attn.qkv_proj
+        )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -687,7 +689,7 @@ class Gemma4DecoderLayer(nn.Module):
             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
             # Also need raw (unfused) residual for router and pre_ff_norm_2
             hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
+                hidden_states, residual, quant_linear=self.mlp.gate_up_proj
             )
             # For MoE: router and pre_ff_norm_2 need the unfused residual
             # (which is now updated to post_attn_out + old_residual)
@@ -732,7 +734,7 @@ class Gemma4DecoderLayer(nn.Module):
         else:
             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
             hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
+                hidden_states, residual, quant_linear=self.mlp.gate_up_proj
             )
             hidden_states = self.mlp(hidden_states)
 

@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -55,14 +56,12 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     add_prefix,
-    is_cuda,
     is_npu,
     is_xpu,
     make_pp_layers,
 )
 from sglang.utils import get_exception_traceback
 
-_is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
@@ -111,14 +110,21 @@ class LlamaMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.dual_gemm = DualGemm(
+            self.gate_up_proj, self.down_proj, hidden_size, activation="silu"
+        )
 
     def forward(
         self,
         x,
         forward_batch=None,
     ):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.dual_gemm.can_run(x):
+            x = self.dual_gemm(x)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+
         x, _ = self.down_proj(x)
         return x
 

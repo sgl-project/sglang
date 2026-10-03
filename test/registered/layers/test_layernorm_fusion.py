@@ -1,9 +1,10 @@
 import itertools
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import Gemma3RMSNorm, GemmaRMSNorm, RMSNorm
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -169,6 +170,43 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
 
         self.assertEqual(var_out[0].dtype, torch.bfloat16)
         self.assertEqual(cast_out[0].dtype, torch.bfloat16)
+
+    def test_gemma_norm_quant_fusion(self):
+        """Gemma's weight-plus-one norms must quantize the effective weight."""
+        import sglang.srt.layers.layernorm as ln_mod
+
+        torch.manual_seed(self.SEED)
+        hidden_size, num_tokens = 512, 16
+        scale = torch.tensor([0.05], dtype=torch.float32)
+        x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16)
+        residual = torch.randn_like(x)
+
+        for norm_type in (GemmaRMSNorm, Gemma3RMSNorm):
+            with self.subTest(norm_type=norm_type.__name__):
+                layer = norm_type(hidden_size).to(dtype=torch.bfloat16)
+                loaded_weight = torch.randn_like(layer.weight) * 0.1
+                layer.weight.weight_loader(layer.weight, loaded_weight)
+                expected, expected_residual = layer.forward_native(
+                    x.clone(), residual.clone()
+                )
+
+                with patch.object(
+                    ln_mod, "_fp8_static_input_scale", return_value=scale
+                ):
+                    (quantized, actual_scale, out_dtype), actual_residual = layer(
+                        x.clone(), residual.clone(), quant_linear=object()
+                    )
+
+                self.assertIs(actual_scale, scale)
+                self.assertEqual(out_dtype, torch.bfloat16)
+                torch.testing.assert_close(
+                    actual_residual, expected_residual, rtol=1e-2, atol=1e-2
+                )
+                dequantized = quantized.float() * scale
+                cosine = torch.nn.functional.cosine_similarity(
+                    dequantized.flatten(), expected.float().flatten(), dim=0
+                )
+                self.assertGreater(cosine.item(), 0.99)
 
 
 if __name__ == "__main__":
