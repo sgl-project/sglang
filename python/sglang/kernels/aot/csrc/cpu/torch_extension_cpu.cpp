@@ -327,6 +327,12 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+// fp8 quant
+std::tuple<at::Tensor, at::Tensor> per_token_quant_fp8_cpu(at::Tensor& A);
+bool cpu_has_avx10_2();
+#endif
+
 // igemm
 at::Tensor int8_scaled_mm_cpu(
     at::Tensor& mat1,
@@ -837,6 +843,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+  // fp8 quant
+  m.def("per_token_quant_fp8_cpu(Tensor A) -> (Tensor, Tensor)");
+  m.impl("per_token_quant_fp8_cpu", torch::kCPU, &per_token_quant_fp8_cpu);
+  m.def("cpu_has_avx10_2() -> bool");
+#endif
+
   // igemm
   m.def(
       "int8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales1, Tensor scales2, Tensor? bias, ScalarType "
@@ -1028,6 +1041,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
   m.impl("init_cpu_threads_env", init_cpu_threads_env);
   m.impl("initialize", &initialize);
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+  m.impl("cpu_has_avx10_2", &cpu_has_avx10_2);
+#endif
 }
 
 REGISTER_EXTENSION(common_ops)

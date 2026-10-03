@@ -148,8 +148,7 @@ Notes:
 
 - If you encounter code compilation issues during the `sgl-kernel` building process,
     please check your `gcc` and `g++` versions and upgrade them if they are outdated.
-    It is recommended to use `gcc-13` and `g++-13` as they have been verified
-    in the official Docker container.
+    The CPU kernels use AVX10.2 intrinsics, which need `gcc-15` and `g++-15` or newer.
 
 - The system library path is typically located in one of the following directories:
     `~/.local/lib/`, `/usr/local/lib/`, `/usr/local/lib64/`, `/usr/lib/`, `/usr/lib64/`
