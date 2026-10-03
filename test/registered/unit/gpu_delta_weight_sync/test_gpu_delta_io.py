@@ -80,9 +80,15 @@ def test_describe_binds_published_scheduler_ranks_without_legacy_ps(rank, monkey
             lambda path: io.StringIO(stat),
             raising=False,
         )
+        cache_engines = []
+
+        def cache_id(engine_id):
+            cache_engines.append(engine_id)
+            return "shared-host-test"
+
         monkeypatch.setattr(
             "sglang.srt.weight_sync.gpu_delta_host.host_cache_id",
-            lambda: "shared-host-test",
+            cache_id,
         )
         control = GpuDeltaSchedulerControl(scheduler)
         receipt = control._describe("engine-0")
@@ -107,6 +113,7 @@ def test_describe_binds_published_scheduler_ranks_without_legacy_ps(rank, monkey
         assert len(backends) == 1
         with pytest.raises(ValueError, match="already bound"):
             control._describe("different-engine")
+        assert cache_engines == ["engine-0"]
         control.session._executor.shutdown(wait=True)
     finally:
         reset_context()
