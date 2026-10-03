@@ -1,4 +1,4 @@
-"""DSA packed-cache and HIP TileLang kernels must accept GLM's 256+0 geometry without changing 512+64."""
+"""DSA sparse kernels must accept GLM's zero-RoPE geometry."""
 
 import math
 import unittest
@@ -13,7 +13,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 # backend-specific: the zero-tail specialization only exists in the HIP TileLang kernels
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -72,6 +72,21 @@ def _torch_sparse_attention(q, kv, indices, scale, d_v):
     "the zero-tail TileLang specialization is compiled for gfx950",
 )
 class TestTileLangDSAZeroRope(CustomTestCase):
+    @staticmethod
+    def _bf16_inputs(tokens, heads=16, kv_len=2112, live_topk=2051, all_masked=False):
+        torch.manual_seed(7)
+        q = torch.randn(tokens, heads, 512, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(kv_len, 1, 512, device="cuda", dtype=torch.bfloat16)
+        indices = torch.arange(2112, device="cuda", dtype=torch.int32)
+        indices = indices.remainder(kv_len).view(1, 1, 2112)
+        indices = indices.expand(tokens, -1, -1).clone()
+        indices[..., live_topk:] = -1
+        if live_topk:
+            indices[..., : min(64, live_topk)] = 3
+        if all_masked:
+            indices.fill_(-1)
+        return q, kv, indices
+
     def _assert_matches_torch(self, use_fp8, d_v, d_tail):
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
             FP8_DTYPE,
@@ -114,6 +129,298 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         for use_fp8 in (False, True):
             with self.subTest(use_fp8=use_fp8):
                 self._assert_matches_torch(use_fp8=use_fp8, d_v=512, d_tail=64)
+
+    def test_glm53_h16_d512_zero_rope_matches_torch(self):
+        """Pin the GLM-5.3 TP4 sparse-attention head geometry and padded top-k."""
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
+
+        q, kv, indices = self._bf16_inputs(tokens=17)
+        scale = 1.0 / math.sqrt(256)
+        expected = _torch_sparse_attention(q, kv, indices, scale, d_v=512)
+        actual = tilelang_sparse_fwd(q, kv, indices, scale, d_v=512).squeeze(0)
+        torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.04)
+        repeated = tilelang_sparse_fwd(q, kv, indices, scale, d_v=512).squeeze(0)
+        torch.testing.assert_close(repeated, actual, atol=0, rtol=0)
+
+    def test_glm53_all_masked_rows_are_finite_zeros(self):
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
+
+        q, kv, indices = self._bf16_inputs(tokens=1, all_masked=True)
+        actual = tilelang_sparse_fwd(q, kv, indices, 1.0 / math.sqrt(256), d_v=512)
+        self.assertTrue(torch.isfinite(actual).all())
+        self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
+
+    def test_glm53_zero_rope_cuda_graph_replay(self):
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
+
+        q, kv, indices = self._bf16_inputs(tokens=17)
+        scale = 1.0 / math.sqrt(256)
+        eager = tilelang_sparse_fwd(q, kv, indices, scale, d_v=512)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = tilelang_sparse_fwd(q, kv, indices, scale, d_v=512)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, eager, atol=0, rtol=0)
+
+    def test_glm53_production_grids_are_finite(self):
+        """M=8192/16384 must retain the traced one-group partial dispatch."""
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
+
+        kv = torch.zeros(2112, 1, 512, device="cuda", dtype=torch.bfloat16)
+        base_indices = torch.arange(2112, device="cuda", dtype=torch.int32)
+        base_indices[2051:] = -1
+        for tokens in (8192, 16384):
+            with self.subTest(tokens=tokens):
+                q = torch.zeros(tokens, 16, 512, device="cuda", dtype=torch.bfloat16)
+                indices = (
+                    base_indices.view(1, 1, -1).expand(tokens, -1, -1).contiguous()
+                )
+                actual = tilelang_sparse_fwd(
+                    q, kv, indices, 1.0 / math.sqrt(256), d_v=512
+                )
+                self.assertEqual(actual.shape, (1, tokens, 16, 512))
+                self.assertTrue(torch.isfinite(actual).all())
+                self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
+                del q, indices, actual
+                empty_gpu_cache()
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
+    "the GLM-5.3 Triton specialization is enabled only on gfx950",
+)
+class TestTritonDSAZeroRope(CustomTestCase):
+    @staticmethod
+    def _run(q, kv, indices):
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+            triton_sparse_mla_fwd,
+        )
+
+        return triton_sparse_mla_fwd(
+            q,
+            q[..., 512:],
+            kv,
+            indices,
+            1.0 / math.sqrt(256),
+            d_v=512,
+        )
+
+    @staticmethod
+    def _run_decode(q, kv, indices, workspace):
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
+        )
+
+        return triton_sparse_mla_decode_splitk(
+            q,
+            q[..., 512:],
+            kv,
+            indices,
+            1.0 / math.sqrt(256),
+            d_v=512,
+            workspace=workspace,
+        )
+
+    def test_glm53_matches_torch_with_duplicates_and_padding(self):
+        for heads in (8, 16):
+            for live_topk in (1, 512, 2048, 2051):
+                with self.subTest(heads=heads, live_topk=live_topk):
+                    q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(
+                        tokens=17, heads=heads, live_topk=live_topk
+                    )
+                    expected = _torch_sparse_attention(
+                        q, kv, indices, 1.0 / math.sqrt(256), d_v=512
+                    )
+                    actual = self._run(q, kv, indices).squeeze(0)
+                    torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.04)
+                    repeated = self._run(q, kv, indices).squeeze(0)
+                    torch.testing.assert_close(repeated, actual, atol=0, rtol=0)
+
+    def test_glm53_all_masked_rows_are_finite_zeros(self):
+        for heads in (8, 16):
+            with self.subTest(heads=heads):
+                q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(
+                    tokens=1, heads=heads, all_masked=True
+                )
+                actual = self._run(q, kv, indices)
+                self.assertTrue(torch.isfinite(actual).all())
+                self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
+
+    def test_glm53_decode_matches_torch_and_is_deterministic(self):
+        for heads in (8, 16):
+            for live_topk in (0, 1, 512, 2051):
+                with self.subTest(heads=heads, live_topk=live_topk):
+                    q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(
+                        tokens=5, heads=heads, live_topk=live_topk
+                    )
+                    expected = _torch_sparse_attention(
+                        q, kv, indices, 1.0 / math.sqrt(256), d_v=512
+                    )
+                    workspace = []
+                    actual = self._run_decode(q, kv, indices, workspace).squeeze(0)
+                    torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.04)
+                    repeated = self._run_decode(q, kv, indices, workspace).squeeze(0)
+                    torch.testing.assert_close(repeated, actual, atol=0, rtol=0)
+
+    def test_glm53_unpadded_kpool_width_matches_torch(self):
+        for heads in (8, 16):
+            with self.subTest(heads=heads):
+                q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(
+                    tokens=17, heads=heads
+                )
+                indices = indices[..., :2051].contiguous()
+                expected = _torch_sparse_attention(
+                    q, kv, indices, 1.0 / math.sqrt(256), d_v=512
+                )
+                prefill = self._run(q, kv, indices).squeeze(0)
+                decode = self._run_decode(q, kv, indices, []).squeeze(0)
+                torch.testing.assert_close(prefill, expected, atol=0.04, rtol=0.04)
+                torch.testing.assert_close(decode, expected, atol=0.04, rtol=0.04)
+
+    def test_glm53_decode_workspace_reuse_and_cuda_graph_replay(self):
+        kv = torch.zeros(2112, 1, 512, device="cuda", dtype=torch.bfloat16)
+        base_indices = torch.arange(2112, device="cuda", dtype=torch.int32)
+        base_indices[2051:] = -1
+        for tokens, heads in ((64, 16), (512, 8)):
+            with self.subTest(tokens=tokens, heads=heads):
+                q = torch.zeros(tokens, heads, 512, device="cuda", dtype=torch.bfloat16)
+                indices = (
+                    base_indices.view(1, 1, -1).expand(tokens, -1, -1).contiguous()
+                )
+                workspace = []
+                eager = self._run_decode(q, kv, indices, workspace)
+                torch.cuda.synchronize()
+                pointers = [(lse.data_ptr(), acc.data_ptr()) for lse, acc in workspace]
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = self._run_decode(q, kv, indices, workspace)
+                graph.replay()
+                torch.cuda.synchronize()
+
+                torch.testing.assert_close(captured, eager, atol=0, rtol=0)
+                self.assertEqual(
+                    [(lse.data_ptr(), acc.data_ptr()) for lse, acc in workspace],
+                    pointers,
+                )
+
+    def test_glm53_cuda_graph_replay(self):
+        for heads in (8, 16):
+            with self.subTest(heads=heads):
+                q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(
+                    tokens=17, heads=heads
+                )
+                eager = self._run(q, kv, indices)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = self._run(q, kv, indices)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(captured, eager, atol=0, rtol=0)
+
+    def test_glm53_mixed_rows_and_physical_padding_graph_replay(self):
+        live_counts = (0, 1, 3, 4, 511, 512, 2047, 2048, 2049, 2051, 512, 3, 1)
+        physical_tokens = len(live_counts) + 4
+        for heads in (8, 16):
+            with self.subTest(heads=heads):
+                q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(
+                    tokens=physical_tokens, heads=heads
+                )
+                for row, live_topk in enumerate(live_counts):
+                    indices[row, :, live_topk:] = -1
+                indices[len(live_counts) :].fill_(-1)
+
+                expected = _torch_sparse_attention(
+                    q, kv, indices, 1.0 / math.sqrt(256), d_v=512
+                )
+                eager = self._run(q, kv, indices).squeeze(0)
+                torch.testing.assert_close(eager, expected, atol=0.04, rtol=0.04)
+                self.assertTrue(
+                    torch.equal(
+                        eager[len(live_counts) :],
+                        torch.zeros_like(eager[len(live_counts) :]),
+                    )
+                )
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = self._run(q, kv, indices)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(captured.squeeze(0), eager, atol=0, rtol=0)
+
+    def test_glm53_production_grids_are_finite(self):
+        kv = torch.zeros(2112, 1, 512, device="cuda", dtype=torch.bfloat16)
+        base_indices = torch.arange(2112, device="cuda", dtype=torch.int32)
+        base_indices[2051:] = -1
+        for tokens, heads in ((1, 8), (65536, 16), (131072, 8)):
+            with self.subTest(tokens=tokens, heads=heads):
+                q = torch.zeros(tokens, heads, 512, device="cuda", dtype=torch.bfloat16)
+                indices = (
+                    base_indices.view(1, 1, -1).expand(tokens, -1, -1).contiguous()
+                )
+                actual = self._run(q, kv, indices)
+                self.assertEqual(actual.shape, (1, tokens, heads, 512))
+                self.assertTrue(torch.isfinite(actual).all())
+                self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
+                del q, indices, actual
+                empty_gpu_cache()
+
+    def test_glm53_dispatch_gate_covers_sparse_attention_envelope(self):
+        from sglang.srt.layers.attention.dsa_backend import (
+            _use_glm53_triton_sparse_attention,
+        )
+
+        kv = torch.empty(13_299_712, 1, 512, device="meta", dtype=torch.bfloat16)
+        for tokens, heads in ((1, 8), (1, 16), (65536, 16), (131072, 8)):
+            with self.subTest(tokens=tokens, heads=heads):
+                q = torch.empty(tokens, heads, 512, device="meta", dtype=torch.bfloat16)
+                indices = torch.empty(tokens, 2051, device="meta", dtype=torch.int32)
+                self.assertTrue(_use_glm53_triton_sparse_attention(q, kv, indices, 512))
+
+        q = torch.empty(8192, 16, 512, device="meta", dtype=torch.bfloat16)
+        indices = torch.empty(8192, 2051, device="meta", dtype=torch.int32)
+        self.assertFalse(
+            _use_glm53_triton_sparse_attention(
+                torch.empty(65537, 16, 512, device="meta", dtype=torch.bfloat16),
+                kv,
+                torch.empty(65537, 2051, device="meta", dtype=torch.int32),
+                512,
+            )
+        )
+        self.assertFalse(
+            _use_glm53_triton_sparse_attention(
+                torch.empty(131073, 8, 512, device="meta", dtype=torch.bfloat16),
+                kv,
+                torch.empty(131073, 2051, device="meta", dtype=torch.int32),
+                512,
+            )
+        )
+        self.assertFalse(
+            _use_glm53_triton_sparse_attention(q, kv, indices[:, :2048], 512)
+        )
+        self.assertFalse(
+            _use_glm53_triton_sparse_attention(q.float(), kv, indices, 512)
+        )
+        self.assertFalse(
+            _use_glm53_triton_sparse_attention(
+                q,
+                kv,
+                torch.empty(8192, 2112, device="meta", dtype=torch.int32),
+                512,
+            )
+        )
 
 
 if __name__ == "__main__":
