@@ -205,6 +205,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._sliding_window_size = (
             params.sliding_window_size if self.is_swa_enabled else None
         )
+        self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self._tree_core_backend = select_tree_core_backend(params)
@@ -3479,7 +3480,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_reprefill_tail_tokens(self) -> int:
         """
-        Only unified_kv needs this: SWA lives in a per-request ring
+        unified_kv needs this: SWA lives in a per-request ring
         (state_slot/pos), not content-stable and never stored in the tree, so a
         reused prefix's trailing sliding window would read another request's
         stale ring slots. Re-prefilling that window rewrites this request's ring.
@@ -3488,6 +3489,12 @@ class UnifiedRadixCache(BasePrefixCache):
         either way. Returns 0 once SWA has a host pool to restore exact contents
         from, and for every non-unified_kv layout, whose SWA slots are
         content-stable.
+
+        DeepSeek-V4.1 decoder SWA bounded replay needs it too: late-layer window
+        KV is written only for the tail rows of an extend, and the cache cannot
+        differentiate which rows of a matched prefix were tails, so the layers
+        after the last kv_source layer have no usable window KV in the prefix.
+        Holding one window back keeps every hit extend at least a window long.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -3496,6 +3503,8 @@ class UnifiedRadixCache(BasePrefixCache):
         swa = self.components.get(ComponentType.SWA)
         if swa is None or not swa.sliding_window_size:
             return 0
+        if self.decoder_swa_bounded_replay:
+            return swa.sliding_window_size
         if not is_unified_kv_triton():
             return 0
         if self.tree_core.has_swa_host_pool:
