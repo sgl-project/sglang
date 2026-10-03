@@ -382,6 +382,8 @@ async fn balanced_affinity_requires_both_thresholds_and_fresh_load() {
         (AffinityMode::Balanced, 100, 50, false, "owner"),
         (AffinityMode::Balanced, 10, 0, false, "owner"),
         (AffinityMode::Balanced, 100, 40, false, "cold"),
+        // 45 alone would switch; the owner's 8 cached prompt tokens keep it.
+        (AffinityMode::Balanced, 100, 45, false, "owner"),
         (AffinityMode::Balanced, 100, 40, true, "owner"),
     ] {
         let table = EngineReportedLoadTable::new();

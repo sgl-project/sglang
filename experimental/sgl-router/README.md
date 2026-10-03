@@ -194,8 +194,9 @@ Both reorg affinity policies accept `--affinity-mode prefer` (default) or
 prefix owner. Balanced samples a power-of-two alternative and switches only
 when the affinity engine's waiting uncached tokens exceed both
 `alternative * --affinity-load-factor` (default 2) and
-`alternative + --affinity-load-gap` (default 1024). Missing fresh native load
-preserves admissible affinity; ties also preserve it.
+`alternative + --affinity-load-gap` (default 1024). For cache affinity, the
+alternative also counts the prompt tokens the affinity engine already holds.
+Missing fresh native load preserves admissible affinity; ties also preserve it.
 
 Both modes fall back within the group when affinity fails admission, excluding
 rejected engines. The fallback winner must pass admission; failure advances to

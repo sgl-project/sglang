@@ -344,9 +344,11 @@ Both affinity policies support `--affinity-mode prefer` (default) and `balanced`
 Prefer retains admissible affinity. Balanced compares it with an admitted
 power-of-two alternative and switches only when waiting uncached tokens exceed
 both the alternative times `--affinity-load-factor` (default 2) and the alternative
-plus `--affinity-load-gap` (default 1024). Both reports must be fresh and native;
-missing data or ties preserve affinity. Bindings commit during selection after
-admission, as with initial placement; dispatch failure does not roll them back.
+plus `--affinity-load-gap` (default 1024). For cache affinity, the alternative
+also counts the prompt tokens it would prefill that the affinity engine holds.
+Both reports must be fresh and native; missing data or ties preserve affinity.
+Bindings commit during selection after admission, as with initial placement;
+dispatch failure does not roll them back.
 
 Sticky fallback supports `round_robin`, `random`, `power_of_two`, and `load_based`,
 with round-robin as the default. Nested fallbacks use

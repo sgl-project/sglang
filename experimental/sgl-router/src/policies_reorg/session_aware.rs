@@ -120,6 +120,7 @@ impl Policy for SessionAwarePolicy {
                     &self.config,
                     rejection.is_none().then_some(primary),
                     fallback,
+                    0, // Without a prefix signal, savings are unknown.
                     &load,
                 )?;
                 if pick.engine.id == bound.id {

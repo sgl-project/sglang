@@ -308,7 +308,8 @@ impl Policy for CacheAwarePolicy {
             let candidates = self.candidates(engines, request, signal.as_deref(), &load);
             let mut rejections = Vec::new();
             let admitted = self.admit(&candidates, &load, request, &mut rejections)?;
-            let affinity = admitted.first().map(|c| Pick {
+            let best = admitted.first();
+            let affinity = best.map(|c| Pick {
                 engine: Arc::clone(c.engine),
                 reason: "cache_candidate",
             });
@@ -344,7 +345,15 @@ impl Policy for CacheAwarePolicy {
                 Ok(pick)
             }
             .await;
-            affinity::choose(&self.config, affinity, fallback, &load)
+            let saved = match (best, &fallback) {
+                (Some(best), Ok(pick)) => candidates
+                    .iter()
+                    .find(|c| c.engine.id == pick.engine.id)
+                    .map_or(request.input_tokens, |c| c.uncached_tokens)
+                    .saturating_sub(best.uncached_tokens),
+                _ => 0,
+            };
+            affinity::choose(&self.config, affinity, fallback, saved, &load)
         })
     }
 

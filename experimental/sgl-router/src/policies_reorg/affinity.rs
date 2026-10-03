@@ -7,17 +7,23 @@ use crate::workers::Worker;
 
 use super::{Pick, PickError};
 
+/// `saved_tokens`: prompt tokens the affinity engine already holds beyond the alternative.
 pub(super) fn choose(
     config: &AffinityConfig,
     affinity: Option<Pick>,
     alternative: Result<Pick, PickError>,
+    saved_tokens: u64,
     load: &EngineReportedLoadSnapshot,
 ) -> Result<Pick, PickError> {
     let Some(affinity) = affinity else {
         return alternative;
     };
     match alternative {
-        Ok(pick) if prefer_alternative(config, &affinity.engine, &pick.engine, load) => Ok(pick),
+        Ok(pick)
+            if prefer_alternative(config, &affinity.engine, &pick.engine, saved_tokens, load) =>
+        {
+            Ok(pick)
+        }
         Ok(_)
         | Err(
             PickError::NoCandidates
@@ -32,6 +38,7 @@ fn prefer_alternative(
     config: &AffinityConfig,
     affinity: &Worker,
     alternative: &Worker,
+    saved_tokens: u64,
     load: &EngineReportedLoadSnapshot,
 ) -> bool {
     if config.mode != AffinityMode::Balanced {
@@ -43,9 +50,12 @@ fn prefer_alternative(
     ) else {
         return false;
     };
+    // The alternative must also prefill what the affinity engine has cached.
     let (a, b) = (
         affinity.num_waiting_uncached_tokens,
-        alternative.num_waiting_uncached_tokens,
+        alternative
+            .num_waiting_uncached_tokens
+            .saturating_add(saved_tokens),
     );
     a.saturating_sub(b) > config.load_gap && a as f64 > b as f64 * config.load_factor
 }
