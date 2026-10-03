@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -57,12 +57,11 @@ class TestPureDP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.60)
@@ -77,12 +76,11 @@ class TestPureDP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=40,
             num_threads=1,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.50)
@@ -130,12 +128,11 @@ class TestHybridDPTP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.60)

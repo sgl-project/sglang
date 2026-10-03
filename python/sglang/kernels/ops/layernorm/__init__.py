@@ -439,6 +439,76 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         residual.copy_(residual_out)
 
 
+class BeamSandwichResidualRMSNormOp(BaseFusedOp):
+    """Post-normalize a branch, combine residuals, then normalize the next input.
+
+    Returns ``(normed, combined)``. Either norm weight may be None; without
+    ``out_weight``, ``normed`` is None (a non-final pipeline stage).
+    """
+
+    op = "layernorm.beam_sandwich_residual_rmsnorm"
+    capabilities = {KernelBackend.TRITON: _CUDA}
+    format_signature = FormatSignature(supported_dtypes=_NORM_DTYPES)
+
+    def _torch_compile_forward(self, num_tokens: int):
+        # Native compilation can remove the required intermediate rounding.
+        return None
+
+    def forward_torch_compile(self, *args, **kwargs):
+        import torch
+
+        if self._compiled_native is None:
+            # Register and warm the opaque op before tracing its dispatch wrapper.
+            self.forward_triton(*args, **kwargs)
+            self._compiled_native = torch.compile(
+                self.forward_triton, options={"emulate_precision_casts": True}
+            )
+        return self._compiled_native(*args, **kwargs)
+
+    def forward_native(
+        self,
+        branch: torch.Tensor,
+        residual: torch.Tensor,
+        sandwich_weight: Optional[torch.Tensor],
+        out_weight: Optional[torch.Tensor],
+        eps: float,
+        scales: tuple[float, float],
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+        if sandwich_weight is not None:
+            branch = _RMSNORM.forward_native(branch, sandwich_weight, eps)
+        residual = residual.to(branch.dtype)
+        combined = branch * scales[0] + residual * scales[1]
+        out = (
+            _RMSNORM.forward_native(combined, out_weight, eps)
+            if out_weight is not None
+            else None
+        )
+        return out, combined
+
+    def forward_triton(
+        self,
+        branch: torch.Tensor,
+        residual: torch.Tensor,
+        sandwich_weight: Optional[torch.Tensor],
+        out_weight: Optional[torch.Tensor],
+        eps: float,
+        scales: tuple[float, float],
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+        import torch
+
+        if not branch.is_cuda or branch.dtype not in (torch.float16, torch.bfloat16):
+            return self.forward_native(
+                branch, residual, sandwich_weight, out_weight, eps, scales
+            )
+        from sglang.kernels.ops.layernorm.beam_fused import (
+            fused_sandwich_residual_rmsnorm,
+        )
+
+        return fused_sandwich_residual_rmsnorm(
+            branch, residual, sandwich_weight, out_weight, eps, *scales
+        )
+
+
 _RMSNORM = register_fused_op(RMSNormOp(), __name__, "_RMSNORM")
 _FUSED_ADD_RMSNORM = register_fused_op(
     FusedAddRMSNormOp(), __name__, "_FUSED_ADD_RMSNORM"
@@ -446,6 +516,10 @@ _FUSED_ADD_RMSNORM = register_fused_op(
 _GEMMA_RMSNORM = register_fused_op(GemmaRMSNormOp(), __name__, "_GEMMA_RMSNORM")
 _GEMMA_FUSED_ADD_RMSNORM = register_fused_op(
     GemmaFusedAddRMSNormOp(), __name__, "_GEMMA_FUSED_ADD_RMSNORM"
+)
+
+_BEAM_SANDWICH_RESIDUAL_RMSNORM = register_fused_op(
+    BeamSandwichResidualRMSNormOp(), __name__, "_BEAM_SANDWICH_RESIDUAL_RMSNORM"
 )
 
 
@@ -494,6 +568,7 @@ def gemma_fused_add_rmsnorm(
 
 
 __all__ = [
+    "BeamSandwichResidualRMSNormOp",
     "RMSNormOp",
     "FusedAddRMSNormOp",
     "GemmaRMSNormOp",
@@ -511,7 +586,6 @@ from sglang.kernels.spec import KernelSpec
 # Triton / TileLang kernels migrated from srt/layers top-level strays
 # (RFC #29630, Phase 2.5); registered for inventory.
 _PHASE25_KERNELS = [
-    ("gemma4_fused_ops", "gemma4_fused_routing", "triton"),
     ("gemma4_fused_ops", "gemma_qkv_rmsnorm", "triton"),
     ("mhc_head", "fused_hc_head", "triton"),
     ("hy4_ihc", "fused_hy4_ihc_pre", "triton"),
@@ -527,6 +601,23 @@ for _mod, _fn, _bk in _PHASE25_KERNELS:
     )
 del _mod, _fn, _bk
 
+# Fused hyper-connection combine / norm kernels for small speculative batches.
+_HC_NORM_KERNELS = [
+    ("hc_combine_norm", "hc_combine_norm"),
+    ("mhc_post_split_h", "mhc_post_split_h"),
+    ("hc_combine_norm", "hc_combine_norm_mxfp8"),
+    ("mxfp8_epilogue", "rmsnorm_mxfp8"),
+]
+for _mod, _fn in _HC_NORM_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.layernorm.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
+
 # The fused-rmsnorm variants physically live in the shared fused-pointwise
 # collection (sglang.kernels.ops.elementwise.elementwise) but stay layernorm ops.
 for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
@@ -538,3 +629,29 @@ for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
         )
     )
 del _fn
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="layernorm.rmsnorm_hf",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.layernorm.rmsnorm_hf:rmsnorm_hf",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="layernorm.grouped_gemma_rmsnorm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm:grouped_gemma_rmsnorm",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="layernorm.rms_normalize_triton",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.rms_normalize_hip:rms_normalize_triton",
+    )
+)

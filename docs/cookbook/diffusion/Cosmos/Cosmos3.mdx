@@ -400,3 +400,9 @@ remains accepted for compatibility, but new clients should use `extra_body`:
 - `use_resolution_template`: accepted for vLLM-Omni request compatibility.
 - `use_system_prompt`: whether to add the Cosmos3 system prompt to the chat template.
 - `guardrails` or `use_guardrails`: per-request guardrail toggle when the server started with guardrails enabled.
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

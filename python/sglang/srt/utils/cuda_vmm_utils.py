@@ -667,7 +667,7 @@ class VmmReservation:
 
 def all_ranks_ok(group: ProcessGroup, ok: bool) -> bool:
     """True iff ``ok`` holds on every rank in ``group`` (BAND all-reduce)."""
-    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device="cpu")
     dist.all_reduce(flag, op=dist.ReduceOp.BAND, group=group)
     return flag.item() == 1
 

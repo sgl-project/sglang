@@ -4,8 +4,8 @@
 # Usage:
 #   build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> <packaging-overlay> [architecture]
 #
-# Writes CUDA-tagged wheels to <deepep-source>/dist. CUDA 13 builds also write
-# PyPI-ready wheels without the local CUDA version to <deepep-source>/dist-pypi.
+# Writes CUDA-tagged wheels to <deepep-source>/dist, plus PyPI-ready wheels
+# without the local CUDA version in <deepep-source>/dist-pypi.
 
 set -euo pipefail
 
@@ -14,7 +14,7 @@ usage() {
 Usage: build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> <packaging-overlay> [architecture]
 
   python-version:     3.10, 3.11, 3.12, or 3.13
-  cuda-version:       12.9 or 13.0
+  cuda-version:       13.0
   deepep-source:      checkout of the selected DeepEP implementation branch
   packaging-overlay: path to the shared DeepEP sgl_deep_ep directory
   architecture:       x86_64 or aarch64 (defaults to the current machine)
@@ -45,9 +45,6 @@ case "${PYTHON_VERSION}" in
 esac
 
 case "${CUDA_VERSION}" in
-    12.9)
-        CUDA_TAG=cu129
-        ;;
     13.0)
         CUDA_TAG=cu130
         ;;

@@ -19,6 +19,7 @@
 
 import logging
 import re
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, TypedDict
 
@@ -201,9 +202,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             self.language_model.logits_processor.logit_scale *= logit_scale
         self.post_init()
 
-    def pad_input_ids(
-        self, input_ids: List[int], image_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         """Pad input IDs with image tokens."""
         # Get special token IDs
         im_start_id: int = image_inputs.im_start_id

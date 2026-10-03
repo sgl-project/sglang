@@ -93,6 +93,10 @@ class HybridAttnBackend(AttentionBackend):
     def supports_full_cuda_graph_chunked_prefix(self) -> bool:
         return self.prefill_backend.supports_full_cuda_graph_chunked_prefix
 
+    @property
+    def supports_prefill_cuda_graph_max_context_size(self) -> bool:
+        return self.prefill_backend.supports_prefill_cuda_graph_max_context_size
+
     def prepare_full_cuda_graph_chunked_prefix(
         self,
         forward_batch: ForwardBatch,
@@ -153,6 +157,9 @@ class HybridAttnBackend(AttentionBackend):
         self._select_backend(
             ForwardMode.TARGET_VERIFY
         ).update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)
+
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        self.decode_backend.validate_elastic_cuda_graph_recapture()
 
     def forward(
         self,

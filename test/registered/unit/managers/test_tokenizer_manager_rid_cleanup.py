@@ -11,9 +11,11 @@ Covers:
   - _init_req_state rejects duplicate rids
   - Resubmission succeeds after cleanup
   - Handler failures clean up pending and dispatched requests
+  - _handle_batch_output takes non-streaming first_token_time from the scheduler
 """
 
 import asyncio
+import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -24,10 +26,12 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
     GenerateReqInput,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -35,6 +39,7 @@ from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
 )
 from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
+    SchedulerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
 
@@ -201,6 +206,8 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [[]]
         elif f.name in _PER_REQUEST_OPTIONAL_FIELDS:
             kwargs[f.name] = [None]
+        elif f.name == "output_token_sampling_mask":
+            kwargs[f.name] = None
         # Fields with class defaults — skip, let the default be used
         elif (
             f.default is not msgspec.NODEFAULT
@@ -215,6 +222,91 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [[]]
 
     return BatchStrOutput(**kwargs)
+
+
+class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tm = _make_tokenizer_manager(self)
+        self.tm.incremental_streaming_output = True
+        self.tm.request_logger = Mock()
+        self.tm.request_metrics_exporter_manager = Mock()
+        self.tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        self.state = _make_req_state("engine_wait")
+        self.state.obj.stream = True
+        self.state.obj.background = False
+        self.tm.rid_to_state[self.state.obj.rid] = self.state
+
+    async def test_available_and_later_outputs_keep_order(self):
+        stream = self.tm._wait_one_response(self.state.obj)
+        first = {"output_ids": [1], "meta_info": {"finish_reason": None}}
+        final = {"output_ids": [2], "meta_info": {"finish_reason": {"type": "length"}}}
+        self.state.out_list.append(first)
+        self.state.event.set()
+        with patch(
+            "asyncio.wait_for",
+            side_effect=AssertionError("Engine installed an HTTP timeout"),
+        ):
+            self.assertEqual((await anext(stream))["output_ids"], [1])
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)
+            self.assertFalse(pending.done())
+            self.state.out_list.append(final)
+            self.state.finished = True
+            self.state.event.set()
+            self.assertEqual((await pending)["output_ids"], [2])
+            with self.assertRaises(StopAsyncIteration):
+                await anext(stream)
+
+    async def test_cancelling_pending_wait_removes_event_waiter(self):
+        stream = self.tm._wait_one_response(self.state.obj)
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        self.assertTrue(self.state.event._waiters)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertFalse(self.state.event._waiters)
+        await stream.aclose()
+
+    async def test_abort_and_shutdown_errors_wake_engine_iterator(self):
+        for status in (400, 500, 503):
+            with self.subTest(status=status):
+                state = _make_req_state(f"engine_abort_{status}")
+                state.obj.stream = True
+                self.tm.rid_to_state[state.obj.rid] = state
+                stream = self.tm._wait_one_response(state.obj)
+                pending = asyncio.create_task(anext(stream))
+                await asyncio.sleep(0)
+                self.tm._handle_abort_req(
+                    AbortReq(
+                        rid=state.obj.rid,
+                        finished_reason={
+                            "type": "abort",
+                            "status_code": status,
+                            "message": "test",
+                        },
+                    )
+                )
+                result = await pending
+                self.assertEqual(
+                    result["meta_info"]["finish_reason"]["status_code"], status
+                )
+                self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
+                with self.assertRaises(StopAsyncIteration):
+                    await anext(stream)
+
+    async def test_http_timeout_still_checks_disconnection(self):
+        request = Mock()
+        request.is_disconnected = AsyncMock(return_value=True)
+        self.tm.abort_request = Mock()
+        stream = self.tm._wait_one_response(self.state.obj, request)
+        with patch(
+            "sglang.srt.managers.tokenizer_manager._REQUEST_STATE_WAIT_TIMEOUT", 0.001
+        ):
+            with self.assertRaisesRegex(ValueError, "disconnected"):
+                await anext(stream)
+        request.is_disconnected.assert_awaited_once()
+        self.tm.abort_request.assert_called_once_with(self.state.obj.rid)
 
 
 class TestRidToStateCleanupOnAbort(CustomTestCase):
@@ -364,6 +456,109 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         asyncio.run(tm._handle_batch_output(batch_output))
 
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestRequestTpotGating(CustomTestCase):
+    """Request TPOT is observed once, only for requests with a real decode
+    interval that ran to completion on a non-prefill worker."""
+
+    def _run(
+        self,
+        batches,
+        disaggregation_mode=DisaggregationMode.NULL,
+        *,
+        stream=False,
+        prefill_finished_time=0.0,
+    ):
+        tm = _make_tokenizer_manager(self)
+        tm.enable_metrics = True
+        tm.enable_priority_scheduling = False
+        tm.disaggregation_mode = disaggregation_mode
+        tm.metrics_collector = MagicMock(labels={})
+        rid = "tpot_rid"
+        state = _make_req_state(rid)
+        state.obj.log_metrics = True
+        state.obj.sampling_params = {}
+        state.obj.custom_labels = None
+        state.obj.stream = stream
+        state.time_stats.created_time = time.perf_counter() - 1.0
+        tm.rid_to_state[rid] = state
+        sched_stats = SchedulerReqTimeStats(
+            enable_metrics=True, prefill_finished_time=prefill_finished_time
+        )
+        for completion_tokens, finished_reason in batches:
+            batch_output = _make_batch_str_output(rid, finished_reason)
+            batch_output.completion_tokens = [completion_tokens]
+            batch_output.time_stats = wrap_as_pickle([sched_stats])
+            asyncio.run(tm._handle_batch_output(batch_output))
+        (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
+        return call.kwargs["time_per_output_token"]
+
+    def test_single_batch_finish(self):
+        produced = time.perf_counter() - 0.5
+        # Streaming: first and final output in one batch leave no decode interval.
+        self.assertIsNone(
+            self._run(
+                [(40, {"type": "stop"})],
+                stream=True,
+                prefill_finished_time=produced,
+            )
+        )
+        # Non-streaming: decode runs from the scheduler's first-token time.
+        self.assertGreater(
+            self._run([(40, {"type": "stop"})], prefill_finished_time=produced),
+            0.0,
+        )
+
+    def test_multi_batch_records_only_completed_decode(self):
+        cases = [
+            ("stop", {"type": "stop"}, DisaggregationMode.NULL, True),
+            ("abort", {"type": "abort"}, DisaggregationMode.NULL, False),
+            ("prefill", {"type": "stop"}, DisaggregationMode.PREFILL, False),
+        ]
+        for name, finished_reason, mode, recorded in cases:
+            with self.subTest(name):
+                tpot = self._run(
+                    [(1, _NOT_FINISHED), (3, finished_reason)],
+                    disaggregation_mode=mode,
+                )
+                if recorded:
+                    self.assertGreater(tpot, 0.0)
+                else:
+                    self.assertIsNone(tpot)
+
+
+class TestNonStreamingFirstTokenTime(CustomTestCase):
+    def _run(self, *, stream: bool, prefill_finished_time: float):
+        tm = _make_tokenizer_manager(self)
+        rid = "ttft_rid"
+        state = _make_req_state(rid)
+        state.obj.stream = stream
+        state.time_stats.created_time = time.perf_counter() - 1.0
+        tm.rid_to_state[rid] = state
+        sched_stats = SchedulerReqTimeStats(
+            enable_metrics=True, prefill_finished_time=prefill_finished_time
+        )
+        batch_output = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
+        batch_output.time_stats = wrap_as_pickle([sched_stats])
+        arrival = time.perf_counter()
+        asyncio.run(tm._handle_batch_output(batch_output))
+        return state.time_stats, arrival
+
+    def test_non_streaming_uses_scheduler_time(self):
+        produced = time.perf_counter() - 0.5
+        stats, arrival = self._run(stream=False, prefill_finished_time=produced)
+        self.assertAlmostEqual(stats.first_token_time, produced, delta=1e-3)
+        self.assertGreaterEqual(stats.last_time, arrival)
+
+    def test_streaming_uses_arrival_time(self):
+        produced = time.perf_counter() - 0.5
+        stats, arrival = self._run(stream=True, prefill_finished_time=produced)
+        self.assertGreaterEqual(stats.first_token_time, arrival)
+
+    def test_falls_back_to_arrival_without_scheduler_time(self):
+        stats, arrival = self._run(stream=False, prefill_finished_time=0.0)
+        self.assertGreaterEqual(stats.first_token_time, arrival)
 
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):

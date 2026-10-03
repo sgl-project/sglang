@@ -1,7 +1,4 @@
-"""Config-time override declarations for moss_vl.
-
-Architectures: MossVLForConditionalGeneration.
-"""
+"""Config-time override declarations for moss_vl."""
 
 import logging
 from typing import Any, Dict

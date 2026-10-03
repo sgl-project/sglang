@@ -408,6 +408,7 @@ def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
+            enable_spectrum=False,
         )
     )
 
@@ -465,6 +466,7 @@ def test_extra_high_quality_does_not_enable_h3_cache_dit():
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
+            enable_spectrum=False,
         )
     )
 
@@ -550,7 +552,7 @@ def test_validate_server_args_requires_packed_varlen_backend():
         resolve_component_attention_backend=lambda *_names: (None, None),
     )
     with patch(
-        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
     ) as get_attn_backend:
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
     get_attn_backend.assert_called_once_with(
@@ -560,7 +562,7 @@ def test_validate_server_args_requires_packed_varlen_backend():
         attention_requirements=AttentionRequirements(packed_varlen=True),
     )
     with patch(
-        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend",
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend",
         side_effect=ValueError("does not implement packed varlen attention"),
     ):
         with pytest.raises(ValueError, match="does not implement packed varlen"):
@@ -581,6 +583,7 @@ def test_validate_server_args_accepts_transformer_backend_override():
     server_args = SimpleNamespace(
         component_attention_backends={"transformer": "subblock_sparse_attn"},
         attention_backend="fa",
+        attention_backend_config={},
         ring_degree=1,
         resolve_component_attention_backend=lambda *_names: (
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
@@ -589,7 +592,7 @@ def test_validate_server_args_accepts_transformer_backend_override():
     )
 
     with patch(
-        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
     ) as get_attn_backend:
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
     get_attn_backend.assert_called_once_with(
@@ -620,7 +623,7 @@ def test_resolve_transformer_attention_backend_uses_selector_precedence():
             ),
         )
         with patch(
-            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+            "sglang.multimodal_gen.runtime.layers.attention.selector."
             "get_global_forced_attn_backend",
             return_value=forced_backend,
         ):

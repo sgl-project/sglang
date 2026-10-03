@@ -88,6 +88,8 @@ def moe_align_block_size(
         max_num_tokens_padded = topk_ids.numel() * block_size
     else:
         max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    # The align kernel pads sorted_ids with int4 stores.
+    max_num_tokens_padded = (max_num_tokens_padded + 3) // 4 * 4
 
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device

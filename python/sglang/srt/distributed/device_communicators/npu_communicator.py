@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -39,8 +40,8 @@ class NpuCommunicator:
             output_size[:1], dtype=scale.dtype, device=scale.device
         )
         # All-gather.
-        dist.all_gather_into_tensor(output_tensor, x_q, group=self.group)
-        dist.all_gather_into_tensor(output_scale, scale, group=self.group)
+        all_gather_single(output_tensor, x_q, group=self.group)
+        all_gather_single(output_scale, scale, group=self.group)
 
         output_tensor = output_tensor.to(x.dtype) * output_scale.unsqueeze(-1).to(
             x.dtype
@@ -60,7 +61,7 @@ class NpuCommunicator:
         # Allocate output tensor.
         output_tensor = torch.empty(output_size, dtype=x.dtype, device=x.device)
         # All-gather.
-        dist.all_gather_into_tensor(output_tensor, x, group=self.group)
+        all_gather_single(output_tensor, x, group=self.group)
         # Reshape
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)

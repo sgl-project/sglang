@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
@@ -82,12 +82,11 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                         base_url=self.base_url,
                         model=model_setup.model_path,
                         eval_name="gsm8k",
-                        api="sgl_eval",
                         num_examples=None,
                         num_threads=1024,
                     )
 
-                    metrics = run_eval(args)
+                    metrics = run_sgl_eval(args)
                     print(
                         f"{'=' * 42}\n{model_setup.model_path} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
                     )

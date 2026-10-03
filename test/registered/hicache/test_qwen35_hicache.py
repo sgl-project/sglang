@@ -35,6 +35,7 @@ class TestQwen35WithHiCache(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.storage_dir = tempfile.mkdtemp(prefix="qwen35-hicache-")
         env = {
+            "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
             "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.storage_dir,
         }
         cls.process = popen_launch_server(
@@ -109,7 +110,7 @@ class TestQwen35WithHiCache(CustomTestCase):
             top_p=0.95,
             top_k=20,
             base_url=self.base_url,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         return run_eval(args)

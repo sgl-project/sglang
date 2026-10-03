@@ -75,7 +75,7 @@ def dsv4_state_payloads(
     """Build NPU-specific DSV4 PD payloads.
 
     Returns payloads for components that are addressed differently from the
-    cross-hardware ``StateType.SWA`` / ``StateType.C128_STATE`` defaults:
+    cross-hardware ``StateType.SWA`` / ``StateType.DSV4_REQUEST_STATE`` defaults:
 
     * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
     * ``DSV4_C4_STATE`` (A5 only) — live C4 compress-state rows.  Prefill
@@ -88,8 +88,10 @@ def dsv4_state_payloads(
     import numpy as np
 
     from sglang.srt.disaggregation.ascend.conn import AscendStateType
-    from sglang.srt.disaggregation.utils import get_dsv4_c4_state_indices
     from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+    from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+        c4_state_transfer_indices,
+    )
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
@@ -113,7 +115,7 @@ def dsv4_state_payloads(
     if is_npu_arch35():
 
         def c4_state_indices():
-            return get_dsv4_c4_state_indices(
+            return c4_state_transfer_indices(
                 req_pool_idx,
                 seq_len,
                 ring_size=req_to_token_pool.get_dsv4_c4_state_ring_size(),

@@ -64,6 +64,30 @@ logger = init_logger(__name__)
 
 _LONGCAT_QKNORM_ROPE = BitExactFusionGate("LongCat fused QKNorm+RoPE")
 _LONGCAT_LN_MOD = BitExactFusionGate("LongCat fused LN+modulate", per_signature=True)
+_LONGCAT_GELU_CAT = BitExactFusionGate("LongCat fused GELU+cat")
+
+
+def _longcat_gelu_cat(
+    attn: torch.Tensor, mlp: torch.Tensor, activation: nn.Module
+) -> torch.Tensor:
+    if (
+        type(activation) is nn.GELU
+        and activation.approximate == "tanh"
+        and _LONGCAT_GELU_CAT.can_attempt_once()
+        and diffusion_ops.can_use_fused_gelu_tanh_cat(attn, mlp)
+    ):
+        try:
+            output = diffusion_ops.fused_gelu_tanh_cat(attn, mlp)
+        except Exception as exc:
+            _LONGCAT_GELU_CAT.on_exception(exc, logger=logger)
+        else:
+            if _LONGCAT_GELU_CAT.verified:
+                return output
+            reference = torch.cat((attn, activation(mlp)), dim=-1)
+            return _LONGCAT_GELU_CAT.accept_or_fallback(
+                output, reference, logger=logger
+            )
+    return torch.cat((attn, activation(mlp)), dim=-1)
 
 
 def _longcat_norm_modulate(
@@ -649,15 +673,15 @@ class _SingleTransformerBlock(nn.Module):
 
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        if fused_gelu_active(self) and can_use_linear_gelu(
+        gelu_in_projection = fused_gelu_active(self) and can_use_linear_gelu(
             self.proj_mlp, norm_hidden_states
-        ):
+        )
+        if gelu_in_projection:
             mlp_hidden_states = fused_linear_gelu_tanh(
                 norm_hidden_states, self.proj_mlp.weight, self.proj_mlp.bias
             )
         else:
             mlp_hidden_states, _ = self.proj_mlp(norm_hidden_states)
-            mlp_hidden_states = self.act_mlp(mlp_hidden_states)
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
@@ -666,7 +690,12 @@ class _SingleTransformerBlock(nn.Module):
             cos_sin_cache=cos_sin_cache,
             positions=positions,
         )
-        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+        if gelu_in_projection:
+            hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+        else:
+            hidden_states = _longcat_gelu_cat(
+                attn_output, mlp_hidden_states, self.act_mlp
+            )
         gate = gate.unsqueeze(1)
         hidden_states, _ = self.proj_out(hidden_states)
         hidden_states = residual_gate_add(residual, hidden_states, gate)

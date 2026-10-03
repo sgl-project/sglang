@@ -4,6 +4,20 @@
 
 SGLang's diffusion/multimodal generation subsystem. Separate from the LLM runtime (`srt`). Supports 20+ image/video diffusion models (Wan, FLUX, HunyuanVideo, LTX, Qwen-Image, etc.) with distributed inference, LoRA, and multiple attention backends.
 
+## Serving a specific model — read its cookbook page first
+
+**Before running or deploying any model, read `docs/cookbook/diffusion/<Family>/`.**
+That page carries the deployment command we recommend to users — GPU count,
+parallelism degrees, pipeline class, offload flags — and it is the answer to
+"how should this model be served". Families: Cosmos, Ernie-Image, FLUX,
+Ideogram, JoyEcho, Krea, LTX, LingBot-Video, LingBot-World, LongLive, MOVA,
+MiniMax, Qwen-Image, SANA-Video, SANA-WM, Wan, Z-Image.
+
+The configs under `test/` are a different thing: pinned, reproducible CI setups
+for correctness and regression checks, not deployment advice. Reach for them
+when you need an exact reproducible configuration, and say which cookbook flags
+you diverged from.
+
 ## Quick Start
 
 ```bash

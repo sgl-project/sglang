@@ -191,6 +191,7 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
             encoder_lens=None,
             out_cache_loc=batch.out_cache_loc,
             spec_info=batch.spec_info,
+            max_seq_len_override=700,
         )
 
         # Pure mocks (no `wraps=...`) so the dispatcher's slicing/contract is
@@ -215,6 +216,8 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         self.assertEqual(
             child_fbs[1].req_pool_indices.shape[0], capture_bs - split_seq_index
         )
+        self.assertEqual(child_fbs[0].max_seq_len_override, 700)
+        self.assertEqual(child_fbs[1].max_seq_len_override, 700)
 
 
 if __name__ == "__main__":

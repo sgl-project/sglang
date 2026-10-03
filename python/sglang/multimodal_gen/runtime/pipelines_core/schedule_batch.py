@@ -12,6 +12,7 @@ in a functional manner, reducing the need for explicit parameter passing.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import pprint
 from collections import Counter
@@ -38,12 +39,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
-from sglang.multimodal_gen.utils import align_to
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 logger = init_logger(__name__)
 
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
+
+
+def _align_to(value: int, alignment: int) -> int:
+    return int(math.ceil(value / alignment) * alignment)
 
 
 @dataclass
@@ -151,7 +155,7 @@ class Req:
     raw_latent_shape: torch.Tensor | None = None
     did_sp_shard_latents: bool = False
     sp_video_start_frame: int = 0
-    noise_pred: torch.Tensor | None = None
+    noise_pred: torch.Tensor | list | tuple | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
@@ -425,11 +429,11 @@ class Req:
 
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
-            target_height = align_to(self.height, 16)
+            target_height = _align_to(self.height, 16)
         else:
             target_height = -1
         if self.width:
-            target_width = align_to(self.width, 16)
+            target_width = _align_to(self.width, 16)
         else:
             target_width = -1
 
@@ -498,7 +502,7 @@ class OutputBatch:
     metrics_list: Optional[list[Optional[RequestMetrics]]] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
-    noise_pred: torch.Tensor | None = None
+    noise_pred: torch.Tensor | list | tuple | None = None
     peak_memory_mb: float = 0.0
     usage: dict[str, Any] | None = None
 

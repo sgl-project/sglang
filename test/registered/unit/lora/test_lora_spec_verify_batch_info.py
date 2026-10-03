@@ -31,6 +31,7 @@ def _verify_batch(bs: int, draft_token_num: int) -> SimpleNamespace:
     return SimpleNamespace(
         forward_mode=ForwardMode.TARGET_VERIFY,
         batch_size=bs,
+        input_ids=torch.zeros(bs * draft_token_num, dtype=torch.int64),
         spec_info=SimpleNamespace(draft_token_num=draft_token_num),
         extend_seq_lens=None,
         extend_seq_lens_cpu=None,

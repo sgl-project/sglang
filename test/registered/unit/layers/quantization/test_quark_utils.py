@@ -8,8 +8,57 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.quark.utils import e8m0_to_f32
+from sglang.srt.layers.quantization.quark.utils import (
+    e8m0_to_f32,
+    should_ignore_layer,
+)
 from sglang.test.test_utils import CustomTestCase
+
+
+class TestShouldIgnoreLayer(CustomTestCase):
+    """MiniMax-M3 MXFP4: sparse index_qkv_proj packs only q/k (the DSA value
+    projection is disabled, so index_v_proj is absent on disk)."""
+
+    _LAYER = "language_model.model.layers.3.self_attn.index_qkv_proj"
+    _IGNORE = (
+        "language_model.model.layers.3.self_attn.index_q_proj",
+        "language_model.model.layers.3.self_attn.index_k_proj",
+    )
+    # The fix lives in the model: index_qkv_proj maps to only q/k (no v).
+    _MAPPING = {
+        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
+    }
+
+    def test_minimax_dsa_index_qkv_ignored(self):
+        # Both present shards are excluded -> fused module stays bf16, no raise.
+        self.assertTrue(should_ignore_layer(self._LAYER, self._IGNORE, self._MAPPING))
+
+    def test_all_shards_agree_still_works(self):
+        layer = "model.layers.0.self_attn.qkv_proj"
+        ignore = (
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.k_proj",
+            "model.layers.0.self_attn.v_proj",
+        )
+        mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+        self.assertTrue(should_ignore_layer(layer, ignore, mapping))
+
+    def test_no_shards_ignored(self):
+        layer = "model.layers.0.self_attn.qkv_proj"
+        mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+        self.assertFalse(should_ignore_layer(layer, (), mapping))
+
+    def test_mixed_schemes_raise(self):
+        # Safety net preserved: if a fused module genuinely mixes excluded and
+        # quantized shards, the loader must fail loudly rather than guess.
+        layer = "model.layers.0.self_attn.qkv_proj"
+        ignore = (
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.k_proj",
+        )  # v_proj NOT excluded -> inconsistent with q/k
+        mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+        with self.assertRaises(ValueError):
+            should_ignore_layer(layer, ignore, mapping)
 
 
 class TestE8M0ToF32(CustomTestCase):
@@ -64,6 +113,47 @@ class TestE8M0ToF32(CustomTestCase):
         self.assertEqual(out[0].item(), 1.0)
         self.assertEqual(out[1].item(), 128.0)
         self.assertTrue(torch.isnan(out[2]).item())
+
+
+QKV_MAPPING = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+
+class TestShouldIgnoreLayerFusedNames(CustomTestCase):
+    """An `exclude` entry naming an already-fused module, or naming experts
+    individually, must exclude the fused module SGLang builds; otherwise an
+    MXFP4-packed parameter is allocated for a BF16 tensor and loading aborts."""
+
+    # ---- Bug-catchers: must FAIL on unfixed code ---------------------------
+
+    def test_directly_excluded_fused_qkv_is_ignored(self):
+        name = "visual.blocks.0.attn.qkv_proj"
+        self.assertTrue(
+            should_ignore_layer(name, ignore=[name], fused_mapping=QKV_MAPPING)
+        )
+
+    def test_per_expert_excludes_ignore_the_fused_moe_module(self):
+        layer = "model.layers.6.mlp.experts"
+        ignore = [
+            f"{layer}.{i}.{proj}"
+            for i in range(3)
+            for proj in ("down_proj", "gate_proj", "up_proj")
+        ]
+        self.assertTrue(
+            should_ignore_layer(layer, ignore=ignore, fused_mapping=QKV_MAPPING)
+        )
+
+    # ---- Guards: behavior that must NOT change -----------------------------
+
+    def test_unrelated_moe_layer_is_not_ignored(self):
+        # a prefix match must not bleed into a neighboring layer index
+        ignore = ["model.layers.6.mlp.experts.0.down_proj"]
+        self.assertFalse(
+            should_ignore_layer(
+                "model.layers.7.mlp.experts",
+                ignore=ignore,
+                fused_mapping=QKV_MAPPING,
+            )
+        )
 
 
 if __name__ == "__main__":

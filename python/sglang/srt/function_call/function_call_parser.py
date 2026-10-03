@@ -13,22 +13,30 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.beam_detector import BeamDetector
 from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.dots_detector import DotsToolDetector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
-from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
+from sglang.srt.function_call.glm4_moe_detector import (
+    Glm4MoeDetector,
+    GlmSpecialTokenConfig,
+    generate_glm_grammar,
+)
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
+from sglang.srt.function_call.iquest_q1_detector import IQuestQ1Detector
 from sglang.srt.function_call.k2_v3_detector import K2V3Detector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
@@ -52,6 +60,7 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +76,13 @@ class FunctionCallParser:
 
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
         "apertus2509": Apertus2509Detector,
+        "beam": BeamDetector,
         "cohere_command4": CohereCommand4Detector,
         "deepseekv3": DeepSeekV3Detector,
         "deepseekv31": DeepSeekV31Detector,
         "deepseekv32": DeepSeekV32Detector,
         "deepseekv4": DeepSeekV4Detector,
+        "deepseekv41": DeepSeekV41Detector,
         "dots": DotsToolDetector,
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
@@ -103,11 +114,24 @@ class FunctionCallParser:
         "hermes": HermesDetector,
         "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
+        "gigachat35": GigaChat35Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
+        "iquest_q1": IQuestQ1Detector,
+        "response_template": ResponseTemplateToolDetector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
+    def __init__(
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        tokenizer=None,
+        tool_choice=None,
+        prefix: str = "",
+        constrained: bool = False,
+    ):
+        self.tools = tools
+        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -115,13 +139,31 @@ class FunctionCallParser:
                 sig = inspect.signature(detector_class)
                 if "tokenizer" in sig.parameters:
                     kwargs["tokenizer"] = tokenizer
+            if issubclass(detector_class, ResponseTemplateToolDetector):
+                if prefix:
+                    kwargs["prefix"] = prefix
+                kwargs["constrained"] = constrained
+                # Forced calls are parsed in the format of the tag for these tools.
+                kwargs["tools"] = self.structural_tag_tools()
             detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 
-        self.detector = detector
-        self.tools = tools
-        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+        if isinstance(detector, Glm47MoeDetector):
+            detector.use_full_assistant_constraint = not any(
+                tool.function.strict for tool in tools
+            )
+        if isinstance(tool_choice, dict):
+            tool_choice = ToolChoice(function={"name": tool_choice["name"]})
+        self._required_tool_parser = detector.get_required_tool_parser(tool_choice)
+        self.detector = self._required_tool_parser or detector
+
+    def owns_tool_format(self) -> bool:
+        return (
+            self._required_tool_parser is not None
+            or self.detector.supports_structural_tag()
+            or self.detector.parses_required_natively()
+        )
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -249,6 +291,18 @@ class FunctionCallParser:
             at_least_one=at_least_one,
         )
 
+    def structural_tag_tools(self) -> List[Tool]:
+        """The tools as structural tags constrain them: all strict at the
+        PARAMETER strict level."""
+        if self.tool_strict_level < ToolStrictLevel.PARAMETER or not self.tools:
+            return self.tools
+        return [
+            tool.model_copy(
+                update={"function": tool.function.model_copy(update={"strict": True})}
+            )
+            for tool in self.tools
+        ]
+
     def get_structure_constraint(
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
@@ -275,9 +329,44 @@ class FunctionCallParser:
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
+        structural_tag_tools = self.structural_tag_tools()
+        if isinstance(self.detector, ResponseTemplateToolDetector):
+            should_constrain_auto = self.detector.validate_structure_constraint_request(
+                tools=structural_tag_tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                strict_requested=should_constrain_auto,
+            )
 
-        # Highest priority: model-native structural_tag when available.
         try:
+            if (
+                isinstance(self.detector, Glm47MoeDetector)
+                and self.detector.parses_required_natively()
+            ):
+                functions = (
+                    [
+                        tool.function
+                        for tool in self.tools
+                        if not isinstance(tool_choice, ToolChoice)
+                        or tool.function.name == tool_choice.function.name
+                    ]
+                    if self.tools and tool_choice != "none"
+                    else None
+                )
+                return (
+                    "full_assistant_ebnf",
+                    generate_glm_grammar(
+                        enable_thinking=thinking_mode,
+                        functions=functions,
+                        special_tokens=GlmSpecialTokenConfig(),
+                        chat_template_version="glm47",
+                        accommodate_chat_template=True,
+                        allow_multiple_assistant_turns=False,
+                        required=is_required,
+                        parallel_tool_calls=parallel_tool_calls,
+                    ),
+                )
+            # Highest priority: model-native structural_tag when available.
             if tool_choice == "auto" and not should_constrain_auto:
                 structural_tag = self.detector.get_auto_tool_call_structural_tag(
                     tools=self.tools,
@@ -288,18 +377,6 @@ class FunctionCallParser:
                     return ("structural_tag", structural_tag)
 
             if is_required or should_constrain_auto:
-                structural_tag_tools = self.tools
-                if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
-                    structural_tag_tools = [
-                        tool.model_copy(
-                            update={
-                                "function": tool.function.model_copy(
-                                    update={"strict": True}
-                                )
-                            }
-                        )
-                        for tool in self.tools
-                    ]
                 structural_tag = self.detector.get_structural_tag(
                     tools=structural_tag_tools,
                     thinking_mode=thinking_mode,
@@ -321,6 +398,14 @@ class FunctionCallParser:
             if (
                 tool_choice == "required" or isinstance(tool_choice, ToolChoice)
             ) and not self.detector.parses_required_natively():
+                required_parser = self.detector.get_required_tool_parser(tool_choice)
+                if required_parser is not None:
+                    return (
+                        "json_schema",
+                        required_parser.get_json_schema_constraint(
+                            self.tools, tool_choice, parallel_tool_calls
+                        ),
+                    )
                 json_schema = get_json_schema_constraint(
                     self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
                 )

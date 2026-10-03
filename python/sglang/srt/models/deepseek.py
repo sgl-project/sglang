@@ -109,6 +109,7 @@ class DeepseekMoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -125,6 +126,7 @@ class DeepseekMoE(nn.Module):
             )
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_id,
             renormalize=config.norm_topk_prob,
         )
         self.experts = nn.ModuleList(
@@ -339,6 +341,7 @@ class DeepseekDecoderLayer(nn.Module):
         ):
             self.mlp = DeepseekMoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )

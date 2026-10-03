@@ -78,6 +78,8 @@ class TestSchedulerInternalStateWorldSize(unittest.TestCase):
             is_dspark=lambda: False,
         )
         scheduler.draft_worker = None
+        # Set by maybe_init_rust_server in a real boot; None = no embedded Rust server.
+        scheduler.rust_server = None
 
         with get_context().override_server_args(**shape):
             output = scheduler.get_internal_state(recv_req=GetInternalStateReq())
@@ -91,16 +93,6 @@ class TestSchedulerInternalStateWorldSize(unittest.TestCase):
         internal_state = self._get_internal_state(shape)
 
         self.assertEqual(internal_state["world_size"], 4)
-
-    def test_the_reported_size_is_not_one_replica_of_a_data_parallel_server(self):
-        """Each plain dp replica has its own process group, so no scheduler can report the whole server from it."""
-        shape = _shape(tp_size=2, pp_size=1, dp_size=2, enable_dp_attention=False)
-
-        internal_state = self._get_internal_state(shape)
-
-        self.assertNotEqual(
-            internal_state["world_size"], shape["tp_size"] * shape["pp_size"]
-        )
 
 
 if __name__ == "__main__":

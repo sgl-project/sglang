@@ -1,7 +1,4 @@
-"""Config-time override declarations for inkling.
-
-Architectures: InklingForConditionalGeneration, InklingForConditionalGenerationMTP.
-"""
+"""Config-time override declarations for inkling."""
 
 import logging
 from typing import Any, Dict
@@ -11,7 +8,6 @@ from sglang.srt.arg_groups.model_override_base import (
     is_attention_backend_not_set,
     resolving_view,
 )
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -58,6 +54,10 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # spec today, but giving it one would silently stop this pin from firing.
     if cfg.mamba_radix_cache_strategy == "auto":
         overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+    # The generic resolution never sets the arch-derived leaf for Inkling, and
+    # handle_mamba_radix_cache rejects extra_buffer on a model without it.
+    if not cfg.disable_radix_cache:
+        overrides["uses_mamba_radix_cache"] = True
     # Inkling attention runs only on the fa4 (Blackwell) or triton backends --
     # models/inkling_common/attn.py asserts attention_backend in {fa4, triton}.
     # The generic resolver would otherwise pick trtllm_mha (SM100) / fa3
@@ -72,5 +72,4 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
             f"Use {inkling_attn_backend} as the attention backend for Inkling "
             "(requires fa4 or triton)."
         )
-    envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.set(True)
     return overrides

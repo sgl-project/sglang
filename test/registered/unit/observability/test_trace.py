@@ -20,7 +20,6 @@ from sglang.srt.observability.trace import (
     TraceThreadInfo,
     extract_trace_headers,
     get_global_trace_level,
-    get_global_tracing_enabled,
     process_tracing_init,
     set_global_trace_level,
     trace_set_thread_info,
@@ -73,14 +72,6 @@ class TestTraceFunctions(unittest.TestCase):
             self.assertEqual(get_global_trace_level(), 3)
         finally:
             get_resources().trace_level = orig
-
-    def test_get_global_tracing_enabled(self):
-        self.assertEqual(get_global_tracing_enabled(), mod.opentelemetry_initialized)
-
-    def test_get_cur_time_ns(self):
-        ts = mod.get_cur_time_ns()
-        self.assertIsInstance(ts, int)
-        self.assertGreater(ts, 0)
 
 
 class TestTraceNullContext(unittest.TestCase):
@@ -174,6 +165,48 @@ class TestProcessTracingInit(unittest.TestCase):
                 process_tracing_init("localhost:4317", "test")
         finally:
             mod.opentelemetry_imported = orig
+
+    @unittest.skipIf(not _has_otel, "OpenTelemetry not installed")
+    def test_service_name_priority_explicit(self):
+        """Service name priority: explicit parameter > env var > default."""
+        with patch.dict(os.environ, {"OTEL_SERVICE_NAME": "from-env"}):
+            with patch.object(mod, "TracerProvider"):
+                with patch.object(mod, "Resource") as mock_resource:
+                    process_tracing_init("localhost:4317", "explicit-name")
+                    # Verify Resource.create was called with the explicit name
+                    mock_resource.create.assert_called_once()
+                    call_kwargs = mock_resource.create.call_args[1]
+                    self.assertEqual(
+                        call_kwargs["attributes"][mod.SERVICE_NAME], "explicit-name"
+                    )
+
+    @unittest.skipIf(not _has_otel, "OpenTelemetry not installed")
+    def test_service_name_priority_env_var(self):
+        """Service name falls back to OTEL_SERVICE_NAME when explicit is None."""
+        with patch.dict(os.environ, {"OTEL_SERVICE_NAME": "from-env"}):
+            with patch.object(mod, "TracerProvider"):
+                with patch.object(mod, "Resource") as mock_resource:
+                    process_tracing_init("localhost:4317", None)
+                    # Verify Resource.create was called with env var value
+                    mock_resource.create.assert_called_once()
+                    call_kwargs = mock_resource.create.call_args[1]
+                    self.assertEqual(
+                        call_kwargs["attributes"][mod.SERVICE_NAME], "from-env"
+                    )
+
+    @unittest.skipIf(not _has_otel, "OpenTelemetry not installed")
+    def test_service_name_priority_default(self):
+        """Service name falls back to 'sglang' when both explicit and env are unset."""
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(mod, "TracerProvider"):
+                with patch.object(mod, "Resource") as mock_resource:
+                    process_tracing_init("localhost:4317", None)
+                    # Verify Resource.create was called with default value
+                    mock_resource.create.assert_called_once()
+                    call_kwargs = mock_resource.create.call_args[1]
+                    self.assertEqual(
+                        call_kwargs["attributes"][mod.SERVICE_NAME], "sglang"
+                    )
 
 
 class TestTraceReqContextDisabled(unittest.TestCase):

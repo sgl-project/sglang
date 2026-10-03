@@ -20,7 +20,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=898, stage="base-c", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=898, stage="extra-b", runner_config="8-gpu-b300")
 
 MODEL_LOADER_EXTRA_CONFIG = '{"enable_multithread_load": true, "num_threads": 6}'
 
@@ -95,6 +95,44 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
     def setUpClass(cls):
         super().setUpClass()
         cls.launch_all()
+
+
+class TestGLM52DSACacheLayerSplitMixedMoE(TestGLM52DSACacheLayerSplit):
+    """Cover target DeepEP with a TP-only EAGLE draft on PD decode."""
+
+    # This variant is a topology/control-flow smoke rather than a second full
+    # accuracy run. Keep enough uneven concurrent work to exercise DP padding.
+    gsm8k_accuracy_thres = 0.8
+    gsm8k_num_questions = 32
+    gsm8k_num_threads = 32
+
+    extra_decode_args = TestGLM52DSACacheLayerSplit.extra_decode_args + [
+        "--dp-size",
+        "4",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--ep-size",
+        "4",
+        "--moe-dense-tp-size",
+        "1",
+        "--moe-a2a-backend",
+        "deepep",
+        "--deepep-mode",
+        "low_latency",
+        # NVFP4 MoE registers a DeepEP fused func only for the CuteDSL runner.
+        "--moe-runner-backend",
+        "flashinfer_cutedsl",
+        "--speculative-moe-a2a-backend",
+        "none",
+        "--speculative-moe-runner-backend",
+        "triton",
+        "--cuda-graph-max-bs-decode",
+        "8",
+        "--max-running-requests",
+        "8",
+        "--disable-prefill-cuda-graph",
+        "--disable-flashinfer-autotune",
+    ]
 
 
 if __name__ == "__main__":

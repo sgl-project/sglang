@@ -159,3 +159,9 @@ LingBot World uses raw-frame websocket GT plus per-chunk latency guards for cons
 - Use the realtime endpoint for interactive sessions: `/v1/realtime_video/generate`.
 - Prefer WebP preview transport for interactive testing; use raw-frame transport for consistency checks.
 - Long-running sessions should be validated with raw-frame consistency before changing causal cache, condition sampling, or VAE decode behavior.
+
+## 7. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

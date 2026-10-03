@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -40,7 +39,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
     ) -> None:
         nn.Module.__init__(self)
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)

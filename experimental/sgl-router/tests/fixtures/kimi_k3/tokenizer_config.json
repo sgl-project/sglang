@@ -1,0 +1,19 @@
+{
+  "added_tokens_decoder": {
+    "308": {"content": "[BOS]"},
+    "309": {"content": "[EOS]"},
+    "310": {"content": "<|end_of_msg|>"},
+    "311": {"content": "<|open|>"},
+    "312": {"content": "<|close|>"},
+    "313": {"content": "<|sep|>"},
+    "329": {"content": "<|media_pad|>"},
+    "562": {"content": "[UNK]"},
+    "563": {"content": "[PAD]"}
+  },
+  "bos_token": "[BOS]",
+  "eos_token": "[EOS]",
+  "pad_token": "[PAD]",
+  "unk_token": "[UNK]",
+  "additional_special_tokens": ["<|end_of_msg|>"],
+  "tokenizer_class": "TikTokenTokenizer"
+}

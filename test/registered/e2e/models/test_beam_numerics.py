@@ -20,8 +20,13 @@ import torch.nn.functional as F
 from torch._inductor import config as inductor_config
 
 import sglang as sgl
-from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.fused_op import (
+    BaseFusedOp,
+    get_fused_op_backend,
+    set_fused_op_backend,
+)
 from sglang.kernels.ops.attention.fused_qknorm_rope import fused_qk_norm_rope
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -294,6 +299,97 @@ class TestBeamNumerics(CustomTestCase):
         self.assertFalse(torch.equal(expected, q * scale.unsqueeze(-1).bfloat16()))
 
     @torch.inference_mode()
+    def test_forced_torch_keeps_the_prologue_reference_after_construction(self):
+        """Backend forcing must bypass QK and SSMax fusion on existing layers."""
+        previous_backend = get_fused_op_backend()
+        try:
+            set_fused_op_backend(None)
+            with (
+                get_context().override_server_args(),
+                get_parallel().override(
+                    tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0, attn_dp_size=1
+                ),
+                set_default_torch_dtype(torch.bfloat16),
+                torch.device("cuda"),
+            ):
+                sliding = BeamAttention(self.config, layer_id=0)
+                full = BeamAttention(self.config, layer_id=1)
+                self.assertTrue(sliding.use_fused_qk_norm_rope)
+                set_fused_op_backend(KernelBackend.TORCH)
+                positions = torch.tensor([0, 511], device="cuda")
+                generator = torch.Generator(device="cuda").manual_seed(49)
+                for attention in (sliding, full):
+                    with self.subTest(sliding=attention.apply_rope):
+                        qkv = torch.randn(
+                            2,
+                            attention.q_size + 2 * attention.kv_size,
+                            device="cuda",
+                            generator=generator,
+                        ).bfloat16()
+                        q, k, _ = qkv.split(
+                            [attention.q_size, attention.kv_size, attention.kv_size],
+                            dim=-1,
+                        )
+                        q = attention.q_norm.forward_native(
+                            q.reshape(-1, attention.head_dim)
+                        ).view(q.shape)
+                        k = attention.k_norm.forward_native(
+                            k.reshape(-1, attention.head_dim)
+                        ).view(k.shape)
+                        if attention.apply_rope:
+                            q, k = attention.rotary_emb.forward_native(positions, q, k)
+                        else:
+                            q = (
+                                q.float() * compute_ssmax_scale(positions)[:, None]
+                            ).to(q.dtype)
+                        attention.gate_bias.zero_()
+                        with (
+                            patch.object(
+                                attention.qkv_proj, "forward", return_value=(qkv, None)
+                            ),
+                            patch.object(
+                                attention.attn,
+                                "forward",
+                                side_effect=lambda q, k, v, b: q,
+                            ),
+                            patch.object(
+                                attention.gate_proj,
+                                "forward",
+                                return_value=(torch.zeros_like(q), None),
+                            ),
+                            patch.object(
+                                attention.o_proj,
+                                "forward",
+                                side_effect=lambda x: (x, None),
+                            ),
+                            patch(
+                                "sglang.srt.models.beam.fused_inplace_qknorm_rope",
+                                side_effect=AssertionError(
+                                    "forced Torch called QK+RoPE"
+                                ),
+                            ),
+                            patch(
+                                "sglang.srt.models.utils.fused_inplace_qknorm",
+                                side_effect=AssertionError(
+                                    "forced Torch called QK norm"
+                                ),
+                            ),
+                            patch(
+                                "sglang.srt.models.beam.apply_log_scaling_tau",
+                                side_effect=AssertionError("forced Torch called SSMax"),
+                            ),
+                        ):
+                            actual = attention(
+                                positions,
+                                torch.zeros(2, self.config.hidden_size),
+                                None,
+                                compute_ssmax_scale(positions),
+                            )
+                        torch.testing.assert_close(actual, q * 0.5, atol=0, rtol=0)
+        finally:
+            set_fused_op_backend(previous_backend)
+
+    @torch.inference_mode()
     def test_single_token_compiled_moe_preserves_runner_scale(self):
         # No process group is needed at TP1; these lookups only feed the disabled
         # symmetric-memory context. All routing and expert kernels remain real.
@@ -309,15 +405,7 @@ class TestBeamNumerics(CustomTestCase):
                 moe_tp_rank=0,
                 moe_ep_size=1,
                 moe_ep_rank=0,
-            ),
-            patch("sglang.srt.layers.moe.topk.get_tp_group", new=lambda: group),
-            patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer.get_tp_group",
-                new=lambda: group,
-            ),
-            patch(
-                "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe.get_tp_group",
-                new=lambda: group,
+                tp_group=group,
             ),
             set_default_torch_dtype(torch.bfloat16),
             torch.device("cuda"),

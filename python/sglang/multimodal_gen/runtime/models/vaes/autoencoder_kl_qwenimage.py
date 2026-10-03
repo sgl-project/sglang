@@ -14,6 +14,7 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
@@ -969,6 +970,8 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.shift_factor = (
             torch.tensor(
                 config.arch_config.latents_mean
+                if config.arch_config.latents_mean is not None
+                else [config.arch_config.shift_factor or 0.0] * latent_channels
             )
             .view(1, latent_channels, 1, 1, 1)
             .to(cuda_device, dtype)
@@ -1067,6 +1070,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.clear_cache()
         return enc
 
+    @cached_vae_encode
     def encode(
         self, x: torch.Tensor, return_dict: bool = True
     ) -> DiagonalGaussianDistribution:

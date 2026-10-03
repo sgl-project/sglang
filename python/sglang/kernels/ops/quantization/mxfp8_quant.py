@@ -143,6 +143,9 @@ def _mxfp8_quant_store_qkv_kernel(
         tl.store(sfq_ptr + (t * NQ + r) * SF + blk, sf)
     else:
         myloc = tl.load(loc_ptr + t).to(tl.int64)
+        # Slot 0 is the reserved CUDA-graph padding sink; skip writes to it.
+        if myloc == 0:
+            return
         if r < NQ + NKV:
             h = r - NQ
             cache = kc_ptr

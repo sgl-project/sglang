@@ -20,6 +20,7 @@
 
 import copy
 import logging
+from array import array
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -1068,7 +1069,7 @@ class GlmImageForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(logits_config)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

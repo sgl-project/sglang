@@ -101,6 +101,36 @@ class TestBatchInvariantOps(CustomTestCase):
             f"{test_name}: diff_range must be 0 in batch-invariant mode, got {diff_range} for {dtype}",
         )
 
+    def test_deepgemm_random_bf16_batch_invariance(self):
+        if not batch_invariant_ops.ENABLE_JIT_DEEPGEMM:
+            self.skipTest("DeepGEMM is unavailable on this device")
+
+        deep_gemm = batch_invariant_ops.deep_gemm
+        get_deterministic = getattr(deep_gemm, "get_deterministic_algorithms", None)
+        original_mode = get_deterministic() if get_deterministic else None
+        modes = (False, True) if get_deterministic else (None,)
+        generator = torch.Generator(device=device_type).manual_seed(42)
+        a = torch.randn(257, 4096, dtype=torch.bfloat16, generator=generator)
+        b = torch.randn(4096, 4096, dtype=torch.bfloat16, generator=generator).T
+        try:
+            for mode in modes:
+                if mode is not None:
+                    deep_gemm.use_deterministic_algorithms(mode)
+                with self.subTest(deterministic=mode):
+                    ref = batch_invariant_ops._matmul_persistent_deepgemm(
+                        a[:1], b, out_dtype=torch.bfloat16
+                    )
+                    for batch_size in (16, 64, 257):
+                        out = batch_invariant_ops._matmul_persistent_deepgemm(
+                            a[:batch_size], b, out_dtype=torch.bfloat16
+                        )
+                        torch.testing.assert_close(out[:1], ref, rtol=0, atol=0)
+                    if get_deterministic:
+                        self.assertEqual(get_deterministic(), mode)
+        finally:
+            if original_mode is not None:
+                deep_gemm.use_deterministic_algorithms(original_mode)
+
     def test_small_matrices(self):
         """Test batch invariance with small matrix sizes"""
         test_cases = [
