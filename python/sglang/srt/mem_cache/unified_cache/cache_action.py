@@ -71,13 +71,13 @@ class BackupKV(msgspec.Struct, frozen=True):
     node_ids: list[NodeId]
 
 
-class MambaEvictExcessPathStates(ComponentAction, frozen=True):
-    """Per-path Mamba state-cap eviction from the tail's root path; applied at
-    the insert's commit barrier, after the walk-time backups whose
-    write-through locks shield the backed-up chain."""
+class EvictExcessPathStates(ComponentAction, frozen=True):
+    """Per-path state-cap eviction (Mamba states, SWA windows) from the tail's
+    root path; applied at the insert's commit barrier, after the walk-time
+    backups whose write-through locks shield the backed-up chain."""
 
     tail_node_id: NodeId
-    component_type: ComponentType = ComponentType.MAMBA
+    component_type: ComponentType
 
 
 class RebuildFullToSWAMapping(ComponentAction, frozen=True):

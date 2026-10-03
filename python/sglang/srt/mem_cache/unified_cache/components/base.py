@@ -316,6 +316,54 @@ class TreeComponent(ABC):
                         f"node {node.id} {ct} session {session_id!r} marker is not indexed"
                     )
 
+    def _evict_path_states_beyond_cap(
+        self,
+        tail: UnifiedTreeNode,
+        cap: int,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Evict shallow eligible device values beyond ``cap`` on tail's root path.
+
+        Full KV and any existing host backup are retained. The tail, forks,
+        locked nodes (including a pending backup chain's write-through locks),
+        and device leaves are preserved, so the cap is a best-effort soft
+        limit. Freed slots are collected into the caller's dicts.
+        """
+        if cap < 0:
+            return
+
+        ct = self.component_type
+        holders = []
+        node = tail
+        while node is not None and node is not self.tree_core.root_node:
+            if node.component_data[ct].value is not None:
+                holders.append(node)
+            node = node.parent
+
+        excess = len(holders) - cap
+        if excess <= 0:
+            return
+
+        tracker = {component: 0 for component in self.cache.tree_components}
+        for node in reversed(holders):
+            if excess <= 0 or node is tail:
+                break
+            if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
+                continue
+            if node in self.tree_core.evictable_device_leaves:
+                continue
+            self.tree_core._evict_component_and_detach_lru(
+                node,
+                self,
+                device_frees,
+                host_frees,
+                target=EvictLayer.DEVICE,
+                tracker=tracker,
+            )
+            self.tree_core._cascade_evict(node, self, tracker, device_frees, host_frees)
+            excess -= 1
+
     def node_has_component_data(
         self, node: UnifiedTreeNode, target: EvictLayer = EvictLayer.DEVICE
     ) -> bool:

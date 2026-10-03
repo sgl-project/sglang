@@ -20,6 +20,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -52,6 +53,12 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
         return "the configured components require the Python TreeCore"
     if params.component_registry_override:
         return "custom components require the Python TreeCore"
+    if (
+        params.tree_components is not None
+        and ComponentType.SWA in params.tree_components
+        and get_schedule().swa_max_states_per_path > 0
+    ):
+        return "the per-path SWA window cap requires the Python TreeCore"
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
     from sglang.srt.rust_extensions.torch_build import (

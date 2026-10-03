@@ -31,11 +31,11 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
+    EvictExcessPathStates,
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
-    MambaEvictExcessPathStates,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
     ReplaceWriteThroughOnNodeSplit,
@@ -126,7 +126,9 @@ def _cache_action_from_tagged(action: tuple) -> CacheAction:
     if tag == "backup_kv":
         return BackupKV(node_ids=list(action[1]))
     if tag == "mamba_evict_excess_path_states":
-        return MambaEvictExcessPathStates(tail_node_id=action[1])
+        return EvictExcessPathStates(
+            tail_node_id=action[1], component_type=ComponentType.MAMBA
+        )
     if tag == "replace_write_through_on_node_split":
         return ReplaceWriteThroughOnNodeSplit(
             ack_id=action[1],
