@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import pytest
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.test_server_utils import PerformanceValidator
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BaselineConfig,
@@ -63,6 +64,7 @@ def test_runner_override_preserves_other_metrics(monkeypatch, runner, flux, qwen
     ],
 )
 def test_runner_baseline_enforces_e2e_boundary(monkeypatch, runner):
+    monkeypatch.setattr(current_platform, "is_hip", lambda: False)
     monkeypatch.setenv("RUNNER_NAME", runner)
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
     monkeypatch.delenv("SGLANG_E2E_TOLERANCE", raising=False)
