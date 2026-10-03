@@ -1,6 +1,7 @@
 """A MoE layer owns its placement, and the fused funcs read it through the
 layer's `MoeRunnerConfig`."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -177,3 +178,7 @@ def test_cutlass_passes_the_runner_config_placement(monkeypatch) -> None:
         4,
         3,
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
