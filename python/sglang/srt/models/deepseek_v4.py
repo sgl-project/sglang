@@ -1341,27 +1341,15 @@ class MQALayer(MqaAttentionBase):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
-            if (
-                (_is_cuda or _is_gfx95_supported)
-                and q_out is not None
-                and (
-                    0 < q.shape[0] <= 8
-                    or (
-                        self.is_dsv41
-                        and (get_platform().is_blackwell or _is_gfx95_supported)
-                        and self.n_local_heads == 16
-                        and 4096 <= q.shape[0] <= 65536
-                    )
+            # TODO: enable zero-copy path to skip the extra no-rope copy overhead
+            if (_is_cuda or _is_gfx95_supported) and q_out is not None:
+                fused_q_norm_rope(
+                    q,
+                    q_out,
+                    None,  # eps = None means no norm
+                    self.freqs_cis,
+                    positions,
                 )
-                and self.head_dim == 512
-                and self.qk_rope_head_dim == 64
-                and q.dtype == q_out.dtype == torch.bfloat16
-                and q.stride(1) == q_out.stride(1) == 512
-                and q.stride(2) == q_out.stride(2) == 1
-            ):
-                from sglang.kernels.ops.attention.dsv4.q_rope_store import q_rope_store
-
-                q_rope_store(q, q_out, self.freqs_cis, positions)
                 return q_out
             fused_rope_inplace(
                 q[..., -self.qk_rope_head_dim :],
@@ -2807,12 +2795,21 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
             self.hc_pre_from_prev_sublayer
-            and get_platform().is_sm100
+            and (get_platform().is_sm100 or get_platform().is_sm90)
             and self.hc_attn_fn.shape == (24, 20480)
             and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
             and getattr(self.config, "model_type", None) == "deepseek_v41"
             and not is_batch_invariant_mode_enabled()
         ):
+            if get_platform().is_sm90:
+                from sglang.kernels.ops.layernorm.mhc import split_bf16_hc_weight
+
+                # The compensated BF16 projection uses ordinary tensor cores;
+                # it does not require Blackwell or DeepGEMM's prenorm kernel.
+                self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
+                self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
+                return
+
             from sglang.kernels.ops.layernorm.mhc import (
                 split_tf32_hc_weight,
             )
@@ -3326,7 +3323,10 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             if (
                 x.is_cuda
-                and get_platform().is_blackwell
+                and (
+                    get_platform().is_blackwell
+                    or (get_platform().is_sm90 and not quantize)
+                )
                 and (
                     0 < x.shape[0] <= 96
                     or (
@@ -3373,95 +3373,106 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         stats_stream: Optional[torch.cuda.Stream] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if stats_stream is None:
+            return DeepseekV4DecoderLayer._hc_mix_stats_impl(
+                self, x, hc_fn, hc_scale, hc_base
+            )
+        main_stream = torch.cuda.current_stream()
+        x.record_stream(stats_stream)
+        with torch.cuda.stream(stats_stream):
+            coefficients = DeepseekV4DecoderLayer._hc_mix_stats_impl(
+                self, x, hc_fn, hc_scale, hc_base
+            )
+        # The producer fork is in _hc_combine; consumers join before hc_post.
+        for coefficient in coefficients:
+            coefficient.record_stream(main_stream)
+        return coefficients
+
+    def _hc_mix_stats_impl(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.layernorm.mhc import hc_mix_stats, hc_mix_stats_sinkhorn
 
         x_flat = x.flatten(1)
 
+        from sglang.srt.batch_invariant_ops import (
+            is_batch_invariant_mode_enabled,
+        )
+
+        parts = bf16_parts = None
+        hopper_medium = get_platform().is_sm90 and 32 <= x_flat.shape[0] < 4096
         if (
             x.is_cuda
-            and (
-                # gfx950: the fused Triton port wins at every row count (MI350X)
-                _is_gfx95_supported
-                or (
-                    torch.version.cuda is not None
-                    and (
-                        get_platform().is_blackwell
-                        or (get_platform().is_sm90 and x.shape[0] == 1)
-                    )
-                )
-            )
-            and x.dtype == torch.bfloat16
+            and (x_flat.shape[0] >= 128 or hopper_medium)
+            and x_flat.is_contiguous()
+            and (get_platform().is_sm100 or get_platform().is_sm90)
+            and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+            and not is_batch_invariant_mode_enabled()
         ):
-            # Fusing the split-K reduction with sinkhorn keeps it batch-invariant.
-            main_stream = torch.cuda.current_stream()
-            if stats_stream is not None:
-                x.record_stream(stats_stream)
-            with (
-                torch.cuda.stream(stats_stream)
-                if stats_stream is not None
-                else nullcontext()
-            ):
-                from sglang.srt.batch_invariant_ops import (
-                    is_batch_invariant_mode_enabled,
+            if hc_fn is self.hc_attn_fn:
+                parts = getattr(self, "_hc_attn_tf32_parts", None)
+                bf16_parts = getattr(self, "_hc_attn_bf16_parts", None)
+            elif hc_fn is self.hc_ffn_fn:
+                parts = getattr(self, "_hc_ffn_tf32_parts", None)
+                bf16_parts = getattr(self, "_hc_ffn_bf16_parts", None)
+
+        use_bf16_projection = bf16_parts is not None and (
+            hopper_medium or 4096 <= x_flat.shape[0] <= 65536
+        )
+        hopper_fused_stats = get_platform().is_sm90 and (
+            x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
+        )
+        # gfx950 uses the fused Triton port at every row count (MI350X).
+        use_fused_stats = _is_gfx95_supported or (
+            torch.version.cuda is not None
+            and (get_platform().is_blackwell or hopper_fused_stats)
+        )
+        if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
+            # The default split-K/Sinkhorn fusion preserves batch invariance;
+            # compensated projections above are disabled in batch-invariant mode.
+            if use_bf16_projection:
+                from sglang.kernels.ops.layernorm.mhc import (
+                    hc_mix_stats_sinkhorn_bf16x3,
                 )
 
-                parts = bf16_parts = None
-                if (
-                    x_flat.shape[0] >= 128
-                    and x_flat.is_contiguous()
-                    and get_platform().is_sm100
-                    and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
-                    and not is_batch_invariant_mode_enabled()
-                ):
-                    if hc_fn is self.hc_attn_fn:
-                        parts = getattr(self, "_hc_attn_tf32_parts", None)
-                        bf16_parts = getattr(self, "_hc_attn_bf16_parts", None)
-                    elif hc_fn is self.hc_ffn_fn:
-                        parts = getattr(self, "_hc_ffn_tf32_parts", None)
-                        bf16_parts = getattr(self, "_hc_ffn_bf16_parts", None)
-                if bf16_parts is not None and 4096 <= x_flat.shape[0] <= 65536:
-                    from sglang.kernels.ops.layernorm.mhc import (
-                        hc_mix_stats_sinkhorn_bf16x3,
-                    )
+                pre, post, comb = hc_mix_stats_sinkhorn_bf16x3(
+                    x_flat,
+                    bf16_parts,
+                    hc_scale,
+                    hc_base,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                )
+            elif parts is not None:
+                from sglang.kernels.ops.layernorm.mhc import (
+                    hc_mix_stats_sinkhorn_deepgemm,
+                )
 
-                    pre, post, comb = hc_mix_stats_sinkhorn_bf16x3(
-                        x_flat,
-                        bf16_parts,
-                        hc_scale,
-                        hc_base,
-                        self.hc_sinkhorn_iters,
-                        self.rms_norm_eps,
-                        self.hc_eps,
-                    )
-                elif parts is not None:
-                    from sglang.kernels.ops.layernorm.mhc import (
-                        hc_mix_stats_sinkhorn_deepgemm,
-                    )
-
-                    pre, post, comb = hc_mix_stats_sinkhorn_deepgemm(
-                        x_flat,
-                        parts,
-                        hc_scale,
-                        hc_base,
-                        self.hc_sinkhorn_iters,
-                        self.rms_norm_eps,
-                        self.hc_eps,
-                    )
-                else:
-                    pre, post, comb = hc_mix_stats_sinkhorn(
-                        x_flat,
-                        hc_fn,
-                        hc_scale,
-                        hc_base,
-                        self.hc_mult,
-                        self.hc_sinkhorn_iters,
-                        self.rms_norm_eps,
-                        self.hc_eps,
-                    )
-            if stats_stream is not None:
-                # Allocated on the side stream, read on the main stream after the join.
-                for coefficient in (pre, post, comb):
-                    coefficient.record_stream(main_stream)
+                pre, post, comb = hc_mix_stats_sinkhorn_deepgemm(
+                    x_flat,
+                    parts,
+                    hc_scale,
+                    hc_base,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                )
+            else:
+                pre, post, comb = hc_mix_stats_sinkhorn(
+                    x_flat,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    self.hc_mult,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                )
             return pre, post, comb
         if x.is_cuda and torch.version.cuda is not None:
             # cuBLAS/torch reductions can change order with num_tokens; this kernel
@@ -3534,7 +3545,15 @@ class DeepseekV4DecoderLayer(nn.Module):
                     and hidden_states.shape[0] > 0
                 )
             )
-            and (not get_platform().is_sm90 or hidden_states.shape[0] == 1)
+            and (
+                not get_platform().is_sm90
+                or hidden_states.shape[0] == 1
+                or (
+                    self.config.model_type == "deepseek_v41"
+                    and forward_batch.forward_mode.is_decode()
+                    and 1 < hidden_states.shape[0] <= 64
+                )
+            )
             else None
         )
 
