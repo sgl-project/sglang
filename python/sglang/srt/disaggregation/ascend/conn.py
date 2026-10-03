@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -289,10 +290,11 @@ class AscendKVManager(MooncakeKVManager):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
-        # Hybrid MLA prefill stages expose PP-local entries, while a PP=1
-        # decode peer registers all model layers. Pair only this layout by
-        # global layer id; every other Ascend layout keeps the legacy path.
-        if self.is_hybrid_mla_backend and self.pp_size > 1:
+        # Compact NPU indexer layouts and hybrid MLA PP stages both expose a
+        # non-dense entry list. Pair those layouts by global layer id.
+        src_layer_ids = getattr(self.kv_args, "kv_layer_ids", [])
+        dst_layer_ids = dst_layer_ids or []
+        if src_layer_ids or dst_layer_ids:
             return self._send_kvcache_generic(
                 mooncake_session_id=mooncake_session_id,
                 src_data_ptrs=self.kv_args.kv_data_ptrs,
@@ -301,7 +303,7 @@ class AscendKVManager(MooncakeKVManager):
                 prefill_data_indices=prefill_kv_indices,
                 dst_data_indices=dst_kv_indices,
                 executor=executor,
-                src_layer_ids=self.kv_args.kv_layer_ids,
+                src_layer_ids=src_layer_ids,
                 dst_layer_ids=dst_layer_ids,
             )
 
@@ -445,11 +447,24 @@ class AscendKVManager(MooncakeKVManager):
             )
 
         src_kv_ptrs = self.kv_args.kv_data_ptrs
-        _, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
-        if dst_kv_item_lens:
-            _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
-                self.kv_args.kv_item_lens, dst_kv_item_lens
+        src_layer_ids = getattr(self.kv_args, "kv_layer_ids", [])
+        dst_layer_ids = dst_layer_ids or []
+        if src_layer_ids or dst_layer_ids:
+            dst_entry_indices = resolve_dcp_dst_entry_indices(
+                src_layer_ids,
+                dst_layer_ids,
+                len(src_kv_ptrs),
+                len(dst_kv_ptrs),
             )
+            dst_kv_ptrs = [dst_kv_ptrs[i] for i in dst_entry_indices]
+            if dst_kv_item_lens:
+                dst_kv_item_lens = [dst_kv_item_lens[i] for i in dst_entry_indices]
+        else:
+            _, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
+            if dst_kv_item_lens:
+                _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                    self.kv_args.kv_item_lens, dst_kv_item_lens
+                )
 
         layout = self._get_dcp_remote_decode_layout()
         num_entries = len(src_kv_ptrs)

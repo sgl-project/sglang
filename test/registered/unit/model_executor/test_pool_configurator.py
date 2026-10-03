@@ -951,6 +951,43 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
 
         self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
 
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_npu_bf16_compacts_indexers_with_and_without_pd(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """NPU prices only producer-layer indexers in standalone and PD."""
+        num_layers = 6
+        for disaggregation_mode, indexer_layers in (("null", 3), ("prefill", 3)):
+            with self.subTest(disaggregation_mode=disaggregation_mode):
+                mr = _make_model_runner(
+                    self,
+                    num_layers=num_layers,
+                    use_mla_backend=True,
+                    disaggregation_mode=disaggregation_mode,
+                )
+                _configure_dsa_model(mr)
+                mr.model_config.hf_config.index_topk_freq = 4
+                mr.model_config.hf_config.index_skip_topk_offset = 3
+
+                with (
+                    patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+                    mock_cpu_env(kv_size=2),
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        DefaultPoolConfigurator,
+                    )
+
+                    cfg = DefaultPoolConfigurator(mr)
+
+                self.assertEqual(
+                    cfg._cell_size,
+                    576 * 2 * num_layers + 128 * 2 * indexer_layers,
+                )
+
 
 class TestFactory(CustomTestCase):
     def test_default_for_non_swa(self):

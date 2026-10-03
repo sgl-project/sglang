@@ -167,6 +167,52 @@ class TestAscendPageDcpSend(CustomTestCase):
             ],
         )
 
+    def test_compact_indexers_map_by_layer_id_during_dcp_relayout(self):
+        mgr = object.__new__(AscendKVManager)
+        mgr.kv_args = SimpleNamespace(
+            kv_buf_groups=3,
+            kv_data_ptrs=[1_000, 2_000, 3_000, 4_000, 5_000],
+            kv_item_lens=[20, 20, 20, 20, 8],
+            kv_layer_ids=[2, 3, 2, 3, 2],
+            page_size=2,
+            mla_compression_ratios=None,
+        )
+        mgr._dcp_remote_decode_layout = [False, False, False, False, True]
+        mgr._transfer_data = Mock(return_value=0)
+
+        dst_ptrs = [10_000 * i for i in range(1, 11)]
+        dst_layer_ids = [0, 1, 2, 3, 0, 1, 2, 3, 0, 2]
+        dst_item_lens = [20] * 8 + [32, 32]
+
+        result = mgr.send_kvcache_dcp(
+            "decode",
+            np.array([5, 6, 7, 8], dtype=np.int32),
+            dst_ptrs,
+            np.array([7], dtype=np.int32),
+            dcp_token_item_lens=[10, 10, 10, 10, 4],
+            dst_dcp_size=4,
+            dst_dcp_rank=2,
+            src_page_offset=0,
+            decode_prefix_len=0,
+            num_kv_tokens=8,
+            executor=None,
+            dst_layer_ids=dst_layer_ids,
+            pack_buffer=None,
+            dst_kv_item_lens=dst_item_lens,
+        )
+
+        self.assertEqual(result, 0)
+        mgr._transfer_data.assert_called_once_with(
+            "decode",
+            [
+                (1_140, 30_140, 20),
+                (2_140, 40_140, 20),
+                (3_140, 70_140, 20),
+                (4_140, 80_140, 20),
+                (5_040, 100_224, 32),
+            ],
+        )
+
     def test_rejects_incorrect_destination_geometry(self):
         mgr = object.__new__(AscendKVManager)
         mgr.kv_args = SimpleNamespace(
