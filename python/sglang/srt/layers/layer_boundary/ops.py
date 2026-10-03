@@ -27,6 +27,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
+    attn_cp_reduce_scatter_tensor,
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
@@ -43,9 +44,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary.adapters.attention import (
     attn_tp_gather,
     attn_tp_slice,
-)
-from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
-    attn_cp_reduce_scatter,
 )
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,
@@ -128,6 +126,19 @@ def attn_tp_reduce_scatter(
     ]
     attn_tp_reduce_scatter_tensor(local_hidden_states, hidden_states)
     return local_hidden_states
+
+
+def attn_cp_interleave_reduce_scatter(hidden_states: torch.Tensor):
+    """Sum rank-major output onto each rank's equal, padded interleave shard."""
+    attn_dp_size = get_parallel().attn_dp_size
+    attn_tp_size = get_parallel().attn_tp_size
+    assert attn_dp_size == 1 and attn_tp_size == 1
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    input_hidden_states = hidden_states
+    hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
+    attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+    return hidden_states
 
 
 def moe_cp_gather(
@@ -353,7 +364,7 @@ def attn_cp_reduce_scatter_output(
 ):
     """DSA and MLA CP: sum the FFN output over the attention-CP group and
     keep this rank's shard."""
-    return attn_cp_reduce_scatter(hidden_states), residual
+    return attn_cp_interleave_reduce_scatter(hidden_states), residual
 
 
 def dp_cp_take_back_output(
@@ -393,8 +404,7 @@ def moe_cp_take_back_output(
     If DP>1, further scatter back to the local DP slice.
     """
     # Only scatter back during prefill; decode was never allgathered so no-op.
-    # Safe w.r.t. empty tensors: same reasoning as _then_moe_cp_gather
-    # — CP extend always has non-zero tokens per rank, and decode skips this path.
+    # CP extend has non-zero tokens per rank, and decode skips this path.
     rows = moe_cp_gathered_rows(forward_batch)
     if rows is not None:
         hidden_states = moe_cp_take_back(hidden_states, rows)

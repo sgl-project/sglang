@@ -1065,12 +1065,12 @@ class Req(ReqDllmMixin):
             else self.origin_input_ids
         )  # Before image padding
         # Each decode stage's output ids. Append-only by contract:
-        # _refresh_fill_ids infers how many output tokens are already in
+        # refresh_fill_ids infers how many output tokens are already in
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
         # Full untruncated sequence: origin + output (+ DLLM mask block).
-        # Kept in sync by _refresh_fill_ids; admission only updates
+        # Kept in sync by refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
         self.full_untruncated_fill_ids = array("q")
         self.extend_range: Optional[Range] = None
@@ -1220,7 +1220,7 @@ class Req(ReqDllmMixin):
         # Refreshed at every sharded alloc — read through last_node, or drawn
         # least-full for a new chain — and consumed by the radix insert to
         # stamp new tree nodes. Allocation itself must NOT read it back when
-        # a tree node is available (the insert_req dedup rebind
+        # a tree node is available (the checkpoint dedup rebind
         # would make it stale); the only allocation-time reader is the
         # ChunkCache fallback, which has no tree nodes and no rebind.
         self.kv_rotation_base: Optional[int] = None
@@ -1571,7 +1571,7 @@ class Req(ReqDllmMixin):
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.extend_range.end]
 
-    def _refresh_fill_ids(self) -> None:
+    def refresh_fill_ids(self) -> None:
         """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
         appending only the new output tokens.
 
@@ -1600,7 +1600,7 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
         else:
-            self._refresh_fill_ids()
+            self.refresh_fill_ids()
 
         input_len = len(self.full_untruncated_fill_ids)
 
@@ -3181,7 +3181,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req, prefix_len in zip(
             running_batch.reqs, running_prefix_lens, strict=True
         ):
-            req._refresh_fill_ids()
+            req.refresh_fill_ids()
             req.set_extend_range(prefix_len, prefix_len + 1)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
@@ -3259,7 +3259,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # cannot stand in for it. Rows past bs are a beam tail, not requests.
         seq_lens = self.seq_lens_cpu[:bs].tolist()
         for req, seq_len in zip(self.reqs, seq_lens, strict=True):
-            req._refresh_fill_ids()
+            req.refresh_fill_ids()
             # end runs one past full_untruncated_fill_ids while output_ids
             # trails; safe only while decoding_reqs suppresses the checkpoint insert.
             req.set_extend_range(seq_len - 1, seq_len)

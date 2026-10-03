@@ -179,7 +179,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
         with get_parallel().override(attn_dcp_size=1):
             scheduler.init_req_max_new_tokens(req)
         self.assertEqual(req.sampling_params.max_new_tokens, 1)
-        req._refresh_fill_ids()
+        req.refresh_fill_ids()
 
         cache = SimpleNamespace(
             sliding_window_size=page_size,
