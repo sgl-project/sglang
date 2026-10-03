@@ -54,6 +54,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.kernels.ops.kvcache.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
+from sglang.kernels.ops.quantization.fp8_utils import to_fp8_satfinite
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -203,8 +204,12 @@ def mla_quantize_without_rope_for_fp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize MLA components to FP8 without applying rotary embeddings."""
     attn_dtype = torch.float8_e4m3fn
-    q = concat_mla_absorb_q_general(q_nope, q_rope).to(attn_dtype)
-    return q, k_nope.to(attn_dtype), k_rope.to(attn_dtype)
+    q = to_fp8_satfinite(concat_mla_absorb_q_general(q_nope, q_rope), attn_dtype)
+    return (
+        q,
+        to_fp8_satfinite(k_nope, attn_dtype),
+        to_fp8_satfinite(k_rope, attn_dtype),
+    )
 
 
 def concat_mla_absorb_q_general(q_nope, q_rope):
