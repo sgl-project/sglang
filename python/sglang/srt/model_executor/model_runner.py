@@ -990,6 +990,9 @@ class ModelRunner:
             self.memory_pool_config.swa_max_total_num_tokens = (
                 resize.swa_max_total_num_tokens
             )
+            self.memory_pool_config.unified_memory_pool_bytes = (
+                resize.unified_memory_pool_bytes
+            )
         if resize.capped_max_running_requests is not None:
             self.max_running_requests = resize.capped_max_running_requests
             if self.memory_pool_config is not None:

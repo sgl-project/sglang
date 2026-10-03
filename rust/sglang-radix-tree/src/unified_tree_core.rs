@@ -1980,7 +1980,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             && self.needs_incremental_component_backup_(target_node_id)
     }
 
-    /// Refresh the LRUs and append terminal backup actions.
+    /// Refresh the LRUs and append the insert backup: a new-leaf write-through,
+    /// or an SWA window publish on an existing backed node.
     fn insert_tail_step_(&mut self, state: &mut InsertWalkState<K>) {
         let target_node_id = state
             .target_node_id
@@ -1997,10 +1998,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         if self.should_backup_after_insert_(state, target_node_id) {
-            let backup = self.build_backup_kv_action_(
-                self.arena.node(target_node_id),
-                /* write_back = */ false,
-            );
+            let backup =
+                self.build_backup_kv_action_(self.arena.node(target_node_id), self.is_write_back);
             state.pending_actions.push(CacheAction::BackupKV(backup));
         }
     }
@@ -3927,7 +3926,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(order)
     }
 
-    /// Build the backup action for a node and its not-yet-persisted ancestors.
+    /// Build the backup action for a node; write-through also chains its
+    /// unbacked ancestors.
     pub fn build_backup_kv_action_(&self, node: &Node<K>, write_back: bool) -> BackupKV {
         let mut chain = vec![node.id];
         if !write_back {
