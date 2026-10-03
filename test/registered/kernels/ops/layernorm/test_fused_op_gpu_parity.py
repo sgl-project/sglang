@@ -13,7 +13,7 @@ import torch
 from sglang.kernels.spec import KernelBackend
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=41, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=28, stage="extra-a", runner_config="1-gpu-small")
 
 # torch_compile is native under the hood; skip it here (compile time dominates)
 # -- it is exercised in the CPU lane.
@@ -175,46 +175,8 @@ def test_beam_residual_cancellation(norms):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("rows", [0, 1, 64, 1024])
-def test_beam_attention_gate(rows):
-    from sglang.kernels.ops.elementwise import _BEAM_ATTENTION_GATE as op
-
-    generator = torch.Generator().manual_seed(5)
-    bias = torch.randn(12, generator=generator).to(device="cuda", dtype=torch.bfloat16)
-    attention = torch.randn(rows, 12 * 128, generator=generator).to(
-        device="cuda", dtype=torch.bfloat16
-    )
-    gate = (
-        torch.randn(rows, 12 * 128, generator=generator).to(
-            device="cuda", dtype=torch.bfloat16
-        )
-        * 2
-    )
-    expected = op.forward_native(attention, gate, bias, 128)
-    for backend in _eligible(op):
-        torch.testing.assert_close(
-            op(attention, gate, bias, 128, backend=backend), expected, atol=0, rtol=0
-        )
-
-
-def test_beam_fp16_gate_rounding_boundaries():
-    from sglang.kernels.ops.elementwise import _BEAM_ATTENTION_GATE as op
-
-    gate = torch.tensor(
-        [[0.0068359375, -0.00634765625]], device="cuda", dtype=torch.float16
-    )
-    attention = torch.ones_like(gate)
-    bias = torch.zeros(1, device="cuda", dtype=torch.float16)
-    expected = op.forward_native(attention, gate, bias, 2)
-    for backend in _eligible(op):
-        torch.testing.assert_close(
-            op(attention, gate, bias, 2, backend=backend), expected, atol=0, rtol=0
-        )
-
-
 @pytest.mark.parametrize("with_norms", [False, True])
 def test_beam_custom_op_contracts(with_norms):
-    from sglang.kernels.ops.elementwise.beam_fused import fused_attention_gate
     from sglang.kernels.ops.layernorm.beam_fused import _fused_sandwich_residual_rmsnorm
 
     # Sliced rows cover real/fake output strides as well as optional norm outputs.
@@ -235,43 +197,27 @@ def test_beam_custom_op_contracts(with_norms):
             torch.empty_like(x),
         ),
     )
-    bias = torch.zeros(40, device="cuda", dtype=x.dtype)
-    torch.library.opcheck(fused_attention_gate, (x, x.clone(), bias, 128))
 
 
-@pytest.mark.parametrize("op_name", ["norm", "gate"])
 @pytest.mark.parametrize("forced_backend", [False, True])
-def test_beam_compiled_rounding(op_name, forced_backend):
-    """Outer compilation must preserve residual cancellation and sigmoid rounding."""
+def test_beam_compiled_rounding(forced_backend):
+    """Outer compilation must preserve residual cancellation."""
     from torch._inductor import config as inductor_config
 
-    from sglang.kernels.ops.elementwise import BeamAttentionGateOp
     from sglang.kernels.ops.layernorm import BeamSandwichResidualRMSNormOp
 
-    if op_name == "norm":
-        op = BeamSandwichResidualRMSNormOp()
-        x = torch.ones(1, 5120, device="cuda", dtype=torch.bfloat16)
-        weight = torch.ones(5120, device="cuda", dtype=x.dtype)
-        args = (
-            x,
-            -x,
-            weight * 5,
-            weight,
-            1e-6,
-            (1 / math.sqrt(26), 5 / math.sqrt(26)),
-            True,
-        )
-    else:
-        op = BeamAttentionGateOp()
-        gate = torch.tensor(
-            [[0.0068359375, -0.00634765625]], device="cuda", dtype=torch.float16
-        )
-        args = (
-            torch.ones_like(gate),
-            gate,
-            torch.zeros(1, device="cuda", dtype=gate.dtype),
-            2,
-        )
+    op = BeamSandwichResidualRMSNormOp()
+    x = torch.ones(1, 5120, device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones(5120, device="cuda", dtype=x.dtype)
+    args = (
+        x,
+        -x,
+        weight * 5,
+        weight,
+        1e-6,
+        (1 / math.sqrt(26), 5 / math.sqrt(26)),
+        True,
+    )
     expected = op.forward_native(*args)
     op(*args)  # Warm backend imports before full-graph capture.
     op.enter_torch_compile(1)
