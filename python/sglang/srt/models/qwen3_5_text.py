@@ -28,6 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import qwen3_5
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import LazyValue, add_prefix
@@ -42,6 +43,16 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     packed_modules_mapping = qwen3_5.Qwen3_5ForCausalLM.packed_modules_mapping
     supported_lora_modules = qwen3_5.Qwen3_5ForCausalLM.supported_lora_modules
+
+    # Some community text-only checkpoints keep the extraneous
+    # `model.language_model.` prefix inherited from the VL training stack.
+    # Strip it so both prefixed and clean checkpoints load correctly.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "language_model.": "model.",
+        },
+    )
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
@@ -190,6 +201,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        mapper = getattr(self, "hf_to_sglang_mapper", None)
+        if mapper is not None:
+            weights = mapper.apply(weights)
+
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
