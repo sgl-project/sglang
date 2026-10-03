@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -178,6 +180,62 @@ class TestFlashInferMLAAttentionBackendCorrectness(CustomTestCase):
         for case in self.CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_mla_cuda_graph_decode_case(self, case, **MLA_SHAPE_KWARGS)
+
+    def test_cuda_graph_replay_updates_wrapper_kv_indptr_buffer(self):
+        from sglang.srt.layers.attention import flashinfer_mla_backend
+
+        class PassthroughTranslator:
+            needs_read_translate = False
+
+            def fill_packed_read_stream(self, **kwargs):
+                return True
+
+        updater = flashinfer_mla_backend.FlashInferMLAIndicesUpdaterDecode.__new__(
+            flashinfer_mla_backend.FlashInferMLAIndicesUpdaterDecode
+        )
+        updater.scaling = 1.0
+        updater.data_type = torch.float16
+        updater.num_local_heads = 4
+        updater.kv_lora_rank = 512
+        updater.qk_rope_head_dim = 64
+        updater.attn_backend = SimpleNamespace(
+            kv_index_translator=PassthroughTranslator()
+        )
+
+        paged_kernel_lens = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+        eager_kv_indptr = torch.full((3,), -1, dtype=torch.int32, device="cuda")
+        graph_kv_indptr = torch.tensor([0, -1, -1], dtype=torch.int32, device="cuda")
+        wrapper = SimpleNamespace(plan=MagicMock())
+
+        with patch.object(
+            flashinfer_mla_backend,
+            "get_parallel",
+            return_value=SimpleNamespace(dcp_enabled=False),
+        ):
+            updater.call_begin_forward(
+                wrapper,
+                paged_kernel_lens,
+                paged_kernel_lens_sum=5,
+                q_indptr=torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda"),
+                kv_indptr=eager_kv_indptr,
+                init_metadata_replay=True,
+                spec_info=None,
+                req_pool_indices=torch.tensor([0, 1], device="cuda"),
+                qo_indptr_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+                kv_indptr_cpu=torch.tensor([0, 2, 5], dtype=torch.int32),
+                kv_indptr_gpu=graph_kv_indptr,
+                kv_len_arr_cpu=torch.tensor([2, 3], dtype=torch.int32),
+                kv_indices=torch.empty(5, dtype=torch.int32, device="cuda"),
+            )
+
+        expected_graph_kv_indptr = torch.tensor(
+            [0, 2, 5], dtype=torch.int32, device="cuda"
+        )
+        torch.testing.assert_close(graph_kv_indptr, expected_graph_kv_indptr)
+        torch.testing.assert_close(
+            eager_kv_indptr, torch.full_like(eager_kv_indptr, -1)
+        )
+        wrapper.plan.assert_called_once()
 
     def test_runner_mode_split_op_extend_cases(self):
         for case, static_num_tokens in self.SPLIT_OP_CASES:
