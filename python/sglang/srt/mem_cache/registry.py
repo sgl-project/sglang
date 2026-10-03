@@ -84,9 +84,13 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     is_pure_swa = ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0
     if ctx.disable_radix_cache and (
         get_disagg().disaggregation_decode_retraction_backup == "host_pool"
-        # Streaming sessions live in UnifiedRadixCache; its disabled mode
-        # stands in for the chunk caches. Pure-SWA has no unified layout.
-        or (get_serving().enable_streaming_session and not is_pure_swa)
+        # Streaming sessions and mamba states live in UnifiedRadixCache; its
+        # disabled mode stands in for the chunk caches. Pure-SWA has no
+        # unified layout.
+        or (
+            not is_pure_swa
+            and (get_serving().enable_streaming_session or ctx.is_hybrid_ssm)
+        )
     ):
         return create_unified_radix_cache(ctx)
 
@@ -290,6 +294,13 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             f"--enable-streaming-session is not verified with {type(cache).__name__}; "
             "streaming sessions run on UnifiedRadixCache. Please open an issue or "
             "a PR at https://github.com/sgl-project/sglang if you need this."
+        )
+
+    if ctx.is_hybrid_ssm and not cache.supports_mamba():
+        raise NotImplementedError(
+            f"Models with mamba state are not verified with {type(cache).__name__}; "
+            "mamba state lives in UnifiedRadixCache. Please open an issue or a PR "
+            "at https://github.com/sgl-project/sglang if you need this."
         )
 
     hicache_attached = cache.cache_controller is not None
