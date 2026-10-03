@@ -37,6 +37,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Tuple,
     Union,
 )
 
@@ -63,6 +64,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from pydantic import ValidationError
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
@@ -73,6 +75,13 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+from sglang.srt.entrypoints.decision.protocol import (
+    DecisionsRouteRequest,
+    JevRequest,
+    SystemOneRouteRequest,
+)
+from sglang.srt.entrypoints.decision.request_id import install_typesafe_request_id
+from sglang.srt.entrypoints.decision.serving import PROMPT_SOURCES
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -89,7 +98,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
     CompletionRequest,
-    DecisionRequest,
     DetokenizeRequest,
     EmbeddingRequest,
     ErrorResponse,
@@ -100,6 +108,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeRequest,
     V1RerankReqInput,
 )
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
@@ -114,7 +123,6 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
-from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
@@ -328,9 +336,10 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
         _global_state.tokenizer_manager
     )
-    fast_api_app.state.openai_serving_decisions = OpenAIServingDecisions(
-        fast_api_app.state.openai_serving_chat
-    )
+    (
+        fast_api_app.state.openai_serving_decisions,
+        fast_api_app.state.systemone_serving,
+    ) = decision_route_servings(fast_api_app.state.openai_serving_chat)
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
@@ -349,11 +358,6 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Initialize Anthropic-compatible serving handler
     fast_api_app.state.anthropic_serving = AnthropicServing(
-        fast_api_app.state.openai_serving_chat
-    )
-
-    # Initialize System One compatible decision handler
-    fast_api_app.state.systemone_serving = SystemOneServing(
         fast_api_app.state.openai_serving_chat
     )
 
@@ -484,6 +488,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+install_typesafe_request_id(app)
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (
@@ -609,6 +614,10 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
 
 
+# /v1/decisions validation tags a Jev body's errors after "body".
+_JEV_BODY_LOC = ("body", "jev")
+
+
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -628,12 +637,19 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         )
 
     route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
-    if route_path == "/v1/systemone":
+    errors = exc.errors()
+    jev_body = route_path == "/v1/decisions" and any(
+        tuple(error["loc"][:2]) == _JEV_BODY_LOC for error in errors
+    )
+    if route_path in ("/v1/systemone", "/v1/jev") or jev_body:
         # The System One API documents FastAPI's default 422 detail list. The
         # optional input echo is left out, since it can be any client value.
         detail = [
-            {key: value for key, value in error.items() if key != "input"}
-            for error in exc.errors()
+            {
+                **{key: value for key, value in error.items() if key != "input"},
+                "loc": _untagged_loc(error["loc"]),
+            }
+            for error in errors
         ]
         return ORJSONResponse(
             status_code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
@@ -1963,8 +1979,11 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 
 
 @app.post("/v1/decisions", dependencies=[Depends(validate_json_request)])
-async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
-    """Answer typed choice, score, and yes or no questions about an input by scoring single-token answer labels through the scoring API, without generation."""
+async def v1_decisions_request(request: DecisionsRouteRequest, raw_request: Request):
+    """Answer typed choice, score, and yes or no questions about an input by scoring single-token answer labels through the scoring API, without generation.
+
+    A body with a state, or with questions keyed by field name, is a Jev request for a decision model checkpoint.
+    """
     return await raw_request.app.state.openai_serving_decisions.handle_request(
         request, raw_request
     )
@@ -2086,11 +2105,54 @@ async def anthropic_v1_count_tokens(
 
 ## System One compatible decision API
 @app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
-async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
-    """System One compatible decisions, answered by candidate scoring without generation."""
-    return await raw_request.app.state.systemone_serving.handle_request(
+async def systemone_decisions(
+    body: Annotated[
+        SystemOneRouteRequest,
+        Body(
+            description=(
+                "A SystemOneRequest, or a JevRequest when the served checkpoint is "
+                "a decision model, which answers with its own trained prompt."
+            )
+        ),
+    ],
+    raw_request: Request,
+):
+    """System One compatible decisions, answered by candidate scoring without generation.
+
+    A decision model checkpoint answers with its own trained protocol instead.
+    """
+    serving = raw_request.app.state.systemone_serving
+    try:
+        request = serving.native_source.request_model.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            [{**error, "loc": ("body", *error["loc"])} for error in e.errors()]
+        ) from e
+    return await serving.handle_request(request, raw_request)
+
+
+@app.post("/v1/jev", dependencies=[Depends(validate_json_request)])
+async def jev_decisions(request: JevRequest, raw_request: Request):
+    """Decision model checkpoints: every field's answer read at its readout position in one prefill."""
+    return await raw_request.app.state.openai_serving_decisions.handle_request(
         request, raw_request
     )
+
+
+def decision_route_servings(
+    chat_serving: OpenAIServingChat,
+) -> Tuple[OpenAIServingDecisions, SystemOneServing]:
+    return (
+        OpenAIServingDecisions(chat_serving, prompt_sources=PROMPT_SOURCES),
+        SystemOneServing(chat_serving, prompt_sources=PROMPT_SOURCES),
+    )
+
+
+def _untagged_loc(loc) -> tuple:
+    loc = tuple(loc)
+    if loc[:2] == _JEV_BODY_LOC:
+        return ("body", *loc[2:])
+    return loc
 
 
 ## SageMaker API
