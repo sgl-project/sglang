@@ -209,24 +209,37 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     )
 
 
-def _hopper_mhc_layer(norm, w):
-    return SimpleNamespace(
+def _hopper_mhc_layer(norm, w, scale, base):
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+
+    layer = SimpleNamespace(
         input_layernorm=norm,
         post_attention_layernorm=norm,
         config=SimpleNamespace(model_type="deepseek_v41"),
         hc_pre_from_prev_sublayer=True,
         hc_attn_fn=w,
         hc_ffn_fn=-w,
+        hc_attn_scale=scale,
+        hc_ffn_scale=scale,
+        hc_attn_base=base,
+        hc_ffn_base=base,
+        hc_cfg=model_mhc.HcConfig(4, 20, 1e-6, 1e-6, 5120, True, False),
         hc_mult=4,
         hc_sinkhorn_iters=20,
         rms_norm_eps=1e-6,
         hc_eps=1e-6,
     )
+    layer._init_hyper_connections = lambda: (
+        DeepseekV4DecoderLayer._init_hyper_connections(layer)
+    )
+    return layer
 
 
 @pytest.mark.parametrize("num_tokens", [32, 33, 64, 128, 257, 4096, 4097, 8192])
 def test_hopper_compensated_mhc(num_tokens):
     from sglang.srt.environ import envs
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
     from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
     from sglang.srt.utils import is_sm90_supported
 
@@ -238,12 +251,12 @@ def test_hopper_compensated_mhc(num_tokens):
     scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
     base = torch.randn(24, device="cuda")
     norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
-    layer = _hopper_mhc_layer(norm, w)
+    layer = _hopper_mhc_layer(norm, w, scale, base)
     with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True):
         DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
         assert layer._hc_attn_bf16_parts is not None
         assert layer._hc_attn_tf32_parts is None
-        actual = DeepseekV4DecoderLayer._hc_mix_stats(layer, x, w, scale, base)
+        actual = model_mhc.mix_stats(layer.attn_hc, x)
     xd = x.flatten(1).double()
     z = (xd @ w.double().T) * torch.rsqrt(xd.square().mean(-1, keepdim=True) + 1e-6)
     expected_pre = torch.sigmoid(z[:, :4] * scale[0] + base[:4]) + 1e-6
@@ -258,7 +271,7 @@ def test_hopper_compensated_mhc(num_tokens):
     for result, expected in zip(actual, (expected_pre, expected_post, comb)):
         torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
     with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(False):
-        fallback = DeepseekV4DecoderLayer._hc_mix_stats(layer, x, w, scale, base)
+        fallback = model_mhc.mix_stats(layer.attn_hc, x)
         for result, expected in zip(fallback, (expected_pre, expected_post, comb)):
             torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
         DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
@@ -268,7 +281,7 @@ def test_hopper_compensated_mhc(num_tokens):
 @pytest.mark.parametrize("num_tokens", [1, 4, 64, 4096])
 def test_hopper_combine_norm(num_tokens):
     from sglang.srt.layers.layernorm import RMSNorm
-    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
     from sglang.srt.utils import is_sm90_supported
 
     if not is_sm90_supported():
@@ -277,10 +290,14 @@ def test_hopper_combine_norm(num_tokens):
     x = torch.randn(num_tokens, 4, 5120, device="cuda", dtype=torch.bfloat16)
     pre = torch.rand(num_tokens, 4, device="cuda")
     norm = RMSNorm(5120, eps=1e-6).cuda().bfloat16()
-    layer = SimpleNamespace(
-        hc_mult=4, config=SimpleNamespace(model_type="deepseek_v41")
+    hc = model_mhc.HcSubLayer(
+        model_mhc.HcConfig(4, 20, 1e-6, 1e-6, 5120, True, False),
+        None,
+        None,
+        None,
+        norm,
     )
-    actual = DeepseekV4DecoderLayer._hc_combine(layer, x, pre, norm)
+    actual = model_mhc.combine(hc, model_mhc.HcState(x, pre))
     expected = norm(mhc.hc_combine(x.flatten(1), pre, 4, x.dtype))
     torch.testing.assert_close(actual, expected, rtol=1 / 128, atol=1e-5)
 
@@ -289,6 +306,7 @@ def test_hopper_combine_norm(num_tokens):
 def test_hopper_mhc_stats_stream_graph(num_tokens):
     from sglang.srt.layers.layernorm import RMSNorm
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
     from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
     from sglang.srt.utils import is_sm90_supported
 
@@ -301,19 +319,19 @@ def test_hopper_mhc_stats_stream_graph(num_tokens):
     base = torch.randn(24, device="cuda")
     pre = torch.rand(num_tokens, 4, device="cuda")
     norm = RMSNorm(5120, eps=1e-6).cuda().bfloat16()
-    layer = _hopper_mhc_layer(norm, w)
+    layer = _hopper_mhc_layer(norm, w, scale, base)
     layer.hc_stats_stream = torch.cuda.Stream()
     DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
-    stream = DeepseekV4DecoderLayer._get_hc_stats_stream(
-        layer, x, SimpleNamespace(forward_mode=ForwardMode.DECODE)
+    assert model_mhc.use_stats_stream(
+        layer.hc_cfg, SimpleNamespace(forward_mode=ForwardMode.DECODE), x
     )
-    assert stream is layer.hc_stats_stream
+    stream = layer.hc_stats_stream
 
     def run(stats_stream):
-        combined = DeepseekV4DecoderLayer._hc_combine(layer, x, pre, norm, stats_stream)
-        coefficients = DeepseekV4DecoderLayer._hc_mix_stats(
-            layer, x, w, scale, base, stats_stream
+        combined = model_mhc.combine(
+            layer.attn_hc, model_mhc.HcState(x, pre), stats_stream
         )
+        coefficients = model_mhc.mix_stats(layer.attn_hc, x, stats_stream)
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         # Read on the consumer stream after the join, as hc_post does.
@@ -332,6 +350,81 @@ def test_hopper_mhc_stats_stream_graph(num_tokens):
         graph.replay()
         for result, reference in zip(actual, expected):
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
+def test_mhc_refresh_without_deepgemm_prenorm():
+    from unittest.mock import patch
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.deep_gemm_wrapper import configurer
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+    from sglang.srt.runtime_context import override_platform
+
+    norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
+    w = torch.randn(24, 20480, device="cuda")
+    scale = torch.ones(3, device="cuda")
+    base = torch.zeros(24, device="cuda")
+    layer = _hopper_mhc_layer(norm, w, scale, base)
+    layer._can_fuse_attn_mhc = layer._can_fuse_ffn_mhc = True
+    layer.local_boundary = layer.next_boundary = object()
+    with (
+        override_platform(is_sm100=True, is_sm90=False),
+        envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True),
+        patch.object(configurer, "ENABLE_JIT_DEEPGEMM", True),
+        patch.dict("sys.modules", {"deep_gemm": SimpleNamespace()}),
+    ):
+        DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
+    assert layer.attn_hc.fn is w
+    assert layer.ffn_hc.fn is layer.hc_ffn_fn
+    assert layer.attn_hc.tf32_parts is None
+    assert layer.attn_hc.bf16_parts is None
+    assert "_can_fuse_attn_mhc" not in layer.__dict__
+    assert "_can_fuse_ffn_mhc" not in layer.__dict__
+    assert layer.local_boundary is None and layer.next_boundary is None
+
+
+@pytest.mark.parametrize(
+    "replicated,add_shared,has_shared,expected",
+    [
+        (False, False, True, 16.0),
+        (True, False, True, 2.0),
+        (True, True, True, 9.0),
+        (True, True, False, 2.0),
+    ],
+)
+def test_moe_post_reduces_before_adding_replicated_shared(
+    monkeypatch, replicated, add_shared, has_shared, expected
+):
+    from sglang.srt.layers import moe
+    from sglang.srt.layers.moe import utils as moe_utils
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
+
+    routed = torch.ones(2, 3)
+    shared = torch.full((2, 3), 7.0) if has_shared else None
+    pieces = model_mhc.MoEOutput(routed, shared, None, 1.0, replicated)
+    partial = routed if replicated or shared is None else routed + shared
+    monkeypatch.setattr(model_mhc.MoEOutput, "get_merged", lambda self: partial)
+    monkeypatch.setattr(model_mhc, "is_deferred_finalize", lambda value: False)
+    monkeypatch.setattr(
+        moe_utils, "should_add_replicated_moe_output", lambda: add_shared
+    )
+    reduced_inputs = []
+
+    def reduce(value):
+        reduced_inputs.append(value.clone())
+        return value * 2
+
+    monkeypatch.setattr(moe, "post_experts_all_reduce", reduce)
+    monkeypatch.setattr(model_mhc, "_compute_triplet", lambda *args: None)
+    monkeypatch.setattr(
+        model_mhc, "_plain_post", lambda hc, value, residual, triplet, **kwargs: value
+    )
+    actual = model_mhc.run_moe_post(
+        None, pieces, None, stats_stream=None, next=None, world_size=2
+    )
+    assert len(reduced_inputs) == 1
+    torch.testing.assert_close(reduced_inputs[0], partial)
+    torch.testing.assert_close(actual, torch.full((2, 3), expected))
 
 
 if __name__ == "__main__":

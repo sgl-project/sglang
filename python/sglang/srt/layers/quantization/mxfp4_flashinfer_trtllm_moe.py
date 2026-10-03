@@ -519,82 +519,34 @@ def maybe_fuse_routed_scale_and_shared_add(
     return routed
 
 
-# Fused finalize + shared add + TP all-reduce
-_fused_finalize_all_reduce_world_size: Optional[int] = None
-_fused_finalize_all_reduce_probed = False
-_fused_finalize_all_reduce_comm = None
+# Fused finalize + shared add + TP all-reduce, staged through the TP group's own
+# CustomAllReduceV2 push plane (tiny batches only; no dedicated workspace).
 
 
-def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
-    """Reserve a separate push plane for up to 384 rows of fused MoE output."""
-    global _fused_finalize_all_reduce_world_size, _fused_finalize_all_reduce_probed
-    global _fused_finalize_all_reduce_comm
-    if not _fused_finalize_all_reduce_probed:
-        # The eager warmup must initialize peer workspaces before capture.
-        if torch.cuda.is_current_stream_capturing():
-            return None
-        _fused_finalize_all_reduce_probed = True
-        from sglang.kernels.ops.communication import all_reduce_fusion
-        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-            CustomAllReduceV2,
+def register_fused_all_reduce_comm() -> None:
+    """Hand the TP group's push plane to the fusion kernels, once per process.
+    Must run before graph capture; unregistered means everything runs unfused."""
+    from sglang.kernels.ops.communication import all_reduce_fusion
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
+
+    ca_comm = get_parallel().tp_group.ca_comm
+    if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
+        all_reduce_fusion.register_comm(ca_comm.obj)
+    else:
+        log_info_on_rank0(
+            logger,
+            "Fused MoE finalize: TP group has no "
+            "CustomAllReduceV2 push plane; keeping the unfused finalize path",
         )
 
-        ca_comm = get_parallel().tp_group.ca_comm
-        if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
-            fused_comm = ca_comm
-            if ca_comm.world_size == 4:
-                from sglang.kernels.ops.communication.mp import register_comm_cleanup
 
-                fused_comm = CustomAllReduceV2(
-                    ca_comm.group,
-                    ca_comm.device,
-                    max_pull_size=0,
-                    max_pull_blocks=0,
-                    max_push_size=4 * 1024 * 1024,
-                    max_push_blocks=512,
-                )
-                register_comm_cleanup(fused_comm)
-            if fused_comm.disabled:
-                return None
-            _fused_finalize_all_reduce_comm = fused_comm
-            all_reduce_fusion.register_comm(fused_comm.obj)
-            _fused_finalize_all_reduce_world_size = fused_comm.world_size
-        else:
-            log_info_on_rank0(
-                logger,
-                "Fused MoE finalize: TP group has no "
-                "CustomAllReduceV2 push plane; keeping the unfused finalize path",
-            )
-    return _fused_finalize_all_reduce_world_size
-
-
-def should_use_fuse_finalize_all_reduce(
-    experts, num_tokens: int, hidden_dim: int
-) -> bool:
-    """Capability only; the batch-size policy cap lives at the call site. The
-    kernel never rescales, so the expert weights must carry the routed scaling."""
-    if not isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
-        return False
-    if experts.quant_method.flashinfer_mxfp4_moe_precision != "default":
-        return False
-    if not experts.should_fuse_routed_scaling_factor_in_topk:
-        return False
-    if num_tokens <= 0:
-        return False
-    if num_tokens > 96:
-        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
-        if is_batch_invariant_mode_enabled():
-            return False
+def can_fuse_all_reduce() -> bool:
+    """Whether fused-collective epilogues may stage rows through the registered
+    push plane. The deferred-finalize handle type carries its own contract (every
+    producer folds the routed scaling; no consumer rescales), and slot capacity /
+    geometry are checked loudly kernel-side."""
     from sglang.kernels.ops.communication import all_reduce_fusion
 
-    if not all_reduce_fusion.valid_cluster_sizes(hidden_dim):
-        return False
-    tp_group = get_parallel().tp_group
-    if _fused_finalize_all_reduce_comm_world_size() != tp_group.world_size:
-        return False
-    comm = _fused_finalize_all_reduce_comm
-    # Each token row owns a push phase counter on the epilogue's plane.
-    if num_tokens > comm.config.num_push_blocks:
-        return False
-    return all_reduce_fusion.fits_push_slot(comm.max_push_size, num_tokens, hidden_dim)
+    return all_reduce_fusion.get_registered_comm(get_parallel().tp_size) is not None
