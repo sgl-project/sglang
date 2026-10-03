@@ -410,6 +410,11 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.extend_attention_block_m = block_m
 
+        if _is_hip:
+            from sglang.kernels.ops.attention import mla_paged_decode_gluon_hip
+
+            mla_paged_decode_gluon_hip.install(self, model_runner)
+
     def get_num_kv_splits(
         self,
         num_kv_splits: torch.Tensor,
