@@ -490,6 +490,18 @@ Use ascend backend with [memfabric_hybrid](https://gitcode.com/Ascend/memfabric_
 pip install memfabric-hybrid==1.0.0
 export ASCEND_MF_STORE_URL="tcp://xxx.xx.xxx.xxx:xxxx"
 ```
+
+#### Host RDMA transport
+
+`ASCEND_MF_TRANSFER_PROTOCOL` selects the transport (`sdma` by default; `host_rdma` / `device_rdma` / `device_urma` with newer memfabric_hybrid builds). `host_rdma` additionally requires `ASCEND_MF_HCOM_URL` pointing at the local RDMA nic data-plane endpoint: each worker derives its own port from this base, with Prefill and Decode getting disjoint ranges, so both roles can share one host (and one base value).
+
+```bash
+export ASCEND_MF_TRANSFER_PROTOCOL=host_rdma
+export ASCEND_MF_HCOM_URL="tcp://<rdma-nic-ip>:<port>"
+```
+
+The resolved per-worker endpoint is logged as `Resolved Ascend Host RDMA endpoint: role=..., endpoint=...`.
+
 Use mooncake backend, more details can be found in mooncake section.
 ```bash
 export ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE=true

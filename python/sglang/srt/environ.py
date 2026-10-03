@@ -808,6 +808,9 @@ class Envs:
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
+    # MemFabric (memfabric_hybrid) host_rdma data-plane nic endpoint; the
+    # per-worker port is derived from this base (see AscendTransferEngine).
+    ASCEND_MF_HCOM_URL = EnvStr(None)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
