@@ -6,11 +6,12 @@ Tests verify that:
 3. All pods are eventually discovered and tracked consistently
 4. Prometheus discovery metrics are emitted correctly
 5. Reconciliation does not cause instability over multiple cycles
+6. Reconciliation removes a worker the watch path structurally cannot
 
-These tests require a kind cluster with the gateway deployed. The
-reconciliation interval is 60s (see ServiceDiscoveryConfig.check_interval
-in sgl-model-gateway/src/service_discovery.rs), so tests exercising
-reconciliation must wait ~90s for a tick to fire.
+These tests require a kind cluster with the gateway deployed. Worker
+convergence is driven by the periodic full-LIST reconcile, whose interval the
+gateway manifests pin with --service-discovery-resync-secs; tests exercising
+it wait RECONCILIATION_WAIT_SECS for a tick to fire.
 
 Run with:
     cd e2e_test/k8s_integration
@@ -239,9 +240,12 @@ class TestWatcherDiscovery:
 class TestReconciliationStaleWorkerRemoval:
     """Test that stale workers are removed after pod deletion.
 
-    The watcher DELETE event typically handles this immediately.
-    If the watcher misses it (e.g., during restart or backoff),
-    reconciliation catches it within ~60s.
+    A graceful delete is usually caught immediately by the watch path, which
+    sees the pod carrying a deletion_timestamp. That path is not reliable on
+    its own — the watcher's Delete events are discarded before the gateway
+    sees them, so a pod that vanishes while the watch is down or stale is
+    never noticed by it. Reconciliation is what closes that gap, within one
+    resync interval.
     """
 
     def test_stale_worker_removed_after_pod_deletion(self, gateway_port_forward):
@@ -268,9 +272,9 @@ class TestReconciliationStaleWorkerRemoval:
             _delete_worker_pod(pod_name, force=True)
             _wait_for_pod_gone(pod_name)
 
-            # Wait for the gateway to remove the stale worker.
-            # The watcher DELETE event may handle this immediately.
-            # If it doesn't, reconciliation will catch it within ~60s.
+            # Wait for the gateway to remove the stale worker. The watch path
+            # may catch it immediately; if it doesn't, reconciliation does so
+            # within one resync interval.
             _poll_until(
                 lambda: _get_worker_count(gateway_url) < count_with_pod,
                 f"worker count < {count_with_pod} (stale worker removed)",
@@ -280,6 +284,70 @@ class TestReconciliationStaleWorkerRemoval:
 
             final_count = _get_worker_count(gateway_url)
             logger.info("Worker count after stale removal: %d", final_count)
+            assert final_count < count_with_pod
+
+        finally:
+            _safe_delete_worker_pod(pod_name)
+
+
+class TestReconciliationSelectorChange:
+    """Reconciliation removes a worker the watch path structurally cannot.
+
+    Relabelling a running pod so it no longer matches the selector does
+    produce a watch event, but the gateway filters the stream on
+    `should_include` before any handler runs, so the event is dropped and the
+    watch path can never deregister that worker. The periodic full-LIST
+    reconcile can: the pod is filtered out of the LIST too, so it is not in
+    the present set and the tracked entry goes stale.
+
+    Unlike the deletion tests, this needs no cooperation from the watcher and
+    no way to force it to miss events — the watch path is incapable of the
+    removal by construction, so a pass here is attributable to reconciliation
+    alone.
+    """
+
+    def test_worker_removed_when_pod_stops_matching_selector(
+        self, gateway_port_forward
+    ):
+        """Relabel a running pod out of the selector and verify deregistration."""
+        gateway_url, _ = gateway_port_forward
+        pod_name = "test-selector-change"
+
+        try:
+            _deploy_worker_pod(pod_name)
+            _wait_for_pod_ready(pod_name)
+
+            _poll_until(
+                lambda: _get_worker_count(gateway_url) >= 1,
+                "at least 1 worker discovered",
+                timeout=30,
+                interval=3,
+            )
+            count_with_pod = _get_worker_count(gateway_url)
+            logger.info("Worker count with test pod: %d", count_with_pod)
+
+            # Relabel in place: the pod keeps running and stays in the API, so
+            # there is no deletion of any kind for the watch path to observe.
+            _kubectl(
+                "label",
+                "pod",
+                pod_name,
+                "-n",
+                NAMESPACE,
+                "app=not-a-worker",
+                "--overwrite",
+            )
+            logger.info("Relabelled pod %s out of the selector", pod_name)
+
+            _poll_until(
+                lambda: _get_worker_count(gateway_url) < count_with_pod,
+                f"worker count < {count_with_pod} (deselected pod removed)",
+                timeout=RECONCILIATION_WAIT_SECS,
+                interval=5,
+            )
+
+            final_count = _get_worker_count(gateway_url)
+            logger.info("Worker count after deselection: %d", final_count)
             assert final_count < count_with_pod
 
         finally:

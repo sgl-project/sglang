@@ -25,6 +25,8 @@ spec:
             - "role=prefill"
             - "--decode-selector"
             - "role=decode"
+            - "--service-discovery-resync-secs"
+            - "10"
             - "--service-discovery-port"
             - "8000"
             - "--service-discovery-namespace"

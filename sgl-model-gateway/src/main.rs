@@ -252,6 +252,20 @@ struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
     decode_selector: Vec<String>,
 
+    /// Interval (seconds) of the periodic full-LIST reconcile that repairs the
+    /// discovered worker set independently of watch health. Keep it below the
+    /// pod termination-drain budget so draining pods stop receiving traffic
+    /// early enough for in-flight requests to complete. Removing a model's
+    /// last healthy worker can be held a few seconds longer while a
+    /// replacement activates, so leave headroom rather than sizing this to the
+    /// drain budget exactly.
+    #[arg(
+        long,
+        default_value_t = 30,
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    service_discovery_resync_secs: u64,
+
     // ==================== Logging ====================
     /// Directory to store log files
     #[arg(long, help_heading = "Logging")]
@@ -1095,6 +1109,7 @@ impl CliArgs {
                 enabled: true,
                 selector,
                 check_interval: std::time::Duration::from_secs(60),
+                resync_interval: std::time::Duration::from_secs(self.service_discovery_resync_secs),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
                 pd_mode: self.pd_disaggregation,
