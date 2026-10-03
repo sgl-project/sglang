@@ -97,8 +97,8 @@ def _validate_compute_cp_gather():
         parallel.enable_prefill_cp
         and parallel.attn_cp_size == parallel.tp_size > 1
         and parallel.attn_tp_size == parallel.attn_dp_size == 1
-        and parallel.moe_dp_size == 1
-        and parallel.moe_ep_size * parallel.moe_tp_size == parallel.tp_size
+        and parallel.moe_dp_size == parallel.moe_ep_size == 1
+        and parallel.moe_tp_size == parallel.tp_size
         and get_moe_a2a_backend().is_none()
         and parallel.dwdp_size == 1
         and not is_moe_input_scattered_across_dp_ranks()
@@ -106,8 +106,7 @@ def _validate_compute_cp_gather():
     ):
         raise NotImplementedError(
             "compute-owned CP gathering requires collocated rank-major prefill CP "
-            "with CP == TP, attention TP/DP == 1, MoE DP == 1, "
-            "MoE EP * MoE TP == TP, and no all-to-all"
+            "with CP == TP, attention TP/DP == 1, MoE DP/EP == 1, and no all-to-all"
         )
     ranks = list(get_moe_cp_group().ranks)
     if any(

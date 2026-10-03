@@ -4,7 +4,6 @@ import itertools
 import unittest
 from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import test_declared_decoder_boundary as fixture
 import torch
@@ -25,7 +24,6 @@ from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_RESIDUAL_OPS
 from sglang.srt.layers.layer_boundary.residual.mhc import MHCState
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
-from sglang.srt.layers.moe.utils import post_experts_reduction_group
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -47,9 +45,9 @@ class RecordingGroup(fixture.Group):
         return super().all_gather_into_tensor(output, value)
 
 
-def parallel_of(*, attn_cp=2, **overrides):
+def parallel_of(**overrides):
     return fixture.parallel_of(
-        attn_dp=1, attn_tp=1, attn_cp=attn_cp, enable_prefill_cp=True, **overrides
+        attn_dp=1, attn_tp=1, attn_cp=2, enable_prefill_cp=True, **overrides
     )
 
 
@@ -148,7 +146,7 @@ class TestComputeOwnedCpMoe(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "sparse FFN"):
             declare_ffn(gathers_cp_input=True)
         for fields, options in (
-            ({"moe_ep_size": 2}, {}),
+            ({"moe_ep_size": 2, "moe_tp_size": 1}, {}),
             ({"moe_dp_size": 2, "moe_tp_size": 1}, {}),
             ({"moe_tp_size": 1}, {}),
             ({"dwdp_size": 2}, {}),
@@ -181,29 +179,12 @@ class TestComputeOwnedCpMoe(CustomTestCase):
         *,
         mhc=False,
         cp=True,
-        moe_ep_size=1,
         complete_output=False,
         square_output=False,
         with_following=False,
     ):
-        world_size = len(rows)
-        moe_tp_size = world_size // moe_ep_size
-        world = fixture.World(world_size)
-        group = RecordingGroup(world, "cp", range(world_size))
-        ep_groups = [
-            RecordingGroup(
-                world, f"ep-{tp_rank}", range(tp_rank, world_size, moe_tp_size)
-            )
-            for tp_rank in range(moe_tp_size)
-        ]
-        tp_groups = [
-            RecordingGroup(
-                world,
-                f"moe-tp-{ep_rank}",
-                range(ep_rank * moe_tp_size, (ep_rank + 1) * moe_tp_size),
-            )
-            for ep_rank in range(moe_ep_size)
-        ]
+        world = fixture.World(2)
+        group = RecordingGroup(world, "cp", range(2))
         states = [
             SimpleNamespace(
                 rank=rank,
@@ -211,18 +192,13 @@ class TestComputeOwnedCpMoe(CustomTestCase):
                 events=[],
                 flags=fixture.Flags(),
                 parallel=parallel_of(
-                    attn_cp=world_size,
                     tp_rank=rank,
                     attn_cp_rank=rank,
                     tp_group=group,
                     attn_cp_group=group,
-                    moe_ep_size=moe_ep_size,
-                    moe_tp_size=moe_tp_size,
-                    moe_ep_group=ep_groups[rank % moe_tp_size],
-                    moe_tp_group=tp_groups[rank // moe_tp_size],
                 ),
             )
-            for rank in range(world_size)
+            for rank in range(2)
         ]
 
         def run_rank(rank):
@@ -279,25 +255,17 @@ class TestComputeOwnedCpMoe(CustomTestCase):
             torch.testing.assert_close(local, expected_input, rtol=0, atol=0)
             self.assertNotIn("gather", state.events, "routing must see local rows")
             state.events.append("route")
-            expert_ids = torch.div(local[:, 0], 16, rounding_mode="floor").remainder(
-                moe_ep_size
-            )
-            routing = torch.stack((local.sum(-1), expert_ids), dim=-1)
+            routing = local.sum(-1, keepdim=True)
             with ffn.exit(fb) as exit_:
                 skip = state.flags.mlp_reduce_scatter
                 if cp:
-                    gathered = moe_cp_gather(local, rows, world_size)
-                    routed = moe_cp_gather(routing, rows, world_size)
+                    gathered = moe_cp_gather(local, rows, 2)
+                    routed = moe_cp_gather(routing, rows, 2)
                 else:
                     gathered, routed = local, routing
-                # EP owns distinct experts; TP owns complementary shards of each
-                # expert. Both sums must complete over the same CP return group.
-                selected = routed[:, 1:2]
-                output = (5 * gathered + routed[:, :1]) * (selected + 1)
+                output = 5 * gathered + routed
                 if not complete_output:
-                    output *= (selected == rank // moe_tp_size) * fixture.WEIGHTS[
-                        moe_tp_size
-                    ][rank % moe_tp_size]
+                    output *= fixture.WEIGHTS[2][rank]
                 if not cp and not skip:
                     output = group.all_reduce(output)
                 if cp:
@@ -310,9 +278,7 @@ class TestComputeOwnedCpMoe(CustomTestCase):
                 if complete_output
                 else exit_.finish(output)
             )
-            expected = (5 * expected_input + expected_input.sum(-1, keepdim=True)) * (
-                expert_ids[:, None] + 1
-            )
+            expected = 5 * expected_input + expected_input.sum(-1, keepdim=True)
             if square_output:
                 expected = expected.square()
             if mhc:
@@ -355,18 +321,12 @@ class TestComputeOwnedCpMoe(CustomTestCase):
             stack.enter_context(
                 planning(lambda: world.state().parallel, group, policy=policy)
             )
-            stack.enter_context(
-                patch.object(
-                    fixture.moe_utils, "get_parallel", lambda: world.state().parallel
-                )
-            )
             for name, value in {
                 "get_forward": lambda: world.state().flags,
                 "get_moe_cp_rank": lambda: world.state().rank,
                 "moe_cp_all_gather_into_tensor": group.all_gather_into_tensor,
                 "get_attn_tp_context": lambda: SimpleNamespace(input_scattered=False),
                 "is_dp_attention_enabled": lambda: False,
-                "post_experts_reduction_group": post_experts_reduction_group,
                 "post_experts_sum_is_one_all_reduce": lambda: True,
                 "use_symmetric_memory": lambda *a, **kw: nullcontext(),
                 "is_allocation_symmetric": lambda: False,
@@ -378,7 +338,7 @@ class TestComputeOwnedCpMoe(CustomTestCase):
                 error, fixture.threading.BrokenBarrierError
             ):
                 raise error
-        self.assertEqual(errors, [None] * world_size)
+        self.assertEqual(errors, [None, None])
 
     def test_rank_major_padded_output_and_local_residual(self):
         for rows, policy, mhc in itertools.product(
@@ -393,14 +353,6 @@ class TestComputeOwnedCpMoe(CustomTestCase):
         for policy, mhc in itertools.product(("ar", "rs+rsv"), (False, True)):
             with self.subTest(policy=policy, mhc=mhc):
                 self.run_world([2, 2], policy, mhc=mhc, cp=False)
-
-    def test_ep_and_mixed_ep_tp_return_local_rows(self):
-        for rows, policy in itertools.product(
-            ([3, 1], [0, 2], [0, 0], [3, 1, 0, 2], [0, 0, 0, 0]),
-            ("ar", "rs"),
-        ):
-            with self.subTest(rows=rows, policy=policy):
-                self.run_world(rows, policy, moe_ep_size=2)
 
     def test_complete_output_skips_boundary_reduction(self):
         for policy, mhc in itertools.product(("ar", "rs"), (False, True)):
