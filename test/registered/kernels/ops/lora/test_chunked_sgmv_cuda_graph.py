@@ -17,15 +17,15 @@
 import pytest
 import torch
 
-from sglang.kernels.ops.gemm.chunked_sgmv_expand import (
+from sglang.kernels.ops.lora.dense.chunked_sgmv_expand import (
     _chunked_lora_expand_kernel,
     chunked_sgmv_lora_expand_forward,
 )
-from sglang.kernels.ops.gemm.chunked_sgmv_shrink import (
+from sglang.kernels.ops.lora.dense.chunked_sgmv_shrink import (
     _chunked_lora_shrink_kernel,
     chunked_sgmv_lora_shrink_forward,
 )
-from sglang.kernels.ops.gemm.kv_b_lora_absorbed import (
+from sglang.kernels.ops.lora.dense.kv_b_lora_absorbed import (
     step_a_q_fwd,
     step_a_v_fwd,
     step_b_q_fwd,

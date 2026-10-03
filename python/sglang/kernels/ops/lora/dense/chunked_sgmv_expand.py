@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.gemm.lora_tuning_config import get_lora_expand_config
+from sglang.kernels.ops.lora.dense.lora_tuning_config import get_lora_expand_config
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import cached_triton_kernel
 

@@ -2,20 +2,19 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.gemm.kernel_utils import _resolve_token_positions
+from sglang.kernels.ops.lora.dense.kernel_utils import _resolve_token_positions
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
 @triton.jit
-def _sgemm_lora_a_kernel(
+def _sgemm_lora_b_kernel(
     # Pointers to matrices
     x,
     weights,
     output,
     # Matrix dimensions
-    N,  # stack_num * r
-    K,  # input_dim
-    stack_num,
+    N,  # output_dim
+    K,  # r
     # Strides
     x_stride_0,
     x_stride_1,
@@ -24,7 +23,7 @@ def _sgemm_lora_a_kernel(
     w_stride_2,
     output_stride_0,
     output_stride_1,
-    # Information on sequence lengths,ranks and weight id
+    # Information on sequence lengths and weight id
     seg_lens,
     seg_indptr,
     weight_indices,
@@ -35,21 +34,24 @@ def _sgemm_lora_a_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # For fused output scaling
+    scalings,
 ):
     """
-    Computes a segmented batched matrix multiplication for the LoRA A matrix.
+    Computes a segmented batched matrix multiplication for the LoRA B matrix
+    and adds the result to the output in-place.
 
-    The kernel ensures that output[seg_start:seg_start + seg_len, :rank * stack_num]
-    stores the product of the input `x` and the LoRA weights for the corresponding
-    sequence. This implies that when rank is 0, the kernel is essentially a no-op,
-    as output[seg_start:seg_start + seg_len, :0] is trivially correct (empty).
+    When a sequence's rank is 0, the kernel is essentially a no-op, following
+    the convention in pytorch where the product of two matrices of shape (m, 0)
+    and (0, n) is an all-zero matrix of shape (m, n).
 
     Args:
-        x (torch.Tensor): The input activations tensor of shape `(s, K)`, where `s`
-            is the sum of all sequence lengths in the batch.
-        weights (torch.Tensor): The LoRA 'A' weights for all available adapters,
+        x (torch.Tensor): The intermediate tensor from the LoRA 'A' multiplication,
+            of shape `(s, K)`, where `s` is the total number of tokens.
+        weights (torch.Tensor): The LoRA 'B' weights for all available adapters,
             with shape `(num_lora, N, K)`.
-        output (torch.Tensor): The output tensor of shape `(s, N)`.
+        output (torch.Tensor): The output tensor of shape `(s, N)`. This can be
+            the base model's output for a fused add operation.
     """
 
     # Current block computes sequence with batch_id,
@@ -58,18 +60,18 @@ def _sgemm_lora_a_kernel(
     w_index = tl.load(weight_indices + batch_id)
     rank = tl.load(lora_ranks + w_index)
 
-    # If rank is 0, this kernel becomes a no-op as the output is always trivially correct.
+    # If rank is 0, this kernel is a no-op.
     if rank == 0:
         return
 
     pid = tl.program_id(axis=0)
-    seg_start = tl.load(seg_indptr + batch_id)
     seg_len = tl.load(seg_lens + batch_id)
     if seg_len == 0:
         return
-
-    # Adjust N (stack_num * max_rank) according to the specific LoRA adapter
-    N = tl.minimum(N, rank * stack_num)
+    seg_start = tl.load(seg_indptr + batch_id)
+    scaling = tl.load(scalings + w_index)
+    # Adjust K (rank) according to the specific LoRA adapter
+    K = tl.minimum(K, rank)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -93,6 +95,7 @@ def _sgemm_lora_a_kernel(
     )
 
     # Iterate to compute the block in output matrix
+    n_mask = n_offset[None, :] < N
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
@@ -102,7 +105,7 @@ def _sgemm_lora_a_kernel(
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < N),
+            mask=(k_offset[:, None] < K - k * BLOCK_K) & n_mask,
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
@@ -111,26 +114,26 @@ def _sgemm_lora_a_kernel(
         w_ptrs += BLOCK_K * w_stride_2
 
     # Store result to output matrix
+    partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
-    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < N)
     output_ptr = output + (
         s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
+    output_mask = (s_offset[:, None] < seg_len) & n_mask
+    partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
-def sgemm_lora_a_fwd(
+def sgemm_lora_b_fwd(
     x: torch.Tensor,
     weights: torch.Tensor,
     batch_info: LoRABatchInfo,
-    stack_num: int = 1,
+    base_output: torch.Tensor = None,
 ) -> torch.Tensor:
-    # x: (s, input_dim)
-    # weights: (num_lora, stack_num * r, input_dim)
-    # output: (s, stack_num * r)
-    # stack_num: run_qkv_lora: 3, run_gate_up_lora: 2
-    # when called by run_qkv_lora, the weights.shape[-2] will be 3 * r
-    # input_dim is much larger than r
+    # x: (s, max_r)
+    # weights: (num_lora, output_dim, max_r)
+    # output: (s, output_dim)
+    # output_dim is much larger than max_r
 
     assert x.is_contiguous()
     assert weights.is_contiguous()
@@ -138,30 +141,32 @@ def sgemm_lora_a_fwd(
     assert len(weights.shape) == 3
 
     S = x.shape[0]
-    R = weights.shape[-2]
-    K = weights.shape[-1]
-    assert x.shape[-1] == K
+    N = weights.shape[-2]
+    R = weights.shape[-1]
+    assert x.shape[-1] == R
 
     # Block shapes
     BLOCK_S = 16
-    BLOCK_K = 256
     BLOCK_R = 16
+    BLOCK_N = 256
 
     grid = (
-        triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(R, BLOCK_R),
+        triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(N, BLOCK_N),
         batch_info.bs,
     )
 
-    sorted_by_adapter = batch_info.permutation is not None
+    if base_output is None:
+        output = torch.zeros((S, N), device=x.device, dtype=x.dtype)
+    else:
+        output = base_output
 
-    output = torch.empty((S, R), device=x.device, dtype=x.dtype)
-    _sgemm_lora_a_kernel[grid](
+    sorted_by_adapter = batch_info.permutation is not None
+    _sgemm_lora_b_kernel[grid](
         x,
         weights,
         output,
+        N,
         R,
-        K,
-        stack_num,
         x.stride(0),
         x.stride(1),
         weights.stride(0),
@@ -176,7 +181,8 @@ def sgemm_lora_a_fwd(
         batch_info.permutation,
         sorted_by_adapter,
         BLOCK_S,
+        BLOCK_N,
         BLOCK_R,
-        BLOCK_K,
+        batch_info.scalings,
     )
     return output

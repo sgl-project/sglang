@@ -2,10 +2,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.gemm.trtllm_lora_temp.gate_up_lora_b import (
+from sglang.kernels.ops.lora.dense.trtllm_lora_temp.gate_up_lora_b import (
     _CUBLAS_MIN_S_RANK,
 )
-from sglang.kernels.ops.gemm.trtllm_lora_temp.kernel_utils import (
+from sglang.kernels.ops.lora.dense.trtllm_lora_temp.kernel_utils import (
     _resolve_token_positions,
     get_pdl_launch_metadata,
 )
