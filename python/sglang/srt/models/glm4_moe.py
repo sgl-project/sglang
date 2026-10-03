@@ -1294,6 +1294,9 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    # ModelConfig rewrites a GLM draft's architecture to this class's own name,
+    # so the inherited DeepSeek name would never match what the gate compares.
+    fused_shared_experts_architecture = "GlmMoeDsaForCausalLMNextN"
     # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited
     # substr mapping would wrongly rewrite GLM's real layer-61 weights.
     # exclude_layers remapping for the MTP layer is handled explicitly in
@@ -1301,6 +1304,14 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     hf_to_sglang_mapper = WeightsMapper()
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        # The PTPC cast only rewrites routed experts, so the shared expert never
+        # matches the FP8 per-channel slot it would be fused into.
+        if should_apply_glm_nextn_moe_ptpc(quant_config, hf_config.num_hidden_layers):
+            return "GLM NextN PTPC does not support shared experts fusion."
+        return super().shared_experts_fusion_disable_reason(hf_config, quant_config)
 
     @classmethod
     def _map_mtp_ckpt_name(cls, name: str, layer_prefix: str) -> str:
