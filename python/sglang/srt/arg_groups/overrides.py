@@ -894,7 +894,6 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "GlmMoeDsaForCausalLM",
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
-        "Glm5NextForConditionalGeneration",
         "MistralLarge3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
@@ -1755,9 +1754,9 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
 
 def cutedsl_moe_max_num_tokens(server_args: Any) -> int:
     """Largest number of tokens a single forward routes through a CuteDSL
-    MoE layer on one (DP) rank. Single source of truth for both the
-    standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
-    budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
+    MoE layer on one (DP) rank; sizes the standard-allgather wrapper buffers.
+    The FlashInfer A2A budget is required_flashinfer_a2a_dispatch_tokens_per_rank.
+    Max over the prefill (max_prefill_tokens), piecewise-prefill
     capture, and decode/verify bounds; num_tokens_per_req is
     speculative_num_draft_tokens under speculative decoding, else 1.
     """

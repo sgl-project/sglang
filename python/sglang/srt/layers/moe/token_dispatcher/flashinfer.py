@@ -6,7 +6,6 @@ from typing import NamedTuple, Optional
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     is_dp_attention_enabled,
@@ -31,7 +30,13 @@ from sglang.srt.layers.moe.utils import (
     get_flashinfer_a2a_dispatch_type,
     get_moe_runner_backend,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    flashinfer_a2a_max_dispatch_tokens_per_rank,
+    get_flags,
+    get_parallel,
+    get_spec,
+    max_prefill_buffer_tokens,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 try:
@@ -142,21 +147,16 @@ class FlashinferDispatcher(BaseDispatcher):
         # dispatch op's epSize * runtimeMaxTokensPerRank payload buffer.
         #
         # The workspace must fit both:
-        #  (a) the fattest prefill batch (bounded by chunked_prefill_size), and
+        #  (a) the largest eager prefill chunk on one rank (the prefill buffer
+        #      ceiling, which includes PP dynamic-chunking growth), and
         #  (b) the largest decode batch (bounded by max_running_requests, which
         #      resolve_max_num_reqs caps at 4096 per DP worker).
         # max_running_requests is not yet resolved at model-construction time,
         # so we use 4096 as a floor to cover decode batches and _dummy_run
         # (which warms up at batch_size = req_to_token_pool.size).
-        cps = get_schedule().chunked_prefill_size
-        default_max_tokens = max(cps if cps and cps > 0 else 4096, 4096)
-        configured_max_tokens = (
-            envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-        )
-        self.max_num_tokens = (
-            configured_max_tokens
-            if configured_max_tokens is not None
-            else default_max_tokens
+        # validate_flashinfer_a2a_token_budget rejects configs exceeding this.
+        self.max_num_tokens = flashinfer_a2a_max_dispatch_tokens_per_rank(
+            max_prefill_buffer_tokens()
         )
         speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
