@@ -663,6 +663,8 @@ class Envs:
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    # Override NVML Confidential Computing autodetection. None = autodetect.
+    SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 
     # ===================================================================
     # Radix and sparse KV caches
