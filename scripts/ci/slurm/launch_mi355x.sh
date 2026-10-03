@@ -1890,8 +1890,15 @@ set -e
 # server logs (the actual root cause). We still fall through to normalize
 # whatever raw results the completed concurrencies produced -- partial perf data
 # is worth uploading -- and propagate the failure via the exit code at the end.
+#
+# drive_*.log comes first: when drive.sh fails before starting a server -- the
+# node-local staging check is the common case -- it is the only file with the
+# reason in it, and the others are empty or absent.
 if [[ "$SALLOC_RC" -ne 0 ]]; then
     echo "ERROR: allocation/bench failed (rc=$SALLOC_RC); bench + server logs:" >&2
+    for f in "$WORKDIR"/drive_*.log; do
+        [[ -f "$f" ]] && { echo "--- $f (tail) ---"; tail -30 "$f"; }
+    done
     echo "--- bench.log (tail) ---"; tail -40 "$WORKDIR/bench.log" 2>/dev/null || true
     for f in "$WORKDIR"/prefill_*.log "$WORKDIR"/decode_*.log; do
         [[ -f "$f" ]] && { echo "--- $f (tail) ---"; tail -30 "$f"; }
