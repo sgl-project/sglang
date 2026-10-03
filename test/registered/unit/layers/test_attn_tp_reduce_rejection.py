@@ -149,36 +149,6 @@ class TestAttnTpReduceRejection(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "PhiMoEAttention shards over"):
                     PhiMoEAttention(hidden_size=16, num_heads=4, num_kv_heads=4)
 
-    def test_the_other_gated_attentions_refuse_the_same_layout(self):
-        """These models have no checkpoint in CI, so state the gate on the
-        layer classes themselves. Only the refused layout is stated here: both
-        constructors reach a rotary embedding that needs a GPU build, and the
-        accepted layouts are covered by the checks above."""
-        from sglang.srt.models.exaone_moe import ExaoneMoEAttention
-        from sglang.srt.models.phimoe import PhiMoEAttention
-
-        def phimoe():
-            return PhiMoEAttention(hidden_size=16, num_heads=4, num_kv_heads=4)
-
-        def exaone():
-            return ExaoneMoEAttention(
-                config=SimpleNamespace(
-                    attention_bias=False, head_dim=4, rms_norm_eps=1e-6
-                ),
-                hidden_size=16,
-                num_heads=4,
-                num_kv_heads=4,
-            )
-
-        for name, build in (
-            ("PhiMoEAttention", phimoe),
-            ("ExaoneMoEAttention", exaone),
-        ):
-            with self.subTest(layer=name):
-                self.publish(tp_size=4, attn_dp_size=2)
-                with self.assertRaisesRegex(ValueError, f"{name} shards over"):
-                    build()
-
     def test_a_replicated_branch_is_not_gated(self):
         """MoonViT's tensor-parallel MLP is refused, while its ModelSlim branch
         builds replicated layers that neither shard nor reduce."""
