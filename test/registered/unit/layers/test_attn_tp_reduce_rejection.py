@@ -79,6 +79,66 @@ class TestAttnTpReduceRejection(CustomTestCase):
         self.publish(tp_size=4, attn_cp_size=2)
         Qwen3_VisionMLP(16, 32, bias=False, hidden_act="relu", use_data_parallel=True)
 
+    def test_a_language_only_instance_builds_its_tower_without_running_it(self):
+        """A language-only or language-model-only instance constructs its
+        multimodal tower but forwards it on the encoder instance instead, so
+        the layout it serves must not be refused."""
+        from sglang.srt.models.clip import CLIPAttention
+
+        config = SimpleNamespace(
+            hidden_size=16, num_attention_heads=4, attention_dropout=0.0
+        )
+        self.publish(tp_size=4, attn_dp_size=2)
+        with self.assertRaisesRegex(ValueError, "CLIPAttention shards over"):
+            CLIPAttention(config)
+        for role in ("language_only", "language_model_only"):
+            with self.subTest(role=role):
+                self.publish(tp_size=4, attn_dp_size=2, **{role: True})
+                CLIPAttention(config)
+
+    def test_the_other_gated_attentions_refuse_the_same_layout(self):
+        """These models have no checkpoint in CI, so state the gate on the
+        layer classes themselves. Only PhiMoE builds from a stub config, so it
+        carries the accepted-layout half."""
+        from sglang.srt.models.exaone_moe import ExaoneMoEAttention
+        from sglang.srt.models.phimoe import PhiMoEAttention
+
+        def phimoe():
+            return PhiMoEAttention(hidden_size=16, num_heads=4, num_kv_heads=4)
+
+        def exaone():
+            return ExaoneMoEAttention(
+                config=SimpleNamespace(
+                    attention_bias=False, head_dim=4, rms_norm_eps=1e-6
+                ),
+                hidden_size=16,
+                num_heads=4,
+                num_kv_heads=4,
+            )
+
+        for name, build in (
+            ("PhiMoEAttention", phimoe),
+            ("ExaoneMoEAttention", exaone),
+        ):
+            with self.subTest(layer=name):
+                self.publish(tp_size=4, attn_dp_size=2)
+                with self.assertRaisesRegex(ValueError, f"{name} shards over"):
+                    build()
+
+        self.publish(tp_size=4)
+        phimoe()
+
+    def test_a_replicated_branch_is_not_gated(self):
+        """MoonViT's tensor-parallel MLP is refused, while its ModelSlim branch
+        builds replicated layers that neither shard nor reduce."""
+        from sglang.srt.models.kimi_vl_moonvit import MLP2
+
+        self.publish(tp_size=4, attn_dp_size=2)
+        with self.assertRaisesRegex(ValueError, "MLP2 shards over"):
+            MLP2(dims=[16, 32, 16], activation=None, use_tensor_parallel=True)
+        # Without tensor parallelism the shard is one rank wide.
+        MLP2(dims=[16, 32, 16], activation=None)
+
 
 if __name__ == "__main__":
     unittest.main()

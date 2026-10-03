@@ -81,6 +81,55 @@ def test_a_full_expert_bind_collapses_ep_on_the_config(monkeypatch) -> None:
     assert layer.moe_runner_config.num_local_experts == 4
 
 
+def test_the_kernel_gets_the_bound_placement(monkeypatch) -> None:
+    """The reason the placement lives on the layer: after a full-expert bind
+    the kernel must be told this rank owns every expert."""
+    layer = _layer(monkeypatch)
+    before = _kernel_placement(monkeypatch, layer.moe_runner_config)
+    assert before == (2, 1, 2, 1)
+
+    layer.bind_full_expert_weights({})
+
+    # The layer kept its TP shard and now owns every expert.
+    assert _kernel_placement(monkeypatch, layer.moe_runner_config) == (2, 1, 1, 0)
+
+
+def _kernel_placement(monkeypatch, runner_config):
+    """Run the CUTLASS fused func against a fake kernel and report the
+    (tp_size, tp_rank, ep_size, ep_rank) it was handed."""
+    calls = []
+
+    def fake_kernel(**kwargs):
+        calls.append(kwargs)
+        return [kwargs["output"]]
+
+    monkeypatch.setattr(
+        flashinfer_cutlass,
+        "_flashinfer_cutlass_fused_moe",
+        lambda: (fake_kernel, None),
+    )
+    monkeypatch.setattr(flashinfer_cutlass, "_activation_type", lambda config: None)
+
+    hidden_states = torch.zeros(2, 4, dtype=torch.bfloat16)
+    flashinfer_cutlass._run_flashinfer_cutlass(
+        dispatch_output=SimpleNamespace(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            topk_output=SimpleNamespace(
+                topk_weights=torch.ones(2, 1),
+                topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+            ),
+        ),
+        quant_info=FlashInferCutlassMoeQuantInfo(
+            quant_type="bf16", w13_weight=torch.zeros(1), w2_weight=torch.zeros(1)
+        ),
+        runner_config=runner_config,
+        output=torch.empty_like(hidden_states),
+    )
+    (call,) = calls
+    return (call["tp_size"], call["tp_rank"], call["ep_size"], call["ep_rank"])
+
+
 def test_cutlass_passes_the_runner_config_placement(monkeypatch) -> None:
     calls = []
 
