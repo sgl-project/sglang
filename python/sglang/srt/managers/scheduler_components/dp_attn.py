@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
@@ -217,12 +216,18 @@ class MLPSyncBatchInfo:
                 op=torch.distributed.ReduceOp.SUM,
                 group=group,
             )
-            # Scalar sync so tick N+1's collective can't fire before Mooncake settles N.
-            global_info_tensor.sum().item()
+            # No scalar sync here: tick N+1's collective must not fire before
+            # Mooncake settles N, and the D2H copy below already blocks on this
+            # stream before this function returns.
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
-            all_gather_single(
+            # Mooncake refuses this while it digests a rank fault, and this gather is
+            # the first thing a tick does, so the refusal lands before anything has
+            # converged the view. Non-Mooncake backends re-raise unchanged.
+            from sglang.srt.elastic_ep.elastic_ep import mooncake_all_gather_settling
+
+            mooncake_all_gather_settling(
                 global_info_tensor.flatten(),
                 local_info_tensor,
                 group=group,

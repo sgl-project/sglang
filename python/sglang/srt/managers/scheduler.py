@@ -1437,6 +1437,13 @@ class Scheduler(
             self, watchdog_timeout=get_device().watchdog_timeout
         )
 
+        # A retiree's terminal park has to disarm the watchdog above, and only the
+        # scheduler holds what keeps it armed; see park_retired_rank.
+        if self.server_args.elastic_ep_backend is not None:
+            model_runner = getattr(self.tp_worker, "model_runner", None)
+            if model_runner is not None:
+                model_runner.elastic_park_hook = self.park_retired_rank
+
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=get_exec().features.enable_memory_saver
@@ -4939,6 +4946,27 @@ class Scheduler(
 
         return ElasticEPStateManager.get_scale_phase() in ("retiring", "reconfiguring")
 
+    def park_retired_rank(self) -> None:
+        """Terminal park for a retiree under ``elastic-ep-retiree-lifecycle external``.
+
+        Owned here because only the scheduler holds what keeps the watchdog armed. It
+        stays armed while ``cur_batch_for_debug`` is set, which it is whenever the last
+        tick ran a batch, and nothing advances ``forward_ct`` from here. Left armed, the
+        retiree SIGQUITs its parent after ``--watchdog-timeout`` -- on a single-node
+        shrink that parent is the primary's launcher, which takes the survivors down
+        with it unless the orchestrator terminated the retiree first.
+
+        Does not return: the groups this rank was serving on are already destroyed.
+        """
+        self.cur_batch_for_debug = None
+        self.is_initializing = False
+        logger.info(
+            "[Elastic EP][retire] parked with the watchdog disarmed; "
+            "awaiting external termination"
+        )
+        while True:
+            time.sleep(5.0)
+
     def tick_elastic_scale(self):
         """Advance the shrink FSM ahead of this tick's control-plane broadcast.
 
@@ -4948,7 +4976,13 @@ class Scheduler(
             return
         model_runner = self.tp_worker.model_runner
         # Passed as a callable, not a value: only a retiree in DRAIN consults it.
-        model_runner.maybe_retire_ep_ranks(is_idle=self.is_fully_idle)
+        # Idle batches are excluded: a retiree holds none of their work, and counting
+        # them means a drained retiree never reports idle while the cohort serves.
+        model_runner.maybe_retire_ep_ranks(
+            is_idle=lambda: self.is_fully_idle(ignore_idle_batches=True)
+        )
+        # Here, not in the shrink finalize: that can run at the tail of forward().
+        model_runner.maybe_recapture_elastic_graphs()
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
         # forward_pass_id counts entries, not returns, but this tick shares the event
@@ -5053,7 +5087,24 @@ class Scheduler(
         else:
             self.metrics_reporter.record_scheduler_active()
 
-    def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
+    def _pending_results(self, ignore_idle_batches: bool) -> int:
+        """Results still to process. Optionally excluding the request-free ones.
+
+        A departing rank under dp-attention is pulled into an idle-batch forward on
+        every iteration any survivor holds tokens, and that batch lands here. It
+        carries no request, so counting it keeps a fully drained retiree from ever
+        reporting idle.
+        """
+        if not ignore_idle_batches:
+            return len(self.result_queue)
+        return sum(1 for batch, _ in self.result_queue if not batch.is_empty())
+
+    def is_fully_idle(
+        self,
+        for_health_check=False,
+        ignore_waiting=False,
+        ignore_idle_batches=False,
+    ) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -5065,7 +5116,10 @@ class Scheduler(
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
-            and (not self.enable_overlap or len(self.result_queue) == 0)
+            and (
+                not self.enable_overlap
+                or self._pending_results(ignore_idle_batches) == 0
+            )
             and self._pp_microbatches_drained()
         )
 
@@ -5653,6 +5707,26 @@ class Scheduler(
                 new_ep_size=new_ep_size,
             )
         if ElasticEPStateManager.is_scaling():
+            # A fault inside the current width reaches here too, and it is not a scale
+            # anyone is driving: say so, because the caller's next move differs. Every
+            # rendezvous from here sizes itself from the width, which a bare fault does
+            # not lower, so admitting the resize would park the cohort on a participant
+            # that cannot arrive. Refuse instead, and name the ranks to recover first.
+            faulted = ElasticEPStateManager.get_inactive_ranks()
+            if faulted:
+                return ScaleElasticEPReqOutput(
+                    success=False,
+                    message=(
+                        f"Ranks {list(faulted)} are inactive at the current width "
+                        f"({old_ep_size}), so no resize can be admitted: its barriers "
+                        "would wait on a rank that cannot arrive. Recover those ranks "
+                        "first, or recreate the deployment."
+                    ),
+                    old_ep_size=old_ep_size,
+                    new_ep_size=new_ep_size,
+                    pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
+                    scale_phase=ElasticEPStateManager.get_scale_phase(),
+                )
             return ScaleElasticEPReqOutput(
                 success=False,
                 message=(
@@ -5664,6 +5738,16 @@ class Scheduler(
                 pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
             )
+
+        if new_ep_size < old_ep_size:
+            # Deferred from init so a fault-tolerance-only deployment, which never
+            # retires a rank, is not held to a mooncake it does not need.
+            from sglang.srt.elastic_ep.elastic_ep import assert_shrink_supported
+
+            try:
+                assert_shrink_supported()
+            except RuntimeError as exc:
+                return _reject(str(exc))
 
         # Grow-only: recover-mode (retired slot) vs scale-mode (append); no mixing.
         pending_recover_ranks: List[int] = []

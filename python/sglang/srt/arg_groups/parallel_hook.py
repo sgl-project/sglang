@@ -479,18 +479,38 @@ def handle_elastic_ep(server_args: Any):
                 "_handle_elastic_ep",
                 mooncake_ib_device=validate_ib_devices(cfg.mooncake_ib_device),
             )
-            # Reject raw-NCCL fast paths that bypass active_ranks.
-            if envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.get():
-                raise ValueError(
-                    "SGLANG_SYNC_TOKEN_IDS_ACROSS_TP + mooncake bypasses active_ranks."
-                )
-            if cfg.enable_symm_mem:
-                raise ValueError("--enable-symm-mem + mooncake bypasses active_ranks.")
-            # shm broadcaster deadlocks on retiree exit (fixed-size, no remove_reader).
-            if envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get():
-                envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.set(False)
+            # Only for a deployment that opted into runtime width changes. A
+            # fault-tolerance-only deployment leaves --max-ep-size unset (it defaults
+            # to the launch width) and never retires a rank, so it must keep booting
+            # on configurations that only a scale would break.
+            scalable = cfg.max_ep_size is not None
+            # Raw-NCCL fast paths that bypass active_ranks.
+            for name, enabled in (
+                (
+                    "SGLANG_SYNC_TOKEN_IDS_ACROSS_TP",
+                    envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.get(),
+                ),
+                ("--enable-symm-mem", cfg.enable_symm_mem),
+            ):
+                if not enabled:
+                    continue
+                message = f"{name} + mooncake bypasses active_ranks."
+                if scalable:
+                    raise ValueError(message)
                 logger.warning(
-                    "[Elastic EP] mooncake: force SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=False"
+                    "[Elastic EP] %s Tolerated: --max-ep-size is unset, "
+                    "so this deployment does not change width.",
+                    message,
+                )
+            # The shm broadcaster deadlocks on a retiree's exit (fixed-size, no
+            # remove_reader), and only a scale retires a rank. Not disabled by writing
+            # the env var here: a resolution hook declares values, and a process-global
+            # write leaks into the caller under Engine. parallel_state resolves it at
+            # group construction instead; see _use_message_queue_broadcaster.
+            if scalable and envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get():
+                logger.warning(
+                    "[Elastic EP] mooncake: the shm message-queue broadcaster is "
+                    "bypassed for the TP-family groups while --max-ep-size is set."
                 )
     if cfg.ep_join_mode is not None:
         assert cfg.elastic_ep_backend is not None, (
