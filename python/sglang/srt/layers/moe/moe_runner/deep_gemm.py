@@ -173,6 +173,60 @@ def _cake_activation_scale_ok(src: torch.Tensor, m: int, k_groups: int) -> bool:
     return src.dtype == torch.int32 and 4 * int(src.shape[1]) >= k_groups
 
 
+
+def _cake_debug_sync(stage: str) -> None:
+    """``SGLANG_CAKE_DEBUG``: synchronize after ``stage`` (outside graph capture) and log the outcome."""
+    if torch.cuda.is_current_stream_capturing():
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception as exc:  # noqa: BLE001 - diagnostics must name the failing stage
+        logger.error("Cake %s debug: stage %s FAILED: %r", _CAKE_ROUTE, stage, exc)
+        raise
+    logger.info("Cake %s debug: stage %s ok", _CAKE_ROUTE, stage)
+
+
+def _cake_debug_tensor(name: str, t: Optional[torch.Tensor]) -> str:
+    if t is None:
+        return f"{name}=None"
+    return (
+        f"{name}=shape{tuple(t.shape)}/{str(t.dtype).replace('torch.', '')}"
+        f"/stride{tuple(t.stride())}/ptr%16={t.data_ptr() % 16}"
+    )
+
+
+def _cake_debug_describe(req: _CakeContigRequest, plan: _CakeContigPlan) -> None:
+    """``SGLANG_CAKE_DEBUG``: one-time summary of the dispatcher inputs and the staged Cake buffers."""
+    b = plan.buffers
+    mi = b["m_indices"]
+    raw = req.m_indices
+    parts = [
+        _cake_debug_tensor("hidden_states", req.hidden_states),
+        _cake_debug_tensor("hidden_states_scale", req.hidden_states_scale),
+        _cake_debug_tensor("m_indices", raw),
+        _cake_debug_tensor("w13_weight", req.w13_weight),
+        _cake_debug_tensor("w13_scale", req.w13_scale),
+        _cake_debug_tensor("w2_weight", req.w2_weight),
+        _cake_debug_tensor("w2_scale", req.w2_scale),
+        f"layout_alignment={req.layout_alignment} swiglu_limit={req.swiglu_limit}",
+        f"m_indices_raw[min={int(raw.min())} max={int(raw.max())} neg={int((raw < 0).sum())}]",
+        f"m_indices_staged[min={int(mi.min())} max={int(mi.max())} "
+        f"nondecreasing={bool((mi[1:] >= mi[:-1]).all())} groups={int(req.w13_weight.shape[0])}]",
+    ]
+    for name in ("a_scale",):
+        t = b[name].float()
+        parts.append(
+            f"{name}[finite={bool(torch.isfinite(t).all())} min={t.min().item():.3g} max={t.max().item():.3g}]"
+        )
+    for name, runner in (("gateup", plan.gateup_runner), ("down", plan.down_runner)):
+        parts.append(
+            f"{name}_runner[route={getattr(runner, 'route', None)} grid={getattr(runner, 'grid', None)} "
+            f"module={getattr(runner, 'module_name', None)}]"
+        )
+    parts.append(" ".join(_cake_debug_tensor(k, v) for k, v in b.items()))
+    logger.info("Cake %s debug: fused=%s %s", _CAKE_ROUTE, plan.fused, " ".join(parts))
+
+
 _cake_weight_scale_cache: Dict[Tuple[int, Tuple[int, ...]], torch.Tensor] = {}
 
 
@@ -242,6 +296,7 @@ class _CakeContigPlan:
     gateup_runner: Any
     down_runner: Any
     swiglu_limit: Optional[float]
+    debug_described: bool = False
 
 
 class _CakeContigFp8Route:
@@ -492,6 +547,7 @@ class _CakeContigFp8Route:
         allocate_output: Callable[[], torch.Tensor],
     ) -> torch.Tensor:
         buffers = plan.buffers
+        debug = envs.SGLANG_CAKE_DEBUG.get()
         buffers["a"].copy_(req.hidden_states)
         _cake_fill_activation_scale(buffers["a_scale"], req.hidden_states_scale)
         # ep_scatter marks alignment-padding rows with -1, which FlashInfer
@@ -499,12 +555,21 @@ class _CakeContigFp8Route:
         # dropped by post-permute, exactly as DeepGEMM's skipped tiles are).
         filled, _ = torch.cummax(req.m_indices, 0)
         torch.clamp(filled, min=0, out=buffers["m_indices"])
+        if debug:
+            _cake_debug_sync("inputs_staged")
+            if not plan.debug_described:
+                plan.debug_described = True
+                _cake_debug_describe(req, plan)
         if plan.fused:
             plan.gateup_runner.launch()
+            if debug:
+                _cake_debug_sync("gateup_fused_silu_quant")
         else:
             from sglang.kernels.ops.moe.dsv4 import silu_and_mul_contig_post_quant
 
             plan.gateup_runner.launch()
+            if debug:
+                _cake_debug_sync("gateup")
             silu_and_mul_contig_post_quant(
                 input=buffers["gateup"],
                 output=buffers["act"],
@@ -515,7 +580,11 @@ class _CakeContigFp8Route:
                 swiglu_limit=plan.swiglu_limit,
                 swizzle=False,
             )
+            if debug:
+                _cake_debug_sync("silu_quant")
         plan.down_runner.launch()
+        if debug:
+            _cake_debug_sync("down")
         out = allocate_output()
         out.copy_(buffers["down_out"])
         return out
