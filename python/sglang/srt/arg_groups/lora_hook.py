@@ -192,10 +192,10 @@ def check_lora_moe_runner_args(server_args: Any):
             f"--moe-runner-backend {backend} requires --enable-lora (or --lora-paths)"
         )
     # Layer attachment checks the specific weight layout within each scheme.
-    if cfg.quantization is not None:
+    if cfg.quantization not in (None, "fp8"):
         raise ValueError(
-            f"--moe-runner-backend {backend} supports unquantized BF16 "
-            f"MoE, got --quantization {cfg.quantization}"
+            f"--moe-runner-backend {backend} supports unquantized BF16 and 128-block "
+            f"FP8 MoE, got --quantization {cfg.quantization}"
         )
     if cfg.moe_a2a_backend != "none":
         raise ValueError(
