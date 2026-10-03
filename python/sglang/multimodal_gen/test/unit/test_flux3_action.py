@@ -612,6 +612,43 @@ def test_dit_cached_streams_match_full_forward():
     assert full["x_act_cond"].shape == (1, 1, 3)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA graphs")
+def test_cuda_graph_replays_match_eager_denoise_steps():
+    """Replays with fresh inputs must match eager steps bit for bit."""
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        set_forward_context,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
+    from sglang.multimodal_gen.runtime.vla.cuda_graph import VLATensorGraphRunner
+
+    _init_single_process_parallel()
+    torch.manual_seed(0)
+    model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch())).cuda().bfloat16()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.05)
+    _, ids = pack_video(torch.zeros(1, 96, 2, 2, 3), first_frame=1, fps=15.0)
+    rope = model.rope(ids.cuda())
+
+    def step(x, t, rope):
+        state = model.encode_stream(name="video", x=x, ids=None, timesteps=t, rope=rope)
+        return (state.hidden,)
+
+    runner = VLATensorGraphRunner("test", enabled=True, max_entries=2)
+    with torch.no_grad(), set_forward_context(current_timestep=0, attn_metadata=None):
+        for seed, t in ((1, 0.7), (2, 0.3)):
+            torch.manual_seed(seed)
+            inputs = (
+                torch.randn(1, 12, 96, device="cuda", dtype=torch.bfloat16),
+                torch.full((1,), t, device="cuda"),
+                rope,
+            )
+            (eager,) = step(*inputs)
+            (graph,) = runner.run(step, inputs)
+            assert torch.equal(graph, eager)
+    info = runner.cache_info()
+    assert (info.captures, info.hits, info.failures) == (1, 1, 0)
+
+
 @pytest.mark.parametrize("fnuz", [False, True])
 @pytest.mark.parametrize("tuple_output", [False, True])
 def test_fp8r_native_format_preserves_values(monkeypatch, fnuz, tuple_output):
