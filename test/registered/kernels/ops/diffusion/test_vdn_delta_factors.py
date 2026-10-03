@@ -55,7 +55,7 @@ def _fp64(A, B, alpha):
 @pytest.mark.parametrize("beta_scale", [1.0, 50.0])
 def test_matches_eager_and_fp64(frames, heads, tokens, beta_scale):
     A, B, alpha = _inputs(frames, heads, tokens, beta_scale)
-    assert can_use_vdn_delta_factors(A, B, alpha)
+    assert can_use_vdn_delta_factors(A.device, A.dtype, A.shape[-1])
     t_ref, j_ref = _fp64(A, B, alpha)
     t_eager, j_eager = vdn.delta_factor_apply(
         "vdn_solve", alpha, A, B, tokens_per_frame=tokens
@@ -110,24 +110,30 @@ def test_storage_offset_input_matches_aligned(which):
     ref = vdn_delta_factors(A, B, alpha)
     inputs = {"A": A, "B": B, "alpha": alpha}
     inputs[which] = _storage_offset_copy(inputs[which])
-    assert can_use_vdn_delta_factors(inputs["A"], inputs["B"], inputs["alpha"])
+    assert can_use_vdn_delta_factors(A.device, A.dtype, A.shape[-1])
     out = vdn_delta_factors(inputs["A"], inputs["B"], inputs["alpha"])
     for got, want in zip(out, ref):
         assert torch.equal(got, want)
 
 
-def test_can_use_rejects_unsupported():
-    A, B, alpha = _inputs(2, 2, 32)
-    assert can_use_vdn_delta_factors(A, B, alpha)
-    assert not can_use_vdn_delta_factors(
-        A[..., :64, :64].contiguous(),
-        B[..., :64, :64].contiguous(),
-        alpha[..., :64].contiguous(),
-    )
-    assert not can_use_vdn_delta_factors(A.bfloat16(), B, alpha)
-    assert not can_use_vdn_delta_factors(A.transpose(-1, -2), B, alpha)
-    assert not can_use_vdn_delta_factors(A, B, alpha[..., :1].expand_as(alpha))
-    assert not can_use_vdn_delta_factors(A.cpu(), B.cpu(), alpha.cpu())
+def test_launcher_rejects_invalid_inputs():
+    A, B, alpha = _inputs(2, 3, 32)
+    invalid = [
+        (
+            A[..., :64, :64].contiguous(),
+            B[..., :64, :64].contiguous(),
+            alpha[..., :64].contiguous(),
+        ),
+        (A.bfloat16(), B, alpha),
+        (A.transpose(-1, -2), B, alpha),
+        (A, B, alpha[..., :1].expand_as(alpha)),
+        (A.cpu(), B.cpu(), alpha.cpu()),
+        (A, B.view(3, 2, 128, 128), alpha),
+        (A, B, alpha.view(3, 2, 128)),
+    ]
+    for tensors in invalid:
+        with pytest.raises(RuntimeError):
+            vdn_delta_factors(*tensors)
 
 
 if __name__ == "__main__":

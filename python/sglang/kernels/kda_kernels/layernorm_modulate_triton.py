@@ -407,28 +407,38 @@ def _mod_row_stride(t: torch.Tensor, batch: int, hidden: int) -> int | None:
     return t.stride(0) if batch > 1 else hidden
 
 
-def can_use_fused_layernorm_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None
-) -> bool:
+def can_use_fused_layernorm_modulate(dtype: torch.dtype, hidden: int) -> bool:
+    """Select the BF16 vectorized LayerNorm reduction replicated below."""
+    return (
+        is_cuda() and dtype is torch.bfloat16 and 0 < hidden <= 8192 and hidden % 4 == 0
+    )
+
+
+def _validate_layernorm_modulate(x, scale, shift) -> int:
     if not (
         _is_bf16_cuda(x)
-        and x.dim() == 3
+        and x.ndim == 3
         and x.numel() > 0
         and x.is_contiguous()
-        and x.shape[-1] % 4 == 0
-        and x.shape[-1] <= 8192
-        and _is_bf16_cuda(scale)
-        and scale.device == x.device
+        and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
-        return False
+        raise RuntimeError(
+            "LayerNorm modulation expects contiguous BF16 CUDA [B, S, D], D divisible by 4 and <= 8192"
+        )
     batch, _, hidden = x.shape
-    q = _mod_row_stride(scale, batch, hidden)
-    if shift is None:
-        return q is not None
-    if not _is_bf16_cuda(shift) or shift.device != x.device:
-        return False
-    v = _mod_row_stride(shift, batch, hidden)
-    return q is not None and v is not None and q == v
+    stride = _mod_row_stride(scale, batch, hidden)
+    if stride is None:
+        raise RuntimeError("scale must have packed [B, D] rows")
+    for name, tensor in (("scale", scale), ("shift", shift)):
+        if tensor is not None and not (
+            tensor.dtype == x.dtype
+            and tensor.device == x.device
+            and _mod_row_stride(tensor, batch, hidden) == stride
+        ):
+            raise RuntimeError(
+                f"{name} must match scale's row layout and x's dtype/device"
+            )
+    return stride
 
 
 def _fake_ln_modulate(
@@ -510,11 +520,11 @@ def fused_layernorm_modulate_raw(
     of microseconds per call); use it on CPU-launch-bound eager hot paths
     (e.g. Sana), and the registered custom op under ``torch.compile``.
     """
+    stride = _validate_layernorm_modulate(x, scale, shift)
     batch, seq_len, hidden = x.shape
     n_rows = batch * seq_len
     rows = 2
     out = torch.empty_like(x)
-    stride = _mod_row_stride(scale, batch, hidden)
     with torch.cuda.device(x.device):
         _layernorm_modulate_kernel[(triton.cdiv(n_rows, rows),)](
             out,
@@ -558,11 +568,11 @@ def fused_layernorm_modulate_fp8_quant_raw(
     Unlike that two-op chain, this path does not materialize the intermediate
     BF16 activation because FLUX.2 feeds it directly into an FP8 projection.
     """
+    stride = _validate_layernorm_modulate(x, scale, shift)
     batch, seq_len, hidden = x.shape
     n_rows = batch * seq_len
     rows = 2
     out = torch.empty_like(x, dtype=fp8_dtype)
-    stride = _mod_row_stride(scale, batch, hidden)
     with torch.cuda.device(x.device):
         _layernorm_modulate_kernel[(triton.cdiv(n_rows, rows),)](
             out,
@@ -595,19 +605,13 @@ fused_layernorm_modulate = register_custom_op(
 )
 
 
-def can_use_fused_qk_head_layernorm(q: torch.Tensor, k: torch.Tensor) -> bool:
-    head_dim = q.shape[-1] if q.dim() == 4 else 0
+def can_use_fused_qk_head_layernorm(dtype: torch.dtype, head_dim: int) -> bool:
+    """Select the BF16 per-head LayerNorm reduction."""
     return (
-        _is_bf16_cuda(q)
-        and _is_bf16_cuda(k)
-        and q.device == k.device
-        and q.dim() == 4
-        and q.shape == k.shape
-        and head_dim % 4 == 0
+        is_cuda()
+        and dtype is torch.bfloat16
         and 0 < head_dim <= 128
-        and q.numel() > 0
-        and q.is_contiguous()
-        and k.is_contiguous()
+        and head_dim % 4 == 0
     )
 
 
@@ -627,6 +631,20 @@ def fused_qk_head_layernorm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-head ``nn.LayerNorm(dim_head)`` (no affine) over q and k in one
     launch, bit-exact vs the eager aten kernel."""
+    if not (
+        _is_bf16_cuda(q)
+        and q.ndim == 4
+        and q.numel() > 0
+        and can_use_fused_qk_head_layernorm(q.dtype, q.shape[-1])
+        and k.dtype == q.dtype
+        and k.device == q.device
+        and k.shape == q.shape
+        and q.is_contiguous()
+        and k.is_contiguous()
+    ):
+        raise RuntimeError(
+            "QK LayerNorm expects matching contiguous BF16 CUDA [B, S, H, D], D divisible by 4 and <= 128"
+        )
     head_dim = q.shape[-1]
     n_rows = q.numel() // head_dim
     # Architecture sweeps at the production GLM shape select 32 rows / 1 warp

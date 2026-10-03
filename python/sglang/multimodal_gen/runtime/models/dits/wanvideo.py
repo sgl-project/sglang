@@ -11,7 +11,6 @@ import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_temb_table_slices,
     can_use_linear_gelu,
     fused_gelu_active,
     fused_linear_gelu_tanh,
@@ -410,7 +409,7 @@ def _wan_temb_table_slices(
     verified = _WAN_TEMB_SLICES.verified
     if (
         not _WAN_TEMB_SLICES.disabled
-        and can_use_fused_temb_table_slices(table, temb)
+        and _is_cuda
         and (verified or _WAN_TEMB_SLICES.can_attempt_once())
     ):
         try:

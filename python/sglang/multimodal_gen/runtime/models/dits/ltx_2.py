@@ -12,9 +12,9 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    can_use_fused_rmsnorm_scale_shift,
     can_use_linear_gelu,
     can_use_ltx2_qknorm_split_rope_cuda,
-    can_use_ltx2_rms_norm_modulate,
     can_use_modulate_scale_shift_cuda,
     fused_gelu_active,
     fused_linear_gelu_tanh,
@@ -208,8 +208,8 @@ def _ltx2_rms_norm_modulate(
     default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
     on the request-scoped mount rather than a runtime self-check.
     """
-    if ltx2_rms_norm_modulate_active(block) and can_use_ltx2_rms_norm_modulate(
-        x, scale, shift
+    if ltx2_rms_norm_modulate_active(block) and can_use_fused_rmsnorm_scale_shift(
+        x.dtype, x.shape[-1]
     ):
         return fused_ltx2_rms_norm_modulate(x, scale, shift, eps)
     normed = rms_norm(x, eps)

@@ -5,7 +5,6 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.diffusion import (
-    can_use_ltx25_decoder_rope,
     fused_ltx25_decoder_rope,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -91,23 +90,38 @@ def test_ltx25_decoder_rope_is_bit_exact(
     assert k_out.data_ptr() not in (q.data_ptr(), k.data_ptr())
 
 
-def test_ltx25_decoder_rope_predicate_rejects_unsupported_inputs() -> None:
+def test_ltx25_decoder_rope_launcher_rejects_invalid_inputs() -> None:
     q = torch.empty(1, 3, 7, 7, 1, 64, dtype=torch.bfloat16, device="cuda")
     k = torch.empty_like(q)
     tables = make_tables(3, 7, 7)
 
-    assert can_use_ltx25_decoder_rope(q, k, tables, DIM_SPLIT)
-    assert not can_use_ltx25_decoder_rope(q.flatten(), k, tables, DIM_SPLIT)
-    assert not can_use_ltx25_decoder_rope(q.float(), k, tables, DIM_SPLIT)
-    assert not can_use_ltx25_decoder_rope(q, k[..., ::2], tables, DIM_SPLIT)
-    assert not can_use_ltx25_decoder_rope(q, k, tables, (16, 16, 16))
+    with pytest.raises(RuntimeError):
+        fused_ltx25_decoder_rope(
+            q.flatten(), k, *tables[0], *tables[1], *tables[2], *DIM_SPLIT[:2]
+        )
+    with pytest.raises(RuntimeError):
+        fused_ltx25_decoder_rope(
+            q.float(), k, *tables[0], *tables[1], *tables[2], *DIM_SPLIT[:2]
+        )
+    with pytest.raises(RuntimeError):
+        fused_ltx25_decoder_rope(
+            q, k[..., ::2], *tables[0], *tables[1], *tables[2], *DIM_SPLIT[:2]
+        )
+    with pytest.raises(RuntimeError):
+        fused_ltx25_decoder_rope(q, k, *tables[0], *tables[1], *tables[2], 16, 16)
     bad_tables = (tables[0], tables[1], (tables[2][0].double(), tables[2][1]))
-    assert not can_use_ltx25_decoder_rope(q, k, bad_tables, DIM_SPLIT)
+    with pytest.raises(RuntimeError):
+        fused_ltx25_decoder_rope(
+            q, k, *bad_tables[0], *bad_tables[1], *bad_tables[2], *DIM_SPLIT[:2]
+        )
     unaligned = torch.empty(q.numel() + 1, dtype=torch.bfloat16, device="cuda")[
         1:
     ].view_as(q)
     assert unaligned.is_contiguous()
-    assert not can_use_ltx25_decoder_rope(unaligned, k, tables, DIM_SPLIT)
+    with pytest.raises(RuntimeError):
+        fused_ltx25_decoder_rope(
+            unaligned, k, *tables[0], *tables[1], *tables[2], *DIM_SPLIT[:2]
+        )
 
 
 if __name__ == "__main__":

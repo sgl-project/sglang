@@ -134,7 +134,9 @@ def _qwen_norm_out(
     if (
         _QWEN_NORM_OUT.disabled
         or not is_plain_layer_norm(norm_out.norm, hidden_states.shape[-1])
-        or not can_use_fused_layernorm_modulate(hidden_states, scale, shift)
+        or not can_use_fused_layernorm_modulate(
+            hidden_states.dtype, hidden_states.shape[-1]
+        )
     ):
         return (
             norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]

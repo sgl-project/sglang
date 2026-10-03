@@ -251,14 +251,9 @@ def test_bitexact_norm_guards_follow_platform():
     # platform decides: engaged on CUDA, rejected on ROCm.  A fatal LLVM error
     # there kills the process, so the sites' own try/except cannot be what
     # catches it -- the guards have to.
-    x = torch.randn(1, 256, 4096, device="cuda", dtype=torch.bfloat16)
-    row = torch.randn(1, 4096, device="cuda", dtype=torch.bfloat16)
-    vec = torch.randn(1, 1, 4096, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(4096, device="cuda", dtype=torch.bfloat16)
-    q = torch.randn(1, 256, 32, 128, device="cuda", dtype=torch.bfloat16)
-    assert can_use_fused_layernorm_modulate(x, row, row) is is_cuda()
-    assert can_use_fused_qk_head_layernorm(q, q) is is_cuda()
-    assert can_use_fused_rmsnorm_scale_shift(x, weight, vec, vec) is is_cuda()
+    assert can_use_fused_layernorm_modulate(torch.bfloat16, 4096) is is_cuda()
+    assert can_use_fused_qk_head_layernorm(torch.bfloat16, 128) is is_cuda()
+    assert can_use_fused_rmsnorm_scale_shift(torch.bfloat16, 4096) is is_cuda()
 
 
 # -------------------------------------------------------------------------

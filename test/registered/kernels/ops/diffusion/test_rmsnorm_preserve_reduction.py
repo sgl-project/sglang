@@ -5,7 +5,6 @@ import pytest
 import torch
 
 from sglang.kernels.ops.diffusion import (
-    can_use_rmsnorm_preserve_reduction,
     rmsnorm_preserve_reduction,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -31,7 +30,7 @@ def test_preserves_native_reduction_and_rounding(dtype, shape, scale, eps):
     torch.manual_seed(42)
     x = (torch.randn(shape, device="cuda") * scale).to(dtype)
     weight = torch.randn(shape[-1], device="cuda", dtype=dtype)
-    assert can_use_rmsnorm_preserve_reduction(x, weight)
+
     actual = rmsnorm_preserve_reduction(x, weight, eps)
     torch.testing.assert_close(actual, reference(x, weight, eps), atol=0, rtol=0)
 
@@ -39,19 +38,42 @@ def test_preserves_native_reduction_and_rounding(dtype, shape, scale, eps):
 def test_layout_guards_and_offset():
     x = torch.randn(259, 128, device="cuda", dtype=torch.bfloat16)[2:]
     weight = torch.randn(128, device="cuda", dtype=x.dtype)
-    assert can_use_rmsnorm_preserve_reduction(x, weight)
+
     torch.testing.assert_close(
         rmsnorm_preserve_reduction(x, weight, 1e-6),
         reference(x, weight, 1e-6),
         atol=0,
         rtol=0,
     )
-    assert not can_use_rmsnorm_preserve_reduction(x.cpu(), weight.cpu())
-    assert not can_use_rmsnorm_preserve_reduction(x.float(), weight.float())
-    assert not can_use_rmsnorm_preserve_reduction(x[:, ::2], weight[::2])
-    assert not can_use_rmsnorm_preserve_reduction(x, weight.float())
-    assert not can_use_rmsnorm_preserve_reduction(x, weight[:-1])
-    assert not can_use_rmsnorm_preserve_reduction(x[:0], weight)
+    with pytest.raises(RuntimeError):
+        rmsnorm_preserve_reduction(x.cpu(), weight.cpu(), 1e-6)
+    with pytest.raises(RuntimeError):
+        rmsnorm_preserve_reduction(x.float(), weight.float(), 1e-6)
+    with pytest.raises(RuntimeError):
+        rmsnorm_preserve_reduction(x[:, ::2], weight[::2], 1e-6)
+    with pytest.raises(RuntimeError):
+        rmsnorm_preserve_reduction(x, weight.float(), 1e-6)
+    with pytest.raises(RuntimeError):
+        rmsnorm_preserve_reduction(x, weight[:-1], 1e-6)
+    with pytest.raises(RuntimeError):
+        rmsnorm_preserve_reduction(x[:0], weight, 1e-6)
+
+
+def test_packed_projection_view():
+    packed = torch.randn(2, 17, 3, 4, 128, device="cuda", dtype=torch.bfloat16)
+    x = packed.unbind(2)[0]
+    weight = torch.randn(128, device=x.device, dtype=x.dtype)
+    actual = rmsnorm_preserve_reduction(x, weight, 1e-6)
+    assert torch.equal(actual, reference(x, weight, 1e-6))
+
+
+def test_compiled_transposed_input_has_contiguous_output():
+    x = torch.randn(17, 2, 128, device="cuda", dtype=torch.bfloat16).transpose(0, 1)
+    weight = torch.randn(128, device=x.device, dtype=x.dtype)
+    compiled = torch.compile(rmsnorm_preserve_reduction, fullgraph=True)
+    actual = compiled(x, weight, 1e-6)
+    assert torch.equal(actual, reference(x, weight, 1e-6))
+    assert actual.is_contiguous()
 
 
 def test_compile_and_graph_replay():

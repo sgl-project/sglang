@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.diffusion import can_use_joint_qkv_cat, joint_qkv_cat
+from sglang.kernels.ops.diffusion import joint_qkv_cat
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.runtime.models.dits import joy_image
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -46,7 +46,6 @@ class TestJointQKVCat(CustomTestCase):
                     for value in inputs:
                         value.view(torch.int16)[0, 0, 0, :8].copy_(bits)
                     before = tuple(x.clone() for x in inputs)
-                    self.assertTrue(can_use_joint_qkv_cat(*inputs))
                     out = joint_qkv_cat(*inputs)
                     self.assert_bits_equal(out, reference(inputs))
                     self.assert_bits_equal(
@@ -56,6 +55,12 @@ class TestJointQKVCat(CustomTestCase):
                     saved = tuple(x.clone() for x in out[1:])
                     out[0].zero_()
                     self.assert_bits_equal(out[1:], saved)
+
+    def test_launcher_rejects_mismatched_shapes(self):
+        inputs = list(make_inputs(2, 17, 3, 4, 32, torch.bfloat16))
+        inputs[1] = inputs[1].view(1, 34, 4, 32)
+        with self.assertRaises(RuntimeError):
+            joint_qkv_cat(*inputs)
 
     def test_changed_input_graph_replay(self):
         inputs = make_inputs(2, 2048, 13, 32, 128, torch.bfloat16)

@@ -99,10 +99,15 @@ Keep backend selection separate from input validation.
   numerical verification in `sites/` is a separate policy: retain its reference
   comparison when exactness depends on a library's reduction or rounding order.
 
-For example, Helios chooses the packed RoPE kernel for supported dtypes and
-contiguous, pair-aligned inputs. Its C++ launcher checks the Q/K and frequency
-shapes and common device. The same launcher accepts the model's batched tensors
-without flattening away their shape relationships.
+For example, Helios selects JIT CUDA RoPE on NVIDIA GPUs unless it uses TP
+RMSNorm. The launcher validates the original batched Q/K and frequencies,
+including shape relationships, dtype, device, layout and pair alignment.
+There is no Python `can_use_helios_qk_rope` scan before the call.
+
+A numerical specialization query should take configuration values, not a list
+of tensors. For example, `can_use_fused_rmsnorm_scale_shift(dtype, hidden)`
+selects BF16 with width 2048 or 4096 because those are the FlashInfer reduction
+trees the kernel reproduces. Its launcher validates weight, scale and shift.
 
 Existing `try_*` entry points return `None` for an unsupported specialization.
 Keep that convention explicit at their call sites; do not add it to direct

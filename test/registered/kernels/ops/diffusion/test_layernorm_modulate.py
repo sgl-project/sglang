@@ -35,7 +35,7 @@ def test_modulation_preserves_bits(shape, amplitude, eps, has_shift):
     scale[:, :3] = torch.tensor([-1, 0, 1], device=x.device, dtype=x.dtype)
     if not has_shift:
         shift = None
-    assert can_use_fused_layernorm_modulate(x, scale, shift)
+    assert can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     actual = fused_layernorm_modulate(x, scale, shift, eps)
     expected = reference(x, scale, shift, eps)
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
@@ -53,16 +53,24 @@ def test_scale_only_preserves_signed_zero():
 def test_scale_only_layout_guards():
     x = torch.randn(2, 17, 128, device="cuda", dtype=torch.bfloat16)
     scale = torch.randn(2, 128, device=x.device, dtype=x.dtype)
-    assert can_use_fused_layernorm_modulate(x, scale, None)
-    assert not can_use_fused_layernorm_modulate(x.cpu(), scale.cpu(), None)
-    assert not can_use_fused_layernorm_modulate(x.float(), scale.float(), None)
-    assert not can_use_fused_layernorm_modulate(x[:, ::2], scale, None)
-    assert not can_use_fused_layernorm_modulate(x, scale.float(), None)
-    assert not can_use_fused_layernorm_modulate(x, scale[:, :-1], None)
-    assert not can_use_fused_layernorm_modulate(x[:, :0], scale, None)
-    assert not can_use_fused_layernorm_modulate(x, scale, scale.float())
+    assert can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
+    with pytest.raises(RuntimeError):
+        fused_layernorm_modulate(x.cpu(), scale.cpu(), None, 1e-6)
+    with pytest.raises(RuntimeError):
+        fused_layernorm_modulate(x.float(), scale.float(), None, 1e-6)
+    with pytest.raises(RuntimeError):
+        fused_layernorm_modulate(x[:, ::2], scale, None, 1e-6)
+    with pytest.raises(RuntimeError):
+        fused_layernorm_modulate(x, scale.float(), None, 1e-6)
+    with pytest.raises(RuntimeError):
+        fused_layernorm_modulate(x, scale[:, :-1], None, 1e-6)
+    with pytest.raises(RuntimeError):
+        fused_layernorm_modulate(x[:, :0], scale, None, 1e-6)
+    with pytest.raises(RuntimeError):
+        fused_layernorm_modulate(x, scale, scale.float(), 1e-6)
     strided = torch.empty(2, 256, device=x.device, dtype=x.dtype)[:, :128]
-    assert not can_use_fused_layernorm_modulate(x, scale, strided)
+    with pytest.raises(RuntimeError):
+        fused_layernorm_modulate(x, scale, strided, 1e-6)
 
 
 @pytest.mark.parametrize("has_shift", [False, True])

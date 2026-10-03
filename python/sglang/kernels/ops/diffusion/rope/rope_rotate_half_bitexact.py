@@ -83,32 +83,6 @@ def _rope_rotate_half_kernel(
         tl.store(out_ptr + toff, tail, mask=tmask)
 
 
-def can_use_fused_rope_rotate_half(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> bool:
-    if x.dtype is not torch.bfloat16 or not x.is_cuda:
-        return False
-    if x.dim() != 4 or not x.is_contiguous():
-        return False
-    rows = x.shape[0] * x.shape[1]
-    rot = cos.shape[-1]
-    return (
-        cos.dtype is torch.bfloat16
-        and sin.dtype is torch.bfloat16
-        and cos.is_cuda
-        and cos.device == x.device
-        and sin.device == x.device
-        and cos.shape == (rows, rot)
-        and sin.shape == (rows, rot)
-        and cos.is_contiguous()
-        and sin.is_contiguous()
-        and rot % 2 == 0
-        and 0 < rot <= x.shape[-1]
-    )
-
-
 def _fake_rope_rotate_half(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -132,6 +106,25 @@ def fused_rope_rotate_half_bitexact(
     ``x`` is ``(B, S, H, D)``; ``cos``/``sin`` are ``(B * S, rot_dim)`` rows.
     Bit-exact vs the eager chunk/neg/cat/mul/add chain.
     """
+    if not (
+        x.is_cuda and x.dtype is torch.bfloat16 and x.ndim == 4 and x.is_contiguous()
+    ):
+        raise RuntimeError("rotate-half RoPE expects contiguous BF16 CUDA [B, S, H, D]")
+    if cos.ndim != 2:
+        raise RuntimeError("cos must have shape [B * S, rot_dim]")
+    rows, rot = x.shape[0] * x.shape[1], cos.shape[-1]
+    if not (0 < rot <= x.shape[-1] and rot % 2 == 0):
+        raise RuntimeError("rot_dim must be positive, even and no larger than head_dim")
+    for name, tensor in (("cos", cos), ("sin", sin)):
+        if not (
+            tensor.dtype == x.dtype
+            and tensor.device == x.device
+            and tensor.shape == (rows, rot)
+            and tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"{name} must be contiguous [B * S, rot_dim] with x's dtype/device"
+            )
     batch, seq_len, heads, head_dim = x.shape
     rot = cos.shape[-1]
     half = rot // 2

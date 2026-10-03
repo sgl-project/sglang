@@ -210,7 +210,7 @@ def _try_flux2_norm_modulate_fp8(
         _FLUX2_LN_FP8.disabled
         or x.shape[-1] != 6144
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
         return None
 
@@ -374,7 +374,7 @@ def _flux2_norm_modulate(
     if (
         _FLUX2_LN_MOD.disabled
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
         return norm(x) * (1 + scale) + shift
 

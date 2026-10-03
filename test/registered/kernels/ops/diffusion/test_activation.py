@@ -16,9 +16,6 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
-    can_use_fused_bias_glu,
-    can_use_fused_bias_silu,
-    can_use_fused_silu_mul,
     fused_bias_glu,
     fused_bias_silu,
     fused_packed_silu_mul_bitexact,
@@ -40,7 +37,6 @@ def test_sana_bias_silu_is_bit_exact(channels):
     ).to(memory_format=torch.channels_last)
     bias = torch.randn(channels, device="cuda", dtype=torch.bfloat16)
 
-    assert can_use_fused_bias_silu(x, bias)
     actual = fused_bias_silu(x, bias)
     expected = F.silu(x + bias[None, :, None, None])
 
@@ -58,7 +54,6 @@ def test_sana_bias_glu_is_bit_exact(channels):
     ).to(memory_format=torch.channels_last)
     bias = torch.randn(2 * channels, device="cuda", dtype=torch.bfloat16)
 
-    assert can_use_fused_bias_glu(x, bias)
     actual = fused_bias_glu(x, bias)
     biased = x + bias[None, :, None, None]
     hidden, gate = torch.chunk(biased, 2, dim=1)
@@ -82,7 +77,6 @@ def test_silu_mul_is_bit_exact(shape):
     a = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     b = torch.randn_like(a)
 
-    assert can_use_fused_silu_mul(a, b)
     assert torch.equal(fused_silu_mul_bitexact(a, b), F.silu(a) * b)
 
 
@@ -104,8 +98,10 @@ def test_packed_silu_mul_is_bit_exact(hidden, strided):
 
 def test_silu_mul_rejects_mismatched_operands():
     a = torch.randn(1, 8, 64, device="cuda", dtype=torch.bfloat16)
-    assert not can_use_fused_silu_mul(a, a.float())  # mixed dtypes
-    assert not can_use_fused_silu_mul(a, a[:, :-1])  # mismatched shapes
+    with pytest.raises(RuntimeError):
+        fused_silu_mul_bitexact(a, a.float())
+    with pytest.raises(RuntimeError):
+        fused_silu_mul_bitexact(a, a[:, :-1])
 
 
 if __name__ == "__main__":
