@@ -608,7 +608,6 @@ def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
     fields = dict(
         rids=["r0", "r1"],
         finished_reasons=[None] * n,
-        decoded_texts=["", ""],
         decode_ids=[array("q", [1]), array("q", [2])],
         read_offsets=[0] * n,
         output_ids=None,

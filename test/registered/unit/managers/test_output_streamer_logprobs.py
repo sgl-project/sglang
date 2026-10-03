@@ -31,7 +31,6 @@ class _FakeReq:
         self.send_token_offset = 0
         self.send_output_token_logprobs_offset = 0
         self.send_decode_id_offset = 0
-        self.decoded_text = ""
         self.origin_input_ids = []
         self.reasoning_tokens = 0
         self.cached_tokens = 0

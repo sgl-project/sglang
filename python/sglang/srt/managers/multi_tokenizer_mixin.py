@@ -175,7 +175,6 @@ def _handle_output_by_index(output, i):
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
             decode_ids=_extract_field_by_index(output, "decode_ids", i),
             read_offsets=_extract_field_by_index(output, "read_offsets", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),
