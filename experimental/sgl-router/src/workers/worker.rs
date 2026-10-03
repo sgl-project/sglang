@@ -273,6 +273,9 @@ pub struct Worker {
     /// can upgrade it in place once the engine is ready. See
     /// [`crate::workers::manager`].
     protocol: AtomicU8,
+    /// Chat-template serving setup from this worker's `/server_info`, set
+    /// alongside `protocol` (see [`crate::workers::introspect::EngineChatTemplate`]).
+    chat_template_serving: std::sync::RwLock<crate::workers::introspect::ChatTemplateServing>,
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
@@ -320,6 +323,7 @@ impl Worker {
             // `set_protocol` from `/server_info` introspection before (and on
             // reconcile, after) the worker becomes routable.
             protocol: AtomicU8::new(WireProtocol::default().as_u8()),
+            chat_template_serving: Default::default(),
             model_ids: spec.model_ids,
             breaker,
             active_requests,
@@ -381,6 +385,20 @@ impl Worker {
     /// `active_requests` + breaker state).
     pub fn set_protocol(&self, p: WireProtocol) {
         self.protocol.store(p.as_u8(), Ordering::Relaxed);
+    }
+
+    pub fn chat_template_serving(&self) -> crate::workers::introspect::ChatTemplateServing {
+        self.chat_template_serving
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_chat_template_serving(&self, s: crate::workers::introspect::ChatTemplateServing) {
+        *self
+            .chat_template_serving
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = s;
     }
 
     pub fn active_load(&self) -> usize {

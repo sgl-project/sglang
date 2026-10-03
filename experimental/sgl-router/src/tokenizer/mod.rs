@@ -113,6 +113,9 @@ pub struct ChatRenderOpts {
     /// mirrored by the built-in dsv4 encoder, ignored by Jinja and by K3.
     pub dsv4_parts: ChatRenderOptsDsv4Parts,
     pub kimi_k3: kimi_k3::RenderOpts,
+    /// Tools and template kwargs for the Jinja encoder, resolved as SGLang's
+    /// generic Jinja path resolves them.
+    pub jinja: chat_template::JinjaRenderOpts,
 }
 
 // Deliberately NO `Default` impl: the only sensible body would be `chat()`, and
@@ -137,6 +140,7 @@ impl ChatRenderOpts {
             dsv4: dsv4::RenderOpts::chat(),
             dsv4_parts: ChatRenderOptsDsv4Parts::default(),
             kimi_k3: kimi_k3::RenderOpts::default(),
+            jinja: chat_template::JinjaRenderOpts::default(),
         }
     }
 
@@ -149,8 +153,18 @@ impl ChatRenderOpts {
         }
     }
 
-    /// Resolve both encoders' options from one request body.
+    /// Resolve every encoder's options from one request body, with no engine
+    /// default template kwargs.
     pub fn resolve(request: &serde_json::Value) -> Self {
+        Self::resolve_with_engine_defaults(request, None)
+    }
+
+    /// [`ChatRenderOpts::resolve`] for an engine running with
+    /// `--default-chat-template-kwargs` (Jinja encoder only).
+    pub fn resolve_with_engine_defaults(
+        request: &serde_json::Value,
+        engine_defaults: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Self {
         ChatRenderOpts {
             dsv4: dsv4::resolve_render_opts(request),
             // The bool is coerced the way pydantic would (`openai_bool`), not
@@ -165,6 +179,7 @@ impl ChatRenderOpts {
                     == Some(true),
             },
             kimi_k3: kimi_k3::resolve_render_opts(request),
+            jinja: chat_template::JinjaRenderOpts::resolve(request, engine_defaults),
         }
     }
 }
@@ -202,9 +217,10 @@ impl ChatEncoder {
     /// The DeepSeek-V4 encoder renders `tools` (see [`dsv4::render_messages`]) so
     /// cache-aware routing matches the engine's cached blocks for tool traffic,
     /// and it threads the request-level `parts` (`task`, `continue_final_message`;
-    /// see [`dsv4::render_request`]). The Jinja path does not yet thread
-    /// `tools`/`parts` (a tools-carrying request there still routes on the
-    /// no-tools rendering); adding per-model Jinja tool rendering is future work.
+    /// see [`dsv4::render_request`]). The Jinja path renders the request's tools
+    /// and template kwargs as SGLang's generic Jinja path does
+    /// ([`ChatRenderOpts::jinja`]); it does not do the trailing-assistant
+    /// surgery, so such requests are never forwarded.
     fn render(
         &self,
         messages: &serde_json::Value,
@@ -212,10 +228,9 @@ impl ChatEncoder {
         opts: &ChatRenderOpts,
     ) -> Result<(String, Option<String>)> {
         match self {
-            // The Jinja path does not thread thinking-mode/tools/parts yet
-            // (future work); it ignores `opts` and renders the model's default
-            // template.
-            ChatEncoder::Jinja(t) => t.render(messages).map(|s| (s, None)),
+            // `opts.jinja.tools` (tool_choice-selected, pydantic-dumped), not
+            // the raw `tools`.
+            ChatEncoder::Jinja(t) => t.render_with(messages, &opts.jinja).map(|s| (s, None)),
             ChatEncoder::DeepSeekV4 => {
                 dsv4::render_request(messages, tools, opts.dsv4, opts.dsv4_parts())
                     .map_err(anyhow::Error::from)
@@ -242,7 +257,7 @@ impl ChatEncoder {
         opts: &ChatRenderOpts,
     ) -> Result<String> {
         match self {
-            ChatEncoder::Jinja(t) => t.render(messages),
+            ChatEncoder::Jinja(t) => t.render_with(messages, &opts.jinja),
             ChatEncoder::DeepSeekV4 => Ok(dsv4::render_messages(messages, tools, opts.dsv4)),
             // As in `render`: K3 has no single-string form, so the segment path
             // in `encode_chat_plain` handles it before reaching here.
@@ -259,8 +274,11 @@ impl ChatEncoder {
     /// downstream from another registry lookup.
     fn forward_parity(&self) -> ForwardParity {
         match self {
-            // The Jinja encoder needs the conservative predicate (no tool /
-            // thinking / task rendering — see `input_ids_safe_to_forward`).
+            // A Jinja model verified token-identical to the engine (see
+            // `FULL_FORWARDING_MODEL_TYPES`) forwards every shape
+            // `JinjaRenderOpts` mirrors; any other Jinja model stays on the
+            // conservative predicate.
+            ChatEncoder::Jinja(t) if t.full_forwarding() => ForwardParity::JinjaFull,
             ChatEncoder::Jinja(_) => ForwardParity::Conservative,
             // The dsv4 encoder mirrors the engine's full dsv4 request
             // handling (`input_ids_safe_to_forward_dsv4`).
@@ -287,6 +305,11 @@ pub enum ForwardParity {
     /// `input_ids_safe_to_forward_dsv4` (only genuinely unmirrored engine
     /// internals withheld).
     Dsv4Full,
+    /// `input_ids_safe_to_forward_jinja_full`: a Jinja model whose rendering
+    /// with tools / reasoning effort / template kwargs is verified identical to
+    /// SGLang's generic Jinja path (multimodal, trailing assistant and
+    /// malformed shapes withheld).
+    JinjaFull,
 }
 
 /// Parse a JSON value the way pydantic v2 (lax mode) coerces an OpenAI
@@ -743,6 +766,15 @@ impl TokenizerRegistry {
                 Ok(Some(tmpl)) => {
                     tracing::info!(model = %model_id,
                         "chat-template routing enabled; chat requests route by templated tokens");
+                    let tmpl = match full_forwarding_model_type(tokenizer_path) {
+                        Some(model_type) => {
+                            tracing::info!(model = %model_id, model_type = %model_type,
+                                "verified Jinja parity: input_ids forwarding covers tools, \
+                                 reasoning_effort and chat_template_kwargs");
+                            tmpl.with_full_forwarding()
+                        }
+                        None => tmpl,
+                    };
                     return Some(ChatEncoder::Jinja(Box::new(tmpl)));
                 }
                 Ok(None) => {} // no template — fall through to built-in detection
@@ -776,6 +808,14 @@ impl TokenizerRegistry {
     /// tokenization path is available for it).
     pub fn has_chat_encoder(&self, model_id: &str) -> bool {
         self.encoders.contains_key(model_id)
+    }
+
+    /// Whether this model's chat encoder renders its Jinja template (the only
+    /// encoder an engine-side template override can invalidate).
+    pub fn has_jinja_encoder(&self, model_id: &str) -> bool {
+        self.encoders
+            .get(model_id)
+            .is_some_and(|e| matches!(e.encoder, ChatEncoder::Jinja(_)))
     }
 
     /// This model's chat encoder's forwarding parity ([`ForwardParity`]),
@@ -1213,6 +1253,25 @@ fn extension_concat_safe(encoder: &ChatEncoder, tokenizer: &Tokenizer) -> bool {
 fn is_deepseek_v4(model_id: &str) -> bool {
     let id = model_id.to_ascii_lowercase();
     id.contains("deepseek") && id.contains("v4")
+}
+
+/// `config.json` `model_type`s whose Jinja rendering (tools, reasoning effort,
+/// template kwargs via [`chat_template::JinjaRenderOpts`]) is verified
+/// token-identical to SGLang's generic Jinja path against engine
+/// `return_prompt_token_ids` (`testdata/step5_parity.json`). Adding a model
+/// type here requires the same verification.
+///
+/// Keyed on the checkpoint's architecture: served model ids are arbitrary.
+const FULL_FORWARDING_MODEL_TYPES: [&str; 1] = ["step5_vl"];
+
+/// The verified `model_type` of the checkpoint next to `tokenizer_path`, if
+/// any. An unreadable or absent `config.json` keeps the conservative predicate.
+fn full_forwarding_model_type(tokenizer_path: &str) -> Option<String> {
+    let cfg = adapter::load_model_config(tokenizer_path).ok().flatten()?;
+    let model_type = cfg.get("model_type")?.as_str()?;
+    FULL_FORWARDING_MODEL_TYPES
+        .contains(&model_type)
+        .then(|| model_type.to_owned())
 }
 
 /// Whether `model_id` denotes a Kimi-K3 model, which ships no Jinja template and
@@ -1791,6 +1850,80 @@ mod tests {
         c.model.tokenizer_path = dir.path().to_str().unwrap().to_owned();
         let reg = TokenizerRegistry::load_from_config(&c).unwrap();
         assert!(reg.has_chat_encoder(&c.model.id));
+    }
+
+    /// Full forwarding is keyed on the checkpoint's `config.json` `model_type`:
+    /// only verified types get `JinjaFull`; everything else stays conservative.
+    #[test]
+    fn full_forwarding_follows_verified_model_type() {
+        let parity_for = |config: Option<&str>| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::copy(
+                "tests/fixtures/tiny_tokenizer.json",
+                dir.path().join("tokenizer.json"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("tokenizer_config.json"),
+                r#"{"chat_template":"{{ bos_token }}X","bos_token":"<s>"}"#,
+            )
+            .unwrap();
+            if let Some(config) = config {
+                std::fs::write(dir.path().join("config.json"), config).unwrap();
+            }
+            let mut c = cfg();
+            c.model.tokenizer_path = dir.path().to_str().unwrap().to_owned();
+            TokenizerRegistry::load_from_config(&c)
+                .unwrap()
+                .forward_parity(&c.model.id)
+        };
+        assert_eq!(
+            parity_for(Some(r#"{"model_type":"step5_vl"}"#)),
+            ForwardParity::JinjaFull
+        );
+        assert_eq!(
+            parity_for(Some(r#"{"model_type":"llama"}"#)),
+            ForwardParity::Conservative
+        );
+        assert_eq!(parity_for(Some("not json")), ForwardParity::Conservative);
+        assert_eq!(parity_for(None), ForwardParity::Conservative);
+    }
+
+    /// Token parity against the engine for real Step-5 traffic shapes
+    /// (`testdata/step5_parity.json`, regenerated by `gen_step5_parity.py`).
+    /// Needs the checkpoint's tokenizer files (tokenizer.json,
+    /// tokenizer_config.json, chat_template.jinja, config.json), which are not
+    /// vendored: `STEP5_TOK_DIR=<dir> cargo test step5_parity -- --ignored`.
+    #[test]
+    #[ignore = "needs STEP5_TOK_DIR with the Step-5 tokenizer files"]
+    fn step5_parity_with_engine_prompt_ids() {
+        let dir = std::env::var("STEP5_TOK_DIR").expect("STEP5_TOK_DIR");
+        let mut c = cfg();
+        c.model.id = "step5".into();
+        c.model.tokenizer_path = dir;
+        let reg = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert_eq!(reg.forward_parity(&c.model.id), ForwardParity::JinjaFull);
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/step5_parity.json")).unwrap();
+        let mut compared = 0;
+        for case in fixture["cases"].as_array().unwrap() {
+            if !case["forward"].as_bool().unwrap() {
+                continue;
+            }
+            let req = &case["request"];
+            let ids = reg
+                .encode_chat(
+                    &c.model.id,
+                    &req["messages"],
+                    req.get("tools"),
+                    &ChatRenderOpts::resolve(req),
+                )
+                .unwrap_or_else(|| panic!("{}: render failed", case["name"]));
+            let expected: Vec<u32> = serde_json::from_value(case["expected_ids"].clone()).unwrap();
+            assert_eq!(ids, expected, "{}", case["name"]);
+            compared += 1;
+        }
+        assert!(compared > 0);
     }
 
     #[test]

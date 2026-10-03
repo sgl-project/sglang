@@ -920,7 +920,9 @@ impl CacheAwareZmqPolicy {
                         );
                     }
                 };
-                let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
+                let engine = crate::workers::introspect::EngineChatTemplate::from_workers(workers);
+                let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value, &engine)
+                else {
                     self.record_decision(model_id, CacheAwareDecision::TokenizationUnavailable);
                     if should_log(&TOKENIZATION_LOG_COUNTER) {
                         tracing::warn!(
@@ -3787,12 +3789,66 @@ mod tests {
 
         let model = ModelId("tiny".into());
         let value = serde_json::json!({ "model": "tiny", "messages": messages });
-        let rt = request_tokens_for(&registry, &model, &value).expect("tokens");
+        let rt = request_tokens_for(
+            &registry,
+            &model,
+            &value,
+            &crate::workers::introspect::EngineChatTemplate::Unverified,
+        )
+        .expect("tokens");
         assert!(
             rt.engine_equivalent,
             "chat-encoder ids must be engine-equivalent"
         );
         assert_eq!(rt.ids, expected);
+    }
+
+    /// The engine's chat-template setup, agreed across workers, shapes both the
+    /// tokens (default kwargs are rendered in) and how far they may be
+    /// forwarded (full only when agreed; never past a template override).
+    #[test]
+    fn request_tokens_for_applies_engine_chat_template() {
+        use crate::tokenizer::{chat_template::ChatTemplate, ChatEncoder, ForwardParity};
+        use crate::workers::introspect::EngineChatTemplate;
+        let registry = tokenizer_registry_with_tiny();
+        let tmpl = ChatTemplate::from_tokenizer_config(&serde_json::json!({
+            "chat_template": "{% if reasoning_effort is defined %}{{ reasoning_effort }} {% endif %}{{ messages[0]['content'] }}"
+        }))
+        .unwrap()
+        .unwrap()
+        .with_full_forwarding();
+        registry.attach_chat_encoder_for_test("tiny", ChatEncoder::Jinja(Box::new(tmpl)));
+        let model = ModelId("tiny".into());
+        let value = serde_json::json!({"messages": [{"role": "user", "content": "hello world"}]});
+        let tokens = |engine: EngineChatTemplate| {
+            request_tokens_for(&registry, &model, &value, &engine).expect("tokens")
+        };
+        let low = serde_json::json!({"reasoning_effort": "low"})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        let plain = tokens(EngineChatTemplate::Checkpoint(serde_json::Map::new()));
+        assert!(plain.engine_equivalent);
+        assert_eq!(plain.parity, ForwardParity::JinjaFull);
+
+        let defaulted = tokens(EngineChatTemplate::Checkpoint(low));
+        assert_ne!(
+            defaulted.ids, plain.ids,
+            "engine default kwargs must be rendered in"
+        );
+        assert_eq!(defaulted.parity, ForwardParity::JinjaFull);
+
+        let unverified = tokens(EngineChatTemplate::Unverified);
+        assert_eq!(unverified.ids, plain.ids);
+        assert!(unverified.engine_equivalent);
+        assert_eq!(unverified.parity, ForwardParity::Conservative);
+
+        let overridden = tokens(EngineChatTemplate::Overridden);
+        assert!(
+            !overridden.engine_equivalent,
+            "a template override is never engine-equivalent"
+        );
     }
 
     /// End-to-end: `request_tokens_for` threads the request's thinking mode through
@@ -3813,6 +3869,7 @@ mod tests {
             &registry,
             &model,
             &serde_json::json!({ "messages": messages.clone() }),
+            &crate::workers::introspect::EngineChatTemplate::Unverified,
         )
         .expect("tokens")
         .ids;
@@ -3823,6 +3880,7 @@ mod tests {
                 "messages": messages.clone(),
                 "chat_template_kwargs": {"thinking": true}
             }),
+            &crate::workers::introspect::EngineChatTemplate::Unverified,
         )
         .expect("tokens")
         .ids;
@@ -3873,7 +3931,13 @@ mod tests {
         assert!(!registry.has_chat_encoder("tiny"));
         let model = ModelId("tiny".into());
         let value = serde_json::json!({ "prompt": "hello world" });
-        let rt = request_tokens_for(&registry, &model, &value).expect("tokens");
+        let rt = request_tokens_for(
+            &registry,
+            &model,
+            &value,
+            &crate::workers::introspect::EngineChatTemplate::Unverified,
+        )
+        .expect("tokens");
         assert!(!rt.engine_equivalent);
         assert!(!rt.ids.is_empty());
     }
@@ -3886,7 +3950,13 @@ mod tests {
         let registry = tokenizer_registry_with_tiny();
         let model = ModelId("tiny".into());
         let value = serde_json::json!({ "frobnicate": 42 });
-        assert!(request_tokens_for(&registry, &model, &value).is_none());
+        assert!(request_tokens_for(
+            &registry,
+            &model,
+            &value,
+            &crate::workers::introspect::EngineChatTemplate::Unverified
+        )
+        .is_none());
     }
 
     /// `select` consumes the ingress-precomputed tokens and does NOT

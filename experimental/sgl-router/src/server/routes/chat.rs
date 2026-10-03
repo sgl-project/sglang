@@ -366,9 +366,12 @@ pub(crate) async fn chat_completions_inner(
     // forwarded as `input_ids` so it skips re-tokenizing the same prompt. The
     // ingress owns the tokenize via the shared registry, so the choice of
     // policy never changes whether we tokenize.
+    let engine_template = crate::workers::introspect::EngineChatTemplate::from_workers(
+        &ctx.registry.workers_for(&model_id),
+    );
     let request_tokens = request_value
         .as_ref()
-        .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
+        .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v, &engine_template));
     let at_post_tokenize = start.elapsed();
 
     // The request id, derived HERE rather than at dispatch because both tees
@@ -1775,6 +1778,11 @@ fn select_forward_input_ids<'a>(
             crate::tokenizer::ForwardParity::Dsv4Full if input_ids_safe_to_forward_dsv4(v) => {
                 Some(t.ids.as_slice())
             }
+            crate::tokenizer::ForwardParity::JinjaFull
+                if input_ids_safe_to_forward_jinja_full(v) =>
+            {
+                Some(t.ids.as_slice())
+            }
             crate::tokenizer::ForwardParity::Conservative if input_ids_safe_to_forward(v) => {
                 Some(t.ids.as_slice())
             }
@@ -1782,6 +1790,128 @@ fn select_forward_input_ids<'a>(
         },
         _ => None,
     }
+}
+
+/// The forwarding predicate for a Jinja model with verified full parity
+/// ([`crate::tokenizer::ForwardParity::JinjaFull`]). Its encoder threads what
+/// SGLang's generic Jinja path threads — request `tools` (tool_choice-selected,
+/// pydantic-dumped), `reasoning_effort`, `chat_template_kwargs` — so those are
+/// forwardable. `tool_choice` / `response_format` only steer engine-side
+/// constraints, which the engine still derives from the request alongside
+/// `input_ids`. Withheld, because the encoder does not replicate them or the
+/// engine would reject the request:
+///   * multimodal content — the engine's `input_ids` path drops `image_data`;
+///     text-only part arrays render identically and stay forwardable;
+///   * a trailing `assistant` turn or `continue_final_message` — the engine
+///     rewrites it to a user turn or strips it as a prefix;
+///   * per-request `chat_template`, legacy `functions`, message-level `tools`,
+///     and the dsv4/K3-only `task` / `reasoning` / `thinking` /
+///     `thinking_effort` fields;
+///   * roles outside `system` / `user` / `assistant` / `tool` / `developer`;
+///   * tool messages with array content (`normalize_tool_content` flattens it);
+///   * a non-string effort, a `chat_template_kwargs` that is not an object or
+///     names a reserved render argument, a malformed tool / `tool_choice`, or
+///     a history tool call whose `arguments` is not a JSON object (inline or
+///     as a JSON string) — the engine 4xxes those before a prompt exists.
+fn input_ids_safe_to_forward_jinja_full(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    let present = |v: &Value, key: &str| v.get(key).is_some_and(|x| !x.is_null());
+    for key in [
+        "chat_template",
+        "functions",
+        "task",
+        "reasoning",
+        "thinking",
+        "thinking_effort",
+    ] {
+        if present(value, key) {
+            return false;
+        }
+    }
+    if let Some(v) = value.get("continue_final_message").filter(|v| !v.is_null()) {
+        if crate::tokenizer::openai_bool(v) != Some(false) {
+            return false;
+        }
+    }
+    if last_message_is_assistant(value) {
+        return false;
+    }
+    if present(value, "reasoning_effort") && !value["reasoning_effort"].is_string() {
+        return false;
+    }
+    if let Some(ctk) = value.get("chat_template_kwargs").filter(|v| !v.is_null()) {
+        let Some(ctk) = ctk.as_object() else {
+            return false;
+        };
+        if ctk
+            .keys()
+            .any(|k| crate::tokenizer::chat_template::RESERVED_RENDER_KEYS.contains(&k.as_str()))
+        {
+            return false;
+        }
+        if ctk
+            .get("reasoning_effort")
+            .is_some_and(|e| !e.is_null() && !e.is_string())
+        {
+            return false;
+        }
+    }
+    if let Some(tools) = value.get("tools").filter(|v| !v.is_null()) {
+        let Some(tools) = tools.as_array() else {
+            return false;
+        };
+        let well_formed = tools.iter().all(|t| {
+            let f = t.get("function");
+            f.and_then(|f| f.get("name")).is_some_and(Value::is_string)
+                && f.and_then(|f| f.get("strict"))
+                    .is_none_or(|s| s.is_null() || s.is_boolean())
+        });
+        if !well_formed {
+            return false;
+        }
+    }
+    match value.get("tool_choice") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if matches!(s.as_str(), "none" | "auto" | "required") => {}
+        Some(Value::Object(o))
+            if o.get("function")
+                .and_then(|f| f.get("name"))
+                .is_some_and(Value::is_string) => {}
+        Some(_) => return false,
+    }
+    let Some(msgs) = value.get("messages").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    msgs.iter().all(|m| {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if !matches!(role, "system" | "user" | "assistant" | "tool" | "developer") {
+            return false;
+        }
+        if present(m, "tools") && m["tools"].as_array().is_none_or(|t| !t.is_empty()) {
+            return false;
+        }
+        if let Some(parts) = m.get("content").and_then(|c| c.as_array()) {
+            let text_only = parts
+                .iter()
+                .all(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"));
+            if role == "tool" || !text_only {
+                return false;
+            }
+        }
+        m.get("tool_calls")
+            .and_then(|c| c.as_array())
+            .is_none_or(|calls| {
+                calls.iter().all(
+                    |c| match c.get("function").and_then(|f| f.get("arguments")) {
+                        Some(Value::Object(_)) => true,
+                        Some(Value::String(s)) => {
+                            matches!(serde_json::from_str::<Value>(s), Ok(Value::Object(_)))
+                        }
+                        _ => false,
+                    },
+                )
+            })
+    })
 }
 
 /// The dsv4-encoder forwarding predicate. The built-in encoder mirrors the
@@ -3201,6 +3331,122 @@ mod tests {
         assert!(input_ids_safe_to_forward(&serde_json::json!({
             "messages":[{"role":"user","content":"hi"},{"role":"system","tools":[]}]
         })));
+    }
+
+    /// Shapes a verified-parity Jinja encoder renders exactly like the engine
+    /// (see `step5_parity_with_engine_prompt_ids`) are forwardable.
+    #[test]
+    fn jinja_full_forwards_tools_effort_and_template_kwargs() {
+        let user = serde_json::json!([{"role":"user","content":"hi"}]);
+        let tools =
+            serde_json::json!([{"type":"function","function":{"name":"f","parameters":{}}}]);
+        let ok = [
+            serde_json::json!({ "messages": user }),
+            serde_json::json!({"messages": user, "tools": tools}),
+            serde_json::json!({"messages": user, "tools": tools, "tool_choice": "required"}),
+            serde_json::json!({"messages": user, "tools": tools,
+                               "tool_choice": {"type":"function","function":{"name":"f"}}}),
+            serde_json::json!({"messages": user, "reasoning_effort": "low"}),
+            serde_json::json!({"messages": user, "chat_template_kwargs": {"preserve_thinking": false,
+                                                                          "reasoning_effort": "high"}}),
+            serde_json::json!({"messages": user, "response_format": {"type": "json_object"}}),
+            serde_json::json!({"messages": user, "continue_final_message": false}),
+            serde_json::json!({"messages": [{"role":"user","content":[{"type":"text","text":"a"},
+                                                                      {"type":"text","text":"b"}]}]}),
+            serde_json::json!({"messages": [{"role":"developer","content":"terse"},
+                                            {"role":"user","content":"hi"},
+                                            {"role":"system","tools":[]}]}),
+            serde_json::json!({"messages": [
+                {"role":"user","content":"weather?"},
+                {"role":"assistant","content":"","tool_calls":[
+                    {"id":"1","type":"function","function":{"name":"f","arguments":"{\"city\":\"x\"}"}},
+                    {"id":"2","type":"function","function":{"name":"f","arguments":{"city":"y"}}}]},
+                {"role":"tool","tool_call_id":"1","content":"sunny"}], "tools": tools}),
+        ];
+        for b in ok {
+            assert!(
+                input_ids_safe_to_forward_jinja_full(&b),
+                "should forward {b}"
+            );
+        }
+    }
+
+    /// Everything the Jinja encoder does not replicate, or the engine would
+    /// reject before a prompt exists, stays engine-tokenized.
+    #[test]
+    fn jinja_full_withholds_unreplicated_or_rejected_shapes() {
+        let user = serde_json::json!([{"role":"user","content":"hi"}]);
+        let blockers = [
+            serde_json::json!({"messages": [{"role":"user","content":[
+                {"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"x"}}]}]}),
+            serde_json::json!({"messages": [{"role":"user","content":"hi"},
+                                            {"role":"assistant","content":"pre"}]}),
+            serde_json::json!({"messages": user, "continue_final_message": true}),
+            serde_json::json!({"messages": user, "continue_final_message": "maybe"}),
+            serde_json::json!({"messages": user, "chat_template": "{{ x }}"}),
+            serde_json::json!({"messages": user, "functions": [{"name":"f"}]}),
+            serde_json::json!({"messages": user, "task": "t"}),
+            serde_json::json!({"messages": user, "thinking": {"type":"disabled"}}),
+            serde_json::json!({"messages": user, "reasoning_effort": 3}),
+            serde_json::json!({"messages": user, "chat_template_kwargs": "x"}),
+            serde_json::json!({"messages": user, "chat_template_kwargs": {"messages": []}}),
+            serde_json::json!({"messages": user, "chat_template_kwargs": {"reasoning_effort": 1}}),
+            serde_json::json!({"messages": user, "tools": {"not": "a list"}}),
+            serde_json::json!({"messages": user, "tools": [{"type":"function","function":{}}]}),
+            serde_json::json!({"messages": user,
+                               "tools": [{"type":"function","function":{"name":"f","strict":"yes"}}]}),
+            serde_json::json!({"messages": user, "tool_choice": "sometimes"}),
+            serde_json::json!({"messages": user, "tool_choice": {"type":"function"}}),
+            serde_json::json!({"messages": [{"role":"latest_reminder","content":"x"},
+                                            {"role":"user","content":"hi"}]}),
+            serde_json::json!({"messages": [{"role":"system","content":"s",
+                "tools":[{"type":"function","function":{"name":"f"}}]},
+                {"role":"user","content":"hi"}]}),
+            serde_json::json!({"messages": [{"role":"user","content":"hi"},
+                {"role":"tool","content":[{"type":"text","text":"r"}]}]}),
+            serde_json::json!({"messages": [{"role":"user","content":"hi"},
+                {"role":"assistant","content":"","tool_calls":[
+                    {"function":{"name":"f","arguments":"[1,2]"}}]},
+                {"role":"tool","content":"r"}]}),
+            serde_json::json!({"messages": [{"role":"user","content":"hi"},
+                {"role":"assistant","content":"","tool_calls":[
+                    {"function":{"name":"f","arguments":"not json"}}]},
+                {"role":"tool","content":"r"}]}),
+            serde_json::json!({"prompt": "no messages"}),
+        ];
+        for b in blockers {
+            assert!(
+                !input_ids_safe_to_forward_jinja_full(&b),
+                "must not forward {b}"
+            );
+        }
+    }
+
+    /// `JinjaFull` ids pass only their own predicate: a tools request a
+    /// conservative encoder produced is still withheld.
+    #[test]
+    fn select_forward_input_ids_gates_by_stamped_parity() {
+        let body = serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f"}}]});
+        let tokens = |parity| RequestTokens {
+            ids: vec![1, 2, 3],
+            engine_equivalent: true,
+            parity,
+        };
+        let full = tokens(crate::tokenizer::ForwardParity::JinjaFull);
+        let conservative = tokens(crate::tokenizer::ForwardParity::Conservative);
+        assert_eq!(
+            select_forward_input_ids(true, Some(&full), Some(&body)),
+            Some(&[1u32, 2, 3][..])
+        );
+        assert_eq!(
+            select_forward_input_ids(true, Some(&conservative), Some(&body)),
+            None
+        );
+        assert_eq!(
+            select_forward_input_ids(false, Some(&full), Some(&body)),
+            None
+        );
     }
 
     /// Plain text chat with nothing unreplicated → input_ids may be forwarded.

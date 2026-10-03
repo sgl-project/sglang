@@ -644,19 +644,35 @@ pub fn load_tokenizer_config(source: &str) -> Result<Option<serde_json::Value>> 
 /// Returns `Ok(None)` when no such file exists. For an HF repo id a failed
 /// download is treated as absent (logged at debug): most repos ship none.
 pub fn load_chat_template_jinja(source: &str) -> Result<Option<String>> {
-    const FILE: &str = "chat_template.jinja";
+    load_sibling_text(source, "chat_template.jinja")
+}
+
+/// Load the model's `config.json` co-located with the tokenizer (resolved like
+/// [`load_chat_template_jinja`]); `Ok(None)` when absent.
+pub fn load_model_config(source: &str) -> Result<Option<serde_json::Value>> {
+    let Some(text) = load_sibling_text(source, "config.json")? else {
+        return Ok(None);
+    };
+    let value = serde_json::from_str(&text).context("parse config.json")?;
+    Ok(Some(value))
+}
+
+/// Read `file` from the model directory `source` names (see
+/// [`load_tokenizer_config`] for the resolution rules). A failed HF download
+/// is treated as absent (logged at debug).
+fn load_sibling_text(source: &str, file: &str) -> Result<Option<String>> {
     let path = if Path::new(source).is_dir() {
-        Path::new(source).join(FILE)
+        Path::new(source).join(file)
     } else if Path::new(source).is_file() || looks_like_path(source) {
         match Path::new(source).parent() {
-            Some(dir) => dir.join(FILE),
+            Some(dir) => dir.join(file),
             None => return Ok(None),
         }
     } else {
-        match download_repo_file(source, FILE) {
+        match download_repo_file(source, file) {
             Ok(p) => p,
             Err(e) => {
-                tracing::debug!(repo = %source, error = %e, "no {FILE} in repo");
+                tracing::debug!(repo = %source, error = %e, "no {file} in repo");
                 return Ok(None);
             }
         }
@@ -665,7 +681,7 @@ pub fn load_chat_template_jinja(source: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {FILE} at {}", path.display()))?;
+        .with_context(|| format!("read {file} at {}", path.display()))?;
     Ok(Some(text))
 }
 

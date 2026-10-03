@@ -69,7 +69,12 @@ pub(crate) async fn count_tokens(
     if model != ctx.config.model.id {
         return adapt(ApiError::ModelNotFound(model).into_response(), None).await;
     }
-    match crate::policies::request_tokens_for(&ctx.tokenizers, &ModelId(model), &converted.chat) {
+    let model_id = ModelId(model);
+    let engine = crate::workers::introspect::EngineChatTemplate::from_workers(
+        &ctx.registry.workers_for(&model_id),
+    );
+    match crate::policies::request_tokens_for(&ctx.tokenizers, &model_id, &converted.chat, &engine)
+    {
         Some(t) => axum::Json(serde_json::json!({"input_tokens": t.ids.len()})).into_response(),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
