@@ -177,6 +177,40 @@ Compute cooperates through the flags the scope publishes on `get_forward()`:
 
 A complete tensor after `finish()` can still have a pending **residual update**. An incomplete reduction is exposed to the model as an opaque `OwedOutput`; pass it to the next boundary or a supported access method. Do not inspect it as a tensor, slice it, or unwrap its contribution in model code.
 
+### Route locally before a CP gather
+
+For a sparse FFN that routes tokens before gathering them, use `declare_ffn(sparse=True, gathers_cp_input=True)`. This capability applies only to the context-parallel batch variant. It supports TP-only MoE with collocated prefill CP: CP and MoE TP cover the same ordered ranks, attention TP/DP and MoE EP/DP are one, and all-to-all and DWDP are disabled. Ordinary batches retain their existing input and output behavior.
+
+The boundary prepares the input on CP-local rows and retains the local residual. Compute runs the gate and top-k locally, gathers hidden states and routing payload together, and runs the experts on the gathered rows. Every gathered tensor must use the same rank-major blocks, padded to the maximum count in `forward_batch.attn_cp_metadata.per_rank_actual_token`. The MoE returns a partial output for all padded rows. It must not call `reduce_moe_output()`, run an output collective, or reshape the output to the local row count itself.
+
+The exit owns both the reduction and the return to local rows. With a reduce-scatter policy, it sums the partial expert outputs and removes collective padding. With an all-reduce policy, the exit completes the sum before taking back the local rows. Compute returns the same partial output under either policy. An update with `applied_at_exit=True` runs after this movement, so a nonlinear residual update sees a complete contribution on its residual's rows. `Qwen2MoeSparseMoeBlock.forward_cp()` provides the compute path; a caller must select it only for the active CP variant and supply the matching gather and allocation callbacks.
+
+After opting into the declaration, select this path from the boundary's actual input rows. This also respects batches using sequence parallelism or scattered attention input:
+
+```python
+from sglang.srt.layers.layer_boundary import TokenAxis
+
+hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+cp_local = (
+    TokenAxis.ATTN_CP
+    in self.ffn_boundary.entry(forward_batch).input_rows.sharded
+)
+with self.ffn_boundary.exit(forward_batch) as output:
+    if cp_local:
+        hidden_states = self.mlp.forward_cp(
+            hidden_states,
+            all_gather_rows=all_gather_rows,
+            symmetric_memory=symmetric_memory,
+        )
+    else:
+        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+hidden_states = output.finish(hidden_states)
+```
+
+The gather callback must run even on empty local ranks and zero-pad hidden states, routing weights, and expert IDs to the same rank-block size. The CUDA Qwen helper calls the existing `select_experts()` on local rows and gathers its STANDARD IDs and weights. It requires a runner accepting that format, such as the FlashInfer TRT-LLM routed kernels. Normal token-wise scoring, bias, expert grouping, and scaling remain available without a separate CP router implementation.
+
+This path requires trivial expert placement with no redundant experts, EPLB, expert-distribution recording, or routed-expert capture. The Qwen constructor supplies a token-wise router; simulated routing is excluded because it depends on global row indices. Topology validation and reduction policy belong to the boundary.
+
 ### Enter and leave the layer stack
 
 Initialize a fresh stream once on the embedding path, and leave the stack through the final norm:

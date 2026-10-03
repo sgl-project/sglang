@@ -81,7 +81,8 @@ class OutputContract(msgspec.Struct, frozen=True):
     Fields:
         layout: Token sharding of the producer contribution.
         group: Named sum group, or None when there is no reduction.
-        always_partial: Compute always returns a partial sum.
+        always_partial: Compute always returns a partial sum. An FFN exit
+            completes it before handing its output to the next stage.
         may_defer_to_next: Compute can skip reduction under the exit scope
             and let the following layer complete it.
         may_reduce_scatter: Compute can leave reduction to a fixed-size

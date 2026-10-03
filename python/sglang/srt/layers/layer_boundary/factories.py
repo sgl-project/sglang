@@ -82,6 +82,7 @@ def _resolve_ffn(
     update=PLAIN_ADD,
     dense_tp_size=None,
     reduction=ProducerReduction.EXIT_SCOPED,
+    gathers_cp_input=False,
 ):
     parallel = get_parallel()
     if dense_tp_size not in (None, 1, parallel.tp_size):
@@ -95,6 +96,8 @@ def _resolve_ffn(
     use_reduce_scatter = strategy in ("rs", "rs+rsv") and can_move_output
     use_reduce_scatterv = strategy in ("rsv", "rs+rsv") and can_move_output
     cp_shards = _prefill_cp_shards_tokens()
+    compute_gathers_cp = gathers_cp_input and variant is BatchVariant.CONTEXT_PARALLEL
+    cp_moves = _cp_moves(gathers_cp_input=compute_gathers_cp) if cp_shards else None
     axes, attention, local, full = _row_layouts(variant)
     on_rank_rows = (
         is_moe_input_scattered_across_dp_ranks()
@@ -142,7 +145,7 @@ def _resolve_ffn(
             residual,
             returned,
         )
-    if cp_shards and _cp_moves().reduce_scatter is not None:
+    if cp_moves is not None and cp_moves.reduce_scatter is not None:
         may_leave = variant is not BatchVariant.CONTEXT_PARALLEL
         may_scatter = True
     elif cp_shards or parallel.attn_dp_size > 1:
@@ -162,6 +165,7 @@ def _resolve_ffn(
         else OutputContract(
             rows,
             group=group,
+            always_partial=compute_gathers_cp,
             may_defer_to_next=may_leave
             and not terminal
             and not update.applied_at_exit
@@ -176,7 +180,18 @@ def _resolve_ffn(
     )
     returned = local if on_rank_rows and not terminal else attention
     return (
-        StageContract(InputContract(rows, read=read), produced),
+        StageContract(
+            InputContract(
+                rows,
+                gathered_by_compute=(
+                    frozenset({TokenAxis.ATTN_CP})
+                    if compute_gathers_cp
+                    else frozenset()
+                ),
+                read=read,
+            ),
+            produced,
+        ),
         local if on_rank_rows else attention,
         returned,
     )
@@ -201,6 +216,9 @@ class StageDeclaration:
         reduction: Whether compute always leaves a partial sum, obeys the
             exit scope, or adds a replicated component after its own sum.
         gathers_attn_tp_input: Whether attention gathers TP-sharded input itself.
+        gathers_cp_input: Whether a sparse FFN gathers CP-local input itself on
+            collocated rank-major prefill CP, after routing the local rows,
+            and leaves the full-row partial sum to its output boundary.
         dense_tp_size: Dense FFN compute width: None uses the configured width,
             1 means local compute, and the full TP size means TP compute.
         exit_rows: Required FFN output rows at the layer or branch exit.
@@ -220,6 +238,7 @@ class StageDeclaration:
     output_transform: Optional[OutputTransform] = None
     reduction: ProducerReduction = ProducerReduction.EXIT_SCOPED
     gathers_attn_tp_input: bool = False
+    gathers_cp_input: bool = False
     dense_tp_size: Optional[int] = None
     exit_rows: Optional[ExitRows] = None
     # Only declarations participate in construction, never executable stages.
@@ -311,6 +330,7 @@ def declare_ffn(
     dense_tp_size=None,
     reduction=ProducerReduction.EXIT_SCOPED,
     exit_rows=None,
+    gathers_cp_input=False,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -331,10 +351,17 @@ def declare_ffn(
             replicated tail after the sum. ALWAYS_PARTIAL is rejected for FFN stages.
         exit_rows: Explicit output-row requirement; otherwise derived from
             the adjacent FFN kinds and TBO configuration.
+        gathers_cp_input: Sparse compute accepts CP-local normalized rows,
+            gathers its input and routing payload, and returns a full-row partial
+            sum. The boundary completes that sum and returns local rows. Only
+            collocated rank-major prefill CP is supported; ordinary batches keep
+            their existing input and reduction contracts.
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
     """
+    if gathers_cp_input and not sparse:
+        raise ValueError("compute-owned CP gathering requires a sparse FFN")
     if reduction is ProducerReduction.ALWAYS_PARTIAL:
         raise ValueError("ALWAYS_PARTIAL is not supported for ffn stages")
     return StageDeclaration(
@@ -348,6 +375,7 @@ def declare_ffn(
         output_transform=output_transform,
         dense_tp_size=dense_tp_size,
         reduction=reduction,
+        gathers_cp_input=gathers_cp_input,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
     )
 
@@ -355,7 +383,7 @@ def declare_ffn(
 def _resolve_stage(stage, variant, following=None):
     axes, attention, local, full = _row_layouts(variant)
     if stage.update.applied_at_exit:
-        if stage.sparse and moe_gathers_over_moe_cp():
+        if stage.sparse and moe_gathers_over_moe_cp() and not stage.gathers_cp_input:
             raise NotImplementedError(
                 "MHC does not support a MoE gathered over the MoE-CP group"
             )
@@ -373,6 +401,7 @@ def _resolve_stage(stage, variant, following=None):
             update=stage.update,
             dense_tp_size=stage.dense_tp_size,
             reduction=stage.reduction,
+            gathers_cp_input=stage.gathers_cp_input,
         )
         if resolve_exit_rows(stage.exit_rows) is ExitRows.ATTENTION:
             returned = attention
@@ -466,7 +495,12 @@ def _connect(producer, consumer, *, residual_from=None):
                         and before.reduction is ProducerReduction.EXIT_SCOPED
                     )
                     or resolve_exit_rows(before.exit_rows) is ExitRows.ATTENTION
-                ) and (decl.output.always_partial or decl.output.may_defer_to_next)
+                ) and (
+                    # An FFN's always-partial compute is completed by its own
+                    # exit. Only attention publishes a declared partial sum.
+                    (before.kind is StageKind.ATTENTION and decl.output.always_partial)
+                    or decl.output.may_defer_to_next
+                )
                 arrived = OutputContract(
                     returned,
                     group=decl.output.group

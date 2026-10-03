@@ -37,6 +37,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
+    get_moe_cp_group,
     get_moe_cp_rank,
     is_allocation_symmetric,
     moe_cp_all_gather_into_tensor,
@@ -388,10 +389,42 @@ def dp_cp_take_back_output(
     return local_hidden_states, residual
 
 
+def _moe_cp_output_rows(hidden_states, forward_batch):
+    rows = moe_cp_gathered_rows(forward_batch)
+    group = get_moe_cp_group()
+    if rows is None or len(rows) != group.world_size:
+        raise ValueError("MoE-CP output requires one row count per CP rank")
+    if min(rows) < 0 or hidden_states.shape[0] != max(rows) * group.world_size:
+        raise ValueError("MoE-CP output must contain equal padded rank-major blocks")
+    return rows
+
+
+def moe_cp_reduce_scatter_output(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    forward_batch: ForwardBatch,
+    **kwargs,
+):
+    """Sum rank-major, equally padded MoE-CP blocks and return this rank's rows.
+
+    Compute gathers the local rows and routing payload with the same padding as
+    ``moe_cp_gather``. Padding belongs to the collective, not to the residual.
+    """
+    rows = _moe_cp_output_rows(hidden_states, forward_batch)
+    group = get_moe_cp_group()
+    max_tokens = max(rows)
+    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+        local = hidden_states.new_empty((max_tokens, *hidden_states.shape[1:]))
+    if max_tokens:
+        group.reduce_scatter_tensor(local, hidden_states)
+    return local[: rows[group.rank_in_group]], residual
+
+
 def moe_cp_take_back_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
+    validate_rows: bool = False,
     **kwargs,
 ):
     """Return a MoE output computed on the MoE-CP-gathered rows to this rank's attention rows.
@@ -404,8 +437,11 @@ def moe_cp_take_back_output(
     If DP>1, further scatter back to the local DP slice.
     """
     # Only scatter back during prefill; decode was never allgathered so no-op.
-    # CP extend has non-zero tokens per rank, and decode skips this path.
-    rows = moe_cp_gathered_rows(forward_batch)
+    rows = (
+        _moe_cp_output_rows(hidden_states, forward_batch)
+        if validate_rows
+        else moe_cp_gathered_rows(forward_batch)
+    )
     if rows is not None:
         hidden_states = moe_cp_take_back(hidden_states, rows)
 

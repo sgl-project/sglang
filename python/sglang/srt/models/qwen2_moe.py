@@ -20,7 +20,17 @@
 
 import logging
 from contextlib import nullcontext
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn.functional as F
@@ -68,7 +78,12 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutputChecker,
+    select_experts,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -803,6 +818,83 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = None
 
         return router_output, shared_output
+
+    def forward_cp(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        all_gather_rows: Callable[..., list[torch.Tensor]],
+        symmetric_memory: Callable[[], ContextManager],
+    ) -> torch.Tensor:
+        """Route local rows, gather them for TP experts, and return partial output.
+
+        The ``gathers_cp_input`` boundary validates the TP-only topology and
+        owns reduction and return to local rows. The gather zero-pads every
+        tensor into the same rank-major row blocks.
+        """
+        moe = get_exec().moe
+        cfg = self.topk.topk_config
+        if not _is_cuda:
+            raise NotImplementedError("CP routing requires CUDA")
+        if (
+            moe.enable_eplb
+            or moe.init_expert_location != "trivial"
+            or moe.ep_num_redundant_experts > 0
+            or moe.expert_distribution_recorder_mode is not None
+            or (
+                cfg.allow_routed_experts_capture
+                and get_exec().features.enable_return_routed_experts
+            )
+        ):
+            raise NotImplementedError(
+                "CP routing requires trivial expert placement without expert recording"
+            )
+        if (
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        ):
+            raise NotImplementedError("CP routing does not support simulated routing")
+
+        with symmetric_memory():
+            if hidden_states.shape[0]:
+                router_logits, _ = self.gate(hidden_states)
+                # Materialize routes even when the runner normally uses a
+                # logits-based fused router (BYPASSED TopK output).
+                local_topk = select_experts(
+                    hidden_states, router_logits, cfg, layer_id=self.layer_id
+                )
+                weights = local_topk.topk_weights.to(torch.float32)
+                ids = local_topk.topk_ids.to(torch.int32)
+            else:
+                # Empty ranks still participate in the gather.
+                weights = torch.empty(
+                    (0, cfg.top_k), dtype=torch.float32, device=hidden_states.device
+                )
+                ids = torch.empty(
+                    (0, cfg.top_k), dtype=torch.int32, device=hidden_states.device
+                )
+        gathered, weights, ids = all_gather_rows(hidden_states, weights, ids)
+        if gathered.shape[0] == 0:
+            return gathered
+        topk_output = StandardTopKOutput(weights, ids, None)
+        if self.enable_shared_expert_fusion:
+            topk_output = self._append_shared_to_topk_output(topk_output, gathered)
+        use_fused_gate = self.shared_expert_gate is not None
+        shared_output = self._forward_shared_experts(
+            gathered, apply_gate=not use_fused_gate
+        )
+        final_hidden_states = self.experts(gathered, topk_output)
+        if shared_output is not None:
+            if use_fused_gate:
+                fused_gate_sigmoid_mul_add(
+                    gathered,
+                    self.shared_expert_gate.weight.squeeze(),
+                    shared_output,
+                    final_hidden_states,
+                )
+            else:
+                final_hidden_states += shared_output
+        return final_hidden_states
 
     def forward(
         self,

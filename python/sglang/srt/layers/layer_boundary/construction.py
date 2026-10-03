@@ -276,10 +276,10 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
         raise ValueError("incoming and outgoing batch variants disagree")
     variants = {}
     for variant, edge in incoming.entries.items():
-        if (
-            declaration.update.applied_at_exit
-            and TokenAxis.ATTN_CP
-            in edge.produced.layout.sharded - edge.need.layout.sharded
+        if declaration.update.applied_at_exit and TokenAxis.ATTN_CP in (
+            edge.produced.layout.sharded
+            - edge.need.layout.sharded
+            - edge.need.gathered_by_compute
         ):
             raise NotImplementedError("MHC with a gather over attention CP")
         attn_input_adapter = None
@@ -290,7 +290,11 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
                 and not declaration.update.is_plain_add
                 else _attn_input_default
             )
-        moves = _cp_moves() if variant is BatchVariant.CONTEXT_PARALLEL else None
+        moves = (
+            _cp_moves(gathers_cp_input=declaration.gathers_cp_input)
+            if variant is BatchVariant.CONTEXT_PARALLEL
+            else None
+        )
         variants[variant] = VariantEdges(
             edge, outgoing.exits[variant], attn_input_adapter, moves
         )

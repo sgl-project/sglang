@@ -19,6 +19,7 @@ from typing import Callable, NamedTuple, Optional, Tuple
 
 import msgspec
 
+from sglang.srt.layers.dp_attention import get_moe_cp_group
 from sglang.srt.layers.layer_boundary.contracts import (
     CpMoves,
     EdgeContract,
@@ -43,6 +44,7 @@ from sglang.srt.layers.layer_boundary.ops import (
     attn_tp_slice_output,
     dp_cp_take_back_output,
     keep_output,
+    moe_cp_reduce_scatter_output,
     moe_cp_take_back_output,
     move_rows,
     residual_slice_output,
@@ -64,6 +66,10 @@ from sglang.srt.layers.layer_boundary.prepare import (
     _tp_sum_with_residual_read,
     _update_read,
 )
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    is_moe_input_scattered_across_dp_ranks,
+)
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -84,10 +90,51 @@ def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
     raise NotImplementedError(f"{layer_input_rows=}")
 
 
-def _cp_moves() -> CpMoves:
+def _validate_compute_cp_gather():
+    """A local router's rank-major gather must cover exactly the expert sum."""
+    parallel = get_parallel()
+    if not (
+        parallel.enable_prefill_cp
+        and parallel.attn_cp_size == parallel.tp_size > 1
+        and parallel.attn_tp_size == parallel.attn_dp_size == 1
+        and parallel.moe_dp_size == parallel.moe_ep_size == 1
+        and parallel.moe_tp_size == parallel.tp_size
+        and get_moe_a2a_backend().is_none()
+        and parallel.dwdp_size == 1
+        and not is_moe_input_scattered_across_dp_ranks()
+        and not _cp_gathers_over_attn_cp()
+    ):
+        raise NotImplementedError(
+            "compute-owned CP gathering requires collocated rank-major prefill CP "
+            "with CP == TP, attention TP/DP == 1, MoE DP/EP == 1, and no all-to-all"
+        )
+    ranks = list(get_moe_cp_group().ranks)
+    if any(
+        list(group.ranks) != ranks
+        for group in (
+            parallel.tp_group,
+            parallel.attn_cp_group,
+            _sum_group(SumGroup.MOE_OUTPUT),
+        )
+    ):
+        raise NotImplementedError(
+            "compute-owned CP gathering requires identical ordered CP and MoE sum ranks"
+        )
+
+
+def _cp_moves(*, gathers_cp_input: bool = False) -> CpMoves:
     """DSA and MLA CP gather equal shards over the attention-CP group and can
     complete a sum over it. GQA prefill CP gathers blocks padded to the longest
-    over the MoE-CP group and takes back only a complete output."""
+    over the MoE-CP group and takes back only a complete output. An opted-in
+    collocated MoE gathers its own input and leaves its sum to the return move."""
+    if gathers_cp_input:
+        _validate_compute_cp_gather()
+        return CpMoves(
+            gather=_then_moe_cp_gather,
+            take_back=partial(moe_cp_take_back_output, validate_rows=True),
+            reduce_scatter=moe_cp_reduce_scatter_output,
+            reduce_scatter_group=get_moe_cp_group,
+        )
     if _cp_gathers_over_attn_cp():
         return CpMoves(
             gather=_then_attn_cp_gather,
