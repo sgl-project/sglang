@@ -1,12 +1,16 @@
 """Exercise container and ancestor budgets using synthetic procfs/cgroup files."""
 
+import functools
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache import host_memory
 from sglang.test.ci.ci_register import register_cpu_ci
+
+_cgroup_memory_headroom = host_memory._cgroup_memory_headroom
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -112,11 +116,48 @@ class TestHostMemory(unittest.TestCase):
             ):
                 self.assertEqual(host_memory.available_host_memory_bytes(), expected)
 
-    def test_unmounted_memory_cgroup_fails(self):
-        self.configure()
-        (self.proc / "self/mountinfo").write_text("")
-        with self.assertRaisesRegex(RuntimeError, "Cannot locate"):
-            host_memory._cgroup_memory_headroom(self.proc)
+    def available(self, host_available=5000):
+        """Public sizing entry point over the synthetic procfs."""
+        with (
+            patch.object(
+                host_memory.psutil,
+                "virtual_memory",
+                return_value=Mock(available=host_available),
+            ),
+            patch.object(
+                host_memory,
+                "_cgroup_memory_headroom",
+                functools.partial(_cgroup_memory_headroom, self.proc),
+            ),
+        ):
+            return host_memory.available_host_memory_bytes()
+
+    def without_cgroupfs(self, v1=False):
+        # A container sharing the host cgroup namespace, no cgroupfs mounted.
+        self.configure("/system.slice/engine.scope", v1=v1)
+        (self.proc / "self/mountinfo").write_text("1 0 0:1 / /proc rw - proc proc rw\n")
+
+    def test_no_cgroup_filesystem_sizes_against_host(self):
+        for v1 in [False, True]:
+            with self.subTest(v1=v1):
+                self.without_cgroupfs(v1=v1)
+                self.assertEqual(self.available(host_available=5000), 5000)
+
+    def test_explicit_budget_replaces_discovery(self):
+        # Mounted but unresolvable: discovery alone would raise.
+        self.configure("/system.slice/engine.scope")
+        with envs.SGLANG_HICACHE_HOST_MEMORY_BYTES.override(1234):
+            self.assertEqual(self.available(host_available=5000), 1234)
+        with envs.SGLANG_HICACHE_HOST_MEMORY_BYTES.override(0):
+            with self.assertRaisesRegex(ValueError, "must be positive"):
+                self.available()
+
+    def test_unresolved_mounted_cgroup_fails(self):
+        self.configure("/system.slice/engine.scope")
+        with self.assertRaisesRegex(
+            RuntimeError, "Cannot locate.*SGLANG_HICACHE_HOST_MEMORY_BYTES"
+        ):
+            self.available()
 
     def test_missing_usage_for_known_limit_fails(self):
         self.configure()
