@@ -13,3 +13,8 @@
   autograd::variable_list{};                                                   \
   throw std::runtime_error("align_tensors is unavailable in PyTorch 2.13+")
 #endif
+
+// PT 2.14-specific shims live in their own file so they can be dropped when
+// tch-rs ships a build against PyTorch 2.14; the include is a no-op on older
+// torch versions.
+#include "torch_2_14_compat.h"
