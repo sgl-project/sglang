@@ -50,7 +50,11 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
-from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_free_rendezvous_port,
+    wait_port_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -681,16 +685,43 @@ class PortArgs:
     instance_id: str = ""
 
     @staticmethod
+    def _rendezvous_port_exclusions(server_args: ServerArgs) -> list[int]:
+        cfg = resolving_view(server_args)
+        num_dp_ranks = (
+            num_dp_ranks_of(cfg) if hasattr(cfg, "attn_dp_size") else cfg.dp_size
+        )
+        ports = [server_args.port + dp_rank for dp_rank in range(num_dp_ranks)] + [
+            server_args.disaggregation_bootstrap_port,
+            server_args.encoder_bootstrap_port,
+            server_args.engine_info_bootstrap_port,
+        ]
+        if server_args.grpc_port is not None:
+            ports.append(server_args.grpc_port)
+        if server_args.gated_launch_port is not None:
+            ports.append(server_args.gated_launch_port)
+        if server_args.smg_grpc_mode or server_args.grpc_mode:
+            ports.append(
+                server_args.smg_http_sidecar_port
+                if server_args.smg_http_sidecar_port is not None
+                else server_args.port + 1
+            )
+        seed_port = server_args.remote_instance_weight_loader_seed_instance_service_port
+        if seed_port:
+            ports.append(seed_port)
+        group_ports = server_args.remote_instance_weight_loader_send_weights_group_ports
+        if group_ports:
+            ports.extend(group_ports)
+        return ports
+
+    @staticmethod
     def init_new(
         server_args: ServerArgs,
         dp_rank: int | None = None,
         worker_ports: list[int] | None = None,
     ) -> PortArgs:
         cfg = resolving_view(server_args)
-        if server_args.nccl_port is None:
-            nccl_port = get_free_port()
-        else:
-            nccl_port = server_args.nccl_port
+        nccl_port = server_args.nccl_port
+        rendezvous_port_exclusions = PortArgs._rendezvous_port_exclusions(server_args)
 
         if server_args.tokenizer_worker_num == 1:
             tokenizer_worker_ipc_name = None
@@ -720,6 +751,10 @@ class PortArgs:
             )
 
         if not attn_dp_enabled_of(cfg):
+            if nccl_port is None:
+                nccl_port = get_free_rendezvous_port(
+                    exclude_ports=rendezvous_port_exclusions
+                )
             # Normal case, use IPC within a single node
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -774,6 +809,22 @@ class PortArgs:
             else:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
+
+            rendezvous_port_exclusions.extend(
+                [
+                    dist_init_port,
+                    port_base,
+                    detokenizer_port,
+                    rpc_port,
+                    metrics_port,
+                    load_collector_port,
+                    scheduler_input_port,
+                ]
+            )
+            if nccl_port is None:
+                nccl_port = get_free_rendezvous_port(
+                    exclude_ports=rendezvous_port_exclusions
+                )
 
             is_joiner = ep_joiner_of(resolving_view(server_args))
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds

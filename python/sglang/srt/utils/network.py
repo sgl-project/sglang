@@ -3,10 +3,11 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import random
 import socket
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple, Union
 
 import psutil
 import zmq
@@ -50,7 +51,9 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
     return None
 
 
+MIN_UNPRIVILEGED_PORT = 1024
 MAX_VALID_PORT = 65535
+LINUX_EPHEMERAL_PORT_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
 
 
 def wait_port_available(
@@ -192,6 +195,73 @@ def get_free_port():
     port = sock.getsockname()[1]
     sock.close()
     return port
+
+
+def _read_linux_ephemeral_port_range() -> Optional[Tuple[int, int]]:
+    try:
+        with open(LINUX_EPHEMERAL_PORT_RANGE, encoding="utf-8") as f:
+            fields = f.read().split()
+        if len(fields) < 2:
+            return None
+        start, end = int(fields[0]), int(fields[1])
+        if 0 <= start <= end <= MAX_VALID_PORT:
+            return start, end
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _iter_ports_outside_ephemeral_range(ephemeral_start: int, ephemeral_end: int):
+    candidates = []
+
+    lower_end = min(ephemeral_start - 1, MAX_VALID_PORT)
+    candidates.extend(range(MIN_UNPRIVILEGED_PORT, lower_end + 1))
+    upper_start = max(ephemeral_end + 1, MIN_UNPRIVILEGED_PORT)
+    candidates.extend(range(upper_start, MAX_VALID_PORT + 1))
+
+    if not candidates:
+        return
+
+    start = random.randrange(len(candidates))
+    for i in range(len(candidates)):
+        yield candidates[(start + i) % len(candidates)]
+
+
+def _get_free_port_excluding(excluded):
+    for _ in range(128):
+        port = get_free_port()
+        if port not in excluded:
+            return port
+
+    for port in range(MIN_UNPRIVILEGED_PORT, MAX_VALID_PORT + 1):
+        if port not in excluded and is_port_available(port):
+            return port
+
+    raise RuntimeError("No free rendezvous port available")
+
+
+def get_free_rendezvous_port(exclude_ports: Optional[Iterable[int]] = None):
+    """Return a free port outside Linux's ephemeral client-port range when possible."""
+    excluded = {
+        port
+        for port in (exclude_ports or ())
+        if MIN_UNPRIVILEGED_PORT <= port <= MAX_VALID_PORT
+    }
+    ephemeral_range = _read_linux_ephemeral_port_range()
+    if ephemeral_range is None:
+        return _get_free_port_excluding(excluded)
+    else:
+        for port in _iter_ports_outside_ephemeral_range(*ephemeral_range):
+            if port not in excluded and is_port_available(port):
+                return port
+
+        logger.warning(
+            "No free rendezvous port outside Linux ephemeral range %s-%s; "
+            "falling back to an OS-assigned port.",
+            ephemeral_range[0],
+            ephemeral_range[1],
+        )
+    return _get_free_port_excluding(excluded)
 
 
 def bind_port(port):
