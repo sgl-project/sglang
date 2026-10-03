@@ -37,6 +37,11 @@ def handle_ppu_backends(server_args: Any):
         envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(True)
     if envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
         check_acext_version_compatibility()
+    # deep gemm init
+    if not envs.SGLANG_SAIL_DEEPGEMM_DENSE.is_set():
+        envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
+    if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
+        envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
     if cfg.chunked_prefill_size is not None:
         set_acext_token_limit(
             acext_num_tokens=int(cfg.chunked_prefill_size * 0.5),

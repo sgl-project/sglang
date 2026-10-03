@@ -24,6 +24,7 @@ from .compressed_tensors_wNa16 import (
     XPUCompressedTensorsWNA16,
 )
 from .compressed_tensors_wNa16_moe import (
+    CompressedTensorsWNA16DeepGemmMoE,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
@@ -42,6 +43,7 @@ __all__ = [
     "XPUCompressedTensorsWNA16",
     "CompressedTensorsWNA16MoE",
     "CompressedTensorsWNA16TritonMoE",
+    "CompressedTensorsWNA16DeepGemmMoE",
     "NPUCompressedTensorsW4A16Int4DynamicMoE",
     "WNA16_SUPPORTED_BITS",
     "CompressedTensorsW4A4Fp4",

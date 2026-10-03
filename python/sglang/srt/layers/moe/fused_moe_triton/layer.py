@@ -8,6 +8,7 @@ from functools import cached_property
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -60,13 +61,21 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+    CompressedTensorsFusedMoEMethod,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
+    CompressedTensorsW8A8Fp8MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8FP8MoEMethod
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8MoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
@@ -85,11 +94,13 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
+    is_ppu,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -185,6 +196,7 @@ def create_moe_dispatcher(
         or a2a_backend.is_nixl()
         or a2a_backend.is_pplx()
     ):
+        use_recv_hook = envs.SGLANG_SAIL_DEEPEP_RECV_HOOK.get()
         return MaybeTboDeepEPDispatcher(
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
@@ -195,7 +207,7 @@ def create_moe_dispatcher(
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=True,
+            return_recv_hook=use_recv_hook,
         )
     elif a2a_backend.is_deepep_v2():
         output_dtype = get_deepep_v2_dispatcher_output_dtype(
@@ -557,6 +569,13 @@ class FusedMoE(torch.nn.Module):
         ):
             self.moe_runner_config.inplace = False
 
+        # Build the dictionary used by the dispatcher to infer the DeepEP
+        # output dtype. On PPU the ``dispatcher_output_dtype`` field tells the
+        # dispatcher whether to use fp8/int8/uint8 dispatch paths.
+        dispatcher_quant_config = self._build_dispatcher_quant_config()
+
+        self.dispatcher.set_quant_config(dispatcher_quant_config)
+
         self.should_fuse_routed_scaling_factor_in_topk = (
             _fuses_routed_scaling_factor_in_topk(self.quant_method)
         )
@@ -630,6 +649,56 @@ class FusedMoE(torch.nn.Module):
             param.data = tensor
         else:
             setattr(self, name, tensor)
+
+    def _build_dispatcher_quant_config(self) -> dict:
+        """Build the dictionary passed to ``dispatcher.set_quant_config``.
+
+        The dispatcher only accepts dictionaries. This method converts the
+        layer's ``quant_config`` object (e.g. ``CompressedTensorsConfig``)
+        into a dict with the fields required by the dispatcher, while
+        preserving the existing object for weight-loading paths.
+        """
+        if not _is_ppu:
+            return self.dispatcher.quant_config
+
+        quant_config_dict: dict = {}
+
+        # On PPU the DeepEP dispatcher needs to know the concrete dispatch dtype.
+        # We communicate it through the same ``dispatcher_output_dtype`` field
+        # that ``get_deepep_output_dtype`` consumes, keeping dtype decisions
+        # config-driven and consistent across layer.py and utils.py.
+        if (
+            isinstance(self.quant_method, Fp8MoEMethod)
+            or isinstance(self.quant_method, W8A8FP8MoEMethod)
+            or (
+                isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+                and isinstance(self.scheme, CompressedTensorsW8A8Fp8MoE)
+            )
+        ):
+            quant_config_dict["dispatcher_output_dtype"] = "fp8"
+        elif isinstance(self.quant_method, W8A8Int8MoEMethod):
+            quant_config_dict["dispatcher_output_dtype"] = "int8"
+        elif isinstance(self.quant_method, Mxfp4MoEMethod):
+            quant_config_dict["dispatcher_output_dtype"] = "uint8"
+        # default use bf16 dispatcher on ppu (e.g. unquant, wn_a16)
+        else:
+            quant_config_dict["dispatcher_output_dtype"] = "bf16"
+
+        is_channel_quant = False
+        if isinstance(self.quant_config, CompressedTensorsConfig):
+            linear_scheme = self.quant_config.target_scheme_map.get("Linear", {})
+            weight_scheme = linear_scheme.get("weights") if linear_scheme else None
+            if (
+                weight_scheme is not None
+                and weight_scheme.strategy == QuantizationStrategy.CHANNEL
+            ):
+                is_channel_quant = True
+
+        if isinstance(self.quant_method, W8A8Int8MoEMethod):
+            is_channel_quant = True
+
+        quant_config_dict["is_channel_quant"] = is_channel_quant
+        return quant_config_dict
 
     @cached_property
     def use_padded_loading(self) -> bool:
@@ -1218,6 +1287,7 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16MarlinMoE",
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
+                    "CompressedTensorsWNA16DeepGemmMoE",
                 ]
             )
             and "zero" not in weight_name
@@ -1471,6 +1541,7 @@ class FusedMoE(torch.nn.Module):
                 in [
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
+                    "CompressedTensorsWNA16DeepGemmMoE",
                 ]
             )
             and "zero" not in weight_name

@@ -30,6 +30,8 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -50,6 +52,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
+    CompressedTensorsWNA16DeepGemmMoE,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
@@ -72,12 +75,13 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_ppu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_ppu = is_ppu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -871,6 +875,21 @@ class CompressedTensorsConfig(QuantizationConfig):
                             f"Using CompressedTensorsWNA16TritonMoE ({reason})"
                         )
                         return CompressedTensorsWNA16TritonMoE(
+                            self, weight_quant=weight_quant
+                        )
+                    if (
+                        _is_ppu
+                        and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+                        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                        and weight_quant.type == QuantizationType.INT
+                        and weight_quant.num_bits == 4
+                        and weight_quant.group_size == 32
+                    ):
+                        logger.info_once(
+                            "Using CompressedTensorsWNA16DeepGemmMoE "
+                            "(moe_runner_backend=deep_gemm)"
+                        )
+                        return CompressedTensorsWNA16DeepGemmMoE(
                             self, weight_quant=weight_quant
                         )
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")

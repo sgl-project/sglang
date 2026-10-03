@@ -93,6 +93,9 @@ class CudaDeviceMixin(DeviceMixin):
     def get_torch_distributed_backend_str(self) -> str:
         return "nccl"
 
+    def get_device_num_tensorcores(self, device_id: int = 0) -> int:
+        return torch.cuda.get_device_properties(device="cuda").multi_processor_count
+
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:
         if seed is not None:

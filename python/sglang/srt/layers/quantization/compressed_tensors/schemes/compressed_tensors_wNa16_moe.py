@@ -26,7 +26,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     moe_awq_to_marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_ppu, set_weight_attrs
 
 if TYPE_CHECKING:
     from compressed_tensors.quantization import QuantizationArgs
@@ -42,11 +42,13 @@ if TYPE_CHECKING:
 __all__ = [
     "CompressedTensorsWNA16MoE",
     "CompressedTensorsWNA16TritonMoE",
+    "CompressedTensorsWNA16DeepGemmMoE",
     "NPUCompressedTensorsW4A16Int4DynamicMoE",
 ]
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_ppu = is_ppu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -560,6 +562,42 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         )
 
         quant_info = self.get_triton_quant_info(layer)
+        return self.runner.run(dispatch_output, quant_info)
+
+
+class CompressedTensorsWNA16DeepGemmMoE(CompressedTensorsWNA16MoE):
+    """PPU W4A16 MoE method using DeepGemm kernels instead of Marlin."""
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        import sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe  # noqa: F401 – triggers @register_fused_func
+
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.DEEP_GEMM, moe_runner_config)
+
+    def get_deep_gemm_quant_info(self, layer):
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+        return DeepGemmMoeQuantInfo(
+            w13_weight=layer.w13_weight_packed,
+            w2_weight=layer.w2_weight_packed,
+            use_int4_w4a16=True,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            block_shape=[0, self.group_size],
+        )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
+
+        quant_info = self.get_deep_gemm_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
 
 

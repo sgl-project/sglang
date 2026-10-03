@@ -21,8 +21,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalDispatchOutput
 from sglang.srt.layers.moe.utils import is_sbo_enabled
-from sglang.srt.utils import is_blackwell
+from sglang.srt.platforms import current_platform
+from sglang.srt.utils import is_blackwell, is_ppu
 
 
 class SboFlags:
@@ -85,13 +87,15 @@ def compute_overlap_args(dispatch_output, alt_stream):
     ):
         return None, None, {}
 
+    # sbo expected in deepep ll mode, and normal mode will raise error in following code, skipping here
+    if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
+        return None, None, {}
+
     hidden_states = dispatch_output.hidden_states
 
     num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
 
-    total_num_sms = torch.cuda.get_device_properties(
-        device="cuda"
-    ).multi_processor_count
+    total_num_sms = current_platform.get_device_num_tensorcores()
 
     if envs.SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS.is_set():
         communicate_num_sms = envs.SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS.get()
@@ -120,7 +124,11 @@ def compute_overlap_args(dispatch_output, alt_stream):
                 num_local_experts, dtype=torch.uint32, device=hidden_states.device
             )
         else:
-            MIN_BLOCK_M = 64
+            # <NOTE>
+            # MIN_BLOCK_M must equal to kMinBlockM in DeepEP
+            # TODO: get MIN_BLOCK_M from deepep interface
+            # </NOTE>
+            MIN_BLOCK_M = 64 if not is_ppu() else 16
             combine_signal_size = num_local_experts * (
                 (num_tokens_static + MIN_BLOCK_M - 1) // MIN_BLOCK_M
             )

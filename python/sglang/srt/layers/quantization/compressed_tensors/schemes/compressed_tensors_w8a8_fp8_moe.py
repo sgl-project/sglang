@@ -7,13 +7,13 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
-    get_moe_a2a_backend,
     get_moe_runner_backend,
     get_moe_weight_sizes,
 )
@@ -27,7 +27,7 @@ from sglang.srt.layers.quantization.utils import (
     swap_w13_to_w31,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, is_ppu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -342,23 +342,44 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto():
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and is_ppu()
+            and (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            )
+        ):
+            moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+        elif moe_runner_backend.is_auto():
             if (
                 _use_aiter
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
                 and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
+            elif (
+                envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+                and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+                and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            ):
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if moe_runner_backend.is_deep_gemm():
+            import sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe  # noqa: F401 – triggers @register_fused_func
 
         if (
             moe_runner_backend.is_aiter()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
+            or moe_runner_backend.is_deep_gemm()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -372,7 +393,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
     ) -> CombineInput:
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
 
@@ -430,15 +450,32 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 )
             return self.runner.run(dispatch_output, quant_info)
         else:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8_w8a8=True,
-                per_channel_quant=self.weight_quant.strategy
-                == QuantizationStrategy.CHANNEL,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-            )
+            backend = self.runner.runner_backend
+            if backend.is_triton():
+                quant_info = TritonMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8_w8a8=True,
+                    per_channel_quant=self.weight_quant.strategy
+                    == QuantizationStrategy.CHANNEL,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    a13_scale=layer.w13_input_scale,
+                    a2_scale=layer.w2_input_scale,
+                )
+            elif backend.is_deep_gemm():
+                from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                    DeepGemmMoeQuantInfo,
+                )
+
+                quant_info = DeepGemmMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8=True,
+                    per_channel_quant=self.weight_quant.strategy
+                    == QuantizationStrategy.CHANNEL,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    block_shape=None,
+                )
             return self.runner.run(dispatch_output, quant_info)

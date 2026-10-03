@@ -6,12 +6,14 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_musa,
+    is_ppu,
 )
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
+_is_ppu = is_ppu()
 
 
 def _sm120_deep_gemm_apis_available() -> bool:
@@ -36,7 +38,11 @@ def _compute_enable_deep_gemm():
         return False
 
     sm_version = get_device_sm()
-    if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
+    if not _is_ppu and (
+        (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31)
+    ):
+        return False
+    elif _is_ppu and sm_version < 80:
         return False
     # SM120/SM121 support (mma.sync block-scale, no TMEM) landed in DeepGEMM#324;
     # probe every API used by the SM120 DSV4 paths since installed builds may
@@ -58,7 +64,7 @@ DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and get_platform().is_sm100
 DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
     get_platform().is_sm100 or get_device_sm() in (120, 121)
 )
-DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
+DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa or _is_ppu)
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:

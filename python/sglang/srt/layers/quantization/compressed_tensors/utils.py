@@ -182,7 +182,8 @@ def _is_equal_or_regex_match(
         if re.match(pattern, value):
             return True
     elif check_contains:
-        if target.lower() in value.lower():
+        # add "value.lower() in target.lower()" check for kimi-2.5 mxfp4
+        if target.lower() in value.lower() or value.lower() in target.lower():
             return True
     elif target == value:
         return True
