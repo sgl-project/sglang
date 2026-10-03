@@ -1023,6 +1023,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         global_backend = get_moe_runner_backend()
         if base_layer.runner is not None:
             runner_backend = base_layer.runner.runner_backend
+            # UnquantizedFusedMoEMethod.create_moe_runner resolves experimental_sgl_trtllm to the
+            # stock FLASHINFER_TRTLLM runner, because the two share the kernels and the weight
+            # layout. That erases the identity the experimental LoRA dispatch below keys on, so an
+            # unquantized MoE served with --moe-runner-backend experimental_sgl_trtllm --enable-lora
+            # falls through to get_moe_quant_info(), which no quant method implements for
+            # 'flashinfer_trtllm', and raises at LoRA-layer init. Restore what the user asked for.
+            if (
+                global_backend.is_experimental_sgl_trtllm()
+                and runner_backend.is_flashinfer_trtllm()
+            ):
+                runner_backend = global_backend
         elif not global_backend.is_auto():
             runner_backend = global_backend
         else:
