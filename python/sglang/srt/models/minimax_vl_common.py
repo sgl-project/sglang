@@ -93,6 +93,7 @@ class MiniMaxVLMultiModalProjector(nn.Module):
             type(self).__name__,
             shard_tp_size=tp_size,
             reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
             hint=", or --mm-enable-dp-encoder where the model supports it",
         )
 
@@ -157,6 +158,7 @@ class MiniMaxVLPatchMerger(nn.Module):
             type(self).__name__,
             shard_tp_size=tp_size,
             reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
             hint=", or --mm-enable-dp-encoder where the model supports it",
         )
 
@@ -288,6 +290,7 @@ class CLIPEncoderLayer(nn.Module):
             type(self).__name__,
             shard_tp_size=tp_size,
             reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
             hint=", or --mm-enable-dp-encoder where the model supports it",
         )
 

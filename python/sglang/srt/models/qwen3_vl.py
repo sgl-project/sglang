@@ -156,6 +156,7 @@ class Qwen3_VisionMLP(nn.Module):
             type(self).__name__,
             shard_tp_size=self.tp_size,
             reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
             hint=", or --mm-enable-dp-encoder where the model supports it",
         )
         self.linear_fc1 = ColumnParallelLinear(
@@ -334,6 +335,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
                 type(self).__name__,
                 shard_tp_size=self.tp_size,
                 reduces_over_attn_tp=is_dp_attention_enabled(),
+                multimodal_encoder=True,
                 hint=", or --mm-enable-dp-encoder where the model supports it",
             )
             self.linear_fc1 = ColumnParallelLinear(

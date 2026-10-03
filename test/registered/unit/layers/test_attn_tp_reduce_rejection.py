@@ -79,10 +79,9 @@ class TestAttnTpReduceRejection(CustomTestCase):
         self.publish(tp_size=4, attn_cp_size=2)
         Qwen3_VisionMLP(16, 32, bias=False, hidden_act="relu", use_data_parallel=True)
 
-    def test_a_language_only_instance_builds_its_tower_without_running_it(self):
-        """A language-only or language-model-only instance constructs its
-        multimodal tower but forwards it on the encoder instance instead, so
-        the layout it serves must not be refused."""
+    def test_a_worker_that_never_forwards_its_tower(self):
+        """Most models build their multimodal tower unconditionally. Where the
+        tower is not forwarded, the layout it would need must not be refused."""
         from sglang.srt.models.clip import CLIPAttention
 
         config = SimpleNamespace(
@@ -91,10 +90,33 @@ class TestAttnTpReduceRejection(CustomTestCase):
         self.publish(tp_size=4, attn_dp_size=2)
         with self.assertRaisesRegex(ValueError, "CLIPAttention shards over"):
             CLIPAttention(config)
-        for role in ("language_only", "language_model_only"):
-            with self.subTest(role=role):
-                self.publish(tp_size=4, attn_dp_size=2, **{role: True})
+        for fields in (
+            # The encoder instance forwards the tower instead.
+            dict(language_only=True),
+            # Multimodal requests are rejected outright.
+            dict(language_model_only=True),
+            # A decode instance embeds nothing.
+            dict(disaggregation_mode="decode"),
+        ):
+            with self.subTest(**fields):
+                self.publish(tp_size=4, attn_dp_size=2, **fields)
                 CLIPAttention(config)
+
+    def test_a_text_layer_is_checked_on_every_worker(self):
+        """The exemption belongs to towers that do not run, not to the worker:
+        a text attention still reduces on a language-only instance."""
+        from sglang.srt.models.phimoe import PhiMoEAttention
+
+        for fields in (
+            {},
+            dict(language_only=True),
+            dict(language_model_only=True),
+            dict(disaggregation_mode="decode"),
+        ):
+            with self.subTest(**fields):
+                self.publish(tp_size=4, attn_dp_size=2, **fields)
+                with self.assertRaisesRegex(ValueError, "PhiMoEAttention shards over"):
+                    PhiMoEAttention(hidden_size=16, num_heads=4, num_kv_heads=4)
 
     def test_the_other_gated_attentions_refuse_the_same_layout(self):
         """These models have no checkpoint in CI, so state the gate on the
