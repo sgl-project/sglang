@@ -49,9 +49,12 @@ mod tests {
         let mut ctx = crate::server::app_context::AppContext::stub();
         ctx.config.model = crate::config::ModelConfig {
             id: "qwen3".into(),
-            tokenizer_path: "x".into(),
+            tokenizer_path: Some("x".into()),
+            disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
@@ -60,6 +63,7 @@ mod tests {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         };
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));
         let res = app

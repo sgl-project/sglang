@@ -122,6 +122,12 @@ class TestHipAutoEnableRejectionSampling(CustomTestCase):
     def test_already_on_is_a_no_op(self):
         self.assertFalse(_hip_auto_enable(use_rejection_sampling=True))
 
+    def test_simulate_acc_len_stays_off(self):
+        # AgentX throughput overwrites accept after real verify; skip the
+        # Triton chain sampler so HIP stays on the greedy argmax path.
+        self.assertFalse(_hip_auto_enable(simulate_acc_len=3.39))
+        self.assertTrue(_hip_auto_enable(simulate_acc_len=-1.0))
+
 
 if __name__ == "__main__":
     unittest.main()

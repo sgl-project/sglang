@@ -27,15 +27,16 @@
 
 use std::time::Duration;
 
+use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use tracing::warn;
 use url::Url;
 
-use crate::policies::kv_events::EventConfig;
+use crate::state::kv_events::EventConfig;
 
 /// Default timeout for `/server_info`. Conservative for a small JSON
 /// payload served by SGLang's HTTP server.
-const SERVER_INFO_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const SERVER_INFO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Retry budget for transient `/server_info` failures (connect/timeout/5xx).
 /// 4xx + JSON-parse errors short-circuit — they're authoritative.
@@ -65,6 +66,9 @@ pub struct ServerInfo {
     /// protocol costs throughput and never correctness. Consumed by
     /// `manager::register_one` to set [`crate::workers::WireProtocol`].
     pub enable_http2: Option<bool>,
+    /// DP ranks behind the endpoint, mirroring the engine's `num_dp_ranks_of`;
+    /// an absent field counts as 1.
+    pub dp_ranks: u32,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -82,6 +86,16 @@ pub enum DisaggregationRole {
     Decode,
 }
 
+/// Client for the router's own requests to workers, sending `auth` (from
+/// `--worker-api-key`) as the `Authorization` header when set.
+pub fn worker_client(timeout: Duration, auth: Option<HeaderValue>) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .default_headers(auth.map(|v| (AUTHORIZATION, v)).into_iter().collect())
+        .build()
+        .expect("worker http client builds")
+}
+
 /// Performs the two round-trips concurrently and projects the responses into
 /// `ServerInfo`. Cheap to clone — wraps a `reqwest::Client` (which is
 /// internally `Arc`-backed).
@@ -91,15 +105,9 @@ pub struct WorkerIntrospector {
 }
 
 impl WorkerIntrospector {
-    /// Build with a private `reqwest::Client` carrying the supplied
-    /// request timeout.  Production callers pass `SERVER_INFO_TIMEOUT`
-    /// via `default()`; tests may pass shorter timeouts.
+    /// Build with an unauthenticated client and the given request timeout.
     pub fn new(timeout: Duration) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("introspector http client builds");
-        Self { client }
+        Self::with_client(worker_client(timeout, None))
     }
 
     /// Reuse a caller-owned `reqwest::Client`. Useful in tests that want
@@ -148,7 +156,7 @@ impl WorkerIntrospector {
 
         // EAGLE-family speculative decoding ⇒ the worker hashes KV blocks over
         // token bigrams; the router must mirror that on the selection side.
-        let is_bigram = crate::policies::kv_events::classify_bigram(
+        let is_bigram = crate::state::kv_events::classify_bigram(
             parsed.speculative_algorithm.as_deref(),
             worker_url,
         );
@@ -167,6 +175,10 @@ impl WorkerIntrospector {
             event_config,
             disaggregation_role,
             enable_http2: parsed.enable_http2,
+            dp_ranks: parsed
+                .dp_size
+                .unwrap_or(1)
+                .saturating_mul(parsed.attn_dp_size.unwrap_or(1)),
         }
     }
 
@@ -287,12 +299,6 @@ fn resolve_disaggregation_role(
     }
 }
 
-impl Default for WorkerIntrospector {
-    fn default() -> Self {
-        Self::new(SERVER_INFO_TIMEOUT)
-    }
-}
-
 /// Substitute a wildcard bind host (`*`, `0.0.0.0`, `::`, `[::]`) with
 /// the host parsed from the worker URL — the gateway has to connect to
 /// a routable address.  An unparsable worker URL leaves the host
@@ -377,6 +383,11 @@ struct ServerInfoBody {
     /// predate the flag.
     #[serde(default)]
     enable_http2: Option<bool>,
+    #[serde(default)]
+    dp_size: Option<u32>,
+    /// Absent on engines that express attention DP through `dp_size`.
+    #[serde(default)]
+    attn_dp_size: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,6 +466,34 @@ mod tests {
 
     fn fast_introspector() -> WorkerIntrospector {
         WorkerIntrospector::new(Duration::from_millis(500))
+    }
+
+    /// An engine started with `--api-key` answers `/server_info` only to the key.
+    #[tokio::test]
+    async fn fetch_sends_worker_api_key() {
+        let app = Router::new().route(
+            "/server_info",
+            get(|headers: axum::http::HeaderMap| async move {
+                match headers.get(AUTHORIZATION) {
+                    Some(v) if v == "Bearer k" => Ok(Json(json!({"served_model_name": "m"}))),
+                    _ => Err(axum::http::StatusCode::UNAUTHORIZED),
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let auth = Some(HeaderValue::from_static("Bearer k"));
+        let keyed = WorkerIntrospector::with_client(worker_client(Duration::from_secs(1), auth));
+        assert_eq!(
+            keyed.fetch(&url).await.served_model_name.as_deref(),
+            Some("m")
+        );
+        assert_eq!(
+            fast_introspector().fetch(&url).await.served_model_name,
+            None
+        );
     }
 
     /// The PRIMARY `/server_info` path (the introspector, not the discovery.rs
@@ -756,6 +795,17 @@ mod tests {
         let (url, _shutdown) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
         let got = fast_introspector().fetch(&url).await;
         assert_eq!(got.enable_http2, None);
+    }
+
+    #[tokio::test]
+    async fn fetch_counts_dp_ranks() {
+        for (body, want) in [
+            (json!({"dp_size": 1, "attn_dp_size": 8}), 8),
+            (json!({"dp_size": 4}), 4),
+        ] {
+            let (url, _shutdown) = spawn_fake_worker(body).await;
+            assert_eq!(fast_introspector().fetch(&url).await.dp_ranks, want);
+        }
     }
 
     /// Partial data (`prefill` mode with no bootstrap port) returns

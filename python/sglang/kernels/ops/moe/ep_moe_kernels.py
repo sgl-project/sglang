@@ -1270,13 +1270,13 @@ def ep_scatter_from_psum(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
+    quant_block_size: int = 128,
 ):
     BLOCK_E = 128
-    BLOCK_D = 128
     num_warps = 8
     num_experts = psum_num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
-    scale_hidden_size = hidden_size // BLOCK_D
+    scale_hidden_size = hidden_size // quant_block_size
     if scale_ue8m0:
         scale_hidden_size = ceil_div(scale_hidden_size, 4)
 

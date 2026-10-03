@@ -147,7 +147,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
@@ -160,10 +159,9 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp 32 \
-        --dp 8 \
+        --attn-dp-size 8 \
         --ep 32 \
         --moe-dense-tp-size 1 \
-        --enable-dp-attention \
         --enable-dp-lm-head \
         --watchdog-timeout 9000 \
         --mem-fraction-static 0.79 \
@@ -345,7 +343,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
@@ -358,10 +355,9 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp 32 \
-        --dp 8 \
+        --attn-dp-size 8 \
         --ep 32 \
         --moe-dense-tp-size 1 \
-        --enable-dp-attention \
         --enable-dp-lm-head \
         --watchdog-timeout 9000 \
         --mem-fraction-static 0.79 \
@@ -542,7 +538,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
@@ -555,10 +550,9 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp 32 \
-        --dp 8 \
+        --attn-dp-size 8 \
         --ep 32 \
         --moe-dense-tp-size 1 \
-        --enable-dp-attention \
         --enable-dp-lm-head \
         --watchdog-timeout 9000 \
         --mem-fraction-static 0.79 \

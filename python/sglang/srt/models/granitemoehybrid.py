@@ -4,7 +4,6 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba2AttnBackend,
@@ -27,7 +26,7 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import make_pp_layers
 
 from .granitemoe import GraniteMoeMoE, GraniteMoeSharedMLP
 
@@ -67,7 +66,6 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
                 quant_config=quant_config,
-                tp_size=get_parallel().tp_size,
                 prefix=f"{prefix}.block_sparse_moe",
             )
 
@@ -253,7 +251,6 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
                 quant_config=quant_config,
-                tp_size=get_parallel().tp_size,
                 prefix=f"{prefix}.block_sparse_moe",
             )
 
@@ -327,7 +324,7 @@ class GraniteMoeHybridModel(nn.Module):
 
         self.vocab_size = config.vocab_size
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -350,11 +347,9 @@ class GraniteMoeHybridModel(nn.Module):
                 prefix=prefix,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             get_layer,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -443,7 +438,7 @@ class GraniteMoeHybridForCausalLM(
         super().__init__()
 
         self.capture_aux_hidden_states = False
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.quant_config = quant_config
         self.config = config

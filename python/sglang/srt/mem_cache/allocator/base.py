@@ -95,6 +95,43 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
         )
 
+    def prealloc_fits_assumes_reclaim(self) -> bool:
+        """Whether `prealloc_fits` answers about the state reachable AFTER
+        reclaiming the evictable pages, so admitting on it still owes the
+        reclaim. False when the answer describes the pool as it stands.
+        """
+        return False
+
+    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
+        """Whether a demand this size could EVER be preallocated, or None when
+        this pool has no ceiling of its own and the caller's token capacity is
+        the only bound.
+        """
+        return None
+
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Whether a decode-node preallocation of this size fits.
+
+        The budgets are the scheduler's policy: what each side has left once
+        decode headroom and retraction are reserved. Separate buffers make the
+        two sides independent, so each is checked against its own budget and
+        ``tree_cache`` is never read -- what it could reclaim is already
+        inside that budget. A pool that cuts both sides from one buffer
+        overrides this to price them together, since a per-side token budget
+        cannot express a shared byte envelope.
+        """
+        return full_tokens <= full_budget_tokens and (
+            swa_budget_tokens is None or swa_tokens <= swa_budget_tokens
+        )
+
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
         """Evict unlocked prefix-cache entries until this allocator can serve
         ``num_tokens`` or nothing evictable remains.
