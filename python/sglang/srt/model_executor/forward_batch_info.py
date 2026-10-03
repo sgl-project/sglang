@@ -967,6 +967,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return_hidden_states_before_norm: bool,
         extend_position_info=None,
         spec_mrope_positions: Optional[torch.Tensor] = None,
+        pp_loras: Optional[set[Optional[str]]] = None,
         iteration_ids: Optional[IterationIds] = None,
         write_cols: Optional[Cols] = None,
     ):
@@ -1293,7 +1294,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not get_lora().enable_lora_overlap_loading:
-                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+                model_runner.lora_manager.fetch_new_loras(
+                    set(ret.lora_ids), pp_loras=pp_loras
+                )
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 

@@ -4268,6 +4268,9 @@ class Scheduler(
             running_loras = {
                 req.lora_id for req in running_batch.reqs if not req.finished()
             }
+            if get_parallel().pp_size > 1:
+                running_loras |= self._get_all_pp_loras()
+
             # Account for LoRAs that are already loaded in the adder, such as chunked requests
             running_loras.update(req.lora_id for req in adder.can_run_list)
 
@@ -4520,6 +4523,15 @@ class Scheduler(
             return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
                 new_lora_set
             )
+
+    def _get_all_pp_loras(self) -> set[Optional[str]]:
+        return {
+            req.lora_id
+            for batch in (*self.running_mbs, *self.mbs)
+            if batch is not None
+            for req in batch.reqs
+            if not req.finished()
+        }
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
@@ -4944,6 +4956,8 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                if self.enable_lora and get_parallel().pp_size > 1:
+                    kwargs["pp_loras"] = self._get_all_pp_loras()
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
