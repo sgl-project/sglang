@@ -3,7 +3,7 @@ use smg_mcp::McpConfig;
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
     HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-    RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+    ResponseCacheConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -439,6 +439,11 @@ impl RouterConfigBuilder {
 
     pub fn tokenizer_cache(mut self, cache: TokenizerCacheConfig) -> Self {
         self.config.tokenizer_cache = cache;
+        self
+    }
+
+    pub fn response_cache(mut self, cache: ResponseCacheConfig) -> Self {
+        self.config.response_cache = cache;
         self
     }
 

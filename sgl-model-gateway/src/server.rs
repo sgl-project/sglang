@@ -399,6 +399,9 @@ async fn v1_conversations_delete_item(
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
+    if let Some(cache) = &state.context.response_cache {
+        cache.clear();
+    }
     WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
         .await
         .into_response()
@@ -577,6 +580,10 @@ pub fn build_app(
         // Tokenize / Detokenize endpoints
         .route("/v1/tokenize", post(v1_tokenize))
         .route("/v1/detokenize", post(v1_detokenize))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::response_cache_middleware,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             middleware::concurrency_limit_middleware,
