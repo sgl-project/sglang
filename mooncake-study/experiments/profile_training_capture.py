@@ -106,6 +106,17 @@ def profile_workload(url, args, directory, *, input_len, output_len):
         "batches": args.steps,
         "requests": args.steps * args.concurrency,
         "capture_counter_delta": counters,
+        "kv_export_byte_delta": (
+            {
+                key: after["host_pool"][key] - before["host_pool"].get(key, 0)
+                for key in (
+                    "kv_export_host_enqueued_bytes",
+                    "kv_export_device_enqueued_bytes",
+                )
+            }
+            if after is not None
+            else {}
+        ),
         "traces": [str(path) for path in traces],
         "capture_after": after,
     }
@@ -197,6 +208,9 @@ def main():
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 14, 27])
     parser.add_argument("--kv-d2h-batch-tokens", type=int, default=1)
+    parser.add_argument(
+        "--kv-export-backend", choices=("torch", "hicache"), default="torch"
+    )
     parser.add_argument("--teacher-d2h-batch-tokens", type=int, default=1)
     parser.add_argument(
         "--teacher-topk-backend", choices=("torch", "flashinfer"), default="torch"
@@ -208,11 +222,16 @@ def main():
         or args.teacher_d2h_batch_tokens < 1
         or args.device_mib < 0
         or (
-            max(args.kv_d2h_batch_tokens, args.teacher_d2h_batch_tokens) > 1
+            (
+                max(args.kv_d2h_batch_tokens, args.teacher_d2h_batch_tokens) > 1
+                or args.kv_export_backend == "hicache"
+            )
             and not args.device_mib
         )
     ):
-        parser.error("Batched KV D2H requires positive batching and device budget")
+        parser.error(
+            "Batched D2H or HiCache export requires positive batching and device budget"
+        )
     if (
         min(args.input_len, args.output_len, args.concurrency, args.steps) < 1
         or args.warmup_steps < 0

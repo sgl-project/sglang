@@ -98,6 +98,7 @@ class CaptureConfig(StrictStruct):
     max_inflight_samples: Positive = 4
     max_host_bytes: Positive = 512 << 20
     kv_d2h_batch_tokens: Positive = 1
+    kv_export_backend: Literal["torch", "hicache"] = "torch"
     teacher_d2h_batch_tokens: Positive = 1
     teacher_topk_backend: Literal["torch", "flashinfer"] = "torch"
     max_device_bytes: Nonnegative = 0
@@ -135,6 +136,8 @@ class CaptureConfig(StrictStruct):
             raise ContractError("capture journal directory must be absolute")
         if config.kv_d2h_batch_tokens > 1 and not config.max_device_bytes:
             raise ContractError("batched KV D2H requires a device staging budget")
+        if config.kv_export_backend == "hicache" and not config.max_device_bytes:
+            raise ContractError("HiCache KV export requires a device metadata budget")
         if config.teacher_d2h_batch_tokens > 1 and not config.max_device_bytes:
             raise ContractError("batched teacher D2H requires a device staging budget")
         if config.adaptive is not None:

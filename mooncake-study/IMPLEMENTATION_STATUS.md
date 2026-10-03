@@ -27,7 +27,7 @@ it does not redefine the goal as the modules already implemented.
 | --- | --- | --- |
 | Wire contract | Typed manifest, raw tensor descriptors, shape/byte/digest/coverage/content validation | Generated fixtures pass the design's JSON Schema; malformed metadata and contents are rejected |
 | Raw teacher capture | Unpadded top-128 IDs/values and full-vocabulary LSE before serving processors | Independent online logits observer validates every captured row; serving bias does not leak into teacher scores |
-| KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode |
+| KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, direct or bounded batched D2H, optional HiCache JIT mapped Host writes | H100 source-reuse, cross-stream staging and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode; optional JIT lowers local export cost but has mixed serving results |
 | Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Coordinator admission, renewal, expiry, retract, shutdown and publication tests pass; traffic-scale stress remains open |
 | Teacher D2H batching | Optional bounded aux-owner staging shares the existing device budget with KV | Source reuse, cross-stream tail fencing, CPU P/D handoff and real AR/DSpark/P/D pass; decode transfer work falls, but no serving throughput improvement is established |
 | Mooncake adapter | Required hard pin, registered raw buffers, optional native payload batching, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including complete reads after producer exit; native batching passes TCP correctness and fault tests without a measured serving speedup; batch RDMA and production retention remain open |
@@ -4093,6 +4093,43 @@ fixture failure is retained. Exact source/artifact hashes, replayed request and
 pause diagnostics, profile traces, scope attribution and measurement limits are
 in [the runbook](experiments/TEACHER_TOPK.md) and
 [evidence](experiments/teacher-topk.json). The resident H100 resumes idle load.
+
+## Optional HiCache KV Export
+
+`kv_export_backend="hicache"` reuses the existing HiCache JIT pointer-table
+kernel to export only selected KV layers directly to owned pinned Host slots or
+to existing device staging. Each slot owns bounded pointer/position metadata
+inside the shared `max_device_bytes` budget. Startup checks geometry, compiles
+the kernel and binds storage before admission; runtime retains asynchronous
+source-index bounds checks, producer-stream ordering and completion quarantine.
+The serving HiCache LRU and Mooncake snapshot format are unchanged. Torch
+remains the default. Mapped Host writes count as kernel activity, so explicit
+enqueue-byte counters supplement profiler memcpy events.
+
+The initial focused suite passes 140 methods. Real Qwen3 runtime passes both
+methods in 754.566 seconds; P/D passes both methods in 174.873 seconds, with
+ten complete post-exit snapshots and fault/cancellation exclusion. These runs
+cover direct prefill and batched KV/teacher paths. FP16 test fixtures are
+subsequently corrected to declare the matching codec and validate the KV spec;
+production code is identical across the frozen versions.
+
+The controlled serving pair completes 6,144 requests and validates 184
+snapshots after producer exit. HiCache capture reaches 78.209 requests/s
+(84.94% of its off-bracket mean), versus Torch at 76.960 requests/s (83.29%).
+Both HiCache p99 TTFT and TPOT are slightly worse. This single pair establishes
+neither a reliable serving improvement nor SLO acceptance; defaults remain
+unchanged. Scope, reproduction and measurement details are in the
+[runbook](experiments/KV_HICACHE.md).
+
+The corrected six-method CUDA suite and all 24 complete-export microcases pass.
+Host export eager wall time falls 51.6-57.7%, but 128-row device-only graph copies
+are slower. Actual decode profiling reduces KV CPU scope time from 223.052 to
+123.286 ms and replaces 3,168 memcpy events with mapped Host kernel writes.
+Byte counters exactly match Torch's independently attributed D2H traffic,
+including overlap lookahead. All eleven experiment jobs pass; the initial
+auditor's fixed-row-count assumption fails and its corrected audit passes.
+Final source and archived trace/report hashes are checked. Full results and the
+preserved audit failure are in [the evidence](experiments/kv-hicache.json).
 
 ## Next Implementation
 

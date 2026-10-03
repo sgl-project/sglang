@@ -38,6 +38,7 @@ register_cuda_ci(est_time=720, stage="base-b", runner_config="1-gpu-small")
 MODEL_PATH = "Qwen/Qwen3-0.6B"
 ASSERT_HF_KV = False
 TEACHER_TOPK_BACKEND = "torch"
+KV_EXPORT_BACKEND = "torch"
 
 
 def free_port():
@@ -119,6 +120,7 @@ class TestTrainingCaptureRuntime(CustomTestCase):
             kv_d2h_batch_tokens=16,
             teacher_d2h_batch_tokens=16,
             teacher_topk_backend=TEACHER_TOPK_BACKEND,
+            kv_export_backend=KV_EXPORT_BACKEND,
             max_device_bytes=8 << 20,
             storage_chunk_tokens=64,
             http_timeout_seconds=2.0,
@@ -617,6 +619,9 @@ class TestTrainingCaptureRuntime(CustomTestCase):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default=MODEL_PATH)
+    parser.add_argument(
+        "--kv-export-backend", choices=("torch", "hicache"), default="torch"
+    )
     parser.add_argument("--assert-hf-kv", action="store_true")
     parser.add_argument(
         "--teacher-topk-backend", choices=("torch", "flashinfer"), default="torch"
@@ -625,4 +630,5 @@ if __name__ == "__main__":
     MODEL_PATH = args.model_path
     ASSERT_HF_KV = args.assert_hf_kv
     TEACHER_TOPK_BACKEND = args.teacher_topk_backend
+    KV_EXPORT_BACKEND = args.kv_export_backend
     unittest.main(argv=[__file__, *remaining])

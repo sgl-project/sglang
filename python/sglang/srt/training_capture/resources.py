@@ -88,10 +88,17 @@ class CaptureResources:
             pin_memory=pin_memory,
             device=self.exporter.device if self.exporter is not None else device,
             kv_d2h_batch_tokens=config.kv_d2h_batch_tokens,
+            kv_export_backend=config.kv_export_backend,
             teacher_d2h_batch_tokens=config.teacher_d2h_batch_tokens,
             max_device_bytes=config.max_device_bytes,
             partition=partition,
         )
+        if config.kv_export_backend == "hicache" and self.exporter is not None:
+            for slot in self.pool.slots:
+                slot.kv_exporter = self.exporter.bind(slot)
+            import torch
+
+            torch.cuda.current_stream(self.exporter.device).synchronize()
         if partition is None or partition.include_aux:
             self.journal = PublicationJournal(config.journal_directory)
 

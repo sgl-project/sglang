@@ -535,6 +535,15 @@ Catalog，不覆盖混合 TP/PP prefill、非对称 P/D prefill、跨节点 RDMA
 
 当前 Host backup 有 `backup_from_device_all_layer`，MHA 页元数据可能横跨全部本地层。不能只减少长度实现选层。V1 实现明确的 gather/pack，再评估 scatter/gather 优化。
 
+可选 `kv_export_backend="hicache"` 复用现有 HiCache JIT 的指针表拷贝 kernel，
+仅绑定 contract 选择的 K/V 层，直接写入采集专用 pinned Host buffer，或写入已有
+KV staging。它不启用 serving L2，也不将训练快照纳入 HiCache 的 LRU 管理。
+每个槽位独占 GPU 指针表与目标位置表，连同 KV/teacher staging 计入
+`max_device_bytes`；资源初始化阶段检查布局、编译 kernel 并完成绑定后才准入。
+源索引保留异步越界检查，跨 stream 和异常回收沿用 completion/quarantine 约束。
+默认仍为 Torch；使用要求、测量方法和边界见
+[KV 导出说明](experiments/KV_HICACHE.md)。
+
 使用独占临时 buffer 填尾部 padding，或只写有效范围；不能修改共享 Host KV 页，也不能将邻接请求的无效槽位写入对象。
 
 ### 7.5 生命周期与背压

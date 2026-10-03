@@ -8,7 +8,10 @@ import torch
 
 from sglang.srt.training_capture import coordinator
 from sglang.srt.training_capture.context import RequestCaptureContext
-from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
+from sglang.srt.training_capture.kv_exporter import (
+    BoundHiCacheKVExporter,
+    SelectedLayerKVExporter,
+)
 from sglang.srt.training_capture.kv_staging import KVStaging
 from sglang.srt.training_capture.teacher_staging import TeacherStaging
 
@@ -24,6 +27,7 @@ def scoped(name, function):
 
 coordinator.capture_teacher = scoped("teacher", coordinator.capture_teacher)
 SelectedLayerKVExporter.export = scoped("kv", SelectedLayerKVExporter.export)
+BoundHiCacheKVExporter.export = scoped("kv", BoundHiCacheKVExporter.export)
 KVStaging.flush = scoped("kv_d2h", KVStaging.flush)
 RequestCaptureContext.record_teacher_range = scoped(
     "teacher_d2h", RequestCaptureContext.record_teacher_range

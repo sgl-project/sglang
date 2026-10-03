@@ -137,11 +137,12 @@ class RequestCaptureContext:
         if end == self.kv_end:
             return
         start = self.kv_end
+        bound_exporter = self.slot.kv_exporter or exporter
         try:
             if self.kv_staging is None:
-                exporter.export(slots, self.slot.tensors, start, end)
+                bound_exporter.export(slots, self.slot.tensors, start, end)
             else:
-                self.kv_staging.export(exporter, slots, start=start, end=end)
+                self.kv_staging.export(bound_exporter, slots, start=start, end=end)
         finally:
             if self.kv_staging is not None and self.kv_staging.transfer_uncertain:
                 self.transfer_uncertain = True

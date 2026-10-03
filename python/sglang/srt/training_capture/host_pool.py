@@ -33,6 +33,8 @@ class HostSlot(msgspec.Struct, eq=False):
     device_storage: torch.Tensor | None = None
     device_tensors: dict[str, torch.Tensor] | None = None
     teacher_device_tensors: dict[str, torch.Tensor] | None = None
+    kv_export_tensors: dict[str, torch.Tensor] | None = None
+    kv_exporter: object | None = None
 
 
 class HostBufferPool:
@@ -54,6 +56,7 @@ class HostBufferPool:
         pin_memory: bool = True,
         device: torch.device | None = None,
         kv_d2h_batch_tokens: int = 1,
+        kv_export_backend: str = "torch",
         teacher_d2h_batch_tokens: int = 1,
         max_device_bytes: int = 0,
         partition: CapturePartition | None = None,
@@ -65,6 +68,8 @@ class HostBufferPool:
             or max_device_bytes < 0
         ):
             raise ValueError("invalid device staging limits")
+        if kv_export_backend not in ("torch", "hicache"):
+            raise ValueError("unknown KV export backend")
         layers = kv.layers if partition is None else partition.local_layers(kv)
         include_aux = partition is None or partition.include_aux
         if partition is not None and not partition.active:
@@ -127,6 +132,35 @@ class HostBufferPool:
                     f"{label} staging requires {device_bytes * slots} bytes, "
                     f"budget is {max_device_bytes}"
                 )
+        export_names = set()
+        if kv_export_backend == "hicache" and kv_names:
+            if (
+                device is None
+                or torch.device(device).type != "cuda"
+                or not pin_memory
+                or not max_device_bytes
+            ):
+                raise ValueError(
+                    "HiCache KV export requires CUDA, pinned Host storage and a device budget"
+                )
+            for name, dtype, count in (
+                ("export_sources", torch.uint64, len(kv_names)),
+                ("export_host", torch.uint64, len(kv_names)),
+                ("export_staging", torch.uint64, len(kv_names)),
+                ("export_positions32", torch.int32, max_tokens),
+                ("export_positions64", torch.int64, max_tokens),
+            ):
+                export_names.add(name)
+                dtype_name = str(dtype).removeprefix("torch.")
+                device_bytes = (device_bytes + 63) // 64 * 64
+                length = count * dtype.itemsize
+                device_layout[name] = (device_bytes, length, dtype_name, [count])
+                device_bytes += length
+            if device_bytes * slots > max_device_bytes:
+                raise ValueError(
+                    f"KV export metadata and staging require {device_bytes * slots} bytes, "
+                    f"budget is {max_device_bytes}"
+                )
         self.registrar = registrar
         self.lock = threading.Lock()
         self.slots: list[HostSlot] = []
@@ -152,7 +186,7 @@ class HostBufferPool:
                     )
                     device_views = {
                         name: slot.device_storage[start : start + length]
-                        .view(DTYPES[dtype])
+                        .view(torch.uint64 if dtype == "uint64" else DTYPES[dtype])
                         .reshape(shape)
                         for name, (start, length, dtype, shape) in device_layout.items()
                     }
@@ -164,7 +198,12 @@ class HostBufferPool:
                     slot.teacher_device_tensors = {
                         name: value
                         for name, value in device_views.items()
-                        if name not in kv_names
+                        if name not in kv_names and name not in export_names
+                    } or None
+                    slot.kv_export_tensors = {
+                        name: value
+                        for name, value in device_views.items()
+                        if name in export_names
                     } or None
                 self.registrar.register(storage)
                 self.slots.append(slot)
@@ -196,6 +235,16 @@ class HostBufferPool:
                 "allocated_bytes": self.allocated_bytes,
                 "device_allocated_bytes": self.device_allocated_bytes,
                 "device_limit_bytes": self.device_limit_bytes,
+                "kv_export_host_enqueued_bytes": sum(
+                    slot.kv_exporter.host_enqueued_bytes
+                    for slot in self.slots
+                    if slot.kv_exporter is not None
+                ),
+                "kv_export_device_enqueued_bytes": sum(
+                    slot.kv_exporter.device_enqueued_bytes
+                    for slot in self.slots
+                    if slot.kv_exporter is not None
+                ),
                 **{
                     s: sum(slot.state == s for slot in self.slots)
                     for s in ("free", "filling", "quarantined")

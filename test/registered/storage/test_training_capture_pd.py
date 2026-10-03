@@ -23,8 +23,12 @@ class TestPDCaptureRuntime(PDCaptureRuntimeBase):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--kv-export-backend", choices=("torch", "hicache"), default="torch"
+    )
+    parser.add_argument(
         "--teacher-topk-backend", choices=("torch", "flashinfer"), default="torch"
     )
     args, remaining = parser.parse_known_args()
     TestPDCaptureRuntime.teacher_topk_backend = args.teacher_topk_backend
+    TestPDCaptureRuntime.kv_export_backend = args.kv_export_backend
     unittest.main(argv=[sys.argv[0], *remaining])

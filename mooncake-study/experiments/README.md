@@ -52,6 +52,11 @@ serving comparisons against the index-upload/gather path.
 FlashInfer FP32 path, per-call scratch ownership, numerical comparisons and
 controlled serving/profile commands. Torch remains the default.
 
+[Optional HiCache KV Export](KV_HICACHE.md) documents selected-layer mapped Host
+writes through existing JIT kernels, per-slot metadata budgets, completion
+ownership and complete-export/serving/profile comparisons. Torch remains the
+default; mapped Host writes are kernel traffic, not memcpy events.
+
 [P/D Prefill Graph Capture](PD_PREFILL_CAPTURE.md) covers the independent P/D
 workers' Full, Breakable and piecewise graph paths for AR and static target-KV
 DSpark, with raw source comparison and post-exit Store reads on the resident GPU.

@@ -161,6 +161,8 @@ class TestCaptureConfiguration(CustomTestCase):
             {"max_host_bytes": 0},
             {"kv_d2h_batch_tokens": 0},
             {"kv_d2h_batch_tokens": 16},
+            {"kv_export_backend": "unknown"},
+            {"kv_export_backend": "hicache"},
             {"teacher_d2h_batch_tokens": 0},
             {"teacher_d2h_batch_tokens": 16},
             {"teacher_topk_backend": "unknown"},
