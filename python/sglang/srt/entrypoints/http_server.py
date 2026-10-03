@@ -121,12 +121,10 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    AbortWeightsFromDeltaReqInput,
     AttachHiCacheStorageReqInput,
     BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
-    CommitWeightsFromDeltaReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -135,8 +133,6 @@ from sglang.srt.managers.io_struct import (
     EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
-    GetWeightsDeltaInfoReqInput,
-    GetWeightsDeltaStatusReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
@@ -144,7 +140,6 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
-    PrepareWeightsFromDeltaReqInput,
     ProfileReq,
     PullWeightsReqInput,
     RegisterLoRAAdapterReqInput,
@@ -156,7 +151,6 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDeltaReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -198,6 +192,7 @@ from sglang.srt.utils.json_response import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.weight_sync.gpu_delta_http import register_gpu_delta_routes
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -522,6 +517,7 @@ from sglang.srt.runtime_context import (
 
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
+register_gpu_delta_routes(app, get_global_state)
 
 
 def _anthropic_validation_message(raw_errors) -> str:
@@ -1275,78 +1271,6 @@ async def update_weights_from_disk(
         )
 
 
-@app.post("/get_weights_delta_info")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_weights_delta_info(
-    obj: Annotated[GetWeightsDeltaInfoReqInput, Body()], request: Request
-):
-    content = await _global_state.tokenizer_manager.gpu_delta_request(obj, request)
-    return ORJSONResponse(
-        content,
-        status_code=HTTPStatus.OK if content["success"] else HTTPStatus.CONFLICT,
-    )
-
-
-@app.post("/prepare_weights_from_delta")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def prepare_weights_from_delta(
-    obj: Annotated[PrepareWeightsFromDeltaReqInput, Body()], request: Request
-):
-    content = await _global_state.tokenizer_manager.gpu_delta_request(obj, request)
-    return ORJSONResponse(
-        content,
-        status_code=HTTPStatus.OK if content["success"] else HTTPStatus.CONFLICT,
-    )
-
-
-@app.post("/get_weights_delta_status")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_weights_delta_status(
-    obj: Annotated[GetWeightsDeltaStatusReqInput, Body()], request: Request
-):
-    content = await _global_state.tokenizer_manager.gpu_delta_request(obj, request)
-    return ORJSONResponse(
-        content,
-        status_code=HTTPStatus.OK if content["success"] else HTTPStatus.CONFLICT,
-    )
-
-
-@app.post("/update_weights_from_delta")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weights_from_delta(
-    obj: Annotated[UpdateWeightsFromDeltaReqInput, Body()], request: Request
-):
-    content = await _global_state.tokenizer_manager.gpu_delta_request(obj, request)
-    return ORJSONResponse(
-        content,
-        status_code=HTTPStatus.OK if content["success"] else HTTPStatus.CONFLICT,
-    )
-
-
-@app.post("/commit_weights_from_delta")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def commit_weights_from_delta(
-    obj: Annotated[CommitWeightsFromDeltaReqInput, Body()], request: Request
-):
-    content = await _global_state.tokenizer_manager.gpu_delta_request(obj, request)
-    return ORJSONResponse(
-        content,
-        status_code=HTTPStatus.OK if content["success"] else HTTPStatus.CONFLICT,
-    )
-
-
-@app.post("/abort_weights_from_delta")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def abort_weights_from_delta(
-    obj: Annotated[AbortWeightsFromDeltaReqInput, Body()], request: Request
-):
-    content = await _global_state.tokenizer_manager.gpu_delta_request(obj, request)
-    return ORJSONResponse(
-        content,
-        status_code=HTTPStatus.OK if content["success"] else HTTPStatus.CONFLICT,
-    )
-
-
 @app.post("/pull_weights")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def pull_weights(obj: Annotated[PullWeightsReqInput, Body()], request: Request):
@@ -1859,12 +1783,7 @@ async def pause_generation(
     obj: Annotated[PauseGenerationReqInput, Body()], request: Request
 ):
     """Pause generation."""
-    try:
-        await _global_state.tokenizer_manager.pause_generation(obj)
-    except ValueError as exc:
-        return ORJSONResponse(
-            {"success": False, "message": str(exc)}, status_code=HTTPStatus.CONFLICT
-        )
+    await _global_state.tokenizer_manager.pause_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation paused successfully.", "status": "ok"},
         status_code=200,
@@ -1877,16 +1796,9 @@ async def continue_generation(
     obj: Annotated[ContinueGenerationReqInput, Body()], request: Request
 ):
     """Continue generation."""
-    try:
-        result = await _global_state.tokenizer_manager.continue_generation(obj)
-    except ValueError as exc:
-        return ORJSONResponse(
-            {"success": False, "message": str(exc)}, status_code=HTTPStatus.CONFLICT
-        )
+    result = await _global_state.tokenizer_manager.continue_generation(obj)
     content = {"message": "Generation continued successfully.", "status": "ok"}
-    if obj.delta_session_id is not None:
-        content["success"] = True
-        content["participants"] = result["participants"]
+    content.update(result or {})
     return ORJSONResponse(content=content, status_code=200)
 
 

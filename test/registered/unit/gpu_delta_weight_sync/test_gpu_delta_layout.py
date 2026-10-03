@@ -178,6 +178,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         for module in (shared.gate_up_proj, shared.down_proj):
             module.tp_rank, module.tp_size = tp_rank, 8
         root._gpu_delta_load_generation = 1
+        root._gpu_delta_metadata_complete = True
         root._gpu_delta_canonical_inventory = {
             f"model.layers.0.mlp.shared_experts.{key}_proj.weight": {
                 "dtype": "BF16",
@@ -585,6 +586,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         layer.self_attn.indexer = torch.nn.Module()
         norm = layer.self_attn.indexer.k_norm = torch.nn.LayerNorm(128)
         root._gpu_delta_load_generation = 1
+        root._gpu_delta_metadata_complete = True
         root._gpu_delta_canonical_inventory = {
             f"model.layers.0.self_attn.indexer.k_norm.{key}": {
                 "dtype": "BF16",

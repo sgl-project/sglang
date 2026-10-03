@@ -82,10 +82,7 @@ class NvcompDecoder:
             raise ValueError("Delta decoder requires an explicit CUDA device")
         cuda_major = torch.version.cuda.split(".")[0]
         package = f"nvidia-libnvcomp-cu{cuda_major}"
-        try:
-            distribution = importlib.metadata.distribution(package)
-        except importlib.metadata.PackageNotFoundError as exc:
-            raise RuntimeError(f"Direct GPU deltas require {package}>=5.3,<6") from exc
+        distribution = importlib.metadata.distribution(package)
         version = tuple(int(v) for v in distribution.version.split(".")[:2])
         if not (5, 3) <= version < (6, 0) or ctypes.sizeof(ctypes.c_size_t) != 8:
             raise RuntimeError("Direct GPU deltas require the 64-bit nvCOMP 5.3+ ABI")
@@ -179,6 +176,7 @@ class NvcompDecoder:
 
         A plan can reuse an encoded tensor slot and decoded scratch. Its caller
         must order slot reuse after all previous consumers on the chosen stream.
+        ``workspace`` must be allocated for these batches with ``allocate_workspace``.
         """
         frames = tuple(frames)
         for tensor in (encoded, decoded, workspace.temporary):
@@ -197,8 +195,6 @@ class NvcompDecoder:
             or len(frames) > workspace.actual_sizes.numel()
         ):
             raise ValueError("Insufficient per-frame status capacity")
-        if self.temporary_bytes(frames) > workspace.temporary.numel():
-            raise ValueError("Insufficient decoder workspace")
         if (
             workspace.temporary.numel()
             and workspace.temporary.data_ptr() % self.alignments.temp

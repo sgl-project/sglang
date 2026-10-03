@@ -234,13 +234,6 @@ class DeepseekV2WeightLoaderMixin:
         """
         nextn_conf = self._initialize_nextn_conf(is_nextn)
 
-        if not is_nextn:
-            from sglang.srt.weight_sync.gpu_delta_layout import (
-                record_canonical_weight_metadata,
-            )
-
-            weights = record_canonical_weight_metadata(self, weights)
-
         weights = self._maybe_quant_weights_to_fp8_ue8m0(
             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
         )

@@ -29,7 +29,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaSchedulerControl
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
@@ -70,7 +69,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.gpu_delta_control = GpuDeltaSchedulerControl(scheduler)
         scheduler._engine_paused = False
         scheduler.enable_overlap = False
         scheduler.last_batch = None

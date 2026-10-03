@@ -10,6 +10,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 import os
 import socket
 import threading
@@ -18,6 +19,10 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+
+class GpuDeltaConflict(ValueError):
+    """A delta control conflicts with the current engine/session state."""
 
 
 class GpuDeltaCommunicator:
@@ -75,18 +80,20 @@ _CONFLICTING_REQUESTS = {
 }
 
 
-def guard_tokenizer_dispatch(manager, request):
-    active = getattr(manager, "_gpu_delta_session_id", None)
+def guard_tokenizer_dispatch(control, request):
+    active = control.session_id
     name = type(request).__name__
     if name == "PrepareWeightsFromDeltaReqInput":
         if active is not None and active != request.session_id:
-            raise ValueError("another delta session is active")
+            raise GpuDeltaConflict("another delta session is active")
         # Acquire only at the FIFO communicator's actual send. An earlier
         # abort/resume completion cannot clear a prepare still in its queue.
         # Keep the lease if sending or receiving the acknowledgment fails.
-        manager._gpu_delta_session_id = request.session_id
+        control.session_id = request.session_id
     elif active is not None and name in _CONFLICTING_REQUESTS:
-        raise ValueError("GPU delta session owns the model; competing mutation refused")
+        raise GpuDeltaConflict(
+            "GPU delta session owns the model; competing mutation refused"
+        )
 
 
 def _identity_key(identity: dict) -> str:
@@ -397,6 +404,61 @@ class DeltaSession:
             return self.status(session_id)
 
 
+def with_gpu_delta_controls(scheduler, dispatcher):
+    """Register control handlers without wrapping the generation hot path."""
+    from sglang.srt.managers import io_struct as io
+    from sglang.utils import TypeBasedDispatcher
+
+    control = GpuDeltaSchedulerControl(scheduler)
+
+    def mutation(request):
+        rejected = control.reject_conflicting(request)
+        return dispatcher(request) if rejected is None else rejected
+
+    def pause(request):
+        if control.leased:
+            # Stop new work before the reader fence; never reclaim caches if
+            # that fence fails. The ordinary pause implementation owns reclaim.
+            scheduler._engine_paused = True
+            try:
+                control.before_pause(request.mode)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "GPU delta pause failed; engine remains paused"
+                )
+                return
+        return dispatcher(request)
+
+    def resume(request):
+        if control.leased:
+            # Only the certified delta handler may call the ordinary resume
+            # implementation while leased. An IPC session ID is not a proof.
+            logging.getLogger(__name__).error(
+                "Refusing resume while a GPU delta session owns the model"
+            )
+            return
+        return dispatcher(request)
+
+    wrapped = TypeBasedDispatcher(
+        [
+            (io.GetWeightsDeltaInfoReqInput, control.handle),
+            (io.PrepareWeightsFromDeltaReqInput, control.handle),
+            (io.GetWeightsDeltaStatusReqInput, control.handle),
+            (io.UpdateWeightsFromDeltaReqInput, control.handle),
+            (io.CommitWeightsFromDeltaReqInput, control.handle),
+            (io.AbortWeightsFromDeltaReqInput, control.handle),
+            (io.ContinueWeightsFromDeltaReqInput, control.handle),
+            (io.PauseGenerationReqInput, pause),
+            (io.ContinueGenerationReqInput, resume),
+            *[(getattr(io, name), mutation) for name in _CONFLICTING_REQUESTS],
+        ]
+    )
+    # Feature controls take precedence. Ordinary requests retain their original
+    # handlers and the same single dictionary lookup, with no delta branch.
+    wrapped += dispatcher
+    return wrapped
+
+
 class GpuDeltaSchedulerControl:
     """Small scheduler adapter; dependencies are lazy for ordinary disk users."""
 
@@ -605,10 +667,3 @@ class GpuDeltaSchedulerControl:
             if mode != "retract":
                 raise ValueError("GPU delta requires retract pause")
             self.session.quiesce(self.scheduler.device_module.synchronize)
-
-    def may_resume(self, session_id: str | None) -> bool:
-        if not self.leased:
-            return True
-        if not session_id:
-            return False
-        return self.session.status(session_id)["state"] == "COMMITTED"

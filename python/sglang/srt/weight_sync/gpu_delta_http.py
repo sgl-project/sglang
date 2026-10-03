@@ -1,0 +1,80 @@
+"""HTTP integration for the GPU-delta control plane."""
+
+from collections.abc import Callable
+from http import HTTPStatus
+from typing import Annotated
+
+from fastapi import Body, FastAPI, Request
+from fastapi.responses import ORJSONResponse
+from sglang.srt.managers.io_struct import (
+    AbortWeightsFromDeltaReqInput,
+    CommitWeightsFromDeltaReqInput,
+    GetWeightsDeltaInfoReqInput,
+    GetWeightsDeltaStatusReqInput,
+    PrepareWeightsFromDeltaReqInput,
+    UpdateWeightsFromDeltaReqInput,
+)
+from sglang.srt.utils.auth import AuthLevel, auth_level
+from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaConflict
+
+
+def register_gpu_delta_routes(app: FastAPI, get_global_state: Callable):
+    """Use the app's route class and resolve its tokenizer manager per request."""
+
+    @app.exception_handler(GpuDeltaConflict)
+    async def conflict(request, exc):
+        return ORJSONResponse(
+            {"success": False, "message": str(exc), "participants": []},
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+    async def dispatch(obj, request):
+        content = await get_global_state().tokenizer_manager.gpu_delta.request(
+            obj, request
+        )
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.OK if content["success"] else HTTPStatus.CONFLICT,
+        )
+
+    @app.post("/get_weights_delta_info")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def get_weights_delta_info(
+        obj: Annotated[GetWeightsDeltaInfoReqInput, Body()], request: Request
+    ):
+        return await dispatch(obj, request)
+
+    @app.post("/prepare_weights_from_delta")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def prepare_weights_from_delta(
+        obj: Annotated[PrepareWeightsFromDeltaReqInput, Body()], request: Request
+    ):
+        return await dispatch(obj, request)
+
+    @app.post("/get_weights_delta_status")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def get_weights_delta_status(
+        obj: Annotated[GetWeightsDeltaStatusReqInput, Body()], request: Request
+    ):
+        return await dispatch(obj, request)
+
+    @app.post("/update_weights_from_delta")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def update_weights_from_delta(
+        obj: Annotated[UpdateWeightsFromDeltaReqInput, Body()], request: Request
+    ):
+        return await dispatch(obj, request)
+
+    @app.post("/commit_weights_from_delta")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def commit_weights_from_delta(
+        obj: Annotated[CommitWeightsFromDeltaReqInput, Body()], request: Request
+    ):
+        return await dispatch(obj, request)
+
+    @app.post("/abort_weights_from_delta")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def abort_weights_from_delta(
+        obj: Annotated[AbortWeightsFromDeltaReqInput, Body()], request: Request
+    ):
+        return await dispatch(obj, request)

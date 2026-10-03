@@ -6,6 +6,19 @@ Torch byte transforms cover CuTe DSL NVFP4 expert layouts and BF16 dense storage
 the standalone MegaMoE transform helper does not admit an integrated MegaMoE
 runtime on this branch.
 
+Canonical names, shapes and dtypes are observed once at the common checkpoint
+loader boundary, before model-specific transforms. The observer retains no tensor
+values and invalidates the layout on later ordinary reloads, including failed or
+partial loads. Model classes need no delta hook; loaders that bypass this boundary
+are not admitted. Layout/backend support remains a separate check.
+
+HTTP routes, tokenizer session coordination and scheduler control handlers live
+under `srt/weight_sync/gpu_delta_*`. Shared managers retain only registration and
+dispatch/pause/resume hooks; generation handlers and the shared communicator remain
+unchanged. Preparation takes no model-update writer lock. Error handling stays at
+the HTTP/IPC and asynchronous task boundaries, with partial writes poisoning the
+session instead of attempting recovery.
+
 ```bash
 python -m pytest -q \
   test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout.py \

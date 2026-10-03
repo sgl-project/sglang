@@ -25,7 +25,6 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
-    DeltaWeightsReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -185,14 +184,7 @@ class TokenizerControlMixin:
     """
 
     def init_communicators(self: TokenizerManager):
-        from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaCommunicator
-
-        self.gpu_delta_communicator = GpuDeltaCommunicator(
-            self._dispatch_to_scheduler, get_parallel().dp_size
-        )
-        dispatch_pairs = [
-            (DeltaWeightsReqOutput, self.gpu_delta_communicator.handle_recv)
-        ]
+        dispatch_pairs = []
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
@@ -204,6 +196,10 @@ class TokenizerControlMixin:
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+        from sglang.srt.weight_sync.gpu_delta_tokenizer import GpuDeltaTokenizerControl
+
+        self.gpu_delta = GpuDeltaTokenizerControl(self, get_parallel().dp_size)
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
@@ -221,7 +217,7 @@ class TokenizerControlMixin:
             getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
 
         self.get_internal_state_communicator.set_fan_out(control_fan_out)
-        self.gpu_delta_communicator.set_fan_out(worker_count)
+        self.gpu_delta.communicator.set_fan_out(worker_count)
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
@@ -1014,85 +1010,6 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
-
-    async def gpu_delta_request(self, obj, request=None):
-        """No model-update writer lock: preparation must overlap generation."""
-        self.auto_create_handle_loop()
-        import json
-
-        from sglang.srt.managers.io_struct import (
-            AbortWeightsFromDeltaReqInput,
-            GetWeightsDeltaInfoReqInput,
-            PrepareWeightsFromDeltaReqInput,
-        )
-
-        if get_serving().tokenizer_worker_num != 1:
-            return {
-                "success": False,
-                "message": "GPU delta requires one Python tokenizer worker",
-                "participants": [],
-            }
-        if isinstance(obj, PrepareWeightsFromDeltaReqInput):
-            identities = getattr(self, "_gpu_delta_participants", None)
-            if identities is None or {
-                json.dumps(item, sort_keys=True) for item in identities
-            } != {json.dumps(item, sort_keys=True) for item in obj.participants}:
-                return {
-                    "success": False,
-                    "message": "prepare must bind the original described participants",
-                    "participants": [],
-                }
-        try:
-            results = await self.gpu_delta_communicator(obj)
-        except ValueError as exc:
-            return {"success": False, "message": str(exc), "participants": []}
-        participants = [result.participant for result in results]
-        identities = [item.get("identity") for item in participants]
-
-        keys = [json.dumps(identity, sort_keys=True) for identity in identities]
-        success = all(result.success for result in results)
-        if len(set(keys)) != len(keys) or any(
-            identity is None for identity in identities
-        ):
-            success = False
-        expected_identities = getattr(self, "_gpu_delta_participants", None)
-        if (
-            not isinstance(obj, GetWeightsDeltaInfoReqInput)
-            and expected_identities is not None
-        ):
-            success &= set(keys) == {
-                json.dumps(item, sort_keys=True) for item in expected_identities
-            }
-        if hasattr(obj, "session_id"):
-            success &= all(
-                item.get("session_id") == obj.session_id for item in participants
-            )
-        phase_states = {
-            "GetWeightsDeltaInfoReqInput": {"IDLE"},
-            "UpdateWeightsFromDeltaReqInput": {"APPLIED", "COMMITTED", "RESUMED"},
-            "CommitWeightsFromDeltaReqInput": {"COMMITTED", "RESUMED"},
-            "ContinueWeightsFromDeltaReqInput": {"RESUMED"},
-            "AbortWeightsFromDeltaReqInput": {"ABORTED"},
-        }
-        allowed = phase_states.get(type(obj).__name__)
-        if allowed is not None:
-            success &= all(item.get("state") in allowed for item in participants)
-        if isinstance(obj, GetWeightsDeltaInfoReqInput) and success:
-            self._gpu_delta_participants = identities
-        if (
-            isinstance(obj, AbortWeightsFromDeltaReqInput)
-            and success
-            and all(item["state"] == "ABORTED" for item in participants)
-            and getattr(self, "_gpu_delta_session_id", None) == obj.session_id
-        ):
-            self._gpu_delta_session_id = None
-        return {
-            "success": success,
-            "message": " | ".join(
-                result.message for result in results if result.message
-            ),
-            "participants": participants,
-        }
 
     async def pull_weights(
         self: TokenizerManager,

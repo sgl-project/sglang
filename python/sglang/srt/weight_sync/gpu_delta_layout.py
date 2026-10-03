@@ -23,7 +23,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Callable, Iterable
+from typing import Callable
 
 import torch
 
@@ -110,25 +110,6 @@ def flashinfer_delta_layout(
         out = swizzle_scale_bytes(out)
     # Transposed MegaMoE weight views do not move physical storage bytes.
     return out
-
-
-def record_canonical_weight_metadata(model, weights: Iterable):
-    """Record only startup source metadata, before optional value conversions.
-
-    No source values are retained. A second ordinary reload invalidates an
-    existing direct-delta session instead of silently changing its base.
-    """
-    inventory = {}
-    model._gpu_delta_canonical_inventory = inventory
-    model._gpu_delta_load_generation = (
-        getattr(model, "_gpu_delta_load_generation", 0) + 1
-    )
-    for name, tensor in weights:
-        metadata = {"shape": list(tensor.shape), "dtype": _dtype_name(tensor.dtype)}
-        if name in inventory:
-            model._gpu_delta_duplicate_source_names = True
-        inventory[name] = metadata
-        yield name, tensor
 
 
 _DTYPES = {
@@ -373,7 +354,11 @@ class GpuDeltaLayout:
         self.model = model
         self.generation = getattr(model, "_gpu_delta_load_generation", None)
         inventory = getattr(model, "_gpu_delta_canonical_inventory", None)
-        if not inventory or getattr(model, "_gpu_delta_duplicate_source_names", False):
+        if (
+            not inventory
+            or not getattr(model, "_gpu_delta_metadata_complete", False)
+            or getattr(model, "_gpu_delta_duplicate_source_names", False)
+        ):
             raise ValueError("canonical startup metadata is unavailable or ambiguous")
         self.inventory = inventory
         self.bindings = []
@@ -1015,11 +1000,9 @@ class PreparedDelta:
             torch.cuda.Event(enable_timing=True),
         )
         start.record(self.stream)
-        try:
-            yield
-        finally:
-            end.record(self.stream)
-            self.events.setdefault(name, []).append((start, end))
+        yield
+        end.record(self.stream)
+        self.events.setdefault(name, []).append((start, end))
 
     def apply(self):
         if self.applied:

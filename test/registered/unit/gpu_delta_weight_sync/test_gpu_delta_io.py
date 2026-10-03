@@ -250,9 +250,7 @@ def test_matching_version_is_still_rejected_during_delta_lease():
     assert not reply.success and "owns the model" in reply.message
     assert not control.legacy_mutated
     with pytest.raises(ValueError, match="competing mutation"):
-        guard_tokenizer_dispatch(
-            SimpleNamespace(_gpu_delta_session_id="publication-1"), request
-        )
+        guard_tokenizer_dispatch(SimpleNamespace(session_id="publication-1"), request)
 
 
 if __name__ == "__main__":
