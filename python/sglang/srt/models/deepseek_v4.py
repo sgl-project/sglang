@@ -3330,7 +3330,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     return hc_norm_prefill(combined, norm.weight, norm.variance_epsilon)
                 return norm(combined)
             if apply_pre is None:
-                return norm(x[:, 0, :].contiguous())
+                return norm(x[:, 0, :] if _is_cuda else x[:, 0, :].contiguous())
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
             if (
@@ -4582,9 +4582,12 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     cp_all_tokens=cp_extend,
                 )
+                # Only multimodal placeholders become image_token_id, so a text-only
+                # batch skips this full-residual where.
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
+                    and forward_batch.contains_mm_inputs()
                 ):
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
@@ -4830,7 +4833,9 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            from sglang.kernels.ops.layernorm.mhc import hc_broadcast
+
+            hidden_states = hc_broadcast(hidden_states, self.hc_mult)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]

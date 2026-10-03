@@ -334,6 +334,58 @@ def test_hopper_mhc_stats_stream_graph(num_tokens):
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("rows", [0, 1, 7, 129])
+@pytest.mark.parametrize("hidden", [37, 5120])
+@pytest.mark.parametrize("row_stride", [1, 2])
+def test_hc_broadcast_replay(rows, hidden, row_stride):
+    from sglang.kernels.ops.layernorm.mhc import hc_broadcast
+
+    x = torch.randn(rows * row_stride, hidden, device="cuda", dtype=torch.bfloat16)[
+        ::row_stride
+    ]
+    expected = lambda: x.unsqueeze(1).repeat(1, 4, 1)
+    actual = hc_broadcast(x, 4)
+    torch.testing.assert_close(actual, expected(), rtol=0, atol=0)
+    if rows:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = hc_broadcast(x, 4)
+        for _ in range(3):
+            x.normal_()
+            graph.replay()
+            torch.testing.assert_close(actual, expected(), rtol=0, atol=0)
+    # Non-unit hidden stride must use the fallback and preserve the values.
+    sliced = x[:, ::2]
+    torch.testing.assert_close(
+        hc_broadcast(sliced, 4), sliced.unsqueeze(1).repeat(1, 4, 1), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 7, 129])
+def test_initial_mhc_norm_strided_replay(rows):
+    from sglang.srt.layers.layernorm import RMSNorm
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+
+    x = torch.randn(rows, 4, 5120, device="cuda", dtype=torch.bfloat16)
+    norm = RMSNorm(5120, eps=1e-6).cuda().bfloat16()
+    layer = SimpleNamespace(
+        hc_mult=4, config=SimpleNamespace(model_type="deepseek_v41")
+    )
+
+    def run():
+        return DeepseekV4DecoderLayer._hc_combine(layer, x, None, norm)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for _ in range(3):
+        x.normal_()
+        expected = norm(x[:, 0, :].contiguous())
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     import sys
 
