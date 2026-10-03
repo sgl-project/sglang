@@ -9,8 +9,11 @@ import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.utils import MappedRegions
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HostPinBudget,
+    host_copies_would_not_fit,
+    module_weight_bytes,
     shared_pool_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -141,6 +144,29 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         self._ready_events: dict[str, object] = {}
 
     def _load_component(self, module: nn.Module, use: ComponentUse) -> None:
+        if (
+            current_platform.is_cuda()
+            and not current_platform.device_shares_host_memory()
+            and weight_snapshot(module) is None
+        ):
+            parameters = list(module.parameters())
+            if parameters and all(
+                p.device.type == "cpu"
+                and not p.is_pinned()
+                and (
+                    use.target_dtype is None
+                    or not p.is_floating_point()
+                    or p.dtype == use.target_dtype
+                )
+                for p in parameters
+            ):
+                regions = MappedRegions()
+                if all(
+                    regions.holds(p) for p in parameters
+                ) and host_copies_would_not_fit(module_weight_bytes(module)):
+                    # preserve reclaimable mappings under host pressure; with
+                    # room, the normal swap-out yields faster pinned H2D next time
+                    capture_weight_snapshot(module)
         _module_to_local_device(module, dtype=use.target_dtype)
 
     def prepare_for_use(
@@ -191,6 +217,9 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         state: ResidencyState,
     ) -> None:
         self.wait_for_use(module, use, state)
+        if restore_weight_snapshot(module):
+            self._ready_events.pop(use.component_name, None)
+            return
         tensor = _module_reference_tensor(module)
         if tensor is not None and tensor.device.type != "cpu":
             # A non-blocking device->host move lands in pinned host memory the
@@ -238,15 +267,6 @@ class SnapshotOffloadStrategy(ComponentOffloadStrategy):
                 module, pin_budget=self._pin_budget, component_name=use.component_name
             )
         super()._load_component(module, use)
-
-    def finish_use(
-        self, module: nn.Module, use: ComponentUse, state: ResidencyState
-    ) -> None:
-        self.wait_for_use(module, use, state)
-        if restore_weight_snapshot(module):
-            self._ready_events.pop(use.component_name, None)
-        else:
-            super().finish_use(module, use, state)
 
 
 class LayerwiseOffloadStrategy(ComponentResidencyStrategy):

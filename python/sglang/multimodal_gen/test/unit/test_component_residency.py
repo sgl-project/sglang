@@ -11,6 +11,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.runtime.loader.utils import component_residency_bytes
+from sglang.multimodal_gen.runtime.managers.memory_managers import host_memory_budget
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
     ComponentUse,
@@ -74,11 +75,20 @@ def test_component_offload_releases_preferred_component_after_request():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("host_storage", ["pageable", "pinned", "mmap"])
+@pytest.mark.parametrize(
+    "host_storage,residency",
+    [
+        ("pageable", "snapshot-offload"),
+        ("pinned", "snapshot-offload"),
+        ("mmap", "snapshot-offload"),
+        ("mmap", "component-offload"),
+    ],
+)
 @pytest.mark.parametrize("prefetch", [False, True])
 def test_snapshot_offload_preserves_host_storage_and_live_buffers(
-    tmp_path, monkeypatch, host_storage, prefetch
+    tmp_path, monkeypatch, host_storage, residency, prefetch
 ):
+    monkeypatch.setattr(host_memory_budget, "host_memory_available_bytes", lambda: 0)
     module = torch.nn.Linear(16, 16, bias=False)
     if host_storage == "pinned":
         module.weight.data = module.weight.detach().pin_memory()
@@ -91,9 +101,9 @@ def test_snapshot_offload_preserves_host_storage_and_live_buffers(
     pointer = original_host.data_ptr()
     x = torch.randn(2, 16, device="cuda")
     expected = torch.nn.functional.linear(x, original_host.to("cuda"))
-    args = SimpleNamespace(residency_mode=lambda _: "snapshot-offload")
+    args = SimpleNamespace(residency_mode=lambda _: residency)
     strategy = build_component_residency_strategy("vae", module, args)
-    assert isinstance(strategy, SnapshotOffloadStrategy)
+    assert isinstance(strategy, ComponentOffloadStrategy)
     use = ComponentUse("decode", "vae")
     state = ResidencyState()
 
@@ -129,6 +139,85 @@ def test_snapshot_offload_preserves_host_storage_and_live_buffers(
         assert module.counter.item() == iteration + 1
         assert weight_snapshot(module) is None
     assert not weight_d2h
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "storage", ["pageable", "pinned", "mixed", "dtype", "shared", "mmap-room"]
+)
+def test_component_offload_does_not_retain_unbudgeted_host_weights(
+    tmp_path, monkeypatch, storage
+):
+    module = torch.nn.Linear(16, 16)
+    if storage in {"mixed", "dtype", "shared", "mmap-room"}:
+        checkpoint = str(tmp_path / "model.safetensors")
+        save_file(module.state_dict(), checkpoint)
+        module.load_state_dict(load_file(checkpoint), assign=True)
+    if storage == "mixed":
+        module.bias.data = module.bias.detach().clone()
+    elif storage == "pinned":
+        for parameter in module.parameters():
+            parameter.data = parameter.detach().pin_memory()
+    monkeypatch.setattr(
+        host_memory_budget,
+        "host_memory_available_bytes",
+        lambda: 32 * 1024**3 if storage == "mmap-room" else 0,
+    )
+    monkeypatch.setattr(
+        current_platform, "device_shares_host_memory", lambda: storage == "shared"
+    )
+    use = ComponentUse(
+        "decode", "vae", target_dtype=torch.bfloat16 if storage == "dtype" else None
+    )
+    strategy = ComponentOffloadStrategy()
+    expected = {name: p.detach().clone() for name, p in module.named_parameters()}
+    for _ in range(2):
+        strategy.prepare_for_use(module, use, ResidencyState())
+        assert weight_snapshot(module) is None
+        totals = component_residency_bytes(module)
+        assert totals["host"] + totals["host_pinned"] + totals["host_mapped"] == 0
+        strategy.finish_use(module, use, ResidencyState())
+        for name, parameter in module.named_parameters():
+            torch.testing.assert_close(parameter, expected[name].to(parameter.dtype))
+        if storage == "shared":
+            assert not module.weight.is_pinned()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mapped_component_reuses_snapshot_mutation_and_sleep_boundaries(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(host_memory_budget, "host_memory_available_bytes", lambda: 0)
+    module = torch.nn.Linear(4, 4, bias=False)
+    checkpoint = str(tmp_path / "model.safetensors")
+    save_file(module.state_dict(), checkpoint)
+    module.load_state_dict(load_file(checkpoint), assign=True)
+    original = module.weight.detach().clone()
+    pointer = module.weight.data_ptr()
+    strategy = ComponentOffloadStrategy()
+    use = ComponentUse("denoise", "transformer")
+    state = ResidencyState()
+    strategy.prefetch_for_use(module, use, state)
+    strategy.wait_for_use(module, use, state)
+    pipeline = SimpleNamespace(modules={"transformer": module})
+    controller = MemoryOccupationController(pipeline, rank=0, use_fsdp_inference=False)
+    controller._move_modules(["transformer"], "cpu")
+    assert module.weight.data_ptr() == pointer
+    strategy.prepare_for_use(module, use, state)
+    _load_weights_into_module(module, [("weight", torch.full((4, 4), 2.0))])
+    strategy.prepare_for_use(module, use, state)
+    torch.testing.assert_close(module.weight, torch.full((4, 4), 2.0, device="cuda"))
+    with LoRAPipeline._temporarily_disable_offload(
+        pipeline, target="transformer", use_module_names_only=True
+    ):
+        module.weight = torch.nn.Parameter(torch.full((4, 4), 3.0))
+    strategy.prepare_for_use(module, use, state)
+    assert weight_snapshot(module) is None
+    torch.testing.assert_close(module.weight, torch.full((4, 4), 3.0, device="cuda"))
+    strategy.finish_use(module, use, state)
+    torch.testing.assert_close(
+        load_file(checkpoint)["weight"], original, rtol=0, atol=0
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
