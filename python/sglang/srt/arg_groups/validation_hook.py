@@ -41,8 +41,12 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
         "Pipeline parallelism is not compatible with overlap schedule"
     )
     if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.disaggregation_mode == "prefill", (
-            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
+        assert (
+            cfg.disaggregation_mode in ("prefill", "decode")
+            and cfg.speculative_dspark_pp_replicated_draft
+        ), (
+            "Pipeline parallel DSPARK requires PD disaggregation with "
+            "--speculative-dspark-pp-replicated-draft"
         )
         assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
             "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
@@ -141,6 +145,14 @@ def check_server_args(server_args: Any):
     check_lora_server_args(server_args)
 
     # Check speculative decoding
+    if cfg.speculative_draft_scheduling_policy == "bubble":
+        assert (
+            cfg.speculative_algorithm or ""
+        ).upper() == "DSPARK" and cfg.speculative_dspark_pp_replicated_draft, (
+            "--speculative-draft-scheduling-policy=bubble requires DSPARK "
+            "with --speculative-dspark-pp-replicated-draft"
+        )
+
     if cfg.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 

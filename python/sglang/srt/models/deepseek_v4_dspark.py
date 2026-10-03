@@ -56,6 +56,7 @@ from sglang.srt.models.dspark import (
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
+    get_spec,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
@@ -842,6 +843,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         self.start_layer = 0
         self.end_layer = self.num_stages
+        # draft_pp_context intentionally presents the draft as PP1. The
+        # replicated mode flag is therefore the authoritative ownership signal.
+        self.uses_own_vocab_modules = (
+            _is_npu or get_spec().speculative_dspark_pp_replicated_draft
+        )
+
         use_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and envs.SGLANG_DSPARK_ENABLE_MULTI_STREAM.get()
@@ -931,9 +938,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
-        stage0 = self.stages[0]
-        projected, _ = stage0.main_proj(main_hidden)
-        return stage0.main_norm(projected)
+        projected = self.project_target_hidden_for_transfer(main_hidden)
+        return self.stages[0].main_norm(projected)
+
+    def project_target_hidden_for_transfer(
+        self, main_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        projected, _ = self.stages[0].main_proj(main_hidden)
+        return projected
 
     def write_target_hidden_kv(
         self,
@@ -944,6 +956,37 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
         main_x = self.project_target_hidden(main_hidden)
+        self._write_context_hidden_kv(
+            main_x=main_x,
+            swa_loc=swa_loc,
+            positions=positions,
+            pool=pool,
+        )
+
+    def write_projected_context_kv(
+        self,
+        *,
+        projected_context: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
+        main_x = self.stages[0].main_norm(projected_context)
+        self._write_context_hidden_kv(
+            main_x=main_x,
+            swa_loc=swa_loc,
+            positions=positions,
+            pool=pool,
+        )
+
+    def _write_context_hidden_kv(
+        self,
+        *,
+        main_x: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
         swa_loc = swa_loc.to(torch.int32)
         kvs = CommitKvProj.execute(
             main_x=main_x,
@@ -1165,7 +1208,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
-        if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+        if self.uses_own_vocab_modules:
+            if name in (
+                "model.embed_tokens.weight",
+                "embed.weight",
+                "embed_tokens.weight",
+            ):
+                return "embed_tokens.weight"
+            if name in ("head.weight", "lm_head.weight"):
+                return "lm_head.weight"
+        if name.startswith(
+            ("model.embed_tokens.", "embed.", "embed_tokens.", "head.", "lm_head.")
+        ):
             return None
         if "rotary_emb.inv_freq" in name:
             return None
@@ -1176,6 +1230,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if len(parts) < 3:
             return None
         stage_id, rest = parts[1], parts[2]
+        if not stage_id.isdigit():
+            return None
+        stage_idx = int(stage_id)
+        if rest in ("embed.weight", "embed_tokens.weight"):
+            return (
+                "embed_tokens.weight"
+                if self.uses_own_vocab_modules and stage_idx == 0
+                else None
+            )
+        if rest in ("head.weight", "lm_head.weight"):
+            return (
+                "lm_head.weight"
+                if self.uses_own_vocab_modules and stage_idx == self.num_stages - 1
+                else None
+            )
 
         if rest.startswith("markov_head."):
             rest = rest.replace("markov_head.embed.", "markov_head.markov_w1.", 1)

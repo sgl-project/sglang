@@ -112,6 +112,13 @@ class GenerationBatchResult:
     next_verify_parent_list: Optional[torch.Tensor] = None
     next_verify_top_scores_index: Optional[torch.Tensor] = None
 
+    # Replicated PP DSpark keeps the local draft KV commit layout with the
+    # in-flight microbatch and relays only the projected target context.
+    pp_dspark_commit_state: Optional[Any] = None
+    pp_dspark_projected_context: Optional[torch.Tensor] = None
+    pp_dspark_next_proposal: Optional[dict] = None
+    pp_dspark_draft_idle: bool = False
+
     # PP+spec: the verify forward's KV slots on a non-last stage. That stage
     # prepares verify inside forward isolation, which restores
     # batch.out_cache_loc, so the slots have to travel on the result to survive
@@ -159,7 +166,7 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
-        if return_logprob:
+        if self.logits_output is not None and return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
                     self.logits_output.next_token_logprobs
@@ -183,11 +190,16 @@ class GenerationBatchResult:
                     _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if return_hidden_states and self.logits_output.hidden_states is not None:
+        if (
+            self.logits_output is not None
+            and return_hidden_states
+            and self.logits_output.hidden_states is not None
+        ):
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
+        if self.next_token_ids is not None:
+            self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)

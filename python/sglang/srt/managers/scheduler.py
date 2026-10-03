@@ -4484,6 +4484,10 @@ class Scheduler(
                 self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
+            elif self._pp_is_replicated_dspark_batch(batch):
+                batch_result = self._pp_run_replicated_dspark_batch(
+                    batch, pp_proxy_tensors
+                )
             elif not batch.spec_algorithm.is_none():
                 is_verify_round = get_parallel().pp_size > 1 and not (
                     batch.forward_mode.is_extend() or batch.is_extend_in_batch

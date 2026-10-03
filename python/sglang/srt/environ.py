@@ -662,6 +662,9 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PP2 replicated DSpark: exchange result relays in one batched bidirectional
+    # operation instead of serializing recv-before-send on the odd PP rank.
+    SGLANG_PP_DSPARK_BATCHED_RESULT_RELAY = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # ===================================================================

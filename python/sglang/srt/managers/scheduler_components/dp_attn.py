@@ -118,54 +118,57 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     prefill_cuda_graph_max_prefix_len: int = 0
+    pp_dspark_owned_num_tokens: int = 0
+    include_pp_dspark_owner_counts: bool = False
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_pp_dspark_owned_num_tokens: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                self.num_tokens,
-                self.num_tokens_for_logprob,
-                int(self.can_run_decode_cuda_graph),
-                int(self.is_extend_in_batch),
-                int(self.local_can_run_tbo),
-                self.local_forward_mode,
-                int(self.can_run_prefill_cuda_graph),
-                self.prefill_cuda_graph_max_prefix_len,
-                int(self.can_run_draft_cuda_graph),
-            ],
-            device=device,
-            dtype=dtype,
-        )
+        values = [
+            self.num_tokens,
+            self.num_tokens_for_logprob,
+            int(self.can_run_decode_cuda_graph),
+            int(self.is_extend_in_batch),
+            int(self.local_can_run_tbo),
+            self.local_forward_mode,
+            int(self.can_run_prefill_cuda_graph),
+            self.prefill_cuda_graph_max_prefix_len,
+            int(self.can_run_draft_cuda_graph),
+        ]
+        if self.include_pp_dspark_owner_counts:
+            values.append(self.pp_dspark_owned_num_tokens)
+        return torch.tensor(values, device=device, dtype=dtype)
 
     def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                0,  # num_tokens
-                0,  # num_tokens_for_logprob
-                1,  # can_run_decode_cuda_graph
-                0,  # is_extend_in_batch
-                1,  # local_can_run_tbo
-                ForwardMode.IDLE.value,  # local_forward_mode
-                0,  # can_run_prefill_cuda_graph
-                0,  # prefill_cuda_graph_max_prefix_len
-                1,  # can_run_draft_cuda_graph
-            ],
-            device=device,
-            dtype=dtype,
-        )
+        values = [
+            0,  # num_tokens
+            0,  # num_tokens_for_logprob
+            1,  # can_run_decode_cuda_graph
+            0,  # is_extend_in_batch
+            1,  # local_can_run_tbo
+            ForwardMode.IDLE.value,  # local_forward_mode
+            0,  # can_run_prefill_cuda_graph
+            0,  # prefill_cuda_graph_max_prefix_len
+            1,  # can_run_draft_cuda_graph
+        ]
+        if self.include_pp_dspark_owner_counts:
+            values.append(0)  # pp_dspark_owned_num_tokens
+        return torch.tensor(values, device=device, dtype=dtype)
 
     def finalize_local(self):
         """Populate gather-derived metadata from the sole attention-DP rank."""
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        if self.include_pp_dspark_owner_counts:
+            self.global_pp_dspark_owned_num_tokens = [self.pp_dspark_owned_num_tokens]
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -234,6 +237,8 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        if self.include_pp_dspark_owner_counts:
+            self.global_pp_dspark_owned_num_tokens = tp0_info_cpu[:, 9].tolist()
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
@@ -273,6 +278,11 @@ def _update_gather_batch(
             batch.draft_global_num_tokens_for_logprob = [
                 mlp_sync_info.num_tokens_for_logprob
             ]
+    if mlp_sync_info.include_pp_dspark_owner_counts:
+        batch.draft_global_num_tokens = mlp_sync_info.global_pp_dspark_owned_num_tokens
+        batch.draft_global_num_tokens_for_logprob = (
+            mlp_sync_info.global_pp_dspark_owned_num_tokens
+        )
     if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
         # Fresh counts have not yet been adjusted by the coordination plan.
         batch.dp_spec_prefill_coordination_applied = False
@@ -294,6 +304,22 @@ def _update_gather_batch(
     batch.dp_prefill_cuda_graph_max_prefix_len = (
         mlp_sync_info.prefill_cuda_graph_max_prefix_len
     )
+
+
+def _pp_dspark_owned_num_tokens(
+    local_batch: Optional[ScheduleBatch],
+) -> int:
+    if (
+        local_batch is None
+        or local_batch.forward_mode.is_idle()
+        or not get_spec().speculative_dspark_pp_replicated_draft
+    ):
+        return 0
+    from sglang.srt.speculative.dspark_components.dspark_pp import draft_owner
+
+    pp_rank = get_parallel().pp_rank
+    pp_size = get_parallel().pp_size
+    return sum(draft_owner(req.rid, pp_size) == pp_rank for req in local_batch.reqs)
 
 
 def should_skip_scheduler_all_gather(num_dp_ranks: int) -> bool:
@@ -523,6 +549,10 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
+        pp_dspark_owned_num_tokens=_pp_dspark_owned_num_tokens(local_batch),
+        include_pp_dspark_owner_counts=(
+            get_spec().speculative_dspark_pp_replicated_draft
+        ),
     )
 
     if num_dp_ranks == 1:
