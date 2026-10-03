@@ -38,7 +38,9 @@ use crate::policies::decode::{
 use crate::policies::{
     ExternalPrefixSignal, Policy, PrefillProposal, ProposalKind, SelectionContext,
 };
-use crate::server::metrics::{CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason};
+use crate::server::metrics::{
+    CacheAwareDecision, LocalityBlocks, MetricsRegistry, PolicySelectionFailureReason,
+};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 
@@ -127,6 +129,109 @@ fn cache_aware_fallback_decision(
     CacheAwareDecision::CacheWorkerQueued
 }
 
+/// What the cache-aware locality metrics need out of one prefix lookup, once
+/// the winning worker is known. Pure so the arithmetic — the part that decides
+/// whether a dashboard reads a hit rate above 100% — is testable without a
+/// ladder.
+struct LocalitySample {
+    blocks: LocalityBlocks,
+    /// `Tiers::SLOTS` label, `none`, or `unknown`. See
+    /// [`MetricsRegistry::record_selected_owner_tier`].
+    selected_tier: &'static str,
+    /// Whether the first queried block hash is carried by the tree. `None`
+    /// when the provider did not ask — it only asks on a miss, which is the
+    /// only case this attributes.
+    block0_in_tree: Option<bool>,
+}
+
+/// Decompose one lookup against the worker the request was actually sent to.
+///
+/// The nesting the counters promise — `selected <= matched <= query` — is the
+/// ROUTER's invariant to enforce, not the provider's, so both counts are
+/// clamped here rather than trusted. `query` is the outer clamp because a
+/// provider may legitimately report a worker holding a longer chain than was
+/// asked about. `matched` is the inner one because `best_prefix_blocks` and
+/// the per-worker depths are two numbers the provider computes separately:
+/// the in-process tree derives both from one descent and cannot disagree, but
+/// the out-of-process indexer is a separate service on a wire contract that
+/// only documents the relationship. A violation renders as a hit rate above
+/// 100% and a negative loss bar on every panel built from these, which is a
+/// poor way to learn an indexer is out of contract.
+///
+/// The debug assertion at the booking site stays rather than being made
+/// redundant by the clamp: the clamp keeps a release build's charts honest,
+/// the assertion is what fails a test build loudly enough to go fix the
+/// provider instead of silently flattening its numbers.
+fn locality_sample(signal: &ExternalPrefixSignal, selected_url: &str) -> LocalitySample {
+    let query = signal.query_blocks as u64;
+    let (matched, selected) = match &signal.outcome {
+        sgl_kv_indexer::PrefixOutcome::Matched {
+            matches,
+            best_prefix_blocks,
+        } => {
+            let matched = u64::from(*best_prefix_blocks).min(query);
+            let selected = matches
+                .iter()
+                .find(|m| m.address == selected_url)
+                .map_or(0, |m| u64::from(m.matched_prefix_blocks))
+                .min(matched);
+            (matched, selected)
+        }
+        sgl_kv_indexer::PrefixOutcome::Empty => (0, 0),
+    };
+    let selected_tier = match &signal.tree_view {
+        // A holder below `cache_threshold` still reports the tier it holds on:
+        // `selected_overlap_blocks_total` credits its blocks, so suppressing
+        // the tier here would leave those blocks tier-less.
+        Some(view) if selected > 0 => view
+            .owner_tiers
+            .get(selected_url)
+            .copied()
+            .unwrap_or("none"),
+        Some(_) => "none",
+        None => "unknown",
+    };
+    LocalitySample {
+        blocks: LocalityBlocks {
+            query,
+            matched,
+            selected,
+        },
+        selected_tier,
+        block0_in_tree: signal
+            .tree_view
+            .as_ref()
+            .and_then(|view| view.block0_in_tree),
+    }
+}
+
+/// Book one cache-aware selection's locality against the decision that
+/// produced it.
+///
+/// A selection with no lookup books nothing here — there is no prefix to
+/// attribute, and inventing a zero would drag every ratio toward zero for a
+/// reason that has nothing to do with the cache. Its decision is still in
+/// `sgl_router_cache_aware_decisions_total`.
+fn record_cache_locality(
+    metrics: &MetricsRegistry,
+    model_id: &str,
+    signal: Option<&ExternalPrefixSignal>,
+    decision: CacheAwareDecision,
+    selected_url: &str,
+) {
+    let Some(signal) = signal else {
+        return;
+    };
+    let sample = locality_sample(signal, selected_url);
+    metrics.record_cache_aware_locality(model_id, decision, sample.blocks);
+    metrics.record_selected_owner_tier(model_id, sample.selected_tier);
+    if sample.blocks.matched == 0 {
+        if let Some(present) = sample.block0_in_tree {
+            metrics.record_zero_match_block0(model_id, present);
+        }
+    }
+}
+
 /// Runs the prefill selection ladder. `Err` carries the reason the last rung
 /// to record one gave up with; the route maps it onto a status code.
 pub(crate) fn select_prefill_worker(
@@ -144,6 +249,7 @@ pub(crate) fn select_prefill_worker(
         },
         failure_reason: PolicySelectionFailureReason::ProposalEmpty,
         cache_gate_audit: None,
+        cache_winner_decision: None,
     };
     let selected = selector.run();
     selected.ok_or(selector.failure_reason)
@@ -163,6 +269,11 @@ struct Selector<'a> {
     /// resolution at all — no load snapshot, or no candidate proposal — which
     /// reads as a plain miss because nothing was gated out.
     cache_gate_audit: Option<(u64, u64, bool, u32)>,
+    /// Decision of a Cache-Aware resolution that produced a winner, set only
+    /// on the path that returns it. `run` books it, so the decision and the
+    /// locality triple keyed on it are booked at one site, once the selected
+    /// worker is known.
+    cache_winner_decision: Option<CacheAwareDecision>,
 }
 
 impl<'a> Selector<'a> {
@@ -182,7 +293,6 @@ impl<'a> Selector<'a> {
 
         // Cache-Aware resolves one bounded global candidate set and returns a final winner.
         let cache_winner = self.cache_winner();
-        let cache_winner_hit = cache_winner.is_some();
 
         let global_affinity_probe = use_global_affinity_probe
             .then(|| {
@@ -247,22 +357,35 @@ impl<'a> Selector<'a> {
         // reached nothing book `cache_worker_queued` and contribute to
         // `sgl_router_diverted_overlap_blocks` — a diversion that never
         // arrived is not evidence about what the gate traded away.
-        if inputs.policy_kind == PolicyKind::CacheAware && !cache_winner_hit && selected.is_some() {
-            let (rejected, evaluated, fleet_all_queued, blocks) =
-                self.cache_gate_audit.unwrap_or((0, 0, false, 0));
-            let decision = cache_aware_fallback_decision(rejected, evaluated, fleet_all_queued);
-            if matches!(decision, CacheAwareDecision::CacheWorkerQueued) {
-                // A real diversion: an unqueued destination existed and the
-                // gate gave up `blocks` of matched prefix to reach it. The
-                // histogram is the evidence for whether the gate is trading
-                // large cached prefixes for short waits.
-                inputs
-                    .metrics
-                    .observe_diverted_overlap_blocks(&inputs.model_id.0, u64::from(blocks));
-            }
+        if let Some(worker) = selected
+            .as_ref()
+            .filter(|_| inputs.policy_kind == PolicyKind::CacheAware)
+        {
+            let decision = self.cache_winner_decision.unwrap_or_else(|| {
+                let (rejected, evaluated, fleet_all_queued, blocks) =
+                    self.cache_gate_audit.unwrap_or((0, 0, false, 0));
+                let decision = cache_aware_fallback_decision(rejected, evaluated, fleet_all_queued);
+                if matches!(decision, CacheAwareDecision::CacheWorkerQueued) {
+                    // A real diversion: an unqueued destination existed and the
+                    // gate gave up `blocks` of matched prefix to reach it. The
+                    // histogram is the evidence for whether the gate is trading
+                    // large cached prefixes for short waits.
+                    inputs
+                        .metrics
+                        .observe_diverted_overlap_blocks(&inputs.model_id.0, u64::from(blocks));
+                }
+                decision
+            });
             inputs
                 .metrics
                 .record_cache_aware_decision(&inputs.model_id.0, decision);
+            record_cache_locality(
+                inputs.metrics,
+                &inputs.model_id.0,
+                inputs.external_prefix,
+                decision,
+                &worker.url,
+            );
         }
         selected
     }
@@ -384,9 +507,7 @@ impl<'a> Selector<'a> {
             // the off-owner draw in `run`: when every gate-rejected owner
             // also fails capacity admission the pin yields no decision, and
             // the fallback records the same label from an off-owner landing.
-            inputs
-                .metrics
-                .record_cache_aware_decision(&inputs.model_id.0, CacheAwareDecision::AllQueued);
+            self.cache_winner_decision = Some(CacheAwareDecision::AllQueued);
             if SATURATION_PIN_LOG_COUNTER
                 .fetch_add(1, AtomicOrdering::Relaxed)
                 .is_multiple_of(SATURATION_PIN_LOG_SAMPLE)
@@ -401,18 +522,15 @@ impl<'a> Selector<'a> {
                 );
             }
         } else {
-            inputs.metrics.record_cache_aware_decision(
-                &inputs.model_id.0,
-                if cache_decision.queue_gate_fell_back {
-                    // The gate removed every owner and nowhere in the fleet is
-                    // unqueued, so the prefix was kept rather than traded for a
-                    // wait that cannot be dodged. Booked as saturation, never
-                    // as a plain hit.
-                    CacheAwareDecision::AllQueued
-                } else {
-                    CacheAwareDecision::CacheHit
-                },
-            );
+            self.cache_winner_decision = Some(if cache_decision.queue_gate_fell_back {
+                // The gate removed every owner and nowhere in the fleet is
+                // unqueued, so the prefix was kept rather than traded for a
+                // wait that cannot be dodged. Booked as saturation, never as a
+                // plain hit.
+                CacheAwareDecision::AllQueued
+            } else {
+                CacheAwareDecision::CacheHit
+            });
         }
         Some(decision.selected)
     }
@@ -698,8 +816,9 @@ fn projected_decode_kv_tokens(input_tokens: u64, max_output_tokens: Option<u64>)
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_aware_fallback_decision, prefill_policy_reason, projected_decode_kv_tokens,
-        select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
+        cache_aware_fallback_decision, locality_sample, prefill_policy_reason,
+        projected_decode_kv_tokens, select_decode_peer, select_prefill_worker,
+        DecodeSelectionInputs, PrefillSelectionInputs,
     };
     use crate::config::{AffinityConfig, DecodePolicyKind, PolicyKind, SessionAffinityMode};
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -707,9 +826,11 @@ mod tests {
     use crate::policies::buckets::BucketSelector;
     use crate::policies::cache_aware::CacheAwarePolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
-    use crate::policies::{ExternalPrefixSignal, Policy, ProposalKind, SelectionProposal};
+    use crate::policies::{
+        ExternalPrefixSignal, Policy, ProposalKind, SelectionProposal, TreePrefixView,
+    };
     use crate::server::metrics::{
-        CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason,
+        CacheAwareDecision, LocalityBlocks, MetricsRegistry, PolicySelectionFailureReason,
     };
     use crate::state::load_monitor::engine_reported_load::{
         EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
@@ -1038,6 +1159,211 @@ mod tests {
         assert!(
             rendered.contains(r#"sgl_router_diverted_overlap_blocks_count{model_id="model"} 1"#),
             "a real diversion must observe its overlap depth, got:\n{rendered}"
+        );
+        // The locality triple books under the SAME decision, and the worker
+        // taken holds nothing: the full 7 blocks are locality given up.
+        for want in [
+            r#"sgl_router_cache_aware_query_blocks_total{model_id="model",decision="cache_worker_queued"} 10"#,
+            r#"sgl_router_matched_overlap_blocks_total{model_id="model",decision="cache_worker_queued"} 7"#,
+            r#"sgl_router_selected_overlap_blocks_total{model_id="model",decision="cache_worker_queued"} 0"#,
+            r#"sgl_router_selected_owner_tier_total{model_id="model",tier="unknown"} 1"#,
+        ] {
+            assert!(rendered.contains(want), "missing {want} in:\n{rendered}");
+        }
+    }
+
+    /// A cache hit books its triple under `cache_hit` with the winner's own
+    /// depth, and a selection with no lookup books a decision and no blocks.
+    #[test]
+    fn a_cache_hit_books_the_locality_triple_under_its_decision() {
+        let owner = worker("owner");
+        let other = worker("other");
+        let workers = vec![Arc::clone(&owner), Arc::clone(&other)];
+        let loads = snapshot(&[(&owner, 10, 10_000_000), (&other, 10, 10_000_000)]);
+        let signal = prefix_signal(&[(&owner, 7)], 10);
+        let policy = CacheAwarePolicy::new(AffinityConfig::default());
+        let buckets = BucketSelector::new(None);
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+        let mut inputs = prefill_inputs(
+            &policy,
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&loads),
+            100_000,
+        );
+        inputs.policy_kind = PolicyKind::CacheAware;
+        inputs.external_prefix = Some(&signal);
+
+        let selected = select_prefill_worker(&inputs).expect("the owner has room");
+        assert_eq!(selected.id, owner.id);
+
+        let rendered = metrics.render();
+        for want in [
+            r#"sgl_router_cache_aware_decisions_total{model_id="model",decision="cache_hit"} 1"#,
+            r#"sgl_router_cache_aware_query_blocks_total{model_id="model",decision="cache_hit"} 10"#,
+            r#"sgl_router_matched_overlap_blocks_total{model_id="model",decision="cache_hit"} 7"#,
+            r#"sgl_router_selected_overlap_blocks_total{model_id="model",decision="cache_hit"} 7"#,
+        ] {
+            assert!(rendered.contains(want), "missing {want} in:\n{rendered}");
+        }
+
+        let metrics = MetricsRegistry::new();
+        let mut inputs = prefill_inputs(
+            &policy,
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&loads),
+            100_000,
+        );
+        inputs.policy_kind = PolicyKind::CacheAware;
+        select_prefill_worker(&inputs).expect("min-load still routes");
+        let rendered = metrics.render();
+        assert!(rendered.contains(
+            r#"sgl_router_cache_aware_decisions_total{model_id="model",decision="cache_miss"} 1"#
+        ));
+        assert!(
+            !rendered.contains("sgl_router_cache_aware_query_blocks_total{"),
+            "no lookup means no denominator; got:\n{rendered}"
+        );
+    }
+
+    fn matched_signal(
+        best: u32,
+        holders: &[(&str, u32)],
+        tree_view: Option<TreePrefixView>,
+    ) -> ExternalPrefixSignal {
+        ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: holders
+                    .iter()
+                    .map(|(url, blocks)| sgl_kv_indexer::PrefixMatch {
+                        worker_id: (*url).to_string(),
+                        address: (*url).to_string(),
+                        matched_prefix_blocks: *blocks,
+                    })
+                    .collect(),
+                best_prefix_blocks: best,
+            },
+            query_blocks: 100,
+            tree_view,
+        }
+    }
+
+    fn tree_view(owners: &[(&str, &'static str)], block0_in_tree: Option<bool>) -> TreePrefixView {
+        TreePrefixView {
+            owner_tiers: owners
+                .iter()
+                .map(|(url, tier)| ((*url).to_string(), *tier))
+                .collect(),
+            block0_in_tree,
+        }
+    }
+
+    /// `matched` is the fleet best and `selected` is what the request will
+    /// actually get. Conflating them is the misreading the whole metric set
+    /// exists to prevent: here the gate routed off a 90-block owner onto a
+    /// 30-block one, and only `selected` shows it.
+    #[test]
+    fn locality_sample_separates_the_fleet_best_from_the_worker_taken() {
+        let signal = matched_signal(90, &[("http://a", 90), ("http://b", 30)], None);
+        let sample = locality_sample(&signal, "http://b");
+        assert_eq!(
+            sample.blocks,
+            LocalityBlocks {
+                query: 100,
+                matched: 90,
+                selected: 30,
+            }
+        );
+    }
+
+    /// A worker not in the match list holds nothing of this prefix — the
+    /// ordinary min-load fallback.
+    #[test]
+    fn locality_sample_credits_an_unlisted_winner_with_nothing() {
+        let signal = matched_signal(90, &[("http://a", 90)], None);
+        let sample = locality_sample(&signal, "http://elsewhere");
+        assert_eq!(sample.blocks.selected, 0);
+        assert_eq!(sample.blocks.matched, 90);
+    }
+
+    /// A provider may report a deeper chain than was asked about. The nesting
+    /// the counters promise is the router's invariant, so clamp rather than
+    /// render a hit rate above 100%.
+    #[test]
+    fn locality_sample_clamps_a_provider_that_overshoots_the_query() {
+        let signal = matched_signal(400, &[("http://a", 400)], None);
+        let sample = locality_sample(&signal, "http://a");
+        assert_eq!(sample.blocks.matched, 100);
+        assert_eq!(sample.blocks.selected, 100);
+    }
+
+    /// A provider whose fleet best is computed over a different candidate set
+    /// than its per-worker depths reports a holder DEEPER than the best. That
+    /// is out of contract, and unclamped it renders as a hit rate above 100%
+    /// and a negative loss bar on every panel built from these counters.
+    #[test]
+    fn locality_sample_clamps_a_holder_deeper_than_the_reported_fleet_best() {
+        let signal = matched_signal(40, &[("http://a", 90)], None);
+        let sample = locality_sample(&signal, "http://a");
+        assert_eq!(sample.blocks.matched, 40);
+        assert_eq!(
+            sample.blocks.selected, 40,
+            "selected must never exceed matched, whatever the provider says",
+        );
+    }
+
+    #[test]
+    fn locality_sample_reports_the_selected_workers_own_tier() {
+        let signal = matched_signal(
+            90,
+            &[("http://a", 90), ("http://b", 30)],
+            Some(tree_view(
+                &[("http://a", "device"), ("http://b", "host")],
+                None,
+            )),
+        );
+        assert_eq!(locality_sample(&signal, "http://a").selected_tier, "device");
+        assert_eq!(
+            locality_sample(&signal, "http://b").selected_tier,
+            "host",
+            "the winner's own tier, not the fleet best's",
+        );
+        assert_eq!(
+            locality_sample(&signal, "http://elsewhere").selected_tier,
+            "none",
+            "a winner holding nothing has no tier",
+        );
+    }
+
+    /// The indexer path cannot answer the tier question. Reporting `device`
+    /// there would read as a fleet serving every hit in place.
+    #[test]
+    fn locality_sample_reports_unknown_tier_without_a_tree_view() {
+        let signal = matched_signal(90, &[("http://a", 90)], None);
+        let sample = locality_sample(&signal, "http://a");
+        assert_eq!(sample.selected_tier, "unknown");
+        assert_eq!(sample.block0_in_tree, None);
+    }
+
+    #[test]
+    fn locality_sample_carries_block0_presence_for_a_zero_match() {
+        let signal = ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Empty,
+            query_blocks: 100,
+            tree_view: Some(tree_view(&[], Some(true))),
+        };
+        let sample = locality_sample(&signal, "http://a");
+        assert_eq!(sample.blocks.matched, 0);
+        assert_eq!(
+            sample.block0_in_tree,
+            Some(true),
+            "carried but unreachable is a router-side linkage fault, not an engine gap",
         );
     }
 
