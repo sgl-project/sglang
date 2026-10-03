@@ -109,7 +109,7 @@ const BOOTSTRAP_QUEUE_DEPTH: usize = 1024;
 /// have stored blocks, so the rank keeps waiting for a snapshot. A batch 0
 /// arriving later is a publisher restart instead; see the regression arms in
 /// `pump_loop`.
-const STREAM_ORIGIN_SEQ: i64 = 0;
+pub(super) const STREAM_ORIGIN_SEQ: i64 = 0;
 
 /// Control-plane messages for the pump task.
 ///

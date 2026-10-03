@@ -22,7 +22,8 @@
 //! # Sequence repair
 //!
 //! A seq that regresses on one socket is a publisher restart and is
-//! forwarded as a reset. A forward gap is re-fetched from the publisher's
+//! forwarded as a reset, except batch 0, which the pump already resolves from
+//! the stream's origin. A forward gap is re-fetched from the publisher's
 //! replay ROUTER when `/server_info` advertises one; live frames wait in the
 //! SUB socket meanwhile, so the pump always sees this rank in order.
 //!
@@ -72,6 +73,7 @@ use tracing::{debug, error, info, trace, warn};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
 use super::discovery::EventConfig;
+use super::index::STREAM_ORIGIN_SEQ;
 use super::tally::{EventTally, ReplayOutcome};
 use super::tree::KvWorkerId;
 use super::wire::{decode_event_batch, KvEventBatch};
@@ -428,10 +430,19 @@ async fn run_subscriber(
                     Ok(msg) => {
                         errors_in_a_row = 0;
                         let events = match decode_message(&id, msg, kind) {
-                            Some(event) => {
-                                sequence(&id, event, &mut last_seq, replay.as_deref(), &tally)
-                                    .await
-                            }
+                            // A gap replay can take REPLAY_TIMEOUT; don't let
+                            // it hold up remove_worker / shutdown.
+                            Some(event) => tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => return,
+                                events = sequence(
+                                    &id,
+                                    event,
+                                    &mut last_seq,
+                                    replay.as_deref(),
+                                    &tally,
+                                ) => events,
+                            },
                             None => Vec::new(),
                         };
                         for event in events {
@@ -561,7 +572,8 @@ async fn connect_with_backoff(
 }
 
 /// What to forward for `event`. One PUB stream never goes backwards, so a
-/// regressed seq is a publisher restart and becomes a reset; a forward gap
+/// regressed seq is a publisher restart and becomes a reset (batch 0 is left
+/// to the pump); a forward gap
 /// is filled from the replay socket when one is advertised.
 async fn sequence(
     id: &KvWorkerId,
@@ -574,7 +586,10 @@ async fn sequence(
     match &event {
         WorkerEvent::Batch { seq, .. } => {
             match *last_seq {
-                Some(last) if *seq <= last => {
+                // A restart from batch 0 is left to the pump, which resolves
+                // it from the stream's origin (keeping a bootstrapped rank
+                // warm) instead of failing the rank as a reset would.
+                Some(last) if *seq <= last && *seq != STREAM_ORIGIN_SEQ => {
                     warn!(
                         worker = ?id,
                         last,
@@ -671,14 +686,20 @@ async fn fetch_replay(
     dealer.send(request).await?;
     loop {
         let reply = dealer.recv().await?;
-        let (Some(seq), Some(payload)) = (reply.get(1), reply.get(2)) else {
+        let (3, Some(delim), Some(seq), Some(payload)) =
+            (reply.len(), reply.get(0), reply.get(1), reply.get(2))
+        else {
             return Err(anyhow!("replay reply has {} frames", reply.len()));
         };
+        if !delim.is_empty() {
+            return Err(anyhow!("replay reply lacks the empty delimiter frame"));
+        }
         let seq = i64::from_be_bytes(seq.as_ref().try_into().context("replay seq frame")?);
         if seq == END_SEQ_SENTINEL || seq >= to {
             return Ok(());
         }
-        if seq >= from {
+        // Kept strictly increasing, so a full count in fill_gap means no hole.
+        if seq >= from && batches.last().is_none_or(|&(last, _)| seq > last) {
             batches.push((seq, decode_event_batch(payload.as_ref())?));
         }
         if seq == to - 1 {
@@ -1857,7 +1878,9 @@ mod tests {
         };
         let mut last = None;
         let mut kinds = Vec::new();
-        for seq in [5, 9, 2] {
+        // A regression to batch 0 passes through without a reset: the pump
+        // resolves that one from the stream's origin.
+        for seq in [5, 9, 2, 0] {
             for ev in sequence(&id, batch(seq), &mut last, None, &tally).await {
                 kinds.push(match ev {
                     WorkerEvent::Batch { seq, .. } => seq,
@@ -1865,7 +1888,7 @@ mod tests {
                 });
             }
         }
-        assert_eq!(kinds, [5, 9, -1, 2]);
+        assert_eq!(kinds, [5, 9, -1, 2, 0]);
         assert_eq!(tally.replays(ReplayOutcome::Failed), 0);
     }
 }
