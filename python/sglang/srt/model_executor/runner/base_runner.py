@@ -43,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    attach_flashinfer_autotune_store,
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
@@ -250,6 +251,15 @@ class BaseRunner(ABC):
 
         if mr.device != "cuda":
             return
+
+        if should_run_flashinfer_autotune(mr) or (
+            get_parallel().tp_group.pcie_ipc_comm is not None
+            and not get_exec().kernel.disable_flashinfer_autotune
+        ):
+            # Attach before anything tunes, including PCIe-IPC's prepare(),
+            # which tunes even when the model does not: winners tuned before
+            # the attach land outside the store, and serving never sees them.
+            attach_flashinfer_autotune_store(mr)
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
