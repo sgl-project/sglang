@@ -402,7 +402,7 @@ def _qk_head_launch_config() -> tuple[int, int]:
 def _mod_row_stride(t: torch.Tensor, batch: int, hidden: int) -> int | None:
     # (batch, hidden) modulation rows, possibly strided views of a chunked
     # adaLN projection; the last dim must be packed.
-    if t.dim() != 2 or t.shape != (batch, hidden) or t.stride(1) != 1:
+    if t.shape != (batch, hidden) or t.stride(1) != 1:
         return None
     return t.stride(0) if batch > 1 else hidden
 
@@ -414,31 +414,33 @@ def can_use_fused_layernorm_modulate(dtype: torch.dtype, hidden: int) -> bool:
     )
 
 
-def _validate_layernorm_modulate(x, scale, shift) -> int:
+def _validate_layernorm_modulate(x, scale, shift) -> tuple[int, int, int, int]:
+    shape = x.shape
     if not (
         _is_bf16_cuda(x)
-        and x.ndim == 3
+        and len(shape) == 3
         and x.numel() > 0
         and x.is_contiguous()
-        and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
+        and 0 < shape[-1] <= 8192
+        and shape[-1] % 4 == 0
     ):
         raise RuntimeError(
             "LayerNorm modulation expects contiguous BF16 CUDA [B, S, D], D divisible by 4 and <= 8192"
         )
-    batch, _, hidden = x.shape
+    batch, seq_len, hidden = shape
+    device = x.device
     stride = _mod_row_stride(scale, batch, hidden)
-    if stride is None:
-        raise RuntimeError("scale must have packed [B, D] rows")
-    for name, tensor in (("scale", scale), ("shift", shift)):
-        if tensor is not None and not (
-            tensor.dtype == x.dtype
-            and tensor.device == x.device
-            and _mod_row_stride(tensor, batch, hidden) == stride
-        ):
-            raise RuntimeError(
-                f"{name} must match scale's row layout and x's dtype/device"
-            )
-    return stride
+    if not (
+        stride is not None and scale.dtype is torch.bfloat16 and scale.device == device
+    ):
+        raise RuntimeError("scale must have packed BF16 [B, D] rows on x's device")
+    if shift is not None and not (
+        shift.dtype is torch.bfloat16
+        and shift.device == device
+        and _mod_row_stride(shift, batch, hidden) == stride
+    ):
+        raise RuntimeError("shift must match scale's row layout and dtype/device")
+    return batch, seq_len, hidden, stride
 
 
 def _fake_ln_modulate(
@@ -520,8 +522,7 @@ def fused_layernorm_modulate_raw(
     of microseconds per call); use it on CPU-launch-bound eager hot paths
     (e.g. Sana), and the registered custom op under ``torch.compile``.
     """
-    stride = _validate_layernorm_modulate(x, scale, shift)
-    batch, seq_len, hidden = x.shape
+    batch, seq_len, hidden, stride = _validate_layernorm_modulate(x, scale, shift)
     n_rows = batch * seq_len
     rows = 2
     out = torch.empty_like(x)
@@ -568,8 +569,7 @@ def fused_layernorm_modulate_fp8_quant_raw(
     Unlike that two-op chain, this path does not materialize the intermediate
     BF16 activation because FLUX.2 feeds it directly into an FP8 projection.
     """
-    stride = _validate_layernorm_modulate(x, scale, shift)
-    batch, seq_len, hidden = x.shape
+    batch, seq_len, hidden, stride = _validate_layernorm_modulate(x, scale, shift)
     n_rows = batch * seq_len
     rows = 2
     out = torch.empty_like(x, dtype=fp8_dtype)
@@ -631,21 +631,23 @@ def fused_qk_head_layernorm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-head ``nn.LayerNorm(dim_head)`` (no affine) over q and k in one
     launch, bit-exact vs the eager aten kernel."""
+    shape = q.shape
     if not (
         _is_bf16_cuda(q)
-        and q.ndim == 4
+        and len(shape) == 4
         and q.numel() > 0
-        and can_use_fused_qk_head_layernorm(q.dtype, q.shape[-1])
-        and k.dtype == q.dtype
+        and 0 < shape[-1] <= 128
+        and shape[-1] % 4 == 0
+        and k.dtype is torch.bfloat16
         and k.device == q.device
-        and k.shape == q.shape
+        and k.shape == shape
         and q.is_contiguous()
         and k.is_contiguous()
     ):
         raise RuntimeError(
             "QK LayerNorm expects matching contiguous BF16 CUDA [B, S, H, D], D divisible by 4 and <= 128"
         )
-    head_dim = q.shape[-1]
+    head_dim = shape[-1]
     n_rows = q.numel() // head_dim
     # Architecture sweeps at the production GLM shape select 32 rows / 1 warp
     # on B300 (SM103) and 8 rows / 4 warps on RTX 5090 (SM120). Preserve the
