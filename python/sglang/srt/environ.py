@@ -687,6 +687,11 @@ class Envs:
     # - Source builds with a missing or unusable Rust toolchain.
     # This also applies when Rust is explicitly selected.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
+    # Python TreeCore only: keep a persistent lazy-deletion heap over the Full
+    # component's evictable leaves instead of rebuilding it on every eviction
+    # call. False re-keys every leaf at each eviction (legacy O(#leaves) cost,
+    # identical eviction order) through the same code path.
+    SGLANG_UNIFIED_RADIX_LAZY_EVICTION_HEAP = EnvBool(True)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
 
     # ===================================================================

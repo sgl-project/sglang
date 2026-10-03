@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import heapq
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -66,6 +65,7 @@ class FullComponent(TreeComponent):
             cd = node.component_data[self.component_type]
             assert cd.session_ref > 0
             cd.session_ref -= 1
+            self.tree_core._touch_full_eviction_key(node)
             node = node.parent
 
     def _advance_session_coverage(
@@ -82,6 +82,7 @@ class FullComponent(TreeComponent):
             and node is not self.tree_core.root_node
         ):
             node.component_data[self.component_type].session_ref += 1
+            self.tree_core._touch_full_eviction_key(node)
             node = node.parent
 
     def _recede_session_coverage(
@@ -100,6 +101,7 @@ class FullComponent(TreeComponent):
             cd = node.component_data[self.component_type]
             assert cd.session_ref > 0
             cd.session_ref -= 1
+            self.tree_core._touch_full_eviction_key(node)
             node = node.parent
 
     def create_match_validator(
@@ -192,14 +194,9 @@ class FullComponent(TreeComponent):
         return ref > 0, ref, self.tree_core.eviction_strategy.get_priority(node)
 
     def _evict_device_start(self, request_cnt: int) -> None:
-        self._ensure_eviction_strategy()
         self._evict_device_request_cnt = request_cnt
         self._evict_device_last_node = None
-        self._evict_device_heap = [
-            (self.session_ref_eviction_strategy(n), n)
-            for n in self.tree_core.evictable_device_leaves
-        ]
-        heapq.heapify(self._evict_device_heap)
+        self.tree_core.full_device_heap.begin_walk()
 
     def _evict_device_next_node(
         self,
@@ -208,28 +205,23 @@ class FullComponent(TreeComponent):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> Optional[NodeId]:
         ct = self.component_type
+        heap = self.tree_core.full_device_heap
         lv = self._evict_device_last_node
-        if (
-            lv is not None
-            and lv.parent is not None
-            and lv.parent in self.tree_core.evictable_device_leaves
-        ):
-            heapq.heappush(
-                self._evict_device_heap,
-                (self.session_ref_eviction_strategy(lv.parent), lv.parent),
-            )
+        if lv is not None and lv.parent is not None:
+            # The evicted leaf's parent may have become a device leaf: admit
+            # it to the current walk, keyed now (the legacy explicit push).
+            heap.promote(lv.parent)
         self._evict_device_last_node = None
-        while tracker[ct] < self._evict_device_request_cnt and self._evict_device_heap:
-            _, x = heapq.heappop(self._evict_device_heap)
-            if x not in self.tree_core.evictable_device_leaves:
-                continue
-            self._evict_device_last_node = x
-            return x.id
+        if tracker[ct] < self._evict_device_request_cnt:
+            x = heap.pop_next()
+            if x is not None:
+                self._evict_device_last_node = x
+                return x.id
         return None
 
     def _evict_device_end(self) -> None:
-        self._evict_device_heap = []
         self._evict_device_last_node = None
+        self.tree_core.full_device_heap.end_walk()
 
     def drive_host_eviction(
         self,
@@ -239,26 +231,19 @@ class FullComponent(TreeComponent):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         """Evict host leaves to free KV host pool space."""
-        self._ensure_eviction_strategy()
-        heap = [
-            (self.session_ref_eviction_strategy(n), n)
-            for n in self.tree_core.evictable_host_leaves
-        ]
-        heapq.heapify(heap)
         ct = self.component_type
-        while tracker[ct] < num_tokens and heap:
-            _, x = heapq.heappop(heap)
-            if x not in self.tree_core.evictable_host_leaves:
-                continue
-            self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
-            if (
-                x.parent is not None
-                and x.parent in self.tree_core.evictable_host_leaves
-            ):
-                heapq.heappush(
-                    heap,
-                    (self.session_ref_eviction_strategy(x.parent), x.parent),
-                )
+        heap = self.tree_core.full_host_heap
+        heap.begin_walk()
+        try:
+            while tracker[ct] < num_tokens:
+                x = heap.pop_next()
+                if x is None:
+                    break
+                self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+                if x.parent is not None:
+                    heap.promote(x.parent)
+        finally:
+            heap.end_walk()
 
     def acquire_component_lock(
         self,
@@ -290,6 +275,9 @@ class FullComponent(TreeComponent):
 
         # Lock the device-on segment up to root
         delta = 0
+        tree_core = self.tree_core
+        evictable_device_leaves = tree_core.evictable_device_leaves
+        device_live = tree_core._full_device_live
         while cur is not root:
             cd = cur.component_data[ct]
             assert cd.value is not None, (
@@ -297,11 +285,13 @@ class FullComponent(TreeComponent):
             )
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
-                self.tree_core.component_evictable_size_[ct] -= key_len
-                self.tree_core.component_protected_size_[ct] += key_len
+                tree_core.component_evictable_size_[ct] -= key_len
+                tree_core.component_protected_size_[ct] += key_len
                 delta += key_len
             cd.lock_ref += 1
-            self.tree_core.evictable_device_leaves.discard(cur)
+            evictable_device_leaves.discard(cur)
+            if cur in device_live:
+                tree_core.full_device_heap.forget(cur)
             cur = cur.parent
         result.delta = delta
         return result
