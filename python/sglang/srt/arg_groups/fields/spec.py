@@ -29,7 +29,7 @@ class Spec(msgspec.Struct):
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, MAMBA_ATTN_HYBRID, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     uno_lora_path: A[Optional[str], "Path to the UNO draft LoRA checkpoint."] = None
     speculative_draft_model_path: A[

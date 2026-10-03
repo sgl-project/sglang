@@ -536,7 +536,7 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_target_verify():
             if (
                 forward_batch.spec_algorithm is not None
-                and forward_batch.spec_algorithm.is_dflash()
+                and forward_batch.spec_algorithm.is_dflash_family()
             ):
                 # dflash_worker_v2 already publishes seq_lens_cpu as prefix +
                 # one verify block, which already covers the draft block.

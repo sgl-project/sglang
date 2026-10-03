@@ -152,6 +152,67 @@ _LONGCAT_ARCHS = {
 }
 
 
+def _try_load_speculators_config(model, revision: Optional[str], **kwargs):
+    """Load speculators-format draft configs (e.g. ``mamba_attn_hybrid``).
+
+    Speculators checkpoints nest the drafter transformer fields under
+    ``transformer_layer_config`` and carry no ``model_type``, so AutoConfig
+    cannot read them directly. This mirrors the vLLM ``SpeculatorsConfig``
+    normalization: lift the nested fields onto a ``Qwen3Config``, default the
+    fusion ids to the aux capture ids, and synthesize the ``dflash_config``
+    block that the shared DFLASH draft plumbing expects.
+    """
+    try:
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model, revision=revision, **kwargs
+        )
+    except Exception:
+        return None
+    if config_dict.get("speculators_model_type") != "mamba_attn_hybrid":
+        return None
+
+    lifted = dict(config_dict.get("transformer_layer_config") or {})
+    for key, value in config_dict.items():
+        if key in ("transformer_layer_config", "speculators_config"):
+            continue
+        lifted.setdefault(key, value)
+    lifted["model_type"] = "qwen3"
+    lifted.setdefault("architectures", ["MambaAttnHybridDraftModel"])
+    if "sliding_attention" in (lifted.get("layer_types") or []) and lifted.get(
+        "sliding_window"
+    ):
+        # Qwen3Config zeroes sliding_window unless use_sliding_window is set.
+        lifted.setdefault("use_sliding_window", True)
+    if not lifted.get("latent_fusion_layer_ids"):
+        aux = lifted.get("aux_hidden_state_layer_ids")
+        if aux:
+            lifted["latent_fusion_layer_ids"] = list(aux)
+
+    block_size = None
+    methods = (config_dict.get("speculators_config") or {}).get(
+        "proposal_methods"
+    ) or []
+    if methods:
+        speculative_tokens = (methods[0] or {}).get("speculative_tokens")
+        if speculative_tokens is not None:
+            block_size = int(speculative_tokens) + 1
+    dflash_cfg = dict(lifted.get("dflash_config") or {})
+    dflash_cfg.setdefault("block_size", block_size)
+    dflash_cfg.setdefault("mask_token_id", lifted.get("mask_token_id"))
+    dflash_cfg.setdefault("projector_type", "dspark")
+    dflash_cfg.setdefault(
+        "target_layer_ids", list(lifted.get("latent_fusion_layer_ids") or [])
+    )
+    dflash_cfg.setdefault(
+        "num_target_layers", len(lifted.get("latent_fusion_layer_ids") or [])
+    )
+    lifted["dflash_config"] = dflash_cfg
+
+    from transformers import Qwen3Config
+
+    return Qwen3Config.from_dict(lifted)
+
+
 def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     config_dict, _ = PretrainedConfig.get_config_dict(
         model, revision=revision, **kwargs
@@ -215,7 +276,9 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config = _try_load_speculators_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
