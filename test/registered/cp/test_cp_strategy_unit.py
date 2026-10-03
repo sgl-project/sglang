@@ -139,6 +139,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             input_embeds=None,
             replace_embeds=None,
             mm_inputs=None,
+            contains_mm_inputs=lambda: False,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
