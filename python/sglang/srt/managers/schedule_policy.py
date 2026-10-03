@@ -1234,6 +1234,8 @@ class PrefillAdder:
                 for i in range(len(self.req_states)):
                     if tokens_left <= self.req_states[i][0]:
                         break
+                else:
+                    i = len(self.req_states)
                 self.req_states.insert(i, (tokens_left, tokens_occupied))
 
         if self.req_states is None:

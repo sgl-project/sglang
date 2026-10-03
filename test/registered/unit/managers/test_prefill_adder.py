@@ -782,6 +782,32 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
 
+    def test_ignore_eos_admits_request_with_longer_decode(self):
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.available_size.return_value = 142
+        adder = self.create_adder(self.create_running_batch())
+
+        reqs = []
+        for rid, input_len, max_new_tokens in [
+            ("short_decode", 100, 10),
+            ("long_decode", 1, 20),
+        ]:
+            req = self.create_shared_req(rid, max_new_tokens=max_new_tokens)
+            req.sampling_params.ignore_eos = True
+            req.origin_input_ids = list(range(input_len))
+            req.full_untruncated_fill_ids = list(range(input_len))
+            reqs.append(req)
+
+        # The first request finishes sooner and frees its long prompt.
+        for req in reqs:
+            self.assertEqual(
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                ),
+                AddReqResult.CONTINUE,
+            )
+        self.assertEqual(adder.can_run_list, reqs)
+
     @patch(
         "sglang.srt.managers.schedule_policy.page_interleave_shard_size",
         return_value=4,
