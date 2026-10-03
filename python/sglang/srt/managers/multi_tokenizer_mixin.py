@@ -31,6 +31,7 @@ import zlib
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
+import msgspec
 import psutil
 import setproctitle
 import zmq
@@ -39,6 +40,7 @@ import zmq.asyncio
 from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
+    _USE_PICKLE_IPC,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
@@ -48,6 +50,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
+    PickleWrapper,
     TokenizerWorkerRegistrationReq,
     async_sock_recv,
     async_sock_send,
@@ -107,6 +110,22 @@ class SocketMapping:
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=is_tokenizer)
         sock_send(self._mapping[ipc_name], output)
+
+
+def _materialize_fanout_metadata(output: Any) -> Any:
+    """Reuse opaque fields locally; native row slicing restores wire wrappers."""
+    if (
+        _USE_PICKLE_IPC
+        or not isinstance(output, (BatchTokenIDOutput, BatchStrOutput))
+        or len(output.rids) <= 1
+    ):
+        return output
+    updates = {}
+    for name in ("time_stats", "customized_info"):
+        value = getattr(output, name, None)
+        if isinstance(value, PickleWrapper):
+            updates[name] = unwrap_from_pickle(value)
+    return msgspec.structs.replace(output, **updates) if updates else output
 
 
 def _extract_field_by_index(
@@ -420,6 +439,8 @@ class MultiHttpWorkerDetokenizerMixin:
                         self.socket_mapping.send_output(
                             ipc_name, new_output, is_tokenizer=True
                         )
+                        if i == 0:
+                            output = _materialize_fanout_metadata(output)
                 elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
                         recv_obj.http_worker_ipc, output, is_tokenizer=True
@@ -620,6 +641,8 @@ class MultiDetokenizerRouter:
                         raise TypeError(f"Cannot split {type(recv_obj)}")
                     one.http_worker_ipcs = [ipc_key]
                     self._send(self._pick(ipc_key), one)
+                    if i == 0:
+                        recv_obj = _materialize_fanout_metadata(recv_obj)
                 continue
 
             raise ValueError(
