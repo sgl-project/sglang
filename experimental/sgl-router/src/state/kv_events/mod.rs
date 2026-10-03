@@ -39,8 +39,8 @@ pub use index::{KvEventIndex, KvIndexMetrics};
 pub use subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
 pub use tally::{EventKind, EventTally, ReplayOutcome, TallyRow};
 pub use tree::{
-    HashTree, KvWorkerId, MatchResult, SnapshotNode, TierCounts, Tiers, ACCOUNTING_REASONS,
-    TIER_SLOT_COUNT,
+    HashTree, KvWorkerId, MatchResult, PrefixDepth, SnapshotNode, TierCounts, Tiers,
+    ACCOUNTING_REASONS, TIER_SLOT_COUNT,
 };
 pub use wire::{
     decode_event_batch, BlockRemoved, BlockStored, DecodeError, KvCacheEvent, KvEventBatch,

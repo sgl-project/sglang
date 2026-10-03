@@ -77,6 +77,9 @@ impl CacheSource {
             Ok(outcome) => Ok(Some(Arc::new(ExternalPrefixSignal {
                 outcome,
                 query_blocks,
+                // The indexer's wire contract carries neither the storage
+                // tier nor reverse-index presence.
+                tree_view: None,
             }))),
             Err(PrefixIndexError::Rejected(code)) => Err(PickError::InvalidSignal(format!(
                 "KV Indexer rejected the query: {code}"
@@ -181,6 +184,7 @@ impl CacheAwarePolicy {
         let Some(ExternalPrefixSignal {
             outcome: PrefixOutcome::Matched { matches, .. },
             query_blocks,
+            ..
         }) = signal.filter(|signal| signal.query_blocks > 0)
         else {
             return Vec::new();
