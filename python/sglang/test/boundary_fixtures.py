@@ -152,7 +152,7 @@ def postprocess_output(boundary, hidden, residual, forward_batch):
     stream = (
         residual if isinstance(residual, ResidualStream) else ResidualStream(residual)
     )
-    hidden = boundary.finish_complete_output(hidden, stream, forward_batch)
+    hidden = boundary.complete_now(hidden, stream, forward_batch)
     if isinstance(residual, ResidualStream):
         return hidden, stream
     return (hidden, None) if stream.pending is None else stream.input(hidden)
