@@ -24,6 +24,7 @@ from sglang.kernels.cake_kernels.attention_common import flashinfer_module_avail
 from sglang.kernels.ops.attention.cake import (
     cake_concat_mla_k,
     cake_kimi_k3_mla_fp8_paged_attention,
+    cake_mla_varq_dcp_decode,
     cake_prepare_kimi_k3_mla_fp8_paged_attention,
     cake_prepare_nvfp4_batch_decode_with_kv_cache_mla,
     cake_trtllm_batch_decode_sparse_mla_dsv4,
@@ -232,6 +233,97 @@ def test_kimi_k3_mla_public_route_and_direct_entries():
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+def _varq_reference(query, cum_q, kv_rows, kv_lens, scale):
+    """FP32 var-Q reference (same as ``test_cake_mla_varq._varq_reference``)."""
+    total_q, num_heads, _ = query.shape
+    out = torch.zeros((total_q, num_heads, LATENT), device=query.device)
+    lse = torch.full((total_q, num_heads), -math.inf, device=query.device)
+    offsets = cum_q.tolist()
+    for b, (q0, q1) in enumerate(zip(offsets[:-1], offsets[1:])):
+        q_len, g = q1 - q0, kv_lens[b]
+        keys = kv_rows[b][:g].float()
+        bounds = g - q_len + torch.arange(q_len, device=query.device)
+        visible = torch.arange(g, device=query.device)[None, :] <= bounds[:, None]
+        scores = torch.einsum("qhd,kd->qhk", query[q0:q1].float(), keys) * scale
+        scores = scores.masked_fill(~visible[:, None, :], -math.inf)
+        row_lse = torch.logsumexp(scores, dim=-1)
+        probs = torch.exp(scores - row_lse[..., None])
+        out[q0:q1] = torch.einsum("qhk,kd->qhd", probs, keys[:, :LATENT])
+        lse[q0:q1] = row_lse
+    return out, lse
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason=(
+        "FlashInfer 46340689a5ab: the first var-Q DCP decode launch after a "
+        "Kimi-K3 FP8 MLA (cake) launch in the same process returns wrong rows "
+        "(Linear CAKE-922); the second launch is correct. Strict: flips to a "
+        "failure once FlashInfer fixes it so this guard can be removed."
+    ),
+)
+def test_varq_after_kimi_k3_mla(request):
+    """Cross-kernel interference guard (see ``test_cake_mla_varq.py``).
+
+    Runs the Kimi-K3 cake MLA public route once, then the var-Q one-shot with
+    the same inputs as the standalone var-Q test and checks it against the FP32
+    reference.  Deterministic on GB300 and B200; not a stream race (survives
+    synchronize + sleep, a fresh stream and ``CUDA_LAUNCH_BLOCKING=1``).
+    """
+    test_kimi_k3_mla_public_route_and_direct_entries()
+    _skip_unless(cake.ARCHS, cake.FI_VARQ_DCP_MODULE)
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(12)
+    kv_lens, q_lens, num_heads = [300, 70], [2, 1], 12
+    total_q = sum(q_lens)
+    query = (
+        torch.randn((total_q, num_heads, QK_DIM), generator=gen, device=device) * 0.1
+    ).to(torch.bfloat16)
+    pages_per = [_ceil_div(k, PAGE) for k in kv_lens]
+    kv_cache = (
+        torch.randn((sum(pages_per), PAGE, QK_DIM), generator=gen, device=device) * 0.1
+    ).to(torch.bfloat16)
+    page_table = torch.zeros((2, max(pages_per)), dtype=torch.int32, device=device)
+    kv_rows, off = [], 0
+    for b, n in enumerate(pages_per):
+        page_table[b, :n] = torch.arange(off, off + n, dtype=torch.int32, device=device)
+        kv_rows.append(kv_cache[off : off + n].reshape(-1, QK_DIM))
+        off += n
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    cum_q = torch.tensor([0, q_lens[0], total_q], dtype=torch.int32, device=device)
+    scale = 1.0 / math.sqrt(LATENT)
+    ref_out, ref_lse = _varq_reference(query, cum_q, kv_rows, kv_lens, scale)
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    workspace = torch.empty(
+        cake.max_mla_varq_dcp_decode_workspace_size(
+            batch_size=2, max_q_len=2, num_heads=num_heads, num_sms=num_sms
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    out = torch.full(
+        (total_q, num_heads, LATENT), math.nan, dtype=torch.bfloat16, device=device
+    )
+    lse = torch.full((total_q, num_heads), math.nan, dtype=torch.float32, device=device)
+    cake_mla_varq_dcp_decode(
+        query,
+        kv_cache,
+        workspace,
+        page_table,
+        seq_lens,
+        max(kv_lens),
+        scale,
+        cum_seq_lens_q=cum_q,
+        max_q_len=2,
+        out=out,
+        lse=lse,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), ref_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-2, rtol=1e-2)
 
 
 # --------------------------------------------------------------------------
