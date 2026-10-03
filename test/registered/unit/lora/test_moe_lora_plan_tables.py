@@ -350,9 +350,13 @@ class TestLoraMoeRunnerBackend:
         for backend in (
             MoeRunnerBackend.LORA_CUTEDSL,
             MoeRunnerBackend.LORA_TRITON,
+            MoeRunnerBackend.LORA_MARLIN,
         ):
             assert backend.is_lora()
         assert not MoeRunnerBackend.LORA_TRITON.is_triton()
+        assert not MoeRunnerBackend.LORA_MARLIN.is_marlin()
+        assert MoeRunnerBackend.LORA_MARLIN.is_lora_marlin()
+        assert not MoeRunnerBackend.MARLIN.is_lora_marlin()
         assert not MoeRunnerBackend.DEEP_GEMM.is_lora()
         assert not MoeRunnerBackend.TRITON.is_lora()
 
@@ -363,6 +367,7 @@ class TestLoraMoeRunnerBackend:
         for backend in (
             MoeRunnerBackend.LORA_CUTEDSL,
             MoeRunnerBackend.LORA_TRITON,
+            MoeRunnerBackend.LORA_MARLIN,
         ):
             assert backend.value in MOE_RUNNER_BACKEND_CHOICES
 
