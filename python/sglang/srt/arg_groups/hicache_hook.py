@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,22 @@ def handle_hicache(server_args: Any):
         )
     ):
         return
+
+    if cfg.device == "npu" and envs.SGLANG_IS_IN_CI.get():
+        # CI-only mitigation for large pinned-host allocations. This limits the
+        # logical pool size in GB per rank, not the allocator's reserved bytes.
+        # Decode offload consumes the same configuration as ordinary HiCache.
+        ci_host_size_gb = 4
+        declare_resolution(
+            server_args,
+            "handle_hicache_npu_ci_host_size",
+            hicache_size=(
+                min(cfg.hicache_size, ci_host_size_gb)
+                if cfg.hicache_size > 0
+                else ci_host_size_gb
+            ),
+            hicache_host_memory_fraction=None,
+        )
 
     validate_hicache_host_memory_mode(server_args)
 

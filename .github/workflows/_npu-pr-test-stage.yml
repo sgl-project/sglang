@@ -46,6 +46,10 @@ on:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
         type: boolean
         default: false
+      install_sglang_deps:
+        description: 'Compatibility input; this debug workflow always installs checkout source and dependencies.'
+        type: boolean
+        default: false
       use_coverage_runner:
         description: 'If true, delegate test execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh instead of running via run_suite.py directly'
         type: boolean
@@ -215,16 +219,10 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          if [[ "${{ inputs.is_nightly_pipeline_job }}" != "true" ]]; then
-            bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.npu_device_type }}
+          # Debug nightly jobs must use the checkout even when callers pass false.
+          bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.npu_device_type }}
 
-          else
-            sglang_pkg_path=/sgl-workspace/sglang/python
-            ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
-            mkdir -p ${ascend_test_util_path}
-            mv ${ascend_test_util_path} ${ascend_test_util_path}_bak
-            cp -r $(pwd)/python/sglang/test/ascend ${ascend_test_util_path}
-
+          if [[ "${{ inputs.is_nightly_pipeline_job }}" == "true" ]]; then
             pip install sentence_transformers zss "wandb>=0.16.0" tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
             pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 "sacrebleu>=1.5.0" pytablewriter "peft>=0.2.0" "accelerate>=0.29.1"
             pip install jsonlines "evaluate>=0.4.0" numexpr dotenv
@@ -235,6 +233,9 @@ jobs:
           # install sglang_router
           apt-get install -y libssl-dev
           pip install sglang_router
+          if [[ "${{ inputs.is_nightly_pipeline_job }}" == "true" ]]; then
+            echo "PYTHONPATH=${GITHUB_WORKSPACE}/python${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
+          fi
 
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
@@ -249,6 +250,9 @@ jobs:
 
           # Install missing python deps (skip if already importable).
           PYTHON_FOR_SGLANG="python"
+          if [[ "${{ inputs.is_nightly_pipeline_job }}" == "true" ]]; then
+            ${PYTHON_FOR_SGLANG} -c 'import importlib.util, pathlib; actual = pathlib.Path(importlib.util.find_spec("sglang").origin).resolve(); expected = pathlib.Path("python/sglang/__init__.py").resolve(); print(f"SGLang source: {actual}"); assert actual == expected, f"expected checkout source: {expected}"'
+          fi
           PIP_INDEXES=("https://pypi.org/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple")
           PIP_TRUSTED_HOST=cache-service.nginx-pypi-cache.svc.cluster.local
           install_pkg() {
