@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import msgspec
 import msgspec.structs
+import torch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
@@ -1081,6 +1082,56 @@ class TestKV4Compatibility(unittest.TestCase):
     def test_nvfp4_rejects_unified_memory(self):
         args = self._make_nvfp4_args(enable_unified_memory=True)
         with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+            handle_kv4_compatibility(args)
+
+    @staticmethod
+    def _make_ultraquant_args(dtype=torch.bfloat16, **overrides):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="ultraquant_4bit",
+            attention_backend="ultraquant",
+            **overrides,
+        )
+        # Pre-set the memoized model config so the hook does not load "dummy".
+        args._model_config = SimpleNamespace(dtype=dtype)
+        return args
+
+    @override_platform(is_cuda=False, is_hip=True)
+    def test_ultraquant_allows_plain_serving(self):
+        handle_kv4_compatibility(self._make_ultraquant_args())
+
+    @override_platform(is_cuda=False, is_hip=True)
+    def test_ultraquant_rejects_unvalidated_kv_paths(self):
+        for option, value, flag in (
+            ("enable_unified_memory", True, "--enable-unified-memory"),
+            ("enable_hierarchical_cache", True, "--enable-hierarchical-cache"),
+            ("enable_lmcache", True, "--enable-lmcache"),
+            ("disaggregation_mode", "decode", "--disaggregation-mode"),
+            ("speculative_algorithm", "NEXTN", "--speculative-algorithm"),
+            ("pp_size", 2, "--pp-size"),
+            ("dcp_size", 2, "--dcp-size"),
+        ):
+            with self.subTest(option=option):
+                args = self._make_ultraquant_args(**{option: value})
+                with self.assertRaisesRegex(ValueError, flag):
+                    handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=False, is_hip=True)
+    def test_ultraquant_rejects_mla_models(self):
+        args = self._make_ultraquant_args()
+        with (
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.use_mla_backend",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(ValueError, "MLA"),
+        ):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=False, is_hip=True)
+    def test_ultraquant_rejects_non_bf16_models(self):
+        args = self._make_ultraquant_args(dtype=torch.float16)
+        with self.assertRaisesRegex(ValueError, "bfloat16 models only"):
             handle_kv4_compatibility(args)
 
 

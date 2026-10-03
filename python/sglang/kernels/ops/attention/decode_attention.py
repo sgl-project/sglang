@@ -921,6 +921,7 @@ def _fwd_kernel_stage2(
     HAS_SINK: tl.constexpr,
     USE_PDL: tl.constexpr = False,
     FORCED_KV_SPLITS: tl.constexpr = 0,
+    STRIDED_BLOCK_KV: tl.constexpr = 0,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -958,10 +959,20 @@ def _fwd_kernel_stage2(
     )
 
     for split_kv_id in tl.range(0, SPLIT_END, num_stages=2):
-        split_kv_start = kv_len_per_split * split_kv_id
-        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+        if STRIDED_BLOCK_KV > 0:
+            # Stage 1 dealt STRIDED_BLOCK_KV-token blocks to the splits round
+            # robin, so split i holds data iff block i exists.
+            has_kv = (split_kv_id < kv_splits) & (
+                split_kv_id * STRIDED_BLOCK_KV < cur_batch_seq_len
+            )
+        else:
+            split_kv_start = kv_len_per_split * split_kv_id
+            split_kv_end = tl.minimum(
+                split_kv_start + kv_len_per_split, cur_batch_seq_len
+            )
+            has_kv = split_kv_end > split_kv_start
 
-        if split_kv_end > split_kv_start:
+        if has_kv:
             tv = tl.load(
                 Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
             )
@@ -1000,9 +1011,13 @@ def _decode_softmax_reducev_fwd(
     sinks=None,
     use_pdl=False,
     forced_kv_splits: int = 0,
+    v_head_dim: Optional[int] = None,
+    strided_block_kv: int = 0,
 ):
     batch, head_num = q.shape[0], q.shape[1]
-    Lv = v_buffer.shape[-1]
+    # Packed KV buffers store fewer elements than the head dimension they
+    # represent, so those callers pass the logical width explicitly.
+    Lv = v_buffer.shape[-1] if v_head_dim is None else v_head_dim
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     MAX_KV_SPLITS = max_kv_splits
@@ -1035,6 +1050,7 @@ def _decode_softmax_reducev_fwd(
         HAS_SINK=HAS_SINK,
         USE_PDL=use_pdl,
         FORCED_KV_SPLITS=forced_kv_splits,
+        STRIDED_BLOCK_KV=strided_block_kv,
         num_warps=4,
         num_stages=2,
         **({"launch_pdl": True} if use_pdl else {}),

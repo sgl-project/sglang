@@ -42,6 +42,18 @@ import torch
 from torch import Tensor
 
 from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_MAX
+from sglang.srt.layers.quantization.ultraquant_tensor import (
+    GROUP_SIZE as ULTRAQUANT_GROUP_SIZE,
+)
+from sglang.srt.layers.quantization.ultraquant_tensor import (
+    UltraQuantKVQuantizeUtil,
+)
+from sglang.srt.layers.quantization.ultraquant_tensor import (
+    code_bytes as ultraquant_code_bytes,
+)
+from sglang.srt.layers.quantization.ultraquant_tensor import (
+    n_groups as ultraquant_n_groups,
+)
 from sglang.srt.runtime_context import get_platform
 
 
@@ -338,6 +350,17 @@ class KVCacheQuantMethodBase(ABC):
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int
     ) -> int:
         """Per-token memory footprint in bytes (for capacity estimation)."""
+
+    @classmethod
+    def max_pool_tokens(
+        cls, head_num: int, head_dim: int, page_size: int
+    ) -> Optional[int]:
+        """Largest pool, in tokens, the recipe's kernels can address (None: no limit)."""
+        return None
+
+    def configure_model(self, model_config) -> None:
+        """Per-model setup, called before buffers are sized (no-op by default)."""
+        pass
 
     def load_scales_from_model(self, model_runner) -> None:
         """Load per-layer global scales from model weights (no-op by default)."""
@@ -914,6 +937,172 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         return fp4_size + scale_size + dq_size
 
 
+class UltraQuantKVCacheMethod(KVCacheQuantMethodBase):
+    """UltraQuant: FP4 E2M1 codes with one UE8M0 scale per group of 32.
+
+    Keys are Hadamard-rotated before quantization to spread channel outliers,
+    so queries must be rotated to match, which the UltraQuant attention backend
+    does. The attention kernels read the packed codes directly, so no dequant
+    workspace is allocated. Codes and scales live in separate buffers.
+
+    Layers in ``full_precision_layers`` keep plain K/V in the model dtype, with
+    empty scale buffers, and are served by the stock Triton attention path.
+    """
+
+    name = "ultraquant_4bit"
+    SCALE_BLOCK_SIZE = ULTRAQUANT_GROUP_SIZE
+
+    def __init__(
+        self,
+        num_layers: Optional[int] = None,
+        device: Optional[str] = None,
+        page_size: Optional[int] = None,
+    ):
+        self.full_precision_layers: frozenset[int] = frozenset()
+        self.full_precision_dtype = torch.bfloat16
+
+    @staticmethod
+    def boundary_layers(num_layers: int, is_hybrid: bool, n: int = 2) -> frozenset[int]:
+        """First and last ``n`` layers of a dense model.
+
+        Hybrid models have few full-attention layers, so all of them are
+        quantized.
+        """
+        if is_hybrid:
+            return frozenset()
+        n = min(n, num_layers // 2)
+        return frozenset(range(n)) | frozenset(range(num_layers - n, num_layers))
+
+    def configure_model(self, model_config) -> None:
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        self.full_precision_layers = self.boundary_layers(
+            model_config.num_attention_layers,
+            is_hybrid=mambaish_config(model_config) is not None,
+        )
+        self.full_precision_dtype = model_config.dtype
+
+    def needs_native_fp4_scales(self) -> bool:
+        # The stored scale layout is the one the kernels read, so there is no
+        # second, hardware-swizzled copy to allocate.
+        return False
+
+    def create_buffers(
+        self, size: int, head_num: int, head_dim: int, layer_num: int, device: str
+    ) -> dict:
+        store_dtype = self.kv_storage_dtype()
+        code_shape = (size, head_num, ultraquant_code_bytes(head_dim))
+        scale_shape = (size, head_num, ultraquant_n_groups(head_dim))
+        plain_shape = (size, head_num, head_dim)
+        no_scale_shape = (size, head_num, 0)
+
+        def allocate(shape, full_precision_shape, full_precision_dtype):
+            return [
+                (
+                    torch.zeros(
+                        full_precision_shape, dtype=full_precision_dtype, device=device
+                    )
+                    if layer in self.full_precision_layers
+                    else torch.zeros(shape, dtype=store_dtype, device=device)
+                )
+                for layer in range(layer_num)
+            ]
+
+        return {
+            "k_buffer": allocate(code_shape, plain_shape, self.full_precision_dtype),
+            "v_buffer": allocate(code_shape, plain_shape, self.full_precision_dtype),
+            "k_scale_buffer": allocate(scale_shape, no_scale_shape, torch.uint8),
+            "v_scale_buffer": allocate(scale_shape, no_scale_shape, torch.uint8),
+            "store_dtype": store_dtype,
+        }
+
+    def quantize_and_store(
+        self,
+        k_buffer,
+        v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
+        loc,
+        cache_k,
+        cache_v,
+        k_scale=None,
+        v_scale=None,
+        native_k_scale_buffer=None,
+        native_v_scale_buffer=None,
+    ) -> None:
+        if k_buffer.dtype == self.full_precision_dtype:
+            k_buffer[loc] = cache_k.to(k_buffer.dtype)
+            v_buffer[loc] = cache_v.to(v_buffer.dtype)
+            return
+
+        from sglang.kernels.ops.kvcache.ultraquant import ultraquant_store
+
+        # One kernel does the rotation, the quantization, and the packing, so
+        # the rotated keys never reach memory in full precision.
+        ultraquant_store(
+            cache_k,
+            cache_v,
+            k_buffer,
+            k_scale_buffer,
+            v_buffer,
+            v_scale_buffer,
+            loc,
+        )
+
+    def dequantize_kv_tensor(
+        self,
+        fp4_tensor: Tensor,
+        scales: Tensor,
+        layer_id: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tensor:
+        return UltraQuantKVQuantizeUtil.batched_dequantize(
+            fp4_tensor, scales, dtype=dtype or torch.bfloat16
+        )
+
+    def dequantize_prev_kv(
+        self,
+        k_fp4: Tensor,
+        k_scales: Tensor,
+        v_fp4: Tensor,
+        v_scales: Tensor,
+        layer_id: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Dequantize stored KV. Keys stay in the rotated basis."""
+        return (
+            self.dequantize_kv_tensor(k_fp4, k_scales, layer_id),
+            self.dequantize_kv_tensor(v_fp4, v_scales, layer_id),
+        )
+
+    def compute_cell_size(
+        self, head_num: int, head_dim: int, num_layers: int, kv_size: int
+    ) -> int:
+        # The buffers are uint8, so these element counts are already bytes and
+        # the caller's storage-dtype element size does not apply.
+        per_token_per_side = head_num * (
+            ultraquant_code_bytes(head_dim) + ultraquant_n_groups(head_dim)
+        )
+        full_precision_per_token_per_side = (
+            head_num * head_dim * self.full_precision_dtype.itemsize
+        )
+        num_full_precision = sum(
+            layer in self.full_precision_layers for layer in range(num_layers)
+        )
+        return 2 * (
+            per_token_per_side * (num_layers - num_full_precision)
+            + full_precision_per_token_per_side * num_full_precision
+        )
+
+    @classmethod
+    def max_pool_tokens(
+        cls, head_num: int, head_dim: int, page_size: int
+    ) -> Optional[int]:
+        # The FlyDSL decode addresses each code buffer through a 32-bit buffer
+        # offset, and the buffers hold one padding page past the pool.
+        row_bytes = head_num * ultraquant_code_bytes(head_dim)
+        return 0xFFFFFFFF // row_bytes - page_size
+
+
 # Registry: method name -> attention access rules.
 _PREFILL = KVCacheAttentionPhase.PREFILL
 _DECODE = KVCacheAttentionPhase.DECODE
@@ -934,6 +1123,9 @@ _FP4_MX_MHA_BACKENDS = frozenset(
 )
 _FP4_MX_PREFILL_BACKENDS = _FP4_MX_MHA_BACKENDS | frozenset({"fa4"})
 _CPU_FP8_BACKENDS = frozenset({"intel_amx"})
+_ULTRAQUANT_SCALE = "ultraquant"
+# Keys are stored rotated; only a backend that rotates queries may read them.
+_ULTRAQUANT_BACKENDS = frozenset({"ultraquant"})
 
 
 def _backend_matcher(backends) -> KVCacheBackendMatcher:
@@ -1009,6 +1201,10 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _plain(_PREFILL, _FP4_MX_PREFILL_BACKENDS, _FP4_MX_SCALE, _BF16),
         _plain(_DECODE, _FP4_MX_MHA_BACKENDS, _FP4_MX_SCALE, _BF16),
     ),
+    UltraQuantKVCacheMethod.name: (
+        _native_fp4(_PREFILL, _ULTRAQUANT_BACKENDS, _ULTRAQUANT_SCALE, _TORCH_FP4),
+        _native_fp4(_DECODE, _ULTRAQUANT_BACKENDS, _ULTRAQUANT_SCALE, _TORCH_FP4),
+    ),
 }
 
 
@@ -1017,6 +1213,7 @@ KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethodBase]] = {
     "cpu_fp8_e4m3": CPUFP8KVCacheMethod,
     "nvfp4": NVFP4KVCacheMethod,
     "fp4_mx_block16": FP4MXBlock16KVCacheMethod,
+    "ultraquant_4bit": UltraQuantKVCacheMethod,
 }
 
 
@@ -1030,7 +1227,8 @@ def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:
         ):
             raise ValueError(
                 "FP4 KV cache storage dtype does not identify the recipe. "
-                "Pass the explicit --kv-cache-dtype value: 'nvfp4' or 'fp4_mx_block16'."
+                "Pass the explicit --kv-cache-dtype value: 'nvfp4', "
+                "'fp4_mx_block16' or 'ultraquant_4bit'."
             )
         return None
 

@@ -196,7 +196,10 @@ class Model(msgspec.Struct):
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "
+                '"ultraquant_4bit" selects the UltraQuant recipe, FP4 E2M1 '
+                "with UE8M0 scales per group of 32 and Hadamard-rotated keys, "
+                "which requires the ultraquant attention backend on ROCm"
             ),
             choices=[
                 "auto",
@@ -207,6 +210,7 @@ class Model(msgspec.Struct):
                 "bfloat16",
                 "nvfp4",
                 "fp4_mx_block16",
+                "ultraquant_4bit",
             ],
             resolvable=True,
         ),
