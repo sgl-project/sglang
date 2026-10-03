@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -9,7 +10,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _PAGE_SIZE = 256
 
@@ -94,6 +95,26 @@ class TestKVPageInvariants(CustomTestCase):
         )
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
+
+    def test_classed_allocator_without_flat_free_list_is_checked(self):
+        chk, rtt, _tc, alloc = _make_checker(page_size=4, row_width=8)
+        alloc.free_pages = None
+        alloc.get_all_free_pages = MagicMock(
+            return_value=torch.tensor([5, 6], dtype=torch.int64)
+        )
+        rtt[0, :1] = torch.tensor([5 * alloc.page_size])
+        chk.get_last_batch = lambda: SimpleNamespace(
+            reqs=[_FakeOwner(0, 1, 1, rid="classed")]
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.invariant_checker.page_interleave_shard_size",
+            return_value=2,
+        ):
+            with self.assertRaisesRegex(ValueError, "use-after-free"):
+                chk._check_kv_page_invariants()
+
+        alloc.get_all_free_pages.assert_called()
 
     def test_free_pool_duplicate_raises(self):
         chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([3, 3, 4]))

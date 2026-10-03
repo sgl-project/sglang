@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -12,21 +14,22 @@ from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
     def test_skip_all_gather_policy(self):
         with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):
-            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(dp_size=1))
-            self.assertFalse(dp_attn.should_skip_scheduler_all_gather(dp_size=2))
+            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=1))
+            self.assertFalse(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
         with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(True):
-            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(dp_size=2))
+            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
 
     def test_dp1_skip_preserves_local_tbo_metadata(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 4,
+            spec_info=None,
         )
         tbo_preparer = Mock()
         tbo_preparer.prepare_all_gather.return_value = (
@@ -39,6 +42,18 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
             patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
             patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    num_dp_ranks=1,
+                    attn_tp_size=4,
+                    attn_cp_size=1,
+                    tp_group=SimpleNamespace(
+                        device_group=object(), device="cpu", cpu_group=object()
+                    ),
+                ),
+            ),
             patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
             patch.object(dp_attn.MLPSyncBatchInfo, "all_gather") as all_gather,
         ):
@@ -48,12 +63,6 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
                     prefill_cuda_graph_runner=None,
                     spec_algorithm=SpeculativeAlgorithm.NONE,
                     model_config=object(),
-                ),
-                dp_size=1,
-                attn_tp_size=4,
-                attn_cp_size=1,
-                tp_group=SimpleNamespace(
-                    device_group=object(), device="cpu", cpu_group=object()
                 ),
                 get_idle_batch=Mock(
                     side_effect=AssertionError("DP1 must not emit idle batch")
@@ -84,12 +93,14 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
     def _vote(self, *, beam):
         runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
         runner.enable_lora = False
+        runner.max_context_size = None
         runner.can_replay_locally.return_value = True
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 2,
             return_logprob=False,
             has_grammar=False,
+            multimodal_inputs=None,
             reqs=[
                 SimpleNamespace(beam_group=Mock() if beam else None),
                 SimpleNamespace(beam_group=None),
@@ -128,6 +139,78 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
 
     def test_beam_request_blocks_conversion(self):
         self.assertFalse(self._vote(beam=True))
+
+
+class TestPrefillCudaGraphVote(CustomTestCase):
+    def _vote(self, mode, *, mm=None):
+        runner_cls = dp_attn.PrefillCudaGraphRunner
+        runner = Mock(spec=runner_cls)
+        runner.enable_lora = False
+        runner.max_context_size = None
+        runner._qwen_bcg_hc_sidechannel = True
+        runner.can_replay_locally.side_effect = lambda **kwargs: (
+            not kwargs["contains_mm_inputs"]
+            or runner_cls.can_replay_locally(self=runner, **kwargs)
+        )
+        batch = SimpleNamespace(
+            forward_mode=mode,
+            extend_num_tokens=4,
+            multimodal_inputs=mm,
+            input_embeds=None,
+            replace_embeds=None,
+            prefix_lens=[1, 1],
+            return_logprob=False,
+            batch_size=lambda: 2,
+        )
+        vote = dp_attn._local_prefill_cuda_graph_vote(
+            local_batch=batch,
+            prefill_graph_runner=runner,
+            coordinated_prefill=True,
+            breakable_prefill=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            model_config=object(),
+        )
+        return vote, runner
+
+    def test_extend_batch_votes_for_prefill_graph(self):
+        vote, runner = self._vote(ForwardMode.EXTEND)
+
+        self.assertTrue(vote)
+        runner.can_replay_locally.assert_called_once()
+        self.assertFalse(runner.can_replay_locally.call_args.kwargs["is_mixed"])
+
+    def test_mixed_batch_delegates_to_runner_policy(self):
+        vote, runner = self._vote(ForwardMode.MIXED)
+
+        self.assertTrue(vote)
+        runner.can_replay_locally.assert_called_once()
+        self.assertTrue(runner.can_replay_locally.call_args.kwargs["is_mixed"])
+
+    @patch.object(dp_attn, "get_parallel")
+    @patch.object(dp_attn, "all_gather_single")
+    def test_multimodal_ranks_vote_eager(self, gather, parallel):
+        infos = [
+            dp_attn.MLPSyncBatchInfo(
+                num_dp_ranks=2,
+                tp_size=1,
+                cp_size=1,
+                num_tokens=4,
+                num_tokens_for_logprob=1,
+                can_run_decode_cuda_graph=False,
+                can_run_draft_cuda_graph=False,
+                can_run_prefill_cuda_graph=self._vote(ForwardMode.EXTEND, mm=mm)[0],
+                is_extend_in_batch=True,
+                local_can_run_tbo=False,
+                local_forward_mode=ForwardMode.EXTEND.value,
+            )
+            for mm in ([SimpleNamespace(contains_mm_input=lambda: True)], None)
+        ]
+        values = torch.cat([i._get_local_tensor(device="cpu") for i in infos])
+        gather.side_effect = lambda output, *a, **kw: output.copy_(values)
+        parallel.return_value.tp_group.active_ranks_cpu = torch.ones(2)
+        for info in infos:
+            info.all_gather(device="cpu", group=None)
+            self.assertFalse(info.can_run_prefill_cuda_graph)
 
 
 if __name__ == "__main__":

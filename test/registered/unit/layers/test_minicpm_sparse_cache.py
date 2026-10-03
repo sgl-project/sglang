@@ -1,3 +1,4 @@
+import functools
 import sys
 from types import SimpleNamespace
 
@@ -15,11 +16,14 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class RecordingAllocator(BaseTokenToKVPoolAllocator):
@@ -89,6 +93,16 @@ def alloc_extend(pool, req_pool_idx: int, seq_len: int):
         req_pool_indices_cpu=torch.tensor([req_pool_idx], dtype=torch.int64),
         target_seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
     )
+
+
+def setup_function(_):
+    # The cache reads its parallel topology from the context.
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+
+
+def teardown_function(_):
+    reset_context()
 
 
 def test_extend_allocates_at_sparse_boundaries():
@@ -182,6 +196,7 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
         get_last_batch=lambda: None,
         get_running_batch=lambda: None,
+        scheduler_stage_metrics=None,
     )
 
     leak, message = checker._check_full_pool(
@@ -227,13 +242,13 @@ def test_streaming_session_release_frees_compressed_slots():
     compressed_cache = pool._aux_cache
     assert len(compressed_cache.free_slots) < len(compressed_cache.reserved_slots)
 
-    session = StreamingSession(
-        SimpleNamespace(
-            req_to_token_pool=pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=1,
-        )
+    cache = SimpleNamespace(
+        req_to_token_pool=pool,
+        token_to_kv_pool_allocator=allocator,
+        page_size=1,
     )
+    cache.free_kv_row = functools.partial(BasePrefixCache.free_kv_row, cache)
+    session = StreamingSession(cache)
     session.slots["session-a"] = SessionSlot(
         kv=ReqKvInfo(req_pool_idx=req_pool_idx, kv_allocated_len=16),
     )
@@ -272,6 +287,7 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
         ),
         get_last_batch=lambda: None,
         get_running_batch=lambda: None,
+        scheduler_stage_metrics=None,
     )
 
     leak, message = checker._check_mamba_pool(

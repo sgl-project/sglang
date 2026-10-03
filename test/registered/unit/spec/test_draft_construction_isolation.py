@@ -23,7 +23,7 @@ from sglang.srt.runtime_context import get_context, get_flags, get_model, publis
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _AlwaysDisables:
@@ -202,6 +202,40 @@ class TestDraftWeightUpdateRecord(CustomTestCase):
         seeded = self._seed()
         self._update(is_draft_worker=True)
         self.assertEqual(get_model().model_path, seeded.model_path)
+
+
+class TestDraftBoundaryPolicy(unittest.TestCase):
+    def test_scope_restores_target_policy_after_nested_failure(self):
+        from sglang.srt.runtime_context import (
+            get_exec,
+            get_spec,
+            publish,
+            reset_context,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        reset_context()
+        try:
+            publish(
+                ServerArgs(
+                    model_path="dummy",
+                    boundary_reduction="rs+rsv",
+                ),
+                role="test",
+            )
+            self.assertEqual(get_exec().comm.boundary_reduction, "rs+rsv")
+            with (
+                get_spec().override(speculative_boundary_reduction="ar"),
+                self.assertRaisesRegex(RuntimeError, "draft failed"),
+            ):
+                with draft_model_build_scope():
+                    self.assertEqual(get_exec().comm.boundary_reduction, "ar")
+                    with draft_model_build_scope():
+                        self.assertEqual(get_exec().comm.boundary_reduction, "ar")
+                    raise RuntimeError("draft failed")
+            self.assertEqual(get_exec().comm.boundary_reduction, "rs+rsv")
+        finally:
+            reset_context()
 
 
 if __name__ == "__main__":

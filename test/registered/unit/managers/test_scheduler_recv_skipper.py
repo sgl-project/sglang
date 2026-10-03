@@ -12,15 +12,16 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (  # noqa: E40
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _publish(case, interval, enable_dp_attention=False):
+def _publish(case, interval, attn_dp_size=1):
     """Publish the config the skipper reads; the double is a published config,
     not an injected object."""
     override = get_context().override_server_args(
         scheduler_recv_interval=interval,
-        enable_dp_attention=enable_dp_attention,
+        tp_size=attn_dp_size,
+        attn_dp_size=attn_dp_size,
     )
     override.install()
     case.addCleanup(override.restore)
@@ -40,8 +41,8 @@ class TestSchedulerRecvSkipper(CustomTestCase):
         self.assertIsNone(SchedulerRecvSkipper.maybe_create())
 
     def test_enabled_under_dp_attention(self):
-        # Regression: the constructor used to assert `not enable_dp_attention`.
-        _publish(self, 50, enable_dp_attention=True)
+        # Regression: the constructor used to reject DP attention.
+        _publish(self, 50, attn_dp_size=2)
         skipper = SchedulerRecvSkipper.maybe_create()
         self.assertIsNotNone(skipper)
 
@@ -69,12 +70,12 @@ class TestSchedulerRecvSkipper(CustomTestCase):
     def test_dp_uses_synced_mode_not_local(self):
         # Local EXTEND (weight 1000) must be ignored in favor of the synced
         # DECODE (weight 1); a recv here would mean the local mode leaked in.
-        _publish(self, 50, enable_dp_attention=True)
+        _publish(self, 50, attn_dp_size=2)
         skipper = SchedulerRecvSkipper.maybe_create()
         self.assertFalse(skipper.handle(_batch(ForwardMode.EXTEND, ForwardMode.DECODE)))
 
     def test_dp_synced_extend_triggers_recv(self):
-        _publish(self, 50, enable_dp_attention=True)
+        _publish(self, 50, attn_dp_size=2)
         skipper = SchedulerRecvSkipper.maybe_create()
         self.assertTrue(skipper.handle(_batch(ForwardMode.IDLE, ForwardMode.EXTEND)))
 
