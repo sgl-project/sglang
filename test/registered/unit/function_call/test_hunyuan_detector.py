@@ -628,6 +628,37 @@ class TestHunyuanDetectorStreaming(CustomTestCase):
         args = json.loads(collected[0]["parameters"])
         self.assertEqual(args["city"], "San Francisco")
 
+    def test_streaming_string_arg_json_escaping(self):
+        values = [chr(code) for code in range(32)] + [
+            'quotes " and backslash \\ with 中文 😀',
+            "before\x00\b\f\x1fafter",
+        ]
+        for value in values:
+            text = (
+                "<tool_calls><tool_call>search<tool_sep>"
+                f"<arg_key>query</arg_key><arg_value>{value}</arg_value>"
+                "<arg_key>count</arg_key><arg_value>2</arg_value>"
+                "</tool_call></tool_calls>"
+            )
+            expected = {"query": value, "count": 2}
+            non_streamed = self._new_detector().detect_and_parse(text, self.tools)
+            self.assertEqual(json.loads(non_streamed.calls[0].parameters), expected)
+
+            for chunk_size in (1, 7, len(text)):
+                with self.subTest(value=repr(value), chunk_size=chunk_size):
+                    detector = self._new_detector()
+                    all_calls = []
+                    for start in range(0, len(text), chunk_size):
+                        all_calls.extend(
+                            detector.parse_streaming_increment(
+                                text[start : start + chunk_size], self.tools
+                            ).calls
+                        )
+                    collected = _collect_streamed_tool_calls(all_calls)
+                    self.assertEqual(len(collected), 1)
+                    self.assertEqual(collected[0]["name"], "search")
+                    self.assertEqual(json.loads(collected[0]["parameters"]), expected)
+
     def test_streaming_all_in_one_delta(self):
         """Entire tool call arriving in a single delta."""
         detector = self._new_detector()
