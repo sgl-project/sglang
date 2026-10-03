@@ -45,7 +45,9 @@ use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/chat/completions", post(chat_completions))
+    Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/invocations", post(chat_completions))
 }
 
 #[derive(Deserialize)]
