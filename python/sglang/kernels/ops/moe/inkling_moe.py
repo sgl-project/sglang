@@ -331,14 +331,14 @@ def silu_and_mul_triton(
 
     Adapted from ``inkling_kernels.activation.silu_and_mul_fwd`` (without MXFP).
     """
-    assert (
-        gateup_output.is_contiguous()
-    ), f"{gateup_output.shape=} {gateup_output.stride()=}"
+    assert gateup_output.is_contiguous(), (
+        f"{gateup_output.shape=} {gateup_output.stride()=}"
+    )
     assert gateup_output.ndim == 2, f"{gateup_output.shape=}"
     if topk_weights is not None:
-        assert (
-            topk_weights.is_contiguous()
-        ), f"{topk_weights.shape=} {topk_weights.stride()=}"
+        assert topk_weights.is_contiguous(), (
+            f"{topk_weights.shape=} {topk_weights.stride()=}"
+        )
         assert topk_weights.ndim == 1, f"{topk_weights.shape=}"
 
     M = gateup_output.shape[0]
@@ -502,9 +502,9 @@ def compute_expert_block_metadata(
     block_size_m: int = BLOCK_SIZE_M,
 ):
     assert num_tokens_per_expert.ndim == 1, f"{num_tokens_per_expert.shape=}"
-    assert (
-        num_tokens_per_expert.is_contiguous()
-    ), f"{num_tokens_per_expert.shape=} {num_tokens_per_expert.stride()=}"
+    assert num_tokens_per_expert.is_contiguous(), (
+        f"{num_tokens_per_expert.shape=} {num_tokens_per_expert.stride()=}"
+    )
 
     num_experts = num_tokens_per_expert.numel()
     max_num_blocks = _get_max_num_blocks(num_routed_tokens, [block_size_m], num_experts)

@@ -43,9 +43,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int64)
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int64),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+        )
         all = T
         T = eos - bos
     else:
@@ -708,7 +709,6 @@ def fused_recurrent_kda_packed_decode(
 
 
 class FusedRecurrentFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     def forward(
@@ -907,9 +907,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int64)
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int64),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+        )
         all = T
         T = eos - bos
     else:
@@ -1144,7 +1145,6 @@ def fused_recurrent_gated_delta_rule_update_fwd(
 
 
 class FusedRecurrentUpdateFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     def forward(
@@ -1227,7 +1227,11 @@ def fused_recurrent_gated_delta_rule_update(
                     f"The number of initial states is expected to be equal to the number of input sequences, "
                     f"i.e., {len(cu_seqlens) - 1} rather than {initial_state_indices.shape[0]}."
                 )
-            if initial_state_indices.shape[0] != intermediate_state_indices.shape[0]:
+            if (
+                intermediate_state_indices is not None
+                and initial_state_indices.shape[0]
+                != intermediate_state_indices.shape[0]
+            ):
                 raise ValueError(
                     f"The number of intermediate state indices is expected to be equal to the number of input sequences, "
                     f"i.e., {initial_state_indices.shape[0]} != {intermediate_state_indices.shape[0]}."

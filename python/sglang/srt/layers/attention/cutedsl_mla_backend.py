@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 
@@ -174,22 +175,17 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         if self.data_type == torch.float8_e4m3fn:
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
-                if (
-                    save_kv_cache
-                    and self._fused_set_kv_concat_q_fp8
-                    and not self.kv_index_translator.is_translating
-                ):
-                    # Static pool: out_cache_loc is already the physical loc.
-                    # Fused: bf16->fp8 quantize + KV scatter + q concat in one
-                    # launch; None when not covered.
-                    query = self._set_kv_and_concat_q_fp8_fused(
-                        layer=layer,
-                        loc=forward_batch.out_cache_loc,
-                        q=q,
-                        q_rope=q_rope,
-                        k=k,
-                        k_rope=k_rope,
-                    )
+                if save_kv_cache and self._fused_set_kv_concat_q_fp8:
+                    loc = self._resolve_fused_write_loc(forward_batch)
+                    if loc is not None:
+                        query = self._set_kv_and_concat_q_fp8_fused(
+                            layer=layer,
+                            loc=loc,
+                            q=q,
+                            q_rope=q_rope,
+                            k=k,
+                            k_rope=k_rope,
+                        )
                 if query is None:
                     q, k, k_rope = mla_quantize_without_rope_for_fp8(
                         q, q_rope, k.squeeze(1), k_rope.squeeze(1)
@@ -211,7 +207,10 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         if query is None and save_kv_cache:
             assert k is not None and k_rope is not None
             self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
+                layer,
+                self._kv_write_loc(forward_batch),
+                k,
+                k_rope,
             )
 
         if query is not None:
@@ -231,7 +230,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             query = query.unsqueeze(1)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
         metadata = (
             getattr(forward_batch, "decode_trtllm_mla_metadata", None)

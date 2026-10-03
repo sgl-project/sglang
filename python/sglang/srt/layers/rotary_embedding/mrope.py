@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.rotary_triton import (
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.rotary_embedding.yarn import (
+    _extend_yarn_cache,
     yarn_find_correction_range,
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
@@ -22,12 +23,14 @@ from sglang.srt.runtime_context import attention_backends
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
+    is_hip,
     is_npu,
     is_xpu,
     support_triton,
 )
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -39,7 +42,10 @@ if _is_npu:
     import torch_npu
 
 if _is_xpu:
-    from sgl_kernel import multimodal_rotary_embedding
+    try:
+        from sgl_kernel import multimodal_rotary_embedding
+    except ImportError:
+        multimodal_rotary_embedding = None
 
 from sglang.kernels.ops.attention.mrope import apply_interleaved_rope_triton
 
@@ -110,9 +116,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             return None
         section = self.mrope_section
         num_pairs = self.rotary_dim // 2
-        assert (
-            len(section) == 3 and sum(section) == num_pairs
-        ), f"mrope_section {section} must be three axes summing to {num_pairs}"
+        assert len(section) == 3 and sum(section) == num_pairs, (
+            f"mrope_section {section} must be three axes summing to {num_pairs}"
+        )
         if self.mrope_interleaved_glm:
             axes = []
             spent = [0, 0, 0]
@@ -166,11 +172,18 @@ class MRotaryEmbedding(RotaryEmbedding):
         self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
-        if (
-            self.cos_sin_cache.device != query.device
-            or self.cos_sin_cache.dtype != query.dtype
-        ):
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+        if _is_hip:
+            # On HIP, keep fp32 for the fused QSA indexer JIT kernel.
+            if self.cos_sin_cache.device != query.device:
+                self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+        else:
+            if (
+                self.cos_sin_cache.device != query.device
+                or self.cos_sin_cache.dtype != query.dtype
+            ):
+                self.cos_sin_cache = self.cos_sin_cache.to(
+                    query.device, dtype=query.dtype
+                )
 
     def forward_native(
         self,
@@ -179,9 +192,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "save kv cache is not supported for MRotaryEmbedding."
+        assert fused_set_kv_buffer_arg is None, (
+            "save kv cache is not supported for MRotaryEmbedding."
+        )
         assert positions.ndim == 1 or positions.ndim == 2
 
         cos_sin = self.cos_sin_cache[positions]
@@ -247,6 +260,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
+        if query.shape[0] == 0:
+            return query, key
         self._match_cos_sin_cache_dtype(query)
         if positions.ndim == 2 and self.mrope_section:
             return self.forward_triton(positions, query, key)
@@ -282,9 +297,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for npu implementation"
+        )
         if query.shape[1] > 4096:
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half" if self.is_neox_style else "interleave"
@@ -309,7 +324,11 @@ class MRotaryEmbedding(RotaryEmbedding):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim in (1, 2)
         self._match_cos_sin_cache_dtype(query)
-        if positions.ndim == 2 and self.mrope_section:
+        if (
+            multimodal_rotary_embedding is not None
+            and positions.ndim == 2
+            and self.mrope_section
+        ):
             multimodal_rotary_embedding(
                 query,
                 key,
@@ -479,6 +498,14 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
         )
         return inv_freq
 
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        self.cos_sin_cache, _ = _extend_yarn_cache(
+            cache=self.cos_sin_cache,
+            compute_inv_freq=lambda: self._compute_inv_freq(self.scaling_factor),
+            mscale=self.mscale,
+            needed_max_pos=needed_max_pos,
+        )
+
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
         t = torch.arange(
@@ -610,6 +637,32 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
 
         return self.forward_native(positions, query, key)
 
+    def forward_xpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor = None,
+    ):
+        assert key is not None
+        assert positions.ndim in (1, 2)
+        self._match_cos_sin_cache_dtype(query)
+
+        if positions.ndim == 2:
+            assert self.mrope_section is not None
+            triton_ernie45_rope_fused_inplace(
+                q=query,
+                k=key,
+                cos_sin_cache=self.cos_sin_cache,
+                positions=positions,
+                mrope_section=self.mrope_section,
+                head_size=self.head_size,
+                rotary_dim=self.rotary_dim,
+                is_neox_style=self.is_neox_style,
+            )
+            return query, key
+
+        return self.forward_native(positions, query, key)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -618,4 +671,6 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
+        if _is_xpu:
+            return self.forward_xpu(positions, query, key)
         return self.forward_cuda(positions, query, key)

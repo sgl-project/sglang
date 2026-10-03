@@ -301,7 +301,7 @@ class DecodeStagingHandler:
         receiver = self._room_to_receiver.get(room)
         if receiver is None:
             logger.warning(
-                "Staging chunk arrived for unregistered room=%s chunk=%d, " "skipping",
+                "Staging chunk arrived for unregistered room=%s chunk=%d, skipping",
                 room,
                 chunk_idx,
             )
@@ -901,9 +901,9 @@ class StagingManagerMixin:
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")
         handler = self._staging_handler
-        assert (
-            handler is not None
-        ), "STAGING_REQ received before staging handler initialized"
+        assert handler is not None, (
+            "STAGING_REQ received before staging handler initialized"
+        )
         decode_req = handler._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -951,13 +951,7 @@ def prefetch_staging_reqs(
     full_chunk_pages = staging_grid_tokens(chunked_prefill_size, page_size) // page_size
 
     for session_id, tinfo in transfer_infos[room].items():
-        # mooncake exposes is_dummy as a dataclass bool field, NIXL exposes it
-        # as a method (it consults decode_prefix_len). Normalize via callable()
-        # so this shared helper works for either backend; treating a bound
-        # method as truthy (the previous behavior) silently dropped every
-        # STAGING_REQ on NIXL and deadlocked the prefill transfer worker.
-        is_dummy_attr = tinfo.is_dummy
-        if is_dummy_attr() if callable(is_dummy_attr) else is_dummy_attr:
+        if tinfo.is_dummy:
             continue
         total_pages = len(tinfo.dst_kv_indices)
         if total_pages == 0:

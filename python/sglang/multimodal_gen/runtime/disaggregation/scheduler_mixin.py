@@ -17,6 +17,7 @@ import pickle
 import queue
 import threading
 import time
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -24,6 +25,10 @@ import torch
 import zmq
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.disaggregation.extra_tensors import (
+    extract_extra_tensors,
+    restore_extra_tensors,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferTensorBuffer,
@@ -50,6 +55,11 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
+    attach_cuda_tensors,
+    detach_cuda_tensors,
+)
+from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
 from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
@@ -57,7 +67,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
-from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 from sglang.srt.observability.trace import TraceReqContext
@@ -169,20 +178,16 @@ def _is_tensor_like(value) -> bool:
 
 
 def _to_json_serializable(value):
+    if isinstance(value, Enum):
+        return value.name
     if isinstance(value, (torch.Tensor, np.ndarray)):
         return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, dict):
+        return {key: _to_json_serializable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        converted = []
-        for item in value:
-            if isinstance(item, (torch.Tensor, np.ndarray)):
-                converted.append(item.tolist())
-            elif isinstance(item, np.generic):
-                converted.append(item.item())
-            else:
-                converted.append(item)
-        return converted
+        return [_to_json_serializable(item) for item in value]
     return value
 
 
@@ -203,18 +208,6 @@ def _is_default(value, field_info) -> bool:
         if isinstance(value, (list, dict)) and len(value) == 0:
             return True
     return False
-
-
-def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
-    """Extract JSON-serializable entries from Req.extra into scalar_fields."""
-    for key, value in extra.items():
-        if key.startswith("_"):
-            continue
-        try:
-            json.dumps(value)
-            scalar_fields[f"_extra_{key}"] = value
-        except (TypeError, ValueError, OverflowError):
-            pass
 
 
 def _init_request_scheduler(scheduler: Any, req: Req, device: torch.device) -> None:
@@ -300,7 +293,7 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
 
     extra = getattr(req, "extra", None)
     if extra:
-        _extract_extra_fields(extra, scalar_fields)
+        extract_extra_tensors(extra, tensor_fields, scalar_fields)
 
     sp = getattr(req, "sampling_params", None)
     if sp is not None:
@@ -801,6 +794,31 @@ class SchedulerDisaggMixin:
 
         return data
 
+    def _broadcast_recv_reqs(self: Scheduler, recv_reqs):
+        """ComfyUI multi-rank recv: pickle the Req skeleton, NCCL the CUDA tensors.
+
+        The general SP/CFG/TP path stays in ``Scheduler.recv_reqs`` as the
+        original whole-list ``broadcast_pyobj``. This helper is only the
+        ComfyUI overlay and does not use disagg extract.
+        """
+        is_rank0 = self.gpu_id == 0
+        if is_rank0:
+            assert recv_reqs is not None, "rank 0 must pass the ZMQ poll result"
+            skeleton, tensors = detach_cuda_tensors(recv_reqs)
+        else:
+            skeleton, tensors = None, None
+
+        skeleton = self._broadcast_to_all_ranks(skeleton)
+        tensors = self._broadcast_tensor_dict_to_all_ranks(tensors)
+        if is_rank0:
+            return recv_reqs
+        if not skeleton:
+            return []
+        local_device = torch.device(
+            f"{current_platform.device_type}:{self.worker.local_rank}"
+        )
+        return attach_cuda_tensors(skeleton, tensors or {}, device=local_device)
+
     def _is_multi_rank(self: Scheduler) -> bool:
         sa = self.server_args
         return sa.sp_degree != 1 or sa.tp_size > 1 or sa.enable_cfg_parallel
@@ -1083,7 +1101,7 @@ class SchedulerDisaggMixin:
         )
         use_prefetch = self._compute_ready_queue is not None
         logger.info(
-            "Pool mode %s rank %d event loop started " "(multi_rank=%s, prefetch=%s)",
+            "Pool mode %s rank %d event loop started (multi_rank=%s, prefetch=%s)",
             role_name,
             self.gpu_id,
             is_multi_rank,
@@ -1411,6 +1429,7 @@ class SchedulerDisaggMixin:
                 object.__setattr__(req, f.name, f.default_factory())
         # Ensure sampling_params is not None so __getattr__ delegation works
         object.__setattr__(req, "sampling_params", SamplingParams())
+        restore_extra_tensors(req.extra, tensors, scalar_fields)
         # Restore _extra_* prefixed fields into req.extra dict
         extra_keys = [k for k in scalar_fields if k.startswith("_extra_")]
         for key in extra_keys:

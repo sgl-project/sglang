@@ -29,8 +29,8 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 # IPC handoff is exercised on every PR. Since the CI runner executes the whole
 # file per suite, TestWeightCacheDaemonTP2 self-skips when fewer than 2 GPUs are
 # visible (i.e. on the 1-gpu runner).
-register_cuda_ci(est_time=280, stage="extra-a", runner_config="2-gpu-large")
-register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=440, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=68, stage="base-b", runner_config="1-gpu-small")
 
 # Capture the client server's logs so test_loaded_via_ipc can assert the IPC
 # load path actually ran (and did not silently fall back to disk).
@@ -352,11 +352,10 @@ class TestWeightCacheDaemonQwen3MoeDP(TestWeightCacheDaemonTP2):
     """Qwen3 with static attention DP through the existing IPC fixture."""
 
     daemon_args = [
-        "--dp",
+        "--attn-dp-size",
         "2",
         "--ep-size",
         "1",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--random-seed",
         "42",
@@ -376,6 +375,28 @@ class TestWeightCacheDaemonQwen3MoeEP(TestWeightCacheDaemonTP2):
         "--enable-eplb",
         "--ep-num-redundant-experts",
         "2",
+        "--random-seed",
+        "42",
+    ]
+    server_args = daemon_args[:]
+
+
+class TestWeightCacheDaemonQwen3MoeAttnCP(TestWeightCacheDaemonTP2):
+    """Qwen3 MoE with attention CP wider than MoE-DP.
+
+    The MoE-DP communicator aliases the attention-CP group here, so it is wider
+    than the configured `moe_dp_size`; the engine and the daemon must still
+    state the same width in the config fingerprint.
+    """
+
+    model_override = DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN
+    daemon_args = [
+        "--attn-cp-size",
+        "2",
+        "--enable-prefill-cp",
+        "--cp-strategy",
+        "zigzag",
+        "--cuda-graph-backend-prefill=disabled",
         "--random-seed",
         "42",
     ]

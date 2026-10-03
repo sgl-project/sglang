@@ -21,7 +21,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import ( 
 )
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 # MI355X. Passed explicitly so the tests are device-independent and run on CPU.
 NUM_CU = 256
@@ -61,9 +61,9 @@ def test_splits_never_increase_with_token_count():
     for tokens in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]:
         splits = _kv_splits_heuristic(tokens, HEADS, BLOCK_H, num_cu=NUM_CU)
         if prev is not None:
-            assert (
-                splits <= prev
-            ), f"splits rose from {prev} to {splits} going to T={tokens}"
+            assert splits <= prev, (
+                f"splits rose from {prev} to {splits} going to T={tokens}"
+            )
         prev = splits
 
 

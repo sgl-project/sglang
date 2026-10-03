@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Serialized ModelOpt FP8 checkpoints must postprocess on device even under
-layerwise offload: requantize_with_max_scale() runs scaled_fp8_quant(), a
-CUDA-only kernel, so a CPU-resident postprocess must never come back."""
+"""Serialized ModelOpt FP8 checkpoints must postprocess correctly even when
+layerwise offload moves the component back to CPU after loading."""
 
 import unittest
 from unittest.mock import patch
@@ -9,6 +8,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
@@ -99,6 +99,9 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
                 checkpoint_weight = state_dict["qkv.weight"].clone()
                 checkpoint_scales = state_dict["qkv.weight_scale"].clone()
                 expected_max_scale = checkpoint_scales.max()
+                fnuz = is_fp8_fnuz()
+                scale_factor = 2 if fnuz else 1
+                expected_dtype = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
 
                 with patch(
                     "sglang.multimodal_gen.runtime.layers.quantization."
@@ -127,24 +130,29 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
                 # consume a channelwise scale, so it preserves the checkpoint's
                 # FP8 shards; the fallback requantizes them to one max scale.
                 weight = model.qkv.weight
-                self.assertEqual(weight.dtype, torch.float8_e4m3fn)
+                self.assertEqual(weight.dtype, expected_dtype)
                 self.assertEqual(tuple(weight.shape), (_IN_FEATURES, 2 * _SHARD_OUT))
                 weight_scale = model.qkv.weight_scale.flatten()
                 if cutlass_supported:
                     expected_scales = torch.repeat_interleave(
                         checkpoint_scales, _SHARD_OUT
                     )
-                    self.assertTrue(torch.equal(weight.t(), checkpoint_weight))
+                    torch.testing.assert_close(
+                        weight.t().float() * scale_factor,
+                        checkpoint_weight.float(),
+                        atol=0,
+                        rtol=0,
+                    )
                 else:
                     expected_scales = expected_max_scale.expand(weight_scale.numel())
                 torch.testing.assert_close(
                     weight_scale,
-                    expected_scales,
+                    expected_scales * scale_factor,
                     check_device=False,
                 )
                 torch.testing.assert_close(
                     model.qkv.input_scale.flatten().max(),
-                    torch.tensor(0.5),
+                    torch.tensor(0.5 * scale_factor),
                     check_device=False,
                 )
 
