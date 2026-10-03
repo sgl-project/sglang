@@ -79,6 +79,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     LazyValue,
@@ -1236,23 +1237,67 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
             )
         return self._encoder_processor.preprocess_for_encoder(mm_data, modality)
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+    def _iter_visual_rows(self, items, grid_attr: str):
+        """Yield one packed patch tensor per grid row, in row order."""
+        for item in items:
+            feature = item.feature
+            grids = getattr(item, grid_attr)
+            if feature.dim() != 2 or grids.dim() != 2:
+                raise RuntimeError(
+                    f"{grid_attr} feature {tuple(feature.shape)} grid {tuple(grids.shape)}"
+                )
+            counts = [int(n) for n in torch.prod(grids, dim=-1).tolist()]
+            if sum(counts) != feature.shape[0]:
+                raise RuntimeError(
+                    f"{grid_attr} rows {feature.shape[0]} != grid patches {sum(counts)}"
+                )
+            start = 0
+            for n in counts:
+                yield feature[start : start + n]
+                start += n
+
+    def _encode_visual(self, items, grid_attr: str) -> torch.Tensor:
+        grids = torch.cat([getattr(item, grid_attr) for item in items], dim=0)
+        rows = list(self._iter_visual_rows(items, grid_attr))
+
+        if not self.visual.use_data_parallel:
+            pixel_values = torch.cat(rows, dim=0).to(dtype=self.visual.dtype)
+            return self.visual(pixel_values, grid_thw=grids)
+
+        if grid_attr == "video_grid_thw":
+            flat_grids = []
+            flat_rows = []
+            for grid, pixels in zip(grids.tolist(), rows):
+                t, h, w = (int(v) for v in grid)
+                frame = h * w
+                for i in range(t):
+                    flat_grids.append([1, h, w])
+                    flat_rows.append(pixels[i * frame : (i + 1) * frame])
+            grids_list = flat_grids
+            rows = flat_rows
+        else:
+            grids_list = [[int(v) for v in row] for row in grids.tolist()]
+
+        def load_local(indices):
+            return torch.cat([rows[i] for i in indices], dim=0).to(
+                dtype=self.visual.dtype
+            )
+
+        return run_dp_sharded_mrope_vision_model(
+            self.visual,
+            None,
+            grids_list,
+            rope_type="rope_3d",
+            load_local_pixel_values=load_local,
+            pixel_values_device=self.visual.device,
+            pixel_values_dtype=self.visual.dtype,
         )
-        image_grid_thw = torch.cat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        return self.visual(pixel_values, grid_thw=image_grid_thw)
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        return self._encode_visual(items, "image_grid_thw")
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
-        video_grid_thw = torch.cat([item.video_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
-        return self.visual(pixel_values, grid_thw=video_grid_thw)
+        return self._encode_visual(items, "video_grid_thw")
 
     @torch.inference_mode()
     def encode_video_audio(self, mm_inputs: Dict) -> Optional[torch.Tensor]:
