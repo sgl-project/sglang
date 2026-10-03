@@ -192,7 +192,7 @@ from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
     tiny_router_gemm_max_tokens,
 )
-from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+from sglang.srt.multimodal.dsv41.vl_routing import batch_has_images, vision_topk
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
     attention_backends,
@@ -973,9 +973,15 @@ class DeepseekV2MoE(nn.Module):
             if forward_batch is not None
             else None
         )
-        use_vision_topk = self.gate.e_score_correction_bias_vl is not None
-        if use_vision_topk and _is_hip:
-            use_vision_topk = _hip_moe.batch_has_images(forward_batch)
+        # Route through vision_topk only when the batch can actually carry image
+        # tokens. With no image tokens the VL bias never applies, and vision_topk
+        # bypasses _post_process_topk_ids (expert distribution recording and the
+        # EPLB logical->physical remap), so text-only batches must use the
+        # standard TopK path.
+        use_vision_topk = (
+            self.gate.e_score_correction_bias_vl is not None
+            and batch_has_images(forward_batch)
+        )
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
