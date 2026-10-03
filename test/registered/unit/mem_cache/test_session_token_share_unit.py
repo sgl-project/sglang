@@ -5,7 +5,8 @@
 - committed_* lengths recorded at finish_req trim away tokens appended by a
   turn that aborted before finishing (mid-turn and first-turn aborts);
 - max_new_tokens overshoot falls back to a fill_ids rebuild instead of
-  carrying an inconsistent array.
+  carrying an inconsistent array;
+- create_req carries the client's replay-output flags onto the turn's Req.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,6 +45,7 @@ def _recv(rid, input_ids, max_new_tokens=8):
         return_hidden_states=False,
         return_routed_experts=False,
         routed_experts_start_len=0,
+        return_indexer_topk=False,
         bootstrap_host=None,
         bootstrap_port=None,
         bootstrap_room=None,
@@ -82,6 +84,17 @@ class TestSessionTokenShare(CustomTestCase):
         req._refresh_fill_ids()
         req.output_ids.extend(output[baked:])
         self.session.finish_req(req)
+
+    def test_create_req_carries_replay_output_flags(self):
+        """A session turn must request the replay outputs its client asked for;
+        a dropped flag returns no data for that turn without any error."""
+        for flag in ("return_routed_experts", "return_indexer_topk"):
+            with self.subTest(flag=flag):
+                session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
+                recv = _recv("r1", [1, 2, 3])
+                setattr(recv, flag, True)
+                req = session.create_req(recv, tokenizer=None, vocab_size=VOCAB)
+                self.assertTrue(getattr(req, flag))
 
     def test_normal_multi_turn_share_and_carry(self):
         in1, out1 = list(range(100, 110)), [1, 2, 3]
