@@ -205,10 +205,10 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         video_array = video.get_frames_at(frames)
         avg_fps = video.avg_fps
         if avg_fps > 0:
-            frame_duration_ms = int(1000 / avg_fps)
+            frame_duration_s = 1 / avg_fps
         else:
-            frame_duration_ms = 0
-        timestamps = [i * frame_duration_ms / 1000.0 for i in frames]
+            frame_duration_s = 0.0
+        timestamps = [i * frame_duration_s for i in frames]
         return video_array, timestamps
 
     def render_audio(self, *, num_tokens: int):
