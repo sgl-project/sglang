@@ -116,7 +116,7 @@ class MambaPoolHost(HostKVCache):
         # previous occupant's side state.
         self.slot_state_entries = [
             entry
-            for sibling in getattr(device_pool, "_slot_siblings", ())
+            for sibling in device_pool._slot_siblings
             for entry in sibling.iter_transfer_state_entries()
         ]
         self.slot_state_buffers = []
