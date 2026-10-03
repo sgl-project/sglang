@@ -44,7 +44,6 @@ def layernorm(hidden_states, residual=None):
 
 class Flags:
     def __init__(self):
-        self.fuse_mlp_allreduce = False
         self.mlp_reduce_scatter = False
         self.defer_moe_finalize = False
         self.sp_active = False
@@ -188,8 +187,9 @@ class TestAttentionCpBoundary(CustomTestCase):
         )
 
     def run_ranks(self, use_reduce_scatter):
-        """Gather on each rank, run an FFN that leaves a partial sum or not,
-        finish the exit and return what each rank got back and published."""
+        """Gather on each rank, run an FFN that leaves its partial sum, finish
+        the exit and return the ranks the exit summed over, what each rank got
+        back, and the ranks the reduce-scatter summed over."""
         handed = {}
 
         def record_gather(cp):
@@ -230,10 +230,17 @@ class TestAttentionCpBoundary(CustomTestCase):
         for cp in range(CP_SIZE):
             torch.testing.assert_close(gathered[cp], expected_rows, rtol=0, atol=0)
 
-        def compute_output(cp, leaves):
-            return gathered[cp] * PARTIAL_WEIGHTS[cp] if leaves else gathered[cp]
+        reduced, summed = {}, {}
 
-        reduced = {}
+        def record_sum(cp):
+            def sum_output(value, *args, **kwargs):
+                summed[cp] = value.clone()
+                return value
+
+            return sum_output
+
+        def fill_sum(value, *args, **kwargs):
+            return sum(summed[r] for r in range(CP_SIZE))
 
         def record_reduce_scatter(cp):
             def reduce_scatter(output, input_):
@@ -248,7 +255,7 @@ class TestAttentionCpBoundary(CustomTestCase):
 
             return reduce_scatter
 
-        published, back = {}, {}
+        back = {}
         for phase in ("record", "fill"):
             for cp in range(CP_SIZE):
                 reduce_scatter = (
@@ -256,33 +263,38 @@ class TestAttentionCpBoundary(CustomTestCase):
                     if phase == "record"
                     else fill_reduce_scatter(cp)
                 )
-                with self.as_rank(
-                    cp, dict(gather=fill_gather, reduce_scatter=reduce_scatter)
-                ) as rank:
+                with (
+                    self.as_rank(
+                        cp, dict(gather=fill_gather, reduce_scatter=reduce_scatter)
+                    ) as rank,
+                    patch_communicator(
+                        "sum_output", record_sum(cp) if phase == "record" else fill_sum
+                    ),
+                ):
                     communicator = self.build(use_reduce_scatter)
                     with communicator.ffn.plan.output.ffn_exit(
                         self.cp_extend(), stream=ResidualStream()
                     ) as exit_:
-                        published[cp] = rank.flags.mlp_reduce_scatter
-                        output = compute_output(cp, leaves=published[cp])
+                        self.assertFalse(rank.flags.mlp_reduce_scatter)
+                        output = gathered[cp] * PARTIAL_WEIGHTS[cp]
                     back[cp], _ = finish_exit(
                         exit_, output, ResidualStream(residuals[cp].residual)
                     )
-        return published, back, reduced
+        return summed, back, reduced
 
     def test_the_reduce_scatter_completes_the_sum_the_moe_leaves(self):
-        published, back, reduced = self.run_ranks(use_reduce_scatter=True)
-        self.assertEqual(published, {0: True, 1: True}, "the MoE leaves its sum")
+        summed, back, reduced = self.run_ranks(use_reduce_scatter=True)
+        self.assertEqual(summed, {}, "the exit runs no all-reduce")
         self.assertEqual(sorted(reduced), [0, 1], "every rank joins the reduce-scatter")
         for cp in range(CP_SIZE):
             torch.testing.assert_close(
                 back[cp], self.values[cp] + self.residuals[cp], rtol=0, atol=0
             )
 
-    def test_a_complete_output_is_only_taken_back(self):
-        published, back, reduced = self.run_ranks(use_reduce_scatter=False)
-        self.assertEqual(published, {0: False, 1: False}, "the MoE sums itself")
-        self.assertEqual(reduced, {}, "nothing is summed again")
+    def test_without_a_reduce_scatter_the_exit_sums_then_takes_back(self):
+        summed, back, reduced = self.run_ranks(use_reduce_scatter=False)
+        self.assertEqual(sorted(summed), [0, 1], "the exit sums what the MoE leaves")
+        self.assertEqual(reduced, {}, "the take-back sums nothing")
         for cp in range(CP_SIZE):
             torch.testing.assert_close(
                 back[cp], self.values[cp] + self.residuals[cp], rtol=0, atol=0
