@@ -1023,6 +1023,27 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+
+    def _kv_split_page_tensors(self, page_index: int):
+        """One host page as the buffers L3 must round-trip.
+
+        Order matches get_page_buffer_meta: K, then V unless FP8 DSA already
+        packed V into K, then indexer K, then the FP32 indexer scale.
+        """
+        tensors = [self.k_buffer[page_index]]
+        if not getattr(self, "dsa_kv_cache_store_fp8", False):
+            tensors.append(self.v_buffer[page_index])
+        index_k = getattr(self, "index_k_buffer", None)
+        if index_k is not None:
+            tensors.append(index_k[page_index])
+        scale = getattr(self, "index_k_scale_buffer", None)
+        if scale is not None:
+            tensors.append(scale[page_index])
+        return tensors
+
+    def _kv_split_page_nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self._kv_split_page_tensors(0))
+
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         assert self.dcp_size == 1, (
             "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
@@ -1036,6 +1057,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif self.layout == "page_first_direct":
             real_index = index // self.page_size
             data_page = self.kv_buffer[real_index : real_index + 1, :, :, :, :]
+        elif self.layout == "page_first_kv_split":
+            parts = [
+                t.contiguous().view(torch.uint8).reshape(-1)
+                for t in self._kv_split_page_tensors(index // self.page_size)
+            ]
+            return torch.cat(parts)
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         if flat:
@@ -1043,6 +1070,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
+        if self.layout == "page_first_kv_split":
+            return torch.zeros(
+                self._kv_split_page_nbytes(),
+                dtype=torch.uint8,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
         return torch.zeros(
             (
                 self.layer_num,
@@ -1079,6 +1113,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 1,
                 self.kv_cache_dim,
             )
+        elif self.layout == "page_first_kv_split":
+            raw = data_page.contiguous().view(torch.uint8).reshape(-1)
+            offset = 0
+            for part in self._kv_split_page_tensors(index // self.page_size):
+                nbytes = part.numel() * part.element_size()
+                chunk = raw[offset : offset + nbytes]
+                if chunk.numel() != nbytes:
+                    raise ValueError(
+                        f"kv_split page short by {nbytes - chunk.numel()} bytes"
+                    )
+                part.copy_(chunk.view(part.dtype).reshape(part.shape))
+                offset += nbytes
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
