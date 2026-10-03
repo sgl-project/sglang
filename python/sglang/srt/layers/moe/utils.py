@@ -285,16 +285,16 @@ class DispatcherOutputDtype(Enum):
     - FP8: dispatch hidden states in fp8
     - INT8: dispatch hidden states in int8
     - NVFP4: dispatch hidden states in nvfp4
-    - MXFP4: dispatch hidden states in mxfp4 (fp4_e2m1 + e8m0 block scale)
     - MXFP8: dispatch hidden states in mxfp8 (fp8_e4m3 + e8m0 block scale)
+    - MXFP4: dispatch hidden states in mxfp4 (fp4_e2m1 + e8m0 block scale)
     """
 
     BF16 = "bf16"
     FP8 = "fp8"
     INT8 = "int8"
     NVFP4 = "nvfp4"
-    MXFP4 = "mxfp4"
     MXFP8 = "mxfp8"
+    MXFP4 = "mxfp4"
 
 
 class FlashinferA2ADispatchType(Enum):
@@ -330,10 +330,10 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
 
     The decision follows several checks in priority order:
     0. Parse server argument.
-    1. Parse deprecated environment variables.
-    2. If quant_config contains input_global_scale → NVFP4 path.
-    3. Parse a mode-specific dtype from quant_config.
-    4. Parse a generic dtype from quant_config.
+    1. If quant_config contains input_global_scale → NVFP4 path.
+    2. Parse a mode-specific dtype from quant_config.
+    3. Parse a generic dtype from quant_config.
+    4. Parse deprecated environment variables if the layer has no explicit dtype.
     5. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
     6. Otherwise default for NPU → BF16 (the default for NPU).
     7. Otherwise → FP8 (the default for most models like DeepSeek-V3).
@@ -344,22 +344,13 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     if server_args and get_exec().moe.deepep_dispatcher_output_dtype != "auto":
         return DispatcherOutputDtype(get_exec().moe.deepep_dispatcher_output_dtype)
 
-    # 1. Parse deprecated environment variables.
-    if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
-        logger.warning_once(
-            "Warning: The env variable SGLANG_DEEPEP_BF16_DISPATCH deprecated "
-            "and will be removed in future releases. Please use a new "
-            "`--deepep-dispatcher-output-dtype bf16` argument instead."
-        )
-        return DispatcherOutputDtype.BF16
-
-    # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
+    # 1. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
     if self.quant_config is not None:
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             return DispatcherOutputDtype.NVFP4
 
-        # 3. Some MoE kernels require different wire formats for prefill and
+        # 2. Some MoE kernels require different wire formats for prefill and
         # decode. Prefer a mode-specific override when the dispatcher exposes
         # its concrete mode (normal or low_latency).
         dispatch_mode = getattr(self, "dispatch_mode", None)
@@ -370,10 +361,27 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
             if mode_dispatcher_output_dtype is not None:
                 return DispatcherOutputDtype(mode_dispatcher_output_dtype)
 
-        # 4. Parse quant config to determine the output dtype of dispatcher
+        # 3. Parse quant config to determine the output dtype of dispatcher
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
+
+    # 4. Legacy hints apply only when the layer does not specify a wire format.
+    if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+        logger.warning_once(
+            "Warning: The env variable SGLANG_DEEPEP_BF16_DISPATCH deprecated "
+            "and will be removed in future releases. Please use a new "
+            "`--deepep-dispatcher-output-dtype bf16` argument instead."
+        )
+        return DispatcherOutputDtype.BF16
+
+    if envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.get():
+        logger.warning_once(
+            "Warning: The env variable DEEP_NORMAL_MODE_USE_INT8_QUANT deprecated "
+            "and will be removed in future releases. Please use "
+            "`--deepep-dispatcher-output-dtype int8` instead."
+        )
+        return DispatcherOutputDtype.INT8
 
     # 5. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
     if (

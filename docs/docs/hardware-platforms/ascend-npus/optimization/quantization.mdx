@@ -410,7 +410,21 @@ python3 -m sglang.launch_server \
 > - Offline path: `ModelSlimMXFP8MoEScheme` (one instance per weight group) loads `float8_e4m3fn` expert weights + uint8 (e8m0, exponent + 127) block scales. The scale is reshaped `[E, N, K/32] → [E, N, K/64, 2]` (contiguous pairing, matching `npu_dynamic_mx_quant`) then transposed.
 > - Forward: `AscendTPDispatcher` runs `npu_moe_init_routing_v2(quant_mode=3)`, which fuses the per-token MX activation quant into routing (e4m3 payload + e8m0 block scale, reshaped to the pair-split layout). `AscendRunnerCore` then runs gmm1 `npu_grouped_matmul_swiglu_quant_v2` (cumulative `group_list`; fuses gate/up + swiglu + requant, so no separate activation step) → gmm2 `npu_grouped_matmul` (count `group_list`). The UE8M0 (`float8_e8m0fnu`) scale dtypes are passed explicitly; the e4m3 `x`/`weight` dtypes are left implicit.
 > - **Router gate**: msmodelslim may also quantize `mlp.gate` (`W8A8_MXFP8`). The gate is a `ReplicatedLinear`, so its quantization must be **description-driven**: for the offline `modelslim` path the gate is passed the quant config and dequantized correctly; the online path keeps it in BF16. Loading a quantized gate as BF16 without its block scale scrambles routing and produces garbage output.
-> - Where the activation quant happens depends on the dispatcher. On `ascend_tp` it is fused into routing as described above. DeepEP has no MXFP8 dispatch dtype, so it keeps dispatching BF16 and gmm1 quantizes the hidden states itself via `npu_dynamic_mx_quant` before the fused kernel — the two paths reach the same gmm1 input. Only the `ascend_tp` path has been validated end-to-end on the Ascend 950PR/DT Series.
+> - Where activation quantization happens depends on the dispatcher. On `ascend_tp` it is fused into routing as described above. DeepEP supports MXFP8 dispatch on Ascend 950PR/DT Series; BF16 dispatch quantizes hidden states in gmm1 via `npu_dynamic_mx_quant` before the fused kernel. Only the `ascend_tp` path has been validated end-to-end on the Ascend 950PR/DT Series.
+
+**DeepEP dispatcher output quantization:**
+
+DeepEP uses the same MXFP dispatcher names as the Ascend MoE path: `mxfp8` is FP8 E4M3 data with an E8M0 block scale, and `mxfp4` is packed FP4 E2M1 data with an E8M0 block scale. E5M2 is not part of the MXFP8 dispatcher API. Normal-mode MXFP dispatch requires the default (non-all-to-all) strategy. Low-latency MXFP4 requires `DEEP_USE_MODE=default`; the `ops` and `alltoall` strategies do not support its payload and scale contract.
+
+This naming aligns with the `mxfp8` value introduced by [PR #30768](https://github.com/sgl-project/sglang/pull/30768). When both changes are present, its DeepEP path can select `mxfp8` instead of the temporary BF16 fallback. The CLI value takes precedence over automatic selection:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path /path/to/mxfp-model \
+    --device npu --attention-backend ascend \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --deepep-dispatcher-output-dtype mxfp8
+```
 
 **MXFP4 W4A8 for LLM dense models (e.g., Qwen3 / Qwen3.5):**
 

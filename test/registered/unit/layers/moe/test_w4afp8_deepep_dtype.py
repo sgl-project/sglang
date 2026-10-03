@@ -83,6 +83,40 @@ class TestW4AFP8DeepEPDispatcherDtype(CustomTestCase):
         self.assertEqual(normal_dtype, DispatcherOutputDtype.BF16)
         self.assertEqual(low_latency_dtype, DispatcherOutputDtype.FP8)
 
+    def test_legacy_normal_int8_env_selects_int8(self):
+        with (
+            patch.object(moe_utils, "get_server_args", return_value=None),
+            moe_utils.envs.SGLANG_DEEPEP_BF16_DISPATCH.override(False),
+            moe_utils.envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(True),
+        ):
+            dtype = moe_utils.get_deepep_output_dtype(
+                SimpleNamespace(quant_config=None)
+            )
+
+        self.assertEqual(dtype, DispatcherOutputDtype.INT8)
+
+    def test_layer_dtype_overrides_legacy_process_hint(self):
+        """A process-wide hint must not change another MoE layer's wire format."""
+        cases = (
+            ("bf16", False, True, DispatcherOutputDtype.BF16),
+            ("int8", True, False, DispatcherOutputDtype.INT8),
+        )
+        for layer_dtype, bf16_hint, int8_hint, expected in cases:
+            with (
+                self.subTest(layer_dtype=layer_dtype),
+                patch.object(moe_utils, "get_server_args", return_value=None),
+                moe_utils.envs.SGLANG_DEEPEP_BF16_DISPATCH.override(bf16_hint),
+                moe_utils.envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(int8_hint),
+            ):
+                for dispatch_mode in (DeepEPMode.NORMAL, DeepEPMode.LOW_LATENCY):
+                    dtype = moe_utils.get_deepep_output_dtype(
+                        SimpleNamespace(
+                            quant_config={"dispatcher_output_dtype": layer_dtype},
+                            dispatch_mode=dispatch_mode,
+                        )
+                    )
+                    self.assertEqual(dtype, expected)
+
     def test_normal_rejects_fp8_and_preserves_empty_bf16(self):
         method = w4afp8.W4AFp8MoEMethod(SimpleNamespace())
         empty_topk_ids = torch.empty((0, 1), dtype=torch.int64)

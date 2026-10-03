@@ -490,10 +490,6 @@ class _DeepEPDispatcherImplBase:
         self.use_mxfp8 = config["use_mxfp8"]
         self.use_nvfp4 = config["use_nvfp4"]
 
-        # Handle environment variables
-        if _is_npu:
-            self._update_int8_quant_env()
-
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
         if _is_npu and self.deepep_output_dtype == DispatcherOutputDtype.FP8:
@@ -510,6 +506,24 @@ class _DeepEPDispatcherImplBase:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
+            if os.environ.get(
+                "DEEP_USE_MODE", "default"
+            ) == "alltoall" and self.deepep_output_dtype in (
+                DispatcherOutputDtype.MXFP8,
+                DispatcherOutputDtype.MXFP4,
+            ):
+                raise ValueError(
+                    f"{self.deepep_output_dtype.value} DeepEP dispatch is not "
+                    "supported with DEEP_USE_MODE=alltoall"
+                )
+            if (
+                self.dispatch_mode == DeepEPMode.LOW_LATENCY
+                and self.deepep_output_dtype == DispatcherOutputDtype.MXFP4
+                and os.environ.get("DEEP_USE_MODE", "default") != "default"
+            ):
+                raise ValueError(
+                    "MXFP4 DeepEP low-latency dispatch requires DEEP_USE_MODE=default"
+                )
         else:
             if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
                 logger.warning_once(
@@ -517,11 +531,15 @@ class _DeepEPDispatcherImplBase:
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
                 self.deepep_output_dtype = DispatcherOutputDtype.FP8
+            elif self.deepep_output_dtype in (
+                DispatcherOutputDtype.MXFP8,
+                DispatcherOutputDtype.MXFP4,
+            ):
+                raise ValueError(
+                    f"{self.deepep_output_dtype.value} DeepEP dispatcher output "
+                    "dtype is only supported on Ascend NPU"
+                )
             # NVFP4 is supported on GPU, no adjustment needed
-
-    def _update_int8_quant_env(self) -> None:
-        """TODO adapt different quantization schemes for base model and draft model on NPU"""
-        pass
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
@@ -577,10 +595,17 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             return flag_kwargs
 
         if "quant_mode" in dispatch_params:
+            if os.environ.get("DEEP_USE_MODE", "default") == "alltoall":
+                return {}
             if self.use_mxfp4:
                 quant_mode = "mx_fp4_e2m1"
             elif self.use_mxfp8:
                 quant_mode = "mx_fp8_e4m3"
+            elif self.deepep_output_dtype == DispatcherOutputDtype.FP8:
+                raise RuntimeError(
+                    "Installed DeepEP quant_mode API does not expose a native FP8 "
+                    "mode; use a DeepEP build with use_fp8 support."
+                )
             elif self.use_fp8:
                 quant_mode = "int8"
             else:
