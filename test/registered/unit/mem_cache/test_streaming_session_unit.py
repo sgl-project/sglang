@@ -93,7 +93,7 @@ class _FakeInnerCache:
         pass
 
     def on_release(self, req, *, inserted):
-        self.session.try_on_release(req, inserted=inserted)
+        pass
 
     def match_prefix(self, params):
         result = self.session.try_match_prefix(params)

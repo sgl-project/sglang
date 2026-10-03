@@ -417,6 +417,8 @@ class MlxAuxiliaryStateComponent(MambaComponent):
             req.kv.mamba_last_track_seqlen = None
             return
 
+        if not req.kv.holds_mamba:
+            return
         auxiliary_value_exists = (
             insert_result.mamba_exist if insert_result is not None else True
         )

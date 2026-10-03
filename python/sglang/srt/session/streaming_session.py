@@ -189,11 +189,21 @@ class StreamingSession:
 
         from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
-        if isinstance(req.finished_reason, FINISH_ABORT):
-            return False
-
         session_id = req.session.session_id
         slot = self.slots.get(session_id)
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            if slot is not None and slot.kv is req.kv:
+                # The turn ran on the slot's record, which the caller frees:
+                # drop the slot with its tree lock and mamba state. The session
+                # keeps its last finished request and re-prefills next turn.
+                del self.slots[session_id]
+                if slot.last_node is not None:
+                    skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
+                    self.cache.dec_lock_ref(slot.last_node, slot.lock_receipt, **skip)
+                self._free_slot_mamba(slot)
+            req.session.abort_req()
+            return False
+
         is_first = slot is None
         if is_first:
             slot = SessionSlot()
@@ -228,28 +238,6 @@ class StreamingSession:
         return True
 
     # -- Session lifecycle --
-
-    def try_on_release(self, req: Req, *, inserted: bool) -> None:
-        """After a release the slot did not claim. A later turn ran on the
-        slot's record, which was just freed: drop the slot and its tree lock.
-        The session keeps its last finished request, so the next turn
-        re-prefills."""
-        if not _is_streaming(req):
-            return
-        from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
-        session_id = req.session.session_id
-        slot = self.slots.get(session_id)
-        if slot is not None and slot.kv is req.kv:
-            del self.slots[session_id]
-            if slot.last_node is not None:
-                skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
-                self.cache.dec_lock_ref(slot.last_node, slot.lock_receipt, **skip)
-            if inserted:
-                # The tree's component cleanup skipped this record.
-                self._free_slot_mamba(slot)
-        if isinstance(req.finished_reason, FINISH_ABORT):
-            req.session.abort_req()
 
     def release_session(self, session_id: str) -> None:
         slot = self.slots.pop(session_id, None)

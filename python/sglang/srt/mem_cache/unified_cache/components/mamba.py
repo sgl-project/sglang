@@ -646,6 +646,8 @@ class MambaComponent(TreeComponent):
         insert_params: Optional[InsertParams] = None,
     ) -> None:
         if is_finished:
+            if not req.kv.holds_mamba:
+                return
             mamba_value_inserted = (
                 insert_result is not None and not insert_result.mamba_exist
             )

@@ -993,10 +993,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "inserted"])
     def on_release(self, req: Req, *, inserted: bool) -> None:
-        if not inserted:
-            for comp in self._components_tuple:
-                comp.cleanup_after_caching_req(req, is_finished=True)
-        self.session.try_on_release(req, inserted=inserted)
+        if inserted:
+            return
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(req, is_finished=True)
 
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
