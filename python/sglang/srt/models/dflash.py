@@ -15,6 +15,7 @@ from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -933,6 +934,12 @@ class DFlashDraftModel(nn.Module):
                     "DFLASH Domino checkpoint is missing required projector weights: "
                     f"{sorted(missing)}."
                 )
+
+        # DSpark drafts load their backbone through here as well.
+        if envs.SGLANG_SPEC_DRAFT_INT8_WEIGHTS.get():
+            from sglang.srt.speculative.draft_int8 import apply_draft_int8_weights
+
+            apply_draft_int8_weights(self)
 
 
 class DFlashLagunaAttention(DFlashAttention):

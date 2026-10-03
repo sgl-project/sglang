@@ -526,6 +526,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.int8_weight_only_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.int8_weight_only_gemv:int8_weight_only_gemv",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.sm120_fp8_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.sm120_fp8_gemv:sm120_fp8_gemv",
