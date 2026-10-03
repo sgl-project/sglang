@@ -56,7 +56,7 @@ dependencies = [
   "scipy",
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
-  "sglang-kernel-xpu @ https://github.com/sgl-project/whl/releases/download/v0.3.0+xpu/sglang_kernel_xpu-0.3.0-cp310-abi3-manylinux_2_38_x86_64.whl",
+  "sglang-kernel-xpu @ git+https://github.com/sgl-project/sgl-kernel-xpu.git@main",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
