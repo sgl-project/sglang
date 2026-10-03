@@ -418,5 +418,67 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertEqual(second.normal_text, " tail")
 
 
+class TestMarkdownToolCallFallback(unittest.TestCase):
+    """Markdown-style pseudo tool calls ('### name\\n{json}') are recovered
+    when no DSML block is present; anything ambiguous stays untouched."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                ),
+            )
+        ]
+
+    def test_markdown_call_with_valid_json_is_parsed(self):
+        detector = DeepSeekV4Detector()
+        result = detector.detect_and_parse(
+            '### get_weather\n{"city": "San Francisco"}', self.tools
+        )
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertIn("San Francisco", result.calls[0].parameters)
+
+    def test_markdown_call_case_insensitive_tool_name(self):
+        detector = DeepSeekV4Detector()
+        result = detector.detect_and_parse(
+            '### Get_Weather\n{"city": "SF"}', self.tools
+        )
+        self.assertEqual(len(result.calls), 1)
+
+    def test_markdown_call_with_undeclared_tool_is_ignored(self):
+        detector = DeepSeekV4Detector()
+        result = detector.detect_and_parse('### unknown_tool\n{"a": 1}', self.tools)
+        self.assertEqual(result.calls, [])
+
+    def test_markdown_call_with_invalid_json_is_ignored(self):
+        detector = DeepSeekV4Detector()
+        result = detector.detect_and_parse("### get_weather\nnot json", self.tools)
+        self.assertEqual(result.calls, [])
+
+    def test_non_markdown_text_is_untouched(self):
+        detector = DeepSeekV4Detector()
+        text = "Let me check the weather for you."
+        result = detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, text)
+
+    def test_dsml_block_still_wins_over_markdown(self):
+        detector = DeepSeekV4Detector()
+        result = detector.detect_and_parse(
+            _wrapped(_invoke("get_weather", _param("city", "true", "SF"))), self.tools
+        )
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
+
 if __name__ == "__main__":
     unittest.main()
