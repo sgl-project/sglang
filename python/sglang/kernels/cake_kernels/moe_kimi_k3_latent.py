@@ -109,6 +109,42 @@ def supports_kimi_k3_latent_moe_front(
         return False
 
 
+def _tail_route_registered(
+    device, num_tokens: int, i_local: int, tp: int, num_partials: int
+) -> bool:
+    """Mirror ``prepare_kimi_k3_latent_moe_tail``'s program lookup exactly.
+
+    FlashInfer's ``generated_program_available(device, "tail", tp, T)`` plans the
+    decode route with ``num_partials=1`` (``cake_backend.route_kernel_keys``), while
+    ``prepare_kimi_k3_latent_moe_tail`` plans with the caller's ``P = routed.shape[0]``
+    and raises ``NotImplementedError`` when that exact instance is not registered
+    (observed on sm_100a for tp=8, T=1/16, P=2 at FlashInfer 46340689a5ab).  Admission
+    therefore re-derives the decode key with ``P`` and checks the registry itself;
+    prefill routes (``T > DECODE_MAX_T``) do not depend on ``P``.  Imports FlashInfer
+    lazily (only called at admission time, never at module import).
+    """
+    from flashinfer.experimental.kimi_k3_latent_moe import cake_backend as cb
+
+    arch = cb.SUPPORTED_COMPUTE_CAPABILITIES.get(torch_capability(device))
+    if arch is None:
+        return False
+    table = cb.KERNELS.get(arch)
+    if not table:
+        return False
+    if num_tokens <= cb.DECODE_MAX_T:
+        key = cb.decode_kernel_key(
+            cb.decode_tail_plan(num_tokens, i_local, tp, num_partials)
+        )
+        return key in table
+    return cb.generated_program_available(device, "tail", tp, num_tokens)
+
+
+def torch_capability(device):
+    import torch
+
+    return torch.cuda.get_device_capability(device)
+
+
 def supports_kimi_k3_latent_moe_tail(
     routed: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -134,6 +170,8 @@ def supports_kimi_k3_latent_moe_tail(
             return False
         i_local = SHARED_INTERMEDIATE // tp
         bf16 = torch.bfloat16
+        if not _tail_route_registered(routed.device, T, i_local, tp, P):
+            return False
         return (
             contiguous_cuda(routed, shape=(P, T, LATENT), dtype=bf16)
             and contiguous_cuda(norm_weight, shape=(LATENT,), dtype=bf16)

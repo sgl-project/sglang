@@ -179,7 +179,10 @@ def test_tail_matches_flashinfer_and_reference(tp, rank, tokens):
     w = _weights(device, tp, rank)
     i_local = SHARED // tp
     gen = torch.Generator(device="cpu").manual_seed(777 + tokens)
-    P = 2
+    # FlashInfer's own tail tests use one routed partial; the decode programs are
+    # registered per exact plan and the plan depends on ``P`` (see
+    # ``moe_kimi_k3_latent._tail_route_registered``).
+    P = 1
     routed = torch.randn(P, tokens, LATENT, generator=gen).to(torch.bfloat16).to(device)
     shared_act = (
         torch.randn(tokens, i_local, generator=gen).to(torch.bfloat16).to(device)
@@ -205,6 +208,23 @@ def test_tail_matches_flashinfer_and_reference(tp, rank, tokens):
     )
     assert adapter.supports_kimi_k3_latent_moe_tail(
         *args, out, tp=tp, rank=rank, y_workspace=y
+    )
+    # Two partials select a different decode instance; admission must agree with
+    # FlashInfer's registry instead of letting prepare raise NotImplementedError.
+    from flashinfer.experimental.kimi_k3_latent_moe import cake_backend as cb
+
+    routed2 = torch.cat([routed, routed], 0)
+    if tokens <= cb.DECODE_MAX_T:
+        key2 = cb.decode_kernel_key(cb.decode_tail_plan(tokens, i_local, tp, 2))
+        arch = cb.SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability()]
+        registered2 = key2 in cb.KERNELS.get(arch, {})
+    else:
+        registered2 = True
+    assert (
+        adapter.supports_kimi_k3_latent_moe_tail(
+            routed2, *args[1:], out, tp=tp, rank=rank, y_workspace=y
+        )
+        is registered2
     )
     runner = cake_prepare_kimi_k3_latent_moe_tail(
         *args, out, tp=tp, rank=rank, y_workspace=y

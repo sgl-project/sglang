@@ -279,26 +279,34 @@ def _varq_plan(device, *, batch, max_q_len, num_heads, max_seq_len):
 
 
 def _assert_varq_replay_close(out, lse, other_out, other_lse, *, can_split):
-    """Two launches on identical inputs: bitwise unless the plan splits items.
+    """Two launches on identical inputs agree within FlashInfer's replay spread.
 
     FlashInfer's contract (``tests/experimental/test_cake_mla_varq_dcp_decode.py``
     ``_assert_replay_close``): split items are merged from BF16-staged partials
     in unit-completion order, so consecutive launches may differ by a few BF16
-    ulps (``out`` atol 1e-3 / rtol 2^-7, finite ``lse`` atol 4e-3); unsplit
-    rows, the ``-inf`` LSE positions and the zero output rows are exact.  A plan
-    that cannot split has no partials at all, so it must be bitwise.
+    ulps (``out`` atol 1e-3 / rtol 2^-7, finite ``lse`` atol 4e-3); the ``-inf``
+    LSE positions and the zero output rows are exact.  FlashInfer's own suite
+    never asserts bitwise replay, and on sm_103a (GB300, FlashInfer 46340689a5ab)
+    even plans with ``can_split`` False were observed to differ by one BF16 ulp
+    between launches, so ``can_split`` only labels the failure message here.
     """
     assert not torch.isnan(out.float()).any()
-    if not can_split:
-        assert torch.equal(out, other_out)
-        assert torch.equal(lse, other_lse)
-        return
     neg_inf = torch.isneginf(other_lse.float())
-    assert torch.equal(torch.isneginf(lse.float()), neg_inf)
-    torch.testing.assert_close(out.float(), other_out.float(), atol=1e-3, rtol=2.0**-7)
+    assert torch.equal(torch.isneginf(lse.float()), neg_inf), f"can_split={can_split}"
+    torch.testing.assert_close(
+        out.float(),
+        other_out.float(),
+        atol=1e-3,
+        rtol=2.0**-7,
+        msg=lambda m: f"can_split={can_split}: {m}",
+    )
     finite = ~neg_inf
     torch.testing.assert_close(
-        lse.float()[finite], other_lse.float()[finite], atol=4e-3, rtol=0
+        lse.float()[finite],
+        other_lse.float()[finite],
+        atol=4e-3,
+        rtol=0,
+        msg=lambda m: f"can_split={can_split}: {m}",
     )
     assert torch.equal(out.float()[neg_inf], torch.zeros_like(out.float()[neg_inf]))
 
