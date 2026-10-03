@@ -5,6 +5,45 @@ use super::*;
 use crate::state::kv_events::wire::{BlockRemoved, BlockStored};
 use crate::state::load_monitor::engine_reported_load::LoadStat;
 
+/// The manager re-runs `add_worker` for a worker it already knows (its
+/// reconcile loop does so for a worker that advertises no model name), so a
+/// rank the tracker already holds must not buy another sweep: a `Pending`
+/// rank has one in flight, and a resolved one has nothing left to fetch.
+/// Only a rank `remove_worker` forgot registers afresh.
+#[tokio::test]
+async fn register_for_bootstrap_skips_ranks_the_tracker_already_holds() {
+    let index = KvEventIndex::new_with_bootstrap(
+        reqwest::Client::new(),
+        BlockSizeOracle::new(),
+        Arc::new(BootstrapTracker::new(Duration::from_secs(3600))),
+    );
+    let id = worker_id("http://w1:30000", 0);
+    let ranks = std::slice::from_ref(&id);
+
+    let first = index.register_for_bootstrap(ranks);
+    assert_eq!(first.len(), 1, "an untracked rank is registered");
+    assert!(
+        index.register_for_bootstrap(ranks).is_empty(),
+        "a Pending rank already has a sweep",
+    );
+    index.bootstrap.set(&id, BootstrapState::Failed);
+    assert!(
+        index.register_for_bootstrap(ranks).is_empty(),
+        "a resolved rank has nothing left to fetch",
+    );
+    assert_eq!(index.bootstrap.state_of(&id), Some(BootstrapState::Failed));
+
+    index.bootstrap.forget(ranks);
+    let again = index.register_for_bootstrap(ranks);
+    assert_eq!(again.len(), 1, "a forgotten rank registers afresh");
+    assert_ne!(again[0].1, first[0].1, "as a new incarnation");
+
+    assert!(
+        KvEventIndex::new().register_for_bootstrap(ranks).is_empty(),
+        "a disabled tracker registers nothing",
+    );
+}
+
 /// A restarted publisher renumbers from 0, so its cursor MUST be cleared.
 ///
 /// Without this, every post-restart batch has `seq < last_applied` and is
@@ -177,6 +216,8 @@ async fn pump_forget_ranks_drops_held_queue_so_readd_can_bootstrap() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Worker removed, then re-added: fresh incarnation, publisher renumbered.
+    // `remove_worker` forgets the tracker state before it sends `ForgetRanks`.
+    tracker.forget(std::slice::from_ref(&id));
     h.ctrl_tx
         .send(PumpControl::ForgetRanks {
             ranks: vec![id.clone()],
@@ -819,5 +860,60 @@ async fn remove_worker_clears_every_rank_before_returning() {
         "every dp rank of the removed worker must be cleared",
     );
     assert_eq!(tree.node_count(), 0, "cleared chains must prune");
+    index.shutdown().await;
+}
+
+/// The snapshot client must not follow redirects: a sibling router never
+/// redirects this route, so a 3xx is a misconfigured or hostile peer steering
+/// the fetch — and its multi-gigabyte buffering budget — at an arbitrary
+/// in-cluster URL. The 3xx must land as `FetchAnswer::NoBody` (peer is not a
+/// source) with the redirect target never contacted.
+///
+/// Asserted against the index's OWN client, not a test-local one: reqwest's
+/// default policy follows up to ten redirects, so a copy built in the test
+/// would prove nothing about the client the sweep and the probe actually use.
+#[tokio::test]
+async fn snapshot_client_refuses_to_follow_a_redirecting_peer() {
+    use crate::state::kv_events::bootstrap::{fetch_snapshot, FetchAnswer, SNAPSHOT_PATH};
+
+    let followed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let poisoned = Arc::clone(&followed);
+    let app = axum::Router::new()
+        .route(
+            SNAPSHOT_PATH,
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, "/poison")],
+                )
+            }),
+        )
+        .route(
+            "/poison",
+            axum::routing::get(move || {
+                let poisoned = Arc::clone(&poisoned);
+                async move {
+                    poisoned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "gotcha"
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let index = KvEventIndex::new();
+    let got = fetch_snapshot(&index.snapshot_http, &base, None)
+        .await
+        .expect("a refused redirect is an answer, not a transport error");
+    assert!(
+        matches!(got, FetchAnswer::NoBody(status) if status.is_redirection()),
+        "a redirecting peer must read as 'no snapshot here'",
+    );
+    assert_eq!(
+        followed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the redirect target must never be contacted",
+    );
     index.shutdown().await;
 }

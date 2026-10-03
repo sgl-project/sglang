@@ -41,7 +41,6 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import reduce_moe_output
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -192,9 +191,7 @@ class Step3TextAttention(nn.Module):
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
-        self.all_tp_rank = get_parallel().tp_rank
         self.total_num_heads = num_heads
-        self.attn_tp_rank = attn_tp_rank
         self.layer_id = layer_id
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -348,6 +345,7 @@ class Step3TextDecoderLayer(nn.Module):
                 hidden_act="silu",
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
         else:
             self.use_moe = True
@@ -379,12 +377,13 @@ class Step3TextDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=self.is_next_layer_sparse,
+                    next_layer_sparse=self.is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=self.is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=self.is_previous_layer_sparse,
+                next_layer_sparse=self.is_layer_sparse,
             )
             if layer_id != 0
             else None,
@@ -398,7 +397,7 @@ class Step3TextDecoderLayer(nn.Module):
             hidden_states += self.share_expert(h)
         else:
             hidden_states = self.moe(hidden_states)
-        return reduce_moe_output(hidden_states)
+        return hidden_states
 
     def forward(
         self,
@@ -418,12 +417,11 @@ class Step3TextDecoderLayer(nn.Module):
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if self.use_moe:
-                hidden_states = self.moe_mlp_forward(hidden_states)
-            else:
-                hidden_states = self.mlp(hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        if self.use_moe:
+            hidden_states = self.moe_mlp_forward(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 
@@ -478,10 +476,9 @@ class Step3TextModel(nn.Module):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states, forward_batch)
 
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
         return hidden_states
 
 

@@ -649,6 +649,52 @@ def test_cuda_graph_replays_match_eager_denoise_steps():
     assert (info.captures, info.hits, info.failures) == (1, 1, 0)
 
 
+@pytest.mark.parametrize("fnuz", [False, True])
+@pytest.mark.parametrize("tuple_output", [False, True])
+def test_fp8r_native_format_preserves_values(monkeypatch, fnuz, tuple_output):
+    from sglang.multimodal_gen.runtime.models.dits import flux3
+
+    monkeypatch.setattr(flux3, "is_fp8_fnuz", lambda: fnuz, raising=False)
+    # Include negative zero: reinterpreting it as FNUZ without normalization
+    # produces NaN. Keep a byte snapshot to detect mutation of the checkpoint.
+    weight = torch.tensor([[-0.0, 1.0, -2.0, 448.0], [0.0, -1.0, 2.0, -448.0]]).to(
+        torch.float8_e4m3fn
+    )
+    weight_bytes = weight.view(torch.uint8).clone()
+    scale = torch.tensor([0.125, 0.25])
+    x = torch.tensor([[[-0.0, 1.0, -2.0, 0.5], [0.0, 0.0, 0.0, 0.0]]])
+    quantized_x, x_scale = flux3.quantize_fp8_rowwise(x.flatten(0, 1))
+    expected_x = quantized_x.float() * x_scale[:, None]
+    expected_weight = weight.float() * scale[:, None]
+    expected = (expected_x @ expected_weight.T).bfloat16().reshape(1, 2, 2)
+    native_dtype = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
+    calls = []
+
+    def scaled_mm(a, b, scale_a, scale_b, *, out_dtype, use_fast_accum):
+        calls.append(True)
+        assert a.dtype == b.dtype == native_dtype
+        assert a.shape == (16, 4) and b.shape == (4, 2)
+        assert out_dtype == torch.bfloat16 and use_fast_accum
+        dequant_a = a.float() * scale_a
+        dequant_b = b.float() * scale_b
+        torch.testing.assert_close(dequant_a[:2], expected_x, atol=0, rtol=0)
+        torch.testing.assert_close(dequant_a[2:], torch.zeros(14, 4), atol=0, rtol=0)
+        torch.testing.assert_close(dequant_b, expected_weight.T, atol=0, rtol=0)
+        assert torch.isfinite(dequant_a).all() and torch.isfinite(dequant_b).all()
+        return (dequant_a @ dequant_b).to(out_dtype)
+
+    monkeypatch.setattr(torch, "_scaled_mm", scaled_mm)
+    layer = flux3.Flux3Fp8RowwiseLinear(weight, scale, tuple_output)
+    result = layer(x)
+    if tuple_output:
+        result, bias = result
+        assert bias is None
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+    assert len(calls) == 1
+    assert torch.equal(weight.view(torch.uint8), weight_bytes)
+    torch.testing.assert_close(scale, torch.tensor([0.125, 0.25]), atol=0, rtol=0)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
     reason="needs FP8 scaled_mm",

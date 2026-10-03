@@ -22,11 +22,14 @@ from sglang.srt.distributed import (
     GroupCoordinator,
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_quant_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
+    attn_cp_reduce_scatter_tensor,
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
@@ -41,20 +44,19 @@ from sglang.srt.layers.dp_attention import (
     moe_cp_all_gather_into_tensor,
 )
 from sglang.srt.layers.layer_boundary.adapters.attention import (
-    _redistribute_from_attn_tp_shards,
-    _redistribute_to_attn_tp_shards,
-)
-from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
-    dsa_cp_reduce_scatter_hidden_states,
+    attn_tp_gather,
+    attn_tp_slice,
 )
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,
+    SumGroup,
     TokenAxis,
     _cp_shard_token_rows,
     moe_cp_gathered_rows,
 )
-from sglang.srt.layers.layer_boundary.residual import StageUpdate
-from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
+from sglang.srt.layers.moe.utils import sum_post_experts_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -89,7 +91,7 @@ def tp_slice(hidden_states, residual):
     return hidden_states, residual
 
 
-def gather_attention_tp(
+def attn_tp_gather_input(
     hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     forward_batch: ForwardBatch,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -116,10 +118,10 @@ def gather_attention_tp(
             gathered_hidden_states.append(output)
         return tuple(gathered_hidden_states)
 
-    return _redistribute_from_attn_tp_shards(hidden_states)
+    return attn_tp_gather(hidden_states)
 
 
-def _reduce_and_redistribute_output_to_attn_tp_shards(
+def attn_tp_reduce_scatter(
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
     parallel = get_parallel()
@@ -130,7 +132,20 @@ def _reduce_and_redistribute_output_to_attn_tp_shards(
     return local_hidden_states
 
 
-def _redistribute_input_to_moe_cp(
+def attn_cp_interleave_reduce_scatter(hidden_states: torch.Tensor):
+    """Sum rank-major output onto each rank's equal, padded interleave shard."""
+    attn_dp_size = get_parallel().attn_dp_size
+    attn_tp_size = get_parallel().attn_tp_size
+    assert attn_dp_size == 1 and attn_tp_size == 1
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    input_hidden_states = hidden_states
+    hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
+    attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+    return hidden_states
+
+
+def moe_cp_gather(
     hidden_states: torch.Tensor, rows: List[int], moe_cp_size: int
 ) -> torch.Tensor:
     # Zigzag split can produce unequal token counts across CP ranks
@@ -150,7 +165,7 @@ def _redistribute_input_to_moe_cp(
     return output
 
 
-def _mlp_input_reduce_output(
+def attn_tp_all_reduce(
     hidden_states: torch.Tensor, forward_batch: ForwardBatch, may_quantize: bool = True
 ) -> torch.Tensor:
     if (
@@ -162,7 +177,35 @@ def _mlp_input_reduce_output(
     return attention_tensor_model_parallel_all_reduce(hidden_states)
 
 
-def _redistribute_input_to_dp(
+def sum_output(
+    hidden_states: torch.Tensor,
+    group: SumGroup,
+    forward_batch: ForwardBatch,
+    *,
+    may_quantize: bool,
+) -> torch.Tensor:
+    """Complete the sum an output owes over ``group`` on the rows it is on."""
+    parallel = get_parallel()
+    if group is SumGroup.ATTN_TP:
+        if parallel.attn_tp_size == 1:
+            return hidden_states
+        return attn_tp_all_reduce(hidden_states, forward_batch, may_quantize)
+    if group is SumGroup.TP:
+        if parallel.tp_size == 1:
+            return hidden_states
+        if (
+            may_quantize
+            and not forward_batch.forward_mode.is_decode_or_idle()
+            and get_exec().comm.enable_quant_communications
+        ):
+            return tensor_model_parallel_quant_all_reduce(hidden_states)
+        return tensor_model_parallel_all_reduce(hidden_states)
+    if group is SumGroup.MOE_OUTPUT:
+        return sum_post_experts_output(hidden_states)
+    raise ValueError(f"unsupported output sum group: {group!r}")
+
+
+def dp_gather(
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
     cp_shard_counts: Optional[List[int]] = None,
@@ -174,7 +217,7 @@ def _redistribute_input_to_dp(
     return global_hidden_states
 
 
-def _reduce_and_redistribute_output_to_dp(
+def dp_gather_sum(
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
     cp_shard_counts: Optional[List[int]] = None,
@@ -198,30 +241,18 @@ def move_rows(
     gathered, cut = rows.sharded - to.sharded, to.sharded - rows.sharded
     if (gathered and cut) or TokenAxis.ATTN_CP in gathered | cut:
         raise NotImplementedError(f"{rows=} {to=}")
-    if TokenAxis.ATTN_TP_SCATTER in gathered:
-        hidden_states = _redistribute_from_attn_tp_shards(hidden_states)
+    if TokenAxis.ATTN_TP in gathered:
+        hidden_states = attn_tp_gather(hidden_states)
     if TokenAxis.ATTN_DP in gathered:
-        hidden_states = _redistribute_input_to_dp(hidden_states, forward_batch)
+        hidden_states = dp_gather(hidden_states, forward_batch)
     if TokenAxis.ATTN_DP in cut:
-        hidden_states = _to_local_tokens(
-            _redistribute_output, forward_batch, hidden_states
-        )
-    if TokenAxis.ATTN_TP_SCATTER in cut:
+        hidden_states = to_dp_local(_dp_scatter_step, forward_batch, hidden_states)
+    if TokenAxis.ATTN_TP in cut:
         parallel = get_parallel()
         hidden_states = hidden_states.tensor_split(parallel.attn_tp_size)[
             parallel.attn_tp_rank
         ]
     return hidden_states
-
-
-def _tp_all_gather_scattered_rows(
-    hidden_states: torch.Tensor, forward_batch: ForwardBatch
-) -> torch.Tensor:
-    # Input-scattered attention keeps the same number of tokens on every TP rank.
-    total_tokens = forward_batch.input_ids.shape[0]
-    output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
-    get_parallel().tp_group.all_gather_into_tensor(output, hidden_states)
-    return output
 
 
 def _dp_scatter_group() -> GroupCoordinator:
@@ -231,7 +262,7 @@ def _dp_scatter_group() -> GroupCoordinator:
     return parallel.attn_tp_group
 
 
-def _reduce_and_redistribute_output_varlen(
+def dp_reduce_scatterv(
     local_hidden_states: torch.Tensor,
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -243,7 +274,7 @@ def _reduce_and_redistribute_output_varlen(
     )
 
 
-def _reduce_and_redistribute_output_max_len(
+def dp_reduce_scatter(
     local_hidden_states: torch.Tensor,
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -251,7 +282,7 @@ def _reduce_and_redistribute_output_max_len(
     dp_reduce_scatter_tensor(local_hidden_states, hidden_states)
 
 
-def _redistribute_output(
+def _dp_scatter_step(
     local_hidden_states: torch.Tensor,
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -259,9 +290,7 @@ def _redistribute_output(
     dp_scatter(local_hidden_states, hidden_states, forward_batch)
 
 
-def _redistribute_output_from_moe_cp(
-    hidden_states: torch.Tensor, rows: List[int]
-) -> torch.Tensor:
+def moe_cp_take_back(hidden_states: torch.Tensor, rows: List[int]) -> torch.Tensor:
     moe_cp_rank = get_moe_cp_rank()
     # The allgather was padded to max_tokens_per_rank (equal chunks).
     # Extract this rank's actual (non-padded) tokens from its chunk.
@@ -272,7 +301,7 @@ def _redistribute_output_from_moe_cp(
     ).contiguous()
 
 
-def _to_local_tokens(
+def to_dp_local(
     step: Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None],
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
@@ -282,15 +311,13 @@ def _to_local_tokens(
     return local_hidden_states
 
 
-def _all_reduce_then_to_local_tokens(
+def all_reduce_to_dp_local(
     group: GroupCoordinator, forward_batch: ForwardBatch, hidden_states: torch.Tensor
 ) -> torch.Tensor:
-    return _to_local_tokens(
-        _redistribute_output, forward_batch, group.all_reduce(hidden_states)
-    )
+    return to_dp_local(_dp_scatter_step, forward_batch, group.all_reduce(hidden_states))
 
 
-def identity_output(
+def keep_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -299,25 +326,25 @@ def identity_output(
     return hidden_states, residual
 
 
-def update_and_gather(
+def update_attn_tp_gather_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    update: StageUpdate = ADD,
+    update: ResidualUpdate = PLAIN_ADD,
     **kwargs,
 ):
     hidden_states = update.update(hidden_states, residual)
-    return _redistribute_from_attn_tp_shards(hidden_states), None
+    return attn_tp_gather(hidden_states), None
 
 
-def output_on_residual_shard(
+def residual_slice_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     *,
     sums: bool,
     gathers_back: bool,
-    update: StageUpdate,
+    update: ResidualUpdate,
     **kwargs,
 ):
     """Bring the FFN output onto the slice of the rows the residual is on:
@@ -339,16 +366,16 @@ def output_on_residual_shard(
     return hidden_states, None
 
 
-def scatter_output(
+def attn_tp_slice_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
 ):
     assert residual is None, "not yet handled residual!=None"
-    return _redistribute_to_attn_tp_shards(hidden_states), None
+    return attn_tp_slice(hidden_states), None
 
 
-def take_back_attention_cp_shard(
+def attn_cp_take_back_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -361,7 +388,7 @@ def take_back_attention_cp_shard(
     return shard, residual
 
 
-def reduce_scatter_over_cp(
+def attn_cp_reduce_scatter_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -369,10 +396,10 @@ def reduce_scatter_over_cp(
 ):
     """DSA and MLA CP: sum the FFN output over the attention-CP group and
     keep this rank's shard."""
-    return dsa_cp_reduce_scatter_hidden_states(hidden_states), residual
+    return attn_cp_interleave_reduce_scatter(hidden_states), residual
 
 
-def take_back_cp_shard(
+def dp_cp_take_back_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -393,7 +420,7 @@ def take_back_cp_shard(
     return local_hidden_states, residual
 
 
-def scatter_moe_cp_output(
+def moe_cp_take_back_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -401,23 +428,19 @@ def scatter_moe_cp_output(
 ):
     """Return a MoE output computed on the MoE-CP-gathered rows to this rank's attention rows.
 
-    After moe_tensor_model_parallel_all_reduce (which runs unconditionally since
-    mlp_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
-    full MoE result for all cp_per_moe token chunks. We simply slice out this rank's
-    CP-local portion.
+    Once the exit has completed the MoE output's sum, all ranks in the moe_cp
+    group hold the full MoE result for all cp_per_moe token chunks. We simply
+    slice out this rank's CP-local portion.
 
     If DP>1, further scatter back to the local DP slice.
     """
     # Only scatter back during prefill; decode was never allgathered so no-op.
-    # Safe w.r.t. empty tensors: same reasoning as _mlp_input_gather_moe_cp
-    # — CP extend always has non-zero tokens per rank, and decode skips this path.
+    # CP extend has non-zero tokens per rank, and decode skips this path.
     rows = moe_cp_gathered_rows(forward_batch)
     if rows is not None:
-        hidden_states = _redistribute_output_from_moe_cp(hidden_states, rows)
+        hidden_states = moe_cp_take_back(hidden_states, rows)
 
     if get_parallel().attn_dp_size > 1:
-        hidden_states = _to_local_tokens(
-            _redistribute_output, forward_batch, hidden_states
-        )
+        hidden_states = to_dp_local(_dp_scatter_step, forward_batch, hidden_states)
 
     return hidden_states, residual

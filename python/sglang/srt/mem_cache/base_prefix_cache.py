@@ -81,6 +81,8 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    # The ping-pong slot prepare picked; cleanup keeps that same slot.
+    mamba_keep_idx: Optional[int] = None
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
@@ -93,7 +95,9 @@ class InsertParams:
     component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
         default_factory=dict, kw_only=True
     )
-    chunked: bool = False
+    # The inserting request already inserted [0, here) (req.kv.cache_inserted_len);
+    # only the nodes past it count a hit, so a request counts each node once.
+    inserted_len: int = 0
     priority: int = 0
     session_id: Optional[str] = None
     track_adopted_ranges: bool = False
@@ -303,8 +307,8 @@ class MatchResult(NamedTuple):
 def zero_match_result(
     tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
 ) -> MatchResult:
-    if tree_cache.is_chunk_cache():
-        # Chunk caches' match_prefix already returns a miss; no root_node to walk back to.
+    if not tree_cache.supports_prefix_sharing():
+        # match_prefix already returns a miss; no root_node to walk back to.
         return match_result
     root = tree_cache.root_node_handle(extra_key=extra_key)
     return match_result._replace(
@@ -455,15 +459,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def insert_req(self, req: Req, *, up_to: int, **kwargs):
-        """Hand a finished request's KV up to row position ``up_to`` to the
-        tree: insert what can be keyed and advance ``cache_protected_len``
-        past it. The caller then frees ``[cache_protected_len, up_to)`` and
-        everything after, and unpins; nothing here releases a slot."""
-
-    @abstractmethod
-    def cache_unfinished_req(self, req: Req, **kwargs):
-        pass
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs):
+        """Insert the request's KV up to row position ``up_to`` into the tree,
+        repoint the row onto the tree's copy, re-anchor ``req.last_node`` on
+        the node the insert ended on and advance ``cache_protected_len``.
+        Called at every checkpoint of a running request and once more when
+        it finishes (``req.finished()``), when the tree also takes over the
+        component state the request no longer needs. Nothing here frees a
+        slot: ``release_kv_cache`` frees ``[cache_protected_len, up_to)`` and
+        everything after, and unpins."""
 
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
         """Give back ascending, disjoint, half-open row-position ranges
@@ -620,7 +624,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             page_size=self.page_size,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            is_chunk_cache=self.is_chunk_cache(),
+            supports_prefix_sharing=self.supports_prefix_sharing(),
             retain_floor=self.swa_retain_floor(req),
             eviction_interval=eviction_interval,
         )
@@ -639,9 +643,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return 0
 
     def supports_mamba(self) -> bool:
-        return False
-
-    def supports_streaming_session(self) -> bool:
         return False
 
     def release_session(self, session_id: str) -> None:
@@ -665,11 +666,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
         return 0
 
-    def is_chunk_cache(self) -> bool:
-        return False
-
-    def is_tree_cache(self) -> bool:
-        return not self.is_chunk_cache()
+    def supports_prefix_sharing(self) -> bool:
+        """Whether a request's prefix stays in the cache for other requests to
+        share, including after the request finishes."""
+        return True
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
