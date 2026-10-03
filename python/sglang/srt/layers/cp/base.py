@@ -72,7 +72,7 @@ class CPAttentionBackendKind(IntEnum):
     def from_string(cls, value: str) -> CPAttentionBackendKind:
         if value in ("fa3", "fa4", "flashinfer"):
             return cls.FLASH_ATTENTION
-        if value in ("dsa"):
+        if value == "dsa":
             return cls.DSA
         if value == "trtllm_mha":
             return cls.TRTLLM_MHA
