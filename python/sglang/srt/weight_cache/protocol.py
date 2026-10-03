@@ -165,8 +165,18 @@ IPC_QUANT_ALLOWLIST = {
 }
 
 
-def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
-    """Return True if `quant_method` is verified safe for IPC zero-copy sharing."""
+def is_ipc_quant_supported(
+    quant_method: str, quant_config: Any, *, is_fp4_experts: bool = False
+) -> bool:
+    """Return True if the model layout is verified safe for IPC zero-copy sharing.
+
+    ``is_fp4_experts`` is a model-level layout flag.  It is intentionally
+    checked separately from the Hugging Face quantization method because mixed
+    FP8/MXFP4 checkpoints can report ``fp8`` in ``quantization_config`` while
+    their routed-expert tensors still need unsupported MXFP4 post-processing.
+    """
+    if is_fp4_experts:
+        return False
     predicate = IPC_QUANT_ALLOWLIST.get(quant_method)
     if predicate is None:
         return False
@@ -174,20 +184,31 @@ def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
 
 
 def check_ipc_quant_support(
-    quant_method: str, quant_config: Any, *, where: str
+    quant_method: str,
+    quant_config: Any,
+    *,
+    where: str,
+    is_fp4_experts: bool = False,
 ) -> None:
     """Hard-error unless `quant_method` is verified safe for IPC zero-copy sharing.
 
     `where` is a short tag (e.g. "daemon"/"client") used only in the error
     message. Raises UnsupportedQuantForIPCError with an actionable message.
     """
-    if is_ipc_quant_supported(quant_method, quant_config):
+    if is_ipc_quant_supported(
+        quant_method, quant_config, is_fp4_experts=is_fp4_experts
+    ):
         return
     verified = ", ".join(
         (repr(m) if m else "'' (unquantized)") for m in IPC_QUANT_ALLOWLIST
     )
+    layout = (
+        "routed-expert MXFP4 layout"
+        if is_fp4_experts
+        else f"quantization method {quant_method!r}"
+    )
     raise UnsupportedQuantForIPCError(
-        f"[weight_cache:{where}] quantization method {quant_method!r} is not "
+        f"[weight_cache:{where}] {layout} is not "
         f"verified for CUDA IPC zero-copy weight sharing. Its "
         f"process_weights_after_loading may stamp Python-side metadata "
         f"(e.g. format_ue8m0) or repack/transpose weights into shapes the "
