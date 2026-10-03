@@ -1263,7 +1263,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_named_tool_choice_can_keep_every_tool_in_the_prompt(self):
         """An agent that names a tool on one turn must not lose its prefix cache:
         the template gets the same tool list as on a turn with automatic choice,
-        and the output constraint still accepts only the named tool."""
+        and the structural tag lists only the named tool."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         req = self._named_tool_choice_request()
