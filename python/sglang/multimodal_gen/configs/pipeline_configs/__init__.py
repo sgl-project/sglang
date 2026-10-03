@@ -5,6 +5,18 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     SlidingTileAttnConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
+    Cosmos3MultiviewConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
+    CosmosDreamsConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams_realtime import (
+    CosmosDreamsRealtimeConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams_transfer import (
+    CosmosDreamsTransferConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
     DiffusersGenericPipelineConfig,
 )
@@ -70,6 +82,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipeline
 
 __all__ = [
     "Cosmos3Config",
+    "Cosmos3MultiviewConfig",
+    "CosmosDreamsConfig",
+    "CosmosDreamsRealtimeConfig",
+    "CosmosDreamsTransferConfig",
     "DiffusersGenericPipelineConfig",
     "HeliosDistilledConfig",
     "HeliosMidConfig",

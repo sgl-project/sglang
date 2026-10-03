@@ -111,6 +111,7 @@ class VideoResponse(BaseModel):
     inference_time_s: Optional[float] = None
     revised_prompt: Optional[str] = None
     action: Optional[Dict[str, Any]] = None
+    lidar: Optional[Dict[str, Any]] = None
 
 
 class VideoGenerationsRequest(BaseModel):
