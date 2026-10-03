@@ -812,6 +812,37 @@ class TestEagleConfigurator(CustomTestCase):
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
 
+    def test_eagle_dcp_replicated_draft_does_not_exceed_budget(self):
+        """The replicated EAGLE draft pool spans every DCP virtual location."""
+        available = 10_000_000
+        num_layers = 32
+        eagle_draft_num_layers = 1
+        dcp_size = 4
+
+        mr = _make_model_runner(self, num_layers=num_layers)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
+
+        # TP=8 makes the DCP topology valid; target geometry stays fixed so this
+        # isolates the draft term.
+        with (
+            mock_cpu_env(tp_size=8),
+            get_parallel().override(attn_dcp_size=dcp_size),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
+
+        full_pt = _full_per_token(mr)
+        total_layers = num_layers + eagle_draft_num_layers * dcp_size
+        used = config.max_total_num_tokens * full_pt * total_layers
+        self.assertLessEqual(used, available)
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
@@ -892,6 +923,53 @@ class TestEagleConfigurator(CustomTestCase):
         used = full_tokens * full_pt * 2 + swa_tokens * swa_pt * 3
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
+
+    def test_hybrid_swa_dcp_replicated_draft_does_not_exceed_budget(self):
+        """The replicated EAGLE draft pool spans every DCP virtual location."""
+        available = 10_000_000
+        mr = _make_model_runner(
+            self,
+            num_kv_heads=8,
+            head_dim=64,
+            v_head_dim=64,
+            num_layers=4,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0, 1],
+            swa_attention_layer_ids=[2, 3],
+            swa_num_kv_heads=2,
+            swa_head_dim=32,
+            swa_v_head_dim=32,
+            swa_full_tokens_ratio=0.25,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        # One draft layer of each geometry, so both the full and the SWA draft
+        # terms have to be replicated.
+        mr.spec_aux_config.eagle_draft_num_layers = 2
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 1
+
+        for dcp_size in (1, 4):
+            with self.subTest(dcp_size=dcp_size):
+                # TP=8 makes both topologies valid. The mock deliberately keeps
+                # target geometry fixed so this isolates the draft term.
+                with (
+                    mock_cpu_env(tp_size=8),
+                    get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        create_memory_pool_configurator,
+                    )
+
+                    cfg = create_memory_pool_configurator(mr)
+                    config = cfg.calculate_pool_sizes(available, page_size=1)
+
+                full_pt = _full_per_token(mr)
+                swa_pt = _swa_per_token(mr)
+                used = config.full_max_total_num_tokens * full_pt * (
+                    2 + dcp_size
+                ) + config.swa_max_total_num_tokens * swa_pt * (2 + dcp_size)
+                self.assertLessEqual(used, available)
+                self.assertGreater(used, available * 0.99)
 
 
 class TestDSAIndexerAllocationPolicy(CustomTestCase):
