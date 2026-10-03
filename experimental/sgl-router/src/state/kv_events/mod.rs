@@ -25,6 +25,7 @@ pub mod bootstrap;
 pub mod discovery;
 pub mod hash;
 pub mod index;
+pub mod pending;
 pub mod subscriber;
 pub mod tally;
 pub mod tree;
@@ -36,6 +37,7 @@ pub(crate) use discovery::classify_bigram;
 pub use discovery::{fetch_event_config, EventConfig};
 pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
 pub use index::{KvEventIndex, KvIndexMetrics};
+pub use pending::PendingPrefixes;
 pub use subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
 pub use tally::{EventKind, EventTally, ReplayOutcome, TallyRow};
 pub use tree::{
