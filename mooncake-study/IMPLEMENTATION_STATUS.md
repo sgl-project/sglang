@@ -4131,6 +4131,42 @@ auditor's fixed-row-count assumption fails and its corrected audit passes.
 Final source and archived trace/report hashes are checked. Full results and the
 preserved audit failure are in [the evidence](experiments/kv-hicache.json).
 
+## Capture Monitoring Runtime Acceptance
+
+Capture device memory metrics now use names that include all capture arenas,
+including teacher staging and HiCache export metadata. Existing `kv_staging_*`
+gauges remain aliases. Bounded Host/device enqueue counters expose the optional
+HiCache exporter's existing byte accounting through the background metrics
+thread. Two new dashboard panels show device capacity/budget and enqueue rate;
+these are not completed D2H or RDMA bandwidth measurements.
+
+Eleven metrics unit methods pass. The corrected non-streaming runtime completes
+160 requests and 104 post-exit Store snapshot validations. The final mixed
+streaming runtime completes 156 requests and validates 96 snapshots after the
+producer exits. Its sixty paused-phase requests finish without capture; READY
+stays at 48 and enqueue counters remain constant, then publication resumes.
+Together the successful runs validate 124,704,000 payload bytes. All runtime
+scrapes agree with producer status for the new gauges/counters and pause state.
+
+Real Prometheus validates all nineteen dashboard expressions using both all
+and selected model/instance filters, checks scrape continuity and verifies
+the three control phases. Real Grafana browser acceptance passes all fifteen
+panels at 1440x1000 and 390x844, including all/selected desktop views, nonempty
+datasource responses, backend macro expansion, nonblank plots and no horizontal
+overflow. Each view executes all nineteen distinct expressions; 190 responses
+including refreshes and 48 screenshots are retained. The missing streaming
+histogram in the earlier run is explicitly rejected by the negative check.
+
+The [runbook](experiments/CAPTURE_MONITORING.md) and
+[evidence](experiments/capture-monitoring.json) preserve initial validator and
+browser failures, corrections, source identities and 369 archived artifacts.
+This closes the previously untested dashboard rendering/query-engine item for
+the local single-H100 fixture. It does not certify production SLOs or native
+Kubernetes scrape deployment: the cluster denies port-forward, so this test
+uses a read-only pod-exec metrics relay. The Store uses real TCP with the test
+Catalog; production Catalog, alerting, broader topology and rollout gates remain
+open. The H100 experiment worker resumes its existing idle workload afterward.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2 and PP2 AR/static target-KV DSpark prefill graph
@@ -4159,8 +4195,9 @@ preserved audit failure are in [the evidence](experiments/kv-hicache.json).
    target-KV v1 draft remains static by checkpoint contract; the remaining
    capability gates do not constitute implementation of those paths.
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to
-   representative workloads and SLO thresholds, and complete dashboard runtime
-   acceptance and rollout/rollback checks beyond the new single-GPU live capture
+   representative workloads and SLO thresholds, and extend the passing local
+   dashboard runtime acceptance to deployment discovery/authentication/alerting.
+   Complete rollout/rollback checks beyond the new single-GPU live capture
    controls and passing TP1/PP1, TP2/PP1 and TP1/PP2 separate-endpoint P/D matrices,
    including mixed/asymmetric and cross-node P/D control.
    Investigate the timing experiment's

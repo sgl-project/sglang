@@ -46,9 +46,19 @@ Deployments that rename metrics at ingestion must adjust the queries accordingly
 
 The dashboard shows admission ratios, publication/failure events, reservations,
 registered Host slots, writer age, cooldown, disabled state, metric freshness and
-existing serving latency histograms. Details and counter semantics are in the
+existing serving latency histograms. It also shows scheduler latency protection,
+background writer stages, capture device memory/budget and HiCache KV export
+enqueue rate. The latter is zero with the default Torch exporter and is not
+completed D2H or RDMA bandwidth. Inter-token latency histograms require streaming
+traffic; a producer receiving only non-streaming requests can have no series.
+Details and counter semantics are in the
 [producer metrics guide](../../python/sglang/srt/training_capture/README.md#prometheus-metrics).
 This dashboard does not configure alerts or establish service latency thresholds.
+
+The [monitoring runtime runbook](../../mooncake-study/experiments/CAPTURE_MONITORING.md)
+describes live producer, Prometheus query and browser verification, including
+pause/resume and post-exit Mooncake readback. Its local test topology does not
+validate a deployment's service discovery, authentication or alert routing.
 
 ## Troubleshooting
 

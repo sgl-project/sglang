@@ -1,0 +1,280 @@
+{
+  "status": "completed",
+  "scope": "Monitoring correctness only: single H100 Qwen3-0.6B, local real TCP Mooncake and test Catalog; local Prometheus/Grafana through read-only kubectl exec relay.",
+  "source_base_revision": "d0c7d4bd89ea2bb872302148d37ede21dfca3118",
+  "source_sha256": {
+    "python/sglang/srt/training_capture/metrics.py": "e11b9f0180fb16a4af1227abc19d75f03440bd7685a6cace39e3194fe2bf1dff",
+    "test/registered/unit/training_capture/test_metrics.py": "8832f492ab61d1c8915aa822af6d44ed419367dbd75d6f9b00f1256c6d52a787",
+    "examples/monitoring/grafana/dashboards/json/training-capture-dashboard.json": "a816d29469af4349aa983a6a10f9128e203f1779114a254d3a08a81a95eea93c",
+    "mooncake-study/experiments/verify_capture_monitoring.py": "1dc612b9132b8e964c0cf799d5ec5187220f5478e8c057131c2c598cf9874410",
+    "mooncake-study/experiments/verify_capture_dashboard.cjs": "fb6020ca19e75be148e5a88ff016d2f00858b01b4e28bae12283c65f08142105"
+  },
+  "archive": "/gpfs/user/fuxuanwei/mooncake-lab-archive/capture-monitoring-20261003",
+  "archive_manifest_sha256": "90e00888450b3bdcf6bcb79ccfb652795c756e55bf90ba4496fe547c40e56307",
+  "artifact_count": 369,
+  "final_verification": {
+    "archive_sha256_rechecked": 369,
+    "current_source_sha256_rechecked": 5,
+    "distinct_datasource_expressions_per_view": 19,
+    "canonical_mirror_base_files_match_head": 7,
+    "canonical_mirror_new_paths_absent_before_sync": 4,
+    "black_ruff_node_syntax_git_diff_check": "passed"
+  },
+  "runtime_lock_sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84",
+  "jobs": [
+    {
+      "role": "metrics_units",
+      "id": "01790987539533610215-4b72b74a9862",
+      "version": 1,
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-monitor-v1",
+      "result": {
+        "job_id": "01790987539533610215-4b72b74a9862",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790987552.5618613,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790987539533610215-4b72b74a9862.log"
+      }
+    },
+    {
+      "role": "runtime_initial_validator_failure",
+      "id": "01790988031065302624-c07353f8652a",
+      "version": 2,
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-monitor-v2",
+      "result": {
+        "job_id": "01790988031065302624-c07353f8652a",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790988270.9502156,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790988031065302624-c07353f8652a.log"
+      }
+    },
+    {
+      "role": "runtime_nonstream",
+      "id": "01790988610654876984-fca2784cc8f6",
+      "version": 3,
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-monitor-v3",
+      "result": {
+        "job_id": "01790988610654876984-fca2784cc8f6",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790988850.7238848,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790988610654876984-fca2784cc8f6.log"
+      }
+    },
+    {
+      "role": "runtime_mixed_stream",
+      "id": "01790988859150799559-a966daea1d5d",
+      "version": 4,
+      "source": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-monitor-v4",
+      "result": {
+        "job_id": "01790988859150799559-a966daea1d5d",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790989097.7350624,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790988859150799559-a966daea1d5d.log"
+      }
+    }
+  ],
+  "unit_tests": {
+    "methods": 11,
+    "seconds": 0.061,
+    "status": "passed"
+  },
+  "successful_runtime_runs": [
+    {
+      "version": 3,
+      "status": "completed",
+      "requests": 160,
+      "readback": {
+        "validated_samples": 104,
+        "manifest_bytes": 893672,
+        "payload_bytes": 64846080,
+        "aux_payload_bytes": 3504384,
+        "payload_objects": 1456,
+        "kv_payload_bytes": 61341696
+      },
+      "observations": 40
+    },
+    {
+      "version": 4,
+      "status": "completed",
+      "requests": 156,
+      "readback": {
+        "validated_samples": 96,
+        "manifest_bytes": 824928,
+        "payload_bytes": 59857920,
+        "aux_payload_bytes": 3234816,
+        "payload_objects": 1344,
+        "kv_payload_bytes": 56623104
+      },
+      "observations": 39
+    }
+  ],
+  "dashboard": {
+    "report": "/gpfs/user/fuxuanwei/mooncake-lab-archive/capture-monitoring-20261003/dashboard-stream-v3/report.json",
+    "report_sha256": "a81c4cdb0b1164352dad3578c8dd568fec41e23fc055050fd7f02ba78ab09cad",
+    "versions": {
+      "grafana": {
+        "database": "ok",
+        "version": "13.2.3",
+        "commit": "90ffed056f0884267356c12a0eeb72a022af53f1"
+      },
+      "prometheus": {
+        "status": "success",
+        "data": {
+          "version": "3.15.0",
+          "revision": "5241a27fe3c6983549fccc32f6e65917408c63cd",
+          "branch": "HEAD",
+          "buildUser": "root@4635dd007a60",
+          "buildDate": "20260925-07:33:45",
+          "goVersion": "go1.27.1"
+        }
+      }
+    },
+    "chromium": "141.0.7390.37",
+    "playwright": "1.56.1",
+    "window": {
+      "start": 1790988916.6940496,
+      "end": 1790989088.486849
+    },
+    "promql_checks": 38,
+    "phases": [
+      {
+        "phase": "capture",
+        "start": 1790988916.6940496,
+        "end": 1790988968.5377803,
+        "paused": [
+          0
+        ],
+        "ready": [
+          4,
+          44
+        ],
+        "hostBytes": [
+          786432,
+          8650752
+        ]
+      },
+      {
+        "phase": "paused",
+        "start": 1790988976.656972,
+        "end": 1790989030.2597837,
+        "paused": [
+          1
+        ],
+        "ready": [
+          48,
+          48
+        ],
+        "hostBytes": [
+          9437184,
+          9437184
+        ]
+      },
+      {
+        "phase": "resumed",
+        "start": 1790989038.7942255,
+        "end": 1790989088.486849,
+        "paused": [
+          0
+        ],
+        "ready": [
+          52,
+          92
+        ],
+        "hostBytes": [
+          10223616,
+          18087936
+        ]
+      }
+    ],
+    "views": [
+      {
+        "name": "desktop-all",
+        "viewport": {
+          "width": 1440,
+          "height": 1000
+        },
+        "panels": 15,
+        "datasource_queries": 70,
+        "errors": [],
+        "http_responses": [
+          {
+            "url": "http://127.0.0.1:13000/api/user/stars",
+            "status": 401
+          }
+        ],
+        "url": "http://127.0.0.1:13000/d/sglang-training-capture/sglang-training-capture?orgId=1&from=2026-10-03T00:55:16.694Z&to=2026-10-03T00:58:08.486Z&var-datasource=capture-prometheus&var-model_name=$__all&var-instance=$__all&timezone=browser&refresh=5s"
+      },
+      {
+        "name": "desktop-selected",
+        "viewport": {
+          "width": 1440,
+          "height": 1000
+        },
+        "panels": 15,
+        "datasource_queries": 70,
+        "errors": [],
+        "http_responses": [
+          {
+            "url": "http://127.0.0.1:13000/api/user/stars",
+            "status": 401
+          }
+        ],
+        "url": "http://127.0.0.1:13000/d/sglang-training-capture/sglang-training-capture?orgId=1&from=2026-10-03T00:55:16.694Z&to=2026-10-03T00:58:08.486Z&var-datasource=capture-prometheus&var-model_name=capture-monitoring-qwen3&var-instance=127.0.0.1:18081&timezone=browser&refresh=5s"
+      },
+      {
+        "name": "mobile-selected",
+        "viewport": {
+          "width": 390,
+          "height": 844
+        },
+        "panels": 15,
+        "datasource_queries": 50,
+        "errors": [],
+        "http_responses": [],
+        "url": "http://127.0.0.1:13000/d/sglang-training-capture/sglang-training-capture?orgId=1&from=2026-10-03T00:55:16.694Z&to=2026-10-03T00:58:08.486Z&var-datasource=capture-prometheus&var-model_name=capture-monitoring-qwen3&var-instance=127.0.0.1:18081&timezone=browser&refresh=5s"
+      }
+    ]
+  },
+  "final_capture_counters": {
+    "considered": 157,
+    "excluded_health_check": 1,
+    "admitted": 96,
+    "overlap_forwards": 792,
+    "eager_forwards": 24,
+    "cuda_graph_forwards": 768,
+    "sealed": 96,
+    "writer_started": 96,
+    "copies_completed": 96,
+    "snapshot_built": 96,
+    "ready": 96,
+    "control_pause": 1,
+    "excluded_paused": 60,
+    "control_resume": 1
+  },
+  "final_host_pool": {
+    "allocated_bytes": 27018240,
+    "device_allocated_bytes": 1717248,
+    "device_limit_bytes": 16777216,
+    "kv_export_host_enqueued_bytes": 18874368,
+    "kv_export_device_enqueued_bytes": 37748736,
+    "free": 0,
+    "filling": 16,
+    "quarantined": 0
+  },
+  "preserved_failures": [
+    "Initial runtime v2 post-exit validation iterated Catalog keys; fixed with values and exact captured request membership in v3.",
+    "Initial browser probes inherited en-US@posix, rejected by Intl.NumberFormat; explicit en-US context fixes the fixture.",
+    "Non-streaming v3 dashboard negative check fails on panel 8/B missing inter-token latency; v4 adds streaming requests.",
+    "Browser stream v1 checked title before Grafana initialized; v2 explicitly waits for the title.",
+    "Browser stream v2 incorrectly required client-side expansion of $__rate_interval; v3 verifies backend executedQueryString instead."
+  ],
+  "limitations": [
+    "Read-only exec relay because pods/portforward is denied; native Kubernetes discovery/authentication is not validated.",
+    "Grafana anonymous Viewer stars endpoint returns a recorded 401; other HTTP failures and datasource errors are rejected.",
+    "Fixed synthetic fixture budgets and TCP test Catalog do not prove production SLOs, alert routing, cross-node monitoring or trained draft quality.",
+    "Snapshot checks validate hashes/schema/request membership, not an independent online KV/logits oracle; separate HiCache numerical runtime evidence applies to the unchanged exporter.",
+    "Device bytes are allocated capture arena capacity; export counters are submitted HiCache work, not completed or RDMA bytes."
+  ]
+}

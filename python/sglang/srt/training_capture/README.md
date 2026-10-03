@@ -901,7 +901,8 @@ With both `--training-capture-config` and `--enable-metrics`, the existing
 No capture metrics or monitoring thread are created when either flag is absent.
 The producer inherits the scheduler's model/rank and configured extra labels.
 Request IDs, dataset contents, object keys, exception text and per-sample identity
-are never metric labels. Event/action/state/kind/metric/stage labels have bounded value sets.
+are never metric labels. Event/action/state/kind/metric/stage/destination labels
+have bounded value sets.
 
 | Suffix | Type / Extra Label | Meaning |
 | --- | --- | --- |
@@ -911,6 +912,10 @@ are never metric labels. Event/action/state/kind/metric/stage labels have bounde
 | `reservations` | Gauge / `state` | Available, active, queued, writing and pending-publication reservations |
 | `host_slots` | Gauge / `state` | Free, filling and quarantined registered Host slots |
 | `host_allocated_bytes` | Gauge | Allocated Host arena capacity, including manifest buffers |
+| `device_allocated_bytes` | Gauge | Allocated capture device arenas: KV/teacher staging and export metadata |
+| `device_limit_bytes` | Gauge | Configured budget for all capture device arenas |
+| `kv_staging_allocated_bytes`, `kv_staging_limit_bytes` | Gauge | Deprecated aliases of the two device arena gauges; include teacher staging and metadata |
+| `kv_export_enqueued_bytes_total` | Counter / `destination` | Optional HiCache KV exporter bytes enqueued to `host` or `device`; zero for the Torch exporter |
 | `occupied_fraction` | Gauge | Busy reservations plus quarantined slots divided by configured capacity |
 | `queue_depth` | Gauge | Work awaiting background processing |
 | `writer_age_seconds` | Gauge | Age of oldest queued, writing or pending-publication work |
@@ -952,6 +957,16 @@ spare leases, whereas `occupied_fraction` excludes them. Host bytes report
 allocated capacity, not payload transfer volume. These metrics also work with
 fixed sampling (`adaptive` absent).
 
+Device bytes include the optional KV and teacher staging tensors and HiCache
+pointer/position tables; they exclude the model's serving KV pool and other CUDA
+allocations. The old `kv_staging_*` names remain aliases for existing dashboards.
+`kv_export_enqueued_bytes_total` measures submitted HiCache copy work: `host`
+counts mapped pinned-Host kernel stores and `device` counts staging gathers before
+the subsequent D2H flush. It includes overlap lookahead and later-aborted work.
+It does not certify copy completion, publication, unique sample bytes, CUDA graph
+replay traffic, Store bandwidth or RDMA wire traffic. Counter export uses the same
+background snapshot as other metrics and adds no inference-thread Prometheus call.
+
 `stage_timings` in the existing producer status reports the same cumulative
 `calls`, `errors`, `seconds` and `max_seconds`, even when Prometheus is disabled.
 The fixed stages are `queue_wait`, `copy_wait`, `snapshot_build`, `validation`,
@@ -977,7 +992,11 @@ metadata work are not included. Do not add these values across ranks or include
 queue wait to estimate end-to-end latency or GPU cost. The benchmark reports
 per-phase count/time deltas excluding warmup, with lifetime maxima retained only
 in the raw status snapshots. The dashboard displays mean completed-attempt time
-and failure rate; full runtime dashboard acceptance remains a deployment gate.
+and failure rate. Its single-H100, local TCP Store/Prometheus/Grafana runtime
+verification is documented in the
+[monitoring runbook](../../../../mooncake-study/experiments/CAPTURE_MONITORING.md);
+deployment-specific transport, authentication, alerts and SLOs remain acceptance
+requirements.
 
 The [monitoring example](../../../../examples/monitoring/README.md) provisions
 a training-capture Grafana dashboard alongside serving metrics. Scheduler

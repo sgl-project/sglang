@@ -84,6 +84,49 @@ class TestCaptureMetrics(CustomTestCase):
         ]
         self.assertEqual(len(events), len(CaptureMetrics.EVENTS))
 
+    def test_device_arena_metrics_keep_legacy_aliases_and_clear_on_close(self):
+        for allocated in (256, 0):
+            self.stats["host_pool"]["device_allocated_bytes"] = allocated
+            self.metrics.update(self.stats)
+            for prefix in ("device", "kv_staging"):
+                self.assertEqual(self.value(prefix + "_allocated_bytes"), allocated)
+                self.assertEqual(self.value(prefix + "_limit_bytes"), 512)
+
+    def test_export_byte_counters_are_idempotent_and_have_bounded_destinations(self):
+        self.metrics.update(self.stats)
+        for destination in ("host", "device"):
+            self.assertEqual(
+                self.value("kv_export_enqueued_bytes_total", destination=destination), 0
+            )
+        self.stats["host_pool"].update(
+            kv_export_host_enqueued_bytes=100,
+            kv_export_device_enqueued_bytes=200,
+            kv_export_private_request_enqueued_bytes=999,
+        )
+        self.metrics.update(self.stats)
+        self.metrics.update(self.stats)
+        self.stats["host_pool"]["kv_export_host_enqueued_bytes"] = 0
+        self.metrics.update(self.stats)
+        self.assertEqual(
+            self.value("kv_export_enqueued_bytes_total", destination="host"), 100
+        )
+        self.stats["host_pool"]["kv_export_host_enqueued_bytes"] = 250
+        self.metrics.update(self.stats)
+        self.assertEqual(
+            self.value("kv_export_enqueued_bytes_total", destination="host"), 250
+        )
+        self.assertEqual(
+            self.value("kv_export_enqueued_bytes_total", destination="device"), 200
+        )
+        samples = [
+            sample
+            for family in self.registry.collect()
+            for sample in family.samples
+            if sample.name == "sglang:training_capture_kv_export_enqueued_bytes_total"
+        ]
+        self.assertEqual(len(samples), 2)
+        self.assertNotIn("private_request", generate_latest(self.registry).decode())
+
     def test_disabled_and_quarantined_are_distinct_from_adaptive_pause(self):
         self.stats["disabled_reason"] = "private-error-details"
         self.stats["admission"].update(effective_ratio=0, pauses=1)

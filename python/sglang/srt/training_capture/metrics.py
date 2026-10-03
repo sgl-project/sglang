@@ -115,10 +115,24 @@ class CaptureMetrics:
             "host_allocated_bytes", "Allocated registered Host arena bytes."
         )
         self.device_bytes = gauge(
-            "kv_staging_allocated_bytes", "Allocated KV staging tensor bytes."
+            "device_allocated_bytes",
+            "Allocated capture device arena bytes, including KV/teacher staging and export metadata.",
         )
         self.device_limit = gauge(
-            "kv_staging_limit_bytes", "Configured KV staging tensor byte budget."
+            "device_limit_bytes", "Configured total capture device arena byte budget."
+        )
+        self.legacy_device_bytes = gauge(
+            "kv_staging_allocated_bytes",
+            "Deprecated alias of device_allocated_bytes; includes all capture device arenas.",
+        )
+        self.legacy_device_limit = gauge(
+            "kv_staging_limit_bytes",
+            "Deprecated alias of device_limit_bytes; includes all capture device arenas.",
+        )
+        self.kv_export_bytes = counter(
+            "kv_export_enqueued_bytes",
+            "Bytes enqueued by the optional HiCache KV exporter, not completed transfers or wire bytes.",
+            ("destination",),
         )
         self.occupancy = gauge(
             "occupied_fraction", "Busy or quarantined fraction of capture capacity."
@@ -251,6 +265,13 @@ class CaptureMetrics:
             self.host_slots.labels(**self.labels, state=state).set(
                 stats["host_pool"][state]
             )
+        for destination in ("host", "device"):
+            self._increment(
+                self.kv_export_bytes,
+                ("kv_export", destination),
+                stats["host_pool"].get(f"kv_export_{destination}_enqueued_bytes", 0),
+                destination=destination,
+            )
         for metric, value in (
             (self.disabled, int(stats["disabled_reason"] is not None)),
             (self.paused, int(stats.get("admission_paused", False))),
@@ -259,6 +280,8 @@ class CaptureMetrics:
             (self.host_bytes, stats["host_pool"]["allocated_bytes"]),
             (self.device_bytes, stats["host_pool"]["device_allocated_bytes"]),
             (self.device_limit, stats["host_pool"]["device_limit_bytes"]),
+            (self.legacy_device_bytes, stats["host_pool"]["device_allocated_bytes"]),
+            (self.legacy_device_limit, stats["host_pool"]["device_limit_bytes"]),
             (self.occupancy, stats["occupied_fraction"]),
             (self.writer_age, stats["writer_age_seconds"]),
             (self.cooldown, admission["cooldown_remaining_seconds"]),

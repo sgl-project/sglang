@@ -1336,6 +1336,16 @@ D2H 时间，Store 阶段也包含 SDK 之外的校验与重试读回。进行�
 阶段累计值，应结合 `writer_age_seconds` 判断阻塞。基准报告记录扣除 warmup 的
 阶段增量，并在客户端计时结束后验证真实 `/metrics` 导出。
 
+采集专用 GPU arena 的容量由 `device_allocated_bytes/device_limit_bytes` 表示，
+包含 KV/teacher staging 和 HiCache 导出元数据，不包含服务端模型 KV pool。
+旧 `kv_staging_*` 指标保留为兼容别名。可选 HiCache 导出器另提供
+`kv_export_enqueued_bytes_total{destination="host|device"}`：Host 表示映射到
+固定页内存的 kernel stores，device 表示 D2H flush 前的 staging gather。
+该计数包含 overlap lookahead 和后来取消的工作，仅表示已提交字节，不证明
+传输完成、READY 样本量或 RDMA 线上带宽；默认 Torch 导出器的该计数为零。
+实时监控验收使用真实 Prometheus 查询和 Grafana 浏览器渲染，不能仅以 JSON
+导入成功代替。复现实验见 `experiments/CAPTURE_MONITORING.md`。
+
 多租户训练必须沿用 MaaS 的数据授权和 dataset 隔离配置。KV/tokens 同属样本数据，删除/保留策略覆盖二者；只删文本而保留 KV 不算样本删除。
 
 ## 18. checkpoint 导出与回到 SGLang
