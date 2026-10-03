@@ -93,8 +93,8 @@ class PagedKVManager(ParamsBase):
             atom_async_copy, thr_layout, val_layout
         )
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        # Short KV tiles still need one metadata slot for each participating thread.
-        page_entry_per_thread = max(1, n_block_size // num_threads)
+        # Cover short tiles and the remaining rows of a partial final thread group.
+        page_entry_per_thread = (n_block_size + num_threads - 1) // num_threads
 
         if const_expr(mSFK_paged is not None or mSFV_paged is not None):
             atom_async_copy_sf = cute.make_copy_atom(
