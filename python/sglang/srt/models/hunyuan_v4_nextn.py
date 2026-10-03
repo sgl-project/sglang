@@ -5,7 +5,13 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    get_attn_tp_context,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -61,9 +67,19 @@ class HYV4MTPDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
             alt_stream=alt_stream,
             is_nextn=True,
+            reduce_results=False,
         )
         if hasattr(self.mlp, "shared_experts"):
             self.mlp.shared_experts.swiglu_limit = None
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (
+                declare_attn(),
+                self.input_layernorm,
+                {"qkv_latent_func": self.self_attn.prepare_qkv_latent},
+            ),
+            (declare_ffn(sparse=True), self.post_attention_layernorm),
+            terminal=True,
+        )
 
     def forward(
         self,
@@ -73,13 +89,7 @@ class HYV4MTPDecoderLayer(nn.Module):
         zero_allocator,
         prev_topk_indices=None,
     ):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        get_attn_tp_context().set_attn_inputs(
-            AttentionInputs(
-                hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
-            )
-        )
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         try:
             hidden_states = self.self_attn(
                 positions,
@@ -94,9 +104,11 @@ class HYV4MTPDecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states, forward_batch)
-        return hidden_states, residual, topk_indices
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        return hidden_states, topk_indices
 
 
 class HYV4ModelNextN(nn.Module):
@@ -140,8 +152,9 @@ class HYV4ModelNextN(nn.Module):
             dtype=torch.float32,
             device=hidden_states.device,
         )
+        residual_batch.start(forward_batch)
         topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
-        hidden_states, residual, topk_indices = self.decoder(
+        hidden_states, topk_indices = self.decoder(
             positions,
             hidden_states,
             forward_batch,
@@ -150,9 +163,11 @@ class HYV4ModelNextN(nn.Module):
         )
         topk_share.update(topk_indices)
         topk_share.publish()
-        if forward_batch.forward_mode.is_idle():
-            return hidden_states
-        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.shared_head.norm
+            )
         return hidden_states
 
 
