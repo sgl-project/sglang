@@ -182,8 +182,9 @@ class StreamingSession:
         )
 
     def try_cache_finished_req(self, req: Req) -> bool:
-        """Hands a finished turn's row to the session slot. Returns False for
-        non-streaming requests and aborts, which the caller releases."""
+        """Hands a turn's row to the session slot when it finishes or is
+        retracted. Returns False for non-streaming requests and aborts, which
+        the caller releases."""
         if not _is_streaming(req):
             return False
 

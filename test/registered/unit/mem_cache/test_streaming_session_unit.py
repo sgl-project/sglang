@@ -262,7 +262,8 @@ def test_first_mid_abort_releases_like_any_request(published_config):
 
 def test_nth_mid_abort_drops_session_slot(published_config):
     """Later-turn abort: the request ran on the slot's record, so releasing it
-    frees the whole row and drops the slot; the session re-prefills next turn."""
+    frees the whole row and drops the slot with its tree lock (skipping an
+    early-released SWA lock); the session re-prefills next turn."""
     page_size = 1
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
@@ -273,11 +274,21 @@ def test_nth_mid_abort_drops_session_slot(published_config):
     # restore_to_req ran, so the req runs on the slot's record.
     req = _FakeReq("session-a", req_pool_idx=0, committed=65, allocated=65)
     req.finished_reason = FINISH_ABORT("client disconnected")
-    tree_cache.session.slots["session-a"] = SessionSlot(kv=req.kv, last_node=None)
+    lock_node = SimpleNamespace(id=42)
+    tree_cache.session.slots["session-a"] = SessionSlot(
+        kv=req.kv,
+        last_node=lock_node,
+        lock_receipt=DecLockRefParams(
+            node_id=42, component_lock_uuids={ComponentType.SWA: 7}
+        ),
+        swa_prefix_lock_released=True,
+    )
 
     release_kv_cache(req, tree_cache)
 
     assert "session-a" not in tree_cache.session.slots
+    assert inner.dec_lock_ref_calls == [lock_node]
+    assert inner.dec_lock_ref_skip_swa == [True]
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(65))
     # Pool slot returned.
