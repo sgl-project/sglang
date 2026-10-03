@@ -78,9 +78,15 @@ def create_kt_config_from_server_args(
     if get_exec().moe.kt_weight_path is None:
         return None
 
-    num_layers = getattr(
-        model_config_of(server_args).hf_config, "num_hidden_layers", None
-    )
+    hf_config = model_config_of(server_args).hf_config
+    num_layers = getattr(hf_config, "num_hidden_layers", None)
+    if num_layers is None:
+        # Multimodal checkpoints (e.g. Qwen3.5 / Qwen3.8 *ForConditionalGeneration)
+        # keep the language model's layer count under text_config. Without it the
+        # last-layer guard on deferred experts in create_weights never fires.
+        num_layers = getattr(
+            getattr(hf_config, "text_config", None), "num_hidden_layers", None
+        )
 
     return KTConfig(
         layer_idx=layer_idx,
