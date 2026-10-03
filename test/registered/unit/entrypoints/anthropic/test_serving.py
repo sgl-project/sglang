@@ -3,7 +3,7 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
@@ -128,6 +128,14 @@ def _choice(delta, finish_reason=None):
     }
 
 
+def _tool_chunk(index, arguments, name=None):
+    tool_call = {"index": index, "function": {"arguments": arguments}}
+    if name is not None:
+        tool_call["id"] = f"call_{index}"
+        tool_call["function"]["name"] = name
+    return _chunk([_choice({"tool_calls": [tool_call]})])
+
+
 async def _collect_anthropic_events(serving, anthropic_request):
     events = []
     async for sse in serving._generate_anthropic_stream(
@@ -142,7 +150,7 @@ async def _collect_anthropic_events(serving, anthropic_request):
     return events
 
 
-class TestAnthropicServing(unittest.TestCase):
+class TestAnthropicServing(CustomTestCase):
     # Renders system at any position (GLM/Kimi/Qwen3) → can pass through.
     INLINE_SYSTEM_TEMPLATE = (
         "{%- for message in messages %}"
@@ -1154,6 +1162,119 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(starts, [(0, "alpha"), (1, "beta")])
         self.assertEqual(stops, [0, 1])
         self.assertEqual(deltas, [(0, '{"x":1}'), (1, '{"y":2}')])
+
+    def test_stream_tool_arguments_survive_whitespace(self):
+        """Formatting whitespace must not stop a tool before its JSON is complete."""
+        for inputs in ([{}], [{"path": "a.txt"}, {"path": "b.txt"}]):
+            for split_body in (False, True):
+                with self.subTest(inputs=inputs, split_body=split_body):
+                    lines = [_chunk([_choice({"content": "\n\n"})])]
+                    for index, tool_input in enumerate(inputs):
+                        lines.append(_tool_chunk(index, "", name="read_file"))
+                        arguments = json.dumps(tool_input)
+                        fragments = [arguments[:-1], arguments[-1:]]
+                        if split_body:
+                            fragments = [arguments[:1], arguments[1:-1], arguments[-1:]]
+                        for fragment_index, fragment in enumerate(fragments):
+                            # The parser emits normal_text ahead of argument
+                            # fragments from the same decode increment (#42260).
+                            if fragment_index > 0 or not tool_input:
+                                lines.append(_chunk([_choice({"content": "\n"})]))
+                            lines.append(_tool_chunk(index, fragment))
+                        lines.append(_chunk([_choice({"content": " \t\n"})]))
+                    lines.extend(
+                        [
+                            _chunk([_choice({}, finish_reason="tool_calls")]),
+                            "data: [DONE]\n\n",
+                        ]
+                    )
+                    events = asyncio.run(
+                        _collect_anthropic_events(
+                            self._serving(lines), self._anthropic_request()
+                        )
+                    )
+                    blocks = []
+                    partial_json = {}
+                    active_index = None
+                    text = ""
+                    for event in events:
+                        if event["type"] == "content_block_start":
+                            self.assertIsNone(active_index)
+                            active_index = event["index"]
+                            blocks.append(event["content_block"])
+                            partial_json[active_index] = ""
+                        elif event["type"] == "content_block_delta":
+                            self.assertEqual(event["index"], active_index)
+                            delta = event["delta"]
+                            partial_json[active_index] += delta.get("partial_json", "")
+                            text += delta.get("text", "")
+                        elif event["type"] == "content_block_stop":
+                            self.assertEqual(event["index"], active_index)
+                            active_index = None
+                    self.assertIsNone(active_index)
+                    self.assertEqual(
+                        [
+                            json.loads(partial_json[index + 1])
+                            for index in range(len(inputs))
+                        ],
+                        inputs,
+                    )
+                    self.assertEqual(text, "\n\n")
+                    self.assertEqual(
+                        [block["type"] for block in blocks],
+                        ["text"] + ["tool_use"] * len(inputs),
+                    )
+                    self.assertEqual(
+                        [block["id"] for block in blocks[1:]],
+                        [f"call_{index}" for index in range(len(inputs))],
+                    )
+
+    def test_stream_tool_then_text_or_thinking_closes_tool_block(self):
+        """Real text and reasoning after a tool still open their own content blocks."""
+        for field, block_type, delta_type, value_field in (
+            ("content", "text", "text_delta", "text"),
+            ("reasoning_content", "thinking", "thinking_delta", "thinking"),
+        ):
+            with self.subTest(field=field):
+                serving = self._serving(
+                    [
+                        _tool_chunk(0, "{}", name="alpha"),
+                        _chunk([_choice({"content": "\n"})]),
+                        _chunk([_choice({field: "\nAfter the tool"})]),
+                        _chunk([_choice({}, finish_reason="stop")]),
+                        "data: [DONE]\n\n",
+                    ]
+                )
+                events = asyncio.run(
+                    _collect_anthropic_events(serving, self._anthropic_request())
+                )
+                self.assertEqual(
+                    [
+                        (
+                            event["type"],
+                            event["index"],
+                            event.get("content_block", {}).get("type"),
+                        )
+                        for event in events
+                        if event["type"]
+                        in ("content_block_start", "content_block_stop")
+                    ],
+                    [
+                        ("content_block_start", 0, "tool_use"),
+                        ("content_block_stop", 0, None),
+                        ("content_block_start", 1, block_type),
+                        ("content_block_stop", 1, None),
+                    ],
+                )
+                self.assertEqual(
+                    [
+                        event["delta"][value_field]
+                        for event in events
+                        if event["type"] == "content_block_delta"
+                        and event["delta"]["type"] == delta_type
+                    ],
+                    ["\nAfter the tool"],
+                )
 
     def test_stream_finish_chunk_with_payload_emits_delta(self):
         """A chunk carrying both finish_reason and content must not drop the content."""
