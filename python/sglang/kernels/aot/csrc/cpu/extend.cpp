@@ -474,13 +474,18 @@ void extend_attention_cpu(
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
     std::optional<at::Tensor> tree_mask,
-    bool is_causal = true) {
+    bool is_causal = true,
+    bool deterministic = false) {
   TORCH_CHECK(k_extend_opt.has_value() == v_extend_opt.has_value(), "k_extend and v_extend must be given together");
   // A KV-shared layer (Gemma 4) passes no extend K/V - the layer it shares with
   // already wrote them to the cache, so this kernel masks causally itself. Cross
   // attention can also arrive without K/V but reads an encoder sequence that
   // carries no causal order, so it keeps its own path.
-  const bool kv_from_cache = !is_cross_attn && !k_extend_opt.has_value();
+  // Cache hits and chunk boundaries change the prefix/extend split. In
+  // deterministic causal self-attention, use the cache for both portions so
+  // each query sees the same absolute key sequence in the same order.
+  const bool kv_from_cache = !is_cross_attn &&
+      (!k_extend_opt.has_value() || (deterministic && is_causal));
   // unused when the range comes from the cache - bind them to the buffers
   auto k_extend = k_extend_opt.has_value() ? k_extend_opt.value() : k_buffer;
   auto v_extend = v_extend_opt.has_value() ? v_extend_opt.value() : v_buffer;
@@ -592,7 +597,12 @@ void extend_attention_cpu(
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
       CPU_DISPATCH_PACKED_TYPES(k_buffer.scalar_type(), "extend_attention_packed_types", [&] {
-        if (max_len_extend <= 256) {
+        // One query per M block fixes both the key-tile boundary and the
+        // number of visible keys by absolute position, regardless of prefix
+        // cache hits or chunked prefill boundaries.
+        if (deterministic && kv_from_cache) {
+          LAUNCH_EXTEND_ATTENTION_KERNEL(1, 256);
+        } else if (max_len_extend <= 256) {
           LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
         } else if (max_len_extend <= 1024) {
           LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);

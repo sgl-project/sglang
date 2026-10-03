@@ -2,10 +2,9 @@ import unittest
 
 import sgl_kernel  # noqa: F401
 import torch
-from torch.nn.functional import scaled_dot_product_attention
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from torch.nn.functional import scaled_dot_product_attention
 
 register_cpu_ci(est_time=7, suite="stage-a-test-cpu-intel")
 
@@ -13,6 +12,68 @@ torch.manual_seed(1234)
 
 
 class TestExtendAttention(CustomTestCase):
+    def test_deterministic_cache_and_chunk_boundaries(self):
+        num_tokens, num_heads, head_dim = 517, 2, 64
+        q = torch.randn(num_tokens, num_heads, head_dim, dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        req_to_token = torch.arange(num_tokens, dtype=torch.int32).unsqueeze(0)
+        req_pool_indices = torch.tensor([0], dtype=torch.int64)
+
+        def run_extend(prefix_len, end_len):
+            out = torch.empty_like(q[prefix_len:end_len])
+            torch.ops.sgl_kernel.extend_attention_cpu(
+                q[prefix_len:end_len],
+                k[prefix_len:end_len],
+                v[prefix_len:end_len],
+                out,
+                k,
+                v,
+                1.0,
+                1.0,
+                req_to_token,
+                req_pool_indices,
+                torch.tensor([end_len], dtype=torch.int64),
+                torch.tensor([end_len - prefix_len], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+                end_len - prefix_len,
+                head_dim**-0.5,
+                0.0,
+                False,
+                0,
+                None,
+                None,
+                None,
+                True,
+                True,
+            )
+            return out
+
+        full = run_extend(0, num_tokens)
+        reference = (
+            scaled_dot_product_attention(
+                q.transpose(0, 1).unsqueeze(0),
+                k.transpose(0, 1).unsqueeze(0),
+                v.transpose(0, 1).unsqueeze(0),
+                is_causal=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
+        torch.testing.assert_close(full, reference, atol=2e-2, rtol=2e-2)
+        boundaries = (0, 17, 129, 257, 400, num_tokens)
+        for prefix_len, end_len in zip(boundaries, boundaries[1:]):
+            # A continuation chunk must match the same absolute query rows
+            # from an uncached, unchunked prefill.
+            self.assertTrue(
+                torch.equal(run_extend(prefix_len, end_len), full[prefix_len:end_len])
+            )
+        for prefix_len in boundaries[1:-1]:
+            # A radix hit may leave any suffix for prefill.
+            self.assertTrue(
+                torch.equal(run_extend(prefix_len, num_tokens), full[prefix_len:])
+            )
+
     def _scaled_dot_product_attention(self, Q, K, V, S, scaling, sliding_window):
         # sliding_window <= 0 means no sliding window
         # Q: [n_tokens_q, n_heads, q_mult, d_head]
