@@ -207,6 +207,9 @@ class TestDcpCachedPrefixSend(CustomTestCase):
         mgr.transfer_queues = [None]
         mgr._register_staging_memory = Mock()
         mgr.request_status = {}
+        mgr._deferred_ack_targets = {}
+        mgr._deferred_ack_poisoned_rooms = set()
+        mgr._staging_outstanding = {}
         mgr.is_dummy_cp_rank = False
         mgr.enable_all_cp_ranks_for_transfer = False
         mgr.decode_kv_args_table = {
