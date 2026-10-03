@@ -73,9 +73,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
+    checkpoint_kv_cache,
     kv_to_page_indices,
     kv_to_page_num,
-    maybe_cache_unfinished_req,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -97,8 +97,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
-
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -166,7 +164,6 @@ class PrefillBootstrapQueue:
         metadata_buffers: MetadataBuffers,
         gpu_id: int,
         bootstrap_port: int,
-        gloo_group: ProcessGroup,
         max_total_num_tokens: int,
         scheduler: Scheduler,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
@@ -179,13 +176,11 @@ class PrefillBootstrapQueue:
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = parallel.tp_rank
-        self.tp_size = parallel.tp_size
         self.pp_rank = parallel.pp_rank
         self.pp_size = parallel.pp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
-        self.gloo_group = gloo_group
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.max_total_num_tokens = (
@@ -586,15 +581,13 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
-    def cache_unfinished_disagg_prefill(
-        self: Scheduler, req: Req, *, chunked: bool = False
-    ) -> None:
+    def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
         cache = self.tree_cache
         if req.pending_bootstrap and _uses_write_through_cache(cache):
-            cache.advance_unpublished_req(req, chunked=chunked)
+            cache.advance_unpublished_req(req)
             return
 
-        maybe_cache_unfinished_req(req, cache, chunked=chunked)
+        checkpoint_kv_cache(req, cache)
 
     def release_aborted_prefill_waiting_req(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
@@ -902,7 +895,7 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
-                self.cache_unfinished_disagg_prefill(req)
+                self.checkpoint_disagg_prefill(req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -1145,6 +1138,8 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        if req.finished_reason is None:
+            req.finished_reason = FINISH_LENGTH(length=0)
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
@@ -1233,7 +1228,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Metadata buffer was allocated in pop_bootstrapped before
             # the request entered the waiting queue, so finalize should not fail.
             assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
-            self.cache_unfinished_disagg_prefill(req)
+            self.checkpoint_disagg_prefill(req)
             return True
         else:
             raise RuntimeError(
@@ -1260,7 +1255,7 @@ class SchedulerDisaggregationPrefillMixin:
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
-            self.cache_unfinished_disagg_prefill(req, chunked=True)
+            self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
@@ -1560,7 +1555,7 @@ class SchedulerDisaggregationPrefillMixin:
         max_attempts = get_disagg().optimistic_prefill_attempts
         uses_write_through_cache = _uses_write_through_cache(self.tree_cache)
         if not uses_write_through_cache:
-            maybe_cache_unfinished_req(req, self.tree_cache)
+            checkpoint_kv_cache(req, self.tree_cache)
         # The cached prefix is evictable once the KV is released. Its length
         # (capped at what a retry can match) seeds the retry's storage baseline,
         # so an evicted prefix is looked up in L3 once before it is recomputed.
@@ -1573,11 +1568,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
         )
         self._release_aborted_request(req)
-        # Mamba insertion donates the checkpoint and clears its sequence marker.
-        is_insert = (
-            not uses_write_through_cache and not self.tree_cache.supports_mamba()
-        )
-        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        # The checkpoint above already handed the prefill KV to the tree; the
+        # request is not finished, so the release only frees the rest.
+        release_kv_cache(req, self.tree_cache, is_insert=False)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
