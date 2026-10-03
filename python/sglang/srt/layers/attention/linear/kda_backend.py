@@ -1523,8 +1523,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if layer.conv_weights.dtype != torch.float32:
             return False
+        state_item_bytes = ssm_states.element_size()
         if (
-            ssm_states.dtype != torch.float32
+            ssm_states.dtype not in (torch.float32, torch.bfloat16)
             or tuple(ssm_states.shape[-3:])
             != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
             or tuple(ssm_states.stride()[-3:])
@@ -1533,8 +1534,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 layer.head_k_dim,
                 1,
             )
-            or ssm_states.stride(0) % 4 != 0
-            or ssm_states.storage_offset() % 4 != 0
+            or ssm_states.stride(0) * state_item_bytes % 16 != 0
+            or ssm_states.data_ptr() % 16 != 0
         ):
             return False
         if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
@@ -1551,6 +1552,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             layer.head_v_dim,
             layer.head_k_dim,
         ):
+            return False
+        if intermediate_state_cache.dtype != ssm_states.dtype:
             return False
         return True
 
