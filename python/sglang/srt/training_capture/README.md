@@ -124,8 +124,19 @@ Keep model files immutable during loading and serving. Weight/tokenizer file
 digests and actual attention geometry, K norm, RoPE and output transforms bind
 each sample. Optional `expected_weights_revision` and
 `expected_tokenizer_revision` pin the computed artifact digests. Weight updates
-or memory release disable capture and invalidate active attempts; start a new
-producer with a newly bound identity after changing the model.
+or releasing/restoring model weights disable capture and invalidate active
+attempts; start a new producer with a newly bound identity after changing the model.
+
+For ordinary AR serving, all four weight-loading routes (disk, distributed,
+tensor and IPC) invalidate active captures before invoking the loader. A
+failed load also leaves capture disabled because parameters may have changed
+partially. Already detached, sealed snapshots retain their original identity
+and may finish publication. `control_training_capture` with `resume` only
+clears an operator pause; it cannot clear this identity invalidation. The
+target-KV DSpark path rejects live replacement before touching either weights
+or capture; deploy a compatible target/draft pair in a new instance. See
+[weight replacement validation](../../../../mooncake-study/experiments/WEIGHT_REPLACEMENT.md)
+for the tested lifecycle and its scope.
 
 The Catalog endpoint must implement the protocol below. A separate Mooncake
 data node owns storage when the producer uses `global_segment_size=0`; its

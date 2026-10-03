@@ -216,6 +216,39 @@ class TestCaptureCoordinator(CustomTestCase):
         self.assertEqual(self.coordinator.disabled_reason, "weights_changed")
         self.assertEqual(self.coordinator._admission_ratio(), 0)
 
+    def test_weight_update_preserves_already_detached_snapshot(self):
+        req, record = self.sealed_request("sealed-before-update")
+        entered, release = threading.Event(), threading.Event()
+
+        def wait_for_copy():
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("copy gate")
+
+        try:
+            with patch.object(
+                record.context, "wait_for_copies", side_effect=wait_for_copy
+            ):
+                self.coordinator._detach(req, record)
+                self.assertTrue(entered.wait(3))
+                self.coordinator.disable("target_weights_update")
+                self.coordinator.control("resume")
+                self.assertEqual(self.coordinator._admission_ratio(), 0)
+                self.assertEqual(record.context.state, "SEALED")
+                self.assertIsNone(record.invalid_reason)
+                self.assertEqual(self.coordinator.pool.stats()["filling"], 1)
+                release.set()
+                publication = self.catalog.wait_publications(1)[0]
+                self.wait_until(lambda: record.state == "done")
+        finally:
+            release.set()
+        manifest, _ = read_snapshot(self.store, publication)
+        self.assertEqual(manifest.teacher, self.coordinator.teacher)
+        self.assertEqual(self.coordinator.disabled_reason, "target_weights_update")
+        fresh = self.request("after-update")
+        self.coordinator.before_forward([fresh])
+        self.assertIsNone(fresh.training_capture_context)
+
     def test_corrupt_prepared_contents_never_register_or_write_objects(self):
         for field in (
             "loss_mask",

@@ -41,6 +41,7 @@ it does not redefine the goal as the modules already implemented.
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Prefill graph collection | Live request lengths, owned teacher/KV staging, resolved hidden capture, stable PP activations and P/D teacher handoff | Qwen3 AR/static target-KV DSpark pass Full, Breakable and piecewise in colocated/P/D single-rank, TP2, PP2 and TP2/PP2 serving with eager output comparison; Qwen2.5 TP4 colocated graphs pass same-execution capture-on/off equality and post-exit Store parity while retaining a no-capture cross-backend output difference; distributed piecewise uses eager compile debug mode; asymmetric P/D and other speculative prefill graphs remain open |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
+| Target weight replacement | Capture invalidation before loading, persistent identity fault and fresh-instance rebinding | Single-rank Qwen3 AR eager/overlap graph disk replacement passes live parameter checks, failed active leases and four post-exit snapshots; four loader routes have ordering/failure unit coverage; TP/PP and P/D replacement remain open |
 | Mixed-chunk collection | Ordinary AR admits native mixed prefill/decode; per-request offsets reuse owned staging and overlap ledgers | Qwen3 single-rank, TP2, PP2 and TP2/PP2 eager/graph matrices check rank-local request order, KV shards, teacher ownership, selected/unselected rows, prefix hits and output equality; 105 complete post-exit snapshots pass; mixed speculative remains rejected, and mixed P/D, RDMA and SLO coverage remain open |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production checkpoint-manager integration and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
@@ -4512,6 +4513,47 @@ the resident worker and idle task remain live. TCP Store, the test Catalog and
 the pod-exec metrics relay establish monitoring correctness, not production
 retention, native service discovery, SLOs or draft training quality.
 
+## Target Weight Replacement Evidence
+
+The new regression validates the existing weight-update isolation policy against
+real Qwen3-0.6B parameter mutation and Mooncake TCP publication. No production
+loader, scheduler or capture implementation changed in this increment.
+
+- `01791015036433444429-90544784a0a1`: two updater unit methods pass, covering
+  all four loading routes on success, failure and partial-load exceptions, and
+  target-KV DSpark rejection without mutation or capture invalidation.
+- `01791015036839409584-ba452c5c38f5`: 62 coordinator methods pass, including
+  new direct/staged tests preserving an already detached sample across a weight
+  update while its copy completion is held, and preventing fresh admission.
+- `01791015963030518676-fae398f69615`: both real runtime methods pass in
+  179.390 seconds on the resident H100. They cover synchronous eager and overlap
+  decode graph execution, with a test-only deterministic in-place pause after
+  the interrupted request's first committed token. Actual loaded V projection
+  checksums prove the disk update changes parameters to the intended version.
+  The active capture fails, inference completes, and capture resume cannot
+  clear the stale identity. A fresh producer binds the new artifact digest.
+- Newly connected readers, created after both producer processes exit, validate
+  four complete snapshots, 56 tensor objects and 976,096 payload bytes. Selected
+  KV and raw top-128 logits match online tensors exactly, LSE meets the shared
+  numerical check, and token/mask/position coverage is complete. The two teacher
+  weight identities and captured V/logit tensors differ; tokenizer identity
+  remains the same.
+- All 5,028 Python source files in the final tested snapshot match the worktree.
+  The archive retains four unsuccessful fixture iterations (pause timing, array
+  JSON conversion, waiting for a buffered stream while paused, and using the
+  Catalog dictionary instead of its list API), their sources and logs. These
+  were test-driver failures and are not reported as production regressions.
+
+See [the runbook](experiments/WEIGHT_REPLACEMENT.md) and
+[machine-readable evidence](experiments/weight-update.json). The archive at
+`/gpfs/user/fuxuanwei/mooncake-lab-archive/weight-update-20261003` has 53 artifacts;
+its manifest SHA-256 is
+`bc6698b0128945432a1d16e502cf6b58a2a91d559754df969bca39ebab120a4d`.
+The resident worker is live, its experiment queue is empty, and its idle task
+has resumed. This is single-rank AR disk-update runtime evidence; mocked loader
+tests do not certify distributed/tensor/IPC transports, TP/PP/P/D replacement,
+production Catalog behavior or trained draft quality.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2, PP2 and combined TP2/PP2 AR/static target-KV
@@ -4521,7 +4563,7 @@ retention, native service discovery, SLOs or draft training quality.
    colocated/P/D AR on single-rank, TP2, PP2 and combined TP2/PP2, and colocated/P/D
    synchronous TP1/PP2 and TP2/PP2 DSpark to asymmetric combined
    topologies. Broaden real-request coverage to speculative cache
-   eviction, target weight replacement and
+   eviction, distributed target weight replacement and
    saturated backpressure.
 2. Connect P8's SGLang export API to the SpecForge checkpoint manager and validate
    trained checkpoints, including artifact compatibility and quality acceptance.

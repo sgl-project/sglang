@@ -1,0 +1,1461 @@
+{
+  "status": "completed",
+  "scope": "Single-rank Qwen3 AR weight replacement; synchronous eager and overlap decode graph; no TP/PP or P/D runtime claim",
+  "base_commit": "904ad6e14b8c7341ccace09a4fa17324d2d13599",
+  "archive": "/gpfs/user/fuxuanwei/mooncake-lab-archive/weight-update-20261003",
+  "artifacts": 53,
+  "artifact_manifest_sha256": "bc6698b0128945432a1d16e502cf6b58a2a91d559754df969bca39ebab120a4d",
+  "source_audit": {
+    "python_files": 5028,
+    "sha256": "cc5e9a8833857f6c90bb33e7211486ae0476ebc7d712ce29ad44554223b3b4c7"
+  },
+  "jobs": [
+    {
+      "role": "unit",
+      "id": "01791015036433444429-90544784a0a1",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v1",
+      "submission": {
+        "job_id": "01791015036433444429-90544784a0a1",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "test/registered/unit/training_capture",
+          "-p",
+          "test_weight_updates.py",
+          "-v"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1800
+      },
+      "result": {
+        "job_id": "01791015036433444429-90544784a0a1",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791015050.336185,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791015036433444429-90544784a0a1.log"
+      },
+      "classification": "passed",
+      "methods": 2,
+      "elapsed_seconds": 0.005,
+      "cases": [],
+      "log_sha256": "8919733be31055adb278d3e352097feff3d2559500a117cfccbd0272aa3cfdc5"
+    },
+    {
+      "role": "coordinator",
+      "id": "01791015036839409584-ba452c5c38f5",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v1",
+      "submission": {
+        "job_id": "01791015036839409584-ba452c5c38f5",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/unit/training_capture/test_coordinator.py",
+          "-v"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1800
+      },
+      "result": {
+        "job_id": "01791015036839409584-ba452c5c38f5",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791015105.9861424,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791015036839409584-ba452c5c38f5.log"
+      },
+      "classification": "passed",
+      "methods": 62,
+      "elapsed_seconds": 43.842,
+      "cases": [],
+      "log_sha256": "94dd799ded54f262dd2e99ec74097e1cdd999ab25ca65cc02b55527d150f2d9d"
+    },
+    {
+      "role": "gpu",
+      "id": "01791015037236005821-0f9ff6aada76",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v1",
+      "submission": {
+        "job_id": "01791015037236005821-0f9ff6aada76",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_weights.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1800
+      },
+      "result": {
+        "job_id": "01791015037236005821-0f9ff6aada76",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791015199.205326,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791015037236005821-0f9ff6aada76.log"
+      },
+      "classification": "fixture failed to pause before generation completed",
+      "methods": 1,
+      "elapsed_seconds": 81.092,
+      "cases": [],
+      "log_sha256": "bb3413b16a85a8a0bafb241c2ca18ab2fa56d19621b2f244478cd18cf1261fbe"
+    },
+    {
+      "role": "gpu_fixed",
+      "id": "01791015308732211084-85d13417352d",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v2",
+      "submission": {
+        "job_id": "01791015308732211084-85d13417352d",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_weights.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v2",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v2/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1800
+      },
+      "result": {
+        "job_id": "01791015308732211084-85d13417352d",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791015376.3395693,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791015308732211084-85d13417352d.log"
+      },
+      "classification": "fixture array JSON serialization error",
+      "methods": 1,
+      "elapsed_seconds": 54.415,
+      "cases": [],
+      "log_sha256": "fa403e682f4b3620cc0188005405886d250bdf0ae90aa13808ecb460d21b9a44"
+    },
+    {
+      "role": "gpu_v3",
+      "id": "01791015481931457347-e6b3ea8e1eb3",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v3",
+      "submission": {
+        "job_id": "01791015481931457347-e6b3ea8e1eb3",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_weights.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v3",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v3/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1800
+      },
+      "result": {
+        "job_id": "01791015481931457347-e6b3ea8e1eb3",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791015663.1548386,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791015481931457347-e6b3ea8e1eb3.log"
+      },
+      "classification": "fixture waited for a buffered streaming response while paused",
+      "methods": 1,
+      "elapsed_seconds": 168.073,
+      "cases": [],
+      "log_sha256": "30df8a2ec32c26bccdbc8b7e924981b3123ba7bfe386577f4d9e8f2a909f1064"
+    },
+    {
+      "role": "gpu_v4",
+      "id": "01791015777275971385-5ffb4eb4b164",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v4",
+      "submission": {
+        "job_id": "01791015777275971385-5ffb4eb4b164",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_weights.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v4",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v4/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1800
+      },
+      "result": {
+        "job_id": "01791015777275971385-5ffb4eb4b164",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791015883.58675,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791015777275971385-5ffb4eb4b164.log"
+      },
+      "classification": "fixture sliced the Catalog publication dictionary instead of its list API",
+      "methods": 1,
+      "elapsed_seconds": 93.217,
+      "cases": [],
+      "log_sha256": "1341bdd0d8f3f4d4b04076bfc71eec2ad9f40006eb7a54e870ae755aff6487e5"
+    },
+    {
+      "role": "gpu_v5",
+      "id": "01791015963030518676-fae398f69615",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v5",
+      "submission": {
+        "job_id": "01791015963030518676-fae398f69615",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_weights.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v5",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-weight-update-v5/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 1800
+      },
+      "result": {
+        "job_id": "01791015963030518676-fae398f69615",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791016155.6276982,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791015963030518676-fae398f69615.log"
+      },
+      "classification": "passed",
+      "methods": 2,
+      "elapsed_seconds": 179.39,
+      "cases": [
+        {
+          "cuda_graph": false,
+          "revisions": [
+            "44ecba3c046c7805dc153b11282090a906d494770c8e412fc493d973988c1ebe",
+            "eccc27be334200f0bc51cab15aba0b619f1f18838ffaa4deceb4b39f9dcf1280"
+          ],
+          "states": {
+            "boundary": {
+              "rid": "weights-False-interrupted",
+              "capture_id": "a1b88a76848d49d6b7aebedc575ff924",
+              "output_ids": [
+                100
+              ],
+              "kv_committed_len": 16
+            },
+            "mutation": {
+              "success": true,
+              "before_sha256": "89e87de8f53f9777cd9a2096a7b715688a17193bd5da8ec3776c4b3e675a40e2",
+              "expected_after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f",
+              "after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f"
+            },
+            "before": {
+              "counters": {
+                "considered": 3,
+                "excluded_health_check": 1,
+                "admitted": 2,
+                "eager_forwards": 5,
+                "sealed": 1,
+                "writer_started": 1,
+                "copies_completed": 1,
+                "snapshot_built": 1,
+                "ready": 1
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": false,
+              "reservations": 2,
+              "states": {
+                "active": 1,
+                "available": 1
+              },
+              "queued": 0,
+              "occupied_fraction": 0.5,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00006097182631492615,
+                  "max_seconds": 0.00006097182631492615
+                },
+                "copy_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00006545707583427429,
+                  "max_seconds": 0.00006545707583427429
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003654874861240387,
+                  "max_seconds": 0.003654874861240387
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0033786632120609283,
+                  "max_seconds": 0.0033786632120609283
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0012780241668224335,
+                  "max_seconds": 0.0012780241668224335
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.002276170998811722,
+                  "max_seconds": 0.002276170998811722
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.001693878322839737,
+                  "max_seconds": 0.0009717643260955811
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0009591728448867798,
+                  "max_seconds": 0.0009591728448867798
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0035811662673950195,
+                  "max_seconds": 0.0035811662673950195
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0004455558955669403,
+                  "max_seconds": 0.0004455558955669403
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0006664097309112549,
+                  "max_seconds": 0.0006664097309112549
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00026582181453704834,
+                  "max_seconds": 0.00026582181453704834
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 8924160,
+                "device_allocated_bytes": 426112,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 2,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            },
+            "after": {
+              "counters": {
+                "considered": 3,
+                "excluded_health_check": 1,
+                "admitted": 2,
+                "eager_forwards": 5,
+                "sealed": 1,
+                "writer_started": 2,
+                "copies_completed": 2,
+                "snapshot_built": 1,
+                "ready": 1,
+                "failed_target_weights_update": 1
+              },
+              "disabled_reason": "target_weights_update",
+              "admission_paused": false,
+              "enable_overlap": false,
+              "reservations": 1,
+              "states": {
+                "available": 1
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.00015727058053016663,
+                  "max_seconds": 0.00009629875421524048
+                },
+                "copy_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.00016153603792190552,
+                  "max_seconds": 0.00009607896208763123
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003654874861240387,
+                  "max_seconds": 0.003654874861240387
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0033786632120609283,
+                  "max_seconds": 0.0033786632120609283
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0012780241668224335,
+                  "max_seconds": 0.0012780241668224335
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.002276170998811722,
+                  "max_seconds": 0.002276170998811722
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.001693878322839737,
+                  "max_seconds": 0.0009717643260955811
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0009591728448867798,
+                  "max_seconds": 0.0009591728448867798
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0035811662673950195,
+                  "max_seconds": 0.0035811662673950195
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0004455558955669403,
+                  "max_seconds": 0.0004455558955669403
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0006664097309112549,
+                  "max_seconds": 0.0006664097309112549
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00026582181453704834,
+                  "max_seconds": 0.00026582181453704834
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 8924160,
+                "device_allocated_bytes": 426112,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 1,
+                "filling": 1,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 0,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            },
+            "final": {
+              "counters": {
+                "considered": 5,
+                "excluded_health_check": 1,
+                "admitted": 2,
+                "eager_forwards": 5,
+                "sealed": 1,
+                "writer_started": 2,
+                "copies_completed": 2,
+                "snapshot_built": 1,
+                "ready": 1,
+                "failed_target_weights_update": 1,
+                "excluded_disabled": 2,
+                "control_resume": 1
+              },
+              "disabled_reason": "target_weights_update",
+              "admission_paused": false,
+              "enable_overlap": false,
+              "reservations": 1,
+              "states": {
+                "available": 1
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.00015727058053016663,
+                  "max_seconds": 0.00009629875421524048
+                },
+                "copy_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.00016153603792190552,
+                  "max_seconds": 0.00009607896208763123
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003654874861240387,
+                  "max_seconds": 0.003654874861240387
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0033786632120609283,
+                  "max_seconds": 0.0033786632120609283
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0012780241668224335,
+                  "max_seconds": 0.0012780241668224335
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.002276170998811722,
+                  "max_seconds": 0.002276170998811722
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.001693878322839737,
+                  "max_seconds": 0.0009717643260955811
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0009591728448867798,
+                  "max_seconds": 0.0009591728448867798
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0035811662673950195,
+                  "max_seconds": 0.0035811662673950195
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0004455558955669403,
+                  "max_seconds": 0.0004455558955669403
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0006664097309112549,
+                  "max_seconds": 0.0006664097309112549
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00026582181453704834,
+                  "max_seconds": 0.00026582181453704834
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 8924160,
+                "device_allocated_bytes": 426112,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 1,
+                "filling": 1,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 0,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "new_state": {
+            "counters": {
+              "considered": 2,
+              "excluded_health_check": 1,
+              "admitted": 1,
+              "eager_forwards": 4,
+              "sealed": 1,
+              "writer_started": 1,
+              "copies_completed": 1,
+              "snapshot_built": 1,
+              "ready": 1
+            },
+            "disabled_reason": null,
+            "admission_paused": false,
+            "enable_overlap": false,
+            "reservations": 2,
+            "states": {
+              "available": 2
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "stage_timings": {
+              "queue_wait": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.00005994364619255066,
+                "max_seconds": 0.00005994364619255066
+              },
+              "copy_wait": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.00006506964564323425,
+                "max_seconds": 0.00006506964564323425
+              },
+              "snapshot_build": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0035366490483283997,
+                "max_seconds": 0.0035366490483283997
+              },
+              "validation": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0034174881875514984,
+                "max_seconds": 0.0034174881875514984
+              },
+              "catalog_register": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0012301169335842133,
+                "max_seconds": 0.0012301169335842133
+              },
+              "store_payload": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0021917372941970825,
+                "max_seconds": 0.0021917372941970825
+              },
+              "catalog_written": {
+                "calls": 2,
+                "errors": 0,
+                "seconds": 0.0016795024275779724,
+                "max_seconds": 0.0009878762066364288
+              },
+              "journal_save": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0009573474526405334,
+                "max_seconds": 0.0009573474526405334
+              },
+              "catalog_seal": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0015696026384830475,
+                "max_seconds": 0.0015696026384830475
+              },
+              "store_manifest": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.00046079233288764954,
+                "max_seconds": 0.00046079233288764954
+              },
+              "catalog_publish": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0006913095712661743,
+                "max_seconds": 0.0006913095712661743
+              },
+              "journal_complete": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0002620406448841095,
+                "max_seconds": 0.0002620406448841095
+              },
+              "recovery_read": {
+                "calls": 0,
+                "errors": 0,
+                "seconds": 0,
+                "max_seconds": 0
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 8924160,
+              "device_allocated_bytes": 426112,
+              "device_limit_bytes": 8388608,
+              "kv_export_host_enqueued_bytes": 0,
+              "kv_export_device_enqueued_bytes": 0,
+              "free": 0,
+              "filling": 2,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            }
+          },
+          "post_exit_snapshots": 2,
+          "objects": 28,
+          "payload_bytes": 475760,
+          "publications": [
+            {
+              "capture_id": "9874e04c142044e3a82d160db440499c",
+              "contract_id": "maas-target-kv-top128-v1",
+              "dataset_id": "runtime-weight-update",
+              "fencing_token": 1,
+              "generation_id": "24be8ab57de143718c6cf2ba2b12626b",
+              "idempotency_key": "publish-bab6f717326f4958a63474df9dfe14e2-24be8ab57de143718c6cf2ba2b12626b-b142c9ea3f2f3345115f40788d8dc991415205951226e55130bd8eda40131ddf",
+              "manifest_key": "draft-data/runtime-weight-update/bab6f717326f4958a63474df9dfe14e2/24be8ab57de143718c6cf2ba2b12626b/manifest",
+              "manifest_nbytes": 8620,
+              "manifest_sha256": "b142c9ea3f2f3345115f40788d8dc991415205951226e55130bd8eda40131ddf",
+              "sample_id": "bab6f717326f4958a63474df9dfe14e2"
+            },
+            {
+              "capture_id": "dac5aaabcac646c58d1709fd00fb0e8c",
+              "contract_id": "maas-target-kv-top128-v1",
+              "dataset_id": "runtime-weight-update",
+              "fencing_token": 1,
+              "generation_id": "7e7800cdfa1741ffaf34f286565209b9",
+              "idempotency_key": "publish-a2510121412547419d02b7e6991a203b-7e7800cdfa1741ffaf34f286565209b9-db21e08f0833ca1af71b2c1f70662311db6ec179c0b1807afe3b02b36230030b",
+              "manifest_key": "draft-data/runtime-weight-update/a2510121412547419d02b7e6991a203b/7e7800cdfa1741ffaf34f286565209b9/manifest",
+              "manifest_nbytes": 8620,
+              "manifest_sha256": "db21e08f0833ca1af71b2c1f70662311db6ec179c0b1807afe3b02b36230030b",
+              "sample_id": "a2510121412547419d02b7e6991a203b"
+            }
+          ]
+        },
+        {
+          "cuda_graph": true,
+          "revisions": [
+            "44ecba3c046c7805dc153b11282090a906d494770c8e412fc493d973988c1ebe",
+            "eccc27be334200f0bc51cab15aba0b619f1f18838ffaa4deceb4b39f9dcf1280"
+          ],
+          "states": {
+            "boundary": {
+              "rid": "weights-True-interrupted",
+              "capture_id": "f491a9fffd5a4d90b7bb345857280dcf",
+              "output_ids": [
+                100
+              ],
+              "kv_committed_len": 17
+            },
+            "mutation": {
+              "success": true,
+              "before_sha256": "89e87de8f53f9777cd9a2096a7b715688a17193bd5da8ec3776c4b3e675a40e2",
+              "expected_after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f",
+              "after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f"
+            },
+            "before": {
+              "counters": {
+                "considered": 3,
+                "excluded_health_check": 1,
+                "admitted": 2,
+                "overlap_forwards": 7,
+                "eager_forwards": 2,
+                "cuda_graph_forwards": 5,
+                "sealed": 1,
+                "writer_started": 1,
+                "copies_completed": 1,
+                "snapshot_built": 1,
+                "ready": 1
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": true,
+              "reservations": 2,
+              "states": {
+                "active": 1,
+                "available": 1
+              },
+              "queued": 0,
+              "occupied_fraction": 0.5,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00006182864308357239,
+                  "max_seconds": 0.00006182864308357239
+                },
+                "copy_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00006185099482536316,
+                  "max_seconds": 0.00006185099482536316
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003821335732936859,
+                  "max_seconds": 0.003821335732936859
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0036599300801753998,
+                  "max_seconds": 0.0036599300801753998
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0013048350811004639,
+                  "max_seconds": 0.0013048350811004639
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0023210421204566956,
+                  "max_seconds": 0.0023210421204566956
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.0018132105469703674,
+                  "max_seconds": 0.0009898282587528229
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0010692216455936432,
+                  "max_seconds": 0.0010692216455936432
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0015023648738861084,
+                  "max_seconds": 0.0015023648738861084
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0004131309688091278,
+                  "max_seconds": 0.0004131309688091278
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0006589256227016449,
+                  "max_seconds": 0.0006589256227016449
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0002673491835594177,
+                  "max_seconds": 0.0002673491835594177
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 8924160,
+                "device_allocated_bytes": 426112,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 2,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            },
+            "after": {
+              "counters": {
+                "considered": 3,
+                "excluded_health_check": 1,
+                "admitted": 2,
+                "overlap_forwards": 7,
+                "eager_forwards": 2,
+                "cuda_graph_forwards": 5,
+                "sealed": 1,
+                "writer_started": 2,
+                "copies_completed": 2,
+                "snapshot_built": 1,
+                "ready": 1,
+                "failed_target_weights_update": 1
+              },
+              "disabled_reason": "target_weights_update",
+              "admission_paused": false,
+              "enable_overlap": true,
+              "reservations": 1,
+              "states": {
+                "available": 1
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.000152587890625,
+                  "max_seconds": 0.00009075924754142761
+                },
+                "copy_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.00007296726107597351,
+                  "max_seconds": 0.00006185099482536316
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003821335732936859,
+                  "max_seconds": 0.003821335732936859
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0036599300801753998,
+                  "max_seconds": 0.0036599300801753998
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0013048350811004639,
+                  "max_seconds": 0.0013048350811004639
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0023210421204566956,
+                  "max_seconds": 0.0023210421204566956
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.0018132105469703674,
+                  "max_seconds": 0.0009898282587528229
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0010692216455936432,
+                  "max_seconds": 0.0010692216455936432
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0015023648738861084,
+                  "max_seconds": 0.0015023648738861084
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0004131309688091278,
+                  "max_seconds": 0.0004131309688091278
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0006589256227016449,
+                  "max_seconds": 0.0006589256227016449
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0002673491835594177,
+                  "max_seconds": 0.0002673491835594177
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 8924160,
+                "device_allocated_bytes": 426112,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 1,
+                "filling": 1,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 0,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            },
+            "final": {
+              "counters": {
+                "considered": 5,
+                "excluded_health_check": 1,
+                "admitted": 2,
+                "overlap_forwards": 7,
+                "eager_forwards": 2,
+                "cuda_graph_forwards": 5,
+                "sealed": 1,
+                "writer_started": 2,
+                "copies_completed": 2,
+                "snapshot_built": 1,
+                "ready": 1,
+                "failed_target_weights_update": 1,
+                "excluded_disabled": 2,
+                "control_resume": 1
+              },
+              "disabled_reason": "target_weights_update",
+              "admission_paused": false,
+              "enable_overlap": true,
+              "reservations": 1,
+              "states": {
+                "available": 1
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.000152587890625,
+                  "max_seconds": 0.00009075924754142761
+                },
+                "copy_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.00007296726107597351,
+                  "max_seconds": 0.00006185099482536316
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003821335732936859,
+                  "max_seconds": 0.003821335732936859
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0036599300801753998,
+                  "max_seconds": 0.0036599300801753998
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0013048350811004639,
+                  "max_seconds": 0.0013048350811004639
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0023210421204566956,
+                  "max_seconds": 0.0023210421204566956
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.0018132105469703674,
+                  "max_seconds": 0.0009898282587528229
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0010692216455936432,
+                  "max_seconds": 0.0010692216455936432
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0015023648738861084,
+                  "max_seconds": 0.0015023648738861084
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0004131309688091278,
+                  "max_seconds": 0.0004131309688091278
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0006589256227016449,
+                  "max_seconds": 0.0006589256227016449
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0002673491835594177,
+                  "max_seconds": 0.0002673491835594177
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 8924160,
+                "device_allocated_bytes": 426112,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 1,
+                "filling": 1,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 0,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "new_state": {
+            "counters": {
+              "considered": 2,
+              "excluded_health_check": 1,
+              "admitted": 1,
+              "overlap_forwards": 5,
+              "eager_forwards": 1,
+              "cuda_graph_forwards": 4,
+              "sealed": 1,
+              "writer_started": 1,
+              "copies_completed": 1,
+              "snapshot_built": 1,
+              "ready": 1
+            },
+            "disabled_reason": null,
+            "admission_paused": false,
+            "enable_overlap": true,
+            "reservations": 2,
+            "states": {
+              "available": 2
+            },
+            "queued": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "stage_timings": {
+              "queue_wait": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.00005875527858734131,
+                "max_seconds": 0.00005875527858734131
+              },
+              "copy_wait": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.00006292760372161865,
+                "max_seconds": 0.00006292760372161865
+              },
+              "snapshot_build": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0036803223192691803,
+                "max_seconds": 0.0036803223192691803
+              },
+              "validation": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.003494720906019211,
+                "max_seconds": 0.003494720906019211
+              },
+              "catalog_register": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0012552998960018158,
+                "max_seconds": 0.0012552998960018158
+              },
+              "store_payload": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.002333972603082657,
+                "max_seconds": 0.002333972603082657
+              },
+              "catalog_written": {
+                "calls": 2,
+                "errors": 0,
+                "seconds": 0.0018685907125473022,
+                "max_seconds": 0.0010344348847866058
+              },
+              "journal_save": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0008574165403842926,
+                "max_seconds": 0.0008574165403842926
+              },
+              "catalog_seal": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0014897100627422333,
+                "max_seconds": 0.0014897100627422333
+              },
+              "store_manifest": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0004550851881504059,
+                "max_seconds": 0.0004550851881504059
+              },
+              "catalog_publish": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.0006891265511512756,
+                "max_seconds": 0.0006891265511512756
+              },
+              "journal_complete": {
+                "calls": 1,
+                "errors": 0,
+                "seconds": 0.000269819051027298,
+                "max_seconds": 0.000269819051027298
+              },
+              "recovery_read": {
+                "calls": 0,
+                "errors": 0,
+                "seconds": 0,
+                "max_seconds": 0
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 8924160,
+              "device_allocated_bytes": 426112,
+              "device_limit_bytes": 8388608,
+              "kv_export_host_enqueued_bytes": 0,
+              "kv_export_device_enqueued_bytes": 0,
+              "free": 0,
+              "filling": 2,
+              "quarantined": 0
+            },
+            "admission": {
+              "adaptive": false,
+              "configured_ratio": 1,
+              "target_ratio": 1,
+              "effective_ratio": 1,
+              "reason": "configured",
+              "cooldown_remaining_seconds": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "decreases": 0,
+              "recoveries": 0,
+              "failures": 0,
+              "pauses": 0,
+              "latency": null
+            }
+          },
+          "post_exit_snapshots": 2,
+          "objects": 28,
+          "payload_bytes": 500336,
+          "publications": [
+            {
+              "capture_id": "787344ffd010429ebb11c087ceea3485",
+              "contract_id": "maas-target-kv-top128-v1",
+              "dataset_id": "runtime-weight-update",
+              "fencing_token": 1,
+              "generation_id": "b95a66c5785842b0ac37f25c0d9348b6",
+              "idempotency_key": "publish-f714d9274e484805a48591a1f07c4b1d-b95a66c5785842b0ac37f25c0d9348b6-c0f5df30d05708b3a015c2ba2ec1bda984da9f67ed5ce45ef70e6f2a99879f2c",
+              "manifest_key": "draft-data/runtime-weight-update/f714d9274e484805a48591a1f07c4b1d/b95a66c5785842b0ac37f25c0d9348b6/manifest",
+              "manifest_nbytes": 8620,
+              "manifest_sha256": "c0f5df30d05708b3a015c2ba2ec1bda984da9f67ed5ce45ef70e6f2a99879f2c",
+              "sample_id": "f714d9274e484805a48591a1f07c4b1d"
+            },
+            {
+              "capture_id": "a4d5d74725c346ba914c3003ea1e0e85",
+              "contract_id": "maas-target-kv-top128-v1",
+              "dataset_id": "runtime-weight-update",
+              "fencing_token": 1,
+              "generation_id": "12d3e9a9bb4b45d2801617c5d1246dd5",
+              "idempotency_key": "publish-4be8320a00a54f3790ebb3ecc9935108-12d3e9a9bb4b45d2801617c5d1246dd5-469bd9943c28791cf3df369735a71597b1e72107acb34b7e79966a0e57031e3b",
+              "manifest_key": "draft-data/runtime-weight-update/4be8320a00a54f3790ebb3ecc9935108/12d3e9a9bb4b45d2801617c5d1246dd5/manifest",
+              "manifest_nbytes": 8620,
+              "manifest_sha256": "469bd9943c28791cf3df369735a71597b1e72107acb34b7e79966a0e57031e3b",
+              "sample_id": "4be8320a00a54f3790ebb3ecc9935108"
+            }
+          ]
+        }
+      ],
+      "log_sha256": "375f633159ff3fcad85119a771e1a0c9372f9f08b9839904099c1af5d35d9340"
+    }
+  ],
+  "totals": {
+    "unit_methods": 64,
+    "gpu_methods": 2,
+    "post_exit_snapshots": 4,
+    "objects": 56,
+    "payload_bytes": 976096
+  },
+  "environment": {
+    "time": "2026-10-03T08:30:36.143Z",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "gpus": "0, NVIDIA H100 80GB HBM3, GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495, 81559 MiB, 535.154.05",
+    "runtime": {
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "store": "TCP",
+    "catalog": "HTTP TestCaptureCatalog",
+    "state": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1791016235.332089,
+      "idle_pid": 60861,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.2268846035003662
+    },
+    "ps": "PID  PPID STAT COMMAND\n    1     0 Ss   python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60\n60861     1 Ssl  /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6"
+  },
+  "limitations": [
+    "Test Catalog; no production retention, consumer checkpoint replay or trained draft quality acceptance.",
+    "Runtime mutates disk weights; distributed/tensor/IPC mutation ordering and failures are mocked unit tests.",
+    "The test-only server holds one request with the real scheduler pause method after its first committed token; no production scheduling changes.",
+    "The initial snapshot copy skipped inaccessible bytecode caches; every final Python source file is independently compared."
+  ]
+}
