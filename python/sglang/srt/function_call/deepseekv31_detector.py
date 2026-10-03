@@ -201,9 +201,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
             begin=(
-                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>"
-                + name
-                + "<｜tool▁sep｜>"
+                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>" + name + "<｜tool▁sep｜>"
             ),
             end="<｜tool▁call▁end｜>",
             trigger="<｜tool▁call▁begin｜>",
