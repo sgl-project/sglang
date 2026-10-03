@@ -15,6 +15,10 @@ from sglang_simulator.hook import (
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
+from sglang_simulator.simulation.sglang.session_requests import (
+    SessionRequestClassifier,
+)
+from sglang_simulator.simulation.sglang.session_timeline import SessionTimeline
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
     resolve_scheduler_config,
@@ -97,14 +101,30 @@ class ReqDispatcher:
 
         self.mode = mode
         # If the simulation mode is `BLOCKING`, all requests are released immediately.
-        # If the simulation mode is `OFFLINE`, only control requests, such as `flush_cache`
-        # and `server_info`, are released immediately.
+        # If the simulation mode is `OFFLINE`, only timeline-independent control
+        # requests, such as `flush_cache` and `server_info`, are released immediately.
         self.immediate_release_requests = []
         self.future_queue: list[
             tuple[float, int, Any]
         ] = []  # tuple(created time, salt, request)
         self.offline_recv_all_requests = False
         self.profile_active = False
+        # Built on first use: this runs at module import, and the classifier imports
+        # io_struct, which must not load before the hooks install.
+        self._session_requests = None
+        self.session_timeline = SessionTimeline(
+            is_request_finished=self._request_finished
+        )
+
+    @staticmethod
+    def _request_finished(rid: str) -> bool:
+        return request_stats_manager.get_req_stats(rid).finished
+
+    @property
+    def session_requests(self) -> SessionRequestClassifier:
+        if self._session_requests is None:
+            self._session_requests = SessionRequestClassifier()
+        return self._session_requests
 
     @staticmethod
     def simulation_created_time_s(simulation_args: dict) -> float:
@@ -122,11 +142,38 @@ class ReqDispatcher:
         self.immediate_release_requests.clear()
         self.future_queue.clear()
         self.offline_recv_all_requests = False
+        leaked = self.session_timeline.pending_session_ids()
+        if leaked:
+            logger.warning(
+                "Releasing %d held session close(s) at reset; their turns never "
+                "finished: %s",
+                len(leaked),
+                ", ".join(sorted(set(leaked))),
+            )
+        # Deliver them anyway, or the sessions' KV stays pinned into the next run.
+        self.immediate_release_requests.extend(self.session_timeline.drain())
+        self.session_timeline.reset()
+
+    def _hold_session_requests(self, reqs: list) -> list:
+        remaining = []
+        for req in reqs:
+            if self.session_requests.is_close(req):
+                self.session_timeline.hold_close(session_id=req.session_id, req=req)
+            else:
+                remaining.append(req)
+        return remaining
+
+    def _sessions_with_pending_turns(self) -> set[str]:
+        sessions = set()
+        for _, _, req in self.future_queue:
+            sessions |= self.session_requests.session_ids_of(req)
+        return sessions
 
     def add(self, reqs: list):
         if self.mode == SimulationMode.BLOCKING:
             self.immediate_release_requests.extend(reqs)
         elif self.mode == SimulationMode.OFFLINE:
+            reqs = self._hold_session_requests(reqs)
             if self.offline_recv_all_requests:
                 self.immediate_release_requests.extend(reqs)
                 return
@@ -135,8 +182,10 @@ class ReqDispatcher:
             time.sleep(0.05)  # waiting requests
 
             for req in reqs:
-                if req.__class__.__name__ == "TokenizedGenerateReqInput":
-                    gen_requests.append(req)
+                if self.session_requests.carries_generate_req(req):
+                    # OFFLINE mode queues each request at its own arrival time,
+                    # which a batch does not have, so unpack it into its requests.
+                    gen_requests.extend(self.session_requests.iter_generate_reqs(req))
                 else:
                     # Such as: /profile_start, /flush_cache, etc.
                     self.immediate_release_requests.append(req)
@@ -176,6 +225,9 @@ class ReqDispatcher:
                 if len(self.future_queue) == total_request:
                     self.offline_recv_all_requests = True
                     heapq.heapify(self.future_queue)
+                    # Re-baseline so the client's send window is not charged as
+                    # cpu_overhead at t=0, when every request is still queued.
+                    StateManager.set_last_real_time_ts(time.time())
                     logger.info("All requests received. Starting simulation now.")
                 else:
                     logger.info(
@@ -186,6 +238,17 @@ class ReqDispatcher:
         recv_reqs = []
 
         recv_reqs.extend(self.immediate_release_requests)
+        # Admitted after the simulation started, so it arrives now: multi-turn replay
+        # reuses the first turn's metadata, whose timestamp is stale for later turns.
+        live_arrivals = (
+            {
+                id(req)
+                for outer_req in self.immediate_release_requests
+                for req in self.session_requests.iter_generate_reqs(outer_req)
+            }
+            if self.offline_recv_all_requests
+            else set()
+        )
         self.immediate_release_requests.clear()
 
         if self.mode == SimulationMode.OFFLINE and self.offline_recv_all_requests:
@@ -198,12 +261,25 @@ class ReqDispatcher:
                 recv_reqs.append(req)
                 heapq.heappop(self.future_queue)
 
+        for outer_req in recv_reqs:
+            for req in self.session_requests.iter_generate_reqs(outer_req):
+                session_id = self.session_requests.session_id_of(req)
+                if session_id is not None:
+                    self.session_timeline.note_dispatched(
+                        session_id=session_id, rid=req.rid
+                    )
+
+        if self.mode == SimulationMode.OFFLINE and self.session_timeline.has_pending():
+            # Walks the whole future queue, and that wall time is charged to the clock.
+            recv_reqs.extend(
+                self.session_timeline.take_settled_closes(
+                    self._sessions_with_pending_turns()
+                )
+            )
+
         now = time.time()
-        for req in recv_reqs:
-            if req.__class__.__name__ in [
-                "BatchTokenizedGenerateReqInput",
-                "TokenizedGenerateReqInput",
-            ]:
+        for outer_req in recv_reqs:
+            for req in self.session_requests.iter_generate_reqs(outer_req):
                 simulation_args = None
                 if req.sampling_params.custom_params is not None:
                     simulation_args = req.sampling_params.custom_params.get(
@@ -216,6 +292,8 @@ class ReqDispatcher:
                     simulation_args = {}
                 req_stats = request_stats_manager.get_req_stats(req.rid)
                 req_stats.rid = req.rid
+                req_stats.simulated = True
+                req_stats.session_id = self.session_requests.session_id_of(req)
                 req_stats.input_length = len(req.input_ids)
                 req_stats.output_length = req.sampling_params.max_new_tokens
 
@@ -226,13 +304,19 @@ class ReqDispatcher:
                     req_stats.last_event_time = req_stats.created_time
                     req_stats.queue_start = now
                 elif self.mode == SimulationMode.OFFLINE:
-                    req_stats.created_time = self.simulation_created_time_s(
-                        simulation_args
-                    )
+                    is_live_arrival = id(req) in live_arrivals
+                    if is_live_arrival:
+                        req_stats.created_time = StateManager.get_global_clock()
+                    else:
+                        req_stats.created_time = self.simulation_created_time_s(
+                            simulation_args
+                        )
                     req_stats.last_event_time = req_stats.created_time
                     # Align with the real queue start timestamp if queue_start is not None. For debugging only.
+                    # Not for live arrivals: their stale `queue_start` would
+                    # wind the clock back.
                     queue_start = simulation_args.get("queue_start")
-                    if queue_start is not None:
+                    if queue_start is not None and not is_live_arrival:
                         StateManager.set_global_clock(queue_start)
                     req_stats.queue_start = StateManager.get_global_clock()
 
@@ -454,17 +538,23 @@ class C_SchedulerHook(BaseHook):
                             simulation_batch
                         )
                     )
+                    predictor_wall_dur = time.perf_counter() - pred_start
                     # Accumulate predictor execution time for performance analysis.
-                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += (
-                        time.perf_counter() - pred_start
-                    )
+                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += predictor_wall_dur
+                    StateManager.inc_predictor_wall_dur(predictor_wall_dur)
                     predicted_latency = float(predicted_latency)
 
                     forward_latency = 0
                     if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
                         time.sleep(abs(predicted_latency))
                         now = time.time()
-                        forward_latency = now - StateManager.get_last_real_time_ts()
+                        # The predictor ran inside this interval, not inside the
+                        # one process_batch_result charges, so subtract it here.
+                        forward_latency = (
+                            now
+                            - StateManager.get_last_real_time_ts()
+                            - StateManager.pop_predictor_wall_dur()
+                        )
                         StateManager.set_last_real_time_ts(now)
                     else:
                         forward_latency = predicted_latency
@@ -506,9 +596,21 @@ class C_SchedulerHook(BaseHook):
                 # Step CPU overhead BEFORE recording latencies,
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
-                cpu_overhead = max(
-                    now - StateManager.get_last_real_time_ts() - blocked_l2_wall_dur,
-                    0.0,
+                last_real_time_ts = StateManager.get_last_real_time_ts()
+                # The predictor is the simulator's cost, not work a real server does.
+                predictor_wall_dur = StateManager.pop_predictor_wall_dur()
+                # 0 means no batch has run since reset; differencing against it
+                # would add a whole Unix epoch.
+                cpu_overhead = (
+                    max(
+                        now
+                        - last_real_time_ts
+                        - blocked_l2_wall_dur
+                        - predictor_wall_dur,
+                        0.0,
+                    )
+                    if last_real_time_ts
+                    else 0.0
                 )
                 StateManager.step_global_clock(cpu_overhead)
                 StateManager.set_last_real_time_ts(now)
@@ -523,6 +625,7 @@ class C_SchedulerHook(BaseHook):
                             - req_stats.last_event_time  # queue duration
                         )
                         req_stats.last_event_time = request_response_time
+                        req_stats.finished = req.finished()
                     else:
                         # Chunked request: nothing to do
                         pass
@@ -554,7 +657,9 @@ class C_SchedulerHook(BaseHook):
             is_start_profile = req.req_type.name == "START_PROFILE"
             stats: list[RequestStats] = []
             for item in request_stats_manager.get_all_req_stats():
-                if item.rid is not None and item.input_length > 0:
+                # An unstamped request keeps created_time -1, which would anchor the
+                # normalisation below and shift every stamped request by 1 s.
+                if item.rid is not None and item.input_length > 0 and item.simulated:
                     stats.append(item)
 
             stats = sorted(stats, key=lambda req: req.created_time)
@@ -571,7 +676,11 @@ class C_SchedulerHook(BaseHook):
                     item.queue_end -= min_created_time
                     item.last_event_time -= min_created_time
 
-                metrics = calc_metrics(stats)
+                metrics = calc_metrics(
+                    stats,
+                    evicted_tokens=StateManager.get_evicted_tokens(),
+                    evict_calls=StateManager.get_evict_calls(),
+                )
                 metrics["time_cost"] = (
                     time.time() - StateManager.get_last_flush_time_ts()
                 )
