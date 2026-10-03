@@ -87,8 +87,9 @@ class TestTorchNativeExtend(CustomTestCase):
                             for k_pos in range(len(token_ids))
                         ]
                         for q_pos in range(extend_len)
-                    ]
-                )
+                    ],
+                    dtype=torch.bool,
+                ).reshape(extend_len, len(token_ids))
                 logits = logits.masked_fill(~visible, -torch.inf)
             expected.append((logits.softmax(dim=-1) @ v).transpose(0, 1))
             start_q += extend_len
@@ -240,6 +241,19 @@ class TestTorchNativeExtend(CustomTestCase):
     def test_causal_prefix_and_ragged_batch(self):
         """A rectangular causal mask must align each query after its own prefix."""
         self._check_attention(prefix_lens=(0, 3, 7), extend_lens=(4, 2, 1))
+
+    def test_zero_extend_rows(self):
+        """Padding rows contribute no queries and preserve later request offsets."""
+        for public_forward in (False, True):
+            for window in (None, 2):
+                with self.subTest(public_forward=public_forward, window=window):
+                    self._check_attention(
+                        prefix_lens=(0, 5, 3),
+                        extend_lens=(0, 2, 0),
+                        window=window,
+                        public_forward=public_forward,
+                        cpu_metadata=public_forward,
+                    )
 
     def test_sliding_window_prefix(self):
         """Window edges use absolute query positions even when the prefix is omitted."""

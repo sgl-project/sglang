@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
+from torch.nn.attention.bias import causal_lower_right
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -167,15 +168,11 @@ class TorchNativeAttnBackend(AttentionBackend):
             elif causal and prefill_seq_len_q > 0:
                 # SDPA's is_causal mask is upper-left aligned; prefix queries
                 # need their absolute positions in the full key sequence.
-                q_pos = torch.arange(
-                    prefill_seq_len_q,
-                    prefill_seq_len_q + extend_seq_len_q,
-                    device=per_req_query.device,
-                ).unsqueeze(1)
-                k_pos = torch.arange(seq_len_kv, device=per_req_query.device).unsqueeze(
-                    0
+                # The native bias keeps fused SDPA eligible on CUDA and
+                # materializes the same rectangular mask on other backends.
+                attn_mask = causal_lower_right(
+                    per_req_query.shape[-2], per_req_key.shape[-2]
                 )
-                attn_mask = k_pos <= q_pos
                 is_causal = False
 
             per_req_out = (
