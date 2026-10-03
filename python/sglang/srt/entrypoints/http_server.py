@@ -1211,10 +1211,16 @@ async def freeze_gc_async():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_expert_distribution_record_async():
     """Start recording the expert distribution. Clear the previous record if any."""
-    await _global_state.tokenizer_manager.start_expert_distribution_record()
+    result = await _global_state.tokenizer_manager.start_expert_distribution_record()
+    if not result.success:
+        return Response(
+            content=f"{result.message}\n",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
     return Response(
         content="Start recording the expert distribution.\n",
-        status_code=200,
+        status_code=HTTPStatus.OK,
     )
 
 
@@ -1222,10 +1228,16 @@ async def start_expert_distribution_record_async():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_expert_distribution_record_async():
     """Stop recording the expert distribution."""
-    await _global_state.tokenizer_manager.stop_expert_distribution_record()
+    result = await _global_state.tokenizer_manager.stop_expert_distribution_record()
+    if not result.success:
+        return Response(
+            content=f"{result.message}\n",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
     return Response(
         content="Stop recording the expert distribution.\n",
-        status_code=200,
+        status_code=HTTPStatus.OK,
     )
 
 
@@ -1233,10 +1245,16 @@ async def stop_expert_distribution_record_async():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def dump_expert_distribution_record_async():
     """Dump expert distribution record."""
-    await _global_state.tokenizer_manager.dump_expert_distribution_record()
+    result = await _global_state.tokenizer_manager.dump_expert_distribution_record()
+    if not result.success:
+        return Response(
+            content=f"{result.message}\n",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
     return Response(
         content="Dump expert distribution record.\n",
-        status_code=200,
+        status_code=HTTPStatus.OK,
     )
 
 
