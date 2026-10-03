@@ -15,6 +15,10 @@ class LinearAttnKernelBase(ABC):
     # Opt in only when target-verify kernels honor non-unit token strides.
     supports_strided_target_verify_qkv: bool = False
 
+    # True when the kernel honors lower_bound (the safe gate); safe-gate
+    # models reroute kernels without it to the Triton fallback.
+    supports_safe_gate: bool = True
+
     # True when extend() honors the fp32 track snapshot (track_state /
     # track_chunk_idx), natively or by routing tracked batches to a kernel
     # that does. KDAAttnBackend asserts this before allocating the snapshot
