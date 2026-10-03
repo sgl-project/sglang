@@ -65,11 +65,21 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
+from sglang.srt.speculative.dspark_components.dspark_sps import (
+    SpsCostTable,
+    load_sps_table_from_path,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
+)
+from sglang.srt.speculative.dspark_components.dspark_verify_width import (
+    VerifyWidthController,
+    parse_verify_widths,
+    use_verify_width_runtime,
+    verify_width_unsupported_reason,
 )
 from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
@@ -339,6 +349,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not get_parallel().attn_dp_enabled
             and get_parallel().pp_size == 1
         )
+        self._target_is_dsv41 = target_is_dsv41
         # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
         # need the group's pynccl communicator
         if (
@@ -346,21 +357,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._decode_graph_allowed
             and (is_cuda() or (is_cuda_alike() and target_is_dsv41))
         ):
-            self._verify_epilogue = DsparkVerifyEpilogue(
-                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
-                device=self.device,
-                tp_sync=self._tp_sync,
-                fused_argmax=target_is_dsv41,
-                commit_ctx=CommitInjectCtx(
-                    draft_model=self.draft_model,
-                    block_pos_offsets=self._block_pos_offsets,
-                    resolve_pool=lambda: self.draft_model_runner.token_to_kv_pool,
-                    resolve_req_to_token=lambda: (
-                        self.model_runner.req_to_token_pool.req_to_token
-                    ),
-                    kv_injector=self._kv_injector,
-                ),
+            self._verify_epilogue = self._make_verify_epilogue(
+                self.verify_num_draft_tokens
             )
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
@@ -415,6 +413,58 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+        self._verify_width = self._maybe_build_verify_width_controller()
+
+    def _make_verify_epilogue(
+        self, verify_num_draft_tokens: int
+    ) -> DsparkVerifyEpilogue:
+        return DsparkVerifyEpilogue(
+            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            device=self.device,
+            tp_sync=self._tp_sync,
+            fused_argmax=self._target_is_dsv41,
+            commit_ctx=CommitInjectCtx(
+                draft_model=self.draft_model,
+                block_pos_offsets=self._block_pos_offsets,
+                resolve_pool=lambda: self.draft_model_runner.token_to_kv_pool,
+                resolve_req_to_token=lambda: (
+                    self.model_runner.req_to_token_pool.req_to_token
+                ),
+                kv_injector=self._kv_injector,
+            ),
+        )
+
+    def _maybe_build_verify_width_controller(self) -> Optional[VerifyWidthController]:
+        widths = parse_verify_widths(
+            envs.SGLANG_DSPARK_VERIFY_WIDTHS.get(),
+            full_width=self.verify_num_draft_tokens,
+        )
+        if not widths:
+            return None
+        unsupported = verify_width_unsupported_reason(
+            mode_value=self._verify_planner.mode_value,
+            target_is_mambaish=self._target_is_mambaish,
+            simulate_acc_len=self._simulate_acc_len,
+        )
+        if unsupported:
+            raise ValueError(f"SGLANG_DSPARK_VERIFY_WIDTHS: {unsupported}.")
+        sps_table = load_sps_table_from_path(
+            get_spec().speculative_dspark_sps_table_path
+        )
+        if not isinstance(sps_table, SpsCostTable):
+            raise ValueError(
+                "SGLANG_DSPARK_VERIFY_WIDTHS needs a diagonal SPS table (batch "
+                "tokens -> steps per second), not an additive one."
+            )
+        return VerifyWidthController(
+            widths=widths,
+            full_width=self.verify_num_draft_tokens,
+            sps_table=sps_table,
+            forced_width=envs.SGLANG_DSPARK_FORCE_VERIFY_WIDTH.get(),
+            device=self.device,
+        )
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -515,6 +565,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._proposer.attach_draft_sampler(self._draft_sampler)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
+            )
+        if self._verify_width is not None:
+            self._verify_width.build_runtimes(
+                model_runner=self.model_runner,
+                capture_graphs=self._decode_graph_allowed,
+                full_epilogue=self._verify_epilogue,
+                make_epilogue=self._make_verify_epilogue,
             )
 
     def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
@@ -927,6 +984,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not batch.has_grammar
         )
         prepare_mamba_track_for_verify(batch)
+        verify_width = self.verify_num_draft_tokens
+        step_epilogue = self._verify_epilogue
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -940,18 +999,26 @@ class DSparkWorkerV2(BaseSpecWorker):
                     inject_gate=fold_eligible,
                 )
             else:
+                verify_width, width_runtime = self._select_verify_width(batch, bs)
+                step_epilogue = (
+                    width_runtime.epilogue
+                    if width_runtime is not None
+                    else self._verify_epilogue
+                )
                 if (
-                    self._verify_epilogue is not None
+                    step_epilogue is not None
                     and self._verify_planner.mode_value == "static"
                 ):
-                    self._verify_epilogue.begin_static_step(bs, fold_eligible)
-                target_verify = self._verify_executor.run_non_compact(
-                    batch=batch,
-                    draft_input=draft_input,
-                    verify_ids_2d=verify_ids_2d,
-                    verify_window=verify_window,
-                    sampling_info=sampling_info,
-                )
+                    step_epilogue.begin_static_step(bs, fold_eligible)
+                with use_verify_width_runtime(self.model_runner, width_runtime):
+                    target_verify = self._verify_executor.run_non_compact(
+                        batch=batch,
+                        draft_input=draft_input,
+                        verify_ids_2d=verify_ids_2d,
+                        verify_window=verify_window,
+                        sampling_info=sampling_info,
+                        verify_width=verify_width,
+                    )
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
@@ -968,7 +1035,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
 
-        epilogue = self._verify_executor.verify_epilogue
         folded_accept = (
             fold_eligible
             and can_run_cuda_graph
@@ -985,8 +1051,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+            verify_width=verify_width,
+            epilogue=step_epilogue,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
+        if self._verify_width is not None:
+            self._verify_width.observe(
+                width=verify_width, correct_len=accept.correct_len
+            )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=batch.req_pool_indices,
@@ -1026,7 +1098,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             commit_lens=accept.commit_lens,
         )
 
-        folded_commit = folded_accept and epilogue.folds_commit
+        folded_commit = folded_accept and step_epilogue.folds_commit
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         if not folded_commit:
@@ -1039,6 +1111,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 commit_lens=accept.commit_lens,
                 bs=bs,
                 run_compact=run_compact,
+                verify_width=verify_width,
             )
         logits_output.hidden_states = None
 
@@ -1079,8 +1152,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
+            speculative_num_draft_tokens=int(verify_width),
             new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _select_verify_width(self, batch: ScheduleBatch, bs: int):
+        """Grammar masks, logprobs and sampling masks read full-width verify
+        rows, so those steps keep the full width."""
+        if self._verify_width is None:
+            return self.verify_num_draft_tokens, None
+        wants_sampling_mask = (
+            batch.sampling_info is not None
+            and batch.sampling_info.sampling_mask_batch_indices is not None
+        )
+        return self._verify_width.select(
+            bs=bs,
+            eligible=not (
+                batch.has_grammar or batch.return_logprob or wants_sampling_mask
+            ),
         )
 
     def _commit_target_mamba_states_after_verify(
