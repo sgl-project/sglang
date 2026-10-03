@@ -33,6 +33,7 @@ python -m pytest -q test/registered/unit/gpu_delta_weight_sync \
   --ignore=test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout_cuda.py
 python -m pytest -q test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout_cuda.py
 python -m pytest -q test/manual/weight_sync/test_gpu_delta_codec.py
+python -m pytest -q test/manual/weight_sync/test_gpu_delta_host.py
 ```
 
 Layout algebra, allocator admission, protocol and session tests run in the
@@ -49,8 +50,9 @@ suite. The registered `test_gpu_delta_layout_cuda.py` compares layouts and deriv
 scale buffers with the existing SGLang/FlashInfer loader helpers and checks MLA
 source views, failure gating and destination addresses across CUDA graph replay.
 
-Preparation checks compressed artifact SHA-256 on CPU, pins immutable encoded
-buffers and constructs descriptors without reading weights or stopping serving.
+Preparation checks compressed artifact SHA-256 and unwraps outer Zstd once per
+host sharing domain. Each rank registers the retained shared Snappy/raw arena for
+CUDA and constructs descriptors without reading weights or stopping serving.
 Preparation reserves the largest required encoded/decoded tensor arenas. During
 apply, each required matrix tensor is uploaded from pinned host memory, decoded and
 applied before reusing those arenas. There is no staging selector or full-publication
@@ -100,16 +102,51 @@ Protocol 4 carries `codec="snappy-zstd"` and explicit `frame_bytes` (64 KiB or
 redundant codec/file fields. Each natural tensor's outer descriptor names one
 immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
 covering its aligned Snappy arena. The sender computes both Snappy and outer Zstd
-on GPU; the receiver always unwraps Zstd on CPU directly into final pinned tensor
-buffers, then streams tensor Snappy bytes for hardware decoding and in-place apply.
+on GPU; the receiver always unwraps Zstd on CPU directly into a host-shared arena,
+registers each process's mapping for CUDA, then streams tensor Snappy bytes for
+hardware decoding and in-place apply.
 There is no GPU outer decoder, legacy protocol or automatic fallback.
 
-Owner files are SHA-256 checked once into pageable memory. The preparation worker
-unwraps only local tensors using one reused Zstd context and caches tensors shared
-by multiple local bindings. It validates chunk/frame extents, alignment, bounded
-window/output and exact decoded length before reporting `PREPARED`. GPU Zstd may
-omit content size; the bounded decoder output remains mandatory. Invalid envelopes
-fail before any model mutation. Full Snappy HBM residency is not supported.
+`WEIGHT_DELTA_CPU_WORKERS` defaults to 4 (bounded to 1–32). The host cache creator
+uses that many reusable CPU workers, each with its own Zstd context; other ranks
+attach to its completed arena. Thus 4 or 8 means total active decode workers per
+host publication, including two EP4 engines sharing the same cache. Workers touch
+only CPU buffers; CUDA setup remains on each rank's original preparation thread.
+
+`WEIGHT_DELTA_HOST_CACHE_DIR` defaults to `/dev/shm/sglang-gpu-delta-<uid>` and
+must be a private, user-owned directory on tmpfs with enough space for the wrapped
+payloads and expanded host arena during construction. Every engine on the same
+physical host must see the same directory and IPC/mount namespace; across
+containers, explicitly mount the same host tmpfs there. Container hostname is not
+used to infer sharing. A durable cache-root UUID is advertised as `host_cache_id`.
+Miles negotiates the canonical tensor-name union per cache ID and sends it in
+`host_tensor_names`. Each receiver requires its local names to be covered; foreign
+experts outside that union are not decoded.
+
+One creator copies owner files into retained tmpfs mappings and SHA-256 checks
+those exact bytes once. CPU workers decode independent canonical tensors directly
+into one flat shared Snappy arena, and raw targets are copied beside them. Aliased
+bindings and the second engine reuse those bytes. The cache key binds the exact
+manifest path, authenticated digest and host tensor union. It publishes the arena
+index only after all tasks complete and every chunk's bounds, window and exact
+output length pass. GPU Zstd may omit content size; bounded output remains
+mandatory. Every submitted task is joined on failure before ownership is dropped.
+
+Each rank maps the arena with MAP_SHARED, treats its READY contents as immutable,
+and calls `cudaHostRegister` once on its own mapping. Registration happens outside
+the host build mutex, with no inference collectives. The rank retains all mapping
+and tensor references through its final update-stream fence, then unregisters
+before dropping them. Torch's pinned allocator does not own this external memory.
+Normal post-resume cleanup unlinks snapshot names after the complete cohort has
+applied; surviving mappings remain valid. Aborted/failed/crashed snapshots are
+retained for inspection and require explicit cleanup after consumers exit. Small
+lock/identity files persist. There is no automatic eviction, pageable fallback or
+full Snappy HBM residency.
+
+Fresh registration is per publication and may cost more than Torch's warm pinned
+allocator cache. The benchmark measures it separately; sharing does not imply
+zero registration cost, nor free driver work for foreign arena pages. Persistent
+registered arenas and per-rank region registration are deliberately deferred.
 
 Canonical rank-0/rank-1 tensors instead negotiate `raw_bytes`: complete target
 values with no XOR, frames or compression envelope. Unchanged values omit their
@@ -126,24 +163,39 @@ Preparation reports manifest loading/parsing (`host_manifest_read_parse_s`), pla
 validation (`host_plan_validate_s`), frame validation (`host_frames_validate_s`),
 local tensor preparation (`host_tensor_prepare_s`), arena/decoder setup
 (`host_decoder_prepare_s`) and its final GPU wait (`host_ready_wait_s`).
-`host_prepare_s` covers the complete preparation. Tensor preparation includes the
-outer-Zstd phases below, so these nested timings must not be summed together.
+`host_prepare_s` covers the complete preparation. Shared construction, registration
+and local tensor metadata are separate phases; nested timings and concurrent
+worker durations must not be summed as wall time.
 `decoder_metadata_uploads` counts metadata slabs and
 `decoder_metadata_h2d_bytes` counts their uploaded bytes; neither changes the
 matrix/raw payload byte counts.
 
-`host_payload_read_sha256_s` reports wrapped owner-file loading/verification;
-`host_outer_zstd_validate_s`, `host_outer_zstd_pin_allocate_s` and
-`host_outer_zstd_decode_s` separate envelope validation, pinned allocation and CPU
-decode. Encoded/decoded byte and tensor counts use the same `host_outer_zstd_`
-prefix and count each reconstructed local tensor once. `host_outer_zstd_frames`
-counts outer chunks. These preparation costs
-are outside the explicit scheduler pause. Background work and pre-pause status
-handlers can still contend with serving; the pause metric does not measure that
-interference. Each rank still reads the small outer files;
-there is no cross-process shared pinned-memory cache. The CPU tests include
-exact reconstruction, every truncation point, trailing/concatenated frames,
-checksum corruption, protocol mismatch, local-only preparation and buffer reuse.
+`host_payload_cache_created`/`host_payload_cache_reused` distinguish the one
+creator from followers. Creator-only `host_payload_read_s`, `host_payload_sha256_s`,
+`host_payload_hash_files` and `host_payload_hash_bytes` expose once-host read/hash;
+`host_payload_read_sha256_s` is their read-plus-hash sum. Followers report zero
+work for these counters. `host_shared_prepare_s` includes cache wait/attachment or
+construction; `host_payload_cache_wait_s` isolates the short-lock wait.
+
+Creator-only `host_outer_zstd_decode_s` is CPU task submission/join wall time
+(including raw copies). `host_outer_zstd_validate_s` and
+`host_outer_zstd_worker_decode_sum_s` sum worker durations, not critical-path time.
+The `host_outer_zstd_encoded_bytes`, `decoded_bytes`, `tensors` and `frames`
+counters count each reconstructed host tensor/chunk once.
+`host_shared_build_s` is the same cached build duration for all consumers and must
+not be summed across ranks. `host_shared_arena_bytes` is shared physical payload
+size; each rank's `host_shared_registered_bytes`, `host_shared_register_calls` and
+`host_shared_register_s` report its registration work. `host_outer_zstd_cpu_workers`
+records the creator's configured pool size.
+
+These preparation costs occur outside the explicit scheduler pause but can
+contend with serving. Post-resume unregister/disposal is excluded from paused
+apply timing and runs on the session executor before later preparation. The
+manual two-process test checks actual pin recognition, asynchronous H2D bytes,
+completion fences and independent mapping disposal for both 4/8-worker pools.
+CPU tests cover exact reconstruction, truncation/trailing/checksum rejection,
+concurrent creator deduplication, host-union selection, retained verified bytes,
+and draining other workers when one decode fails.
 
 Runtime updates do not hash weights or build a custom compiled extension. Exact
 weight-content comparisons are confined to tests. State/version checks prevent

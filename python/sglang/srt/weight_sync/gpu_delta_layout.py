@@ -717,7 +717,11 @@ class GpuDeltaBackend:
         from sglang.srt.weight_sync.gpu_delta_checkpoint import (
             read_canonical_checkpoint_inventory,
         )
-        from sglang.srt.weight_sync.gpu_delta_payload import configured_codec
+        from sglang.srt.weight_sync.gpu_delta_payload import (
+            OuterZstdPool,
+            configured_codec,
+            configured_cpu_workers,
+        )
 
         self.codec = configured_codec()
         _require_fixed_moe_topology(get_exec().moe)
@@ -728,6 +732,7 @@ class GpuDeltaBackend:
         self.device = next(model_runner.model.parameters()).device
         if self.device.type != "cuda" or self.device.index is None:
             raise ValueError("direct GPU deltas require an explicit CUDA device")
+        self.outer_pool = OuterZstdPool(configured_cpu_workers())
 
     def describe(self):
         self.layout.check_identity()
@@ -743,10 +748,16 @@ class GpuDeltaBackend:
         # Called by the session's background worker: no weight reads, writes,
         # collectives, loader hooks or generation-stream synchronization here.
         with torch.cuda.device(self.device):
-            return PreparedDelta(self, manifest_path, manifest_sha256, metadata)
+            prepared = PreparedDelta.__new__(PreparedDelta)
+            try:
+                prepared.__init__(self, manifest_path, manifest_sha256, metadata)
+                return prepared
+            except BaseException:
+                prepared.close()
+                raise
 
     def close(self):
-        pass
+        self.outer_pool.close()
 
 
 @dataclass
@@ -774,20 +785,22 @@ class PreparedDelta:
         self.events = {}
         self.timings = {}
         from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
+        from sglang.srt.weight_sync.gpu_delta_host import HostDecodedSnapshot
         from sglang.srt.weight_sync.gpu_delta_payload import (
-            OuterZstdReader,
             validate_codec,
             validate_outer_entries,
         )
 
         self.backend = backend
         self.device = backend.device
-        self.stream = torch.cuda.Stream(device=self.device)
-        self.done = None
-        self.applied = False
+        self.host_snapshot = None
         self.units = []
         self.raw_units = []
         self.raw_copies = {}
+        self.apply_succeeded = False
+        self.stream = torch.cuda.Stream(device=self.device)
+        self.done = None
+        self.applied = False
         manifest_started = time.perf_counter()
         path = Path(manifest_path).resolve(strict=True)
         content = path.read_bytes()
@@ -852,50 +865,41 @@ class PreparedDelta:
         if not {b.name for b in backend.layout.bindings} <= self._entries.keys():
             raise ValueError("publication omits an admitted mutable tensor")
         self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started
-        payload_started = time.perf_counter()
-        self.host_files = {}
-        for record in manifest["files"]:
-            name = record["name"]
-            if (
-                name in self.host_files
-                or Path(name).name != name
-                or name in {".", ".."}
-            ):
-                raise ValueError("invalid or duplicate delta payload path")
-            source = (path.parent / name).resolve(strict=True)
-            if source.parent != path.parent:
-                raise ValueError(
-                    "delta payload escapes immutable publication directory"
-                )
-            size = record["nbytes"]
-            if type(size) is not int or size < 0 or source.stat().st_size != size:
-                raise ValueError("delta payload size mismatch")
-            # Outer bytes never reach a GPU. Read/hash each immutable owner
-            # once; only local tensors are decoded into final pinned storage.
-            encoded = source.read_bytes()
-            if (
-                len(encoded) != size
-                or hashlib.sha256(encoded).hexdigest() != record["sha256"]
-            ):
-                raise ValueError("delta payload SHA256/size mismatch")
-            self.host_files[name] = encoded
-        self.timings["host_payload_read_sha256_s"] = (
-            time.perf_counter() - payload_started
-        )
+        host_names = metadata["host_tensor_names"][backend.identity["host_cache_id"]]
+        if (
+            not isinstance(host_names, list)
+            or not all(isinstance(name, str) for name in host_names)
+            or host_names != sorted(set(host_names))
+            or not {binding.name for binding in backend.layout.bindings}
+            <= set(host_names)
+            or not set(host_names) <= self._entries.keys()
+        ):
+            raise ValueError(
+                "host tensor union does not cover the admitted local tensors"
+            )
         frames_started = time.perf_counter()
         validate_outer_entries(
             self._entries.values(),
-            {name: len(data) for name, data in self.host_files.items()},
+            {record["name"]: record["nbytes"] for record in manifest["files"]},
             manifest["frame_bytes"],
         )
         self.timings["host_frames_validate_s"] = time.perf_counter() - frames_started
-
-        def allocate_pinned(size):
-            tensor = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
-            return tensor, memoryview(tensor.numpy())
+        payload_started = time.perf_counter()
+        self.host_snapshot = HostDecodedSnapshot(
+            path,
+            manifest_sha256,
+            manifest,
+            host_names,
+            backend.outer_pool,
+            self.timings,
+        )
+        self.timings["host_payload_read_sha256_s"] = (
+            self.timings["host_payload_read_s"] + self.timings["host_payload_sha256_s"]
+        )
+        self.timings["host_shared_prepare_s"] = time.perf_counter() - payload_started
+        self.host_snapshot.register(self.device, self.timings)
 
         tensors_started = time.perf_counter()
-        outer_reader = OuterZstdReader(self.host_files, allocate_pinned, self.timings)
         prepared, direct = [], []
         max_encoded, max_decoded = 0, 0
         batches = []
@@ -912,7 +916,7 @@ class PreparedDelta:
                 continue
             if not entry["frames"]:
                 continue  # Omitted XOR masks need no work.
-            pinned = outer_reader.get(entry)
+            pinned = self.host_snapshot.get(entry["name"])
             # Admission already bounds every inner frame, including foreign EP
             # tensors. One pinned tensor arena directly supplies one Snappy batch.
             frames = [
@@ -928,7 +932,7 @@ class PreparedDelta:
             prepared.append((binding, entry, pinned, frames))
             max_encoded = max(max_encoded, pinned.numel())
             max_decoded = max(max_decoded, entry["nbytes"])
-        # Includes CPU outer decompression; do not add those nested timings.
+        # Rank-local tensor metadata; host-shared decompression is measured above.
         self.timings["host_tensor_prepare_s"] = time.perf_counter() - tensors_started
         # Scalars and vectors are complete target values, never delta masks.
         # Pack once on the preparation worker and upload the small arena before
@@ -947,18 +951,15 @@ class PreparedDelta:
         )
         raw_view = memoryview(self.raw_pinned.numpy())
         for (_, entry), position in zip(direct, raw_offsets):
-            raw = entry["raw"]
-            source = self.host_files[raw["file"]]
-            source = memoryview(source)
-            start, size = raw["encoded_offset"], raw["encoded_bytes"]
-            raw_view[position : position + size] = source[start : start + size]
+            source = memoryview(self.host_snapshot.get(entry["name"]).numpy())
+            size = entry["nbytes"]
+            raw_view[position : position + size] = source
         self.timings.update(
             host_raw_pack_s=time.perf_counter() - raw_started,
             raw_tensors=len(direct),
             raw_bytes=raw_bytes,
             raw_h2d_bytes=raw_h2d_bytes,
         )
-        self.host_files.clear()  # Prepared units own their final pinned buffers.
         decoder_started = time.perf_counter()
         self.decoder = NvcompDecoder(self.device) if batches else None
         self.workspace = self.decoder.allocate_workspace(batches) if batches else None
@@ -1116,6 +1117,7 @@ class PreparedDelta:
                 name: sum(start.elapsed_time(end) for start, end in pairs)
                 for name, pairs in self.events.items()
             }
+        self.apply_succeeded = True
         return {
             "applied": True,
             "verification": "artifact-sha256-and-decoder-status",
@@ -1153,7 +1155,9 @@ class PreparedDelta:
         self.units.clear()
         self.raw_units.clear()
         self.raw_copies.clear()
-        self.host_files.clear()
+        if getattr(self, "host_snapshot", None) is not None:
+            self.host_snapshot.close(discard=self.apply_succeeded)
+            self.host_snapshot = None
         self.encoded = self.decoded = self.raw_device = self.raw_pinned = None
         self.workspace = self.decoder = None
 

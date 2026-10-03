@@ -70,6 +70,7 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
                 "plan_digest": "b" * 64,
                 "participants": [],
                 "cohort": [],
+                "host_tensor_names": {"host": []},
             },
         ),
         ("get_weights_delta_status", GetWeightsDeltaStatusReqInput, session),

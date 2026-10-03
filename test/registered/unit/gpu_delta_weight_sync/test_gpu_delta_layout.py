@@ -2,16 +2,16 @@
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -26,6 +26,43 @@ _spec = importlib.util.spec_from_file_location("gpu_delta_layout_under_test", _p
 layout = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = layout
 _spec.loader.exec_module(layout)
+
+
+@contextmanager
+def cpu_host_snapshot(backend, metadata, directory):
+    """Real shared CPU decode; explicitly mock CUDA registration in CPU tests."""
+    from sglang.srt.weight_sync import gpu_delta_host as host
+    from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
+
+    backend.identity = {"host_cache_id": "cpu-host"}
+    metadata["host_tensor_names"] = {
+        "cpu-host": sorted({binding.name for binding in backend.layout.bindings})
+    }
+    backend.outer_pool = OuterZstdPool(2)
+    cache = Path(directory) / "cache"
+    cache.mkdir()
+
+    def register(snapshot, device, timings):
+        snapshot.tensor = (
+            torch.frombuffer(snapshot.mapping, dtype=torch.uint8)
+            if snapshot.mapping is not None
+            else torch.empty(0, dtype=torch.uint8)
+        )
+
+    try:
+        with (
+            patch.object(host, "_cache_root", return_value=cache),
+            patch.object(
+                os,
+                "posix_fallocate",
+                side_effect=lambda fd, offset, size: os.ftruncate(fd, offset + size),
+                create=True,
+            ),
+            patch.object(host.HostDecodedSnapshot, "register", register),
+        ):
+            yield
+    finally:
+        backend.outer_pool.close()
 
 
 class TestFlashInferDeltaLayout(unittest.TestCase):
@@ -665,6 +702,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             content = json.dumps(manifest).encode()
             path.write_bytes(content)
             with (
+                cpu_host_snapshot(backend, metadata, directory),
                 patch.object(torch, "empty", side_effect=unpinned),
                 patch.object(torch.cuda, "Stream", return_value=object()),
                 patch.object(torch.cuda, "stream", return_value=nullcontext()),
@@ -683,7 +721,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 prepared = layout.PreparedDelta(
                     backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
                 )
-                self.assertFalse(prepared.host_files)
+                self.assertEqual(prepared.timings["host_payload_cache_created"], 1)
                 self.assertEqual(prepared.timings["host_outer_zstd_tensors"], 2)
                 self.assertEqual(prepared.timings["host_outer_zstd_frames"], 2)
                 self.assertEqual(
@@ -707,7 +745,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         ),
                     )
                     self.assertEqual(prepared.encoded.data_ptr(), pointer)
-                # Immutable-file corruption cannot reach any model write.
+                # A completed snapshot retains verified bytes; discard explicitly to
+                # test corruption on a new acquisition before model writes.
+                prepared.host_snapshot.close(discard=True)
                 targets[0].zero_()
                 path.with_name("0.bin").write_bytes(
                     blobs["0"][:-1] + bytes([blobs["0"][-1] ^ 1])
@@ -878,6 +918,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             content = json.dumps(manifest).encode()
             path.write_bytes(content)
             with (
+                cpu_host_snapshot(backend, metadata, directory),
                 patch.object(torch, "empty", side_effect=unpinned),
                 patch.object(torch.cuda, "Stream", return_value=object()),
                 patch.object(torch.cuda, "stream", return_value=nullcontext()),

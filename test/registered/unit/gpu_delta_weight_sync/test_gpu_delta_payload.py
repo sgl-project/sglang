@@ -5,9 +5,8 @@ import unittest
 from unittest.mock import patch
 
 import zstandard as zstd
-
 from sglang.srt.weight_sync.gpu_delta_payload import (
-    OuterZstdReader,
+    OuterZstdPool,
     configured_codec,
     validate_codec,
     validate_outer_entries,
@@ -80,8 +79,10 @@ class TestOuterZstd(unittest.TestCase):
         with patch.dict("os.environ", {"WEIGHT_DELTA_CODEC": "invalid"}):
             validate_codec(admitted, "snappy-zstd")
 
-    def test_gpu_outer_chunks_decode_directly_to_one_pinned_tensor_arena(self):
+    def test_gpu_outer_chunks_decode_directly_to_one_destination(self):
         values = [bytes(range(256)) * 4096, bytes(range(19))]
+        pool = OuterZstdPool(2)
+        self.addCleanup(pool.close)
         for known_size in (False, True):
             payload, chunks = bytearray(), []
             for index, value in enumerate(values):
@@ -98,37 +99,11 @@ class TestOuterZstd(unittest.TestCase):
                     )
                 )
                 payload.extend(compressed)
-            allocations, metrics = [], {}
-
-            def allocate(size):
-                target = bytearray(size)
-                allocations.append(target)
-                return target, memoryview(target)
-
-            record = entry(payload, size=sum(map(len, values)))
-            record["outer"]["frames"] = chunks
-            reader = OuterZstdReader({"owner.bin": payload}, allocate, metrics)
-            output = reader.get(record)
-            self.assertEqual(output, b"".join(values))
-            self.assertIs(output, allocations[0])
-            self.assertIs(reader.get(record), output)
-            self.assertEqual(len(allocations), 1)
-            self.assertEqual(metrics["host_outer_zstd_encoded_bytes"], len(payload))
-            self.assertEqual(
-                metrics["host_outer_zstd_decoded_bytes"], sum(map(len, values))
-            )
-            self.assertEqual(metrics["host_outer_zstd_frames"], 2)
-            self.assertEqual(metrics["host_outer_zstd_tensors"], 1)
-            # Exact block extent is validated before the final arena allocation,
-            # including the optional unknown-content-size GPU frame form.
-            truncated = copy.deepcopy(record)
-            truncated["outer"]["frames"][-1]["encoded_bytes"] -= 1
-            with self.assertRaisesRegex(ValueError, "truncated"):
-                OuterZstdReader(
-                    {"owner.bin": payload},
-                    lambda _: self.fail("truncated chunk allocated a tensor arena"),
-                    {},
-                ).get(truncated)
+            target = bytearray(sum(map(len, values)))
+            pool.executor.submit(
+                pool.decode, memoryview(payload), chunks, memoryview(target)
+            ).result()
+            self.assertEqual(target, b"".join(values))
 
     def test_exact_frame_extent_rejects_every_truncation_and_trailing_data(self):
         raw = bytes(range(64)) * 128
@@ -147,32 +122,33 @@ class TestOuterZstd(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "trailing or truncated"):
                     validate_zstd_frame(encoded + suffix, len(raw))
 
-    def test_known_content_size_mismatch_fails_before_output_allocation(self):
-        raw = b"abcd" * 100
-        encoded = zstd.ZstdCompressor().compress(raw)
-        reader = OuterZstdReader(
-            {"owner.bin": encoded},
-            lambda _: self.fail("invalid frame allocated a pinned destination"),
-            {},
-        )
-        with self.assertRaisesRegex(ValueError, "content size"):
-            reader.get(entry(encoded, size=len(raw) + 1))
-
-    def test_block_corruption_never_caches_a_prepared_buffer(self):
+    def test_invalid_frames_fail_without_publishing_a_decoded_result(self):
         raw = bytes(range(64)) * 128
         encoded = bytearray(zstd.ZstdCompressor(write_checksum=True).compress(raw))
-        encoded[-1] ^= 1  # Complete envelope, invalid content checksum.
-        targets = []
-
-        def allocate(size):
-            target = bytearray(size)
-            targets.append(target)
-            return target, memoryview(target)
-
-        reader = OuterZstdReader({"owner.bin": encoded}, allocate, {})
+        pool = OuterZstdPool(2)
+        self.addCleanup(pool.close)
+        chunk = dict(
+            encoded_offset=0,
+            encoded_bytes=len(encoded),
+            decoded_offset=0,
+            decoded_bytes=len(raw) + 1,
+        )
+        with self.assertRaisesRegex(ValueError, "content size"):
+            pool.executor.submit(
+                pool.decode,
+                memoryview(encoded),
+                [chunk],
+                memoryview(bytearray(len(raw) + 1)),
+            ).result()
+        chunk["decoded_bytes"] = len(raw)
+        encoded[-1] ^= 1
         with self.assertRaises(zstd.ZstdError):
-            reader.get(entry(encoded, size=len(raw)))
-        self.assertFalse(reader.cache)
+            pool.executor.submit(
+                pool.decode,
+                memoryview(encoded),
+                [chunk],
+                memoryview(bytearray(len(raw))),
+            ).result()
 
     def test_relative_span_accepts_expanded_snappy_without_raw_fallback(self):
         record = entry(bytes(50))

@@ -395,6 +395,7 @@ class GpuDeltaSchedulerControl:
         if error is not None:
             raise ValueError(error)
         if self.identity is None:
+            from sglang.srt.weight_sync.gpu_delta_host import host_cache_id
             from sglang.srt.weight_sync.gpu_delta_layout import GpuDeltaBackend
 
             # proc stat starttime is the 22nd field; comm may contain spaces.
@@ -404,6 +405,7 @@ class GpuDeltaSchedulerControl:
                 "engine_id": engine_id,
                 "rank_id": uuid.uuid4().hex,
                 "hostname": socket.gethostname(),
+                "host_cache_id": host_cache_id(),
                 "pid": os.getpid(),
                 "start_ticks": start_ticks,
                 "tp_rank": parallel.tp_rank,
@@ -459,6 +461,7 @@ class GpuDeltaSchedulerControl:
                             "plan_digest",
                             "participants",
                             "cohort",
+                            "host_tensor_names",
                         )
                     }
                 )

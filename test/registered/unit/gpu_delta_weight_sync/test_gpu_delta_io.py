@@ -80,6 +80,10 @@ def test_describe_binds_published_scheduler_ranks_without_legacy_ps(rank, monkey
             lambda path: io.StringIO(stat),
             raising=False,
         )
+        monkeypatch.setattr(
+            "sglang.srt.weight_sync.gpu_delta_host.host_cache_id",
+            lambda: "shared-host-test",
+        )
         control = GpuDeltaSchedulerControl(scheduler)
         receipt = control._describe("engine-0")
         assert receipt["identity"] | {
@@ -90,6 +94,7 @@ def test_describe_binds_published_scheduler_ranks_without_legacy_ps(rank, monkey
             "engine_id": "engine-0",
             "rank_id": "ignored",
             "hostname": "ignored",
+            "host_cache_id": "shared-host-test",
             "pid": 0,
             "start_ticks": 456,
             "tp_rank": rank,
@@ -167,6 +172,7 @@ def test_prepare_uses_scheduler_updater_session_and_offload_state(
         plan_digest="b" * 64,
         participants=[who],
         cohort=[who],
+        host_tensor_names={"host": []},
     )
     result = control.handle(request)
     assert result.success is not (legacy_session or offloaded)

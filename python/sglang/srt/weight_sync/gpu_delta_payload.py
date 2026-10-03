@@ -14,7 +14,9 @@
 """Immutable delta transport validation; never reads or mutates weights."""
 
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 
 def configured_codec():
@@ -232,47 +234,35 @@ def validate_zstd_frame(payload, expected_size):
         raise ValueError("outer Zstd frame has trailing or truncated bytes")
 
 
-class OuterZstdReader:
-    """One preparation worker, one context, one final pinned copy per tensor."""
+def configured_cpu_workers():
+    value = int(os.environ.get("WEIGHT_DELTA_CPU_WORKERS", "4"))
+    if not 1 <= value <= 32:
+        raise ValueError("WEIGHT_DELTA_CPU_WORKERS must be between 1 and 32")
+    return value
 
-    def __init__(self, files, allocate, timings):
+
+class OuterZstdPool:
+    """Reusable bounded CPU workers; no CUDA work or shared decoder contexts."""
+
+    def __init__(self, workers):
+        self.workers = workers
+        self.executor = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="gpu-delta-zstd"
+        )
+        self.local = threading.local()
+
+    def decode(self, payload, chunks, destination):
         import zstandard as zstd
 
-        self.files, self.allocate, self.timings = files, allocate, timings
-        self.decoder = zstd.ZstdDecompressor()
-        self.cache = {}
-        for key in (
-            "validate_s",
-            "pin_allocate_s",
-            "decode_s",
-            "encoded_bytes",
-            "decoded_bytes",
-            "tensors",
-            "frames",
-        ):
-            timings["host_outer_zstd_" + key] = 0
-
-    def get(self, entry):
-        name = entry["name"]
-        if name in self.cache:
-            return self.cache[name]
-        outer = entry["outer"]
-        start, count, size = (
-            outer[k] for k in ("encoded_offset", "encoded_bytes", "decoded_bytes")
-        )
-        payload = memoryview(self.files[outer["file"]])[start : start + count]
-        chunks = outer["frames"]
+        if not hasattr(self.local, "decoder"):
+            self.local.decoder = zstd.ZstdDecompressor()
         started = time.perf_counter()
         for chunk in chunks:
             offset, length = chunk["encoded_offset"], chunk["encoded_bytes"]
             validate_zstd_frame(
-                payload[offset : offset + length],
-                chunk["decoded_bytes"],
+                payload[offset : offset + length], chunk["decoded_bytes"]
             )
-        self.timings["host_outer_zstd_validate_s"] += time.perf_counter() - started
-        started = time.perf_counter()
-        owner, destination = self.allocate(size)
-        self.timings["host_outer_zstd_pin_allocate_s"] += time.perf_counter() - started
+        validation_s = time.perf_counter() - started
         started = time.perf_counter()
         for chunk in chunks:
             offset, length = chunk["encoded_offset"], chunk["encoded_bytes"]
@@ -280,7 +270,7 @@ class OuterZstdReader:
                 chunk["decoded_offset"],
                 chunk["decoded_offset"] + chunk["decoded_bytes"],
             )
-            with self.decoder.stream_reader(
+            with self.local.decoder.stream_reader(
                 payload[offset : offset + length], read_across_frames=False
             ) as reader:
                 while position < stop:
@@ -292,10 +282,7 @@ class OuterZstdReader:
                     raise ValueError(
                         "outer Zstd output exceeds its declared tensor span"
                     )
-        self.timings["host_outer_zstd_decode_s"] += time.perf_counter() - started
-        self.timings["host_outer_zstd_encoded_bytes"] += len(payload)
-        self.timings["host_outer_zstd_decoded_bytes"] += size
-        self.timings["host_outer_zstd_tensors"] += 1
-        self.timings["host_outer_zstd_frames"] += len(chunks)
-        self.cache[name] = owner
-        return owner
+        return validation_s, time.perf_counter() - started
+
+    def close(self):
+        self.executor.shutdown(wait=True)

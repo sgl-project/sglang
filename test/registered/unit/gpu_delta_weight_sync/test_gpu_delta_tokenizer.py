@@ -134,6 +134,7 @@ def test_prepare_ownership_survives_failed_send(control):
             plan_digest="b" * 64,
             participants=facade.participants,
             cohort=facade.participants,
+            host_tensor_names={"host": []},
         )
         with pytest.raises(OSError):
             await facade.request(prepare)

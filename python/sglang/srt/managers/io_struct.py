@@ -1924,6 +1924,7 @@ class PrepareWeightsFromDeltaReqInput(BaseReq, kw_only=True):
     plan_digest: str
     participants: List[Dict[str, Any]]
     cohort: List[Dict[str, Any]]
+    host_tensor_names: Dict[str, List[str]]
 
 
 class GetWeightsDeltaStatusReqInput(BaseReq, kw_only=True):
