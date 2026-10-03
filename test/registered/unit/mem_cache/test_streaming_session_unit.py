@@ -78,13 +78,10 @@ class _FakeInnerCache:
         self.dec_lock_ref_calls = []
         self.dec_lock_ref_params = []
         self.dec_lock_ref_skip_swa = []
-        self.tree_checkpoints = []
         self.session = StreamingSession(self)
 
     def checkpoint(self, req, *, up_to):
-        if self.session.try_checkpoint(req, up_to=up_to):
-            return
-        self.tree_checkpoints.append((req, up_to))
+        pass
 
     def claim_kv_row(self, req):
         return self.session.try_cache_finished_req(req)
@@ -144,7 +141,6 @@ class _FakeReq:
         self.finished_reason = None
         self.finished_len = None
 
-    rid = "req-0"
     skip_radix_cache_insert = False
 
     def detach_kv(self):
