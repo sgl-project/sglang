@@ -1,0 +1,11 @@
+{"request_input_length": null, "rank": 1, "phase": "EXTEND", "local_tokens": 3, "global_tokens": 6, "batch_size": 1, "extend_num_tokens": 6}
+{"request_input_length": null, "rank": 1, "phase": "DECODE", "local_tokens": 1, "global_tokens": 1, "batch_size": 2, "extend_num_tokens": null}
+{"request_input_length": null, "rank": 1, "phase": "EXTEND", "local_tokens": 1, "global_tokens": 1, "batch_size": 1, "extend_num_tokens": 2}
+{"request_input_length": 1024, "rank": 1, "phase": "EXTEND", "local_tokens": 512, "global_tokens": 1024, "batch_size": 1, "extend_num_tokens": 1024}
+{"request_input_length": 1024, "rank": 1, "phase": "EXTEND", "local_tokens": 1536, "global_tokens": 3072, "batch_size": 3, "extend_num_tokens": 3072}
+{"request_input_length": 1024, "rank": 1, "phase": "DECODE", "local_tokens": 2, "global_tokens": 4, "batch_size": 4, "extend_num_tokens": null}
+{"request_input_length": 8192, "rank": 1, "phase": "EXTEND", "local_tokens": 4096, "global_tokens": 8192, "batch_size": 1, "extend_num_tokens": 8192}
+{"request_input_length": 8192, "rank": 1, "phase": "DECODE", "local_tokens": 2, "global_tokens": 4, "batch_size": 4, "extend_num_tokens": null}
+{"request_input_length": 16384, "rank": 1, "phase": "EXTEND", "local_tokens": 4096, "global_tokens": 8192, "batch_size": 1, "extend_num_tokens": 8192}
+{"request_input_length": 16384, "rank": 1, "phase": "DECODE", "local_tokens": 2, "global_tokens": 3, "batch_size": 4, "extend_num_tokens": null}
+{"request_input_length": 16384, "rank": 1, "phase": "DECODE", "local_tokens": 1, "global_tokens": 1, "batch_size": 2, "extend_num_tokens": null}
