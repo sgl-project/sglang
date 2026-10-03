@@ -6,13 +6,13 @@ from sglang.kernels.jit.benchmark.utils import (
     create_empty,
     create_random,
 )
-from sglang.kernels.ops.kvcache.kvcache import store_cache
+from sglang.kernels.ops.kvcache.kvcache import store_cache, store_k_cache
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
-    est_time=9, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=13, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=9, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=13, stage="jit-kernel-benchmark", runner_config="amd")
 
 
 @torch.compile()
@@ -99,6 +99,44 @@ def benchmark_asymmetric(batch_size: int, k_item: int, v_item: int, impl: str):
     )
 
 
+@torch.compile()
+def torch_compile_store_k_cache(
+    k: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> None:
+    k_cache[indices] = k
+
+
+# No torch_streams entry: overlapping the K and V scatters on two streams is the
+# whole point of that variant, and a K-only pool has nothing to overlap with.
+K_ONLY_FN_MAP = {
+    "jit": store_k_cache,
+    "torch_compile": torch_compile_store_k_cache,
+}
+
+
+# A pool with no V half (MiniMax's sparse index cache, 1 kv head x 128 elements
+# -- hence the CI default). Worth its own sweep rather than reading it off the
+# symmetric one: half the traffic moves the crossover with torch's scatter.
+@marker.parametrize("item_size", [64, 128, 256, 512, 1024], [128])
+@marker.parametrize("batch_size", [2**n for n in range(0, 15)], [16])
+@marker.benchmark("impl", ["jit", "torch_compile"])
+def benchmark_k_only(batch_size: int, item_size: int, impl: str):
+    torch.manual_seed(42)
+    k = create_random(batch_size, item_size)
+    k_cache = create_empty(CACHE_SIZE, item_size)
+    indices = torch.randperm(CACHE_SIZE, device=DEFAULT_DEVICE)[:batch_size]
+    return marker.do_bench(
+        K_ONLY_FN_MAP[impl],
+        input_args=(k, k_cache, indices),
+        graph_clone_args=(0, 2),  # not need to clone cache, which is large
+        memory_args=(k, indices),  # k_cache excluded
+        memory_output=(k,),  # inplace write, size = k
+    )
+
+
 if __name__ == "__main__":
     benchmark.run()
     benchmark_asymmetric.run()
+    benchmark_k_only.run()
