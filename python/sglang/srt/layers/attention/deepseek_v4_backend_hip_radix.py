@@ -1007,12 +1007,15 @@ class DeepseekV4HipRadixBackend(
         # Past MAX_FUSED_ROWS the fp4 schedule falls back to AITER's preamble,
         # which frees the scratch its kernels read -- not capture-safe.
         self._fp4_graph_row_limit: Optional[int] = None
-        if self.enable_deepseek_v4_fp4_indexer and self.speculative_num_steps == 0:
+        if self.enable_deepseek_v4_fp4_indexer:
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
                 MAX_FUSED_ROWS,
+                warmup_prefill_schedule_prep,
             )
 
-            self._fp4_graph_row_limit = MAX_FUSED_ROWS
+            warmup_prefill_schedule_prep(self.device)
+            if self.speculative_num_steps == 0:
+                self._fp4_graph_row_limit = MAX_FUSED_ROWS
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
             DSV4Metadata,
