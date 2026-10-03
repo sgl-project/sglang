@@ -284,6 +284,9 @@ class Envs:
     SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
     IS_H200 = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
+    # Fork the worker processes from a forkserver that has the worker modules
+    # preloaded, instead of re-importing them in every spawned worker.
+    SGLANG_ENABLE_EARLY_FORKSERVER = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

@@ -46,6 +46,11 @@ def main():
     args, extra_argv = parser.parse_known_args()
 
     if args.subcommand == "serve":
+        # Before the launcher's heavy imports, so the forkserver's preload
+        # overlaps them. No-op unless SGLANG_ENABLE_EARLY_FORKSERVER=1.
+        from sglang.srt.entrypoints.early_forkserver import start_early
+
+        start_early()
         from sglang.cli.serve import serve
 
         serve(args, extra_argv)
