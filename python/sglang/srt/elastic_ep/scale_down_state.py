@@ -48,6 +48,7 @@ class ScaleDownStateMachine:
     _drain_barrier_handle: Optional[object] = None
     _drain_post_attempts: int = 0
     _drain_barrier_done: bool = False
+    _departure_announced: bool = False
     _nixl_barrier_handle: Optional[object] = None
     _nixl_post_attempts: int = 0
     # Bounded re-arms, then fail rather than flip the mask unsynchronized.
@@ -57,6 +58,27 @@ class ScaleDownStateMachine:
 
     def is_terminal(self) -> bool:
         return self.state in _TERMINAL
+
+    def abandon(self, driver) -> None:
+        """Release any barrier this rank posted, before the machine is discarded.
+
+        The store barriers are leader-based: whoever posted an epoch first owes the
+        ARRIVAL reset. Dropping the machine with a handle outstanding leaves that epoch
+        held, and the next cycle's first arrival then never reads 1, so every later
+        scale waits on a barrier that can no longer arm. Idempotent."""
+        for attr in ("_drain_barrier_handle", "_nixl_barrier_handle"):
+            handle = getattr(self, attr)
+            if handle is None:
+                continue
+            setattr(self, attr, None)
+            try:
+                driver.consume_barrier(handle)
+            except Exception:
+                logger.warning(
+                    "[Elastic EP] releasing %s during teardown failed",
+                    attr,
+                    exc_info=True,
+                )
 
     def is_failed(self) -> bool:
         return self.state is ScaleDownState.FAILED
@@ -121,6 +143,16 @@ class ScaleDownStateMachine:
         if self.state is S.DRAIN:
             # Past the barrier, awaiting cohort agreement; serving keeps mlp_sync alive.
             if self._drain_barrier_done:
+                if not self._departure_announced:
+                    # Idle is re-checked here, not just before the barrier post: this
+                    # rank keeps serving across the barrier wait, so work admitted in
+                    # that window would otherwise ride along to sys.exit(). Holding
+                    # here simply stays in DRAIN, and an unannounced retiree keeps
+                    # contributing 1 to the mlp_sync, so the cohort waits with it.
+                    if self.is_retiree and not driver.local_idle(self):
+                        return
+                    driver.announce_departure(self)
+                    self._departure_announced = True
                 if not driver.departure_cleared(self):
                     return
                 self.state = S.NIXL_RETIRE
@@ -143,15 +175,15 @@ class ScaleDownStateMachine:
                     )
                 self._drain_barrier_handle = driver.post_drain_barrier(self)
                 return
-                # Probe, never wait: every peer here is still serving, so waiting
-                # stalls cohort decode for the window. The NIXL fold does wait --
-                # there peers have gated, and the same-tick crossing needs it.
+            # Probe, never wait: every peer here is still serving, so waiting
+            # stalls cohort decode for the window. The NIXL fold does wait --
+            # there peers have gated, and the same-tick crossing needs it.
             if not driver.check_barrier(self._drain_barrier_handle, keep_serving=True):
                 return
             driver.consume_barrier(self._drain_barrier_handle)
             self._drain_barrier_handle = None
             self._drain_barrier_done = True
-            driver.announce_departure(self)
+            # Departure is announced from the branch above, after a fresh idle check.
             return
 
         if self.state is S.NIXL_RETIRE:
