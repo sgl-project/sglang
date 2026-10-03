@@ -14,6 +14,11 @@ from unittest.mock import AsyncMock, MagicMock
 import torch
 
 from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
+from sglang.srt.entrypoints.openai.protocol import (
+    EmbeddingRequest,
+    MultimodalEmbeddingInput,
+)
+from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -207,6 +212,78 @@ class TestEmbeddingReqInputEmbedOverride(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_single_override_normalization(self):
+        """Single requests must remove the per-input axis before resolution."""
+        for prompt in ({"input_ids": [50, 10, 50]}, {"text": "placeholder text"}):
+            for embeds in ([_vec(1), _vec(2)], None):
+                with self.subTest(prompt=prompt, skip=embeds is None):
+                    req = EmbeddingReqInput(
+                        **prompt,
+                        embed_override_token_id=50,
+                        embed_overrides=[embeds],
+                    )
+                    req.normalize_batch_and_arguments()
+                    self.assertTrue(req.is_single)
+                    self.assertIs(req.embed_overrides, embeds)
+                    if embeds is not None:
+                        resolved = TokenizerManager._resolve_embed_overrides(
+                            [50, 10, 50],
+                            req.embed_override_token_id,
+                            req.embed_overrides,
+                        )
+                        self.assertEqual(resolved.positions, [0, 2])
+                        torch.testing.assert_close(resolved.embeds, torch.stack(embeds))
+
+    def test_openai_override_normalization(self):
+        """The API's per-input overrides work for scalar and batched inputs."""
+        serving = OpenAIServingEmbedding(
+            MagicMock(tokenizer=None), MagicMock(chat_template_name=None)
+        )
+        for input_value in (
+            [50, 10, 50],
+            [[50, 10, 50]],
+            "placeholder text",
+            ["placeholder text"],
+            [MultimodalEmbeddingInput(text="placeholder text")],
+        ):
+            for overrides in ([[1.0] * HIDDEN_DIM, [2.0] * HIDDEN_DIM], None):
+                with self.subTest(input=input_value, skip=overrides is None):
+                    request = EmbeddingRequest(
+                        input=input_value,
+                        embed_override_token_id=50,
+                        embed_overrides=[overrides],
+                    )
+                    req, _ = serving._convert_to_internal_request(request)
+                    req.normalize_batch_and_arguments()
+                    item = req if req.is_single else req[0]
+                    if overrides is None:
+                        self.assertIsNone(item.embed_overrides)
+                    else:
+                        resolved = TokenizerManager._resolve_embed_overrides(
+                            [50, 10, 50],
+                            item.embed_override_token_id,
+                            item.embed_overrides,
+                        )
+                        self.assertEqual(resolved.positions, [0, 2])
+                        torch.testing.assert_close(
+                            resolved.embeds, torch.tensor(overrides)
+                        )
+
+    def test_batch_override_normalization_with_skip(self):
+        embeds = [_vec(1), _vec(2)]
+        req = EmbeddingReqInput(
+            input_ids=[[50, 10, 50], [20]],
+            embed_override_token_id=50,
+            embed_overrides=[embeds, None],
+        )
+        req.normalize_batch_and_arguments()
+        resolved = TokenizerManager._resolve_embed_overrides(
+            req[0].input_ids, req[0].embed_override_token_id, req[0].embed_overrides
+        )
+        self.assertEqual(resolved.positions, [0, 2])
+        torch.testing.assert_close(resolved.embeds, torch.stack(embeds))
+        self.assertIsNone(req[1].embed_overrides)
 
     def test_override_fields_in_getitem(self):
         """embed_override_token_id, embed_overrides, and positional_embed_overrides
