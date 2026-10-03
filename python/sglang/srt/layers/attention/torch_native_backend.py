@@ -40,12 +40,16 @@ class TorchNativeAttnBackend(AttentionBackend):
         sliding_window_size: int,
         device: torch.device,
         query_offset: int = 0,
+        causal: bool = True,  # Default to True to preserve old behaviour
     ) -> torch.Tensor:
         q_pos = torch.arange(
             query_offset, query_offset + q_len, device=device
         ).unsqueeze(1)
         k_pos = torch.arange(kv_len, device=device).unsqueeze(0)
-        return (k_pos <= q_pos) & (k_pos >= q_pos - sliding_window_size)
+        if causal:
+            return (k_pos <= q_pos) & (k_pos >= q_pos - sliding_window_size)
+        else:
+            return torch.abs(q_pos - k_pos) <= sliding_window_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -153,6 +157,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                     kv_len=seq_len_kv,
                     sliding_window_size=sliding_window_size,
                     device=per_req_query.device,
+                    causal=causal,
                 )
                 is_causal = False
 
@@ -255,6 +260,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                     sliding_window_size=sliding_window_size,
                     device=per_req_query.device,
                     query_offset=seq_len_kv - seq_len_q,
+                    causal=causal,
                 )
                 is_causal = False
 
@@ -326,8 +332,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             is_cross_attn=layer.is_cross_attention,
             sliding_window_size=(
                 layer.sliding_window_size
-                if causal
-                and not layer.is_cross_attention
+                if not layer.is_cross_attention
                 and layer.sliding_window_size is not None
                 and layer.sliding_window_size > -1
                 else None
