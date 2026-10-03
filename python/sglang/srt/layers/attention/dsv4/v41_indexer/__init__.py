@@ -93,7 +93,7 @@ def make_candidate_indexer(
     candidate_topk_blocks: int,
     candidate_block_size: int,
 ) -> Tuple[PrefillCandidates, DecodeCandidates]:
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_parallel, get_platform
 
     from .dense_blocks import DenseBlocksBackend
 
@@ -114,6 +114,10 @@ def make_candidate_indexer(
     )
 
     if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
+        # DeepGEMM's paged sparse MQA logits are SM100-only; SM12x decodes the
+        # dense-blocks scheme from the Triton paged scores, as Hopper does.
+        if get_platform().is_sm120:
+            return dense_blocks, dense_blocks
         raise RuntimeError(
             "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
             "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
