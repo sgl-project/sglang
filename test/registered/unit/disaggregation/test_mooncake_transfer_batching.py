@@ -1,14 +1,18 @@
 import concurrent.futures
 import ctypes
 import unittest
-from threading import Event
+from collections import defaultdict
+from queue import SimpleQueue
+from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 
-from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -405,6 +409,133 @@ class TestDcpPackLifetime(CustomTestCase):
                 release.set()
             self.assertEqual(future.result(timeout=10), 17)
         self.assertEqual(observed, [11])
+
+
+class TestMooncakeEarlySend(unittest.TestCase):
+    def test_sender_queues_event_once_without_waiting_on_scheduler(self):
+        for last in (False, True):
+            with self.subTest(last=last):
+                ready = MagicMock()
+                manager = MagicMock()
+                sender = SimpleNamespace(
+                    kv_mgr=manager,
+                    bootstrap_room=1,
+                    aux_index=0,
+                    trace_ctx=MagicMock(),
+                    _early_send_wait_event=ready,
+                    _prepare_send_indices=lambda ids, state: (
+                        ids,
+                        slice(0, 1),
+                        last,
+                        False,
+                    ),
+                    _record_transfer_indices=MagicMock(),
+                )
+                MooncakeKVSender.send(sender, [0])
+                self.assertIs(
+                    manager.add_transfer_request.call_args.kwargs["wait_event"], ready
+                )
+                ready.synchronize.assert_not_called()
+                MooncakeKVSender.send(sender, [1])
+                self.assertIsNone(
+                    manager.add_transfer_request.call_args.kwargs["wait_event"]
+                )
+
+    def test_manager_preserves_event_in_queued_chunk(self):
+        queue = SimpleQueue()
+        ready = MagicMock()
+        manager = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            request_status={1: KVPoll.WaitingForInput},
+            check_status=lambda room: KVPoll.WaitingForInput,
+            transfer_infos={1: {"127.0.0.1:80": object()}},
+            transfer_queues=[queue],
+        )
+        MooncakeKVManager.add_transfer_request(
+            manager, 1, [0], slice(0, 1), False, wait_event=ready
+        )
+        self.assertIs(queue.get_nowait().wait_event, ready)
+        ready.synchronize.assert_not_called()
+
+    def _worker(self, event):
+        chunk = TransferKVChunk(
+            1, [0], slice(0, 1), False, None, None, wait_event=event
+        )
+        queue = SimpleQueue()
+        queue.put(chunk)
+        queue.put(None)
+        peer = SimpleNamespace(
+            is_dummy=False,
+            mooncake_session_id="peer",
+            dst_device_kv_indices=None,
+            dst_kv_indices=[10],
+        )
+        registration = SimpleNamespace(
+            requires_dcp_relayout=False,
+            dst_kv_ptrs=[1000],
+            dst_kv_layer_ids=[0],
+            dst_kv_item_len=16,
+            dst_attn_tp_size=1,
+        )
+        manager = SimpleNamespace(
+            enable_trace=False,
+            enable_staging=False,
+            enable_deferred_decode_kv_release=True,
+            _staging_outstanding=defaultdict(int),
+            request_status={1: KVPoll.WaitingForInput},
+            transfer_infos={1: {"peer": peer}},
+            _prefill_unique_rank=lambda: 0,
+            session_lock=Lock(),
+            failed_sessions=set(),
+            decode_kv_args_table={"peer": registration},
+            _get_dsa_cache_transfer_skip_flags=lambda reg: (False, False),
+            kv_args=SimpleNamespace(kv_data_ptrs=[1]),
+            is_mla_backend=True,
+            send_kvcache=MagicMock(return_value=0),
+            _maybe_ack_drained_abort=MagicMock(),
+            bootstrap_port=8998,
+        )
+        manager.check_status = lambda room: manager.request_status[room]
+        return manager, queue
+
+    def test_worker_waits_before_reading_kv(self):
+        ready = MagicMock()
+        manager, queue = self._worker(ready)
+
+        def transfer(*args, **kwargs):
+            ready.synchronize.assert_called_once_with()
+            return 0
+
+        manager.send_kvcache.side_effect = transfer
+        MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        manager.send_kvcache.assert_called_once()
+
+    def test_abort_during_wait_prevents_transfer_and_releases_ack(self):
+        ready = MagicMock()
+        manager, queue = self._worker(ready)
+        ready.synchronize.side_effect = lambda: manager.request_status.update(
+            {1: KVPoll.Failed}
+        )
+        MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        ready.synchronize.assert_called_once_with()
+        manager.send_kvcache.assert_not_called()
+        manager._maybe_ack_drained_abort.assert_called_once_with(1)
+        self.assertNotIn(1, manager._staging_outstanding)
+
+    def test_failed_room_skips_wait(self):
+        ready = MagicMock()
+        manager, queue = self._worker(ready)
+        manager.request_status[1] = KVPoll.Failed
+        MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        ready.synchronize.assert_not_called()
+        manager.send_kvcache.assert_not_called()
+        manager._maybe_ack_drained_abort.assert_called_once_with(1)
+        self.assertNotIn(1, manager._staging_outstanding)
+
+    def test_worker_preserves_no_event_path(self):
+        manager, queue = self._worker(None)
+        MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        manager.send_kvcache.assert_called_once()
 
 
 if __name__ == "__main__":
