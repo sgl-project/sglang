@@ -54,6 +54,16 @@ register_kernel(
     )
 )
 
+register_kernel(
+    KernelSpec(
+        op="embeddings.nvfp4_embedding",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.embeddings.nvfp4_embedding:nvfp4_embedding",
+        # Triton enables the E4M3 scale dtype on NVIDIA SM 8.9 and newer only.
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+
 __all__ = []
 
 

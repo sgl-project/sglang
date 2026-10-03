@@ -692,6 +692,55 @@ class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
 _E2M1_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
+def _supports_fused_nvfp4_embedding(
+    layer: torch.nn.Module, group_size: int, output_dtype: torch.dtype
+) -> bool:
+    """Whether the loaded table can use the fused kernel bit-exactly."""
+    # ROCm tensors also report device type "cuda"; is_cuda() excludes them.
+    if not is_cuda():
+        return False
+    if output_dtype not in (torch.bfloat16, torch.float16):
+        return False
+
+    weight = layer.weight
+    weight_scale = layer.weight_scale
+    weight_scale_2 = layer.weight_scale_2
+    if weight.device.type != "cuda":
+        return False
+    for tensor in (weight, weight_scale, weight_scale_2):
+        if tensor.device != weight.device or not tensor.is_contiguous():
+            return False
+    if weight.dtype != torch.uint8 or weight.ndim != 2:
+        return False
+    if weight_scale.dtype != torch.float8_e4m3fn:
+        return False
+    if weight_scale_2.dtype != torch.float32 or weight_scale_2.numel() != 1:
+        return False
+
+    num_rows = weight.shape[0]
+    embedding_dim = weight.shape[1] * 2
+    if embedding_dim <= 0 or group_size <= 0 or embedding_dim % group_size:
+        return False
+    if tuple(weight_scale.shape) != (num_rows, embedding_dim // group_size):
+        return False
+
+    # Triton enables the E4M3 scale dtype on NVIDIA SM 8.9 and newer only.
+    major, minor = get_device_capability(weight.device.index)
+    if major is None:
+        return False
+    return (major, minor) >= (8, 9)
+
+
+def _can_use_fused_nvfp4_embedding(
+    layer: torch.nn.Module, input_: torch.Tensor
+) -> bool:
+    if not layer.use_fused_nvfp4_embedding:
+        return False
+    if input_.dtype not in (torch.int32, torch.int64):
+        return False
+    return input_.device == layer.weight.device
+
+
 class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
     """NVFP4 token embedding, dequantized on gather."""
 
@@ -756,9 +805,14 @@ class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
             torch.tensor(_E2M1_LUT, dtype=torch.float32),
             persistent=False,
         )
+        layer.use_fused_nvfp4_embedding = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        pass
+        # Decided once, not per lookup: torch.compile traces every lookup and
+        # cannot cache a device-capability query.
+        layer.use_fused_nvfp4_embedding = _supports_fused_nvfp4_embedding(
+            layer, self.quant_config.group_size, self.params_dtype
+        )
 
     def apply(self, *args, **kwargs):
         raise NotImplementedError(
@@ -768,6 +822,19 @@ class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
         )
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        group_size = self.quant_config.group_size
+        if _can_use_fused_nvfp4_embedding(layer, input_):
+            from sglang.kernels.ops.embeddings.nvfp4_embedding import nvfp4_embedding
+
+            return nvfp4_embedding(
+                input_,
+                layer.weight,
+                layer.weight_scale,
+                layer.weight_scale_2,
+                group_size=group_size,
+                output_dtype=self.params_dtype,
+            )
+
         index_shape = input_.shape
         flat = input_.reshape(-1)
         packed = layer.weight[flat]  # [T, H/2] uint8
@@ -782,7 +849,6 @@ class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
         mag = layer.e2m1_lut[(codes & 0x7).long()]
         vals = torch.where(codes & 0x8 != 0, -mag, mag)
 
-        group_size = self.quant_config.group_size
         eff = scale.float() * layer.weight_scale_2.float()
         out = vals.view(rows, hidden // group_size, group_size) * eff.unsqueeze(-1)
         return out.view(*index_shape, hidden).to(self.params_dtype)
