@@ -1818,6 +1818,9 @@ class Envs:
     # falls back to the engine's default kernel when the contract is not met.
     # See python/sglang/kernels/cake_kernels/_routes.py for the route names.
     SGLANG_CAKE_ROUTES = EnvStr("")
+    # Cake route diagnostics: log per-call input summaries and synchronize after each Cake
+    # stage so a device-side fault is attributed to the stage that raised it (never on in production).
+    SGLANG_CAKE_DEBUG = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
