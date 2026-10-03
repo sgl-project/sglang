@@ -46,7 +46,6 @@ _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
-_has_attentions = False
 
 if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
@@ -57,19 +56,6 @@ if _is_npu:
         fused_rmsnorm_without_weight,
     )
 
-    try:
-        import attentions  # noqa: F401
-
-        _has_attentions = True
-    except ImportError:
-        from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-        logger = init_logger(__name__)  # pylint: disable=invalid-name
-        logger.warning_once(
-            "The 'attentions' library is not installed. Falling back to native layernorm. "
-            "Installing this library may improve performance on NPU. "
-            "See: sgl-project/sgl-kernel-npu"
-        )
 
 if _is_musa:
     from sgl_kernel import fused_add_rmsnorm
@@ -441,31 +427,7 @@ class LayerNorm(CustomOp):
 # adapted from Diffusers: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/normalization.py
 # NOTE(will): Needed to match behavior of diffusers and wan2.1 even while using
 # FSDP's MixedPrecisionPolicy
-@CustomOp.register("fp32_layer_norm")
-class FP32LayerNorm(CustomOp, nn.LayerNorm):
-    def __init__(
-        self,
-        normalized_shape,
-        eps=1e-5,
-        elementwise_affine=True,
-        bias=True,
-        device=None,
-        dtype=None,
-    ):
-        nn.LayerNorm.__init__(
-            self,
-            normalized_shape=normalized_shape,
-            eps=eps,
-            elementwise_affine=elementwise_affine,
-            bias=bias,
-            device=device,
-            dtype=dtype,
-        )
-        self._forward_method = self.dispatch_forward()
-
-        if _is_npu and not _has_attentions:
-            self._forward_method = self.forward_native
-
+class FP32LayerNorm(nn.LayerNorm):
     def _cached_fp32_param(
         self, attr: str, param: torch.Tensor | None, device: torch.device
     ) -> torch.Tensor | None:
@@ -507,22 +469,6 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
 
     def forward_cuda(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.forward_native(inputs)
-
-    def forward_npu(self, inputs: torch.Tensor) -> torch.Tensor:
-        origin_dtype = inputs.dtype
-        device = inputs.device
-        weight = self._cached_fp32_param("_weight_fp32_cache", self.weight, device)
-        bias = self._cached_fp32_param("_bias_fp32_cache", self.bias, device)
-
-        output, _, _ = torch.ops.attentions.layernorm(
-            input=inputs,
-            normalized_shape=list(self.normalized_shape),
-            weight=weight,
-            bias=bias,
-            eps=self.eps,
-            impl_mode=0,
-        )
-        return output.to(origin_dtype)
 
     def forward_xpu(self, inputs: torch.Tensor) -> torch.Tensor:
         def matches_input(param: torch.Tensor | None) -> bool:
