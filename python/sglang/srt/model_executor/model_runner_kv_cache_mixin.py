@@ -1052,7 +1052,11 @@ class ModelRunnerKVCacheMixin:
                     )
 
         # Initialize token_to_kv_pool_allocator
-        need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
+        # Enable page sorting using the SGLANG_SORT_PAGE environment variable.
+        need_sort = (
+            self.server_args.disaggregation_mode in ("decode", "prefill")
+            or envs.SGLANG_SORT_PAGE.get()
+        )
         if self.token_to_kv_pool_allocator is None:
             if current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()

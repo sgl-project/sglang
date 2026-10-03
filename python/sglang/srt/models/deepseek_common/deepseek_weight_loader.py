@@ -733,13 +733,11 @@ class DeepseekV2WeightLoaderMixin:
                         self_attn.w_scale = scale
 
             if w.dtype == torch.int8:
-                weight_block_size = (
-                    self.quant_config.weight_block_size
-                    if self.quant_config is not None
-                    else None
-                )
-                if weight_block_size is not None:
+                # only enter block quant path when block size is not None
+                # otherwise will return non dequant weight in some mix-quant-config like w4a8
+                if getattr(self.quant_config, "weight_block_size", None) is not None:
                     # block-wise int8 need it
+                    weight_block_size = self.quant_config.weight_block_size
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
                     weight = w
                     weight_scale = self_attn.kv_b_proj.weight_scale_inv

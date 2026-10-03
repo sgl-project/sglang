@@ -332,7 +332,8 @@ class ExpertLocationMetadata:
             assert (other_field is not None) == (self_field is not None)
             if self_field is not None:
                 mask_update = torch.tensor(
-                    [i in update_layer_ids for i in range(self.num_layers)]
+                    [i in update_layer_ids for i in range(self.num_layers)],
+                    pin_memory=True,
                 )
                 mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
                 mask_update = mask_update.to(self_field.device, non_blocking=True)
