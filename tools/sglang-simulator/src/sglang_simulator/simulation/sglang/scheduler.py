@@ -455,9 +455,8 @@ class C_SchedulerHook(BaseHook):
                         )
                     )
                     # Accumulate predictor execution time for performance analysis.
-                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += (
-                        time.perf_counter() - pred_start
-                    )
+                    predictor_time_cost = time.perf_counter() - pred_start
+                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += predictor_time_cost
                     predicted_latency = float(predicted_latency)
 
                     forward_latency = 0
@@ -468,6 +467,10 @@ class C_SchedulerHook(BaseHook):
                         StateManager.set_last_real_time_ts(now)
                     else:
                         forward_latency = predicted_latency
+                        # Predictor queries are simulation work, not scheduler CPU overhead.
+                        StateManager.set_last_real_time_ts(
+                            StateManager.get_last_real_time_ts() + predictor_time_cost
+                        )
 
                     StateManager.set_current_inference_dur(forward_latency)
 
