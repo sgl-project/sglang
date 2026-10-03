@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_gfx95_supported, is_xpu
 
 from ..common.utils import (
     _bitonic_merge,
@@ -35,11 +35,14 @@ def _prune_decode_configs(configs, named_args, **kwargs):
 
 
 _ON_HIP = torch.version.hip is not None
+_ON_GFX95 = _ON_HIP and is_gfx95_supported()
 
 
 def _decode_score_block_n(args):
-    # gfx950 pick: 512 for tiny batches (few CTAs), else 128.
-    return max(512 if args["batch_size"] <= 4 else 128, args["block_size"])
+    # gfx950 pick: 512 for tiny batches (few CTAs), else 128. A 512-token K tile
+    # needs 128 KiB of LDS, which gfx942 (64 KiB) does not have.
+    tiny_batch = _ON_GFX95 and args["batch_size"] <= 4
+    return max(512 if tiny_batch else 128, args["block_size"])
 
 
 # On ROCm the autotune sweep is replaced by a fixed config plus the
