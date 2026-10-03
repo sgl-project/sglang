@@ -33,13 +33,12 @@ Place model-specific implementations and tuning data inside the corresponding
 logical operator group, rather than creating a model-specific top-level group
 under `ops/`.
 
-`lora` is an ownership group rather than a computation class: it holds the
-adapter-side kernels (`dense/` SGMV GEMMs and tuning data, `moe/` fused
-MoE-LoRA) that only the LoRA runtime in `srt/lora` calls, plus the experimental
-TRT-LLM LoRA path, kept whole as `dense/trtllm_lora_temp/` and
-`moe/trtllm_lora_temp/` (the latter includes the FlashInfer overlay and the
-flag-gated routing kernels that `srt/layers/moe/topk.py` reaches). Registry op
-ids keep the `gemm.` / `moe.` prefix of the computation they perform.
+`lora` is its own group because it has a distinct responsibility: the adapter
+kernels that only the LoRA runtime in `srt/lora` calls (`dense/` SGMV GEMMs and
+their tuning data, `moe/` fused MoE-LoRA). It also keeps the experimental
+TRT-LLM LoRA path whole as `dense/trtllm_lora_temp/` and
+`moe/trtllm_lora_temp/`; the latter includes the FlashInfer overlay and the
+flag-gated routing kernels that `srt/layers/moe/topk.py` reaches.
 
 As of the RFC #29630 finale (#32072) the legacy `sglang.jit_kernel` package has
 been **removed**: its shared build/runtime infra moved to `sglang.kernels.jit`
