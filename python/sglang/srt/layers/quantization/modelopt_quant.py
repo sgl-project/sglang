@@ -2887,6 +2887,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
             layer.w2_blockscale_swizzled = layer.w2_weight_scale
 
+            # Opt-in Cake NVFP4 warp-decode runner over the same TRT-LLM weight
+            # view (SGLANG_CAKE_ROUTES=moe_nvfp4_warp_decode); None when the
+            # route is off or the layer geometry is not admitted.
+            from sglang.srt.layers.moe.moe_runner.cake_warp_decode import (
+                maybe_create_cake_warp_decode_moe,
+            )
+
+            layer._cake_warp_decode = maybe_create_cake_warp_decode_moe(layer)
+
         else:
             # CUTLASS processing - handle w13 and w2 separately
 
@@ -3168,6 +3177,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 gemm1_alpha=gemm1_alpha.data if gemm1_alpha is not None else None,
                 gemm1_beta=gemm1_beta.data if gemm1_beta is not None else None,
                 gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,
+                cake_warp_decode=getattr(layer, "_cake_warp_decode", None),
             )
 
             return self.runner.run(dispatch_output, quant_info)
