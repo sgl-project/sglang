@@ -470,8 +470,11 @@ pub(super) async fn unary_chat(
         // Split reasoning markers out of the content first (Python splits
         // before tool-call parsing too), then parse tool calls on the clean
         // normal text.
-        let (reasoning_text, text) =
-            split_reasoning_unary(reasoning_parser.as_deref(), &output.text, &output.token_ids);
+        let (reasoning_text, text) = split_reasoning_unary(
+            reasoning_parser.as_deref(),
+            &output.text,
+            output.text_token_ids(),
+        );
         let (content, tool_calls) = parse_chat_tool_calls(
             text,
             parser.as_deref(),
@@ -605,7 +608,7 @@ pub(super) fn chat_event_stream(
             let mut emitted = Vec::with_capacity(2);
             if reasoning_enabled {
                 let (reasoning_text, normal_text) =
-                    reasoning_splitters[index].split(&output.text, &output.token_ids);
+                    reasoning_splitters[index].split(&output.text, output.text_token_ids());
                 let mut remaining_logprobs =
                     want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
                 if !reasoning_text.is_empty() {

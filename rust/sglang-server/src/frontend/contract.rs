@@ -36,6 +36,7 @@ pub(crate) struct FrontendOutput {
     pub(crate) prompt_tokens: u32,
     pub(crate) text: String,
     pub(crate) completion_tokens: u64,
+    pub(crate) stop_token_trimmed: bool,
     pub(crate) extras: Option<Box<ChunkExtras>>,
 }
 
@@ -48,6 +49,7 @@ impl From<ChunkEvent> for FrontendOutput {
             prompt_tokens,
             text,
             completion_tokens,
+            stop_token_trimmed,
             extras,
         } = output;
         Self {
@@ -56,12 +58,22 @@ impl From<ChunkEvent> for FrontendOutput {
             prompt_tokens,
             text,
             completion_tokens,
+            stop_token_trimmed,
             extras,
         }
     }
 }
 
 impl FrontendOutput {
+    /// The token IDs behind `text`: `token_ids` without a matched stop token
+    /// that the detokenizer left out of the text. Parsers that read IDs
+    /// alongside the text use this view so the stop token stays out of their
+    /// output too.
+    pub(crate) fn text_token_ids(&self) -> &[i64] {
+        let trimmed = usize::from(self.stop_token_trimmed);
+        &self.token_ids[..self.token_ids.len().saturating_sub(trimmed)]
+    }
+
     /// Fold one runtime delta into this cumulative native-generation output.
     ///
     /// Runtime events are always incremental. Native HTTP and `runtime.v1`
@@ -75,6 +87,7 @@ impl FrontendOutput {
         self.prompt_tokens = delta.prompt_tokens;
         if delta.finish_reason.is_some() {
             self.finish_reason = delta.finish_reason.clone();
+            self.stop_token_trimmed = delta.stop_token_trimmed;
         }
 
         let Some(delta_extras) = delta.extras.as_deref() else {
@@ -353,4 +366,32 @@ pub(crate) struct MemoryUsage {
 pub(crate) enum MemoryMeasurement {
     Number(f64),
     String(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrontendOutput;
+
+    /// A trimmed stop token stays in the accumulated `token_ids` but out of the
+    /// parser view, which must line up with the accumulated text.
+    #[test]
+    fn text_token_ids_excludes_a_trimmed_stop_token() {
+        let mut output = FrontendOutput {
+            token_ids: vec![1],
+            ..Default::default()
+        };
+        assert_eq!(output.text_token_ids(), [1]);
+
+        output.append_delta(&FrontendOutput {
+            token_ids: vec![2, 3],
+            finish_reason: serde_json::from_value(
+                serde_json::json!({"type": "stop", "matched": 3}),
+            )
+            .expect("finish reason must parse"),
+            stop_token_trimmed: true,
+            ..Default::default()
+        });
+        assert_eq!(output.token_ids, [1, 2, 3]);
+        assert_eq!(output.text_token_ids(), [1, 2]);
+    }
 }

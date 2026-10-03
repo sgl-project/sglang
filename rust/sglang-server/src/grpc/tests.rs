@@ -84,6 +84,7 @@ fn chunk(rid: &Rid, text: &str, token_id: i64, finished: bool) -> ChunkEvent {
         prompt_tokens: 3,
         text: text.into(),
         completion_tokens: 1,
+        stop_token_trimmed: false,
         extras: None,
     }
 }

@@ -644,6 +644,7 @@ mod tests {
                         hidden_lens: vec![2, 1],
                         ..Default::default()
                     })),
+                    ..Default::default()
                 },
             ];
 
