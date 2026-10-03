@@ -54,6 +54,11 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
+    # Platform-specific fingerprint extras. On NPU/Ascend,
+    # current_platform.get_device_capability() always reports (0,0), so we carry
+    # the device name/uuid + torch_npu version here instead; CUDA keeps this
+    # empty and relies on device_capability alone.
+    platform_extra: Dict[str, str] = msgspec.field(default_factory=dict)
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
@@ -248,6 +253,12 @@ def compute_env_stamp() -> Dict[str, str]:
     map cleanly over IPC yet serve garbage; stamping these into CacheConfig turns
     that into a clean mismatch. Imported lazily so protocol.py stays cheap to
     import and usable on CPU-only hosts (both fields degrade to "").
+
+    On NPU/Ascend ``get_device_capability()`` always reports ``(0, 0)`` (it reads
+    ``TORCH_NPU_DEVICE_CAPABILITY`` and is not the real hardware capability), so
+    the capability fingerprint alone cannot distinguish NPU models. We append the
+    device name / uuid and the torch_npu version under the ``platform_extra`` key
+    (a ``CacheConfig`` field) so mismatched Ascend hardware is still caught.
     """
     device_capability = ""
     torch_version = ""
@@ -265,7 +276,28 @@ def compute_env_stamp() -> Dict[str, str]:
             device_capability = f"{cap.major}.{cap.minor}"
     except Exception:
         pass
-    return {"device_capability": device_capability, "torch_version": torch_version}
+
+    stamp = {
+        "device_capability": device_capability,
+        "torch_version": torch_version,
+        "platform_extra": {},
+    }
+    try:
+        from sglang.srt.utils.common import is_npu
+
+        if is_npu():
+            import torch_npu  # noqa: F401
+
+            from sglang.srt.platforms import current_platform
+
+            stamp["platform_extra"] = {
+                "device_name": current_platform.get_device_name(0),
+                "device_uuid": current_platform.get_device_uuid(0),
+                "torch_npu_version": str(torch_npu.__version__),
+            }
+    except Exception:
+        pass
+    return stamp
 
 
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
