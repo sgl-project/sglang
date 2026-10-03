@@ -64,6 +64,7 @@ def cutlass_w4a8_moe(
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
     routed_scaling_factor: float = 1.0,
+    group_size: int = 128,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -123,6 +124,16 @@ def cutlass_w4a8_moe(
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
     topk = topk_ids.size(1)
+
+    if group_size != 128:
+        raise ValueError(
+            "cutlass_w4a8_moe only supports group_size=128 "
+            f"(kernel chunk_size), got {group_size}"
+        )
+    if k % 128 != 0:
+        raise ValueError(
+            f"cutlass_w4a8_moe requires K divisible by 128, got K={k}"
+        )
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
@@ -190,7 +201,7 @@ def cutlass_w4a8_moe(
         b_strides1,
         c_strides1,
         s_strides13,
-        128,
+        group_size,
         topk,
     )
 
@@ -220,7 +231,7 @@ def cutlass_w4a8_moe(
         b_strides2,
         c_strides2,
         s_strides2,
-        128,
+        group_size,
         topk,
     )
 
@@ -262,6 +273,7 @@ def cutlass_w4a8_moe_deepep_normal(
     problem_sizes2: torch.Tensor,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    group_size: int = 128,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -385,7 +397,7 @@ def cutlass_w4a8_moe_deepep_normal(
         b_strides1,
         c_strides1,
         s_strides13,
-        128,
+        group_size,
         topk,
     )
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.bfloat16)
@@ -408,7 +420,7 @@ def cutlass_w4a8_moe_deepep_normal(
         b_strides2,
         c_strides2,
         s_strides2,
-        128,
+        group_size,
         topk,
     )
     num_tokens = src2dst.shape[0] // topk
@@ -457,6 +469,7 @@ def cutlass_w4a8_moe_deepep_ll(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     expected_m: Optional[int] = None,
+    group_size: int = 128,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -552,7 +565,7 @@ def cutlass_w4a8_moe_deepep_ll(
         b_strides1,
         c_strides1,
         s_strides13,
-        128,
+        group_size,
         topk,
     )
 
@@ -574,7 +587,7 @@ def cutlass_w4a8_moe_deepep_ll(
         b_strides2,
         c_strides2,
         s_strides2,
-        128,
+        group_size,
         topk,
     )
 
