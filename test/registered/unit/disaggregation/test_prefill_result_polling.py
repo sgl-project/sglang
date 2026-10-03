@@ -325,7 +325,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
 def _run_loop(scheduler, enabled=True, **topology):
     with (
         published_topology(**topology),
-        envs.SGLANG_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(enabled),
+        envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(enabled),
         patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
     ):
         scheduler.tp_size = get_parallel().tp_size

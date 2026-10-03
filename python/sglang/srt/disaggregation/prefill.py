@@ -103,6 +103,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# TP=1 yield between polls of a pending result. An initial heuristic rather
+# than a tuned value: long enough that the bootstrap, transfer and cache
+# threads reliably win the GIL even when the input socket is empty, and far
+# below the duration of any prefill forward, so it adds no visible latency.
 PREFILL_INPUT_POLL_INTERVAL_S = 0.0001
 
 _is_npu = is_npu()
@@ -724,7 +728,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _is_continuous_input_polling_enabled(self: Scheduler) -> bool:
         """Check support once on entry to the prefill overlap loop."""
-        if not envs.SGLANG_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.get():
+        if not envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.get():
             return False
         parallel = get_parallel()
         enabled = (

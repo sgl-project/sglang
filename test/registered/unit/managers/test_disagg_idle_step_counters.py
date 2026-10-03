@@ -115,8 +115,10 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                     scheduler.request_receiver.recv_requests.side_effect = [[]] * (
                         len(schedule) + len(batches)
                     ) + [StopIteration]
-                with envs.SGLANG_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(
-                    poll_pending_copy
+                with (
+                    envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(
+                        poll_pending_copy
+                    )
                 ):
                     self.run_and_check(
                         scheduler,
@@ -134,7 +136,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         inputs = [[]] * (len(schedule) + len(batches))
         inputs[4] = [object()]
         scheduler.request_receiver.recv_requests.side_effect = inputs + [StopIteration]
-        with envs.SGLANG_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(True):
+        with envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(True):
             self.run_and_check(
                 scheduler,
                 Scheduler.event_loop_overlap_disagg_prefill,
