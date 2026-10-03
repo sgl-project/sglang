@@ -1,5 +1,6 @@
 """Unit tests for the radix-cache registry, routing, and selection chain."""
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -45,6 +46,7 @@ def _make_ctx(
     disable_radix_cache=False,
     effective_chunked_prefill_size=None,
     full_tokens_per_layer=None,
+    enable_kv_cache_sharding=False,
 ):
     # The factory reads the published bags for the cache-backend leaves, so the
     # fixture publishes them; the instance stays for the whole-object contract
@@ -56,6 +58,7 @@ def _make_ctx(
         enable_lmcache=enable_lmcache,
         enable_flexkv=False,
         enable_unified_cache_external_linker=False,
+        enable_kv_cache_sharding=enable_kv_cache_sharding,
     )
     return TreeCacheBuildContext(
         server_args=server_args,
@@ -158,6 +161,23 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             ChunkCache.assert_called_once_with(ctx.params)
             self.assertIs(result, ChunkCache.return_value)
 
+    def test_kv_sharding_keeps_chunk_cache_when_radix_is_disabled(self):
+        ctx = _make_ctx(
+            self,
+            effective_chunked_prefill_size=512,
+            disable_radix_cache=True,
+            enable_kv_cache_sharding=True,
+        )
+        with (
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"),
+            patch("sglang.srt.mem_cache.chunk_cache.ChunkCache") as ChunkCache,
+        ):
+            ChunkCache.return_value = MagicMock()
+            result = default_radix_cache_factory(ctx)
+
+        ChunkCache.assert_called_once_with(ctx.params)
+        self.assertIs(result, ChunkCache.return_value)
+
     def test_swa_chunk_cache_when_chunked_prefill_disable_and_hybrid_swa(self):
         ctx = _make_ctx(
             self,
@@ -186,6 +206,22 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             result = default_radix_cache_factory(ctx)
             PureSWAChunkCache.assert_called_once_with(ctx.params)
             self.assertIs(result, PureSWAChunkCache.return_value)
+
+    def test_kv_sharding_uses_unified_radix_cache(self):
+        ctx = _make_ctx(self, enable_kv_cache_sharding=True)
+        fake_components = MagicMock()
+        fake_radix = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
+        ):
+            result = default_radix_cache_factory(ctx)
+
+        fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
+        self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
     def test_streaming_with_disable_radix_keeps_pure_swa_off_unified(self):
         ctx = _make_ctx(
