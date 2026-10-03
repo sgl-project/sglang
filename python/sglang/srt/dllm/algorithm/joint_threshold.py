@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_npu
 
@@ -162,9 +163,12 @@ class JointThreshold(DllmAlgorithm):
     def step(
         self,
         forward_batch: ForwardBatch,
-        full_logits: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
         states: List[Any],
     ) -> List[bool]:
+        full_logits = logits_output.full_logits
+        if full_logits is None:
+            raise ValueError("JointThreshold requires full dLLM logits")
         if self._use_shared_state:
             return self._step_vectorized_shared(
                 forward_batch=forward_batch, full_logits=full_logits, states=states
