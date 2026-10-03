@@ -702,6 +702,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         self.spec_verify_start_time = ts
 
+    def set_spec_verify_end_time(self, ts=None, num_correct_drafts: int = 0):
+        ts = ts or time.perf_counter()
+
+        if self.trace_ctx.tracing_enable:
+            stage = RequestStage.SPEC_VERIFY
+            self.trace_slice(
+                stage,
+                self.spec_verify_start_time,
+                ts,
+                {"num_correct_drafts": num_correct_drafts},
+            )
+
     def set_run_batch_cpu_start_time(self, ts=None, attrs=None):
         ts = ts or time.perf_counter()
         self.run_batch_cpu_start_time = ts
@@ -1270,6 +1282,27 @@ def set_time_batch(
             method(ts)
         else:
             method(ts, attrs)
+
+
+def set_spec_verify_end_time_batch(reqs: List[Any], accept_lens: Any):
+    """Close the spec_verify span for every request in a verify batch.
+
+    accept_lens counts accepted tokens per request including the bonus token;
+    the drafts-only count excludes it. accept_lens may live on the device, so
+    converting it to a list forces a host synchronisation: it is read only when
+    tracing is enabled.
+    """
+    if reqs is None or len(reqs) == 0:
+        return
+    if not get_global_tracing_enabled():
+        return
+
+    num_correct_drafts = (accept_lens - 1).tolist()
+    ts = time.perf_counter()
+    for idx, req in enumerate(reqs):
+        req.time_stats.set_spec_verify_end_time(
+            ts, num_correct_drafts=num_correct_drafts[idx]
+        )
 
 
 def flush_trace_batch(reqs: List[Any]):

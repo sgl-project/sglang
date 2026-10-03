@@ -43,6 +43,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
+from sglang.srt.observability.req_time_stats import (
+    set_spec_verify_end_time_batch,
+    set_time_batch,
+)
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -1115,7 +1119,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=capture_mode,
                 )
+            set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
             verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+            set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             staged = self.draft_worker._draft_extend_plan_for_decode(batch)
@@ -1129,7 +1135,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             return batch_output
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
-        return run_eagle_verify(
+        set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+        result = run_eagle_verify(
             batch,
             target_worker=self.target_worker,
             req_to_token_pool=self.req_to_token_pool,
@@ -1143,3 +1150,5 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             finalize_tree_path=False,
             grammar_barrier=grammar_barrier,
         )
+        set_spec_verify_end_time_batch(batch.reqs, result.accept_lens)
+        return result
