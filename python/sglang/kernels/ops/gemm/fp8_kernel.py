@@ -816,6 +816,18 @@ def w8a8_block_fp8_matmul_triton(
             "num_stages": 3,
         }
 
+    # The kernel indexes scales per compute tile, so a tile must sit entirely
+    # inside one quantization K block. A hand-supplied config whose
+    # BLOCK_SIZE_K does not evenly divide the quantization block leaves the
+    # scale pointer stuck at the first block and computes silently wrong
+    # results; the tuned configs always satisfy this.
+    if block_size[1] % config["BLOCK_SIZE_K"] != 0:
+        raise ValueError(
+            f"BLOCK_SIZE_K={config['BLOCK_SIZE_K']} is incompatible with "
+            f"quantization block_size={block_size}: the quantization K block "
+            f"must be an exact multiple of BLOCK_SIZE_K"
+        )
+
     # Split-K accumulates K in SPLIT_K separate fp32 partials, so its results
     # do not match the single-accumulator kernels bit-for-bit.
     hopper_tuned = get_platform().is_sm90 and (
