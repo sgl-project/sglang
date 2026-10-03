@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
+    is_deepseek_dsa,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -1485,6 +1486,28 @@ class ModelRunner:
             if resolved_kv_cache_dtype is not None
             else get_model().kv_cache_dtype
         )
+        # Ascend NPU + DSA + env switch => override the resolved dtype to
+        # int8 so pool allocation / cell-size accounting size the int8
+        # COMBINE layout, while the CLI string stays untouched (the
+        # argparse choices and kv_cache_dtype.py whitelist are never hit).
+        # Applies to the draft runner too: a draft worker does not publish
+        # its args, but it reads the same env var and its own
+        # model_config, so the draft pool gets the same int8 layout.
+        if (
+            _is_npu
+            and envs.SGLANG_DSA_KV_INT8.get()
+            and self.use_mla_backend
+            and is_deepseek_dsa(self.model_config.hf_config)
+            and self.kv_cache_dtype == torch.bfloat16
+        ):
+            self.kv_cache_dtype = torch.int8
+            self.kv_cache_dtype_str = "int8-dsa"
+            logger.info(
+                "SGLANG_DSA_KV_INT8 enabled, overriding DSA KV cache "
+                "dtype %s -> torch.int8 (kv_cache_dtype_str=%s)",
+                torch.bfloat16,
+                self.kv_cache_dtype_str,
+            )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         return get_attention_backend(

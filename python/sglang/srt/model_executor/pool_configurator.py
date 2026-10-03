@@ -367,6 +367,25 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * kv_size
                 )
 
+            # DSA int8 KV on Ascend NPU (SGLANG_DSA_KV_INT8=1 made
+            # kv_cache_dtype torch.int8). Single-pool COMBINE layout
+            # consumed by npu_kv_quant_sparse_flash_attention: the
+            # operator's value argument is a dead parameter, so only one
+            # K row per token/layer is stored:
+            #   K row: kv_lora_rank int8 (512) + rope segment 2*rope_head_dim
+            #          bf16 bytes (NoPE: 128 zero-fill, rope_head_dim is pinned
+            #          to 64 by the tiling) + 4 fp32 per-128-tile scales (16)
+            #          = 656B/tok/layer (GLM-5.3, kv_lora_rank=512)
+            # (byte counts already; kv_size is 1 for int8.)
+            if kv_cache_dtype == torch.int8 and envs.SGLANG_DSA_KV_INT8.get():
+                rope_head_dim_kv_quant = 64  # operator tiling hard requirement
+                k_row = (
+                    model_config.kv_lora_rank
+                    + 2 * rope_head_dim_kv_quant
+                    + (model_config.kv_lora_rank // 128) * 4
+                )
+                cell_size = k_row * effective_num_layers
+
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
