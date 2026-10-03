@@ -18,6 +18,7 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackendLike,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    get_nccl_ep_layout,
     register_moe_runner_backend_name,
     resolve_moe_runner_backend,
 )
@@ -92,6 +93,21 @@ class MoeRunner:
                 "FP8 blockwise-quantized or BF16 checkpoint, or "
                 "--moe-a2a-backend deepep."
             )
+
+        if get_moe_a2a_backend().is_nccl_ep() and runner_backend.is_triton():
+            if get_nccl_ep_layout().is_rank_major():
+                raise ValueError("NCCL EP Triton requires expert_major layout")
+            if (
+                lora_enabled
+                or config.activation != "silu"
+                or not config.is_gated
+                or config.num_fused_shared_experts
+                or config.apply_router_weight_on_input
+            ):
+                raise ValueError(
+                    "NCCL EP Triton requires gated SiLU, independent shared experts, "
+                    "and no LoRA or router weights on input"
+                )
 
         self.fused_func = None
 

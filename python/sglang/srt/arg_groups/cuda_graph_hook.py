@@ -521,6 +521,7 @@ def handle_cuda_graph_config(server_args: Any):
     apply_deepep_adjustments(server_args)
     apply_cuda_graph_disaggregation_roles(server_args)
     validate_cuda_graph_config(server_args)
+    validate_nccl_ep_cuda_graph_config(server_args)
     # Warn on the final resolved config (not inside the compat cascade —
     # that path is skipped when the user explicitly sets the backend,
     # which is the only way to get 'full' for prefill today).
@@ -698,3 +699,55 @@ def apply_cuda_graph_disaggregation_roles(server_args: Any):
                     cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
                 ),
             )
+
+
+def validate_nccl_ep_cuda_graph_config(server_args: Any):
+    """Validate the serialized LL scope before model-specific setup."""
+    cfg = resolving_view(server_args)
+    if not cfg.enable_nccl_ep_cuda_graph:
+        return
+    if cfg.device != "cuda" or cfg.moe_a2a_backend != "nccl_ep":
+        raise ValueError(
+            "NCCL EP CUDA Graph requires CUDA and --moe-a2a-backend nccl_ep"
+        )
+    if cfg.cuda_graph_config.decode.backend != Backend.FULL:
+        raise ValueError("NCCL EP CUDA Graph requires the full decode backend")
+    if (
+        (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked
+        and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+    ):
+        raise ValueError("NCCL EP CUDA Graph does not support prefill Graph capture")
+    if cfg.nccl_ep_layout != "expert_major":
+        raise ValueError("NCCL EP CUDA Graph requires expert_major layout")
+    declare_resolution(
+        server_args,
+        "validate_nccl_ep_cuda_graph_config",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+        ),
+    )
+    if cfg.nccl_ep_mode not in ("low_latency", "auto"):
+        raise ValueError("NCCL EP CUDA Graph supports only low-latency dispatch")
+    if not 0 <= cfg.nccl_ep_num_max_dispatch_tokens_per_rank <= 1024:
+        raise ValueError("NCCL EP CUDA Graph dispatch budget must be in [0, 1024]")
+    unsupported = [
+        name.replace("_", "-")
+        for name in (
+            "enable_two_batch_overlap",
+            "enable_single_batch_overlap",
+            "enable_pdmux",
+            "enable_eplb",
+            "elastic_ep_backend",
+            "enable_elastic_expert_backup",
+            "speculative_algorithm",
+            "enable_torch_compile",
+            "enable_memory_saver",
+        )
+        if getattr(cfg, name)
+    ]
+    if cfg.nnodes != 1:
+        unsupported.append("multiple nodes")
+    if unsupported:
+        raise ValueError(
+            "NCCL EP CUDA Graph does not support: " + ", ".join(unsupported)
+        )

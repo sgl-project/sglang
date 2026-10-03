@@ -1373,6 +1373,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # The MxFP4 wrapper methods borrow this instance for weight loading;
         # they never call create_moe_runner, so moe_runner_config is unset.
         self._owns_moe_runner = False
+
+        if get_moe_a2a_backend().is_nccl_ep() and get_moe_runner_backend().is_triton():
+            if (
+                self.use_mxfp8
+                or self.is_fp4_expert
+                or self.weight_block_size != [128, 128]
+            ):
+                raise ValueError(
+                    "NCCL EP Triton requires ordinary block-128 FP8 weights"
+                )
         if get_moe_runner_backend().is_cutlass():
             assert cutlass_fp8_supported(), (
                 "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
@@ -1400,6 +1410,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_a2a_backend = get_moe_a2a_backend()
             if not (
                 moe_a2a_backend.is_deepep()
+                or moe_a2a_backend.is_nccl_ep()
                 or moe_a2a_backend.is_mooncake()
                 or moe_a2a_backend.is_nixl()
             ):
