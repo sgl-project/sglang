@@ -28,9 +28,6 @@ from sglang.test.test_utils import (
 
 TEST_MODEL = os.environ.get("SGLANG_MC_TEST_MODEL", DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
-# The a2a buffer bounds per-rank in-flight tokens; 1024 is the max.
-os.environ.setdefault("SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "1024")
-
 LAUNCH_EP_SIZE = 4
 MAX_EP_SIZE = 5  # +1 headroom keeps a recoverable slot pool for regrow.
 HOST = "127.0.0.1"
@@ -50,6 +47,18 @@ def _visible_devices() -> list[str]:
     import torch
 
     return [str(i) for i in range(torch.cuda.device_count())]
+
+
+def _server_env() -> dict:
+    """Env for a launched server.
+
+    The a2a buffer bounds per-rank in-flight tokens and 1024 is its max. Set here
+    rather than at import: the server needs it, the test process does not, and an
+    import-time write leaks into every other test in the session.
+    """
+    env = os.environ.copy()
+    env.setdefault("SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "1024")
+    return env
 
 
 def _kill(proc, timeout: float = 15) -> None:
@@ -88,7 +97,7 @@ class _ElasticShrinkBase(CustomTestCase):
     def setUpClass(cls):
         cls.model = TEST_MODEL
         cls.base_url = BASE_URL
-        env = os.environ.copy()
+        env = _server_env()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(_visible_devices()[:LAUNCH_EP_SIZE])
         cls.process = popen_launch_server(
             cls.model,
@@ -160,7 +169,7 @@ class _ElasticShrinkBase(CustomTestCase):
             f"--host {HOST} --port {port} --device cuda"
         ).split()
         devices = _visible_devices()
-        env = os.environ.copy()
+        env = _server_env()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(devices[rank_offset:][:join_tp])
         env.setdefault("PYTHONUNBUFFERED", "1")
         args = _common_args(tp=join_tp, nnodes=2, node_rank=1) + join_args
