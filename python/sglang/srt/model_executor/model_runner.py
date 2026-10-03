@@ -257,6 +257,17 @@ elif current_platform.is_out_of_tree():
 logger = logging.getLogger(__name__)
 
 
+def _can_use_synchronous_hisparse_shared(
+    *,
+    is_hip_backend: bool,
+    use_aiter: bool,
+    gfx95: bool,
+    is_hisparse_dsa_pool: bool,
+) -> bool:
+    """Whether the synchronous shared-plan path is safe for this runner."""
+    return is_hip_backend and use_aiter and gfx95 and is_hisparse_dsa_pool
+
+
 @dataclass(frozen=True)
 class SamplingPrewarmResult:
     """Memory requirements observed while pre-warming a sampling path."""
@@ -947,11 +958,19 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        if self.is_draft_worker and isinstance(self.token_to_kv_pool, DSATokenToKVPool):
+            # Resident draft KV uses logical slots. The shared allocator's
+            # coordinator owns the target's sparse KV, not this draft pool.
+            return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
             resolve_shared_index_layers,
         )
+        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+        from sglang.srt.utils import is_gfx95_supported, is_hip
 
         hisparse_cfg = parse_hisparse_config()
         hisparse_top_k = getattr(
@@ -973,6 +992,14 @@ class ModelRunner:
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
                 is_speculative=self.spec_algorithm.is_speculative(),
+                allow_synchronous_shared=_can_use_synchronous_hisparse_shared(
+                    is_hip_backend=is_hip(),
+                    use_aiter=envs.SGLANG_USE_AITER.get(),
+                    gfx95=is_gfx95_supported(),
+                    is_hisparse_dsa_pool=isinstance(
+                        self.token_to_kv_pool, HiSparseDSATokenToKVPool
+                    ),
+                ),
             ),
         )
 
