@@ -236,6 +236,27 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         hi = vocab_size if vocab_size else None
         return [t if (0 <= t and (hi is None or t < hi)) else 0 for t in ids]
 
+    def _safe_decode(
+        self, ids: List[int], skip_special_tokens: bool, spaces_between_special_tokens: bool
+    ) -> str:
+        if not ids:
+            return ""
+        try:
+            return self.tokenizer.decode(
+                ids,
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
+            )
+        except Exception as e:
+            logger.warning(
+                f"tokenizer.decode failed for {len(ids)} id(s) "
+                f"(skip_special_tokens={skip_special_tokens}): {e}. "
+                "Returning empty string for this span instead of crashing "
+                "the detokenizer process -- likely a custom tokenizer bug "
+                "on an empty-after-filtering token list."
+            )
+            return ""
+
     def _grouped_batch_decode(
         self,
         ids_list: List[List[int]],
@@ -260,38 +281,48 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             skip_list = [skip_list[i] for i in keep_idx]
             space_list = [space_list[i] for i in keep_idx]
 
-        if not getattr(self.tokenizer, "is_fast", False):
-            decoded = [
-                decode_without_hf_kwargs(self.tokenizer, ids, skip)
-                for ids, skip in zip(ids_list, skip_list)
-            ]
-        else:
-            # fast path: all rows share the same (skip, space) flags.
-            first_skip, first_space = skip_list[0], space_list[0]
-            if all(
-                s == first_skip and sp == first_space
-                for s, sp in zip(skip_list, space_list)
-            ):
-                decoded = self.tokenizer.batch_decode(
-                    ids_list,
-                    skip_special_tokens=first_skip,
-                    spaces_between_special_tokens=first_space,
-                )
+        try:
+            if not getattr(self.tokenizer, "is_fast", False):
+                decoded = [
+                    decode_without_hf_kwargs(self.tokenizer, ids, skip)
+                    for ids, skip in zip(ids_list, skip_list)
+                ]
             else:
-                # Group indices by (skip, space) tuple and decode each group.
-                groups: Dict[Tuple[bool, bool], List[int]] = defaultdict(list)
-                for idx, (skip, space) in enumerate(zip(skip_list, space_list)):
-                    groups[(skip, space)].append(idx)
-
-                decoded = [""] * len(ids_list)
-                for (skip, space), indices in groups.items():
-                    group_decoded = self.tokenizer.batch_decode(
-                        [ids_list[idx] for idx in indices],
-                        skip_special_tokens=skip,
-                        spaces_between_special_tokens=space,
+                # fast path: all rows share the same (skip, space) flags.
+                first_skip, first_space = skip_list[0], space_list[0]
+                if all(
+                    s == first_skip and sp == first_space
+                    for s, sp in zip(skip_list, space_list)
+                ):
+                    decoded = self.tokenizer.batch_decode(
+                        ids_list,
+                        skip_special_tokens=first_skip,
+                        spaces_between_special_tokens=first_space,
                     )
-                    for idx, text in zip(indices, group_decoded):
-                        decoded[idx] = text
+                else:
+                    # Group indices by (skip, space) tuple and decode each group.
+                    groups: Dict[Tuple[bool, bool], List[int]] = defaultdict(list)
+                    for idx, (skip, space) in enumerate(zip(skip_list, space_list)):
+                        groups[(skip, space)].append(idx)
+
+                    decoded = [""] * len(ids_list)
+                    for (skip, space), indices in groups.items():
+                        group_decoded = self.tokenizer.batch_decode(
+                            [ids_list[idx] for idx in indices],
+                            skip_special_tokens=skip,
+                            spaces_between_special_tokens=space,
+                        )
+                        for idx, text in zip(indices, group_decoded):
+                            decoded[idx] = text
+        except Exception as e:
+            logger.warning(
+                f"tokenizer.batch_decode failed for a batch of {len(ids_list)}: {e}. "
+                "Falling back to per-row safe decode."
+            )
+            decoded = [
+                self._safe_decode(ids, skip, space)
+                for ids, skip, space in zip(ids_list, skip_list, space_list)
+            ]
 
         if keep_idx is None:
             return decoded
@@ -348,9 +379,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         else:
             # Do not use batch decode to prevent some detokenization edge cases (e.g., gpt-oss).
             surr_texts = [
-                self.tokenizer.decode(
-                    surr, skip_special_tokens=skip, spaces_between_special_tokens=space
-                )
+                self._safe_decode(surr, skip, space)
                 for surr, skip, space in zip(
                     surr_ids,
                     recv_obj.skip_special_tokens,
@@ -358,9 +387,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 )
             ]
             read_texts = [
-                self.tokenizer.decode(
-                    read, skip_special_tokens=skip, spaces_between_special_tokens=space
-                )
+                self._safe_decode(read, skip, space)
                 for read, skip, space in zip(
                     read_ids,
                     recv_obj.skip_special_tokens,
