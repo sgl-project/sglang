@@ -804,6 +804,34 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual([c.name for c in result.calls], ["get_weather"])
         self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Tokyo"})
 
+    def test_nonliteral_dict_key_skips_only_that_call(self):
+        for invalid_dict in (
+            "{**other}",
+            "{(1, 2): 'bad'}",
+            "{key: 'bad'}",
+            "{'nested': {**other}}",
+        ):
+            for streaming in (False, True):
+                with self.subTest(argument=invalid_dict, streaming=streaming):
+                    detector = PythonicDetector()
+                    text = (
+                        "[search(query='first'), "
+                        f"search(query={invalid_dict}), "
+                        "search(query={'text': 'last', 'count': 2})]"
+                    )
+                    if streaming:
+                        result = detector.parse_streaming_increment(text, self.tools)
+                    else:
+                        result = detector.detect_and_parse(text, self.tools)
+                    self.assertEqual([call.tool_index for call in result.calls], [0, 2])
+                    self.assertEqual(
+                        [call.name for call in result.calls], ["search", "search"]
+                    )
+                    self.assertEqual(
+                        [json.loads(call.parameters) for call in result.calls],
+                        [{"query": "first"}, {"query": {"text": "last", "count": 2}}],
+                    )
+
 
 class TestMistralDetector(unittest.TestCase):
     def setUp(self):
