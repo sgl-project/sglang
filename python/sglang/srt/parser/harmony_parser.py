@@ -235,6 +235,11 @@ class CanonicalStrategy:
         if channel_type != "analysis":
             return None  # Only stream analysis content - tool calls wait for completion
 
+        # Keep tool arguments until the block is complete.
+        block_header = text[tokens[start_pos].start : tokens[message_pos].start]
+        if re.search(r"(?:^|\s)to=\S+", block_header):
+            return None
+
         # Extract partial content after <|message|>
         content_start = tokens[message_pos].end
         content = text[content_start:]

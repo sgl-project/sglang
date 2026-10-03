@@ -1586,6 +1586,40 @@ class TestContinueFinalMessage(CustomTestCase):
 class TestGptOssDetectorToolCall(CustomTestCase):
     """Test GptOssDetector tool_call raw_text handling."""
 
+    def test_analysis_tool_arguments_stay_out_of_reasoning(self):
+        headers = [
+            "<|channel|>analysis to=browser.search",
+            "<|start|>assistant<|channel|>analysis to=browser.search",
+            "<|start|>assistant to=browser.search<|channel|>analysis",
+        ]
+        for header in headers:
+            with self.subTest(header=header):
+                parser = ReasoningParser("gpt-oss")
+                chunks = [
+                    "<|channel|>analysis<|message|>I should check.<|end|>",
+                    header,
+                    "<|message|>",
+                    '{"query":',
+                    ' "SGLang"}',
+                    "<|call|>",
+                    "<|start|>assistant<|channel|>final<|message|>Done.<|return|>",
+                ]
+                reasoning_parts = []
+                normal_parts = []
+                for index, chunk in enumerate(chunks):
+                    reasoning, normal = parser.parse_stream_chunk(chunk)
+                    if 1 <= index <= 4:
+                        self.assertEqual(reasoning, "")
+                        self.assertEqual(normal, "")
+                    reasoning_parts.append(reasoning or "")
+                    normal_parts.append(normal or "")
+
+                self.assertEqual("".join(reasoning_parts), "I should check.")
+                self.assertEqual(
+                    "".join(normal_parts),
+                    header + '<|message|>{"query": "SGLang"}<|call|>Done.',
+                )
+
     def test_detect_and_parse_tool_call_raw_text(self):
         """Test that tool_call events use raw_text when available."""
         from sglang.srt.parser.reasoning_parser import GptOssDetector
