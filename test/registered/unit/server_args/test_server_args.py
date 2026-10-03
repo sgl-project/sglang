@@ -1639,6 +1639,94 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             handle_a2a_moe(server_args)
 
 
+class TestReturnRoutedExpertsMoeBackend(CustomTestCase):
+    """Regression coverage for runners that previously returned zero-filled routes."""
+
+    def setUp(self):
+        self._nvfp4_env_backup = os.environ.get("SGLANG_MOE_NVFP4_DISPATCH")
+        envs.SGLANG_MOE_NVFP4_DISPATCH.clear()
+
+    def tearDown(self):
+        if self._nvfp4_env_backup is None:
+            envs.SGLANG_MOE_NVFP4_DISPATCH.clear()
+        else:
+            os.environ["SGLANG_MOE_NVFP4_DISPATCH"] = self._nvfp4_env_backup
+
+    @staticmethod
+    def _make_args(
+        runner_backend,
+        *,
+        enable_return_routed_experts=True,
+        is_fp4_experts=False,
+        **overrides,
+    ):
+        fields = dict(
+            model_path="dummy",
+            moe_runner_backend=runner_backend,
+            enable_return_routed_experts=enable_return_routed_experts,
+        )
+        fields.update(overrides)
+        server_args = ServerArgs(**fields)
+        server_args._model_config = SimpleNamespace(
+            is_fp4_experts=is_fp4_experts,
+            nvfp4_moe_meta=None,
+        )
+        return server_args
+
+    def test_from_logits_backends_reject_routed_expert_returns(self):
+        for backend, is_fp4_experts in (
+            ("flashinfer_trtllm", False),
+            ("experimental_sgl_trtllm", False),
+            ("flashinfer_mxfp4", False),
+        ):
+            with (
+                self.subTest(backend=backend),
+                self.assertRaisesRegex(ValueError, backend),
+            ):
+                handle_a2a_moe(
+                    self._make_args(
+                        backend,
+                        is_fp4_experts=is_fp4_experts,
+                    )
+                )
+
+    def test_backends_with_explicit_ids_remain_supported(self):
+        for backend, is_fp4_experts in (
+            ("flashinfer_trtllm_routed", False),
+            ("flashinfer_mxfp4", True),
+        ):
+            with self.subTest(backend=backend):
+                handle_a2a_moe(
+                    self._make_args(
+                        backend,
+                        is_fp4_experts=is_fp4_experts,
+                    )
+                )
+
+    def test_from_logits_backend_is_allowed_when_capture_is_disabled(self):
+        handle_a2a_moe(
+            self._make_args(
+                "flashinfer_trtllm",
+                enable_return_routed_experts=False,
+            )
+        )
+
+    def test_flashinfer_a2a_resolves_to_routed_before_validation(self):
+        server_args = self._make_args(
+            "flashinfer_trtllm",
+            quantization="mxfp8",
+            moe_a2a_backend="flashinfer",
+            flashinfer_a2a_dispatch_type="mxfp8",
+            attn_dp_size=4,
+            tp_size=4,
+        )
+        handle_a2a_moe(server_args)
+        self.assertEqual(
+            resolution_result(server_args, "moe_runner_backend"),
+            "flashinfer_trtllm_routed",
+        )
+
+
 class TestFlashinferMegaMoeConfig(CustomTestCase):
     def setUp(self):
         self._combine_dtype_backup = os.environ.get(
