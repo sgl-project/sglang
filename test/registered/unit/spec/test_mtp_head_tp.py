@@ -3,7 +3,22 @@ import unittest
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
-from sglang.srt.layers.mtp_head_tp import local_argmax_pair, merge_argmax_pairs
+from sglang.srt.layers.mtp_head_tp import (
+    head_tp4_rank_groups,
+    local_argmax_pair,
+    merge_argmax_pairs,
+)
+
+
+class TestMTPHeadTopology(unittest.TestCase):
+    def test_node_local_groups_and_fallback(self):
+        for size in (4, 8, 16):
+            hosts = [(r, f"node{r // 4}", r % 4) for r in range(size)]
+            expected = [list(range(i, i + 4)) for i in range(0, size, 4)]
+            self.assertEqual(head_tp4_rank_groups(hosts), expected)
+            hosts[-1] = (size - 1, "wrong-host", 3)
+            self.assertIsNone(head_tp4_rank_groups(hosts))
+        self.assertIsNone(head_tp4_rank_groups([(r, "node", 0) for r in range(4)]))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")

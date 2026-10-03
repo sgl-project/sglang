@@ -2239,6 +2239,22 @@ def get_dcp_group() -> GroupCoordinator:
 _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
+_MTP_HEAD_TP: Optional[GroupCoordinator] = None
+
+
+def init_mtp_head_tp_group(group_ranks, parent):
+    global _MTP_HEAD_TP
+    if _MTP_HEAD_TP is None:
+        _MTP_HEAD_TP = init_model_parallel_group(
+            group_ranks,
+            parent.local_rank,
+            "nccl",
+            use_custom_allreduce=False,
+            use_mscclpp=False,
+            use_torch_symm_mem_allreduce=False,
+            group_name="mtp_head_tp4",
+        )
+    return _MTP_HEAD_TP
 
 
 def get_moe_dp_group() -> GroupCoordinator:
@@ -2306,7 +2322,14 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _ATTN_TP, _SHARED_EXPERTS_TP, _MOE_EP, _MOE_TP):
+            for group in (
+                _DCP,
+                _ATTN_TP,
+                _SHARED_EXPERTS_TP,
+                _MOE_EP,
+                _MOE_TP,
+                _MTP_HEAD_TP,
+            ):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -3252,6 +3275,10 @@ def destroy_model_parallel():
     from sglang.srt.distributed.bootstrap import reset_parallel_initialised
 
     reset_parallel_initialised()
+    global _MTP_HEAD_TP
+    if _MTP_HEAD_TP:
+        _MTP_HEAD_TP.destroy()
+    _MTP_HEAD_TP = None
     get_parallel().clear_stamp()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
