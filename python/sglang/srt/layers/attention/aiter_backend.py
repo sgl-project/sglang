@@ -1667,7 +1667,7 @@ class AiterAttnBackend(AttentionBackend):
         verify_token_table = None
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
-                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens[:bs], dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
 
                 if not self.use_triton_unified_attention:
@@ -2523,7 +2523,7 @@ class AiterAttnBackend(AttentionBackend):
 
                 if not self.use_triton_unified_attention:
                     kv_indptr = self.kv_indptr
-                    kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                    kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
                     kv_indices = self.cuda_graph_kv_indices
                     create_flashinfer_kv_indices_triton[(bs,)](
@@ -2588,8 +2588,11 @@ class AiterAttnBackend(AttentionBackend):
                             kv_indices[:new_rows, :new_cols].copy_(page_indices)
                             swa_page_table = self.cuda_graph_swa_page_table
                             swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
-                        elif self.page_size > 1:
-                            page_indices = self._transform_table_1_to_real(page_indices)
+                        else:
+                            if self.page_size > 1:
+                                page_indices = self._transform_table_1_to_real(
+                                    page_indices
+                                )
                             new_rows = page_indices.shape[0]
                             new_cols = page_indices.shape[1]
                             kv_indices[:new_rows, :new_cols].copy_(page_indices)
