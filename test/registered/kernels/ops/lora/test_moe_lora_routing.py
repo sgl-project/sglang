@@ -12,6 +12,39 @@ from sglang.srt.lora.workspace import LoraWorkspace
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
+
+def _serial_materialized_reference():
+    """Use standalone stages with no fusion or overlap."""
+    from sglang.srt.lora.moe.plan import (
+        ActFamily,
+        ActivationFn,
+        ActSpec,
+        AFamily,
+        ASpec,
+        BFamily,
+        BridgeLayout,
+        BSpec,
+        FinalizeFamily,
+        FinalizeSpec,
+        MoePlan,
+        Site,
+    )
+
+    return MoePlan(
+        gate_up_a=ASpec(Site.GATE_UP, AFamily.GROUPED, False, BridgeLayout.PAIR_MAJOR),
+        gate_up_b=BSpec(
+            Site.GATE_UP,
+            BFamily.GROUPED,
+            False,
+            BridgeLayout.PAIR_MAJOR,
+        ),
+        act=ActSpec(ActFamily.MATERIALIZED, ActivationFn.SILU),
+        down_a=ASpec(Site.DOWN, AFamily.GROUPED, False, BridgeLayout.PAIR_MAJOR),
+        down_b=BSpec(Site.DOWN, BFamily.GROUPED, False, BridgeLayout.PAIR_MAJOR),
+        finalize=FinalizeSpec(FinalizeFamily.MATERIALIZED),
+    )
+
+
 register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
