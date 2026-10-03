@@ -293,9 +293,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
         self.num_experts = config.num_experts
-        self.num_physical_routed_experts = (
-            config.num_experts + get_exec().moe.ep_num_redundant_experts
-        )
         self.num_shared_experts = get_num_shared_experts(config)
         self.num_fused_shared_experts = 0
 
@@ -501,7 +498,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     topk_output.topk_weights,
                     None,
                     self.num_fused_shared_experts,
-                    N=self.num_physical_routed_experts,
+                    N=self.num_experts,
                     fuse_gate=True,
                     hidden_states=hidden_states,
                     gate_weight=self.shared_expert_gate.weight,
@@ -521,7 +518,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     topk_output.topk_weights,
                     shared_weights,
                     self.num_fused_shared_experts,
-                    N=self.num_physical_routed_experts,
+                    N=self.num_experts,
                 )
             )
         return StandardTopKOutput(

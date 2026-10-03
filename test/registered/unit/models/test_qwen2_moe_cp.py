@@ -89,7 +89,6 @@ class TestQwen2MoeCp(CustomTestCase):
         block = qwen.Qwen2MoeSparseMoeBlock.__new__(qwen.Qwen2MoeSparseMoeBlock)
         nn.Module.__init__(block)
         block.layer_id, block.num_experts = 3, 3
-        block.num_physical_routed_experts = 3
         block.topk = SimpleNamespace(
             topk_config=TopKConfig(top_k=2, torch_native=True), enable_waterfill=False
         )
