@@ -20,10 +20,12 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.utils import convert_to_channelwise
+from sglang.srt.utils import is_cpu
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
 SUPPORTED_STRATEGIES = [QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSOR]
+_is_cpu = is_cpu()
 
 
 class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
@@ -40,6 +42,21 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
     # So if we have a fused module (QKV, MLP) with per tensor scales,
     # we expand each scale to its shard's channels.
     def process_weights_after_loading(self, layer) -> None:
+        if _is_cpu:
+            if self.strategy != QuantizationStrategy.TENSOR:
+                raise NotImplementedError(
+                    "CPU compressed-tensors W8A16 FP8 currently supports only per-tensor weight scales."
+                )
+            if layer.weight_scale.numel() != 1:
+                raise NotImplementedError(
+                    "CPU compressed-tensors W8A16 FP8 does not support fused layers with multiple weight scales."
+                )
+            layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
+            layer.weight_scale = torch.nn.Parameter(
+                layer.weight_scale.reshape(()), requires_grad=False
+            )
+            return
+
         if self.strategy == QuantizationStrategy.TENSOR:
             ws_channelwise = convert_to_channelwise(
                 layer.weight_scale, layer.logical_widths
@@ -125,6 +142,16 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _is_cpu:
+            return torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                bias,
+                x.dtype,
+                False,
+            )
+
         return apply_fp8_marlin_linear(
             input=x,
             weight=layer.weight,
