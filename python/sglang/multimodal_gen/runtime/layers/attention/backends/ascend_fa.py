@@ -318,9 +318,8 @@ class AscendFAImpl(AttentionImpl):
             self._quant_scheme == "MXFP8"
             and not self.causal
             and not self._is_cross_attention
-            and query.shape[1:3] == key.shape[1:3]
+            and query.shape[2:] == key.shape[2:]
             and key.shape == value.shape
-            and (query.shape[0] * query.shape[1]) % 64 == 0
         ):
             batch_size, query_length, num_heads, head_size = query.shape
             key_length = key.shape[1]
@@ -384,7 +383,6 @@ class AscendFAImpl(AttentionImpl):
             and not self._is_cross_attention
             and query.shape == key.shape
             and key.shape == value.shape
-            and query.shape[0] % 64 == 0
         ):
             boundaries = _packed_boundaries(
                 cu_seqlens, cu_seqlens_host, query.shape[0], "cu_seqlens"
@@ -431,6 +429,50 @@ class AscendFAImpl(AttentionImpl):
             cu_seqlens_k_host=cu_seqlens_host,
             softmax_scale=self.softmax_scale,
         )
+
+    def _dynamic_mx_quant_value(
+        self,
+        value: torch.Tensor,
+        actual_seq_kvlen: Sequence[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        FIA restarts 32-token quantization groups at each sequence
+        and packs scales in pairs, requiring [sum(ceil(length_i / 64)), N, D, 2].
+
+        Quantizing the whole tensor produces [ceil(T / 64), N, D, 2] scales
+        and is equivalent only when every internal sequence boundary is
+        divisible by 64. Otherwise, quantize sequences separately and concatenate
+        their values and scales.
+        """
+        if not actual_seq_kvlen or any(
+            stop <= start for start, stop in pairwise((0, *actual_seq_kvlen))
+        ):
+            raise ValueError(
+                "actual_seq_kvlen must contain strictly increasing positive "
+                "cumulative sequence ends"
+            )
+        if actual_seq_kvlen[-1] != value.shape[0]:
+            raise ValueError("actual_seq_kvlen must end at the packed V token count")
+
+        quant_dtype = torch.float8_e4m3fn
+        if all(stop % 64 == 0 for stop in actual_seq_kvlen[:-1]):
+            return torch.ops.npu.npu_dynamic_mx_quant(
+                value, dst_type=quant_dtype, axis=self._MXFP8_V_QUANT_AXIS
+            )
+
+        quantized_values, scales = [], []
+        start = 0
+        for stop in actual_seq_kvlen:
+            if stop > start:
+                quantized_value, scale = torch.ops.npu.npu_dynamic_mx_quant(
+                    value[start:stop],
+                    dst_type=torch.float8_e4m3fn,
+                    axis=self._MXFP8_V_QUANT_AXIS,
+                )
+                quantized_values.append(quantized_value)
+                scales.append(scale)
+            start = stop
+        return torch.cat(quantized_values, dim=0), torch.cat(scales, dim=0)
 
     def _forward_mxfp8_tnd(
         self,
@@ -508,8 +550,8 @@ class AscendFAImpl(AttentionImpl):
         key_fp8, key_scale = torch.ops.npu.npu_dynamic_mx_quant(
             key, dst_type=quant_dtype, axis=self._MXFP8_QK_QUANT_AXIS
         )
-        value_fp8, value_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            value, dst_type=quant_dtype, axis=self._MXFP8_V_QUANT_AXIS
+        value_fp8, value_scale = self._dynamic_mx_quant_value(
+            value, actual_seq_kvlen=actual_seq_kvlen
         )
         return torch.ops.npu.npu_fused_infer_attention_score_v2(
             query_fp8,
