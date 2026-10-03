@@ -1,11 +1,11 @@
 # BF16 LiteTopK for DeepSeek-V4.1
 
-Depends on [SGLang #40764](https://github.com/sgl-project/sglang/pull/40764)
-for the existing experimental LiteTopK package and on
-[sgl-project/DeepGEMM #96](https://github.com/sgl-project/DeepGEMM/pull/96)
-for the BF16 histogram producer and its matching scheduler. The producer core
-is adapted in #96 from [deepseek-ai/DeepGEMM #462](https://github.com/deepseek-ai/DeepGEMM/pull/462).
-The FP32 module and smoke runner remain owned by #40764.
+The selector builds on [SGLang #40764](https://github.com/sgl-project/sglang/pull/40764)'s
+LiteTopK design. This BF16 path runs independently of its standalone FP32 module.
+It requires the BF16 histogram producer and matching scheduler from
+[sgl-project/DeepGEMM #96](https://github.com/sgl-project/DeepGEMM/pull/96).
+The producer core is adapted in #96 from
+[deepseek-ai/DeepGEMM #462](https://github.com/deepseek-ai/DeepGEMM/pull/462).
 
 
 `Bf16Dsv41DecodePlan` selects the exact BF16 top-512 of the decode and target-verify rows of DeepSeek-V4.1's ratio-1/2 index layers
