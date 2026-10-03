@@ -287,12 +287,14 @@ def test_prefill_with_bf16_checkpoints_matches_flashinfer():
     assert not cake_kda.supports_kda_recurrent_prefill(
         q, k, v, g, beta, pool, checkpoint_every_n_tokens=every // 2, **admission
     )
-    out, _ = cake_kda_recurrent(
+    # With checkpointing enabled FlashInfer returns ``(output, final_state,
+    # state_checkpoints)``; the facade forwards that triple unchanged.
+    out, _, checkpoints_ret = cake_kda_recurrent(
         q, k, v, g, beta, initial_state=pool, state_checkpoints=checkpoints, **kwargs
     )
     from flashinfer.kda import recurrent_kda as fi_direct
 
-    out_fi, _ = fi_direct(
+    out_fi, _, checkpoints_fi_ret = fi_direct(
         q,
         k,
         v,
@@ -304,6 +306,7 @@ def test_prefill_with_bf16_checkpoints_matches_flashinfer():
         **kwargs,
     )
     torch.cuda.synchronize()
+    assert checkpoints_ret is checkpoints and checkpoints_fi_ret is checkpoints_fi
     assert torch.equal(out, out_fi)
     assert torch.equal(pool, pool_fi)
     assert torch.isfinite(checkpoints).all()
