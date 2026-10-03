@@ -661,17 +661,30 @@ def _causal_conv1d_update_kernel(
         conv_state_batch_coord = tl.load(
             conv_state_indices_ptr + idx_seq * stride_state_indices
         ).to(tl.int64)
-        if SAVE_INTERMEDIATE:
-            intermediate_state_batch_coord = tl.load(
-                intermediate_state_indices_ptr
-                + idx_seq * stride_intermediate_state_indices
-            ).to(tl.int64)
     else:
         conv_state_batch_coord = idx_seq
     if USE_PAD_SLOT:  # noqa
         if conv_state_batch_coord == pad_slot_id:
-            # not processing as this is not the actual sequence
+            # Dummy requests own no state, but callers still consume the
+            # physical output rows. Initialize them before skipping the update.
+            idx_tokens = tl.arange(0, NP2_SEQLEN)
+            out_ptrs = (
+                o_ptr
+                + idx_seq * stride_o_seq
+                + idx_feats[:, None] * stride_o_dim
+                + idx_tokens[None, :] * stride_o_token
+            )
+            tl.store(
+                out_ptrs,
+                tl.full((BLOCK_N, NP2_SEQLEN), 0, tl.float32),
+                (idx_feats[:, None] < dim) & (idx_tokens[None, :] < seqlen),
+            )
             return
+
+    if IS_CONTINUOUS_BATCHING and SAVE_INTERMEDIATE:
+        intermediate_state_batch_coord = tl.load(
+            intermediate_state_indices_ptr + idx_seq * stride_intermediate_state_indices
+        ).to(tl.int64)
 
     if IS_SPEC_DECODING:
         # The rolling of conv state:
