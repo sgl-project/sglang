@@ -91,6 +91,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _is_cuda,
+    _use_aiter_gfx942,
     _use_aiter_gfx95,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -1347,8 +1348,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "is enabled."
                 )
         else:
-            if not _use_aiter_gfx95:
-                return "HIP shared experts fusion requires AITER on a gfx950 device."
+            if not (_use_aiter_gfx95 or _use_aiter_gfx942):
+                return (
+                    "HIP shared experts fusion requires AITER on a gfx942 "
+                    "(MI308X) or gfx950 device."
+                )
             if not get_moe_a2a_backend().is_none():
                 return (
                     "HIP shared experts fusion is not supported when an MoE A2A "
