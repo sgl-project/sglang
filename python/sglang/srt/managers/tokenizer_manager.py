@@ -42,6 +42,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -198,9 +199,24 @@ _ELASTIC_STAGE_RETRY_S = 2.0
 def elastic_stage_plan(current: int, launch_ep: int, target: int) -> List[int]:
     """Split a grow the schedulers cannot serve in one step into ordered stages.
 
-    A ``recover_ranks`` batch must cover every retired slot at once, so a grow from
-    below the launch width becomes "return to it, then move to the target". Stage 2 can
-    be a shrink, which is why the driver gates on target rather than intent.
+    Any grow off the launch width stops there first, including a partial regrow whose
+    target is below it. The cost is real and worth naming: 2 -> 3 direct would need one
+    joiner, while 2 -> 4 -> 3 needs one per retired slot.
+
+    The intermediate buys a width every rank agrees on. A recover joiner covers
+    ``[ep_join_rank_offset, ep_join_rank_offset + tp_size)`` and sizes its expert map to
+    that upper bound, so a target short of it leaves the joiner holding a wider map than
+    the cohort the survivors publish. It then fails in the expert map store copy, after
+    the survivors have already committed to the cohort, and what the caller sees is the
+    cohort barrier expiring 60s later and the server dying on "WORLD MLP sync
+    num_dp_ranks exceeds WORLD size". MC17 covers it.
+
+    So this is a limitation rather than a law. A joiner booted at exactly the target
+    width can be served directly; what is missing is any way to learn that width here,
+    since joiners announce themselves to the schedulers and this runs before the
+    request reaches them. Stage 2 can therefore be a shrink, which is why the driver
+    gates on target rather than intent. A grow that lands exactly on the launch width
+    needs no stage.
     """
     if current < launch_ep and current < target and target != launch_ep:
         return [launch_ep, target]
@@ -752,10 +768,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
-        # Shrink admission gate (scale-up routes via DPC ready barrier).
+        # Shrink admission gate (scale-up routes via DPC ready barrier). Scoped to
+        # the slots that are leaving; see _await_elastic_shrink_gate.
         self._elastic_shrink_pause_event = asyncio.Event()
         self._elastic_shrink_pause_event.set()
+        self._elastic_shrink_retiring: set[int] = set()
         self._elastic_scale_lock = asyncio.Lock()
+        # Strong refs to in-flight staged-grow drivers; see forward_elastic_scale_update.
+        self._elastic_stage_tasks: Set[asyncio.Task] = set()
 
     def init_lora(self):
         # LoRA
@@ -903,16 +923,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "--enable-strict-thinking"
             )
 
-        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            num_dp_ranks = self.elastic_worker_count
-            if num_dp_ranks <= 1 and obj.routed_dp_rank == 0:
-                logger.debug(
-                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
-                )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= num_dp_ranks:
-                raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
-                )
+        self._validate_routed_dp_rank(obj)
 
         self._init_req_state(obj, request)
         request_states = {
@@ -929,8 +940,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
-            if not self._elastic_shrink_pause_event.is_set():
-                await self._elastic_shrink_pause_event.wait()
+            await self._await_elastic_shrink_gate(obj)
+            # Re-validate: the width checked above was the pre-shrink one, so a pin
+            # that was in range then can name a rank that has since departed. The DPC
+            # rejects an inactive pin, so passing it on moves the failure there.
+            self._validate_routed_dp_rank(obj)
 
             async with self.model_update_lock.reader_lock:
                 await self._validate_and_resolve_lora(obj)
@@ -1740,6 +1754,52 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+
+    def _validate_routed_dp_rank(self, obj) -> None:
+        """Check an explicit DP pin against the width that is live right now.
+
+        Called again after the shrink gate: a shrink narrows the width while a request
+        waits, so a pin accepted on entry can be out of range by the time it is sent."""
+        if not isinstance(obj, GenerateReqInput) or obj.routed_dp_rank is None:
+            return
+        num_dp_ranks = self.elastic_worker_count
+        if num_dp_ranks <= 1 and obj.routed_dp_rank == 0:
+            logger.debug(
+                f"routed_dp_rank={obj.routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
+            )
+        elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= num_dp_ranks:
+            raise ValueError(
+                f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
+            )
+
+    async def _await_elastic_shrink_gate(self, obj) -> None:
+        """Hold a request only if it is pinned to a slot that is leaving.
+
+        Unpinned work is the DPC's to place and it already skips the draining slots, so
+        a server wide hold would stall every rank for as long as the retiree's longest
+        in-flight request. What makes the narrow scope safe is that the retiree's idle
+        test discounts request-free batches: under dp-attention it is pulled into one on
+        every iteration a survivor holds tokens, and counting those kept a drained
+        retiree from ever reporting idle. See ``Scheduler._pending_results``.
+
+        On the 4 to 3 eager lane this takes the admission blackout from 24.7 s to 0.9 s
+        and the settle from 26.5 s to 5.5 s, for a worst in-flight stall of 138 ms
+        against 71 ms."""
+        if self._elastic_shrink_pause_event.is_set():
+            return
+        pin = getattr(obj, "routed_dp_rank", None)
+        if pin is None or pin not in self._elastic_shrink_retiring:
+            return
+        await self._elastic_shrink_pause_event.wait()
+
+    def _close_elastic_shrink_gate(self, retiring: Iterable[int]) -> None:
+        """``retiring`` is required: an empty set makes the pinned-only scope a no-op."""
+        self._elastic_shrink_retiring = set(retiring)
+        self._elastic_shrink_pause_event.clear()
+
+    def _open_elastic_shrink_gate(self) -> None:
+        self._elastic_shrink_retiring = set()
+        self._elastic_shrink_pause_event.set()
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
@@ -3546,7 +3606,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 self.elastic_worker_count = msg.effective_ep_size
                 self.update_control_communicator_fan_out(msg.effective_ep_size)
-            self._elastic_shrink_pause_event.set()
+            self._open_elastic_shrink_gate()
             return
 
         self._dispatch_to_scheduler(msg)
@@ -3556,9 +3616,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # pending_ep_size and the shrink gate untouched -- the op is unfinished.
             self.update_control_communicator_fan_out(msg.effective_ep_size)
             self.elastic_scale_phase = "staged_grow"
-            asyncio.create_task(
+            # Held, not fire-and-forget: asyncio only weakly references running tasks,
+            # so an unreferenced one can be collected mid-stage, and a task nobody
+            # awaits swallows its exception. _drive_next_elastic_stage records failure
+            # in the scale phase itself, so the callback only has to drop the handle.
+            task = asyncio.create_task(
                 self._drive_next_elastic_stage(self.elastic_pending_stages.pop(0))
             )
+            self._elastic_stage_tasks.add(task)
+            task.add_done_callback(self._elastic_stage_tasks.discard)
             return
         self.elastic_pending_ep_size = None
         # Direction from the caller's request: a partial regrow's last stage shrinks.
@@ -3577,7 +3643,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else []
         )
         self.update_control_communicator_fan_out(msg.effective_ep_size)
-        self._elastic_shrink_pause_event.set()
+        self._open_elastic_shrink_gate()
 
     def get_elastic_ep_state(self):
         # A grow clears pending_ep_size at commit but stays warming_up until served.
@@ -3632,7 +3698,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Gate by target, not intent: a partial regrow's stage 2 shrinks, and a
             # shrink needs the gate shut so the router stops feeding the retiree.
             if target < self.elastic_worker_count:
-                self._elastic_shrink_pause_event.clear()
+                self._close_elastic_shrink_gate(
+                    range(target, self.elastic_worker_count)
+                )
             while True:
                 # A landed stage answers "noop": arrival, not failure, and it can
                 # land mid-send. Equality, not >=: stage 2 can sit below stage 1.
@@ -3659,7 +3727,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"staged grow to {target} did not start: {type(exc).__name__}: {exc}"
             )
             logger.error("[Elastic EP] %s", self.elastic_last_error)
-            self._elastic_shrink_pause_event.set()
+            self._open_elastic_shrink_gate()
             if not isinstance(exc, Exception):
                 raise
 
@@ -3682,12 +3750,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Close the shrink gate and publish pending; reopened on completion/failure.
         is_shrink = obj.new_ep_size < self.elastic_worker_count
+        # Restored if the schedulers refuse below: a rejected request must not overwrite
+        # the last completed operation's view, or an orchestrator polling for
+        # safe_to_terminate_ranks would see this id, idle, and nothing left to reap.
+        prev_operation_id = self.elastic_operation_id
+        prev_retired_ranks = list(self.elastic_retired_ranks)
         self.elastic_pending_ep_size = obj.new_ep_size
         self.elastic_scale_phase = "waiting_for_cohort"
         self.elastic_operation_id = obj.operation_id
         self.elastic_retired_ranks = []
         if is_shrink:
-            self._elastic_shrink_pause_event.clear()
+            self._close_elastic_shrink_gate(
+                range(obj.new_ep_size, self.elastic_worker_count)
+            )
 
         # pending_ep_size stays on the caller's target; only the wire request narrows.
         stages = self._elastic_stage_plan(obj.new_ep_size)
@@ -3708,8 +3783,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_pending_ep_size = None
             self._clear_staged_scale()
             self.elastic_scale_phase = "failed"
+            self.elastic_operation_id = prev_operation_id
+            self.elastic_retired_ranks = prev_retired_ranks
             if is_shrink:
-                self._elastic_shrink_pause_event.set()
+                self._open_elastic_shrink_gate()
             raise
 
         for res in responses:
@@ -3718,8 +3795,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.elastic_pending_ep_size = res.pending_ep_size
                 self._clear_staged_scale()
                 self.elastic_last_error = res.message
+                self.elastic_operation_id = prev_operation_id
+                self.elastic_retired_ranks = prev_retired_ranks
                 if is_shrink:
-                    self._elastic_shrink_pause_event.set()
+                    self._open_elastic_shrink_gate()
                 return res
         self.elastic_scale_phase = responses[0].scale_phase
         self.elastic_last_error = None

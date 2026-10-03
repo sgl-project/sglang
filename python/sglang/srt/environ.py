@@ -1190,7 +1190,7 @@ class Envs:
         32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
     )
     # Reshuffle experts in the elastic scale finalizer, not the next EPLB tick.
-    SGLANG_ELASTIC_SYNC_REBALANCE = EnvBool(True)
+    SGLANG_ENABLE_ELASTIC_SCALE_REBALANCE = EnvBool(True)
 
     # ===================================================================
     # DeepGEMM
@@ -1293,8 +1293,10 @@ class Envs:
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
-    # Same switch for the mooncake dispatcher, which otherwise always sends
-    # fp8 and so cannot feed a deep_gemm runner holding BF16 weights.
+    # Same escape hatch for the mooncake dispatcher, which otherwise always sends fp8
+    # and so cannot feed a deep_gemm runner holding BF16 weights. Needed to exercise
+    # the scale-down lanes over mooncake a2a against an unquantized model; fp8
+    # deployments keep the old behaviour.
     SGLANG_MOONCAKE_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)

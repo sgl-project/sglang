@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     BlockReqInput,
     ElasticScaleUpdateReq,
     ProfileReq,
+    ScaleElasticEPReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -205,6 +206,10 @@ class DataParallelController:
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
+        # Slots that are draining for a shrink. Still active for control delivery --
+        # they need the scale request itself -- but excluded from request routing, so
+        # their drain can reach idle instead of being fed until the commit.
+        self._draining_slots: set[int] = set()
 
         if get_parallel().attn_dp_enabled:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -313,12 +318,36 @@ class DataParallelController:
             self.dp_active[slot] = self.status[slot] = False
         self._refresh_active_workers()
 
+    def _dispatch_elastic_scale_request(self, obj: ScaleElasticEPReqInput) -> None:
+        """Forward the scale request, then stop routing new work to the retiring slots.
+
+        Forwarded first, because the retirees have to receive this message to begin
+        draining at all. Once they have it they must not be fed any more requests, or
+        their drain never reaches idle; that is also what lets the tokenizer hold back
+        only the requests pinned to those slots instead of pausing the whole server."""
+        self.send_control_message(obj)
+        if obj.new_ep_size < self._active_count_cache:
+            # Retirees are the contiguous tail of the active list.
+            self._draining_slots = {
+                slot for slot in self._active_workers if slot >= obj.new_ep_size
+            }
+
     def _dispatch_elastic_scale_update(self, msg: ElasticScaleUpdateReq) -> None:
+        # Terminal either way: the slots are gone, or the shrink failed and they stay.
+        self._draining_slots = set()
         # The tokenizer drops failure reports before dispatch; they carry no slots.
         if msg.direction == "shrink":
             self.remove_elastic_workers(msg.slot_offset, msg.slot_count)
         else:
             self.add_elastic_workers(msg.slot_offset, msg.slot_count)
+
+    def _routable_workers(self) -> list[int]:
+        """Active workers that may receive new requests (excludes draining slots)."""
+        if not self._draining_slots:
+            return self._active_workers
+        return [
+            slot for slot in self._active_workers if slot not in self._draining_slots
+        ]
 
     def _refresh_active_workers(self) -> None:
         self._active_workers = [
@@ -380,6 +409,7 @@ class DataParallelController:
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self._dispatch_elastic_scale_update),
+                (ScaleElasticEPReqInput, self._dispatch_elastic_scale_request),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -771,7 +801,7 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        active = self._active_workers
+        active = self._routable_workers()
         if not active:
             raise RuntimeError("No active DP workers are available for routing.")
         attempts = 0
@@ -797,13 +827,13 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        sock_send(self.workers[target_rank], req)
+        sock_send(self.workers[self._redirect_if_draining(target_rank)], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        sock_send(self.workers[target_worker], req)
+        sock_send(self.workers[self._redirect_if_draining(target_worker)], req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -812,7 +842,23 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        sock_send(self.workers[target_worker], req)
+        sock_send(self.workers[self._redirect_if_draining(target_worker)], req)
+
+    def _redirect_if_draining(self, slot: int) -> int:
+        """Move a request off a draining slot.
+
+        The budget and bootstrap-room pickers choose from the full worker set, so they
+        can land on a slot that is retiring. Redirecting is round-robin over what is
+        left rather than a re-run of the picker: the point is only to not feed a rank
+        that is trying to reach idle."""
+        if slot not in self._draining_slots:
+            return slot
+        routable = self._routable_workers()
+        if not routable:
+            raise RuntimeError("No active DP workers are available for routing.")
+        chosen = routable[self.round_robin_counter % len(routable)]
+        self.round_robin_counter = (self.round_robin_counter + 1) % len(routable)
+        return chosen
 
     def event_loop(self):
         while True:
@@ -822,7 +868,16 @@ class DataParallelController:
                     recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-                self._request_dispatcher(recv_req)
+                try:
+                    self._request_dispatcher(recv_req)
+                except Exception:
+                    # Per-request, not fatal: routing rejects a request pinned to a
+                    # slot that has retired, and letting that escape here would take
+                    # the controller down and with it every other DP worker.
+                    logger.exception(
+                        "[DPC] dropping request that could not be dispatched: %s",
+                        type(recv_req).__name__,
+                    )
 
 
 def run_data_parallel_controller_process(

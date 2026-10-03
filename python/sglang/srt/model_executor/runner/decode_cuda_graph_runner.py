@@ -608,7 +608,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self, num_tokens: int, *, dp_len: Optional[int] = None
     ) -> Optional[list[int]]:
         # dp_len lets capture size to the buffer ceiling so a shrink cannot
-        # resize storage the graph replays against; replay passes live dp_size.
+        # resize storage the graph replays against; replay passes live num_dp_ranks.
         if self.require_mlp_tp_gather:
             return [num_tokens] * (dp_len or self.num_dp_ranks)
         if self.require_attn_tp_gather:
@@ -968,7 +968,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         global_num_tokens_cpu = self._global_num_tokens_for_graph(
-            num_tokens, dp_len=dp_capacity_for(self.dp_size)
+            num_tokens, dp_len=dp_capacity_for(self.num_dp_ranks)
         )
 
         if global_num_tokens_cpu is not None:

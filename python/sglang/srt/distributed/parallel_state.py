@@ -2576,6 +2576,25 @@ def init_distributed_environment(
     get_parallel().override_permanently(world_group=_WORLD)
 
 
+def _use_message_queue_broadcaster() -> bool:
+    """Whether the shm broadcaster may back the TP-family groups.
+
+    A deployment that can change width cannot use it: the queue is fixed-size with no
+    remove_reader, so a retiree's exit deadlocks the readers that remain. Resolved here
+    rather than by writing the env var from an arg-resolution hook, which mutates
+    process-global state and, under ``Engine``, leaks into the caller's process.
+    """
+    if not envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get():
+        return False
+    from sglang.srt.runtime_context import get_exec
+
+    scalable = (
+        get_exec().moe.elastic_ep_backend == "mooncake"
+        and get_parallel().max_ep_size is not None
+    )
+    return not scalable
+
+
 def initialize_model_parallel(
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
@@ -2698,7 +2717,7 @@ def initialize_model_parallel(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+        use_message_queue_broadcaster=_use_message_queue_broadcaster(),
         group_name="tp",
         recovered_rank=recovered_rank,
         rank_offset=rank_offset,
@@ -2714,7 +2733,7 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            use_message_queue_broadcaster=_use_message_queue_broadcaster(),
             group_name="pdmux_prefill_tp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
@@ -2738,7 +2757,7 @@ def initialize_model_parallel(
             dcp_group_ranks,
             get_world_group().local_rank,
             backend,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            use_message_queue_broadcaster=_use_message_queue_broadcaster(),
             group_name="dcp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
@@ -2791,7 +2810,7 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            use_message_queue_broadcaster=_use_message_queue_broadcaster(),
             group_name="attn_cp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
@@ -2831,7 +2850,7 @@ def initialize_model_parallel(
             # select a custom communicator or fall back.
             use_custom_allreduce=None,
             use_torch_symm_mem_allreduce=False,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            use_message_queue_broadcaster=_use_message_queue_broadcaster(),
             group_name="attention_tp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
