@@ -331,6 +331,59 @@ def _make_pool(ps=1, full_spec=None, device=_DEV):
     )
 
 
+_SBS = 32  # MXFP8 scale block size
+_SCALE_PS = 128  # the interleaved scale layout's page size
+
+
+def _scaled_spec(name, grow):
+    return MHASubPoolSpec(
+        name=name,
+        layer_num=_L,
+        head_num=_H,
+        head_dim=128,
+        store_dtype=torch.uint8,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        scale_block_size=_SBS,
+        grow_direction=grow,
+    )
+
+
+class TestUnifiedMXFP8ScaleBuffers(unittest.TestCase):
+    def setUp(self):
+        full = _scaled_spec("full", "down")
+        self.budget = 64 * _SCALE_PS * full.entry_bytes()
+        self.pool = UnifiedKVPool(
+            total_bytes=self.budget,
+            sub_pool_specs=[full, _scaled_spec("swa", "up")],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=_SCALE_PS,
+        )
+
+    def test_scale_views_match_the_paged_kv_extent(self):
+        """FA4 keeps only the scale tensor's base pointer and rebuilds its
+        layout from k_cache's extent, so the two must agree page for page."""
+        for name in ("full", "swa"):
+            num_pages = self.pool.max_slots(name) // _SCALE_PS
+            k_kv, _ = self.pool.mha_views_for(name)
+            self.assertEqual(k_kv[0].shape[0] // _SCALE_PS, num_pages)
+            for buf in sum(self.pool.mha_scale_views_for(name), []):
+                self.assertEqual(buf.shape[0], num_pages)
+                self.assertTrue(buf.is_contiguous())
+
+    def test_scales_are_paid_for_out_of_the_budget(self):
+        scales = sum(
+            b.numel()
+            for name in ("full", "swa")
+            for b in sum(self.pool.mha_scale_views_for(name), [])
+        )
+        self.assertLessEqual(self.pool._raw.numel() + scales, self.budget)
+        self.assertAlmostEqual(scales / self.pool._raw.numel(), 2 / _SBS, places=2)
+
+    def test_unscaled_pool_allocates_no_scales(self):
+        self.assertEqual(_make_pool(ps=4)._mha_scale_views, {})
+
+
 class TestUnifiedKVPoolViews(unittest.TestCase):
     def test_every_mha_sub_pool_is_a_slot_strided_view(self):
         """The unified pool has ONE MHA layout: both sub-pools come back as
