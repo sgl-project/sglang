@@ -91,6 +91,26 @@ export const config = {
             "--dsa-decode-backend tilelang",
           ],
         },
+        // Order matters: a disabled pick is re-seated onto the first enabled
+        // option, so this entry must stay after BF16 + TileLang to keep the
+        // Hopper default unchanged.
+        {
+          id: "bf16-q8-prefill",
+          label: "BF16 + Q8 sparse prefill",
+          disabled: (s) => !["h100", "h200"].includes(s.hw),
+          disableReason: "The Q8KV8 sparse prefill kernel is SM90-only (Hopper).",
+          stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
+          flags: [
+            "--kv-cache-dtype bfloat16",
+            "--dsa-prefill-backend flashmla_sparse_q8",
+            "--dsa-decode-backend tilelang",
+          ],
+          hints: [
+            "Sparse MLA prefill computes in FP8 over the BF16 KV cache; the cache stays BF16 and decode stays on TileLang.",
+            "Single-GPU microbenchmark of the DSA prefill path: 1.51-1.72x at the 16 local heads TP4 gives (the same at the 8 local heads this TP8 recipe gives), 1.74-1.99x at 64 heads. End to end on 4x H200 (TP4): 7.85-8.78% lower single-request TTFT at 8,000-120,000 input tokens (at 3,500 the two are at parity), and 8.60-9.42% higher total token throughput on a prefill-dominated workload. Prefill only; the gate is SM90 compute capability, so any Hopper GPU is eligible, but the numbers above are H200-only.",
+            "Requires a build with PR #41790.",
+          ],
+        },
       ],
     },
     {
@@ -928,7 +948,9 @@ sgl-eval run gsm8k \\
       verified: true,
       verificationStatus: (s) =>
         s.bcg !== "off" ? "unverified" :
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        ["off", "l2"].includes(s.hicache)
+          ? (s.kvDsaPair === "bf16-q8-prefill" ? "in-progress" : "verified")
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -976,7 +998,9 @@ sgl-eval run gsm8k \\
       verified: true,
       verificationStatus: (s) =>
         s.bcg !== "off" ? "unverified" :
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        ["off", "l2"].includes(s.hicache)
+          ? (s.kvDsaPair === "bf16-q8-prefill" ? "in-progress" : "verified")
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

@@ -21,6 +21,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    get_schedule,
     get_spec,
 )
 
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,
+    gather_cast_kv_fp8_pad_paged,
     gather_dequant_requant_fp8_paged,
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
@@ -338,6 +340,77 @@ _DSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
+def _validate_flashmla_sparse_q8_backend(
+    *,
+    prefill_impl: str,
+    decode_impl: str,
+    kv_cache_dtype: torch.dtype,
+    kv_cache_store_fp8: bool,
+    qk_rope_head_dim: int,
+    device_sm_major: int,
+    hisparse_enabled: bool = False,
+    mixed_chunk_enabled: bool = False,
+) -> None:
+    # flashmla_sparse_q8 casts q and KV to fp8 per call, so the KV cache may be
+    # bfloat16 or fp8_e4m3.
+    if prefill_impl == "flashmla_sparse_q8":
+        if kv_cache_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError(
+                "--dsa-prefill-backend flashmla_sparse_q8 computes attention in FP8 "
+                "and reads a bfloat16 or fp8_e4m3 KV cache; "
+                f"got kv_cache_dtype={kv_cache_dtype}."
+            )
+        # Not supported yet: an fp8_e4m3 pool on a NoPE model has not been validated
+        # through the q8 prefix gather, and the KPool tail guard stays closed for
+        # fp8 pools.
+        if kv_cache_store_fp8 and qk_rope_head_dim == 0:
+            raise ValueError(
+                "--dsa-prefill-backend flashmla_sparse_q8 does not support an "
+                "fp8_e4m3 KV cache for NoPE MLA models (qk_rope_head_dim=0) yet; use "
+                "--kv-cache-dtype bfloat16."
+            )
+        # An fp8 dtype that is NOT stored packed leaves the pool in the raw
+        # 576-dim layout, which the bf16 prefix gather cannot read; without this
+        # the failure is a message-less assert on the first prefix extend.
+        if kv_cache_dtype == torch.float8_e4m3fn and not kv_cache_store_fp8:
+            raise ValueError(
+                "--dsa-prefill-backend flashmla_sparse_q8 requires either a "
+                "bfloat16 KV cache or the packed fp8_e4m3 pool; got an unpacked "
+                "fp8_e4m3 pool (a trtllm backend keeps the raw layout). Use "
+                "--kv-cache-dtype bfloat16."
+            )
+        if device_sm_major != 9:
+            raise ValueError(
+                "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
+                f"capability sm_{device_sm_major}x."
+            )
+        # A mixed batch takes the PAGED top-k transform, which belongs to the
+        # bf16 kernel. forward_extend refuses it, but the flag is readable here,
+        # so the refusal belongs at launch rather than on the first mixed batch
+        # formed under load.
+        if mixed_chunk_enabled:
+            raise ValueError(
+                "--dsa-prefill-backend flashmla_sparse_q8 does not support "
+                "--enable-mixed-chunk: q8 prefill runs on RAGGED extend batches "
+                "only."
+            )
+        # The q8 route hands top-k to the kernel as ragged ids and never binds the
+        # page table HiSparse would translate, so the two cannot be combined.
+        if hisparse_enabled:
+            raise ValueError(
+                "--dsa-prefill-backend flashmla_sparse_q8 is not supported together "
+                "with HiSparse: the q8 path consumes top-k as ragged ids and does "
+                "not carry the HiSparse page translation."
+            )
+    if decode_impl == "flashmla_sparse_q8":
+        raise ValueError(
+            "--dsa-decode-backend flashmla_sparse_q8 is not supported: "
+            "flashmla_sparse_q8 is a prefill-only backend. Pair it with a decode "
+            "backend that reads the KV cache dtype (flashmla_kv for fp8_e4m3; "
+            "tilelang or fa3 for bfloat16)."
+        )
+
+
 class DeepseekSparseAttnBackend(
     DSAMetadataManagementMixin,
     DeepseekSparseAttnBackendKPoolMixin,
@@ -496,39 +569,25 @@ class DeepseekSparseAttnBackend(
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
-        # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
-        # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
-        # construction: an unsupported config must fail at launch rather than
-        # mid-forward. `flashmla_sparse` remains the bf16 path with no such
-        # requirement.
-        if self.dsa_prefill_impl == "flashmla_sparse_q8":
-            if self.kv_cache_dtype != torch.float8_e4m3fn:
-                raise ValueError(
-                    "--dsa-prefill-backend flashmla_sparse_q8 is native FP8 and requires "
-                    f"--kv-cache-dtype fp8_e4m3 (got kv_cache_dtype={self.kv_cache_dtype}); "
-                    "use --dsa-prefill-backend flashmla_sparse for the bf16 path."
-                )
-            if self.device_sm_major != 9:
-                raise ValueError(
-                    "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
-                    f"capability sm_{self.device_sm_major}x."
-                )
-
-        # `flashmla_sparse_q8` is prefill-only (FP8 decode goes through
-        # `flashmla_kv`); reject it as a decode backend, since argparse accepts it
-        # via the shared CLI choices.
-        if self.dsa_decode_impl == "flashmla_sparse_q8":
-            raise ValueError(
-                "--dsa-decode-backend flashmla_sparse_q8 is not supported: "
-                "flashmla_sparse_q8 is a prefill-only backend. For FP8, use "
-                "--dsa-prefill-backend flashmla_sparse_q8 together with "
-                "--dsa-decode-backend flashmla_kv."
-            )
+        # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
+        _validate_flashmla_sparse_q8_backend(
+            prefill_impl=self.dsa_prefill_impl,
+            decode_impl=self.dsa_decode_impl,
+            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_store_fp8=self.dsa_kv_cache_store_fp8,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            device_sm_major=self.device_sm_major,
+            hisparse_enabled=self.hisparse_coordinator is not None,
+            mixed_chunk_enabled=get_schedule().enable_mixed_chunk,
+        )
 
         # Q8KV8 per-call device-tensor caches, populated lazily on the first
         # Q8KV8 dispatch (no-ops for other backends).
         self._q8kv8_identity_scale: Optional[torch.Tensor] = None
         self._q8kv8_qpad_buf: Optional[torch.Tensor] = None
+        # Grow-only -1-filled top-k pad buffer; see _pad_topk_width_buffered.
+        self._q8kv8_topk_pad_buf: Optional[torch.Tensor] = None
+        self._q8kv8_topk_pad_width: Optional[int] = None
         # Persistent (grow-only) fp8 KV destination for the Q8KV8 prefill
         # gather: [capacity_rows, 576].  Avoids a fresh torch.zeros
         # (alloc + full-buffer FillFunctor) per layer per call; only the
@@ -2052,6 +2111,18 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
+        # q8 is only wired on the RAGGED route; PAGED would run the bf16 kernel.
+        if (
+            dsa_impl == "flashmla_sparse_q8"
+            and topk_indices is not None
+            and topk_transform_method != TopkTransformMethod.RAGGED
+        ):
+            raise NotImplementedError(
+                "--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND prefill "
+                f"batches only; got forward_mode={forward_batch.forward_mode.name} "
+                "(SPLIT_PREFILL under --enable-pdmux, or DLLM_EXTEND under "
+                "--dllm-algorithm; --enable-mixed-chunk is rejected at launch)."
+            )
 
         if self.use_fused_topk:
             if topk_indices is not None:
@@ -2133,11 +2204,9 @@ class DeepseekSparseAttnBackend(
                 _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
                 page_table_1 = topk_indices
 
-                # `flashmla_sparse_q8` = native FP8 sparse prefill (constructor
-                # guarantees fp8_e4m3 KV + SM90). The helper consumes q_nope/q_rope
-                # directly (fusing the concat with the bf16->fp8 cast), so no bf16
-                # q_all is materialized on this path. The prefix path hands over the
-                # paged fp8 KV as-is; the non-prefix path passes the gathered bf16 KV.
+                # flashmla_sparse_q8: FP8 compute on SM90 over a bf16 or fp8_e4m3 KV
+                # cache. The helper fuses the q concat with the bf16->fp8 cast; prefix
+                # batches hand over the paged cache as-is, others pass fresh bf16 KV.
                 if dsa_impl == "flashmla_sparse_q8":
                     if _has_prefix:
                         page_table_1_flattened = (
@@ -2683,6 +2752,45 @@ class DeepseekSparseAttnBackend(
             self._q8kv8_born_q_sentinel = buf
         return buf[:numel].view(num_tokens, num_heads, v_head_dim)
 
+    def _pad_topk_width_buffered(
+        self, topk_indices: torch.Tensor, *, multiple: int
+    ) -> torch.Tensor:
+        """Widen top-k to a multiple of ``multiple``, padding with -1.
+
+        The destination is a persistent grow-only buffer rather than a fresh
+        ``torch.cat``: only the real columns change between calls, while a cat
+        reallocates and rewrites the whole ``[num_tokens, padded_width]`` int32
+        tensor on every DSA layer call (~71 MB at an 8192-token chunk).  The pad
+        columns are filled with -1 once at allocation and never written again,
+        which is exactly what the SM90 kernel's -1 clamp reads.  Eager-mode DSA
+        runs layers sequentially on one stream, so single-buffer reuse is safe
+        here for the same reason it is for _q8kv8_qpad_buf.
+        """
+        assert topk_indices.dim() == 2
+        width = topk_indices.shape[-1]
+        pad = (-width) % multiple
+        if pad == 0:
+            return topk_indices
+        rows = topk_indices.shape[0]
+        buf = self._q8kv8_topk_pad_buf
+        # A different REAL top-k width needs a fresh buffer even when it pads to
+        # the same total: the tail is -1-filled only at allocation, so a buffer
+        # built for a wider call still carries real ids in the columns this call
+        # must read as padding. Comparing width + pad misses that, because 2051
+        # and 2100 both pad to 2176.
+        if (
+            buf is None
+            or buf.shape[0] < rows
+            or buf.shape[-1] != width + pad
+            or self._q8kv8_topk_pad_width != width
+        ):
+            buf = topk_indices.new_full((rows, width + pad), -1)
+            self._q8kv8_topk_pad_buf = buf
+            self._q8kv8_topk_pad_width = width
+        out = buf[:rows]
+        out[:, :width].copy_(topk_indices)
+        return out
+
     def _forward_flashmla_sparse_q8kv8(
         self,
         q_nope: torch.Tensor,
@@ -2701,21 +2809,26 @@ class DeepseekSparseAttnBackend(
 
         Same contract as ``_forward_flashmla_sparse`` but executed through the
         FP8 ``sparse_mla_q8kv8_prefill_fwd`` kernel.  Identity per-tensor
-        scales (scalar 1.0) are used: a raw bf16->fp8 cast of q/kv is accurate
-        on real DeepSeek-V3 magnitudes, so no dynamic rescaling is applied.
+        scales (scalar 1.0) are used, matching the pre-existing fp8-pool path,
+        which dequantizes by the group scale and re-casts at identity scale
+        over the same range; no dynamic rescaling is applied.  The Triton cast
+        saturates at the fp8_e4m3 maximum (+-448) rather than producing NaN.
         The kernel runs via its fixed full-topk entry (``attn_sink`` /
         ``topk_length`` left None), keeping control flow identical across DP
         ranks; -1 topk sentinels are clamped to distinct zero pad rows inside
         the kernel.
 
-        Two KV paths:
+        KV paths:
           * non-prefix extend: ``kv_bf16`` (the gathered bf16 KV) is cast into
             a zero-padded fp8 buffer.
-          * prefix extend: ``paged_kv_cache`` (fp8, 656 B/token: nope_fp8 +
-            per-group scales + rope_bf16) is gathered, dequantized per group,
-            and requantized to per-tensor fp8 in one fused Triton kernel
-            (``gather_dequant_requant_fp8_paged``) — no intermediate bf16
-            materialization.
+          * prefix extend on an fp8 pool (656 B/token: nope_fp8 + per-group
+            scales + rope_bf16): ``gather_dequant_requant_fp8_paged`` gathers,
+            dequantizes per group and requantizes to per-tensor fp8 in one
+            fused Triton kernel.
+          * prefix extend on a bf16 pool: ``gather_cast_kv_fp8_pad_paged``
+            gathers the rows and store-casts them to fp8.
+        The top-k width is -1 padded to a multiple of 128 before the pad band
+        is sized (kpool rows are index_topk + index_kpool - 1 wide).
         """
         from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
             sparse_mla_q8kv8_prefill_fwd,
@@ -2813,6 +2926,8 @@ class DeepseekSparseAttnBackend(
         # they need it EVERY call because a previous, larger call may have
         # left real KV data there.  The gather kernel fuses the pad-row
         # zeroing; the bf16 path zeroes the tail explicitly.
+        # The kernel walks top-k in pairs of 64-wide blocks (topk % 128 == 0).
+        page_table_1 = self._pad_topk_width_buffered(page_table_1, multiple=128)
         topk = page_table_1.shape[-1]
         if paged_kv_cache is not None:
             num_kv_tokens = page_table_1_flattened.shape[0]
@@ -2829,12 +2944,19 @@ class DeepseekSparseAttnBackend(
                 device=dev,
             )
             self._q8kv8_kv_buf = kv_buf
-        if paged_kv_cache is not None:
+        if paged_kv_cache is not None and self.dsa_kv_cache_store_fp8:
             kv_padded = gather_dequant_requant_fp8_paged(
                 paged_kv_cache,
                 page_table_1_flattened,
                 extra_rows=topk,
                 out=kv_buf[:total_kv_rows],
+            ).view(-1, 1, head_dim)
+        elif paged_kv_cache is not None:
+            kv_padded = gather_cast_kv_fp8_pad_paged(
+                out=kv_buf[:total_kv_rows],
+                kv_cache=paged_kv_cache,
+                page_table_1_flattened=page_table_1_flattened,
+                nope_dim=self.kv_lora_rank,
             ).view(-1, 1, head_dim)
         elif kv_k is not None:
             # Fused non-prefix KV prep (SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION):
@@ -3668,11 +3790,12 @@ class DeepseekSparseAttnBackend(
         """
         if (
             # disable for MTP
-            self.dsa_kv_cache_store_fp8
-            # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8
-            # dispatch lives inside the RAGGED branch of forward_extend; without this the
-            # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
-            # fp8 KV ("kv must have dtype kBFloat16").
+            (
+                self.dsa_kv_cache_store_fp8
+                or self.dsa_prefill_impl == "flashmla_sparse_q8"
+            )
+            # flashmla_sparse_q8 always gathers KV into a contiguous fp8 buffer;
+            # it is RAGGED whatever the pool dtype, since its dispatch lives there.
             and self.dsa_prefill_impl in ("flashmla_sparse", "flashmla_sparse_q8")
             and forward_mode == ForwardMode.EXTEND
         ):
