@@ -28,17 +28,18 @@ class GptOssDetector(BaseFormatDetector):
         super().__init__()
         self.harmony_parser = HarmonyParser()
         self.bot_token = "<|start|>assistant<|channel|>commentary"
+        self.bot_token_alt = "<|channel|>commentary"
         self.eot_token = "<|call|>"
 
         # Pattern to extract function name and JSON from tool_call event content
         self.tool_extract_pattern = re.compile(
-            r"to=([a-zA-Z_][a-zA-Z0-9_.-]*)\s*<\|constrain\|>json<\|message\|>(.*?)(?:<\|call\|>|$)",
+            r"to=([a-zA-Z_][a-zA-Z0-9_.\-]*)\s*(?:<\|constrain\|>json<\|message\>|)(.*?)(?:<\|call\||$)",
             re.DOTALL,
         )
 
     def has_tool_call(self, text: str) -> bool:
         """Check if text contains TypeScript-style function call markers."""
-        return self.bot_token in text
+        return self.bot_token in text or self.bot_token_alt in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse TypeScript-style function calls from complete text."""
