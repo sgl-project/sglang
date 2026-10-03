@@ -2512,22 +2512,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.scheduler.batch_result_processor._maybe_update_reasoning_tokens(
                 decode_req.req, committed_output_id
             )
-        decode_req.req.cached_tokens = cached_tokens[0].item()
-        # The prefill node already reported its prefix-cache hit in
-        # cached_tokens[0]. Seed already_computed with it so that
-        # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
-        # only adds decode-side reuse *beyond* what prefill counted, instead of
-        # double-counting the shared prompt prefix (which would make
-        # cached_tokens exceed prompt_tokens when decode radix cache is on).
-        decode_req.req.already_computed = decode_req.req.cached_tokens
-        decode_req.req.cached_tokens_device = cached_tokens[1].item()
-        decode_req.req.cached_tokens_host = cached_tokens[2].item()
-        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
-        # Multimodal prompt token counts packed into cached_tokens slots 4-6
-        # by the prefill node (see MetadataBuffers.set_buf).
-        decode_req.req.mm_image_tokens = cached_tokens[4].item()
-        decode_req.req.mm_audio_tokens = cached_tokens[5].item()
-        decode_req.req.mm_video_tokens = cached_tokens[6].item()
+        # A rebootstrap's prefill recomputed prompt + output, so its cache hit is
+        # not the prompt's. Keep the first handoff's usage, as retracted_stain
+        # does for the aggregated path and prepare_for_prebuilt.
+        if not decode_req.is_rebootstrap:
+            decode_req.req.cached_tokens = cached_tokens[0].item()
+            # The prefill node already reported its prefix-cache hit in
+            # cached_tokens[0]. Seed already_computed with it so that
+            # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
+            # only adds decode-side reuse *beyond* what prefill counted, instead of
+            # double-counting the shared prompt prefix (which would make
+            # cached_tokens exceed prompt_tokens when decode radix cache is on).
+            decode_req.req.already_computed = decode_req.req.cached_tokens
+            decode_req.req.cached_tokens_device = cached_tokens[1].item()
+            decode_req.req.cached_tokens_host = cached_tokens[2].item()
+            decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+            # Multimodal prompt token counts packed into cached_tokens slots 4-6
+            # by the prefill node (see MetadataBuffers.set_buf).
+            decode_req.req.mm_image_tokens = cached_tokens[4].item()
+            decode_req.req.mm_audio_tokens = cached_tokens[5].item()
+            decode_req.req.mm_video_tokens = cached_tokens[6].item()
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
