@@ -30,7 +30,11 @@ import torch
 # guards keep that order.
 # isort: off
 from sglang.srt.layers.quantization.modelopt_quant import _compute_gemm1_alphas
-from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import _compute_g1_scale_c
+from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+    _align_fp4_moe_weights,
+    _compute_g1_scale_c,
+    trtllm_nvfp4_hidden_alignment,
+)
 
 # isort: on
 from sglang.test.test_utils import CustomTestCase
@@ -322,6 +326,103 @@ class TestG1ScaleC(CustomTestCase):
         )
 
         self.assertEqual(g1_scale_c.dtype, torch.float32)
+
+
+def _fp4_moe_weights(num_experts: int, hidden: int, inter: int, is_gated: bool):
+    """Packed FP4 weights + E4M3 block scales in checkpoint layout, no zeros."""
+    gate_up = (2 if is_gated else 1) * inter
+    u8 = lambda *shape: torch.randint(1, 255, shape, dtype=torch.uint8)
+    w13 = u8(num_experts, gate_up, hidden // 2)
+    w13_scale = u8(num_experts, gate_up, hidden // 16).view(torch.float8_e4m3fn)
+    w2 = u8(num_experts, hidden, inter // 2)
+    w2_scale = u8(num_experts, hidden, inter // 16).view(torch.float8_e4m3fn)
+    return w13, w13_scale, w2, w2_scale
+
+
+class TestAlignFp4MoeWeights(CustomTestCase):
+    """Intermediate/hidden zero-padding for the TRT-LLM NVFP4 MoE weights.
+
+    Nemotron 3 / 3.5 (hidden 2688, intermediate 1856, RELU^2 experts) needs
+    both: the non-gated kernel wants a 128-aligned intermediate, and the
+    per-token variant only has a usable tactic set at a 512-aligned hidden.
+    """
+
+    def test_hidden_alignment_only_for_per_token_non_gated(self):
+        self.assertEqual(trtllm_nvfp4_hidden_alignment(True, False), 512)
+        self.assertEqual(trtllm_nvfp4_hidden_alignment(True, True), 1)
+        self.assertEqual(trtllm_nvfp4_hidden_alignment(False, False), 1)
+        self.assertEqual(trtllm_nvfp4_hidden_alignment(False, True), 1)
+
+    def test_aligned_shapes_are_returned_untouched(self):
+        weights = _fp4_moe_weights(4, 3072, 1920, is_gated=False)
+
+        out = _align_fp4_moe_weights(
+            *weights, is_gated=False, intermediate_alignment=128, hidden_alignment=512
+        )
+
+        self.assertEqual(out[4:], (1920, 3072))
+        for original, returned in zip(weights, out[:4]):
+            self.assertIs(returned, original)
+
+    def test_nemotron_pads_intermediate_and_hidden_with_zero_fill(self):
+        num_experts, hidden, inter = 4, 2688, 1856
+        padded_hidden, padded_inter = 3072, 1920
+        w13, w13_scale, w2, w2_scale = _fp4_moe_weights(
+            num_experts, hidden, inter, is_gated=False
+        )
+
+        p_w13, p_w13_scale, p_w2, p_w2_scale, out_inter, out_hidden = (
+            _align_fp4_moe_weights(
+                w13,
+                w13_scale,
+                w2,
+                w2_scale,
+                is_gated=False,
+                intermediate_alignment=128,
+                hidden_alignment=512,
+            )
+        )
+
+        self.assertEqual((out_inter, out_hidden), (padded_inter, padded_hidden))
+        # GEMM1: rows are intermediate, K is hidden (2 values/byte, 16/scale).
+        self.assertEqual(p_w13.shape, (num_experts, padded_inter, padded_hidden // 2))
+        self.assertEqual(
+            p_w13_scale.shape, (num_experts, padded_inter, padded_hidden // 16)
+        )
+        torch.testing.assert_close(p_w13[:, :inter, : hidden // 2], w13)
+        self.assertEqual(p_w13.sum().item(), w13.sum().item())
+        self.assertEqual(
+            p_w13_scale.view(torch.uint8).sum().item(),
+            w13_scale.view(torch.uint8).sum().item(),
+        )
+        # GEMM2: rows are hidden, K is intermediate; padded rows/cols stay zero
+        # so the sliced-off outputs never mix into real ones.
+        self.assertEqual(p_w2.shape, (num_experts, padded_hidden, padded_inter // 2))
+        self.assertEqual(
+            p_w2_scale.shape, (num_experts, padded_hidden, padded_inter // 16)
+        )
+        torch.testing.assert_close(p_w2[:, :hidden, : inter // 2], w2)
+        self.assertEqual(p_w2.sum().item(), w2.sum().item())
+        self.assertEqual(
+            p_w2_scale.view(torch.uint8).sum().item(),
+            w2_scale.view(torch.uint8).sum().item(),
+        )
+        self.assertEqual(p_w13_scale.dtype, w13_scale.dtype)
+        self.assertEqual(p_w2_scale.dtype, w2_scale.dtype)
+
+    def test_gated_pads_only_intermediate_by_default(self):
+        num_experts, hidden, inter = 2, 2688, 1000
+        w13, w13_scale, w2, w2_scale = _fp4_moe_weights(
+            num_experts, hidden, inter, is_gated=True
+        )
+
+        p_w13, _, p_w2, _, out_inter, out_hidden = _align_fp4_moe_weights(
+            w13, w13_scale, w2, w2_scale, is_gated=True, intermediate_alignment=16
+        )
+
+        self.assertEqual((out_inter, out_hidden), (1008, hidden))
+        self.assertEqual(p_w13.shape, (num_experts, 2 * 1008, hidden // 2))
+        self.assertEqual(p_w2.shape, (num_experts, hidden, 1008 // 2))
 
 
 if __name__ == "__main__":
