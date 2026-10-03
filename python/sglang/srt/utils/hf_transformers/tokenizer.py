@@ -193,6 +193,20 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
             return retry_without_mistral_common_kwargs(
                 tokenizer_name, *args, **common_kwargs
             )
+        # Transformers v5's AutoTokenizer routes models that declare a legacy
+        # slow tokenizer class (e.g. GPT2Tokenizer) but ship only vocab.json +
+        # merges.txt (no tokenizer.json) to the generic TokenizersBackend, which
+        # cannot build from those files and *raises* instead of returning. The
+        # TokenizersBackend fallback in get_tokenizer() only fires when
+        # AutoTokenizer *returns* a backend, so handle the raised case here by
+        # loading directly via the class declared in tokenizer_config.json
+        # (e.g. GPT2Tokenizer), which still resolves vocab.json/merges.txt.
+        if "Couldn't instantiate the backend tokenizer" in str(e):
+            fallback = _load_tokenizer_by_declared_class(
+                tokenizer_name, *args, **common_kwargs
+            )
+            if fallback is not None:
+                return fallback
         # If the error pertains to the tokenizer class not existing or not
         # currently being imported, suggest using the --trust-remote-code flag.
         if not common_kwargs.get("trust_remote_code") and (
