@@ -453,6 +453,63 @@ def handle_linear_attn_backend(server_args: Any):
             )
 
 
+def validate_linear_lossless_verify(server_args: Any) -> None:
+    """Gate --enable-linear-lossless-verify once the speculative args are final.
+
+    Registered after ``handle_speculative_decoding``: DFLASH and DSPARK pin
+    ``speculative_eagle_topk`` to 1 there and EAGLE/MTP resolve their defaults,
+    so the top-k seen here is the one the verify will run with.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_linear_lossless_verify:
+        return
+    if cfg.speculative_algorithm is None:
+        raise ValueError(
+            "--enable-linear-lossless-verify only changes speculative "
+            "target-verify; it requires --speculative-algorithm."
+        )
+    if cfg.speculative_eagle_topk != 1:
+        raise ValueError(
+            "--enable-linear-lossless-verify requires a linear draft chain "
+            "(--speculative-eagle-topk 1): the tuple replay applies the "
+            "accepted steps in order and cannot follow an EAGLE tree. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+        )
+    if cfg.enable_linear_replayssm_spec or cfg.enable_linear_replayssm:
+        raise ValueError(
+            "--enable-linear-lossless-verify is mutually exclusive with "
+            "--enable-linear-replayssm and --enable-linear-replayssm-spec: "
+            "they replace the same per-draft state snapshots."
+        )
+    decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
+    verify = cfg.linear_attn_verify_backend
+    if verify not in (None, "triton") or (verify is None and decode == "flashinfer"):
+        raise ValueError(
+            "--enable-linear-lossless-verify needs the Triton GDN verify "
+            "kernel, which is the one that writes the (u, k, g) tuples. Pass "
+            "--linear-attn-verify-backend triton. Got "
+            f"--linear-attn-verify-backend={verify!r} with decode backend "
+            f"{decode!r}."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "--enable-linear-lossless-verify is not supported with "
+            "--enable-unified-memory: the unified pool builds its own "
+            "per-draft state snapshots."
+        )
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+        raise ValueError(
+            "--enable-linear-lossless-verify requires "
+            "SGLANG_RAGGED_VERIFY_MODE=static: the GDN verify reshapes the batch "
+            "to a fixed draft width."
+        )
+
+
 def handle_multi_item_scoring(server_args: Any):
     """Setup and validate multi-item scoring constraints.
 
