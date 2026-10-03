@@ -198,8 +198,7 @@ class CLIPAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=parallel.attn_tp_rank,
-            tp_size=parallel.attn_tp_size,
+            parallel_group="attn_tp",
         )
         # TODO: this layer shards over attention TP but reduces over the full TP
         # group; reduce over the attention-TP group so attention DP and attention

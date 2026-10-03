@@ -353,10 +353,8 @@ class InklingAttention(nn.Module):
             output_size=self.hidden_size,
             bias=o_bias,
             prefix=add_prefix("wo_ud", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
-            use_dp_attention_reduce=True,
             quant_config=quant_config,
         )
         # --enable-scattered-sconv: the output reduction becomes a hidden-dim
