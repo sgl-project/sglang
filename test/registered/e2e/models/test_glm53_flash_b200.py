@@ -1,6 +1,6 @@
 """B200 per-commit coverage for the GLM-5.3-Flash serving recipes.
 
-Runs the Low Latency, DFlash2, and High Throughput TP4 recipes on four B200
+Runs the Low Latency, DFlash2, High Throughput, and Prefill CP recipes on four B200
 GPUs. All recipes must retain GSM8K accuracy; the Low Latency recipe also
 checks EAGLE speculative acceptance and single-request decode performance.
 """
@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=2400, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=3000, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL_PATH = "zai-org/GLM-5.3-Flash"
 DFLASH2_DRAFT_MODEL_PATH = "incoai/GLM-5.3-Flash-DFlash2"
@@ -128,6 +128,30 @@ class TestGLM53FlashB200DFlash2(
         DFLASH2_DRAFT_MODEL_PATH,
         "--speculative-draft-attention-backend",
         "fa4",
+    ]
+
+
+class TestGLM53FlashB200ContextParallel(
+    GSM8KMixin,
+    _GLM53FlashB200Base,
+):
+    gsm8k_score_threshold = 0.93
+    gsm8k_num_examples = 500
+    gsm8k_num_shots = 20
+    server_args = [
+        *COMMON_SERVER_ARGS,
+        "--language-only",
+        "--enable-prefill-cp",
+        "--cp-strategy",
+        "interleave",
+        "--attn-cp-size",
+        "4",
+        # KDA partitions heads over these four CP ranks. EP1 keeps every MoE
+        # on TP4; dense FFNs also use TP4 rather than per-rank computation.
+        "--ep-size",
+        "1",
+        "--moe-dense-tp-size",
+        "4",
     ]
 
 
