@@ -15,6 +15,10 @@ import zmq
 # use the native logger to avoid circular import
 logger = logging.getLogger(__name__)
 
+# Step taken when a bind is allowed to move off a taken port; matches the stride
+# ServerArgs.settle_port probes with, so the two never walk onto each other.
+PORT_DRIFT_STRIDE = 42
+
 
 def add_prefix(name: str, prefix: str) -> str:
     """Add a weight path prefix to a module name.
@@ -134,7 +138,7 @@ def get_zmq_socket(
     endpoint: str,
     bind: bool,
     max_bind_retries: int = 10,
-    same_port: bool = False,
+    allow_port_drift: bool = False,
 ) -> tuple[zmq.Socket, str]:
     """
     Create and configure a ZMQ socket.
@@ -145,13 +149,14 @@ def get_zmq_socket(
         endpoint: Endpoint string (e.g., "tcp://localhost:5555")
         bind: Whether to bind (True) or connect (False)
         max_bind_retries: Maximum number of retries if bind fails due to address already in use
-        same_port: If True, retry on the same port instead of incrementing.
-            Useful when the port must be fixed (e.g., disagg sockets where
-            DiffusionServer connects to a pre-determined port).
+        allow_port_drift: If True, a taken port is retried on the next port instead
+            of the same one. Only for callers that publish the returned endpoint to
+            their peers: a drifted port the peers never learn about leaves them
+            talking to whoever owns the requested port.
 
     Returns:
-        A tuple of (socket, actual_endpoint). The actual_endpoint may differ from the
-        requested endpoint if bind retry was needed (and same_port is False).
+        A tuple of (socket, actual_endpoint). The actual_endpoint differs from the
+        requested endpoint only when the port drifted.
     """
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
@@ -198,14 +203,14 @@ def get_zmq_socket(
             for attempt in range(max_bind_retries):
                 try:
                     current_endpoint = endpoint
-                    if attempt > 0 and not same_port:
-                        # Try next port (increment by 42 to match settle_port logic)
-                        current_port = original_port + attempt * 42
+                    if attempt > 0 and allow_port_drift:
+                        current_port = original_port + attempt * PORT_DRIFT_STRIDE
                         current_endpoint = re.sub(
                             r":(\d+)$", f":{current_port}", endpoint
                         )
                         logger.info(
-                            f"ZMQ bind failed for port {original_port + (attempt - 1) * 42}, "
+                            f"ZMQ bind failed for port "
+                            f"{original_port + (attempt - 1) * PORT_DRIFT_STRIDE}, "
                             f"retrying with port {current_port} (attempt {attempt + 1}/{max_bind_retries})"
                         )
                     elif attempt > 0:
@@ -228,8 +233,8 @@ def get_zmq_socket(
                     last_exception = e
                     if e.errno == zmq.EADDRINUSE and attempt < max_bind_retries - 1:
                         # Address already in use, retry
-                        # Longer sleep for same_port (waiting for TIME_WAIT release)
-                        _time.sleep(1.0 if same_port else 0.5)
+                        # Longer sleep when staying put (waiting for TIME_WAIT release)
+                        _time.sleep(0.5 if allow_port_drift else 1.0)
                         # Re-create socket since ZMQ socket state may be invalid after failed bind
                         socket.close()
                         socket = context.socket(socket_type)
@@ -245,9 +250,14 @@ def get_zmq_socket(
                         continue
                     elif attempt == max_bind_retries - 1:
                         # Last attempt failed
+                        last_port = (
+                            original_port + attempt * PORT_DRIFT_STRIDE
+                            if allow_port_drift
+                            else original_port
+                        )
                         logger.error(
                             f"Failed to bind ZMQ socket after {max_bind_retries} attempts. "
-                            f"Original endpoint: {endpoint}, Last tried port: {original_port + attempt * 42}"
+                            f"Original endpoint: {endpoint}, Last tried port: {last_port}"
                         )
                         raise
                     else:
