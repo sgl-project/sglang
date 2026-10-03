@@ -129,8 +129,7 @@ class SDARAttention(nn.Module):
             self.total_num_kv_heads,
             bias=getattr(config, "attention_bias", False),
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(

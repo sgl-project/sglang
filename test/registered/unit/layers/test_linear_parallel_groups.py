@@ -88,6 +88,62 @@ class TestLinearParallelGroups(CustomTestCase):
                         qkv.weight.weight_loader(qkv.weight, weight + 1, name)
                 torch.testing.assert_close(qkv.weight, expected + 1)
 
+    def test_model_qkv_reload_keeps_attention_shards_and_replicated_kv(self):
+        from sglang.srt.models.qwen2_moe import Qwen2MoeAttention
+
+        for kv_heads in (1, 4):
+            for bias in (False, True):
+                with self.subTest(kv_heads=kv_heads, bias=bias):
+                    attention = Qwen2MoeAttention(
+                        hidden_size=8,
+                        num_heads=4,
+                        num_kv_heads=kv_heads,
+                        max_position_embeddings=16,
+                        qkv_bias=bias,
+                    )
+                    qkv = attention.qkv_proj
+                    weights = {
+                        "q": self.weight,
+                        "k": self.weight[: kv_heads * 2] + 2,
+                        "v": self.weight[: kv_heads * 2] + 4,
+                    }
+                    biases = {
+                        name: torch.arange(weight.shape[0], dtype=torch.float32)
+                        for name, weight in weights.items()
+                    }
+                    # Reload under another replica's scope. This model was
+                    # constructed on attention rank 1, so Q stays on that rank
+                    # and the one-head K/V layout remains replicated.
+                    with get_parallel().override(
+                        tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
+                    ):
+                        for name, weight in weights.items():
+                            qkv.weight.weight_loader(qkv.weight, weight, name)
+                            if bias:
+                                qkv.bias.weight_loader(qkv.bias, biases[name], name)
+                    shards = {
+                        name: value.chunk(2)[1]
+                        if name == "q" or kv_heads >= 2
+                        else value
+                        for name, value in weights.items()
+                    }
+                    bias_shards = {
+                        name: value.chunk(2)[1]
+                        if name == "q" or kv_heads >= 2
+                        else value
+                        for name, value in biases.items()
+                    }
+                    expected_weight = torch.cat(tuple(shards.values()))
+                    expected_bias = (
+                        torch.cat(tuple(bias_shards.values())) if bias else None
+                    )
+                    torch.testing.assert_close(
+                        qkv(self.x)[0],
+                        F.linear(self.x, expected_weight, expected_bias),
+                    )
+                    self.assertEqual(attention.q_size, shards["q"].shape[0])
+                    self.assertEqual(attention.kv_size, shards["k"].shape[0])
+
     def test_v2_loaders_keep_their_partition_during_reload(self):
         column = ColumnParallelLinear(8, 8, bias=False, parallel_group="attn_tp")
         row = RowParallelLinear(8, 8, bias=False, parallel_group="attn_tp")

@@ -571,8 +571,7 @@ class NemotronHAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="attn_tp",
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(

@@ -351,8 +351,7 @@ class ExaoneMoEAttention(nn.Module):
             bias=bias,
             quant_config=qkv_quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
