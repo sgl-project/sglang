@@ -46,6 +46,9 @@ def _load_megamoe_module(monkeypatch):
         SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
             get=lambda: 0
         ),
+        SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT=types.SimpleNamespace(
+            get=lambda: True
+        ),
         SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=types.SimpleNamespace(
             get=lambda: "bf16"
         ),
@@ -90,6 +93,84 @@ def test_max_tokens_uses_runtime_context_accessor(monkeypatch):
     runtime_context = sys.modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 0
     assert module._resolve_max_tokens_per_rank() == 1024
+
+
+def test_make_supported_config_filters_unknown_kwargs(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    class OldConfig:
+        def __init__(self, *, top_k):
+            self.top_k = top_k
+
+    config = module._make_supported_config(
+        OldConfig, top_k=8, topk_reduce_persistent=True
+    )
+    assert config.top_k == 8
+    assert not hasattr(config, "topk_reduce_persistent")
+
+
+def test_make_supported_config_passes_persistent_reduce(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    class NewConfig:
+        def __init__(self, *, top_k, topk_reduce_persistent=False):
+            self.top_k = top_k
+            self.topk_reduce_persistent = topk_reduce_persistent
+
+    config = module._make_supported_config(
+        NewConfig, top_k=8, topk_reduce_persistent=True
+    )
+    assert config.top_k == 8
+    assert config.topk_reduce_persistent is True
+
+
+def test_make_supported_moe_ep_tensors_passes_runtime_num_tokens(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    class NewMoEEpTensors:
+        def __init__(
+            self,
+            *,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            num_tokens=None,
+        ):
+            self.hidden_states = hidden_states
+            self.topk_ids = topk_ids
+            self.topk_weights = topk_weights
+            self.num_tokens = num_tokens
+
+    tensors = module._make_supported_moe_ep_tensors(
+        NewMoEEpTensors,
+        hidden_states="x",
+        topk_ids="ids",
+        topk_weights="weights",
+        num_tokens=7,
+        fc1_alpha="ignored",
+    )
+    assert tensors.num_tokens == 7
+    assert not hasattr(tensors, "fc1_alpha")
+
+
+def test_make_supported_moe_ep_tensors_filters_runtime_num_tokens(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    class OldMoEEpTensors:
+        def __init__(self, *, hidden_states, topk_ids, topk_weights):
+            self.hidden_states = hidden_states
+            self.topk_ids = topk_ids
+            self.topk_weights = topk_weights
+
+    tensors = module._make_supported_moe_ep_tensors(
+        OldMoEEpTensors,
+        hidden_states="x",
+        topk_ids="ids",
+        topk_weights="weights",
+        num_tokens=7,
+    )
+    assert tensors.hidden_states == "x"
+    assert not hasattr(tensors, "num_tokens")
 
 
 def test_adapter_keeps_router_ids_int32(monkeypatch):
@@ -137,6 +218,7 @@ def test_adapter_keeps_router_ids_int32(monkeypatch):
 
     assert mega.tensors.topk_ids.data_ptr() == topk_ids.data_ptr()
     assert mega.tensors.topk_ids.dtype == torch.int32
+    assert mega.tensors.num_tokens == hidden_states.shape[0]
     assert result.hidden_states is output
 
 
@@ -187,6 +269,25 @@ def test_adapter_requests_workspace_output_view(monkeypatch):
     assert mega.tensors.topk_ids.data_ptr() == topk_ids.data_ptr()
     assert mega.tensors.topk_ids.dtype == torch.int32
     assert mega.return_workspace_view is True
+
+
+def test_persistent_topk_reduce_uses_runtime_sized_output(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    output = torch.empty((2, 4), dtype=torch.bfloat16)
+
+    class Mega:
+        _megakernel_config = types.SimpleNamespace(topk_reduce_persistent=True)
+
+        def forward(self, tensors, *, return_workspace_view=False):
+            self.return_workspace_view = return_workspace_view
+            return output
+
+    mega = Mega()
+    forward = module._select_megamoe_forward(mega)
+
+    assert forward(mega, object()) is output
+    assert mega.return_workspace_view is False
 
 
 def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):
