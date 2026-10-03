@@ -8,6 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 _BLOCK_SIZE = 1024
 
 
@@ -96,7 +98,9 @@ def top_p_renorm_probs_triton(
 
     Sorting and prefix sums use PyTorch's device kernels because a vocabulary-sized
     in-register Triton sort does not scale to 100K+ vocabularies. Triton performs
-    the bandwidth-heavy masking, partial reduction, and normalization.
+    the bandwidth-heavy masking, partial reduction, and normalization. With
+    SGLANG_TOPP_RADIX=1 the pivot comes from the sort-free radix select in
+    topp_radix_triton.py instead.
     """
     probs_fp32 = _prepare_probs(probs)
     batch_size, vocab_size = probs_fp32.shape
@@ -118,6 +122,11 @@ def top_p_renorm_probs_triton(
         top_ps = torch.full(
             (batch_size,), float(top_p), device=probs.device, dtype=torch.float32
         )
+
+    if envs.SGLANG_TOPP_RADIX.get():
+        from sglang.kernels.ops.sampling.topp_radix_triton import top_p_pivots_radix
+
+        return _renorm_from_pivots(probs_fp32, top_p_pivots_radix(probs_fp32, top_ps))
 
     # Match FlashInfer's threshold semantics: sort ascending, discard the prefix
     # whose cumulative mass is below 1 - p, and retain all ties at the pivot.
