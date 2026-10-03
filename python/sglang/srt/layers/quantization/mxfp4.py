@@ -405,7 +405,10 @@ class Mxfp4Config(QuantizationConfig):
 
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.layers.quantization.unquant import (
+            UnquantizedFusedMoEMethod,
+            UnquantizedLinearMethod,
+        )
         from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 
         # fp8 channelwise
@@ -433,6 +436,12 @@ class Mxfp4Config(QuantizationConfig):
             else:
                 raise NotImplementedError
         elif isinstance(layer, FusedMoE):
+            if self.ignored_layers and should_ignore_layer(
+                prefix,
+                ignore=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return UnquantizedFusedMoEMethod()
             if self.is_checkpoint_mxfp4_serialized:
                 return Mxfp4MoEMethod(prefix=prefix)
             else:
