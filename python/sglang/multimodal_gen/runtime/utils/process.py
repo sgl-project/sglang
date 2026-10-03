@@ -45,7 +45,11 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
     except psutil.NoSuchProcess:
         return
 
-    children = itself.children(recursive=True)
+    try:
+        children = itself.children(recursive=True)
+    except psutil.NoSuchProcess:
+        # The parent may exit after Process() succeeds but before enumeration.
+        return
     for child in children:
         if child.pid == skip_pid:
             continue
