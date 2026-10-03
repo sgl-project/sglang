@@ -22,6 +22,7 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -72,6 +73,9 @@ def get_batch_sizes_to_capture(
 
     capture_bs = list(get_exec().graph.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
+    dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+    if dllm_config is not None and dllm_config.requires_separate_context_encoding:
+        num_max_requests = min(num_max_requests, dllm_config.max_running_requests)
 
     mul_base = get_cuda_graph_batch_size_alignment()
     # TBO splits each request's rows across two micro-batches, so the
