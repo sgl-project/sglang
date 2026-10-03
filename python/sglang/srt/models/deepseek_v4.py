@@ -1029,7 +1029,16 @@ class MqaAttentionBase(nn.Module):
             sink = self.attn_sink.new_zeros(sink_num_heads)
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
             self._attn_sink_local = sink
+            self._attn_sink_local_slice = slice(
+                rank * num_heads, (rank + 1) * num_heads
+            )
         return self._attn_sink_local[:kernel_num_heads]
+
+    def refresh_attn_sink_cache(self) -> None:
+        if self._attn_sink_local is None:
+            return
+        src = self.attn_sink.data[self._attn_sink_local_slice]
+        self._attn_sink_local[: src.numel()].copy_(src)
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -5360,6 +5369,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 and not self_attn.indexer.compressor.ape_converted
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
+            self_attn.refresh_attn_sink_cache()
             layer.refresh_mhc_norm_weight_cache()
 
     def precompile_kernels_after_loading(self) -> None:
