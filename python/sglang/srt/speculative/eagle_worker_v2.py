@@ -214,6 +214,44 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        # The draft loaded its own embed_tokens/lm_head from the checkpoint, but
+        # for non-EAGLE3 drafts (e.g. NEXTN/MTP) these are replaced by references
+        # to the target's in init_lm_head() -- which runs from alloc_memory_pool(),
+        # AFTER the KV/mamba pool has already been profiled and sized. That leaves
+        # ~embedding-sized redundant draft weights resident during profiling, which
+        # understates free GPU memory and shrinks the mamba state cache (capping
+        # max_running_requests). Share them now, before profiling, so those bytes
+        # are already freed when the pool budget is measured. init_lm_head() still
+        # runs later and is idempotent for this path.
+        self._maybe_free_redundant_draft_embed_head_early()
+
+    def _maybe_free_redundant_draft_embed_head_early(self):
+        import gc
+
+        if self.speculative_algorithm.is_eagle3():
+            return
+        if get_spec().speculative_token_map is not None:
+            return
+        target_model = self.target_worker.model_runner.model
+        draft_model = self.draft_runner.model
+        if not (
+            hasattr(target_model, "get_embed_and_head")
+            and hasattr(draft_model, "set_embed_and_head")
+        ):
+            return
+        try:
+            embed, head = target_model.get_embed_and_head()
+            draft_model.set_embed_and_head(embed, head)
+        except Exception as e:  # be conservative: never break startup for this
+            logger.warning(
+                "Skipped early draft embed/head sharing (%r); "
+                "pool may be sized conservatively.",
+                e,
+            )
+            return
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
