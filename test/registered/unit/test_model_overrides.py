@@ -2332,6 +2332,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 dsa_prefill_backend=None,
                 dsa_decode_backend=None,
                 enable_hisparse=False,
+                page_size=64,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -2606,12 +2607,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _dsa_kv_cache_dtype_default,
         )
 
-        def _view(**kw):
-            hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+        def _view(arch="DeepseekV32ForCausalLM", **kw):
+            hf = SimpleNamespace(architectures=[arch])
             defaults = dict(
                 kv_cache_dtype="auto",
                 dsa_prefill_backend=None,
                 dsa_decode_backend=None,
+                enable_prefill_cp=False,
+                dcp_size=1,
+                enable_hisparse=False,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -2646,6 +2650,56 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(
                     _dsa_kv_cache_dtype_default(_view()),
                     {"kv_cache_dtype": "fp8_e4m3"},
+                )
+                with patch.object(overrides_module, "is_hip", return_value=False):
+                    self.assertEqual(
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                            )
+                        ),
+                        {},
+                    )
+                    with self.assertRaisesRegex(ValueError, "specialized for GLM-5.2"):
+                        _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="nvfp4"))
+                    for topology in (
+                        {"enable_prefill_cp": True},
+                        {"dcp_size": 2},
+                    ):
+                        with (
+                            self.subTest(topology=topology),
+                            self.assertRaisesRegex(
+                                ValueError, "does not yet support.*context parallelism"
+                            ),
+                        ):
+                            _dsa_kv_cache_dtype_default(
+                                _view(
+                                    arch="GlmMoeDsaForCausalLM",
+                                    kv_cache_dtype="nvfp4",
+                                    **topology,
+                                )
+                            )
+                    with self.assertRaisesRegex(
+                        ValueError, "does not yet support HiSparse"
+                    ):
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                enable_hisparse=True,
+                            )
+                        )
+            with (
+                patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+                patch.object(overrides_module, "is_hip", return_value=False),
+                self.assertRaisesRegex(ValueError, "requires an SM100 GPU"),
+            ):
+                _dsa_kv_cache_dtype_default(
+                    _view(
+                        arch="GlmMoeDsaForCausalLM",
+                        kv_cache_dtype="nvfp4",
+                    )
                 )
 
     def test_deepseek_v4_kv_cache_dtype_pass(self):

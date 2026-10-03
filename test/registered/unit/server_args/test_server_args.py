@@ -880,6 +880,21 @@ class TestKV4Compatibility(unittest.TestCase):
         return ServerArgs(model_path="dummy", kv_cache_dtype="nvfp4", **overrides)
 
     @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_dsa_nvfp4_does_not_select_genmha_backends(self):
+        args = self._make_unrouted_nvfp4_args(attention_backend="dsa")
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertIsNone(resolution_result(args, "prefill_attention_backend"))
+        self.assertIsNone(resolution_result(args, "decode_attention_backend"))
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_dsa_nvfp4_rejects_genmha_prefill_dtype(self):
+        args = self._make_unrouted_nvfp4_args(
+            attention_backend="dsa", prefill_kv_cache_dequant_dtype="nvfp4"
+        )
+        with self.assertRaisesRegex(ValueError, "DSA NVFP4 does not support"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_prefill_kv_dequant_dtype_selects_native_backends_on_sm100(self):
         args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="nvfp4")
         handle_nvfp4_prefill_kv_dequant_dtype(args)
@@ -2474,6 +2489,26 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             with self.subTest(kv_cache_dtype=kv_cache_dtype):
                 with self.assertRaisesRegex(ValueError, "nvfp4.*fp4_mx_block16"):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
+
+
+class TestKv4Compatibility(unittest.TestCase):
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_dsa_nvfp4_is_allowed_by_generic_mla_gate(self):
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend="dsa",
+            kv_cache_dtype="nvfp4",
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.use_mla_backend", return_value=True
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.attention_backends_of",
+                return_value=("dsa", "dsa"),
+            ),
+        ):
+            handle_kv4_compatibility(args)
 
 
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):

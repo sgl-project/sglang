@@ -95,6 +95,36 @@ python3 -m sglang.launch_server \
 Native NVFP4 prefill requires SM100, a page size divisible by 4, and an attention head dimension divisible by 64. TRT-LLM GenMHA uses FP8 query and output buffers internally; SGLang converts the result back to the model activation dtype. Top-k-1 EAGLE/EAGLE3/NEXTN and breadth-1 NGRAM speculative decoding are supported: an EAGLE-family draft worker uses `trtllm_mha`, and target verification consumes the physical NVFP4 cache directly in eager execution and CUDA Graphs. Set `--speculative-ngram-max-bfs-breadth=1` for NGRAM. With the mixed FlashInfer-prefill/TRT-LLM-decode recipe, SGLang resolves `--speculative-attention-mode` to `decode` so verification does not depend on FlashInfer's transient dequantization workspace. Other speculative algorithms, PD disaggregation, hierarchical KV cache, and LMCache are not currently supported by the SM100 native NVFP4 path. SM120 XQA continues to use its architecture-specific linear scale layout and BF16 query/output path.
 </Note>
 
+### GLM-5.2 DSA NVFP4 on SM100/SM103 (experimental)
+
+This FlashMLA specialization uses a **distinct** 416-byte main KV row: 256 bytes
+of packed E2M1 NoPE, 32 bytes of E4M3 block-16 scales, and 128 bytes of BF16
+RoPE. The FP8 DSA indexer remains separate (132 bytes per token per layer).
+The kernel requires 64 local query heads (attention DP), 512 NoPE + 64 RoPE
+query dimensions, 512 value dimensions, Top-K 2048, and page size 64.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --tp-size 4 --dp-size 4 --enable-dp-attention \
+    --attention-backend dsa \
+    --dsa-prefill-backend flashmla_sparse \
+    --dsa-decode-backend flashmla_kv \
+    --kv-cache-dtype nvfp4 --page-size 64 \
+    --disable-prefill-cuda-graph --load-format runai_streamer
+```
+
+The checkpoint's per-layer K global scale is stored persistently on the GPU;
+if absent it defaults to 1.0. Sparse prefill dequantizes cached prefix rows
+to a BF16 compatibility workspace; only sparse decode consumes packed NVFP4
+directly. Prefill CP, DCP, HiSparse, and other cache shapes are unsupported.
+GB300 (SM103) validation with CUDA 13.0, PyTorch 2.13, and TP4/DP4 covers
+full-model eager prefill, eager and CUDA-graphed decode, EAGLE/MTP, 200K-token
+prefix reuse, and a two-node NIXL P/D smoke with decode offload and persistent
+prefix reload. The validation used the RunAI checkpoint loader. B200 (SM100)
+validation remains pending. This draft pins an immutable integration merge of
+FlashMLA PR #16, pending review and promotion to `sgl`.
+
 ### Scaling Factors
 
 FP8 quantization requires scaling factors to properly quantize and dequantize the KV cache.
@@ -131,7 +161,11 @@ If scaling factors are not provided and not found in the checkpoint, it will def
 </Warning>
 
 <Tip>
-**FP4 (MXFP4)**: Unlike FP8, FP4 quantization handles scaling factors automatically on-the-fly during quantization and dequantization. No pre-quantized models or external scaling factor files are required—the block-based scaling factors are computed dynamically as needed.
+**FP4 block scales** are computed dynamically during cache writes. The
+GLM-5.2 DSA NVFP4 path additionally applies a persistent per-layer global K
+scale. SGLang loads that scale from the model's attention layer when present
+and otherwise uses `1.0`; calibrated checkpoint scales are recommended for
+accuracy.
 </Tip>
 
 ## Performance Considerations
