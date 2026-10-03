@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Callable
 
+import orjson
 import torch
 
 
@@ -176,7 +177,9 @@ class TensorBinding:
 
     def selected_bytes(self, canonical_bytes):
         value = canonical_bytes.view(self.torch_dtype).reshape(self.shape)
-        return _bytes(value[self._selection]).reshape(-1)
+        # Keep column-sharded selections as views of reusable decoded scratch.
+        # The decoder fills this storage after preparation; never cache a copy.
+        return _byte_view(value[self._selection])
 
 
 def _byte_view(tensor):
@@ -316,16 +319,40 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
         if image.numel() != ((full_rows + 127) // 128 * 128) * ((cols + 3) // 4 * 4):
             raise ValueError(f"unexpected scale padding geometry: {name}")
 
-    def xor(mask):
-        transformed = flashinfer_delta_layout(
-            mask.reshape(rows, cols),
-            dtype="nvfp4",
-            backend="cutedsl",
-            kind="scale",
-            projection=projection,
-        )
+    group = 128 if projection == "down" else 64
+    if (
+        rows % group == 0
+        and cols % 4 == 0
+        and all(image.is_contiguous() for image in images)
+    ):
+        # Physical scale axes: row tile, column tile, row within 32,
+        # row group within 128, column within 4. Gate/up own disjoint groups.
+        destinations = []
         for image in images:
-            image.view(torch.uint8).bitwise_xor_(transformed)
+            view = image.view(torch.uint8).view(rows // group, cols // 4, 32, 4, 4)
+            if projection != "down":
+                start = 2 if projection == "gate" else 0  # CuTe DSL is up-first.
+                view = view[:, :, :, start : start + 2, :]
+            destinations.append(view.permute(0, 3, 2, 1, 4))
+        mask_shape = destinations[0].shape
+
+        def xor(mask):
+            mask = mask.reshape(mask_shape)
+            for destination in destinations:
+                destination.bitwise_xor_(mask)
+
+    else:
+
+        def xor(mask):
+            transformed = flashinfer_delta_layout(
+                mask.reshape(rows, cols),
+                dtype="nvfp4",
+                backend="cutedsl",
+                kind="scale",
+                projection=projection,
+            )
+            for image in images:
+                image.view(torch.uint8).bitwise_xor_(transformed)
 
     return TensorBinding(
         name,
@@ -339,12 +366,18 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
 
 @dataclass
 class DerivedImage:
-    """An independent consumer copy rebuilt from updated canonical storage."""
+    """An independent consumer refreshed from a live canonical storage view."""
 
     name: str
     destination: torch.Tensor
-    compute: Callable[[], torch.Tensor]
-    sources: tuple[torch.Tensor, ...] = ()
+    source: torch.Tensor
+
+    def __post_init__(self):
+        if (
+            self.source.shape != self.destination.shape
+            or self.source.dtype != self.destination.dtype
+        ):
+            raise ValueError(f"unsupported derived delta buffer geometry: {self.name}")
 
 
 class GpuDeltaLayout:
@@ -555,23 +588,18 @@ class GpuDeltaLayout:
 
     def _add_moe_derived(self, prefix, layer):
         # W4A16 neutralizes activation scales, so no reciprocal/reduction of
-        # arbitrary mask bit patterns appears here; these are updated values.
-        for name, compute in (
-            ("g1_alphas", lambda: layer.w13_weight_scale_2[:, 0].float()),
-            ("g1_alphas_up", lambda: layer.w13_weight_scale_2[:, 1].float()),
-            ("g2_alphas", lambda: layer.w2_weight_scale_2.float()),
+        # arbitrary mask bit patterns appears here. ModelOpt's FP32 scale
+        # parameters supply live views, never admission-time value copies.
+        gate = layer.w13_weight_scale_2[:, 0]
+        up = layer.w13_weight_scale_2[:, 1]
+        down = layer.w2_weight_scale_2
+        for name, source in (
+            ("g1_alphas", gate),
+            ("g1_alphas_up", up),
+            ("g2_alphas", down),
         ):
             self.derived.append(
-                DerivedImage(
-                    f"{prefix}.{name}",
-                    getattr(layer, name),
-                    compute,
-                    (
-                        layer.w2_weight_scale_2
-                        if name == "g2_alphas"
-                        else layer.w13_weight_scale_2,
-                    ),
-                )
+                DerivedImage(f"{prefix}.{name}", getattr(layer, name), source)
             )
         if getattr(layer, "_cutedsl_wrapper", None) is None:
             raise ValueError(
@@ -586,14 +614,12 @@ class GpuDeltaLayout:
                     DerivedImage(
                         f"{prefix}._cutedsl_scales.0",
                         layer._cutedsl_scales[0],
-                        lambda: layer.w13_weight_scale_2[:, 0].float(),
-                        (layer.w13_weight_scale_2,),
+                        gate,
                     ),
                     DerivedImage(
                         f"{prefix}._cutedsl_scales.2",
                         layer._cutedsl_scales[2],
-                        lambda: layer.w2_weight_scale_2.float(),
-                        (layer.w2_weight_scale_2,),
+                        down,
                     ),
                 )
             )
@@ -604,24 +630,17 @@ class GpuDeltaLayout:
                 "MLA delta cache refresh currently requires BF16 canonical weights"
             )
 
-        def split():
-            return attn.kv_b_proj.weight.unflatten(
-                0, (-1, attn.qk_nope_head_dim + attn.v_head_dim)
-            ).split([attn.qk_nope_head_dim, attn.v_head_dim], dim=1)
+        key, value = attn.kv_b_proj.weight.unflatten(
+            0, (-1, attn.qk_nope_head_dim + attn.v_head_dim)
+        ).split([attn.qk_nope_head_dim, attn.v_head_dim], dim=1)
 
         self.derived.extend(
             (
-                DerivedImage(
-                    f"{prefix}.w_kc",
-                    attn.w_kc,
-                    lambda: split()[0].transpose(1, 2).contiguous().transpose(1, 2),
-                    (attn.kv_b_proj.weight,),
-                ),
+                DerivedImage(f"{prefix}.w_kc", attn.w_kc, key),
                 DerivedImage(
                     f"{prefix}.w_vc",
                     attn.w_vc,
-                    lambda: split()[1].contiguous().transpose(1, 2),
-                    (attn.kv_b_proj.weight,),
+                    value.transpose(1, 2),
                 ),
             )
         )
@@ -737,6 +756,7 @@ class _PreparedTensor:
     pinned: torch.Tensor
     frames: list
     decoder: object
+    payload: torch.Tensor
 
 
 @dataclass
@@ -768,11 +788,16 @@ class PreparedDelta:
         self.units = []
         self.raw_units = []
         self.raw_copies = {}
+        manifest_started = time.perf_counter()
         path = Path(manifest_path).resolve(strict=True)
         content = path.read_bytes()
         if hashlib.sha256(content).hexdigest() != manifest_sha256:
             raise ValueError("immutable delta manifest SHA256 mismatch")
-        self.manifest = manifest = json.loads(content)
+        self.manifest = manifest = orjson.loads(content)
+        self.timings["host_manifest_read_parse_s"] = (
+            time.perf_counter() - manifest_started
+        )
+        plan_started = time.perf_counter()
         validate_codec(manifest, backend.codec)
         for key in ("stream_id", "base_version", "target_version", "plan_digest"):
             if manifest.get(key) != metadata[key]:
@@ -826,6 +851,7 @@ class PreparedDelta:
             )
         if not {b.name for b in backend.layout.bindings} <= self._entries.keys():
             raise ValueError("publication omits an admitted mutable tensor")
+        self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started
         payload_started = time.perf_counter()
         self.host_files = {}
         for record in manifest["files"]:
@@ -856,16 +882,19 @@ class PreparedDelta:
         self.timings["host_payload_read_sha256_s"] = (
             time.perf_counter() - payload_started
         )
+        frames_started = time.perf_counter()
         validate_outer_entries(
             self._entries.values(),
             {name: len(data) for name, data in self.host_files.items()},
             manifest["frame_bytes"],
         )
+        self.timings["host_frames_validate_s"] = time.perf_counter() - frames_started
 
         def allocate_pinned(size):
             tensor = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
             return tensor, memoryview(tensor.numpy())
 
+        tensors_started = time.perf_counter()
         outer_reader = OuterZstdReader(self.host_files, allocate_pinned, self.timings)
         prepared, direct = [], []
         max_encoded, max_decoded = 0, 0
@@ -899,6 +928,8 @@ class PreparedDelta:
             prepared.append((binding, entry, pinned, frames))
             max_encoded = max(max_encoded, pinned.numel())
             max_decoded = max(max_decoded, entry["nbytes"])
+        # Includes CPU outer decompression; do not add those nested timings.
+        self.timings["host_tensor_prepare_s"] = time.perf_counter() - tensors_started
         # Scalars and vectors are complete target values, never delta masks.
         # Pack once on the preparation worker and upload the small arena before
         # pause, avoiding a pinned allocation/H2D/decode per tiny tensor.
@@ -928,6 +959,7 @@ class PreparedDelta:
             raw_h2d_bytes=raw_h2d_bytes,
         )
         self.host_files.clear()  # Prepared units own their final pinned buffers.
+        decoder_started = time.perf_counter()
         self.decoder = NvcompDecoder(self.device) if batches else None
         self.workspace = self.decoder.allocate_workspace(batches) if batches else None
         with torch.cuda.stream(self.stream):
@@ -957,12 +989,23 @@ class PreparedDelta:
                 max_decoded, dtype=torch.uint8, device=self.device
             )
             self.error = torch.zeros(1, dtype=torch.int32, device=self.device)
-            for binding, entry, pinned, frames in prepared:
-                decode = self.decoder.prepare(
-                    frames, self.encoded, self.decoded, self.workspace, self.stream
+            decoders = (
+                self.decoder.prepare_batches(
+                    batches, self.encoded, self.decoded, self.workspace, self.stream
                 )
+                if batches
+                else []
+            )
+            for (binding, entry, pinned, frames), decode in zip(prepared, decoders):
                 self.units.append(
-                    _PreparedTensor(binding, entry, pinned, frames, decode)
+                    _PreparedTensor(
+                        binding,
+                        entry,
+                        pinned,
+                        frames,
+                        decode,
+                        binding.selected_bytes(self.decoded[: entry["nbytes"]]),
+                    )
                 )
             changed_storages = {
                 tensor.untyped_storage().data_ptr()
@@ -972,17 +1015,21 @@ class PreparedDelta:
             self.derived = [
                 image
                 for image in backend.layout.derived
-                if any(
-                    source.untyped_storage().data_ptr() in changed_storages
-                    for source in image.sources
-                )
+                if image.source.untyped_storage().data_ptr() in changed_storages
             ]
             self.ready = torch.cuda.Event()
             self.ready.record(self.stream)
+        self.timings.update(
+            host_decoder_prepare_s=time.perf_counter() - decoder_started,
+            decoder_metadata_uploads=int(bool(batches)),
+            decoder_metadata_h2d_bytes=4 * 8 * sum(map(len, batches)),
+        )
         # This constructor runs on the preparation worker. PREPARED means
         # immutable pinned inputs, reusable arenas and decoder metadata are ready.
         # Encoded tensor bytes are uploaded only as each tensor is applied.
+        ready_started = time.perf_counter()
         self.ready.synchronize()
+        self.timings["host_ready_wait_s"] = time.perf_counter() - ready_started
         self.timings["host_prepare_s"] = time.perf_counter() - preparation_started
         self.h2d_bytes = raw_h2d_bytes + sum(unit.pinned.numel() for unit in self.units)
 
@@ -1007,6 +1054,7 @@ class PreparedDelta:
         apply_started = time.perf_counter()
         backend = self.backend
         backend.layout.check_identity()
+        self.timings["host_apply_identity_s"] = time.perf_counter() - apply_started
         with (
             torch.cuda.device(self.device),
             torch.cuda.stream(self.stream),
@@ -1015,40 +1063,53 @@ class PreparedDelta:
             self.stream.wait_event(self.ready)
             self.stream.wait_stream(torch.cuda.default_stream(self.device))
             with self._phase("paused_gpu_total"):
+                raw_started = time.perf_counter()
                 # Immutable raw targets are already uploaded and validated.
                 # Their copies cannot introduce a decoder failure and run
                 # before compressed units, whose errors poison the session.
                 with self._phase("raw_apply"):
                     for targets, sources in self.raw_copies.values():
                         torch._foreach_copy_(targets, sources)
+                self.timings["host_raw_enqueue_s"] = time.perf_counter() - raw_started
+                matrices_started = time.perf_counter()
                 for unit in self.units:
                     self._apply_tensor(unit)
+                self.timings["host_matrix_enqueue_s"] = (
+                    time.perf_counter() - matrices_started
+                )
+                derived_started = time.perf_counter()
                 with self._phase("derived_refresh"):
                     # All decoder status updates are complete on this stream.
                     # Reuse one scalar predicate across derived consumers.
                     if self.derived:
                         decode_succeeded = self.error.view(()) == 0
                     for derived in self.derived:
-                        value = derived.compute()
-                        if (
-                            value.shape != derived.destination.shape
-                            or value.dtype != derived.destination.dtype
-                        ):
-                            raise RuntimeError(
-                                f"derived delta buffer geometry changed: {derived.name}"
-                            )
                         # Device predicate: no per-tensor host synchronization.
-                        derived.destination.copy_(
-                            torch.where(decode_succeeded, value, derived.destination)
+                        torch.where(
+                            decode_succeeded,
+                            derived.source,
+                            derived.destination,
+                            out=derived.destination,
                         )
+                self.timings["host_derived_enqueue_s"] = (
+                    time.perf_counter() - derived_started
+                )
             self.done = torch.cuda.Event()
             self.done.record(self.stream)
+        completion_started = time.perf_counter()
         self.done.synchronize()
+        self.timings["host_apply_completion_wait_s"] = (
+            time.perf_counter() - completion_started
+        )
+        final_started = time.perf_counter()
         if self.error.item() != 0:
             raise RuntimeError(
                 "direct GPU delta decompression failed; session is poisoned"
             )
         backend.layout.check_identity()
+        self.timings["host_apply_status_identity_s"] = (
+            time.perf_counter() - final_started
+        )
         self.timings["paused_apply_host_wall_s"] = time.perf_counter() - apply_started
         if self.timing_enabled:
             self.timings["cuda_event_ms"] = {
@@ -1074,15 +1135,14 @@ class PreparedDelta:
             # Raw targets have a separate prepared arena and foreach-copy
             # pass. Every unit here is XOR; absent frames are zero deltas.
             decoded.zero_()
-            unit.decoder.enqueue(self.stream)
+            unit.decoder.enqueue()
             invalid = (unit.decoder.statuses != 0).any() | (
-                unit.decoder.actual_sizes != unit.decoder.metadata[2]
+                unit.decoder.actual_sizes != unit.decoder.expected_sizes
             ).any()
             self.error.bitwise_or_(invalid.to(torch.int32))
         # No gather of current weights, canonical reconstruction or weight hash.
         with self._phase("layout_apply"):
-            payload = binding.selected_bytes(decoded)
-            binding.xor(torch.where(self.error == 0, payload, 0))
+            binding.xor(torch.where(self.error == 0, unit.payload, 0))
 
     def close(self):
         # Cancellation may race a background upload, but never frees storage

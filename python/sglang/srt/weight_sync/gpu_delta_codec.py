@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import ctypes
 import importlib.metadata
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 import torch
 
@@ -122,6 +122,7 @@ class NvcompDecoder:
         )
         self.alignments = _Alignments()
         self._check(self._align(self._options, ctypes.byref(self.alignments)))
+        self._temporary_sizes: dict[tuple[int, int, int], int] = {}
 
     def _bind(self, suffix, arguments):
         function = getattr(
@@ -138,17 +139,26 @@ class NvcompDecoder:
     def temporary_bytes(self, frames: Sequence[DecodeFrame]) -> int:
         if not frames:
             return 0
+        geometry = (
+            len(frames),
+            max(f.decoded_bytes for f in frames),
+            sum(f.decoded_bytes for f in frames),
+        )
+        cached = self._temporary_sizes.get(geometry)
+        if cached is not None:
+            return cached
         size = ctypes.c_size_t()
         with torch.cuda.device(self.device):
             self._check(
                 self._temporary(
-                    len(frames),
-                    max(f.decoded_bytes for f in frames),
+                    geometry[0],
+                    geometry[1],
                     self._options,
                     ctypes.byref(size),
-                    sum(f.decoded_bytes for f in frames),
+                    geometry[2],
                 )
             )
+        self._temporary_sizes[geometry] = size.value
         return size.value
 
     def allocate_workspace(
@@ -164,21 +174,24 @@ class NvcompDecoder:
                 torch.empty(maximum_count, dtype=torch.int32, device=self.device),
             )
 
-    def prepare(
+    def prepare_batches(
         self,
-        frames: Sequence[DecodeFrame],
+        batches: Sequence[Sequence[DecodeFrame]],
         encoded: torch.Tensor,
         decoded: torch.Tensor,
         workspace: DecodeWorkspace,
         stream: torch.cuda.Stream,
-    ) -> PreparedDecode:
-        """Freeze pointers/lengths and upload small metadata before the serving pause.
+    ) -> list[PreparedDecode]:
+        """Upload all tensor plans in one metadata slab before the serving pause.
 
-        A plan can reuse an encoded tensor slot and decoded scratch. Its caller
-        must order slot reuse after all previous consumers on the chosen stream.
+        Plans reuse encoded, decoded and workspace buffers sequentially on the
+        captured stream. The caller owns that stream/device context and orders
+        slot reuse after all previous consumers, including metadata upload.
         ``workspace`` must be allocated for these batches with ``allocate_workspace``.
         """
-        frames = tuple(frames)
+        batches = [tuple(frames) for frames in batches]
+        if not batches:
+            return []
         for tensor in (encoded, decoded, workspace.temporary):
             if (
                 tensor.device != self.device
@@ -190,9 +203,10 @@ class NvcompDecoder:
                 )
         if stream.device != self.device:
             raise ValueError("Decoder stream/device mismatch")
+        maximum_count = max(map(len, batches))
         if (
-            len(frames) > workspace.statuses.numel()
-            or len(frames) > workspace.actual_sizes.numel()
+            maximum_count > workspace.statuses.numel()
+            or maximum_count > workspace.actual_sizes.numel()
         ):
             raise ValueError("Insufficient per-frame status capacity")
         if (
@@ -200,43 +214,80 @@ class NvcompDecoder:
             and workspace.temporary.data_ptr() % self.alignments.temp
         ):
             raise ValueError("Misaligned decoder workspace")
-        prior_output_end = 0
-        for frame in frames:
-            if not 0 < frame.decoded_bytes <= 1 << 20 or frame.encoded_bytes <= 0:
-                raise ValueError(
-                    "Direct-delta frames require positive lengths and <=1 MiB output"
-                )
-            if not 0 <= frame.input_offset <= encoded.numel() - frame.encoded_bytes:
-                raise ValueError("Encoded frame outside input allocation")
-            if (
-                not prior_output_end
-                <= frame.output_offset
-                <= decoded.numel() - frame.decoded_bytes
-            ):
-                raise ValueError(
-                    "Overlapping, unordered or out-of-bounds decoded frames"
-                )
-            if (encoded.data_ptr() + frame.input_offset) % self.alignments.input:
-                raise ValueError("Misaligned encoded frame")
-            if (decoded.data_ptr() + frame.output_offset) % self.alignments.output:
-                raise ValueError("Misaligned decoded frame")
-            prior_output_end = frame.output_offset + frame.decoded_bytes
+        input_base, output_base = encoded.data_ptr(), decoded.data_ptr()
+        input_bytes, output_bytes = encoded.numel(), decoded.numel()
+        for frames in batches:
+            prior_output_end = 0
+            for frame in frames:
+                if not 0 < frame.decoded_bytes <= 1 << 20 or frame.encoded_bytes <= 0:
+                    raise ValueError(
+                        "Direct-delta frames require positive lengths and <=1 MiB output"
+                    )
+                if not 0 <= frame.input_offset <= input_bytes - frame.encoded_bytes:
+                    raise ValueError("Encoded frame outside input allocation")
+                if (
+                    not prior_output_end
+                    <= frame.output_offset
+                    <= output_bytes - frame.decoded_bytes
+                ):
+                    raise ValueError(
+                        "Overlapping, unordered or out-of-bounds decoded frames"
+                    )
+                if (input_base + frame.input_offset) % self.alignments.input:
+                    raise ValueError("Misaligned encoded frame")
+                if (output_base + frame.output_offset) % self.alignments.output:
+                    raise ValueError("Misaligned decoded frame")
+                prior_output_end = frame.output_offset + frame.decoded_bytes
+        all_frames = [frame for frames in batches for frame in frames]
         with torch.cuda.device(self.device), torch.cuda.stream(stream):
             host = torch.empty(
-                (4, len(frames)), dtype=torch.int64, device="cpu", pin_memory=True
+                (4, len(all_frames)), dtype=torch.int64, device="cpu", pin_memory=True
             )
             host.numpy()[:] = [
-                [encoded.data_ptr() + f.input_offset for f in frames],
-                [f.encoded_bytes for f in frames],
-                [f.decoded_bytes for f in frames],
-                [decoded.data_ptr() + f.output_offset for f in frames],
+                [input_base + f.input_offset for f in all_frames],
+                [f.encoded_bytes for f in all_frames],
+                [f.decoded_bytes for f in all_frames],
+                [output_base + f.output_offset for f in all_frames],
             ]
             metadata = host.to(self.device, non_blocking=True)
-            ready = torch.cuda.Event()
-            ready.record(stream)
-        return PreparedDecode(
-            self, frames, encoded, decoded, workspace, host, metadata, ready
-        )
+        plans, offset = [], 0
+        for frames in batches:
+            count = len(frames)
+            rows = metadata[:, offset : offset + count]
+            statuses = workspace.statuses[:count]
+            actual_sizes = workspace.actual_sizes[:count]
+            expected_sizes = rows[2]
+            arguments = (
+                rows[0].data_ptr(),
+                rows[1].data_ptr(),
+                expected_sizes.data_ptr(),
+                actual_sizes.data_ptr(),
+                count,
+                workspace.temporary.data_ptr(),
+                workspace.temporary.numel(),
+                rows[3].data_ptr(),
+                self._options,
+                statuses.data_ptr(),
+                stream.cuda_stream,
+            )
+            plans.append(
+                PreparedDecode(
+                    self,
+                    frames,
+                    encoded,
+                    decoded,
+                    workspace,
+                    host[:, offset : offset + count],
+                    rows,
+                    stream,
+                    statuses,
+                    actual_sizes,
+                    expected_sizes,
+                    arguments,
+                )
+            )
+            offset += count
+        return plans
 
 
 @dataclass
@@ -248,41 +299,19 @@ class PreparedDecode:
     workspace: DecodeWorkspace
     host_metadata: torch.Tensor
     metadata: torch.Tensor
-    ready: torch.cuda.Event
+    stream: torch.cuda.Stream
+    statuses: torch.Tensor
+    actual_sizes: torch.Tensor
+    expected_sizes: torch.Tensor
+    _arguments: tuple
 
-    @property
-    def statuses(self):
-        return self.workspace.statuses[: len(self.frames)]
-
-    @property
-    def actual_sizes(self):
-        return self.workspace.actual_sizes[: len(self.frames)]
-
-    def enqueue(self, stream: torch.cuda.Stream) -> None:
+    def enqueue(self) -> None:
         """Launch only; caller checks statuses/sizes on device before applying weights.
 
         This object and all storage must outlive the submitted work. There is no
-        implicit synchronization in destruction; the session owns the final fence.
+        implicit synchronization in destruction; the session owns the final fence
+        and enters the captured stream/device context around its apply loop.
         """
-        if stream.device != self.decoder.device:
-            raise ValueError("Decoder stream/device mismatch")
         if not self.frames:
             return
-        stream.wait_event(self.ready)
-        metadata, workspace = self.metadata, self.workspace
-        with torch.cuda.device(self.decoder.device):
-            self.decoder._check(
-                self.decoder._decode(
-                    metadata[0].data_ptr(),
-                    metadata[1].data_ptr(),
-                    metadata[2].data_ptr(),
-                    workspace.actual_sizes.data_ptr(),
-                    len(self.frames),
-                    workspace.temporary.data_ptr(),
-                    workspace.temporary.numel(),
-                    metadata[3].data_ptr(),
-                    self.decoder._options,
-                    workspace.statuses.data_ptr(),
-                    stream.cuda_stream,
-                )
-            )
+        self.decoder._check(self.decoder._decode(*self._arguments))

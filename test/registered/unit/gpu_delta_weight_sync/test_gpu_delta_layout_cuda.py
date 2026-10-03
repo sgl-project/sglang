@@ -178,7 +178,12 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
     plan.derived = []
     plan._add_moe_derived("model.layers.3.mlp.experts", live)
     for image in plan.derived:
-        image.destination.copy_(image.compute())
+        torch.where(
+            torch.tensor(True, device="cuda"),
+            image.source,
+            image.destination,
+            out=image.destination,
+        )
     refresh_cutedsl_standard_scales_for_weight_update(expected)
     for name, target in expected.named_parameters(remove_duplicate=False):
         actual = dict(live.named_parameters(remove_duplicate=False))[name]
@@ -206,6 +211,62 @@ def test_feature_scale_permutation_matches_loader_padding():
         torch.testing.assert_close(
             swizzle_scale_bytes(values), expected, rtol=0, atol=0
         )
+
+
+def test_cached_mla_refresh_survives_graph_replay_and_failure_gate():
+    from sglang.srt.weight_sync.gpu_delta_layout import GpuDeltaLayout
+
+    weight = torch.zeros((2 * (4 + 6), 8), dtype=torch.bfloat16, device="cuda")
+    key, value = weight.unflatten(0, (2, 10)).split([4, 6], dim=1)
+    attn = SimpleNamespace(
+        kv_b_proj=SimpleNamespace(weight=weight),
+        qk_nope_head_dim=4,
+        v_head_dim=6,
+        w_kc=key.transpose(1, 2).contiguous().transpose(1, 2),
+        w_vc=value.contiguous().transpose(1, 2),
+    )
+    plan = GpuDeltaLayout.__new__(GpuDeltaLayout)
+    plan.derived = []
+    plan._add_mla_derived("attention", attn)
+    identity = [
+        (d.destination.data_ptr(), d.destination.stride()) for d in plan.derived
+    ]
+    succeeded = torch.tensor(True, device="cuda")
+
+    def refresh():
+        for image in plan.derived:
+            torch.where(
+                succeeded, image.source, image.destination, out=image.destination
+            )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        refresh()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        refresh()
+    for success in (True, True, False):
+        before = [
+            d.destination.contiguous().view(torch.uint8).clone() for d in plan.derived
+        ]
+        weight.view(torch.uint8).random_(256)
+        succeeded.fill_(success)
+        graph.replay()
+        for image, original in zip(plan.derived, before):
+            expected = (
+                image.source.contiguous().view(torch.uint8) if success else original
+            )
+            torch.testing.assert_close(
+                image.destination.contiguous().view(torch.uint8),
+                expected,
+                rtol=0,
+                atol=0,
+            )
+    assert identity == [
+        (d.destination.data_ptr(), d.destination.stride()) for d in plan.derived
+    ]
 
 
 if __name__ == "__main__":

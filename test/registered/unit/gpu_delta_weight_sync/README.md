@@ -1,8 +1,10 @@
 # GPU delta receiver tests
 
 The experimental receiver applies canonical XOR deltas directly to existing
-execution-layout buffers. Static bundled MTP layer weights remain unchanged; its existing shared embedding/head buffers continue to follow the target. It retains the disk update API independently. Pure
-Torch byte transforms cover CuTe DSL NVFP4 expert layouts and BF16 dense storage;
+execution-layout buffers. Static bundled MTP layer weights remain unchanged;
+its shared embedding/head buffers continue to follow the target. The disk update
+API remains independent. Pure Torch byte transforms cover CuTe DSL NVFP4 expert
+layouts and BF16 dense storage;
 the standalone MegaMoE transform helper does not admit an integrated MegaMoE
 runtime on this branch.
 
@@ -27,10 +29,9 @@ writer lock. Partial mutation poisons the delta session instead of attempting
 recovery or falling back to a different update path.
 
 ```bash
-python -m pytest -q \
-  test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout.py \
-  test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_payload.py \
-  test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_session.py
+python -m pytest -q test/registered/unit/gpu_delta_weight_sync \
+  --ignore=test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout_cuda.py
+python -m pytest -q test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout_cuda.py
 python -m pytest -q test/manual/weight_sync/test_gpu_delta_codec.py
 ```
 
@@ -45,7 +46,8 @@ prebuilt nvCOMP dependency. It requires Blackwell, `nvidia-libnvcomp-cu13==5.3.0
 known input bytes, reusing a bounded encoded tensor buffer. No malformed compressed
 streams are sent to nvCOMP. Missing hardware or dependencies fail the manual
 suite. The registered `test_gpu_delta_layout_cuda.py` compares layouts and derived
-scale buffers with the existing SGLang/FlashInfer loader helpers.
+scale buffers with the existing SGLang/FlashInfer loader helpers and checks MLA
+source views, failure gating and destination addresses across CUDA graph replay.
 
 Preparation checks compressed artifact SHA-256 on CPU, pins immutable encoded
 buffers and constructs descriptors without reading weights or stopping serving.
@@ -53,13 +55,29 @@ Preparation reserves the largest required encoded/decoded tensor arenas. During
 apply, each required matrix tensor is uploaded from pinned host memory, decoded and
 applied before reusing those arenas. There is no staging selector or full-publication
 HBM copy. Every retained changed matrix frame is Snappy, including inputs whose
-compressed representation expands; there is no raw-frame fallback. Once every original rank reports `PREPARED`, Miles fans out
+compressed representation expands; there is no raw-frame fallback. Once every
+original rank reports `PREPARED`, Miles fans out
 `update_weights_from_delta`. Each local handler closes generation admission,
 pauses scheduling, fences existing readers, retracts requests, flushes caches and
 applies the delta. It returns `APPLIED` only after GPU completion and decoder
 checks. Miles waits for all original ranks to apply, then sends
 `resume_weights_from_delta` with their compact apply receipts. Resume records the
 new version and reopens generation after successful local acknowledgments.
+
+Layout admission caches physical scale destinations and BF16 MLA/FP32 scale source
+views. Aligned NVFP4 blockscales apply canonical bytes through strided destination
+views; padded geometries retain the explicit zero-padded mask transform. Primary
+and MMA images that alias receive one XOR, while independent consumer images each
+receive it. Derived refresh uses a device predicate and writes into the existing
+destination without allocating a transformed source or replacement buffer.
+
+Preparation caches each local byte selection as a view of reusable decoded
+scratch, including strided TP column slices. It uploads all nvCOMP descriptors in
+one metadata slab and caches launch arguments and status/size views. The plans
+capture the session's stream; metadata upload, tensor upload, decode and apply
+remain ordered on that stream. These caches hold geometry and live storage views,
+not snapshots of values. Decoder status checks, scratch initialization and the
+reader/completion fences retain their existing behavior.
 
 There is no separate global quiesce or commit round. A participant may apply
 before another fails to pause; failed or uncertain activation never authorizes
@@ -104,6 +122,16 @@ the same poisoned-session behavior. The matrix streaming path is unchanged.
 `raw_bytes` counts direct payload bytes; `raw_h2d_bytes` includes arena alignment.
 `host_raw_pack_s` is preparation CPU packing; direct H2D also occurs before pause.
 
+Preparation reports manifest loading/parsing (`host_manifest_read_parse_s`), plan
+validation (`host_plan_validate_s`), frame validation (`host_frames_validate_s`),
+local tensor preparation (`host_tensor_prepare_s`), arena/decoder setup
+(`host_decoder_prepare_s`) and its final GPU wait (`host_ready_wait_s`).
+`host_prepare_s` covers the complete preparation. Tensor preparation includes the
+outer-Zstd phases below, so these nested timings must not be summed together.
+`decoder_metadata_uploads` counts metadata slabs and
+`decoder_metadata_h2d_bytes` counts their uploaded bytes; neither changes the
+matrix/raw payload byte counts.
+
 `host_payload_read_sha256_s` reports wrapped owner-file loading/verification;
 `host_outer_zstd_validate_s`, `host_outer_zstd_pin_allocate_s` and
 `host_outer_zstd_decode_s` separate envelope validation, pinned allocation and CPU
@@ -119,9 +147,9 @@ checksum corruption, protocol mismatch, local-only preparation and buffer reuse.
 
 Runtime updates do not hash weights or build a custom compiled extension. Exact
 weight-content comparisons are confined to tests. State/version checks prevent
-replay but do not prove weight equality. Unsupported layouts are rejected. The exclusive-controller contract requires
-a fresh baseline; pointer checks do not detect arbitrary same-buffer writes by
-another updater.
+replay but do not prove weight equality. Unsupported layouts are rejected. The
+exclusive-controller contract requires a fresh baseline; pointer checks do not
+detect arbitrary same-buffer writes by another updater.
 
 Admission also reuses the ordinary updater's shared CUDA IPC weight-cache and
 HPC-Ops derived-weight-cache exclusions before creating a delta plan or session.

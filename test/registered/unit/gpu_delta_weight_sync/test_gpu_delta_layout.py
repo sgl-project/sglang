@@ -123,6 +123,125 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         binding.xor(binding.selected_bytes(mask.reshape(-1)))
         torch.testing.assert_close(target, (full ^ mask)[:, 8:16])
 
+    def test_prepared_tp_selection_reads_reused_decoder_scratch(self):
+        for dtype, name in (
+            (torch.uint8, "U8"),
+            (torch.bfloat16, "BF16"),
+            (torch.float32, "F32"),
+        ):
+            with self.subTest(dtype=name):
+                size = 12 * 20 * torch.empty((), dtype=dtype).element_size()
+                canonical = torch.randint(256, (size,), dtype=torch.uint8)
+                target = canonical.view(dtype).reshape(12, 20)[2:10, 5:13].clone()
+                binding = layout._direct_binding(
+                    "weight",
+                    {"dtype": name, "shape": [12, 20]},
+                    target,
+                    [[2, 10], [5, 13]],
+                )
+                prepared = layout.PreparedDelta.__new__(layout.PreparedDelta)
+                prepared.encoded = torch.empty_like(canonical)
+                prepared.decoded = torch.zeros_like(canonical)
+                prepared.error = torch.zeros(1, dtype=torch.int32)
+                prepared.timing_enabled = False
+                payload = binding.selected_bytes(prepared.decoded)
+                self.assertEqual(
+                    payload.untyped_storage().data_ptr(),
+                    prepared.decoded.untyped_storage().data_ptr(),
+                )
+                self.assertFalse(payload.is_contiguous())
+                decoder = SimpleNamespace(
+                    enqueue=lambda: prepared.decoded.copy_(prepared.encoded),
+                    statuses=torch.zeros(1, dtype=torch.int32),
+                    actual_sizes=torch.tensor([size]),
+                    expected_sizes=torch.tensor([size]),
+                )
+                unit = layout._PreparedTensor(
+                    binding,
+                    {"nbytes": size},
+                    torch.empty_like(canonical),
+                    [],
+                    decoder,
+                    payload,
+                )
+                expected = layout._bytes(target).clone()
+                pointer, stride = target.data_ptr(), target.stride()
+                # Two successful decodes observe new scratch values. An error
+                # then gates both that mask and every later mask in the batch.
+                for status in (0, 0, 1, 0):
+                    unit.pinned.random_(256)
+                    decoder.statuses.fill_(status)
+                    if not status and not prepared.error.item():
+                        mask = unit.pinned.view(dtype).reshape(12, 20)[2:10, 5:13]
+                        expected.bitwise_xor_(layout._bytes(mask))
+                    prepared._apply_tensor(unit)
+                    torch.testing.assert_close(layout._bytes(target), expected)
+                    self.assertEqual(target.data_ptr(), pointer)
+                    self.assertEqual(target.stride(), stride)
+
+    def test_scale_binding_updates_unique_images_and_preserves_padding(self):
+        cases = [
+            (projection, rows, cols)
+            for projection in ("gate", "up", "down")
+            for rows in ((64, 128, 256) if projection != "down" else (128, 256))
+            for cols in (4, 64, 192)
+        ] + [("gate", 64, 19), ("up", 128, 3), ("down", 17, 3), ("down", 129, 8)]
+        for projection, rows, cols in cases:
+            for independent_mma in (False, True):
+                with self.subTest(
+                    projection=projection, rows=rows, cols=cols, mma=independent_mma
+                ):
+                    mask = torch.randint(256, (rows, cols), dtype=torch.uint8)
+                    transformed = layout.flashinfer_delta_layout(
+                        mask,
+                        dtype="nvfp4",
+                        backend="cutedsl",
+                        kind="scale",
+                        projection=projection,
+                    )
+                    primary = torch.randint(256, transformed.shape, dtype=torch.uint8)
+                    padded_rows, padded_cols = primary.shape
+                    physical = primary.view(
+                        padded_rows // 128, padded_cols // 4, 32, 4, 4
+                    )
+                    mma = physical.permute(2, 3, 0, 4, 1).unsqueeze(-1)
+                    if independent_mma:
+                        mma = mma.clone(memory_format=torch.preserve_format)
+                    stem = "w2" if projection == "down" else "w13"
+                    layer = SimpleNamespace(
+                        moe_tp_size=1,
+                        quant_method=SimpleNamespace(_is_cutedsl_v2_standard=True),
+                        moe_runner_config=SimpleNamespace(is_gated=True),
+                        _map_global_expert_id_to_local_expert_id=lambda _: 0,
+                        **{
+                            stem + "_blockscale_swizzled": primary.unsqueeze(0),
+                            stem + "_weight_scale": primary.unsqueeze(0),
+                            stem + "_blockscale_mma": mma,
+                        },
+                    )
+                    binding = layout._moe_binding(
+                        "scale",
+                        {"dtype": "F8_E4M3", "shape": [rows, cols]},
+                        layer,
+                        0,
+                        projection,
+                        "weight_scale",
+                    )
+                    self.assertEqual(len(binding.storage), 2 if independent_mma else 1)
+                    before = [image.clone() for image in binding.storage]
+                    pointers = [image.data_ptr() for image in binding.storage]
+                    binding.xor(mask)
+                    for image, original in zip(binding.storage, before):
+                        torch.testing.assert_close(image, original ^ transformed)
+                    # Alias duplication would cancel the first XOR. A second
+                    # update also proves cached destinations stay live.
+                    binding.xor(mask)
+                    for image, original, pointer in zip(
+                        binding.storage, before, pointers
+                    ):
+                        torch.testing.assert_close(image, original)
+                        self.assertEqual(image.data_ptr(), pointer)
+
     def test_bf16_masks_are_never_floating_point_values(self):
         # Exercise all byte values, including BF16 NaN bit patterns.
         mask = torch.arange(256, dtype=torch.uint8).repeat(2).reshape(16, 32)
@@ -245,12 +364,46 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     prepared.applied = prepared.timing_enabled = False
                     prepared.raw_copies, prepared.units, prepared.raw_units = {}, [], []
                     prepared.derived = [
-                        layout.DerivedImage(
-                            "consumer", target, lambda source=source: source
-                        ),
-                        layout.DerivedImage(
-                            "other", other_target, lambda value=other_source: value
-                        ),
+                        layout.DerivedImage("consumer", target, source),
+                        layout.DerivedImage("other", other_target, other_source),
+                    ]
+                    # Match the native BF16 MLA cache layout, then change the
+                    # canonical bytes after admission to catch stale copies.
+                    heads, key_dim, value_dim, rank = len(shape) + 1, 4, 6, 8
+                    weight = torch.randint(
+                        256,
+                        (heads * (key_dim + value_dim), rank * 2),
+                        dtype=torch.uint8,
+                    ).view(torch.bfloat16)
+                    key, value = weight.unflatten(
+                        0, (heads, key_dim + value_dim)
+                    ).split([key_dim, value_dim], dim=1)
+                    attn = SimpleNamespace(
+                        kv_b_proj=SimpleNamespace(weight=weight),
+                        qk_nope_head_dim=key_dim,
+                        v_head_dim=value_dim,
+                        w_kc=key.transpose(1, 2).contiguous().transpose(1, 2),
+                        w_vc=value.contiguous().transpose(1, 2),
+                    )
+                    plan = layout.GpuDeltaLayout.__new__(layout.GpuDeltaLayout)
+                    plan.derived = []
+                    plan._add_mla_derived("attention", attn)
+                    prepared.derived.extend(plan.derived)
+                    mla_identity = [
+                        (image.destination.data_ptr(), image.destination.stride())
+                        for image in plan.derived
+                    ]
+                    weight.view(torch.uint8).random_(256)
+                    # A one-head native value cache can already alias the
+                    # canonical slice. Failure must preserve its pre-apply
+                    # state, including that ordinary alias behavior.
+                    mla_before = [
+                        layout._bytes(image.destination).clone()
+                        for image in plan.derived
+                    ]
+                    mla_expected = [
+                        layout._bytes(key),
+                        layout._bytes(value.transpose(1, 2)),
                     ]
                     prepared.error = torch.tensor([error], dtype=torch.int32)
                     prepared.timings, prepared.h2d_bytes = {}, 0
@@ -286,6 +439,22 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         other_target, other_before if error else other_source
                     )
                     self.assertEqual(other_target.data_ptr(), other_pointer)
+                    for image, original, expected, identity in zip(
+                        plan.derived, mla_before, mla_expected, mla_identity
+                    ):
+                        torch.testing.assert_close(
+                            layout._bytes(image.destination),
+                            original if error else expected,
+                        )
+                        self.assertEqual(
+                            (image.destination.data_ptr(), image.destination.stride()),
+                            identity,
+                        )
+
+    def test_derived_geometry_rejected_at_admission(self):
+        for source in (torch.zeros(3), torch.zeros(2, dtype=torch.bfloat16)):
+            with self.assertRaisesRegex(ValueError, "derived delta buffer geometry"):
+                layout.DerivedImage("consumer", torch.zeros(2), source)
 
     def test_w4a16_calibration_is_static_but_weight_scales_remain_mutable(self):
         prefix = "model.layers.0.mlp.experts"
@@ -458,8 +627,11 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             def allocate_workspace(self, batches):
                 return object()
 
-            def prepare(self, frames, encoded, decoded, workspace, stream):
-                def enqueue(_):
+            def prepare_batches(self, batches, encoded, decoded, workspace, stream):
+                return [self._prepare(frames, encoded, decoded) for frames in batches]
+
+            def _prepare(self, frames, encoded, decoded):
+                def enqueue():
                     for frame in frames:
                         data = encoded[
                             frame.input_offset : frame.input_offset
@@ -477,7 +649,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     enqueue=enqueue,
                     statuses=torch.zeros(len(frames)),
                     actual_sizes=sizes,
-                    metadata={2: sizes},
+                    expected_sizes=sizes,
                 )
 
         empty = torch.empty
