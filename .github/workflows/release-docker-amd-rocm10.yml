@@ -28,8 +28,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Disabled on this branch. It exists only to publish the gfx1250 ROCm 10.1
+  # dev image below, and the released gfx942/gfx950 images must keep coming
+  # from main's nightly run rather than being overwritten from here -- this job
+  # tags without the -dev- marker and also mirrors to lmsysorg/sglang-rocm.
   publish:
-    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
+    if: false
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
@@ -161,12 +165,39 @@ jobs:
           username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
           password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
+      # The ROCm 10.1 wheel index is a drop-in replacement for the 10.0 one, so
+      # the flavor stays gfx1250-rocm1000 and only the versions move. They are
+      # passed here rather than changed in the Dockerfile because gfx942 and
+      # gfx950 share the rocm1000-base stage and stay on 10.0.
+      #
+      # ENABLE_MORI=0: ROCm 10.1 drops the legacy rocm_smi library and headers,
+      # and MoRI still does #include "rocm_smi/rocm_smi.h" on its main branch,
+      # so it cannot compile here. Restore ENABLE_MORI=1 once MoRI moves to
+      # amd_smi; until then this image has no MoRI expert-parallel all-to-all.
       - name: Build and push to rocm/sgl-dev
         env:
           PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
           VERSION: ${{ steps.version.outputs.version }}
+          ROCM_SDK_VERSION: 10.1.0rc3
+          ROCM_TORCH_VERSION: 2.12.0
+          ROCM_TORCHVISION_VERSION: 0.27.0
+          ROCM_TORCHAUDIO_VERSION: 2.11.0
+          ROCM_TRITON_VERSION: 3.8.0+git669b31ac
         run: |
-          image_tag="v${VERSION}-rocm10-mi45x-${DATE}"
+          # gfx1250 is BUILD_TRITON=0 now, so the image ships the Triton that
+          # came with the ROCm SDK rather than a source build of
+          # TRITON_COMMIT_DEFAULT. That is what this image is testing, so name
+          # it in the tag and take the revision from the version actually
+          # installed instead of parsing it back out of the Dockerfile.
+          triton_short=${ROCM_TRITON_VERSION##*+git}
+          case "${triton_short}" in
+            [0-9a-f][0-9a-f]*) ;;
+            *)
+              echo "::error::no git revision in ROCM_TRITON_VERSION=${ROCM_TRITON_VERSION}"
+              exit 1
+              ;;
+          esac
+          image_tag="v${VERSION}-dev-rocm1010-mi45x-sdktriton${triton_short}-${DATE}"
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
@@ -174,21 +205,19 @@ jobs:
             --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
             --build-arg BUILD_TYPE=all \
             --build-arg GPU_ARCH=gfx1250-rocm1000 \
-            --build-arg ENABLE_MORI=1 \
+            --build-arg ENABLE_MORI=0 \
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
             --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
+            --build-arg ROCM_INDEX_URL=https://rc.repo.amd.com/rocm/whl-next/ \
+            --build-arg "ROCM_SDK_VERSION=${ROCM_SDK_VERSION}" \
+            --build-arg "ROCM_TORCH_VERSION=${ROCM_TORCH_VERSION}" \
+            --build-arg "ROCM_TORCHVISION_VERSION=${ROCM_TORCHVISION_VERSION}" \
+            --build-arg "ROCM_TORCHAUDIO_VERSION=${ROCM_TORCHAUDIO_VERSION}" \
+            --build-arg "ROCM_TRITON_VERSION=${ROCM_TRITON_VERSION}" \
             -t "rocm/sgl-dev:${image_tag}" \
             --no-cache
           docker push "rocm/sgl-dev:${image_tag}"
 
-      - name: Login to Docker Hub (lmsys)
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push to lmsysorg/sglang-rocm
-        run: |
-          docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
-          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
+      # Not mirrored to lmsysorg/sglang-rocm while this flavor is on a ROCm
+      # release candidate and ships without MoRI.
