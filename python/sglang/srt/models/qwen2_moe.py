@@ -372,6 +372,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_flashinfer()
                         or get_moe_a2a_backend().is_flashinfer_megamoe()
                         or get_moe_a2a_backend().is_megamoe()
+                        or get_moe_a2a_backend().is_ascend_fuseep()
                     )
                     else {}
                 ),
@@ -393,6 +394,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
@@ -822,7 +824,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         ):
+            # FuseEP already combines routed experts for each source token.
+            # Use the replicated shared expert and avoid the TP all-reduce
+            # below, which would sum different ranks' token rows together.
             return self._forward_deepep(hidden_states, forward_batch)
 
         use_fused_gate = (
