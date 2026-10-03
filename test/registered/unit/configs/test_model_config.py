@@ -12,10 +12,12 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_hybrid_swa_model,
     is_multimodal_model,
     register_model_config_factory,
     resolve_spec_hidden_size,
 )
+from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -47,6 +49,31 @@ class TestHybridLayerIds(CustomTestCase):
                     get_hybrid_layer_ids([architecture], config),
                     ([0, 2], [1, 3]),
                 )
+
+    def test_olmo3_opts_in_through_its_own_config(self):
+        config = Olmo3Config(num_hidden_layers=8, sliding_window=4096)
+
+        self.assertEqual(config.architectures, ["Olmo2ForCausalLM"])
+        self.assertTrue(is_hybrid_swa_model(config.architectures, config))
+        self.assertEqual(
+            get_hybrid_layer_ids(config.architectures, config),
+            ([0, 1, 2, 4, 5, 6], [3, 7]),
+        )
+
+    def test_olmo3_without_a_real_mix_does_not_opt_in(self):
+        cases = {
+            "no window": {"sliding_window": None},
+            "all full": {"layer_types": ["full_attention"] * 4},
+            "all sliding": {"layer_types": ["sliding_attention"] * 4},
+        }
+        for name, fields in cases.items():
+            with self.subTest(name):
+                config = Olmo3Config(num_hidden_layers=4, **fields)
+                self.assertFalse(is_hybrid_swa_model(config.architectures, config))
+
+    def test_genuine_olmo2_is_not_hybrid(self):
+        config = SimpleNamespace(num_hidden_layers=4)
+        self.assertFalse(is_hybrid_swa_model(["Olmo2ForCausalLM"], config))
 
 
 class TestEmbeddingGemmaConfig(CustomTestCase):
