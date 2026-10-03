@@ -82,7 +82,7 @@ from sglang.srt.utils import (
     add_prefix,
     is_non_idle_and_non_empty,
     is_npu,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -740,7 +740,7 @@ class Glm4MoeLiteModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = get_stream("alt") if _is_cuda else None
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm4MoeLiteDecoderLayer(
                 config=config,
@@ -749,8 +749,6 @@ class Glm4MoeLiteModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -850,7 +848,6 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         super().__init__()
         config.moe_layer_freq = 1
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.determine_num_fused_shared_experts()
