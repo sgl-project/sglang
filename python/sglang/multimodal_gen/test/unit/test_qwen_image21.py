@@ -358,6 +358,23 @@ def test_latent_pack_decode_contract():
     )
 
 
+def test_vae_tiling_defaults_off_but_forced_on_for_gfx1151(monkeypatch):
+    # See QwenImage21PipelineConfig.should_enable_vae_tiling for why this is
+    # gfx1151-only rather than a global default.
+    latents = torch.zeros(1, 4, 1, 56, 56)
+    module = "sglang.multimodal_gen.configs.pipeline_configs.qwen_image21"
+
+    monkeypatch.setattr(f"{module}.current_platform.is_gfx1151", lambda: False)
+    assert not QwenImage21PipelineConfig().vae_tiling
+    assert not QwenImage21PipelineConfig().should_enable_vae_tiling(latents)
+    assert QwenImage21PipelineConfig(vae_tiling=True).should_enable_vae_tiling(latents)
+
+    monkeypatch.setattr(f"{module}.current_platform.is_gfx1151", lambda: True)
+    assert QwenImage21PipelineConfig().should_enable_vae_tiling(latents)
+    # gfx1151 forces tiling on even when the user explicitly asked for it off.
+    assert QwenImage21PipelineConfig(vae_tiling=False).should_enable_vae_tiling(latents)
+
+
 def test_default_image_output_format_preserves_rgba():
     assert QwenImage21SamplingParams.default_image_output_format() == "png"
     assert _resolve_image_output_format(None, QwenImage21SamplingParams) == "png"

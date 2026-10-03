@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 @dataclass
@@ -18,6 +19,8 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
     task_type: ModelTaskType = ModelTaskType.TI2I
     should_use_guidance: bool = False
     enable_autocast: bool = False
+    # User-controlled default; see should_enable_vae_tiling() for the
+    # gfx1151-specific override.
     vae_tiling: bool = False
     vae_sp: bool = False
     vae_precision: str = "bf16"
@@ -26,6 +29,16 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
     vae_config: QwenImage21VAEConfig = field(default_factory=QwenImage21VAEConfig)
     text_encoder_configs: tuple = field(default_factory=lambda: (Qwen3VLConfig(),))
     text_encoder_precisions: tuple[str, ...] = ("bf16",)
+
+    def should_enable_vae_tiling(self, latents: torch.Tensor) -> bool:
+        del latents
+        # gfx1151 hangs decoding a full (non-tiled) frame at >=896px, so force
+        # tiling on there regardless of --vae-tiling. Untiled decode on CUDA
+        # measures 2.6x-3.8x faster than tiled, so other platforms keep the
+        # user-controlled default instead of paying that cost unconditionally.
+        if current_platform.is_gfx1151():
+            return True
+        return self.vae_tiling
 
     def supports_dynamic_batching(self):
         # the scheduler excludes reference-image requests from cross-request merging

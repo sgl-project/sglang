@@ -50,6 +50,17 @@ class RocmPlatform(Platform):
 
     @classmethod
     @lru_cache(maxsize=1)
+    def get_gcn_arch_name(cls, device_id: int = 0) -> str:
+        """Return the GCN architecture string (e.g. "gfx1151", "gfx950")."""
+        return str(torch.cuda.get_device_properties(device_id).gcnArchName)
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_gfx1151(cls) -> bool:
+        return cls.get_gcn_arch_name().startswith("gfx1151")
+
+    @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         return torch.cuda.get_device_properties(device_id).total_memory
 
