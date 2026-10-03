@@ -16,7 +16,7 @@ Full prefill graphs remain experimental under the existing server contract.
 Each graph family is compared with real eager generation at the same topology.
 Requests exercise chunked prefill, prefix reuse, token padding, repeated graph
 buffers, different prompt/response lengths, batches and speculative acceptance
-or rejection. Independent attention/logits observers compare all selected KV
+or rejection. Independent pool/logits observations compare all selected KV
 shards, raw top-128 IDs/values and full-vocabulary log-sum-exp with Store
 snapshots. Graph buffers are destroyed before the final Store reads.
 

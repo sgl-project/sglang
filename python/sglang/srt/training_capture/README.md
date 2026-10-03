@@ -38,7 +38,7 @@ An example for an unquantized Qwen3-0.6B target with layers 0, 14 and 27:
 Synchronous and normal overlap scheduling are supported for ordinary AR and
 DSpark verification. Ordinary AR can use TP/PP with DP=1;
 the complete worker group must participate in capture startup. Real-model
-numerical validation currently covers Qwen3-0.6B at TP2/PP1, TP1/PP2 and
+numerical validation covers Qwen3-0.6B at TP2/PP1, TP1/PP2 and
 TP2/PP2, including chunked prefill, prefix reuse, decode CUDA Graphs and TP
 overlap scheduling. Other topologies and model families still require deployment
 validation. PP uses SGLang's non-overlap pipeline scheduler.
@@ -55,7 +55,17 @@ checked after producer exit. The piecewise fixture uses eager compile debug
 mode, and Full prefill remains experimental. See the
 [combined graph matrix](../../../../mooncake-study/experiments/COMBINED_CAPTURE_RUNTIME.md)
 for the exact model, backend and transport scope.
-Each rank writes its own captured KV heads to the Store. An independent reader
+Qwen2.5-1.5B-Instruct is also verified at TP4/PP1, where two logical KV heads
+are replicated across four ranks. Colocated AR/static target-KV DSpark cover
+Full, Breakable and piecewise prefill with overlap and exact capture-on/off
+output comparison. Matching TP4 P/D covers AR/DSpark eager/decode graphs;
+AR additionally covers TP2 prefill to TP4 decode. Only canonical ranks 0 and 2
+write payloads; ranks 1 and 3 allocate no capture payload buffers. The fixture
+uses TCP and a synthetic draft with Qwen2 QKV biases. Piecewise and eager
+greedy outputs differ even without capture, so cross-backend equivalence is
+not established. See the
+[replicated-head matrix](../../../../mooncake-study/experiments/REPLICATED_KV_CAPTURE.md).
+Each payload owner writes its captured KV heads to the Store. An independent reader
 reconstructs the global tensors after producer exit; the snapshot path does not
 gather KV payloads through its control group.
 Capture also accepts confidence-scheduled `cap-accept` and `compact` verification.

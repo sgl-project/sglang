@@ -33,11 +33,11 @@ it does not redefine the goal as the modules already implemented.
 | Mooncake adapter | Required hard pin, registered raw buffers, optional native payload batching, immutable retry verification, exact read length | Cross-process TCP and cross-node RDMA publication/readback pass, including complete reads after producer exit; native batching passes TCP correctness and fault tests without a measured serving speedup; batch RDMA and production retention remain open |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Independent writers and real TP2/PP1, TP1/PP2 and TP2/PP2 serving/P/D tests publish complete snapshots through TCP Store; production retention and saturated load remain open |
-| Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact source-reuse checks and distributed serving publication pass; replicated-head runtime coverage still needs expansion |
-| Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture and real Qwen3 TP2/PP1, TP1/PP2 and TP2/PP2 binding pass; additional deployed models remain open |
+| Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact source-reuse checks and distributed serving publication pass; real Qwen2.5 TP4 P/D checks canonical owners 0/2 and zero payload allocation on replica ranks 1/3; broader replicas/topologies remain open |
+| Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture, real Qwen3 TP2/PP1, TP1/PP2 and TP2/PP2, and Qwen2.5-1.5B TP4 binding pass; broader deployed models remain open |
 | Startup identity exchange | Bounded JSON over the existing CPU group, phase failure votes and final digest agreement | Four-process Gloo failure/finite-wait tests and real distributed identity, resource readiness and activation pass; broader deployment combinations remain open |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
-| Prefill graph collection | Live request lengths, owned teacher/KV staging, resolved hidden capture, stable PP activations and P/D teacher handoff | AR and static target-KV DSpark pass Full, Breakable and torch.compile piecewise in colocated and P/D single-rank, TP2 overlap, PP2 synchronous and combined TP2/PP2 serving, with eager output comparison and post-exit Store parity; combined piecewise uses eager compile debug mode; asymmetric P/D and other speculative prefill graphs remain open |
+| Prefill graph collection | Live request lengths, owned teacher/KV staging, resolved hidden capture, stable PP activations and P/D teacher handoff | Qwen3 AR/static target-KV DSpark pass Full, Breakable and piecewise in colocated/P/D single-rank, TP2, PP2 and TP2/PP2 serving with eager output comparison; Qwen2.5 TP4 colocated graphs pass same-execution capture-on/off equality and post-exit Store parity while retaining a no-capture cross-backend output difference; distributed piecewise uses eager compile debug mode; asymmetric P/D and other speculative prefill graphs remain open |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production checkpoint-manager integration and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
@@ -4200,6 +4200,51 @@ do not establish trained quality, production retention or SLO acceptance.
 Asymmetric P/D graphs/control and cross-node distributed RDMA remain open.
 The temporary four-GPU job is deleted; the resident H100 remains available.
 
+## Replicated KV Heads And Qwen2 Identity
+
+Four actual H100s validate Qwen2.5-1.5B-Instruct at TP4/PP1 with two logical
+KV heads. Every snapshot has canonical payload owners 0 and 2; rank-local
+observations require zero Host/device payload allocation on ranks 1 and 3.
+The target retains Qwen2 QKV biases, unnormalized K, RoPE theta 1,000,000 and
+its own weight/tokenizer identity. A test-only DSpark fixture retains those
+biases and explicitly supplies the draft architecture's required Q/K norms.
+An independent projection calculation includes the local bias, and every
+rank compares the encoder's selected global heads with its actual pool rows.
+
+Six colocated graph methods pass in 853.475 seconds. Including the eager AR
+baseline, 70 post-exit snapshots cover Full, Breakable and piecewise for AR
+and static target-KV DSpark, with chunking, prefix reuse, batching, padding,
+buffer reuse and accept/reject paths. All 70 corresponding capture-off
+requests produce exactly the same token IDs. AR/DSpark piecewise retain an
+unbiased-request difference from eager; a separate plain-server diagnostic
+reproduces the AR difference without capture. The numerical root cause remains
+open; these results establish same-execution capture parity, not cross-backend
+greedy equivalence.
+
+Six P/D methods pass in 815.856 seconds: matching TP4 AR/DSpark eager/graph
+and TP2-to-TP4 AR eager/graph. These check 32 post-exit snapshots plus missing
+and stale handoff and cancellation failures in each cell. A one-token reply
+can finish at handoff without D forward; the observer now records that handoff
+and still checks all ranks. P/D prefill graphs are disabled in this lane.
+
+Together the Qwen2 suites check 102 complete snapshots, 3,336 tensor objects
+and 30,813,480 tensor bytes under one teacher/weight/tokenizer identity.
+Selected KV and raw teacher logits are observed from live pools/model output
+before reuse and checked against independent Store reads. This does not
+independently validate attention's writes into its own pool. See the
+[runbook](experiments/REPLICATED_KV_CAPTURE.md) for scope and failed attempts.
+Both P/D endpoints share four GPUs and use TCP. Synthetic drafts, eager
+piecewise compile debug mode and the test Catalog do not establish trained
+quality, production retention, RDMA coverage or serving SLOs.
+
+Final Qwen3 colocated DSpark Full/overlap and P/D AR Full/overlap regressions
+also pass, adding 39 post-exit snapshots. The four final suites pass 14 methods
+and validate 141 snapshots. The [evidence](experiments/replicated-kv-capture.json)
+preserves all ten attempts, including three failures, source identities and
+82 archived artifacts. All 3,359 Python source/storage test files match v5;
+P/D v3 differs only in two unused colocated prefill files. The temporary
+four-H100 job is deleted and the original resident worker remains live.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2, PP2 and combined TP2/PP2 AR/static target-KV
@@ -4212,9 +4257,10 @@ The temporary four-GPU job is deleted; the resident H100 remains available.
    saturated backpressure.
 2. Connect P8's SGLang export API to the SpecForge checkpoint manager and validate
    trained checkpoints, including artifact compatibility and quality acceptance.
-3. Extend P9's real TP2/PP1, TP1/PP2 and TP2/PP2 Qwen3 capture validation to
-   replicated heads, saturated distributed backpressure and additional
-   model identities. Extend passing colocated and P/D static PP speculative
+3. Extend P9's real TP2/PP1, TP1/PP2 and TP2/PP2 Qwen3 capture validation and
+   Qwen2.5 TP4 replicated-head validation to saturated distributed backpressure,
+   broader replica/topology combinations and additional model identities.
+   Extend passing colocated and P/D static PP speculative
    collection to broader topologies, extend real
    speculative PD topology coverage and cross-node distributed RDMA. Both the
    separate Store RDMA lane and single-rank cross-node P/D RDMA lane have passed

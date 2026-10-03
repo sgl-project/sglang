@@ -44,6 +44,7 @@ def free_port(host="127.0.0.1"):
     "CUDA and Mooncake required",
 )
 class PDCaptureRuntimeBase(CustomTestCase):
+    model_id = "Qwen/Qwen3-0.6B"
     prefill_host = "127.0.0.1"
     decode_host = "127.0.0.1"
     transfer_protocol = "tcp"
@@ -68,7 +69,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
         cls.drafts = {}
-        cls.model = os.environ.get("TRAINING_CAPTURE_TEST_MODEL", "Qwen/Qwen3-0.6B")
+        cls.model = os.environ.get("TRAINING_CAPTURE_TEST_MODEL", cls.model_id)
         if not Path(cls.model).is_dir():
             from huggingface_hub import snapshot_download
 
@@ -144,7 +145,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
         folder.mkdir()
         config = {
             "dataset_id": "runtime-pd",
-            "model_id": "Qwen/Qwen3-0.6B",
+            "model_id": self.model_id,
             "producer_revision": "checkout-under-test",
             "selected_layer_ids": [0, 14, 27],
             "catalog_endpoint": self.catalog.endpoint,
@@ -786,8 +787,8 @@ class PDCaptureRuntimeBase(CustomTestCase):
             self.assertEqual(
                 tensors["token_ids"].tolist(), tokens + result["output_ids"]
             )
-            check_capture_snapshot(
-                self, manifest, tensors, references, capture_mode=capture_mode
+            self.check_snapshot(
+                manifest, tensors, references, capture_mode=capture_mode
             )
         self.assertFalse(responses)
         for fault_index, fault in enumerate(("missing", "stale")):
@@ -873,6 +874,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
         print(
             json.dumps(
                 {
+                    "model_id": self.model_id,
                     "prefill_tp": prefill_tp,
                     "decode_tp": decode_tp,
                     "prefill_pp": prefill_pp,
@@ -889,4 +891,10 @@ class PDCaptureRuntimeBase(CustomTestCase):
                 },
                 sort_keys=True,
             )
+        )
+
+    def check_snapshot(self, manifest, tensors, references, *, capture_mode):
+        self.assertEqual(manifest.teacher.model_id, self.model_id)
+        check_capture_snapshot(
+            self, manifest, tensors, references, capture_mode=capture_mode
         )

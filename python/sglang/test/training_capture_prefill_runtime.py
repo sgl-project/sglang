@@ -12,7 +12,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.test import test_utils
-from sglang.test.dspark_capture_observer import check_capture_snapshot
 from sglang.test.pd_capture_runtime import PDCaptureRuntimeBase, free_port
 from sglang.test.training_capture_utils import read_snapshot
 
@@ -22,6 +21,7 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
 
     tp_size = 1
     pp_size = 1
+    compare_capture_off = False
 
     def exercise_prefill(self, backend, *, overlap=True, target_kv=False):
         if (
@@ -47,7 +47,7 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             export_synthetic_kv_draft(self.model, draft, *self.drafts["prefill_seed"])
         config = {
             "dataset_id": "runtime-prefill-graph",
-            "model_id": "Qwen/Qwen3-0.6B",
+            "model_id": self.model_id,
             "producer_revision": "checkout-under-test",
             "selected_layer_ids": [0, 14, 27],
             "catalog_endpoint": self.catalog.endpoint,
@@ -87,65 +87,70 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             graph_config["decode"]["backend"] = "disabled"
         if backend == "full":
             graph_config["prefill"]["full_prefill_max_req"] = 4
-        with (
-            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
-            envs.SGLANG_TEST_RETRACT.override(False),
-            patch.object(test_utils, "_launch_server_process", observed_server),
-        ):
-            process = test_utils.popen_launch_server(
-                self.model,
-                url,
-                timeout=600,
-                other_args=[
-                    "--tp-size",
-                    str(self.tp_size),
-                    "--pp-size",
-                    str(self.pp_size),
-                    "--pp-max-micro-batch-size",
-                    "4",
-                    "--training-capture-config",
-                    str(path),
-                    "--skip-server-warmup",
-                    "--skip-tokenizer-init",
-                    "--attention-backend",
-                    "flashinfer",
-                    "--disable-flashinfer-autotune",
-                    "--mem-fraction-static",
-                    "0.25",
-                    "--max-total-tokens",
-                    "4096",
-                    "--max-running-requests",
-                    "4",
-                    "--max-prefill-tokens",
-                    "128",
-                    "--chunked-prefill-size",
-                    "128",
-                    "--cuda-graph-config",
-                    json.dumps(graph_config),
-                    *(
-                        ["--enable-torch-compile-debug-mode"]
-                        if backend == "tc_piecewise"
-                        else []
-                    ),
-                    *(
-                        [
-                            "--speculative-algorithm",
-                            "DSPARK",
-                            "--speculative-draft-model-path",
-                            str(draft),
-                            "--speculative-draft-attention-backend",
-                            "triton",
-                        ]
-                        if target_kv
-                        else []
-                    ),
-                    *([] if overlap else ["--disable-overlap-schedule"]),
-                ],
-            )
-        self.addCleanup(self.stop_process, process)
+
+        def launch_prefill(capture=True):
+            with (
+                envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+                envs.SGLANG_TEST_RETRACT.override(False),
+                patch.object(test_utils, "_launch_server_process", observed_server),
+            ):
+                process = test_utils.popen_launch_server(
+                    self.model,
+                    url,
+                    timeout=600,
+                    other_args=[
+                        "--tp-size",
+                        str(self.tp_size),
+                        "--pp-size",
+                        str(self.pp_size),
+                        "--pp-max-micro-batch-size",
+                        "4",
+                        *(["--training-capture-config", str(path)] if capture else []),
+                        "--skip-server-warmup",
+                        "--skip-tokenizer-init",
+                        "--attention-backend",
+                        "flashinfer",
+                        "--disable-flashinfer-autotune",
+                        "--mem-fraction-static",
+                        "0.25",
+                        "--max-total-tokens",
+                        "4096",
+                        "--max-running-requests",
+                        "4",
+                        "--max-prefill-tokens",
+                        "128",
+                        "--chunked-prefill-size",
+                        "128",
+                        "--cuda-graph-config",
+                        json.dumps(graph_config),
+                        *(
+                            ["--enable-torch-compile-debug-mode"]
+                            if backend == "tc_piecewise"
+                            else []
+                        ),
+                        *(
+                            [
+                                "--speculative-algorithm",
+                                "DSPARK",
+                                "--speculative-draft-model-path",
+                                str(draft),
+                                "--speculative-draft-attention-backend",
+                                "triton",
+                            ]
+                            if target_kv
+                            else []
+                        ),
+                        *([] if overlap else ["--disable-overlap-schedule"]),
+                    ],
+                )
+            self.addCleanup(self.stop_process, process)
+            return process
+
         first_publication = len(self.catalog.publications)
         expected = {}
         responses = {}
+        control_outputs = {} if self.compare_capture_off else None
+        capture_enabled = True
 
         def state():
             response = requests.get(url + "/server_info", timeout=10)
@@ -153,10 +158,11 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             return response.json()["internal_states"][0]["training_capture"]
 
         def generate(name, prompts, response_lengths, *, bias=True):
-            deadline = time.monotonic() + 20
-            while state()["states"].get("available", 0) < len(prompts):
-                self.assertLess(time.monotonic(), deadline, state())
-                time.sleep(0.05)
+            if capture_enabled:
+                deadline = time.monotonic() + 20
+                while state()["states"].get("available", 0) < len(prompts):
+                    self.assertLess(time.monotonic(), deadline, state())
+                    time.sleep(0.05)
             rids = [
                 f"{backend}-{overlap}-{target_kv}-{name}-{i}"
                 for i in range(len(prompts))
@@ -180,24 +186,31 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             )
             self.assertEqual(response.status_code, 200, response.text)
             results = response.json()
-            responses[name] = [result["output_ids"] for result in results]
+            output_ids = [result["output_ids"] for result in results]
             for rid, prompt, length, result in zip(
                 rids, prompts, response_lengths, results, strict=True
             ):
                 self.assertEqual(len(result["output_ids"]), length)
                 if bias:
                     self.assertEqual(result["output_ids"], [100] * length)
-                expected[hashlib.sha256(rid.encode()).hexdigest()] = (
-                    prompt + result["output_ids"]
-                )
-            if self.tp_size * self.pp_size > 1 and backend != "disabled":
+                if capture_enabled:
+                    expected[hashlib.sha256(rid.encode()).hexdigest()] = (
+                        prompt + result["output_ids"]
+                    )
+            if not capture_enabled:
+                control_outputs[name] = output_ids
+                return
+            responses[name] = output_ids
+            if control_outputs is not None:
+                self.assertEqual(output_ids, control_outputs[name])
+            elif self.tp_size * self.pp_size > 1 and backend != "disabled":
                 for actual, baseline in zip(
                     responses[name], self.drafts["eager_outputs"][name], strict=True
                 ):
                     self.assertEqual(actual, baseline[: len(actual)])
             self.catalog.wait_publications(first_publication + len(expected))
 
-        try:
+        def workload():
             prompt = [100, 200, 300, 400] * 67 + [501, 502, 503]
             response_length = 8 if target_kv or backend == "disabled" else 4
             generate("chunked", [prompt], [response_length])
@@ -223,6 +236,30 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
                 )
             if target_kv or self.tp_size * self.pp_size > 1:
                 generate("reject", [list(range(8000, 8013))], [6], bias=False)
+
+        if self.compare_capture_off:
+            capture_enabled = False
+            control = launch_prefill(capture=False)
+            try:
+                info = requests.get(url + "/server_info", timeout=10)
+                info.raise_for_status()
+                self.assertIsNone(info.json()["training_capture_config"])
+                workload()
+                self.assertEqual(len(self.catalog.publications), first_publication)
+            finally:
+                self.stop_process(control)
+            capture_enabled = True
+        observation_offsets = (
+            {
+                file: len(file.read_text().splitlines())
+                for file in draft.glob("observations*.jsonl")
+            }
+            if target_kv
+            else {}
+        )
+        process = launch_prefill()
+        try:
+            workload()
             publications = self.catalog.wait_publications(
                 first_publication + len(expected)
             )[first_publication:]
@@ -293,7 +330,9 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             observations = [
                 json.loads(line)
                 for path in draft.glob("observations*.jsonl")
-                for line in path.read_text().splitlines()
+                for line in path.read_text().splitlines()[
+                    observation_offsets.get(path, 0) :
+                ]
             ]
             self.assertEqual(
                 {
@@ -353,8 +392,7 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
             trace = manifest.provenance.trace_id
             self.assertNotIn(trace, captured)
             captured[trace] = tensors["token_ids"].tolist()
-            check_capture_snapshot(
-                self,
+            self.check_snapshot(
                 manifest,
                 tensors,
                 references,
@@ -372,11 +410,26 @@ class PrefillCaptureRuntimeBase(PDCaptureRuntimeBase):
         print(
             json.dumps(
                 {
+                    "model_id": self.model_id,
                     "prefill_capture": backend,
                     "tp_size": self.tp_size,
                     "pp_size": self.pp_size,
                     "target_kv": target_kv,
                     "overlap": overlap,
+                    "capture_off_outputs": control_outputs,
+                    "outputs": responses,
+                    "eager_output_differences": [
+                        name
+                        for name, values in responses.items()
+                        if "eager_outputs" in self.drafts
+                        and values
+                        != [
+                            baseline[: len(actual)]
+                            for actual, baseline in zip(
+                                values, self.drafts["eager_outputs"][name], strict=True
+                            )
+                        ]
+                    ],
                     "samples": len(captured),
                     "tensor_objects": objects,
                     "tensor_bytes": tensor_bytes,

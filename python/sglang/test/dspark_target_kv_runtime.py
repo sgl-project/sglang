@@ -75,6 +75,8 @@ def export_synthetic_kv_draft(model_path, destination, manifest, tensors):
         enable_confidence_head=False,
         test_observation_path=str(destination / "observations.jsonl"),
     )
+    if config["model_type"] == "qwen2":
+        config["attention_bias"] = True
     (destination / "config.json").write_text(json.dumps(config))
     weights = {}
     for path in root.glob("*.safetensors"):
@@ -84,6 +86,19 @@ def export_synthetic_kv_draft(model_path, destination, manifest, tensors):
                     ("model.layers.0.", "model.layers.1.")
                 ):
                     weights[name.removeprefix("model.")] = source.get_tensor(name)
+    if config["model_type"] == "qwen2":
+        # This synthetic DSpark backbone adds Q/K norms absent from the target;
+        # Qwen2's QKV biases are retained and its absent output bias is zero.
+        head_dim = hidden_size // config["num_attention_heads"]
+        for layer in range(config["num_hidden_layers"]):
+            prefix = f"layers.{layer}.self_attn."
+            for component in ("q", "k"):
+                weights[prefix + component + "_norm.weight"] = torch.ones(
+                    head_dim, dtype=torch.bfloat16
+                )
+            weights[prefix + "o_proj.bias"] = torch.zeros(
+                hidden_size, dtype=torch.bfloat16
+            )
     generator = torch.Generator().manual_seed(1729)
     weights["kv_encoder.projection.weight"] = (
         torch.randn(hidden_size, contract.feature_size, generator=generator)

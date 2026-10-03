@@ -31,7 +31,10 @@ from sglang.srt.training_capture.pd_protocol import (
     decode_handoff,
     encode_handoff,
 )
-from sglang.test.dspark_capture_observer import install_capture_observer
+from sglang.test.dspark_capture_observer import (
+    capture_partition_state,
+    install_capture_observer,
+)
 
 _pools = {}
 _sequence = itertools.count()
@@ -236,6 +239,43 @@ def pressure_kv(req, req_pool, allocator):
 
 def observed_accept_handoff(self, req, payload):
     result = _accept_pd_handoff(self, req, payload)
+    if req.training_capture_context is not None:
+        # A one-token response can finish at handoff without any D forward.
+        stage, rank = (
+            get_pipeline_model_parallel_rank(),
+            get_tensor_model_parallel_rank(),
+        )
+        root = Path(self.config.journal_directory).parent / "capture-reference"
+        root = root / f"pp{stage}" / f"tp{rank}"
+        root.mkdir(parents=True, exist_ok=True)
+        slots = self.req_to_token.req_to_token[
+            req.req_pool_idx, : len(req.origin_input_ids)
+        ].long()
+        torch.save(
+            {
+                "trace_id": hashlib.sha256(req.rid.encode()).hexdigest(),
+                "tp_rank": rank,
+                "tp_size": get_tensor_model_parallel_world_size(),
+                "pp_rank": stage,
+                "pd_role": "decode_handoff",
+                "capture_partition": capture_partition_state(self),
+                "tokens": list(req.origin_input_ids) + list(req.output_ids),
+                "kv_start": 0,
+                "kv": (
+                    {
+                        name: buffer[slots].cpu()
+                        for name, buffer in self.exporter.buffers.items()
+                    }
+                    if self.exporter is not None
+                    else {}
+                ),
+                "predictions": [],
+                "logits": torch.empty(0, self.teacher.vocab_size),
+                "batch_size": 1,
+                "cuda_graph": False,
+            },
+            root / f"handoff-{next(_sequence):06d}.pt",
+        )
     if req.rid.startswith("pressure-batch-"):
         record = req.training_capture_context
         assert record is not None

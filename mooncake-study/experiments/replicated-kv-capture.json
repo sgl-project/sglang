@@ -1,0 +1,3039 @@
+{
+  "status": "completed",
+  "date": "2026-10-03",
+  "feature": "Qwen2.5 TP4 replicated KV capture",
+  "base_commit": "04e9e99d891f9614ec7e1ee33bca847674e0b6ad",
+  "production_code_changed": false,
+  "environment": {
+    "temporary_job": "job-bd2801b46de3-20261003100903",
+    "node": "node199",
+    "transport": "TCP",
+    "catalog": "HTTP TestCaptureCatalog",
+    "runtime_lock_sha256": "e09e93dcc6bbfe261b72deaa9c6a19d57f18af5339a1f0a5c7b0ea0109fc2c84",
+    "image_id": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "gpus": [
+      "GPU-9a2310f8-4162-b824-638e-95729f284b28, NVIDIA H100 80GB HBM3, 81559 MiB, 535.154.05",
+      "GPU-d509370c-2949-982e-9f93-c0653fe393c0, NVIDIA H100 80GB HBM3, 81559 MiB, 535.154.05",
+      "GPU-a1a12d9d-32a7-7f7d-b7d4-6393e2ab46de, NVIDIA H100 80GB HBM3, 81559 MiB, 535.154.05",
+      "GPU-776781c5-2156-1fae-4763-7fdba75de0d4, NVIDIA H100 80GB HBM3, 81559 MiB, 535.154.05"
+    ],
+    "runtime": {
+      "python": "3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "devices": 4,
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "removed_temporary_image_packages": [
+      "flashinfer-cubin==0.6.12",
+      "flashinfer-jit-cache==0.6.12+cu130"
+    ]
+  },
+  "cleanup": {
+    "temporary_job_deleted": true,
+    "pod_and_job_resources_absent": true,
+    "supervisor_exit_code": 0,
+    "resident_worker_and_idle_load_verified_live": true,
+    "evidence": "cleanup.json"
+  },
+  "jobs": [
+    {
+      "role": "prefill",
+      "version": 1,
+      "final_acceptance": false,
+      "job_id": "01790993697028673771-9b76e5a7190f",
+      "command": "kubectl exec -n qiji job-bd2801b46de3-20261003100903-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v1 --timeout-seconds 2400 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v1/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen2.5-1.5B-Instruct -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_replicated_prefill.py -v -f",
+      "result": {
+        "job_id": "01790993697028673771-9b76e5a7190f",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790994110.4124553,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/logs/01790993697028673771-9b76e5a7190f.log"
+      },
+      "methods": 3,
+      "seconds": 393.091,
+      "log_sha256": "12c321dda668b0c04418ec2a9e497f8fb51b988ddb12af53c0e65536a19779e2",
+      "ownership_checks": 30
+    },
+    {
+      "role": "pd",
+      "version": 1,
+      "final_acceptance": false,
+      "job_id": "01790993697380028359-6b4bbe9180e3",
+      "command": "kubectl exec -n qiji job-bd2801b46de3-20261003100903-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v1 --timeout-seconds 2400 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v1/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen2.5-1.5B-Instruct -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_replicated.py -v -f",
+      "result": {
+        "job_id": "01790993697380028359-6b4bbe9180e3",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790994243.1093342,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/logs/01790993697380028359-6b4bbe9180e3.log"
+      },
+      "methods": 1,
+      "seconds": 112.826,
+      "log_sha256": "63aa615ed6fb7989b3e8e3450b68ced6272b5dc822ab23f8b43186b597e15c74",
+      "ownership_checks": 0
+    },
+    {
+      "role": "qwen3_colocated",
+      "version": 1,
+      "final_acceptance": false,
+      "job_id": "01790994023128757187-fcaba7a39416",
+      "command": "kubectl exec -n qiji job-bd2801b46de3-20261003100903-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v1 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v1/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_dspark_prefill_graph.py TestTargetKVPrefillGraphCapture.test_full_overlap -v -f",
+      "result": {
+        "job_id": "01790994023128757187-fcaba7a39416",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790994403.9618697,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/logs/01790994023128757187-fcaba7a39416.log"
+      },
+      "methods": 1,
+      "seconds": 141.444,
+      "log_sha256": "f4fe1e85c0bfe5e339f059c9850da55b8e766e459f5067d8b56fc795767e90de",
+      "ownership_checks": 0
+    },
+    {
+      "role": "qwen3_pd",
+      "version": 1,
+      "final_acceptance": false,
+      "job_id": "01790994023456111166-bb7b123d47fd",
+      "command": "kubectl exec -n qiji job-bd2801b46de3-20261003100903-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v1 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v1/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_prefill_graph.py TestPDPrefillGraphCapture.test_ar_full_overlap -v -f",
+      "result": {
+        "job_id": "01790994023456111166-bb7b123d47fd",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790994638.7528152,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/logs/01790994023456111166-bb7b123d47fd.log"
+      },
+      "methods": 1,
+      "seconds": 215.172,
+      "log_sha256": "be128abfb7f818f6908b55646db6e0fbfb0e3bac0dd91e508731f6ee4729119f",
+      "ownership_checks": 0
+    },
+    {
+      "role": "capture_off_diagnostic",
+      "version": 2,
+      "final_acceptance": false,
+      "job_id": "01790994528425040479-b6f17e6c27d2",
+      "command": "kubectl exec -n qiji job-bd2801b46de3-20261003100903-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v2 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v2/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen2.5-1.5B-Instruct -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/diagnose_replicated_prefill.py --model /gpfs/models/huggingface.co/Qwen/Qwen2.5-1.5B-Instruct --output /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/capture-off-diagnostic.json",
+      "result": {
+        "job_id": "01790994528425040479-b6f17e6c27d2",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1790994710.6666875,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/logs/01790994528425040479-b6f17e6c27d2.log"
+      },
+      "methods": null,
+      "seconds": null,
+      "log_sha256": "4a727051433bf0051fc422b54079d32a10d0ef94239c0d68dc2b3cb99817285a",
+      "source_note": "Failed with KeyError server_args. The process loaded the original diagnostic source before its file was corrected in flight. v2/v3/v4 share a hard-linked corrected file, so the original failed source was not retained. The traceback is preserved; only the separate v4 run provides successful diagnostic evidence.",
+      "ownership_checks": 0
+    },
+    {
+      "role": "pd_v3",
+      "version": 3,
+      "final_acceptance": true,
+      "job_id": "01790994528747663087-580a036f8268",
+      "command": "kubectl exec -n qiji job-bd2801b46de3-20261003100903-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v3 --timeout-seconds 2400 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v3/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen2.5-1.5B-Instruct -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_replicated.py -v -f",
+      "result": {
+        "job_id": "01790994528747663087-580a036f8268",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790995546.7189023,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/logs/01790994528747663087-580a036f8268.log"
+      },
+      "methods": 6,
+      "seconds": 815.856,
+      "log_sha256": "101dbf26767471c6a70a32f0abd24681f30ce95a65b8af681a5a1a237d3bf1f9",
+      "ownership_checks": 32
+    },
+    {
+      "role": "capture_off_diagnostic_v4",
+      "version": 4,
+      "final_acceptance": false,
+      "job_id": "01790994788681086293-8c313ffc8b51",
+      "command": "kubectl exec -n qiji job-bd2801b46de3-20261003100903-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v4 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v4/python -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python mooncake-study/experiments/diagnose_replicated_prefill.py --model /gpfs/models/huggingface.co/Qwen/Qwen2.5-1.5B-Instruct --output /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/capture-off-diagnostic-v4.json",
+      "result": {
+        "job_id": "01790994788681086293-8c313ffc8b51",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790995693.0400925,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/logs/01790994788681086293-8c313ffc8b51.log"
+      },
+      "methods": null,
+      "seconds": null,
+      "log_sha256": "5b12790de00eae6b206af786366cab71485fe4c492a5b9029134c83fb65d8871",
+      "ownership_checks": 0
+    },
+    {
+      "role": "prefill_v5",
+      "version": 5,
+      "final_acceptance": true,
+      "job_id": "01790995987890117323-a07d5bdee31a",
+      "command": "kubectl exec -n qiji job-bd2801b46de3-20261003100903-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v5 --timeout-seconds 2400 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v5/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen2.5-1.5B-Instruct -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_replicated_prefill.py -v -f",
+      "result": {
+        "job_id": "01790995987890117323-a07d5bdee31a",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790996862.492015,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/logs/01790995987890117323-a07d5bdee31a.log"
+      },
+      "methods": 6,
+      "seconds": 853.475,
+      "log_sha256": "e21552262ecf2e5366b1a38094449318b79e7e4e21f2dc5d7d9c51669fa2018d",
+      "ownership_checks": 70
+    },
+    {
+      "role": "qwen3_colocated_v5",
+      "version": 5,
+      "final_acceptance": true,
+      "job_id": "01790995988215940878-00242f2ada9f",
+      "command": "kubectl exec -n qiji job-bd2801b46de3-20261003100903-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v5 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v5/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_dspark_prefill_graph.py TestTargetKVPrefillGraphCapture.test_full_overlap -v -f",
+      "result": {
+        "job_id": "01790995988215940878-00242f2ada9f",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790996992.0203712,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/logs/01790995988215940878-00242f2ada9f.log"
+      },
+      "methods": 1,
+      "seconds": 109.934,
+      "log_sha256": "8f5cbdf2c04dd84b1f38948526e7ae237c8969ef9157f000ab9c496f5f60e9a0",
+      "ownership_checks": 0
+    },
+    {
+      "role": "qwen3_pd_v5",
+      "version": 5,
+      "final_acceptance": true,
+      "job_id": "01790995988527797328-20f6b7e1c6ba",
+      "command": "kubectl exec -n qiji job-bd2801b46de3-20261003100903-master-0 -c master -- python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003 submit --cwd /gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v5 --timeout-seconds 1200 --env PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env OMP_NUM_THREADS=1 --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-replicated-kv-v5/python --env TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B -- /gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python test/registered/storage/test_training_capture_pd_prefill_graph.py TestPDPrefillGraphCapture.test_ar_full_overlap -v -f",
+      "result": {
+        "job_id": "01790995988527797328-20f6b7e1c6ba",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1790997227.1530075,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-replicated-kv-20261003/logs/01790995988527797328-20f6b7e1c6ba.log"
+      },
+      "methods": 1,
+      "seconds": 215.22,
+      "log_sha256": "2ea1e9b0311b57846de69400df1a69206619d70b55b81bb30dbdac7710adf72f",
+      "ownership_checks": 0
+    }
+  ],
+  "totals": {
+    "methods": 14,
+    "post_exit_snapshots": 141,
+    "qwen2_snapshots": 102,
+    "qwen2_tensor_objects": 3336,
+    "qwen2_tensor_bytes": 30813480,
+    "capture_off_requests": 70
+  },
+  "cases": [
+    {
+      "role": "pd_v3",
+      "decode_pp": 1,
+      "decode_tp": 4,
+      "draft_kind": null,
+      "enable_overlap": null,
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "post_exit_snapshots": 5,
+      "prefill_backend": "disabled",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_replay_frames": 0,
+      "prefill_tp": 4,
+      "ragged_mode": "static",
+      "replay": false,
+      "capture_on_off_output_equal": null,
+      "capture_off_requests": 0,
+      "capture_counters": {
+        "admitted": 8,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 6,
+        "ready": 5,
+        "sealed": 5
+      }
+    },
+    {
+      "role": "pd_v3",
+      "decode_pp": 1,
+      "decode_tp": 4,
+      "draft_kind": null,
+      "enable_overlap": null,
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "post_exit_snapshots": 5,
+      "prefill_backend": "disabled",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_replay_frames": 0,
+      "prefill_tp": 4,
+      "ragged_mode": "static",
+      "replay": true,
+      "capture_on_off_output_equal": null,
+      "capture_off_requests": 0,
+      "capture_counters": {
+        "admitted": 8,
+        "cuda_graph_forwards": 16,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "overlap_forwards": 16,
+        "pd_handoff_committed": 6,
+        "ready": 5,
+        "sealed": 5
+      }
+    },
+    {
+      "role": "pd_v3",
+      "decode_pp": 1,
+      "decode_tp": 4,
+      "draft_kind": null,
+      "enable_overlap": null,
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "post_exit_snapshots": 5,
+      "prefill_backend": "disabled",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_replay_frames": 0,
+      "prefill_tp": 2,
+      "ragged_mode": "static",
+      "replay": false,
+      "capture_on_off_output_equal": null,
+      "capture_off_requests": 0,
+      "capture_counters": {
+        "admitted": 8,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 6,
+        "ready": 5,
+        "sealed": 5
+      }
+    },
+    {
+      "role": "pd_v3",
+      "decode_pp": 1,
+      "decode_tp": 4,
+      "draft_kind": null,
+      "enable_overlap": null,
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "post_exit_snapshots": 5,
+      "prefill_backend": "disabled",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_replay_frames": 0,
+      "prefill_tp": 2,
+      "ragged_mode": "static",
+      "replay": true,
+      "capture_on_off_output_equal": null,
+      "capture_off_requests": 0,
+      "capture_counters": {
+        "admitted": 8,
+        "cuda_graph_forwards": 16,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "overlap_forwards": 16,
+        "pd_handoff_committed": 6,
+        "ready": 5,
+        "sealed": 5
+      }
+    },
+    {
+      "role": "pd_v3",
+      "decode_pp": 1,
+      "decode_tp": 4,
+      "draft_kind": "target_kv",
+      "enable_overlap": null,
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "post_exit_snapshots": 6,
+      "prefill_backend": "disabled",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_replay_frames": 0,
+      "prefill_tp": 4,
+      "ragged_mode": "static",
+      "replay": false,
+      "capture_on_off_output_equal": null,
+      "capture_off_requests": 0,
+      "capture_counters": {
+        "admitted": 9,
+        "eager_forwards": 10,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "speculative_commits_copied": 11,
+        "speculative_verify_forwards": 10
+      }
+    },
+    {
+      "role": "pd_v3",
+      "decode_pp": 1,
+      "decode_tp": 4,
+      "draft_kind": "target_kv",
+      "enable_overlap": null,
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "post_exit_snapshots": 6,
+      "prefill_backend": "disabled",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_replay_frames": 0,
+      "prefill_tp": 4,
+      "ragged_mode": "static",
+      "replay": true,
+      "capture_on_off_output_equal": null,
+      "capture_off_requests": 0,
+      "capture_counters": {
+        "admitted": 9,
+        "cuda_graph_forwards": 14,
+        "failed_pd_handoff_failed": 2,
+        "failed_running_request_aborted": 1,
+        "overlap_forwards": 14,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "speculative_commits_copied": 16,
+        "speculative_verify_forwards": 14
+      }
+    },
+    {
+      "role": "prefill_v5",
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "prefill_capture": "disabled",
+      "tp_size": 4,
+      "pp_size": 1,
+      "target_kv": false,
+      "overlap": false,
+      "eager_output_differences": [],
+      "samples": 10,
+      "tensor_objects": 344,
+      "tensor_bytes": 3500876,
+      "source_frames": 228,
+      "prefill_replay_frames": 0,
+      "verify_replay_frames": 0,
+      "prefill_hidden_states": false,
+      "verify_result_lags": [],
+      "graph_shapes": [],
+      "graph_prefix_lengths": [],
+      "reused_graph_buffers": 0,
+      "reused_graph_buffer_ranks": [],
+      "producer_exited": true,
+      "capture_state": {
+        "counters": {
+          "admitted": 10,
+          "eager_forwards": 41,
+          "sealed": 10,
+          "ready": 10
+        },
+        "disabled_reason": null,
+        "admission_paused": false,
+        "enable_overlap": false,
+        "reservations": 4,
+        "states": {
+          "available": 3,
+          "writing": 0,
+          "pending_publication": 0
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "stage_timings": {
+          "queue_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0034474804997444153,
+            "max_seconds": 0.0007882863283157349
+          },
+          "copy_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0008705109357833862,
+            "max_seconds": 0.0001646280288696289
+          },
+          "snapshot_build": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.016786105930805206,
+            "max_seconds": 0.0036391504108905792
+          },
+          "validation": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.036324549466371536,
+            "max_seconds": 0.0047582052648067474
+          },
+          "catalog_register": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.017654776573181152,
+            "max_seconds": 0.001260519027709961
+          },
+          "store_payload": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.022055920213460922,
+            "max_seconds": 0.005514703691005707
+          },
+          "catalog_written": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.01632293313741684,
+            "max_seconds": 0.0012738853693008423
+          },
+          "journal_save": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.010394934564828873,
+            "max_seconds": 0.0034813731908798218
+          },
+          "catalog_seal": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.021487854421138763,
+            "max_seconds": 0.00550958514213562
+          },
+          "store_manifest": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.004014216363430023,
+            "max_seconds": 0.000543348491191864
+          },
+          "catalog_publish": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.006256096065044403,
+            "max_seconds": 0.0007202960550785065
+          },
+          "journal_complete": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0022303350269794464,
+            "max_seconds": 0.0002572275698184967
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "seconds": 0,
+            "max_seconds": 0
+          }
+        },
+        "host_pool": {
+          "allocated_bytes": 7499264,
+          "device_allocated_bytes": 164096,
+          "device_limit_bytes": 8388608,
+          "kv_export_host_enqueued_bytes": 0,
+          "kv_export_device_enqueued_bytes": 0,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        },
+        "cohort_writer": {
+          "ready": true,
+          "stopping": false,
+          "error": null,
+          "recovery_error": null,
+          "pending": 0,
+          "states": {},
+          "counters": {
+            "submitted": 10,
+            "published": 10
+          },
+          "stage_timings": {
+            "queue_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0034474804997444153,
+              "max_seconds": 0.0007882863283157349
+            },
+            "copy_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0008705109357833862,
+              "max_seconds": 0.0001646280288696289
+            },
+            "snapshot_build": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.016786105930805206,
+              "max_seconds": 0.0036391504108905792
+            },
+            "validation": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.036324549466371536,
+              "max_seconds": 0.0047582052648067474
+            },
+            "catalog_register": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.017654776573181152,
+              "max_seconds": 0.001260519027709961
+            },
+            "store_payload": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.022055920213460922,
+              "max_seconds": 0.005514703691005707
+            },
+            "catalog_written": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.01632293313741684,
+              "max_seconds": 0.0012738853693008423
+            },
+            "journal_save": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.010394934564828873,
+              "max_seconds": 0.0034813731908798218
+            },
+            "catalog_seal": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.021487854421138763,
+              "max_seconds": 0.00550958514213562
+            },
+            "store_manifest": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.004014216363430023,
+              "max_seconds": 0.000543348491191864
+            },
+            "catalog_publish": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.006256096065044403,
+              "max_seconds": 0.0007202960550785065
+            },
+            "journal_complete": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0022303350269794464,
+              "max_seconds": 0.0002572275698184967
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0,
+              "max_seconds": 0
+            }
+          },
+          "oldest_seconds": 0
+        },
+        "request_router": {
+          "considered": 11,
+          "excluded": 1,
+          "selected": 10,
+          "attached": 10,
+          "bound": 10
+        }
+      },
+      "capture_on_off_output_equal": true,
+      "capture_off_requests": 10
+    },
+    {
+      "role": "prefill_v5",
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "prefill_capture": "breakable",
+      "tp_size": 4,
+      "pp_size": 1,
+      "target_kv": false,
+      "overlap": true,
+      "eager_output_differences": [],
+      "samples": 10,
+      "tensor_objects": 344,
+      "tensor_bytes": 3432764,
+      "source_frames": 172,
+      "prefill_replay_frames": 44,
+      "verify_replay_frames": 0,
+      "prefill_hidden_states": false,
+      "verify_result_lags": [],
+      "graph_shapes": [
+        [
+          1,
+          13,
+          16
+        ],
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 4,
+      "reused_graph_buffer_ranks": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ]
+      ],
+      "producer_exited": true,
+      "capture_state": {
+        "counters": {
+          "admitted": 10,
+          "overlap_forwards": 31,
+          "cuda_graph_forwards": 30,
+          "sealed": 10,
+          "eager_forwards": 1,
+          "ready": 10
+        },
+        "disabled_reason": null,
+        "admission_paused": false,
+        "enable_overlap": true,
+        "reservations": 4,
+        "states": {
+          "available": 3,
+          "writing": 0,
+          "pending_publication": 0
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "stage_timings": {
+          "queue_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.02160574495792389,
+            "max_seconds": 0.00966038927435875
+          },
+          "copy_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0013611316680908203,
+            "max_seconds": 0.0004923157393932343
+          },
+          "snapshot_build": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.018694575875997543,
+            "max_seconds": 0.00420481339097023
+          },
+          "validation": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.03979913145303726,
+            "max_seconds": 0.004741184413433075
+          },
+          "catalog_register": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.018658313900232315,
+            "max_seconds": 0.0017017461359500885
+          },
+          "store_payload": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.02312830090522766,
+            "max_seconds": 0.004001393914222717
+          },
+          "catalog_written": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.016531072556972504,
+            "max_seconds": 0.0015595108270645142
+          },
+          "journal_save": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.01002160832285881,
+            "max_seconds": 0.0035639889538288116
+          },
+          "catalog_seal": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.018958818167448044,
+            "max_seconds": 0.002859886735677719
+          },
+          "store_manifest": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.004489075392484665,
+            "max_seconds": 0.000568777322769165
+          },
+          "catalog_publish": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0060950517654418945,
+            "max_seconds": 0.0006602518260478973
+          },
+          "journal_complete": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0025317594408988953,
+            "max_seconds": 0.0002679005265235901
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "seconds": 0,
+            "max_seconds": 0
+          }
+        },
+        "host_pool": {
+          "allocated_bytes": 7499264,
+          "device_allocated_bytes": 164096,
+          "device_limit_bytes": 8388608,
+          "kv_export_host_enqueued_bytes": 0,
+          "kv_export_device_enqueued_bytes": 0,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        },
+        "cohort_writer": {
+          "ready": true,
+          "stopping": false,
+          "error": null,
+          "recovery_error": null,
+          "pending": 0,
+          "states": {},
+          "counters": {
+            "submitted": 10,
+            "published": 10
+          },
+          "stage_timings": {
+            "queue_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.02160574495792389,
+              "max_seconds": 0.00966038927435875
+            },
+            "copy_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0013611316680908203,
+              "max_seconds": 0.0004923157393932343
+            },
+            "snapshot_build": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.018694575875997543,
+              "max_seconds": 0.00420481339097023
+            },
+            "validation": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.03979913145303726,
+              "max_seconds": 0.004741184413433075
+            },
+            "catalog_register": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.018658313900232315,
+              "max_seconds": 0.0017017461359500885
+            },
+            "store_payload": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.02312830090522766,
+              "max_seconds": 0.004001393914222717
+            },
+            "catalog_written": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.016531072556972504,
+              "max_seconds": 0.0015595108270645142
+            },
+            "journal_save": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.01002160832285881,
+              "max_seconds": 0.0035639889538288116
+            },
+            "catalog_seal": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.018958818167448044,
+              "max_seconds": 0.002859886735677719
+            },
+            "store_manifest": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.004489075392484665,
+              "max_seconds": 0.000568777322769165
+            },
+            "catalog_publish": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0060950517654418945,
+              "max_seconds": 0.0006602518260478973
+            },
+            "journal_complete": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0025317594408988953,
+              "max_seconds": 0.0002679005265235901
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0,
+              "max_seconds": 0
+            }
+          },
+          "oldest_seconds": 0
+        },
+        "request_router": {
+          "considered": 11,
+          "excluded": 1,
+          "selected": 10,
+          "attached": 10,
+          "bound": 10
+        }
+      },
+      "capture_on_off_output_equal": true,
+      "capture_off_requests": 10
+    },
+    {
+      "role": "prefill_v5",
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "prefill_capture": "full",
+      "tp_size": 4,
+      "pp_size": 1,
+      "target_kv": false,
+      "overlap": true,
+      "eager_output_differences": [],
+      "samples": 10,
+      "tensor_objects": 344,
+      "tensor_bytes": 3432764,
+      "source_frames": 172,
+      "prefill_replay_frames": 44,
+      "verify_replay_frames": 0,
+      "prefill_hidden_states": false,
+      "verify_result_lags": [],
+      "graph_shapes": [
+        [
+          1,
+          13,
+          16
+        ],
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 4,
+      "reused_graph_buffer_ranks": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ]
+      ],
+      "producer_exited": true,
+      "capture_state": {
+        "counters": {
+          "admitted": 10,
+          "overlap_forwards": 31,
+          "cuda_graph_forwards": 30,
+          "sealed": 10,
+          "eager_forwards": 1,
+          "ready": 10
+        },
+        "disabled_reason": null,
+        "admission_paused": false,
+        "enable_overlap": true,
+        "reservations": 4,
+        "states": {
+          "available": 3,
+          "writing": 0,
+          "pending_publication": 0
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "stage_timings": {
+          "queue_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.02790803834795952,
+            "max_seconds": 0.01674644649028778
+          },
+          "copy_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0004237815737724304,
+            "max_seconds": 0.0001099705696105957
+          },
+          "snapshot_build": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.017825495451688766,
+            "max_seconds": 0.003648269921541214
+          },
+          "validation": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.03474041074514389,
+            "max_seconds": 0.005414094775915146
+          },
+          "catalog_register": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.01779487356543541,
+            "max_seconds": 0.001389428973197937
+          },
+          "store_payload": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.021449200809001923,
+            "max_seconds": 0.003789357841014862
+          },
+          "catalog_written": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.019353844225406647,
+            "max_seconds": 0.001889113336801529
+          },
+          "journal_save": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.009777519851922989,
+            "max_seconds": 0.002321675419807434
+          },
+          "catalog_seal": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.020108718425035477,
+            "max_seconds": 0.002951398491859436
+          },
+          "store_manifest": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.004778578877449036,
+            "max_seconds": 0.0006861351430416107
+          },
+          "catalog_publish": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0062118954956531525,
+            "max_seconds": 0.000793755054473877
+          },
+          "journal_complete": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.002424921840429306,
+            "max_seconds": 0.000292312353849411
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "seconds": 0,
+            "max_seconds": 0
+          }
+        },
+        "host_pool": {
+          "allocated_bytes": 7499264,
+          "device_allocated_bytes": 164096,
+          "device_limit_bytes": 8388608,
+          "kv_export_host_enqueued_bytes": 0,
+          "kv_export_device_enqueued_bytes": 0,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        },
+        "cohort_writer": {
+          "ready": true,
+          "stopping": false,
+          "error": null,
+          "recovery_error": null,
+          "pending": 0,
+          "states": {},
+          "counters": {
+            "submitted": 10,
+            "published": 10
+          },
+          "stage_timings": {
+            "queue_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.02790803834795952,
+              "max_seconds": 0.01674644649028778
+            },
+            "copy_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0004237815737724304,
+              "max_seconds": 0.0001099705696105957
+            },
+            "snapshot_build": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.017825495451688766,
+              "max_seconds": 0.003648269921541214
+            },
+            "validation": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.03474041074514389,
+              "max_seconds": 0.005414094775915146
+            },
+            "catalog_register": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.01779487356543541,
+              "max_seconds": 0.001389428973197937
+            },
+            "store_payload": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.021449200809001923,
+              "max_seconds": 0.003789357841014862
+            },
+            "catalog_written": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.019353844225406647,
+              "max_seconds": 0.001889113336801529
+            },
+            "journal_save": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.009777519851922989,
+              "max_seconds": 0.002321675419807434
+            },
+            "catalog_seal": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.020108718425035477,
+              "max_seconds": 0.002951398491859436
+            },
+            "store_manifest": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.004778578877449036,
+              "max_seconds": 0.0006861351430416107
+            },
+            "catalog_publish": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0062118954956531525,
+              "max_seconds": 0.000793755054473877
+            },
+            "journal_complete": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.002424921840429306,
+              "max_seconds": 0.000292312353849411
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0,
+              "max_seconds": 0
+            }
+          },
+          "oldest_seconds": 0
+        },
+        "request_router": {
+          "considered": 11,
+          "excluded": 1,
+          "selected": 10,
+          "attached": 10,
+          "bound": 10
+        }
+      },
+      "capture_on_off_output_equal": true,
+      "capture_off_requests": 10
+    },
+    {
+      "role": "prefill_v5",
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "prefill_capture": "tc_piecewise",
+      "tp_size": 4,
+      "pp_size": 1,
+      "target_kv": false,
+      "overlap": true,
+      "eager_output_differences": [
+        "reject"
+      ],
+      "samples": 10,
+      "tensor_objects": 344,
+      "tensor_bytes": 3432764,
+      "source_frames": 172,
+      "prefill_replay_frames": 44,
+      "verify_replay_frames": 0,
+      "prefill_hidden_states": false,
+      "verify_result_lags": [],
+      "graph_shapes": [
+        [
+          1,
+          13,
+          16
+        ],
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 4,
+      "reused_graph_buffer_ranks": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ]
+      ],
+      "producer_exited": true,
+      "capture_state": {
+        "counters": {
+          "admitted": 10,
+          "overlap_forwards": 31,
+          "cuda_graph_forwards": 30,
+          "sealed": 10,
+          "eager_forwards": 1,
+          "ready": 10
+        },
+        "disabled_reason": null,
+        "admission_paused": false,
+        "enable_overlap": true,
+        "reservations": 4,
+        "states": {
+          "available": 3,
+          "writing": 0,
+          "pending_publication": 0
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "stage_timings": {
+          "queue_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0355059914290905,
+            "max_seconds": 0.016422219574451447
+          },
+          "copy_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.000983167439699173,
+            "max_seconds": 0.0005008168518543243
+          },
+          "snapshot_build": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.018165048211812973,
+            "max_seconds": 0.004024434834718704
+          },
+          "validation": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.04026274010539055,
+            "max_seconds": 0.004992228001356125
+          },
+          "catalog_register": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.019540607929229736,
+            "max_seconds": 0.0019363202154636383
+          },
+          "store_payload": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.02314087748527527,
+            "max_seconds": 0.003946278244256973
+          },
+          "catalog_written": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.017016734927892685,
+            "max_seconds": 0.001262117177248001
+          },
+          "journal_save": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.009613242000341415,
+            "max_seconds": 0.002650633454322815
+          },
+          "catalog_seal": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.019393879920244217,
+            "max_seconds": 0.003286655992269516
+          },
+          "store_manifest": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0043245889246463776,
+            "max_seconds": 0.00046967342495918274
+          },
+          "catalog_publish": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.006329454481601715,
+            "max_seconds": 0.0007864274084568024
+          },
+          "journal_complete": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0025137998163700104,
+            "max_seconds": 0.0002723969519138336
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "seconds": 0,
+            "max_seconds": 0
+          }
+        },
+        "host_pool": {
+          "allocated_bytes": 7499264,
+          "device_allocated_bytes": 164096,
+          "device_limit_bytes": 8388608,
+          "kv_export_host_enqueued_bytes": 0,
+          "kv_export_device_enqueued_bytes": 0,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        },
+        "cohort_writer": {
+          "ready": true,
+          "stopping": false,
+          "error": null,
+          "recovery_error": null,
+          "pending": 0,
+          "states": {},
+          "counters": {
+            "submitted": 10,
+            "published": 10
+          },
+          "stage_timings": {
+            "queue_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0355059914290905,
+              "max_seconds": 0.016422219574451447
+            },
+            "copy_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.000983167439699173,
+              "max_seconds": 0.0005008168518543243
+            },
+            "snapshot_build": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.018165048211812973,
+              "max_seconds": 0.004024434834718704
+            },
+            "validation": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.04026274010539055,
+              "max_seconds": 0.004992228001356125
+            },
+            "catalog_register": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.019540607929229736,
+              "max_seconds": 0.0019363202154636383
+            },
+            "store_payload": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.02314087748527527,
+              "max_seconds": 0.003946278244256973
+            },
+            "catalog_written": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.017016734927892685,
+              "max_seconds": 0.001262117177248001
+            },
+            "journal_save": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.009613242000341415,
+              "max_seconds": 0.002650633454322815
+            },
+            "catalog_seal": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.019393879920244217,
+              "max_seconds": 0.003286655992269516
+            },
+            "store_manifest": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0043245889246463776,
+              "max_seconds": 0.00046967342495918274
+            },
+            "catalog_publish": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.006329454481601715,
+              "max_seconds": 0.0007864274084568024
+            },
+            "journal_complete": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0025137998163700104,
+              "max_seconds": 0.0002723969519138336
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0,
+              "max_seconds": 0
+            }
+          },
+          "oldest_seconds": 0
+        },
+        "request_router": {
+          "considered": 11,
+          "excluded": 1,
+          "selected": 10,
+          "attached": 10,
+          "bound": 10
+        }
+      },
+      "capture_on_off_output_equal": true,
+      "capture_off_requests": 10
+    },
+    {
+      "role": "prefill_v5",
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "prefill_capture": "breakable",
+      "tp_size": 4,
+      "pp_size": 1,
+      "target_kv": true,
+      "overlap": true,
+      "eager_output_differences": [],
+      "samples": 10,
+      "tensor_objects": 344,
+      "tensor_bytes": 3531596,
+      "source_frames": 156,
+      "prefill_replay_frames": 44,
+      "verify_replay_frames": 108,
+      "prefill_hidden_states": false,
+      "verify_result_lags": [
+        0,
+        3
+      ],
+      "graph_shapes": [
+        [
+          1,
+          13,
+          16
+        ],
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 4,
+      "reused_graph_buffer_ranks": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ]
+      ],
+      "producer_exited": true,
+      "capture_state": {
+        "counters": {
+          "admitted": 10,
+          "overlap_forwards": 27,
+          "cuda_graph_forwards": 26,
+          "speculative_verify_forwards": 19,
+          "speculative_commits_copied": 27,
+          "sealed": 10,
+          "eager_forwards": 1,
+          "ready": 10
+        },
+        "disabled_reason": null,
+        "admission_paused": false,
+        "enable_overlap": true,
+        "reservations": 4,
+        "states": {
+          "available": 3,
+          "writing": 0,
+          "pending_publication": 0
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "stage_timings": {
+          "queue_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.020954877138137817,
+            "max_seconds": 0.008721306920051575
+          },
+          "copy_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0011221878230571747,
+            "max_seconds": 0.0006572455167770386
+          },
+          "snapshot_build": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.018227022141218185,
+            "max_seconds": 0.0036894679069519043
+          },
+          "validation": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.036642614752054214,
+            "max_seconds": 0.004929706454277039
+          },
+          "catalog_register": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.01800781488418579,
+            "max_seconds": 0.001680918037891388
+          },
+          "store_payload": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.02260531485080719,
+            "max_seconds": 0.003987297415733337
+          },
+          "catalog_written": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.016874421387910843,
+            "max_seconds": 0.0015058405697345734
+          },
+          "journal_save": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.00887090340256691,
+            "max_seconds": 0.0017725490033626556
+          },
+          "catalog_seal": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.019253399223089218,
+            "max_seconds": 0.0029224231839179993
+          },
+          "store_manifest": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.004388902336359024,
+            "max_seconds": 0.00046962127089500427
+          },
+          "catalog_publish": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.006172467023134232,
+            "max_seconds": 0.0007217489182949066
+          },
+          "journal_complete": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0024213753640651703,
+            "max_seconds": 0.00028251856565475464
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "seconds": 0,
+            "max_seconds": 0
+          }
+        },
+        "host_pool": {
+          "allocated_bytes": 7499264,
+          "device_allocated_bytes": 164096,
+          "device_limit_bytes": 8388608,
+          "kv_export_host_enqueued_bytes": 0,
+          "kv_export_device_enqueued_bytes": 0,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        },
+        "cohort_writer": {
+          "ready": true,
+          "stopping": false,
+          "error": null,
+          "recovery_error": null,
+          "pending": 0,
+          "states": {},
+          "counters": {
+            "submitted": 10,
+            "published": 10
+          },
+          "stage_timings": {
+            "queue_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.020954877138137817,
+              "max_seconds": 0.008721306920051575
+            },
+            "copy_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0011221878230571747,
+              "max_seconds": 0.0006572455167770386
+            },
+            "snapshot_build": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.018227022141218185,
+              "max_seconds": 0.0036894679069519043
+            },
+            "validation": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.036642614752054214,
+              "max_seconds": 0.004929706454277039
+            },
+            "catalog_register": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.01800781488418579,
+              "max_seconds": 0.001680918037891388
+            },
+            "store_payload": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.02260531485080719,
+              "max_seconds": 0.003987297415733337
+            },
+            "catalog_written": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.016874421387910843,
+              "max_seconds": 0.0015058405697345734
+            },
+            "journal_save": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.00887090340256691,
+              "max_seconds": 0.0017725490033626556
+            },
+            "catalog_seal": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.019253399223089218,
+              "max_seconds": 0.0029224231839179993
+            },
+            "store_manifest": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.004388902336359024,
+              "max_seconds": 0.00046962127089500427
+            },
+            "catalog_publish": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.006172467023134232,
+              "max_seconds": 0.0007217489182949066
+            },
+            "journal_complete": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0024213753640651703,
+              "max_seconds": 0.00028251856565475464
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0,
+              "max_seconds": 0
+            }
+          },
+          "oldest_seconds": 0
+        },
+        "request_router": {
+          "considered": 11,
+          "excluded": 1,
+          "selected": 10,
+          "attached": 10,
+          "bound": 10
+        }
+      },
+      "capture_on_off_output_equal": true,
+      "capture_off_requests": 10
+    },
+    {
+      "role": "prefill_v5",
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "prefill_capture": "full",
+      "tp_size": 4,
+      "pp_size": 1,
+      "target_kv": true,
+      "overlap": true,
+      "eager_output_differences": [],
+      "samples": 10,
+      "tensor_objects": 344,
+      "tensor_bytes": 3531596,
+      "source_frames": 156,
+      "prefill_replay_frames": 44,
+      "verify_replay_frames": 108,
+      "prefill_hidden_states": false,
+      "verify_result_lags": [
+        0,
+        3
+      ],
+      "graph_shapes": [
+        [
+          1,
+          13,
+          16
+        ],
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 4,
+      "reused_graph_buffer_ranks": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ]
+      ],
+      "producer_exited": true,
+      "capture_state": {
+        "counters": {
+          "admitted": 10,
+          "overlap_forwards": 27,
+          "cuda_graph_forwards": 26,
+          "speculative_verify_forwards": 19,
+          "speculative_commits_copied": 27,
+          "sealed": 10,
+          "eager_forwards": 1,
+          "ready": 10
+        },
+        "disabled_reason": null,
+        "admission_paused": false,
+        "enable_overlap": true,
+        "reservations": 4,
+        "states": {
+          "available": 3,
+          "writing": 0,
+          "pending_publication": 0
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "stage_timings": {
+          "queue_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.01979566365480423,
+            "max_seconds": 0.008498728275299072
+          },
+          "copy_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.001019556075334549,
+            "max_seconds": 0.0005817115306854248
+          },
+          "snapshot_build": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.015946459025144577,
+            "max_seconds": 0.0034273751080036163
+          },
+          "validation": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.03558735549449921,
+            "max_seconds": 0.0048368871212005615
+          },
+          "catalog_register": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.020040664821863174,
+            "max_seconds": 0.00215018168091774
+          },
+          "store_payload": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.020172331482172012,
+            "max_seconds": 0.004350639879703522
+          },
+          "catalog_written": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.016583994030952454,
+            "max_seconds": 0.0012344196438789368
+          },
+          "journal_save": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.008722390979528427,
+            "max_seconds": 0.001926269382238388
+          },
+          "catalog_seal": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.019761405885219574,
+            "max_seconds": 0.003134012222290039
+          },
+          "store_manifest": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.004047505557537079,
+            "max_seconds": 0.0005868077278137207
+          },
+          "catalog_publish": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.005778726190328598,
+            "max_seconds": 0.0006260201334953308
+          },
+          "journal_complete": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0023514553904533386,
+            "max_seconds": 0.00026924535632133484
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "seconds": 0,
+            "max_seconds": 0
+          }
+        },
+        "host_pool": {
+          "allocated_bytes": 7499264,
+          "device_allocated_bytes": 164096,
+          "device_limit_bytes": 8388608,
+          "kv_export_host_enqueued_bytes": 0,
+          "kv_export_device_enqueued_bytes": 0,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        },
+        "cohort_writer": {
+          "ready": true,
+          "stopping": false,
+          "error": null,
+          "recovery_error": null,
+          "pending": 0,
+          "states": {},
+          "counters": {
+            "submitted": 10,
+            "published": 10
+          },
+          "stage_timings": {
+            "queue_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.01979566365480423,
+              "max_seconds": 0.008498728275299072
+            },
+            "copy_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.001019556075334549,
+              "max_seconds": 0.0005817115306854248
+            },
+            "snapshot_build": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.015946459025144577,
+              "max_seconds": 0.0034273751080036163
+            },
+            "validation": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.03558735549449921,
+              "max_seconds": 0.0048368871212005615
+            },
+            "catalog_register": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.020040664821863174,
+              "max_seconds": 0.00215018168091774
+            },
+            "store_payload": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.020172331482172012,
+              "max_seconds": 0.004350639879703522
+            },
+            "catalog_written": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.016583994030952454,
+              "max_seconds": 0.0012344196438789368
+            },
+            "journal_save": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.008722390979528427,
+              "max_seconds": 0.001926269382238388
+            },
+            "catalog_seal": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.019761405885219574,
+              "max_seconds": 0.003134012222290039
+            },
+            "store_manifest": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.004047505557537079,
+              "max_seconds": 0.0005868077278137207
+            },
+            "catalog_publish": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.005778726190328598,
+              "max_seconds": 0.0006260201334953308
+            },
+            "journal_complete": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0023514553904533386,
+              "max_seconds": 0.00026924535632133484
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0,
+              "max_seconds": 0
+            }
+          },
+          "oldest_seconds": 0
+        },
+        "request_router": {
+          "considered": 11,
+          "excluded": 1,
+          "selected": 10,
+          "attached": 10,
+          "bound": 10
+        }
+      },
+      "capture_on_off_output_equal": true,
+      "capture_off_requests": 10
+    },
+    {
+      "role": "prefill_v5",
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "prefill_capture": "tc_piecewise",
+      "tp_size": 4,
+      "pp_size": 1,
+      "target_kv": true,
+      "overlap": true,
+      "eager_output_differences": [
+        "reject"
+      ],
+      "samples": 10,
+      "tensor_objects": 344,
+      "tensor_bytes": 3531596,
+      "source_frames": 156,
+      "prefill_replay_frames": 44,
+      "verify_replay_frames": 108,
+      "prefill_hidden_states": false,
+      "verify_result_lags": [
+        0,
+        3
+      ],
+      "graph_shapes": [
+        [
+          1,
+          13,
+          16
+        ],
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 4,
+      "reused_graph_buffer_ranks": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ]
+      ],
+      "producer_exited": true,
+      "capture_state": {
+        "counters": {
+          "admitted": 10,
+          "overlap_forwards": 27,
+          "cuda_graph_forwards": 26,
+          "speculative_verify_forwards": 19,
+          "speculative_commits_copied": 27,
+          "sealed": 10,
+          "eager_forwards": 1,
+          "ready": 10
+        },
+        "disabled_reason": null,
+        "admission_paused": false,
+        "enable_overlap": true,
+        "reservations": 4,
+        "states": {
+          "available": 3,
+          "writing": 0,
+          "pending_publication": 0
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "stage_timings": {
+          "queue_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0022068247199058533,
+            "max_seconds": 0.0004462823271751404
+          },
+          "copy_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0011262856423854828,
+            "max_seconds": 0.0005469508469104767
+          },
+          "snapshot_build": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.01824543997645378,
+            "max_seconds": 0.004301279783248901
+          },
+          "validation": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.037352003157138824,
+            "max_seconds": 0.005349405109882355
+          },
+          "catalog_register": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.017891179770231247,
+            "max_seconds": 0.0014111213386058807
+          },
+          "store_payload": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.02220940589904785,
+            "max_seconds": 0.004002433270215988
+          },
+          "catalog_written": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.0165419764816761,
+            "max_seconds": 0.0013744458556175232
+          },
+          "journal_save": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.008042793720960617,
+            "max_seconds": 0.0015052855014801025
+          },
+          "catalog_seal": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.018794648349285126,
+            "max_seconds": 0.002950131893157959
+          },
+          "store_manifest": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.003810841590166092,
+            "max_seconds": 0.0004662126302719116
+          },
+          "catalog_publish": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0060982294380664825,
+            "max_seconds": 0.0007029697299003601
+          },
+          "journal_complete": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0023700036108493805,
+            "max_seconds": 0.00027759745717048645
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "seconds": 0,
+            "max_seconds": 0
+          }
+        },
+        "host_pool": {
+          "allocated_bytes": 7499264,
+          "device_allocated_bytes": 164096,
+          "device_limit_bytes": 8388608,
+          "kv_export_host_enqueued_bytes": 0,
+          "kv_export_device_enqueued_bytes": 0,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        },
+        "cohort_writer": {
+          "ready": true,
+          "stopping": false,
+          "error": null,
+          "recovery_error": null,
+          "pending": 0,
+          "states": {},
+          "counters": {
+            "submitted": 10,
+            "published": 10
+          },
+          "stage_timings": {
+            "queue_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0022068247199058533,
+              "max_seconds": 0.0004462823271751404
+            },
+            "copy_wait": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0011262856423854828,
+              "max_seconds": 0.0005469508469104767
+            },
+            "snapshot_build": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.01824543997645378,
+              "max_seconds": 0.004301279783248901
+            },
+            "validation": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.037352003157138824,
+              "max_seconds": 0.005349405109882355
+            },
+            "catalog_register": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.017891179770231247,
+              "max_seconds": 0.0014111213386058807
+            },
+            "store_payload": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.02220940589904785,
+              "max_seconds": 0.004002433270215988
+            },
+            "catalog_written": {
+              "calls": 20,
+              "errors": 0,
+              "seconds": 0.0165419764816761,
+              "max_seconds": 0.0013744458556175232
+            },
+            "journal_save": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.008042793720960617,
+              "max_seconds": 0.0015052855014801025
+            },
+            "catalog_seal": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.018794648349285126,
+              "max_seconds": 0.002950131893157959
+            },
+            "store_manifest": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.003810841590166092,
+              "max_seconds": 0.0004662126302719116
+            },
+            "catalog_publish": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0060982294380664825,
+              "max_seconds": 0.0007029697299003601
+            },
+            "journal_complete": {
+              "calls": 10,
+              "errors": 0,
+              "seconds": 0.0023700036108493805,
+              "max_seconds": 0.00027759745717048645
+            },
+            "recovery_read": {
+              "calls": 0,
+              "errors": 0,
+              "seconds": 0,
+              "max_seconds": 0
+            }
+          },
+          "oldest_seconds": 0
+        },
+        "request_router": {
+          "considered": 11,
+          "excluded": 1,
+          "selected": 10,
+          "attached": 10,
+          "bound": 10
+        }
+      },
+      "capture_on_off_output_equal": true,
+      "capture_off_requests": 10
+    },
+    {
+      "role": "qwen3_colocated_v5",
+      "model_id": "Qwen/Qwen3-0.6B",
+      "prefill_capture": "full",
+      "tp_size": 1,
+      "pp_size": 1,
+      "target_kv": false,
+      "overlap": false,
+      "eager_output_differences": [],
+      "samples": 9,
+      "tensor_objects": 198,
+      "tensor_bytes": 13238274,
+      "source_frames": 27,
+      "prefill_replay_frames": 10,
+      "verify_replay_frames": 0,
+      "prefill_hidden_states": false,
+      "verify_result_lags": [],
+      "graph_shapes": [
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 1,
+      "reused_graph_buffer_ranks": [
+        [
+          0,
+          0
+        ]
+      ],
+      "producer_exited": true,
+      "capture_state": {
+        "counters": {
+          "considered": 10,
+          "excluded_health_check": 1,
+          "admitted": 9,
+          "cuda_graph_forwards": 18,
+          "sealed": 9,
+          "writer_started": 9,
+          "copies_completed": 9,
+          "snapshot_built": 9,
+          "ready": 9,
+          "eager_forwards": 1
+        },
+        "disabled_reason": null,
+        "admission_paused": false,
+        "enable_overlap": false,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "stage_timings": {
+          "queue_wait": {
+            "calls": 9,
+            "errors": 0,
+            "seconds": 0.009252574294805527,
+            "max_seconds": 0.004339128732681274
+          },
+          "copy_wait": {
+            "calls": 9,
+            "errors": 0,
+            "seconds": 0.0009622648358345032,
+            "max_seconds": 0.00022046640515327454
+          },
+          "snapshot_build": {
+            "calls": 9,
+            "errors": 0,
+            "seconds": 0.030043665319681168,
+            "max_seconds": 0.007320817559957504
+          },
+          "validation": {
+            "calls": 9,
+            "errors": 0,
+            "seconds": 0.05475147068500519,
+            "max_seconds": 0.013795796781778336
+          },
+          "catalog_register": {
+            "calls": 9,
+            "errors": 0,
+            "seconds": 0.009915545582771301,
+            "max_seconds": 0.0014182813465595245
+          },
+          "store_payload": {
+            "calls": 9,
+            "errors": 0,
+            "seconds": 0.06448409706354141,
+            "max_seconds": 0.042969994246959686
+          },
+          "catalog_written": {
+            "calls": 18,
+            "errors": 0,
+            "seconds": 0.015745263546705246,
+            "max_seconds": 0.001408301293849945
+          },
+          "journal_save": {
+            "calls": 9,
+            "errors": 0,
+            "seconds": 0.006366271525621414,
+            "max_seconds": 0.001002490520477295
+          },
+          "catalog_seal": {
+            "calls": 9,
+            "errors": 0,
+            "seconds": 0.017870157957077026,
+            "max_seconds": 0.004680085927248001
+          },
+          "store_manifest": {
+            "calls": 9,
+            "errors": 0,
+            "seconds": 0.0031605996191501617,
+            "max_seconds": 0.00047709420323371887
+          },
+          "catalog_publish": {
+            "calls": 9,
+            "errors": 0,
+            "seconds": 0.005806289613246918,
+            "max_seconds": 0.000822652131319046
+          },
+          "journal_complete": {
+            "calls": 9,
+            "errors": 0,
+            "seconds": 0.002229034900665283,
+            "max_seconds": 0.00027607008814811707
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "seconds": 0,
+            "max_seconds": 0
+          }
+        },
+        "host_pool": {
+          "allocated_bytes": 21261824,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "kv_export_host_enqueued_bytes": 0,
+          "kv_export_device_enqueued_bytes": 0,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        }
+      },
+      "capture_on_off_output_equal": null,
+      "capture_off_requests": 0
+    },
+    {
+      "role": "qwen3_colocated_v5",
+      "model_id": "Qwen/Qwen3-0.6B",
+      "prefill_capture": "full",
+      "tp_size": 1,
+      "pp_size": 1,
+      "target_kv": true,
+      "overlap": true,
+      "eager_output_differences": [],
+      "samples": 10,
+      "tensor_objects": 212,
+      "tensor_bytes": 13908812,
+      "source_frames": 39,
+      "prefill_replay_frames": 11,
+      "verify_replay_frames": 27,
+      "prefill_hidden_states": false,
+      "verify_result_lags": [
+        0,
+        3
+      ],
+      "graph_shapes": [
+        [
+          1,
+          13,
+          16
+        ],
+        [
+          1,
+          15,
+          16
+        ],
+        [
+          1,
+          19,
+          32
+        ],
+        [
+          1,
+          128,
+          128
+        ],
+        [
+          3,
+          113,
+          128
+        ]
+      ],
+      "graph_prefix_lengths": [
+        0,
+        128,
+        256,
+        271
+      ],
+      "reused_graph_buffers": 1,
+      "reused_graph_buffer_ranks": [
+        [
+          0,
+          0
+        ]
+      ],
+      "producer_exited": true,
+      "capture_state": {
+        "counters": {
+          "considered": 11,
+          "excluded_health_check": 1,
+          "admitted": 10,
+          "overlap_forwards": 27,
+          "cuda_graph_forwards": 26,
+          "speculative_verify_forwards": 19,
+          "speculative_commits_copied": 27,
+          "sealed": 10,
+          "writer_started": 10,
+          "copies_completed": 10,
+          "snapshot_built": 10,
+          "ready": 10,
+          "eager_forwards": 1
+        },
+        "disabled_reason": null,
+        "admission_paused": false,
+        "enable_overlap": true,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "stage_timings": {
+          "queue_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.027116548269987106,
+            "max_seconds": 0.013390641659498215
+          },
+          "copy_wait": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.000596214085817337,
+            "max_seconds": 0.00012315809726715088
+          },
+          "snapshot_build": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0328296422958374,
+            "max_seconds": 0.007394466549158096
+          },
+          "validation": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.06216982752084732,
+            "max_seconds": 0.013935931026935577
+          },
+          "catalog_register": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.01059040054678917,
+            "max_seconds": 0.001505337655544281
+          },
+          "store_payload": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.08239993453025818,
+            "max_seconds": 0.05690238997340202
+          },
+          "catalog_written": {
+            "calls": 20,
+            "errors": 0,
+            "seconds": 0.01851736754179001,
+            "max_seconds": 0.0018150471150875092
+          },
+          "journal_save": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.008207850158214569,
+            "max_seconds": 0.0017320849001407623
+          },
+          "catalog_seal": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.016013674437999725,
+            "max_seconds": 0.002151552587747574
+          },
+          "store_manifest": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0035667121410369873,
+            "max_seconds": 0.0005792491137981415
+          },
+          "catalog_publish": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.006968710571527481,
+            "max_seconds": 0.0008161142468452454
+          },
+          "journal_complete": {
+            "calls": 10,
+            "errors": 0,
+            "seconds": 0.0025699175894260406,
+            "max_seconds": 0.00029540807008743286
+          },
+          "recovery_read": {
+            "calls": 0,
+            "errors": 0,
+            "seconds": 0,
+            "max_seconds": 0
+          }
+        },
+        "host_pool": {
+          "allocated_bytes": 21261824,
+          "device_allocated_bytes": 852224,
+          "device_limit_bytes": 8388608,
+          "kv_export_host_enqueued_bytes": 0,
+          "kv_export_device_enqueued_bytes": 0,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        }
+      },
+      "capture_on_off_output_equal": null,
+      "capture_off_requests": 0
+    },
+    {
+      "role": "qwen3_pd_v5",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": null,
+      "enable_overlap": false,
+      "model_id": "Qwen/Qwen3-0.6B",
+      "post_exit_snapshots": 10,
+      "prefill_backend": "disabled",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_replay_frames": 0,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": false,
+      "capture_on_off_output_equal": null,
+      "capture_off_requests": 0,
+      "capture_counters": {
+        "admitted": 13,
+        "considered": 13,
+        "copies_completed": 13,
+        "eager_forwards": 32,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 11,
+        "ready": 10,
+        "sealed": 10,
+        "snapshot_built": 10,
+        "writer_started": 13
+      }
+    },
+    {
+      "role": "qwen3_pd_v5",
+      "decode_pp": 1,
+      "decode_tp": 1,
+      "draft_kind": null,
+      "enable_overlap": null,
+      "model_id": "Qwen/Qwen3-0.6B",
+      "post_exit_snapshots": 10,
+      "prefill_backend": "full",
+      "prefill_draft": false,
+      "prefill_pp": 1,
+      "prefill_replay_frames": 8,
+      "prefill_tp": 1,
+      "ragged_mode": "static",
+      "replay": true,
+      "capture_on_off_output_equal": null,
+      "capture_off_requests": 0,
+      "capture_counters": {
+        "admitted": 13,
+        "considered": 13,
+        "copies_completed": 13,
+        "cuda_graph_forwards": 39,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 39,
+        "pd_handoff_committed": 11,
+        "ready": 10,
+        "sealed": 10,
+        "snapshot_built": 10,
+        "writer_started": 13
+      }
+    }
+  ],
+  "qwen2_identity": {
+    "teacher_fingerprint": "74ec0c8b86f06395f92d851bd354047b6e92a82aefdc15f0b715e31f6d48d3d8",
+    "weights_revision": "60ce139a6c3f27ab24482c81767d0bf71eccd5bad35bb4a6592a524003d473a0",
+    "tokenizer_revision": "37f64f84322a836b320ab491b2d973c263063057a4697b81208b0accd5839f2c"
+  },
+  "source_sha256": {
+    "python/sglang/test/dspark_capture_observer.py": "462d016afcf26a4acae36a4357a33838b9dc8ab8289fb268b95c7bf7d10a5cce",
+    "python/sglang/test/dspark_target_kv_runtime.py": "c4e024d0153b31cf74cfb21118468dac5dd28b3072736b4ff46849462dcdc5a2",
+    "python/sglang/test/dspark_target_kv_server.py": "255c214c878b19d142c6177ae7472b1f719b1222b91082f15627aeb6ddb0e6d8",
+    "python/sglang/test/pd_capture_runtime.py": "06341a69671b6d6ac703ec119f23d74a4b65a2f12c6a422ea9cccc41b47853c5",
+    "python/sglang/test/pd_capture_server.py": "335d1102c78dd47c2ce92e6d1fb713ea4e5d54455da569d777c5756659d090fa",
+    "python/sglang/test/training_capture_prefill_runtime.py": "de1f48e4fe9e7369a2099a0d162b6792a2a5d8448b5751fa5f82ef36e0d06956",
+    "mooncake-study/experiments/diagnose_replicated_prefill.py": "c6036220012aee27f1b71c465e08784029f08457f36caaf7655ed43cc3fd2551",
+    "python/sglang/test/training_capture_replicated_runtime.py": "b90aafb5ecb4c35e608b9e3325d0fd64bad371f616140e157e20274f27b5bfba",
+    "test/registered/storage/test_training_capture_pd_replicated.py": "5532b6f6d575935c8e0783be253ac1512210488988188fa83ee41d2ad8aa9d7b",
+    "test/registered/storage/test_training_capture_replicated_prefill.py": "4f85794efcdd0e2bcacfddad7197f2d77405b420c2333369ea27dda1f59fed74"
+  },
+  "source_audit": {
+    "scope": "All tracked Python source and storage tests plus new runtime files",
+    "versions": {
+      "1": {
+        "files": 3359,
+        "manifest_sha256": "aca3f4a0669b86cc3c50a9b9080150115ea9ef431510d5d8f991ec7f610e1843",
+        "current_differences": [
+          "python/sglang/test/dspark_capture_observer.py",
+          "python/sglang/test/dspark_target_kv_server.py",
+          "python/sglang/test/pd_capture_server.py",
+          "python/sglang/test/training_capture_prefill_runtime.py",
+          "test/registered/storage/test_training_capture_replicated_prefill.py"
+        ]
+      },
+      "2": {
+        "files": 3359,
+        "manifest_sha256": "218b21bd524027f4280827ba0afe2ffd3ccbc4fdbf761c12dd968ac11c8593c6",
+        "current_differences": [
+          "python/sglang/test/dspark_capture_observer.py",
+          "python/sglang/test/pd_capture_server.py",
+          "python/sglang/test/training_capture_prefill_runtime.py",
+          "test/registered/storage/test_training_capture_replicated_prefill.py"
+        ]
+      },
+      "3": {
+        "files": 3359,
+        "manifest_sha256": "2ee421c5f5baddb1b4ea6d20ded2f647185c546d9cc9d97220f24e3951d4f98a",
+        "current_differences": [
+          "python/sglang/test/training_capture_prefill_runtime.py",
+          "test/registered/storage/test_training_capture_replicated_prefill.py"
+        ]
+      },
+      "4": {
+        "files": 3359,
+        "manifest_sha256": "2ee421c5f5baddb1b4ea6d20ded2f647185c546d9cc9d97220f24e3951d4f98a",
+        "current_differences": [
+          "python/sglang/test/training_capture_prefill_runtime.py",
+          "test/registered/storage/test_training_capture_replicated_prefill.py"
+        ]
+      },
+      "5": {
+        "files": 3359,
+        "manifest_sha256": "039ad88c8a09f8a2fca198d9fd006be9facb124906c6eb7f216de5b919a3b2e8",
+        "current_differences": []
+      }
+    },
+    "pd_v3_difference": "Only the unused colocated prefill helper and its test differ; the P/D fixture imports neither. Diagnostic scripts are archived separately."
+  },
+  "diagnostic": {
+    "job_id": "01790994788681086293-8c313ffc8b51",
+    "evidence": "capture-off-diagnostic-v4.json",
+    "reject_outputs": [
+      [
+        78,
+        11,
+        220,
+        17,
+        15,
+        16
+      ],
+      [
+        78,
+        11,
+        220,
+        16,
+        24,
+        24
+      ]
+    ],
+    "conclusion": "Cross-backend greedy difference also occurs without capture; numerical root cause is not established."
+  },
+  "cross_backend_differences": [
+    {
+      "backend": "tc_piecewise",
+      "target_kv": false,
+      "requests": [
+        "reject"
+      ]
+    },
+    {
+      "backend": "tc_piecewise",
+      "target_kv": true,
+      "requests": [
+        "reject"
+      ]
+    }
+  ],
+  "limitations": [
+    "Exact pool/logits readback does not independently prove attention writes into the pool.",
+    "Same-execution capture-on/off equality is not cross-backend greedy equivalence.",
+    "Piecewise uses eager compile debug mode; Full prefill remains experimental.",
+    "P/D prefill graphs are disabled; both endpoints share four GPUs.",
+    "Synthetic draft weights and test Catalog do not certify trained quality, retention or SLOs.",
+    "TCP only; this lane does not certify RDMA.",
+    "Temporary reference tensors and projection JSONL files were deleted by test cleanup; source assertions and logs are retained.",
+    "The first diagnostic script was edited in flight and its hard-linked original was not retained; only the separate frozen v4 run supplies successful diagnostic evidence."
+  ],
+  "artifact_archive": {
+    "path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/replicated-kv-20261003",
+    "files": 82,
+    "manifest": "artifact-manifest.json",
+    "sha256": "6376fe2992ada1e28add4e49edfbfaceffc0161c37ade15ea0a9fdb9da5defe7"
+  }
+}

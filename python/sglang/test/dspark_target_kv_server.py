@@ -73,6 +73,36 @@ original_write = DSparkTargetKVDraftModel.write_target_kv
 original_verify = TargetKVInjector.inject_verify
 original_context = TargetKVInjector.ensure_context
 original_target_verify = TargetVerifyExecutor.run_non_compact
+original_select = TargetKVInjector._select_target_kv
+
+
+def observed_select(self, locations):
+    selected = original_select(self, locations)
+    rank = get_tensor_model_parallel_rank()
+    size = get_tensor_model_parallel_world_size()
+    heads = {
+        layer.layer_id: layer.num_kv_heads
+        for layer in self.draft_model.target_kv_contract.kv.layers
+    }
+    for name, source in self.sources.items():
+        local = source.index_select(0, locations)
+        global_heads = heads[int(name.split(".")[1])]
+        first = rank * global_heads // size
+        torch.testing.assert_close(
+            selected[name][:, first : first + local.shape[1]], local, rtol=0, atol=0
+        )
+    record(
+        self.draft_model,
+        {
+            "kind": "source_selection",
+            "num_tokens": locations.numel(),
+            "global_heads": {name: value.shape[1] for name, value in selected.items()},
+            "local_heads": {
+                name: value.shape[1] for name, value in self.sources.items()
+            },
+        },
+    )
+    return selected
 
 
 @torch.no_grad()
@@ -110,7 +140,12 @@ def observed_write(self, *, target_kv, pool, positions, cache_loc):
         context_weight = attn.qkv_proj.weight[
             attn.q_size : attn.q_size + 2 * attn.kv_size
         ]
-        key, value = F.linear(encoded, context_weight).chunk(2, dim=-1)
+        context_bias = (
+            attn.qkv_proj.bias[attn.q_size : attn.q_size + 2 * attn.kv_size]
+            if attn.qkv_proj.bias is not None
+            else None
+        )
+        key, value = F.linear(encoded, context_weight, context_bias).chunk(2, dim=-1)
         key = rms(
             key.reshape(-1, attn.num_kv_heads, attn.head_dim),
             attn.k_norm.weight,
@@ -193,6 +228,7 @@ def observed_target_verify(self, **kwargs):
 DSparkTargetKVDraftModel.write_target_kv = observed_write
 TargetKVInjector.inject_verify = observed_verify
 TargetKVInjector.ensure_context = observed_context
+TargetKVInjector._select_target_kv = observed_select
 TargetVerifyExecutor.run_non_compact = observed_target_verify
 install_capture_observer()
 

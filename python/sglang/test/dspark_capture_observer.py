@@ -23,6 +23,20 @@ _after_verify_forward = CaptureCoordinator.after_verify_forward
 _after_verify_accept = CaptureCoordinator.after_verify_accept
 
 
+def capture_partition_state(coordinator):
+    if not hasattr(coordinator, "partition"):
+        return None
+    part, stats = coordinator.partition, coordinator._host_stats()
+    return {
+        "owner_id": part.owner_id,
+        "active": part.active,
+        "include_aux": part.include_aux,
+        "head_ranges": [(item.layer_id, item.start, item.end) for item in part.heads],
+        "host_allocated_bytes": stats["allocated_bytes"],
+        "device_allocated_bytes": stats["device_allocated_bytes"],
+    }
+
+
 def observe(
     coordinator,
     batch,
@@ -107,6 +121,7 @@ def observe(
         # Read all raw vocabulary scores. The test computes its own top-k and
         # row alignment from final output tokens, without using capture tickets.
         reference = {
+            "capture_partition": capture_partition_state(coordinator),
             "trace_id": hashlib.sha256(req.rid.encode()).hexdigest(),
             "result_lag": end - len(req.origin_input_ids) - len(req.output_ids),
             "batch_size": len(batch.reqs),
