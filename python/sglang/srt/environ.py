@@ -746,6 +746,10 @@ class Envs:
     # Tool calling and native web search
     # ===================================================================
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    # Render every tool into the chat template when tool_choice names a function,
+    # instead of only the named one. The prompt then keeps the prefix of earlier
+    # turns. Applies only when the request has an output constraint for the tool.
+    SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS = EnvBool(False)
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
     # request defaults for the built-in GPT-OSS web_search tool.
