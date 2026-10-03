@@ -52,8 +52,6 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
         return "the configured components require the Python TreeCore"
     if params.component_registry_override:
         return "custom components require the Python TreeCore"
-    if envs.SGLANG_EXTERNAL_LINKER_SWA_RETENTION_INTERVAL.get() > 0:
-        return "sparse external SWA retention requires the Python TreeCore"
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
     from sglang.srt.rust_extensions.torch_build import (

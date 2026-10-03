@@ -19,14 +19,12 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
-import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -44,10 +42,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     LinkerTransferPhase,
     TreeComponent,
 )
-from sglang.srt.mem_cache.unified_cache.swa_retention import retained_swa_ranges
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -198,20 +193,6 @@ class UnifiedCacheLinkerWrapper:
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
-        self.swa_retention_interval = (
-            envs.SGLANG_EXTERNAL_LINKER_SWA_RETENTION_INTERVAL.get()
-        )
-        if self.swa_retention_interval < 0 or (
-            self.swa_retention_interval
-            and self.swa_retention_interval % cache.page_size
-        ):
-            raise ValueError(
-                "SWA retention interval must be nonnegative and page aligned"
-            )
-        cache.tree_core.external_swa_sparse_retention = bool(
-            self.swa_retention_interval
-        )
-        cache.tree_core.external_swa_retention_interval = self.swa_retention_interval
 
     @property
     def layer_done_counter(self) -> object:
@@ -233,40 +214,6 @@ class UnifiedCacheLinkerWrapper:
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
             return result
-
-        if self.swa_retention_interval and logger.isEnabledFor(logging.DEBUG):
-            page = cache.page_size
-            query_end = device_hit_len + len(tail_hashes) * page
-            window = cache.sliding_window_size
-            assert window is not None
-            checkpoint_ranges = retained_swa_ranges(
-                device_hit_len,
-                query_end,
-                prompt_boundary=query_end,
-                window=window,
-                interval=self.swa_retention_interval,
-                page_size=page,
-            )
-            checkpoint_keys = [
-                (
-                    start,
-                    end,
-                    tail_hashes[
-                        (start - device_hit_len) // page : (end - device_hit_len)
-                        // page
-                    ],
-                )
-                for start, end in checkpoint_ranges
-            ]
-            logger.debug(
-                "External SWA query geometry: rid=%s first_key=%s "
-                "device_hit_len=%d query_end=%d checkpoints=%s",
-                req.rid,
-                tail_hashes[0],
-                device_hit_len,
-                query_end,
-                checkpoint_keys,
-            )
 
         lookup_transfers = []
         for component in self._components:
@@ -597,91 +544,18 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- offload: device -> remote, driven by the write-through chain ----
 
-    def offload_nodes(
-        self,
-        node_ids: Sequence[NodeId],
-        *,
-        replay_boundary: int | None = None,
-        include_prompt_boundary: bool = True,
-    ) -> None:
+    def offload_nodes(self, node_ids: Sequence[NodeId]) -> None:
         """Persist a write-through chain, skipping nodes already in the store."""
-        sparse = bool(self.swa_retention_interval and replay_boundary is not None)
         for node_id in node_ids:
             transfers = self.cache.tree_core.build_external_linker_offload_transfers(
                 node_id
             )
-            if transfers is None:
-                if sparse:
-                    # A stored node still owes windows of checkpoints crossed since.
-                    self._offload_checkpoint_windows(
-                        node_id, replay_boundary, include_prompt_boundary
-                    )
-                continue
-            if self._skip_swa:
-                transfers = [t for t in transfers if t.name != PoolName.SWA]
-            elif sparse:
-                transfers = [
-                    self._retain_checkpoint_windows(
-                        node_id, t, replay_boundary, include_prompt_boundary
-                    )
-                    if t.name == PoolName.SWA
-                    else t
-                    for t in transfers
-                ]
-                transfers = [t for t in transfers if t.keys]
-            self._offload_node(node_id, transfers)
+            if transfers is not None:
+                if self._skip_swa:
+                    transfers = [t for t in transfers if t.name != PoolName.SWA]
+                self._offload_node(node_id, transfers)
 
-    def _retain_checkpoint_windows(
-        self,
-        node_id: NodeId,
-        transfer: PoolTransfer,
-        replay_boundary: int,
-        include_prompt_boundary: bool,
-    ) -> PoolTransfer:
-        cache = self.cache
-        node = cache.resolve_node_handle(node_id)
-        node_end = 0
-        while node is not cache.tree_core.root_node:
-            node_end += len(node.key)
-            node = node.parent
-        ranges = retained_swa_ranges(
-            node_end - len(transfer.device_indices),
-            node_end,
-            prompt_boundary=replay_boundary,
-            window=cache.sliding_window_size,
-            interval=self.swa_retention_interval,
-            page_size=cache.page_size,
-            include_prompt_boundary=include_prompt_boundary,
-        )
-        transfer.device_indices, transfer.keys = self._select_adopted_pages(
-            transfer.device_indices, ranges, node_end, transfer.keys
-        )
-        return transfer
-
-    def _offload_checkpoint_windows(
-        self, node_id: NodeId, replay_boundary: int, include_prompt_boundary: bool
-    ) -> None:
-        node = self.cache.resolve_node_handle(node_id)
-        if not node.external_cache_stored or node.write_through_pending_id is not None:
-            return
-        swa = self.cache.components.get(ComponentType.SWA)
-        if swa is None:
-            return
-        transfer = swa.build_external_linker_transfer(
-            LinkerTransferPhase.OFFLOAD, node, None
-        )
-        if transfer is None:
-            return
-        transfer = self._retain_checkpoint_windows(
-            node_id, transfer, replay_boundary, include_prompt_boundary
-        )
-        if transfer.keys:
-            # A supplement publishes nothing, so its failure cannot revoke the node.
-            self._offload_node(node_id, [transfer], publish=False)
-
-    def _offload_node(
-        self, node_id: NodeId, transfers: list[PoolTransfer], *, publish: bool = True
-    ) -> None:
+    def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
@@ -693,11 +567,8 @@ class UnifiedCacheLinkerWrapper:
             cache.dec_lock_ref(node_id, lock_params)
             return
 
-        if publish:
-            cache.tree_core.mark_external_linker_offload_pending(node_id)
-        self.pending_offloads.append(
-            _PendingOffload(node_id, lock_params, [node_id] if publish else [])
-        )
+        cache.tree_core.mark_external_linker_offload_pending(node_id)
+        self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
 
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]
