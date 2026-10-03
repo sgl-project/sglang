@@ -174,6 +174,9 @@ for (const path of walk(CONFIGS)) {
 
   for (const dim of (config.overlayDims || [])) {
     const ids = (dim.options || []).map((o) => o.id);
+    if (new Set(ids).size !== ids.length) {
+      fail(where, `overlayDims.${dim.id} has duplicate option ids`);
+    }
     if (dim.kind === "number") {
       if (!Number.isInteger(dim.min) || !Number.isInteger(dim.max) || dim.min > dim.max) {
         fail(where, `overlayDims.${dim.id} has invalid numeric bounds`);
