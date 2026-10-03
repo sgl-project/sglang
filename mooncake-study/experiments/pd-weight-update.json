@@ -1,0 +1,1979 @@
+{
+  "status": "completed",
+  "scope": "Qwen3 AR TP1/PP1 P/D disk weight replacement and fresh mismatched/matched deployments; one H100",
+  "base_commit": "8dc28be284dcf0bc62572c61e4737d81376154e3",
+  "archive": "/gpfs/user/fuxuanwei/mooncake-lab-archive/pd-weight-update-20261003",
+  "artifact_count": 29,
+  "artifact_manifest_sha256": "f29119fc9a06b36de64400c0424874f4d3cdf2283ebff1a8b91f93e5f1b76b30",
+  "source_audit": {
+    "python_files": 5031,
+    "sha256": "be952ea66c60e467823653b8473ef2cdb21836a81c1b7ed7a3554f3f3d1ad365"
+  },
+  "jobs": [
+    {
+      "role": "unit",
+      "id": "01791017075008949333-1d42223b4394",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-weight-update-v1",
+      "submission": {
+        "job_id": "01791017075008949333-1d42223b4394",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/unit/training_capture/test_pd_capture.py",
+          "-v"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-weight-update-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-weight-update-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 2400
+      },
+      "result": {
+        "job_id": "01791017075008949333-1d42223b4394",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791017100.1995838,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791017075008949333-1d42223b4394.log"
+      },
+      "methods": 17,
+      "elapsed_seconds": 11.778,
+      "cases": [],
+      "log_sha256": "04e6cddb65114e2ee37eea59cc1032cc043462aeae0a61aa700d15f6f6ba3c73"
+    },
+    {
+      "role": "gpu",
+      "id": "01791017075416837398-0b8e38e72a9c",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-weight-update-v1",
+      "submission": {
+        "job_id": "01791017075416837398-0b8e38e72a9c",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/storage/test_training_capture_pd_weights.py",
+          "-v",
+          "-f"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-weight-update-v1",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-weight-update-v1/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 2400
+      },
+      "result": {
+        "job_id": "01791017075416837398-0b8e38e72a9c",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791017969.69837,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791017075416837398-0b8e38e72a9c.log"
+      },
+      "methods": 4,
+      "elapsed_seconds": 857.569,
+      "cases": [
+        {
+          "updated_role": "decode",
+          "replay": false,
+          "revisions": [
+            "44ecba3c046c7805dc153b11282090a906d494770c8e412fc493d973988c1ebe",
+            "eccc27be334200f0bc51cab15aba0b619f1f18838ffaa4deceb4b39f9dcf1280"
+          ],
+          "boundary": {
+            "rid": "control-gated-weights-decode-False",
+            "prompt_length": 200,
+            "chunk_end": 128,
+            "attempted": true,
+            "selected": true,
+            "epoch": 0
+          },
+          "mutation": {
+            "success": true,
+            "before_sha256": "89e87de8f53f9777cd9a2096a7b715688a17193bd5da8ec3776c4b3e675a40e2",
+            "expected_after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f",
+            "after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f"
+          },
+          "handoff": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "teacher_present": true,
+            "payload_present": true
+          },
+          "updated": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": null,
+              "admission_paused": false,
+              "counters": {
+                "pd_selected": 2,
+                "pd_teacher_copied": 2,
+                "pd_handoff_ready": 2
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 3,
+                "admitted": 2,
+                "pd_handoff_committed": 1,
+                "eager_forwards": 3,
+                "sealed": 1,
+                "writer_started": 2,
+                "copies_completed": 2,
+                "snapshot_built": 1,
+                "ready": 1,
+                "failed_target_weights_update": 1,
+                "control_resume": 1,
+                "excluded_disabled": 1
+              },
+              "disabled_reason": "target_weights_update",
+              "admission_paused": false,
+              "enable_overlap": false,
+              "reservations": 3,
+              "states": {
+                "available": 3
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.00014152377843856812,
+                  "max_seconds": 0.00007246807217597961
+                },
+                "copy_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.00008266791701316833,
+                  "max_seconds": 0.00008106231689453125
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.004001561552286148,
+                  "max_seconds": 0.004001561552286148
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0037434324622154236,
+                  "max_seconds": 0.0037434324622154236
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0013840459287166595,
+                  "max_seconds": 0.0013840459287166595
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.002413645386695862,
+                  "max_seconds": 0.002413645386695862
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.00193791463971138,
+                  "max_seconds": 0.0010541453957557678
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0011626854538917542,
+                  "max_seconds": 0.0011626854538917542
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.004092015326023102,
+                  "max_seconds": 0.004092015326023102
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00047495588660240173,
+                  "max_seconds": 0.00047495588660240173
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0007002949714660645,
+                  "max_seconds": 0.0007002949714660645
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00029204413294792175,
+                  "max_seconds": 0.00029204413294792175
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 1,
+                "filling": 3,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 0,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "mismatch": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": null,
+              "admission_paused": false,
+              "counters": {
+                "pd_context_rejected": 1
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 1,
+                "admitted": 1,
+                "failed_pd_handoff_failed": 1,
+                "writer_started": 1,
+                "copies_completed": 1
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": false,
+              "reservations": 4,
+              "states": {
+                "available": 4
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00005239620804786682,
+                  "max_seconds": 0.00005239620804786682
+                },
+                "copy_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0000026673078536987305,
+                  "max_seconds": 0.0000026673078536987305
+                },
+                "snapshot_build": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "validation": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_register": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "store_payload": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_written": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "journal_save": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_seal": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "store_manifest": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_publish": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "journal_complete": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "final": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": null,
+              "admission_paused": false,
+              "counters": {
+                "pd_context_rejected": 1,
+                "pd_selected": 1,
+                "pd_teacher_copied": 1,
+                "pd_handoff_ready": 1
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 1,
+                "admitted": 1,
+                "pd_handoff_committed": 1,
+                "eager_forwards": 3,
+                "sealed": 1,
+                "writer_started": 1,
+                "copies_completed": 1,
+                "snapshot_built": 1,
+                "ready": 1
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": false,
+              "reservations": 4,
+              "states": {
+                "available": 4
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00007275119423866272,
+                  "max_seconds": 0.00007275119423866272
+                },
+                "copy_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0000790134072303772,
+                  "max_seconds": 0.0000790134072303772
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003966636955738068,
+                  "max_seconds": 0.003966636955738068
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.004389118403196335,
+                  "max_seconds": 0.004389118403196335
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0012624934315681458,
+                  "max_seconds": 0.0012624934315681458
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.002305779606103897,
+                  "max_seconds": 0.002305779606103897
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.001675724983215332,
+                  "max_seconds": 0.0009264349937438965
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.001008410006761551,
+                  "max_seconds": 0.001008410006761551
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0015962421894073486,
+                  "max_seconds": 0.0015962421894073486
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0007790960371494293,
+                  "max_seconds": 0.0007790960371494293
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0008789040148258209,
+                  "max_seconds": 0.0008789040148258209
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0002979002892971039,
+                  "max_seconds": 0.0002979002892971039
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "failed_captures": {
+            "control-gated-weights-decode-False": "4f0e9d3acf0444348def69e65c2cf70a",
+            "control-weights-decode-False-mismatch": "9e28e05755944f948237c666cafada77"
+          },
+          "post_exit_snapshots": 2,
+          "objects": 28,
+          "payload_bytes": 475760
+        },
+        {
+          "updated_role": "decode",
+          "replay": true,
+          "revisions": [
+            "44ecba3c046c7805dc153b11282090a906d494770c8e412fc493d973988c1ebe",
+            "eccc27be334200f0bc51cab15aba0b619f1f18838ffaa4deceb4b39f9dcf1280"
+          ],
+          "boundary": {
+            "rid": "control-gated-weights-decode-True",
+            "prompt_length": 200,
+            "chunk_end": 128,
+            "attempted": true,
+            "selected": true,
+            "epoch": 0
+          },
+          "mutation": {
+            "success": true,
+            "before_sha256": "89e87de8f53f9777cd9a2096a7b715688a17193bd5da8ec3776c4b3e675a40e2",
+            "expected_after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f",
+            "after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f"
+          },
+          "handoff": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "teacher_present": true,
+            "payload_present": true
+          },
+          "updated": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": null,
+              "admission_paused": false,
+              "counters": {
+                "pd_selected": 2,
+                "pd_teacher_copied": 2,
+                "pd_handoff_ready": 2
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 3,
+                "admitted": 2,
+                "pd_handoff_committed": 1,
+                "overlap_forwards": 4,
+                "cuda_graph_forwards": 4,
+                "sealed": 1,
+                "writer_started": 2,
+                "copies_completed": 2,
+                "snapshot_built": 1,
+                "ready": 1,
+                "failed_target_weights_update": 1,
+                "control_resume": 1,
+                "excluded_disabled": 1
+              },
+              "disabled_reason": "target_weights_update",
+              "admission_paused": false,
+              "enable_overlap": true,
+              "reservations": 3,
+              "states": {
+                "available": 3
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.00016725435853004456,
+                  "max_seconds": 0.00010438263416290283
+                },
+                "copy_wait": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.00006938725709915161,
+                  "max_seconds": 0.0000677742063999176
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003727514296770096,
+                  "max_seconds": 0.003727514296770096
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003724854439496994,
+                  "max_seconds": 0.003724854439496994
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0012379810214042664,
+                  "max_seconds": 0.0012379810214042664
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0024552345275878906,
+                  "max_seconds": 0.0024552345275878906
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.001841563731431961,
+                  "max_seconds": 0.0010843724012374878
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0011706091463565826,
+                  "max_seconds": 0.0011706091463565826
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0014772601425647736,
+                  "max_seconds": 0.0014772601425647736
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00048124417662620544,
+                  "max_seconds": 0.00048124417662620544
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0007587820291519165,
+                  "max_seconds": 0.0007587820291519165
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00030682608485221863,
+                  "max_seconds": 0.00030682608485221863
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 1,
+                "filling": 3,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 0,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "mismatch": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": null,
+              "admission_paused": false,
+              "counters": {
+                "pd_context_rejected": 1
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 1,
+                "admitted": 1,
+                "failed_pd_handoff_failed": 1,
+                "writer_started": 1,
+                "copies_completed": 1
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": true,
+              "reservations": 4,
+              "states": {
+                "available": 4
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00004671141505241394,
+                  "max_seconds": 0.00004671141505241394
+                },
+                "copy_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0000022873282432556152,
+                  "max_seconds": 0.0000022873282432556152
+                },
+                "snapshot_build": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "validation": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_register": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "store_payload": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_written": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "journal_save": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_seal": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "store_manifest": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_publish": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "journal_complete": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "final": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": null,
+              "admission_paused": false,
+              "counters": {
+                "pd_context_rejected": 1,
+                "pd_selected": 1,
+                "pd_teacher_copied": 1,
+                "pd_handoff_ready": 1
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 1,
+                "admitted": 1,
+                "pd_handoff_committed": 1,
+                "overlap_forwards": 4,
+                "cuda_graph_forwards": 4,
+                "sealed": 1,
+                "writer_started": 1,
+                "copies_completed": 1,
+                "snapshot_built": 1,
+                "ready": 1
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": true,
+              "reservations": 4,
+              "states": {
+                "available": 4
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00005984306335449219,
+                  "max_seconds": 0.00005984306335449219
+                },
+                "copy_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00006579980254173279,
+                  "max_seconds": 0.00006579980254173279
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003821995109319687,
+                  "max_seconds": 0.003821995109319687
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003997858613729477,
+                  "max_seconds": 0.003997858613729477
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0012217722833156586,
+                  "max_seconds": 0.0012217722833156586
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0024614743888378143,
+                  "max_seconds": 0.0024614743888378143
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.0019529983401298523,
+                  "max_seconds": 0.0010655149817466736
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0013320334255695343,
+                  "max_seconds": 0.0013320334255695343
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0014470145106315613,
+                  "max_seconds": 0.0014470145106315613
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0004747062921524048,
+                  "max_seconds": 0.0004747062921524048
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0008888058364391327,
+                  "max_seconds": 0.0008888058364391327
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00029924511909484863,
+                  "max_seconds": 0.00029924511909484863
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "failed_captures": {
+            "control-gated-weights-decode-True": "e7da2d7606e740de9ac7e385387af2f4",
+            "control-weights-decode-True-mismatch": "5ef8efb80a164802bd00ac5e91a438e6"
+          },
+          "post_exit_snapshots": 2,
+          "objects": 28,
+          "payload_bytes": 500336
+        },
+        {
+          "updated_role": "prefill",
+          "replay": false,
+          "revisions": [
+            "44ecba3c046c7805dc153b11282090a906d494770c8e412fc493d973988c1ebe",
+            "eccc27be334200f0bc51cab15aba0b619f1f18838ffaa4deceb4b39f9dcf1280"
+          ],
+          "boundary": {
+            "rid": "control-gated-weights-prefill-False",
+            "prompt_length": 200,
+            "chunk_end": 128,
+            "attempted": true,
+            "selected": true,
+            "epoch": 0
+          },
+          "mutation": {
+            "success": true,
+            "before_sha256": "89e87de8f53f9777cd9a2096a7b715688a17193bd5da8ec3776c4b3e675a40e2",
+            "expected_after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f",
+            "after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f"
+          },
+          "handoff": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "teacher_present": false,
+            "payload_present": false
+          },
+          "updated": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": "target_weights_update",
+              "admission_paused": false,
+              "counters": {
+                "pd_selected": 2,
+                "pd_teacher_copied": 1,
+                "pd_handoff_ready": 1,
+                "control_resume": 1
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 3,
+                "admitted": 3,
+                "pd_handoff_committed": 1,
+                "eager_forwards": 3,
+                "sealed": 1,
+                "writer_started": 3,
+                "copies_completed": 3,
+                "snapshot_built": 1,
+                "ready": 1,
+                "failed_pd_handoff_failed": 2
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": false,
+              "reservations": 4,
+              "states": {
+                "available": 4
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 3,
+                  "errors": 0,
+                  "seconds": 0.00014695152640342712,
+                  "max_seconds": 0.00006784498691558838
+                },
+                "copy_wait": {
+                  "calls": 3,
+                  "errors": 0,
+                  "seconds": 0.0000801868736743927,
+                  "max_seconds": 0.00007695332169532776
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0037784315645694733,
+                  "max_seconds": 0.0037784315645694733
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.003766637295484543,
+                  "max_seconds": 0.003766637295484543
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0012806281447410583,
+                  "max_seconds": 0.0012806281447410583
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.002405323088169098,
+                  "max_seconds": 0.002405323088169098
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.001785092055797577,
+                  "max_seconds": 0.001041606068611145
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0011365227401256561,
+                  "max_seconds": 0.0011365227401256561
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.001576833426952362,
+                  "max_seconds": 0.001576833426952362
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00047755613923072815,
+                  "max_seconds": 0.00047755613923072815
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.000742591917514801,
+                  "max_seconds": 0.000742591917514801
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0003008246421813965,
+                  "max_seconds": 0.0003008246421813965
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "mismatch": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": null,
+              "admission_paused": false,
+              "counters": {
+                "pd_context_rejected": 1
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 1,
+                "admitted": 1,
+                "failed_pd_handoff_failed": 1,
+                "writer_started": 1,
+                "copies_completed": 1
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": false,
+              "reservations": 4,
+              "states": {
+                "available": 4
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00004287064075469971,
+                  "max_seconds": 0.00004287064075469971
+                },
+                "copy_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0000024586915969848633,
+                  "max_seconds": 0.0000024586915969848633
+                },
+                "snapshot_build": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "validation": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_register": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "store_payload": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_written": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "journal_save": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_seal": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "store_manifest": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_publish": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "journal_complete": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "final": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": null,
+              "admission_paused": false,
+              "counters": {
+                "pd_context_rejected": 1,
+                "pd_selected": 1,
+                "pd_teacher_copied": 1,
+                "pd_handoff_ready": 1
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 1,
+                "admitted": 1,
+                "pd_handoff_committed": 1,
+                "eager_forwards": 3,
+                "sealed": 1,
+                "writer_started": 1,
+                "copies_completed": 1,
+                "snapshot_built": 1,
+                "ready": 1
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": false,
+              "reservations": 4,
+              "states": {
+                "available": 4
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00006905198097229004,
+                  "max_seconds": 0.00006905198097229004
+                },
+                "copy_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00007598847150802612,
+                  "max_seconds": 0.00007598847150802612
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0038859061896800995,
+                  "max_seconds": 0.0038859061896800995
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0037764571607112885,
+                  "max_seconds": 0.0037764571607112885
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0012934915721416473,
+                  "max_seconds": 0.0012934915721416473
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.002411920577287674,
+                  "max_seconds": 0.002411920577287674
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.0018210448324680328,
+                  "max_seconds": 0.0009474270045757294
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0011664554476737976,
+                  "max_seconds": 0.0011664554476737976
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0014268644154071808,
+                  "max_seconds": 0.0014268644154071808
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00047689303755760193,
+                  "max_seconds": 0.00047689303755760193
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.000824805349111557,
+                  "max_seconds": 0.000824805349111557
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0002911314368247986,
+                  "max_seconds": 0.0002911314368247986
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "failed_captures": {
+            "control-gated-weights-prefill-False": "7f0d1f5c3a6442b1bddf1287a855b507",
+            "control-weights-prefill-False-after-update": "6d528f24762246f9abd1636e901fc65d",
+            "control-weights-prefill-False-mismatch": "2e1560dab6c345c7ae59e3e2e5923f00"
+          },
+          "post_exit_snapshots": 2,
+          "objects": 28,
+          "payload_bytes": 475760
+        },
+        {
+          "updated_role": "prefill",
+          "replay": true,
+          "revisions": [
+            "44ecba3c046c7805dc153b11282090a906d494770c8e412fc493d973988c1ebe",
+            "eccc27be334200f0bc51cab15aba0b619f1f18838ffaa4deceb4b39f9dcf1280"
+          ],
+          "boundary": {
+            "rid": "control-gated-weights-prefill-True",
+            "prompt_length": 200,
+            "chunk_end": 128,
+            "attempted": true,
+            "selected": true,
+            "epoch": 0
+          },
+          "mutation": {
+            "success": true,
+            "before_sha256": "89e87de8f53f9777cd9a2096a7b715688a17193bd5da8ec3776c4b3e675a40e2",
+            "expected_after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f",
+            "after_sha256": "090275427ebfed357fadfc6a12209bbdc9d4707694f8b534a9555ba093fa0b2f"
+          },
+          "handoff": {
+            "capture_epoch": 0,
+            "current_epoch": 0,
+            "teacher_present": false,
+            "payload_present": false
+          },
+          "updated": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": "target_weights_update",
+              "admission_paused": false,
+              "counters": {
+                "pd_selected": 2,
+                "pd_teacher_copied": 1,
+                "pd_handoff_ready": 1,
+                "control_resume": 1
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 3,
+                "admitted": 3,
+                "pd_handoff_committed": 1,
+                "overlap_forwards": 4,
+                "cuda_graph_forwards": 4,
+                "sealed": 1,
+                "writer_started": 3,
+                "copies_completed": 3,
+                "snapshot_built": 1,
+                "ready": 1,
+                "failed_pd_handoff_failed": 2
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": true,
+              "reservations": 4,
+              "states": {
+                "available": 4
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 3,
+                  "errors": 0,
+                  "seconds": 0.0002964138984680176,
+                  "max_seconds": 0.00016963109374046326
+                },
+                "copy_wait": {
+                  "calls": 3,
+                  "errors": 0,
+                  "seconds": 0.000075560063123703,
+                  "max_seconds": 0.00007097423076629639
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.004852507263422012,
+                  "max_seconds": 0.004852507263422012
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.004367690533399582,
+                  "max_seconds": 0.004367690533399582
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.001351233571767807,
+                  "max_seconds": 0.001351233571767807
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.002673126757144928,
+                  "max_seconds": 0.002673126757144928
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.0019466318190097809,
+                  "max_seconds": 0.0010471567511558533
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0012305788695812225,
+                  "max_seconds": 0.0012305788695812225
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.001604478806257248,
+                  "max_seconds": 0.001604478806257248
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0006066784262657166,
+                  "max_seconds": 0.0006066784262657166
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0008561089634895325,
+                  "max_seconds": 0.0008561089634895325
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00031168386340141296,
+                  "max_seconds": 0.00031168386340141296
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "mismatch": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": null,
+              "admission_paused": false,
+              "counters": {
+                "pd_context_rejected": 1
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 1,
+                "admitted": 1,
+                "failed_pd_handoff_failed": 1,
+                "writer_started": 1,
+                "copies_completed": 1
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": true,
+              "reservations": 4,
+              "states": {
+                "available": 4
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00004540756344795227,
+                  "max_seconds": 0.00004540756344795227
+                },
+                "copy_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0000026337802410125732,
+                  "max_seconds": 0.0000026337802410125732
+                },
+                "snapshot_build": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "validation": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_register": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "store_payload": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_written": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "journal_save": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_seal": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "store_manifest": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "catalog_publish": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "journal_complete": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "final": {
+            "prefill": {
+              "role": "prefill_teacher",
+              "disabled_reason": null,
+              "admission_paused": false,
+              "counters": {
+                "pd_context_rejected": 1,
+                "pd_selected": 1,
+                "pd_teacher_copied": 1,
+                "pd_handoff_ready": 1
+              }
+            },
+            "decode": {
+              "counters": {
+                "considered": 1,
+                "admitted": 1,
+                "pd_handoff_committed": 1,
+                "overlap_forwards": 4,
+                "cuda_graph_forwards": 4,
+                "sealed": 1,
+                "writer_started": 1,
+                "copies_completed": 1,
+                "snapshot_built": 1,
+                "ready": 1
+              },
+              "disabled_reason": null,
+              "admission_paused": false,
+              "enable_overlap": true,
+              "reservations": 4,
+              "states": {
+                "available": 4
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "stage_timings": {
+                "queue_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00005868449807167053,
+                  "max_seconds": 0.00005868449807167053
+                },
+                "copy_wait": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.00006706267595291138,
+                  "max_seconds": 0.00006706267595291138
+                },
+                "snapshot_build": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0036306865513324738,
+                  "max_seconds": 0.0036306865513324738
+                },
+                "validation": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.004012752324342728,
+                  "max_seconds": 0.004012752324342728
+                },
+                "catalog_register": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0012156590819358826,
+                  "max_seconds": 0.0012156590819358826
+                },
+                "store_payload": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0025196373462677,
+                  "max_seconds": 0.0025196373462677
+                },
+                "catalog_written": {
+                  "calls": 2,
+                  "errors": 0,
+                  "seconds": 0.0018506050109863281,
+                  "max_seconds": 0.0010646097362041473
+                },
+                "journal_save": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0011800490319728851,
+                  "max_seconds": 0.0011800490319728851
+                },
+                "catalog_seal": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0016072802245616913,
+                  "max_seconds": 0.0016072802245616913
+                },
+                "store_manifest": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0005021244287490845,
+                  "max_seconds": 0.0005021244287490845
+                },
+                "catalog_publish": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.000736534595489502,
+                  "max_seconds": 0.000736534595489502
+                },
+                "journal_complete": {
+                  "calls": 1,
+                  "errors": 0,
+                  "seconds": 0.0003037750720977783,
+                  "max_seconds": 0.0003037750720977783
+                },
+                "recovery_read": {
+                  "calls": 0,
+                  "errors": 0,
+                  "seconds": 0,
+                  "max_seconds": 0
+                }
+              },
+              "host_pool": {
+                "allocated_bytes": 17848320,
+                "device_allocated_bytes": 852224,
+                "device_limit_bytes": 8388608,
+                "kv_export_host_enqueued_bytes": 0,
+                "kv_export_device_enqueued_bytes": 0,
+                "free": 0,
+                "filling": 4,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "failed_captures": {
+            "control-gated-weights-prefill-True": "9b5c8e7249464179a4aa873ace34576c",
+            "control-weights-prefill-True-after-update": "794146ccad794b7ebdf2eb5bc7ed0ea5",
+            "control-weights-prefill-True-mismatch": "9855de6194f8419a916a90cd940340d8"
+          },
+          "post_exit_snapshots": 2,
+          "objects": 28,
+          "payload_bytes": 500336
+        }
+      ],
+      "log_sha256": "9772cf1822c96a6fbb95d9b1c8ed3de91d0efcbf8c081215f67f926ad6ec4ec9"
+    },
+    {
+      "role": "unit_final",
+      "id": "01791017192107745795-ee465b59fae6",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-weight-update-v2",
+      "submission": {
+        "job_id": "01791017192107745795-ee465b59fae6",
+        "command": [
+          "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+          "test/registered/unit/training_capture/test_pd_capture.py",
+          "-v"
+        ],
+        "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-weight-update-v2",
+        "env": {
+          "PATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "OMP_NUM_THREADS": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "PYTHONPATH": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-pd-weight-update-v2/python",
+          "TRAINING_CAPTURE_TEST_MODEL": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+        },
+        "timeout_seconds": 2400
+      },
+      "result": {
+        "job_id": "01791017192107745795-ee465b59fae6",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791017993.296326,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791017192107745795-ee465b59fae6.log"
+      },
+      "methods": 17,
+      "elapsed_seconds": 11.542,
+      "cases": [],
+      "log_sha256": "36bd146b795e1166b7d4860ef472338dffa220f7a385a22e9b757b25cc531510"
+    }
+  ],
+  "totals": {
+    "unit_methods": 17,
+    "gpu_methods": 4,
+    "post_exit_snapshots": 8,
+    "failed_captures": 10,
+    "objects": 112,
+    "payload_bytes": 1952192
+  },
+  "environment": {
+    "time": "2026-10-03T09:00:27.507Z",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "gpus": "0, NVIDIA H100 80GB HBM3, GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495, 81559 MiB, 535.154.05",
+    "runtime": {
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "store": "TCP",
+    "transfer": "Mooncake TCP",
+    "catalog": "HTTP TestCaptureCatalog",
+    "state": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1791018026.8799806,
+      "idle_pid": 1237,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.15658068656921387
+    },
+    "ps": "PID  PPID STAT COMMAND\n    1     0 Ss   python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60\n 1237     1 Ssl  /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6"
+  },
+  "limitations": [
+    "Test Catalog; no production retention, checkpoint replay or draft quality acceptance.",
+    "TP1/PP1 AR endpoints colocated on one GPU; no distributed/tensor/IPC weight loading or cross-node rollout claim.",
+    "Existing test-only chunk gate holds the interrupted request while real HTTP endpoints load weights."
+  ]
+}

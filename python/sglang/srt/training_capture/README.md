@@ -138,6 +138,14 @@ or capture; deploy a compatible target/draft pair in a new instance. See
 [weight replacement validation](../../../../mooncake-study/experiments/WEIGHT_REPLACEMENT.md)
 for the tested lifecycle and its scope.
 
+P/D uses the same persistent invalidation locally. If P changes, it omits the
+teacher handoff and D fails the selected capture. If D changes, it retires the
+capture and ignores the late teacher row. Fresh P/D processes with different
+weight identities reject the handoff contract even when both are enabled;
+matching fresh identities restore collection. This protects capture contents;
+MaaS routing still owns serving-version consistency. See
+[P/D weight replacement validation](../../../../mooncake-study/experiments/PD_WEIGHT_REPLACEMENT.md).
+
 The Catalog endpoint must implement the protocol below. A separate Mooncake
 data node owns storage when the producer uses `global_segment_size=0`; its
 lifetime must exceed producer shutdown. A process-exclusive durable journal

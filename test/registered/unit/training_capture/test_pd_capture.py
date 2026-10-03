@@ -209,6 +209,69 @@ class TestPDCapture(CustomTestCase):
             self.catalog.captures[record.lease.capture_id]["state"], "FAILED"
         )
 
+    def test_prefill_weight_update_fences_each_teacher_stage_after_resume(self):
+        for stage in ("admitted", "copied", "encoded"):
+            with self.subTest(stage=stage):
+                self.prefill = PrefillCaptureCoordinator(
+                    config=self.prefill.config,
+                    teacher=self.prefill.teacher,
+                    kv=self.prefill.kv,
+                )
+                decode, payload = self.begin()
+                record = decode.training_capture_context
+                req = self.prefill_request(payload)
+                req.output_ids = [10]
+                batch = SimpleNamespace(reqs=[req], seq_lens_cpu=[2])
+                if stage != "admitted":
+                    self.prefill.after_forward(
+                        batch,
+                        SimpleNamespace(
+                            extend_seq_lens_cpu=[2], positions=torch.tensor([0, 1])
+                        ),
+                        SimpleNamespace(
+                            next_token_logits=torch.arange(256).float()[None]
+                        ),
+                    )
+                    self.assertIsNotNone(req.training_capture_pd.teacher)
+                if stage == "encoded":
+                    self.assertIsNotNone(self.prefill.pack_pp_handoffs(batch, [10]))
+                    self.assertIsNotNone(req.training_capture_pd.handoff)
+                self.prefill.disable("target_weights_update")
+                self.prefill.control("resume")
+                self.assertEqual(self.prefill.disabled_reason, "target_weights_update")
+                self.assertIsNone(self.prefill.pack_pp_handoffs(batch, [10]))
+                self.assertIsNone(self.prefill.finish_handoff(req))
+                fresh = self.prefill_request(payload)
+                self.assertIsNone(fresh.training_capture_pd)
+                decode.output_ids = [10]
+                self.decode.accept_pd_handoff(decode, None)
+                self.wait_until(lambda record=record: record.state == "done")
+                self.assertEqual(
+                    self.catalog.captures[record.lease.capture_id]["reason"],
+                    "pd_handoff_failed",
+                )
+                self.assertFalse(self.catalog.publications)
+
+    def test_decode_weight_update_rejects_late_teacher_and_new_admission(self):
+        req, payload = self.begin()
+        record = req.training_capture_context
+        handoff, _ = self.handoff(payload)
+        self.decode.disable("target_weights_update")
+        self.decode.control("resume")
+        req.output_ids = [10]
+        self.decode.accept_pd_handoff(req, handoff)
+        self.assertIsNone(req.training_capture_context)
+        self.wait_until(lambda: record.state == "done")
+        self.assertEqual(
+            self.catalog.captures[record.lease.capture_id]["reason"],
+            "target_weights_update",
+        )
+        self.assertFalse(self.catalog.publications)
+        fresh = CaptureTestRequest("after-weight-update", 1)
+        self.assertIsNone(self.decode.begin_pd_transfer(fresh))
+        self.assertIsNone(fresh.training_capture_context)
+        self.assertEqual(self.decode.counters["admitted"], 1)
+
     def test_prefill_abort_fences_materialized_and_encoded_teacher_after_resume(self):
         decode, payload = self.begin()
         record = decode.training_capture_context

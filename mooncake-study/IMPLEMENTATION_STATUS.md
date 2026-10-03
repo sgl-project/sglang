@@ -41,7 +41,7 @@ it does not redefine the goal as the modules already implemented.
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Prefill graph collection | Live request lengths, owned teacher/KV staging, resolved hidden capture, stable PP activations and P/D teacher handoff | Qwen3 AR/static target-KV DSpark pass Full, Breakable and piecewise in colocated/P/D single-rank, TP2, PP2 and TP2/PP2 serving with eager output comparison; Qwen2.5 TP4 colocated graphs pass same-execution capture-on/off equality and post-exit Store parity while retaining a no-capture cross-backend output difference; distributed piecewise uses eager compile debug mode; asymmetric P/D and other speculative prefill graphs remain open |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
-| Target weight replacement | Capture invalidation before loading, persistent identity fault and fresh-instance rebinding | Single-rank Qwen3 AR eager/overlap graph disk replacement passes live parameter checks, failed active leases and four post-exit snapshots; four loader routes have ordering/failure unit coverage; TP/PP and P/D replacement remain open |
+| Target weight replacement | Capture invalidation before loading, persistent identity fault and fresh-instance rebinding | Qwen3 AR single-rank colocated and TP1/PP1 P/D eager/overlap graph disk replacement pass live parameter checks, failed active leases and post-exit snapshots; P-only/D-only updates and fresh unequal/equal identities are covered; four loader routes have ordering/failure unit coverage; multi-rank TP/PP and cross-node replacement remain open |
 | Mixed-chunk collection | Ordinary AR admits native mixed prefill/decode; per-request offsets reuse owned staging and overlap ledgers | Qwen3 single-rank, TP2, PP2 and TP2/PP2 eager/graph matrices check rank-local request order, KV shards, teacher ownership, selected/unselected rows, prefix hits and output equality; 105 complete post-exit snapshots pass; mixed speculative remains rejected, and mixed P/D, RDMA and SLO coverage remain open |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production checkpoint-manager integration and trained-model validation still open |
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
@@ -4554,6 +4554,44 @@ has resumed. This is single-rank AR disk-update runtime evidence; mocked loader
 tests do not certify distributed/tensor/IPC transports, TP/PP/P/D replacement,
 production Catalog behavior or trained draft quality.
 
+## P/D Weight Replacement Evidence
+
+The follow-up regression exercises actual P-only and D-only parameter updates
+while a 200-token request is held after its first 128-token prefill chunk. Real
+HTTP weight loading changes the layer-zero V projection, verified by before/after
+parameter checksums. The request completes while its exact capture lease fails
+without registered/written payloads or READY publication. P-only updates omit
+the teacher handoff; D-only updates exclude P's late valid handoff. Capture
+resume cannot clear either local identity fault.
+
+Fresh P/B and D/A instances reject the incompatible capture contract even with
+both coordinators enabled. Replacing D/A with D/B restores collection. Newly
+connected readers are created after all serving processes exit and validate
+both original and replacement snapshots against online KV and raw teacher data.
+These tests exercise the existing policy; no production code changed.
+
+- `01791017075416837398-0b8e38e72a9c`: all four combinations of update role and
+  eager/overlap decode-graph mode pass in 857.569 seconds. Ten capture attempts
+  are excluded; eight complete post-exit snapshots validate 112 tensor objects
+  and 1,952,192 payload bytes through real Mooncake KV transfer and Store TCP.
+- `01791017192107745795-ee465b59fae6`: all 17 P/D unit methods pass in 11.542
+  seconds, including P invalidation before copying, after copying and after
+  encoding, D invalidation before a late handoff, and persistent exclusion after
+  resume. The earlier identical suite also passed; its closure default was
+  subsequently bound explicitly to satisfy lint.
+- All 5,031 Python files match tested source. The archive distinguishes runtime
+  v1 from unit v2, whose only change is that closure binding. The resident H100
+  worker is live, its experiment queue is empty and its idle task is restored.
+
+See [the P/D runbook](experiments/PD_WEIGHT_REPLACEMENT.md) and
+[machine-readable evidence](experiments/pd-weight-update.json). The archive at
+`/gpfs/user/fuxuanwei/mooncake-lab-archive/pd-weight-update-20261003` contains 29
+artifacts; its manifest SHA-256 is
+`f29119fc9a06b36de64400c0424874f4d3cdf2283ebff1a8b91f93e5f1b76b30`.
+This is AR TP1/PP1 P/D on one H100. It does not certify multi-rank or cross-node
+weight rollout, distributed/tensor/IPC weight transport, target-KV DSpark
+replacement deployment, production Catalog retention or serving SLOs.
+
 ## Next Implementation
 
 1. Extend passing single-GPU, TP2, PP2 and combined TP2/PP2 AR/static target-KV
@@ -4563,7 +4601,7 @@ production Catalog behavior or trained draft quality.
    colocated/P/D AR on single-rank, TP2, PP2 and combined TP2/PP2, and colocated/P/D
    synchronous TP1/PP2 and TP2/PP2 DSpark to asymmetric combined
    topologies. Broaden real-request coverage to speculative cache
-   eviction, distributed target weight replacement and
+   eviction, multi-rank target weight replacement and
    saturated backpressure.
 2. Connect P8's SGLang export API to the SpecForge checkpoint manager and validate
    trained checkpoints, including artifact compatibility and quality acceptance.
