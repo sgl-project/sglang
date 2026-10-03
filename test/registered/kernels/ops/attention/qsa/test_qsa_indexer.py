@@ -19,19 +19,23 @@ from sglang.srt.layers.attention.qsa.kernel import (
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
-
-# MRotaryEmbedding reads the exec config bag at init; publish a minimal
-# process context for the bare pytest process.
-from sglang.srt.runtime_context import publish
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
-
-publish(ServerArgs(model_path="dummy"), role="test")
 
 HEAD_DIM = 128
 NUM_Q_HEADS = 4
 RATIO = 4
 HIDDEN = 2560
 EPS = 1e-6
+
+
+@pytest.fixture(autouse=True)
+def runtime_context():
+    publish(ServerArgs(model_path="dummy"), role="test")
+    try:
+        yield
+    finally:
+        reset_context()
 
 
 def _make_config():

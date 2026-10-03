@@ -28,8 +28,7 @@ class TestPureDP(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-a2a-backend",
                 "pplx",
@@ -43,7 +42,7 @@ class TestPureDP(CustomTestCase):
                 "0.5",
             ],
             # Per-rank dispatch cap must cover the per-rank prefill chunk
-            # (chunked_prefill_size // dp_size = 8192 // 4 = 2048 on H100).
+            # (chunked_prefill_size // attn_dp_size = 8192 // 4 = 2048 on H100).
             env={"SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096"},
         )
 
@@ -99,8 +98,7 @@ class TestHybridDPTP(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
                 "--moe-a2a-backend",
                 "pplx",
@@ -114,7 +112,7 @@ class TestHybridDPTP(CustomTestCase):
                 "0.5",
             ],
             # Per-rank dispatch cap must cover the per-rank prefill chunk
-            # (chunked_prefill_size // dp_size = 8192 // 2 = 4096 on H100).
+            # (chunked_prefill_size // attn_dp_size = 8192 // 2 = 4096 on H100).
             env={"SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096"},
         )
 

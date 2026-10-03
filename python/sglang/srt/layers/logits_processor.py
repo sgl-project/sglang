@@ -84,7 +84,7 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 # None outside a FlashInfer autotune pass; inside one, whether that pass runs the
 # LM head. Not-None means the forward's output is discarded -- attention backends
 # read that via get_in_autotune_dummy_run() to skip a cross-node exchange.
-# Skipping the LM head skips its [batch * dp_size, vocab] all-gather, which OOMs
+# Skipping the LM head skips its [batch * num_dp_ranks, vocab] all-gather, which OOMs
 # under DP attention with a tight mem_fraction_static.
 _autotune_run_lm_head: Optional[bool] = None
 
@@ -106,6 +106,7 @@ class SamplingMaskOutput:
     selected_logprobs: torch.Tensor
     support_logprobs: Optional[torch.Tensor]
     statuses: torch.Tensor
+    num_accept_tokens: Optional[torch.Tensor] = None
 
     def map_device_tensors(self, fn) -> None:
         self.token_ids = fn(self.token_ids)
@@ -114,6 +115,8 @@ class SamplingMaskOutput:
         if self.support_logprobs is not None:
             self.support_logprobs = fn(self.support_logprobs)
         self.statuses = fn(self.statuses)
+        if self.num_accept_tokens is not None:
+            self.num_accept_tokens = fn(self.num_accept_tokens)
 
 
 def _trace_e2e_logits(stage: str, **fields) -> None:
@@ -189,7 +192,7 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
 
 
 # FlashInfer autotune skips the unprofiled LM-head all-gather; its
-# [batch * dp_size, vocab] output can OOM under tight DP-attention memory.
+# [batch * num_dp_ranks, vocab] output can OOM under tight DP-attention memory.
 _in_autotune_dummy_run = False
 
 
@@ -235,8 +238,12 @@ class LogitsProcessorOutput:
     # Post-filter support IDs and requested behavior logprobs, bounded by server
     # capacity. Logprobs are normalized over the full realized support.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
-    next_token_sampling_mask_idx: Optional[List[Optional[np.ndarray]]] = None
-    next_token_sampling_logprobs: Optional[List[Optional[np.ndarray]]] = None
+    next_token_sampling_mask_idx: Optional[
+        List[Optional[Union[np.ndarray, List[np.ndarray]]]]
+    ] = None
+    next_token_sampling_logprobs: Optional[
+        List[Optional[Union[np.ndarray, List[np.ndarray]]]]
+    ] = None
     next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
