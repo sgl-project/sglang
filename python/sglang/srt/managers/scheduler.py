@@ -5497,6 +5497,11 @@ class Scheduler(
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:
+                    # The boundary token is already emitted; preserve its weight
+                    # version before removing it for the rebootstrap replay.
+                    record_weight_version_events(
+                        [req], old_version=get_serving().weight_version
+                    )
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
                 req.pd_rebootstrap_in_progress = True
                 req.time_stats.set_retract_time()
