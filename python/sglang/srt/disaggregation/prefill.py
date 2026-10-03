@@ -590,6 +590,10 @@ class SchedulerDisaggregationPrefillMixin:
         cache = self.tree_cache
         if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
+            if release := getattr(
+                cache.req_to_token_pool, "release_mamba_cache_reservation", None
+            ):
+                release(req)
             return
 
         checkpoint_kv_cache(req, cache)

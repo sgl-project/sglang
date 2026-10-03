@@ -12,6 +12,7 @@ eviction -- which is why the peak, not the decode steady state, sets the floor.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
@@ -21,7 +22,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
-from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+from sglang.srt.mem_cache.unified_cache.components.mamba import (
+    MambaComponent,
+    MambaSlotExhausted,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -41,6 +45,9 @@ class _BoundedMambaAllocator:
         if len(self.free_ids) < n:
             return None
         return torch.tensor([self.free_ids.pop() for _ in range(n)], dtype=torch.int64)
+
+    def available_size(self) -> int:
+        return len(self.free_ids)
 
     def free(self, value: torch.Tensor):
         self.free_ids.extend(int(v) for v in value.tolist())
@@ -226,11 +233,41 @@ class TestDecSwaLockSkip(unittest.TestCase):
 
 
 class TestMambaDonatedAllocRatio(unittest.TestCase):
+    def test_prefix_cow_exhaustion_releases_temporary_lock(self):
+        allocator = SimpleNamespace(alloc=Mock(return_value=None))
+        receipt = SimpleNamespace(to_dec_params=lambda: "release")
+        cache = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(mamba_allocator=allocator),
+            inc_lock_ref=Mock(return_value=receipt),
+            dec_lock_ref=Mock(),
+            evict_for_alloc=Mock(),
+        )
+        component = object.__new__(MambaComponent)
+        component.cache = cache
+        component.component_type = ComponentType.MAMBA
+        component.tree_core = SimpleNamespace(
+            get_component_device_value=lambda node, kind: torch.tensor([2])
+        )
+        request = SimpleNamespace(kv=SimpleNamespace(holds_mamba=False))
+        params = SimpleNamespace(cow_mamba=True, req=request)
+        result = SimpleNamespace(best_match_node=7)
+
+        with self.assertRaises(MambaSlotExhausted):
+            component.finalize_match_result_in_cache(params, result)
+
+        self.assertEqual(allocator.alloc.call_count, 2)
+        cache.evict_for_alloc.assert_called_once_with(
+            EvictParams(num_tokens=0, mamba_num=1)
+        )
+        cache.dec_lock_ref.assert_called_once_with(7, "release")
+        self.assertFalse(hasattr(request.kv, "mamba_pool_idx"))
+
     def test_prefill_peak_ratio2_exhausts_pool(self):
         # pool = 2N, all N prefixes admission-locked: no evictable victim.
         component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
-        with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
+        with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache") as exc:
             component._alloc_mamba_slot()
+        self.assertIn("free=0, evictable=0, protected=4", str(exc.exception))
         self.assertEqual(
             cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
         )

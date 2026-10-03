@@ -169,15 +169,37 @@ def check_server_args(server_args: Any):
         assert cfg.pp_size == 1, (
             "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
         )
-        assert cfg.chunked_prefill_size == -1, (
-            "PD-Multiplexing is not compatible with chunked prefill."
+        assert cfg.speculative_algorithm is None, (
+            "PD-Multiplexing does not yet support speculative decoding: "
+            "the draft worker has no split-prefill forward path."
         )
+        if cfg.chunked_prefill_size > 0:
+            assert not cfg.enable_mixed_chunk, (
+                "PD-Multiplexing is not compatible with mixed chunk: prefill "
+                "and decode run on separate streams."
+            )
         assert cfg.disaggregation_mode == "null", (
             "PD-Multiplexing is not compatible with disaggregation mode."
         )
         assert cfg.disable_overlap_schedule, (
             "PD-Multiplexing is not compatible with overlap schedule."
         )
+
+        if cfg.enable_hierarchical_cache and cfg.hicache_write_policy == "write_back":
+            logger.warning(
+                "PD-Multiplexing with --hicache-write-policy write_back may "
+                "stall decode while write-back eviction completes; prefer "
+                "write_through."
+            )
+
+        if cfg.pdmux_config_path:
+            from sglang.srt.multiplex.pdmux_context import load_pdmux_config
+
+            yaml_sm_group_num = load_pdmux_config(cfg.pdmux_config_path).sm_group_num
+            assert yaml_sm_group_num == cfg.sm_group_num, (
+                "--sm-group-num must match the PD-Multiplexing config's "
+                f"sm_group_num (CLI={cfg.sm_group_num}, YAML={yaml_sm_group_num})."
+            )
 
         # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
         import torch

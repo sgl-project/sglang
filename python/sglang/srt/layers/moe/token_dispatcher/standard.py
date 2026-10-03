@@ -28,7 +28,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
@@ -232,7 +232,9 @@ class StandardDispatcher(BaseDispatcher):
                     # run POST-translation (a pre-translation -1 aliases to
                     # the mapping table's last entry); -1 is the drop
                     # sentinel both the triton and deep_gemm runners honor.
-                    if _MASK_DP_PAD_MOE and is_dp_max_padding():
+                    if (
+                        _MASK_DP_PAD_MOE or get_disagg().enable_pdmux
+                    ) and is_dp_max_padding():
                         mask_dp_pad_moe_topk_ids(topk_ids_local)
                     topk_output = topk_output._replace(topk_ids=topk_ids_local)
                 elif TopKOutputChecker.format_is_triton_kernels(topk_output):
