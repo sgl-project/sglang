@@ -8,27 +8,34 @@ import triton.language as tl
 
 @triton.jit
 def _store_quant(
-    V, Q, S, ROW, COL, K: tl.constexpr, AM: tl.constexpr, BLOCK: tl.constexpr
+    values,
+    q_ptr,
+    s_ptr,
+    row,
+    col,
+    K: tl.constexpr,
+    AM: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     groups: tl.constexpr = BLOCK // 32
-    v = tl.reshape(V, (groups, 32))
+    v = tl.reshape(values, (groups, 32))
     amax = tl.maximum(tl.max(tl.abs(v), axis=1), 1e-10)
     exponent = tl.ceil(tl.log2(amax / 448.0)) + 127.0
     exponent = tl.minimum(tl.maximum(exponent, 0.0), 254.0)
     inv = tl.exp2(127.0 - exponent)
     q = tl.reshape(tl.clamp(v * inv[:, None], -448.0, 448.0), (BLOCK,))
-    tl.store(Q + ROW * K + COL, q, COL < K)
-    group = tl.min(COL, 0) // 32 + tl.arange(0, groups)
+    tl.store(q_ptr + row * K + col, q, col < K)
+    group = tl.min(col, 0) // 32 + tl.arange(0, groups)
     # Four UE8M0 bytes per int32, with the M dimension padded to four rows.
-    offset = (group // 4) * AM * 4 + ROW * 4 + group % 4
-    tl.store(S + offset, exponent.to(tl.uint8), group < K // 32)
+    offset = (group // 4) * AM * 4 + row * 4 + group % 4
+    tl.store(s_ptr + offset, exponent.to(tl.uint8), group < K // 32)
 
 
 @triton.jit
 def _swiglu_quant(
-    X,
-    Q,
-    S,
+    x_ptr,
+    q_ptr,
+    s_ptr,
     K: tl.constexpr,
     AM: tl.constexpr,
     ALPHA: tl.constexpr,
@@ -37,14 +44,14 @@ def _swiglu_quant(
 ):
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    gate = tl.load(X + row * (2 * K) + col, col < K, 0).to(tl.float32)
-    up = tl.load(X + row * (2 * K) + K + col, col < K, 0).to(tl.float32)
+    gate = tl.load(x_ptr + row * (2 * K) + col, col < K, 0).to(tl.float32)
+    up = tl.load(x_ptr + row * (2 * K) + K + col, col < K, 0).to(tl.float32)
     gate = tl.minimum(gate, LIMIT)
     up = tl.maximum(tl.minimum(up, LIMIT), -LIMIT)
     v = gate * tl.sigmoid(ALPHA * gate) * (up + 1.0)
     # The unfused activation materializes BF16 before group quantization.
     v = v.to(tl.bfloat16).to(tl.float32)
-    _store_quant(v, Q, S, row, col, K, AM, BLOCK)
+    _store_quant(v, q_ptr, s_ptr, row, col, K, AM, BLOCK)
 
 
 def _alloc_quant(m: int, k: int, device: torch.device):
@@ -63,7 +70,6 @@ def swiglu_quant(
     m, two_k = x.shape
     assert two_k > 0 and two_k % 256 == 0
     k = two_k // 2
-    assert k % 128 == 0
     q, base = _alloc_quant(m, k, x.device)
     if m:
         _swiglu_quant[(m, triton.cdiv(k, 512))](
