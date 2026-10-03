@@ -35,7 +35,7 @@ def resolve_mx_fa_scheme(quant_config) -> str | None:
     if torch.npu.get_soc_version() < 260:
         logger.warning_once(
             "MXFP8 attention is disabled because MXFP8 quantization is only "
-            "supported on Ascend 950 (A5) devices."
+            "supported on Ascend arch35 devices."
         )
         return None
 

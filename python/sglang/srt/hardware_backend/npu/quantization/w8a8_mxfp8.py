@@ -50,7 +50,7 @@ def _layout_npu_arch35_e4m3_weights(
 
     Dequantizes the fp8 payload with the expanded block scales to BF16, then
     requantizes to MXFP8 (fp8 payload + 1x32 UE8M0 scale via
-    npu_dynamic_mx_quant) so the native A5 quantized GEMM
+    npu_dynamic_mx_quant) so the native arch35 quantized GEMM
     (``npu_w8a8_mxfp8_linear``) can run the layer. Chunked over rows to cap
     peak memory; runs once at load time.
     """
@@ -98,7 +98,7 @@ def _layout_npu_arch35_e4m3_weights(
 
     # Layout mirrors _layout_npu_arch35_ue8m0_weights: weight [in, out] and
     # scale [in//64, out, 2] as strided transpose views — DO NOT call
-    # .contiguous() (the A5 kernel scans the row-major source K-major).
+    # .contiguous() (the arch35 kernel scans the row-major source K-major).
     layer.weight.data = qw.transpose(0, 1)
     if w_scale.dim() == 2:
         # Older torch_npu builds return [out, in//32]; reshape to 3D.
@@ -153,7 +153,7 @@ def _layout_npu_arch35_ue8m0_weights(
     scale_u8 = scale_u8.repeat_interleave(block_k // group_size, dim=1)
     scale_u8 = scale_u8[:, : k_dim // group_size]
 
-    # Keep transpose views: the A5 kernel expects the original row-major
+    # Keep transpose views: the arch35 kernel expects the original row-major
     # storage scanned in K-major logical order.
     layer.weight.data = layer.weight.data.transpose(0, 1)
     layer.weight_scale_inv.data = scale_u8.reshape(
