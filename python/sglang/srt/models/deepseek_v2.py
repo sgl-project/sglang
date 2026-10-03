@@ -218,7 +218,10 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
-    from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
+    from sglang.srt.layers.rocm_linear_utils import (
+        aiter_bf16_query_gemm,
+        aiter_dsv3_router_gemm,
+    )
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
@@ -2571,7 +2574,23 @@ class DeepseekV2AttentionMLA(
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
+    def q_b_proj_forward_rocm(self, q_lora: torch.Tensor) -> torch.Tensor:
+        q = None
+        if (
+            _use_aiter
+            and self.use_dsa
+            and self.q_lora_rank == 2048
+            and self.num_local_heads == 8
+            and self.qk_head_dim == 256
+        ):
+            q = aiter_bf16_query_gemm(self.q_b_proj, q_lora)
+        if q is None:
+            q = self.q_b_proj(q_lora)[0]
+        return q.view(-1, self.num_local_heads, self.qk_head_dim)
+
     def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
+        if _is_hip:
+            return self.q_b_proj_forward_rocm(q_lora)
         if self._use_min_latency_q_b_gemm is None:
             self._use_min_latency_q_b_gemm = (
                 self._q_b_proj_verified_shape
