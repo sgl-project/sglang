@@ -6,7 +6,8 @@ PYTHON_ENV_FOR_EVALSCOPE=test_env_evalscope
 PYTHON_FOR_EVALSCOPE=${PYTHON_ENV_FOR_EVALSCOPE}/bin/python
 PIP_FOR_EVALSCOPE=${PYTHON_ENV_FOR_EVALSCOPE}/bin/pip
 EVALSCOPE_SOURCE_PATH=/root/.cache/.cache/evalscope
-pip_mirror_source="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+#pip_mirror_source="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+pip_mirror_source="https://pypi.tuna.tsinghua.edu.cn/simple"
 
 # Bound key deps so the resolver cannot fall back to ancient versions.
 EVALSCOPE_CONSTRAINTS=(
