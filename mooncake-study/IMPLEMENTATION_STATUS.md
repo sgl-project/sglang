@@ -34,6 +34,7 @@ it does not redefine the goal as the modules already implemented.
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Independent writers and real TP2/PP1, TP1/PP2 and TP2/PP2 serving/P/D tests publish complete snapshots through TCP Store; production retention and saturated load remain open |
 | Cohort adaptive admission | Background rank-local pressure observations and minimum-probability voting | Peer publisher stalls pause new tickets and reservations while existing ownership drains; see distributed backpressure evidence below; saturated transport and production SLOs remain open |
+| Cohort routing observability | Bounded ingress and rank-local ticket counters, separate dashboard panels | TP2/PP2 status-to-metrics checks and real TP2 capture/pause/resume with desktop/mobile Grafana pass; production scrape discovery and alert policy remain open |
 | Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact source-reuse checks and distributed serving publication pass; real Qwen2.5 TP4 P/D checks canonical owners 0/2 and zero payload allocation on replica ranks 1/3; broader replicas/topologies remain open |
 | Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture, real Qwen3 TP2/PP1, TP1/PP2 and TP2/PP2, and Qwen2.5-1.5B TP4 binding pass; broader deployed models remain open |
 | Startup identity exchange | Bounded JSON over the existing CPU group, phase failure votes and final digest agreement | Four-process Gloo failure/finite-wait tests and real distributed identity, resource readiness and activation pass; broader deployment combinations remain open |
@@ -4463,6 +4464,53 @@ Final runtime evidence is recorded in [the report](experiments/cohort-backpressu
 This uses the real TCP Store with an HTTP test Catalog and online source
 observers; it is not saturated RDMA, serving SLO or production retention
 acceptance.
+
+## Cohort Routing Metrics And Dashboard (2026-10-03)
+
+The production metrics exporter now exposes the existing request router state
+as `routing_events_total`, with twelve fixed event values including `other`.
+Previously, distributed selections, exclusions and capacity failures appeared
+only in server status; the coordinator lifecycle exporter did not read them.
+The pre-fix regression confirms the missing series with `None != 8` for eight
+sampling exclusions. Export remains on the background thread and does not alter
+sampling, request transport or capture ownership.
+
+Ingress decisions and rank-local attachment/binding/cancellation are separate
+from existing lifecycle counters. Unknown names never become labels and repeated
+refreshes remain idempotent. Producers without a cohort router emit no routing
+samples. Two dashboard panels display ingress decisions and ticket events;
+the lifecycle panel now preserves TP/PP labels instead of hiding rank-local
+admissions in one sum next to the publisher's READY count.
+
+All 287 unit tests pass in 231.104s. TP2 and PP2 runtime tests pass in 184.804s,
+checking every routing series against each rank's status while publication is
+blocked: two ingress selections, eight skipped requests and two bindings per
+rank. Their 22 completed requests include 16 during the stalls; six post-exit
+snapshots / 102 objects / 1,464,144 bytes pass full source-content checks.
+
+The real TP2 monitoring run completes 144 streaming/non-streaming requests.
+Capture/pause/resume each has twelve observed batches; the paused phase completes
+48 requests without new captures. A separate Store client validates all 96 published
+snapshots / 59,857,920 payload bytes after producer exit. Its status comparisons
+select TP0/PP0 while raw scrapes and Grafana retain every rank. This corrects the
+old monitoring fixture's single-producer assumption, whose failed run is retained.
+
+Grafana verifies seventeen panels, 42 Prometheus expression/filter checks and
+198 datasource responses across two desktop views and one mobile view. All
+applicable panels have finite data and nonblank plots; dimensions and horizontal
+overflow checks pass, with 54 screenshots retained. The browser's initial missing
+`libdbus` search path is retained as an environment failure before the passing run.
+The [runbook](experiments/ROUTING_METRICS.md) and
+[report](experiments/routing-metrics.json) record reproduction and limits.
+
+All 5,024 Python source/registered-test files match both unit/runtime frozen
+checkouts. The 239-artifact archive at
+`/gpfs/user/fuxuanwei/mooncake-lab-archive/routing-metrics-20261003` has manifest
+SHA-256 `16e5bdc0cacdf889ec826a7d415505ef3fda1292c0e916385bff4f52accfc538`.
+Temporary GPU and monitoring processes were stopped and the allocation deleted;
+the resident worker and idle task remain live. TCP Store, the test Catalog and
+the pod-exec metrics relay establish monitoring correctness, not production
+retention, native service discovery, SLOs or draft training quality.
 
 ## Next Implementation
 

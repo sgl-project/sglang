@@ -23,6 +23,7 @@ const write = (name, value) => fs.writeFileSync(output(name), JSON.stringify(val
 const report = { status: 'running', config: args, queries: [], phases: [], views: [] };
 const sha256 = data => crypto.createHash('sha256').update(data).digest('hex');
 const metric = suffix => `sglang:training_capture_${suffix}`;
+const expectsEmpty = expr => !report.cohort && expr.includes(metric('routing_events_total'));
 
 async function json(url) {
   const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
@@ -70,10 +71,11 @@ async function checkView(browser, dashboard, start, end, name, viewport, selecte
           assert(!item.expr.replaceAll('$__rate_interval', '').includes('$'), `Unresolved dashboard variable: ${item.expr}`);
           // Grafana expands its rate macro in the backend, after this request.
           const executed = [...new Set((result.frames || []).map(frame => frame.schema.meta?.executedQueryString).filter(Boolean))];
-          assert(executed.length && executed.every(expr => !expr.includes('$')), 'Backend did not resolve query macros');
+          assert((executed.length || expectsEmpty(item.expr)) && executed.every(expr => !expr.includes('$')), 'Backend did not resolve query macros');
           const numeric = (result.frames || []).flatMap(frame => frame.schema.fields.flatMap((field, index) =>
             field.type === 'number' ? frame.data.values[index].filter(Number.isFinite) : []));
-          view.queryResults.push({ expr: item.expr, executed, refId: item.refId, finiteValues: numeric.length });
+          if (expectsEmpty(item.expr)) assert.equal(numeric.length, 0, 'Single-rank producer unexpectedly exports cohort routing');
+          view.queryResults.push({ expr: item.expr, executed, refId: item.refId, finiteValues: numeric.length, expectedEmpty: expectsEmpty(item.expr) });
         }
       } catch (error) { view.errors.push(String(error)); }
     })());
@@ -101,14 +103,16 @@ async function checkView(browser, dashboard, start, end, name, viewport, selecte
         for (let i = 0; i < data.length; i += 16) if (data[i + 3]) colors.add(`${data[i]},${data[i + 1]},${data[i + 2]},${data[i + 3]}`);
         return { width, height, colors: colors.size };
       }));
-      if (panel.type === 'timeseries') assert(pixels.some(p => p.colors >= 4), `${name}: blank panel ${panel.id}`);
+      const expectedEmpty = panel.targets.every(target => expectsEmpty(target.expr));
+      if (panel.type === 'timeseries' && !expectedEmpty) assert(pixels.some(p => p.colors >= 4), `${name}: blank panel ${panel.id}`);
       const box = await element.boundingBox();
       assert(box && box.width > 150 && box.height > 100, `Invalid panel dimensions: ${panel.id}`);
       assert(box.x >= -1 && box.x + box.width <= viewport.width + 1, `Panel overflows viewport: ${panel.id}`);
       const text = await element.innerText();
-      assert(!/No data|Query error|Panel plugin not found/i.test(text), `${panel.id}: ${text}`);
+      assert(!/Query error|Panel plugin not found/i.test(text), `${panel.id}: ${text}`);
+      assert.equal(/No data/i.test(text), expectedEmpty, `${panel.id}: ${text}`);
       await element.screenshot({ path: output(`${name}-panel-${panel.id}.png`) });
-      view.panels.push({ id: panel.id, box, pixels, text });
+      view.panels.push({ id: panel.id, box, pixels, text, expectedEmpty });
     }
     await page.locator(`[data-testid="${dashboard.panels[0].type}-panel-${dashboard.panels[0].id}"]`).scrollIntoViewIfNeeded();
     await page.screenshot({ path: output(`${name}.png`) });
@@ -121,7 +125,7 @@ async function checkView(browser, dashboard, start, end, name, viewport, selecte
     const unexpected = view.responses.filter(r => !(new URL(r.url).pathname === '/api/user/stars' && r.status === 401));
     assert.equal(unexpected.length, 0, JSON.stringify(unexpected));
     assert(view.queryResults.length >= dashboard.panels.reduce((count, p) => count + p.targets.length, 0));
-    assert(view.queryResults.every(q => q.finiteValues > 0), 'Grafana returned an empty query result');
+    assert(view.queryResults.every(q => q.expectedEmpty || q.finiteValues > 0), 'Grafana returned an empty query result');
     console.log(JSON.stringify({ view: name, panels: view.panels.length, queries: view.queryResults.length }));
   } catch (error) {
     view.failedTitle = await page.title();
@@ -140,6 +144,7 @@ async function main() {
   assert.equal(sha256(dashboardBytes), runtime.source_sha256['examples/monitoring/grafana/dashboards/json/training-capture-dashboard.json']);
   report.sourceSha256 = { dashboard: sha256(dashboardBytes), runtimeReport: sha256(runtimeBytes), verifier: sha256(fs.readFileSync(__filename)) };
   const observations = runtime.observations;
+  report.cohort = observations.some(row => Object.hasOwn(row.state, 'request_router'));
   const start = observations[0].unix + 4;
   const end = observations.at(-1).unix;
   report.window = { start, end };
@@ -158,8 +163,9 @@ async function main() {
       const expr = substitute(target.expr, selected);
       const rows = await query(expr, start, end, `query-${panel.id}-${target.refId}-${selected ? 'selected' : 'all'}.json`);
       const values = finiteValues(rows);
-      assert(values.length > 0, `No finite data for panel ${panel.id}/${target.refId}`);
-      report.queries.push({ panel: panel.id, refId: target.refId, selected, expr, series: rows.length, finiteValues: values.length });
+      if (expectsEmpty(expr)) assert.equal(rows.length, 0, 'Single-rank producer unexpectedly exports cohort routing');
+      else assert(values.length > 0, `No finite data for panel ${panel.id}/${target.refId}`);
+      report.queries.push({ panel: panel.id, refId: target.refId, selected, expr, series: rows.length, finiteValues: values.length, expectedEmpty: expectsEmpty(expr) });
     }
   }
   const noMatch = await query(substitute(dashboard.panels[0].targets[0].expr, true).replace(quoted(regex(args.instance)), 'no-such-capture-instance'), start, end);
@@ -170,8 +176,8 @@ async function main() {
     const from = rows[0].unix + 4, to = rows.at(-1).unix;
     const paused = finiteValues(await query(metric('admission_paused'), from, to));
     assert(paused.length > 0 && paused.every(v => v === Number(phase === 'paused')), `${phase} pause state mismatch`);
-    const ready = finiteValues(await query(`${metric('events_total')}{event="ready"}`, from, to));
-    const host = finiteValues(await query(`${metric('kv_export_enqueued_bytes_total')}{destination="host"}`, from, to));
+    const ready = finiteValues(await query(`${metric('events_total')}{event="ready",tp_rank="0",pp_rank="0"}`, from, to));
+    const host = finiteValues(await query(`${metric('kv_export_enqueued_bytes_total')}{destination="host",tp_rank="0",pp_rank="0"}`, from, to));
     assert(ready.length > 1 && host.length > 1);
     if (phase === 'paused') {
       assert(ready.every(v => v === rows[0].state.counters.ready));

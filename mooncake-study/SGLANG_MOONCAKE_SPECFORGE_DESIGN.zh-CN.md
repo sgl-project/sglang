@@ -605,6 +605,14 @@ TP2、PP2 和 TP2/PP2 的真实 Store 可控 manifest 阻塞验证已通过：33
 这不代表饱和 RDMA 吞吐或生产 SLO 验收；复现与证据见
 [分布式背压验证](experiments/COHORT_BACKPRESSURE.md)。
 
+分布式请求选择发生在 ingress router，需通过独立的
+`sglang:training_capture_routing_events_total{event=...}` 导出。
+`selected`、`sampled_out`、`excluded`、`backpressure` 等决定只在入口 rank
+计数；`attached`、`bound` 和 `cancelled` 是逐 rank 的同一 ticket 生命周期，
+不能跨 rank 求和后当成独立样本数。`sampled_out` 包含全组门控和人工暂停，
+不单独证明 adaptive 限流。原有 coordinator `events_total` 保持语义，
+完整数据集数量仍以 Catalog 状态为准；仪表盘分别展示入口与逐 rank 事件。
+
 网络错误或 CUDA 错误后，只有确认传输停止才可回收注册 buffer。不能仅因 Future 抛错就假设 DMA/RDMA 不再访问内存；需要 transport completion 或 quarantine 队列。
 
 紧凑 teacher 回传可通过 `teacher_d2h_batch_tokens` 单独启用批量 D2H，

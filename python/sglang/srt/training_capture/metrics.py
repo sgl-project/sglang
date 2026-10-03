@@ -42,6 +42,20 @@ class CaptureMetrics:
     )
     STATES = ("available", "active", "queued", "writing", "pending_publication")
     ACTIONS = ("decreases", "recoveries", "failures", "pauses")
+    ROUTING_EVENTS = (
+        "considered",
+        "excluded",
+        "sampled_out",
+        "backpressure",
+        "selected",
+        "selection_failed",
+        "attached",
+        "attachment_failed",
+        "bound",
+        "binding_failed",
+        "cancelled",
+        "other",
+    )
 
     def __init__(self, labels, *, registry=None):
         # Import after the server configures PROMETHEUS_MULTIPROC_DIR.
@@ -71,6 +85,11 @@ class CaptureMetrics:
         self.events = counter(
             "events",
             "Capture lifecycle events; event categories may overlap.",
+            ("event",),
+        )
+        self.routing_events = counter(
+            "routing_events",
+            "Cohort ingress decisions and rank-local ticket lifecycle events.",
             ("event",),
         )
         self.adjustments = counter(
@@ -199,6 +218,18 @@ class CaptureMetrics:
             events[event] += value
         for event in self.EVENTS:
             self._increment(self.events, ("event", event), events[event], event=event)
+        if "request_router" in stats:
+            routing = Counter()
+            for name, value in stats["request_router"].items():
+                event = name if name in self.ROUTING_EVENTS else "other"
+                routing[event] += value
+            for event in self.ROUTING_EVENTS:
+                self._increment(
+                    self.routing_events,
+                    ("routing_event", event),
+                    routing[event],
+                    event=event,
+                )
         for stage in CaptureTimings.STAGES:
             value = stats.get("stage_timings", {}).get(stage, {})
             for field, collector in (

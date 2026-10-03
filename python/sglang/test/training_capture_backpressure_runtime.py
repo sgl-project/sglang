@@ -11,6 +11,7 @@ import requests
 import torch
 from prometheus_client.parser import text_string_to_metric_families
 
+from sglang.srt.training_capture.metrics import CaptureMetrics
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.test import test_utils
 from sglang.test.dspark_capture_observer import check_capture_snapshot
@@ -197,11 +198,17 @@ class CohortBackpressureRuntimeBase(ARPressureCaptureRuntimeBase):
                     before[rank]["host_pool"]["allocated_bytes"],
                     rank,
                 )
+            expected_routing = {
+                (rank, event): state["request_router"].get(event, 0)
+                for rank, state in still_blocked.items()
+                for event in CaptureMetrics.ROUTING_EVENTS
+            }
             deadline = time.monotonic() + 10
             while True:
                 response = requests.get(url + "/metrics", timeout=10)
                 response.raise_for_status()
                 ratios = {}
+                routing = {}
                 for family in text_string_to_metric_families(response.text):
                     for sample in family.samples:
                         if (
@@ -211,11 +218,30 @@ class CohortBackpressureRuntimeBase(ARPressureCaptureRuntimeBase):
                             ratios[
                                 f"pp{sample.labels['pp_rank']}-tp{sample.labels['tp_rank']}"
                             ] = sample.value
-                if ratios == dict.fromkeys(self.rank_names(), 0):
+                        if (
+                            sample.name
+                            == "sglang:training_capture_routing_events_total"
+                        ):
+                            rank = f"pp{sample.labels['pp_rank']}-tp{sample.labels['tp_rank']}"
+                            key = (rank, sample.labels["event"])
+                            self.assertNotIn(key, routing)
+                            routing[key] = sample.value
+                if (
+                    ratios == dict.fromkeys(self.rank_names(), 0)
+                    and routing == expected_routing
+                ):
                     break
                 # Gauges refresh independently of request and control threads.
-                self.assertLess(time.monotonic(), deadline, ratios)
+                self.assertLess(time.monotonic(), deadline, (ratios, routing))
                 time.sleep(0.05)
+            self.assertEqual(
+                sum(routing[rank, "selected"] for rank in self.rank_names()), 2
+            )
+            self.assertEqual(
+                sum(routing[rank, "sampled_out"] for rank in self.rank_names()), 8
+            )
+            for rank in self.rank_names():
+                self.assertEqual(routing[rank, "bound"], 2)
             self.assertEqual(len(self.catalog.publications), first + 1)
             gate.unlink()
             self.catalog.wait_publications(first + 2)
@@ -276,6 +302,13 @@ class CohortBackpressureRuntimeBase(ARPressureCaptureRuntimeBase):
                         "tensor_objects": objects,
                         "tensor_bytes": tensor_bytes,
                         "producer_exited": process.poll() is not None,
+                        "routing_events": {
+                            rank: {
+                                event: routing[rank, event]
+                                for event in CaptureMetrics.ROUTING_EVENTS
+                            }
+                            for rank in self.rank_names()
+                        },
                         "blocked": blocked,
                         "final": final,
                     }

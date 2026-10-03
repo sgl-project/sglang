@@ -1,0 +1,819 @@
+{
+  "status": "completed",
+  "date": "2026-10-03T07:49:37.637Z",
+  "base_commit": "f6079fdae058a6d2d5dd33bcff4bac8b7d430b24",
+  "feature": "Bounded cohort routing metrics with ingress/rank ownership and distributed dashboard verification",
+  "environment": {
+    "time": "2026-10-03T07:43:04.491Z",
+    "pod": "job-677de0ff6992-20261003152721-master-0",
+    "node": "node199",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang@sha256:b172685b9c9449a2d2a877c58004f1f234646ae8739872f3d09196c4a1122855",
+    "gpus": "0, NVIDIA H100 80GB HBM3, GPU-776781c5-2156-1fae-4763-7fdba75de0d4, 81559 MiB, 535.154.05\n1, NVIDIA H100 80GB HBM3, GPU-cbb33d72-ecf6-a5c7-d747-e11663842649, 81559 MiB, 535.154.05",
+    "runtime": {
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "sglang-kernel": "0.4.6.post1",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "transformers": "5.12.1"
+      }
+    },
+    "model": "Qwen3-0.6B BF16",
+    "attention": "Triton",
+    "store": "TCP",
+    "catalog": "HTTP TestCaptureCatalog",
+    "removed_pod_system_packages": [
+      "flashinfer-cubin==0.6.12",
+      "flashinfer-jit-cache==0.6.12+cu130"
+    ]
+  },
+  "jobs": [
+    {
+      "role": "red",
+      "id": "01791012238097282445-fd80383c2c35",
+      "state": "state",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-routing-metrics-red",
+      "result": {
+        "job_id": "01791012238097282445-fd80383c2c35",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791012251.1172397,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791012238097282445-fd80383c2c35.log"
+      },
+      "classification": "confirmed missing routing metric",
+      "methods": 1,
+      "elapsed_seconds": 0.004,
+      "log_sha256": "3be1a5d05624d185bc6b3b14a78dfb85446902c1182fc6dd9210ebaadb523101"
+    },
+    {
+      "role": "unit",
+      "id": "01791012440913466042-6698c34678b7",
+      "state": "state",
+      "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-routing-metrics-v1",
+      "result": {
+        "job_id": "01791012440913466042-6698c34678b7",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791012687.7660713,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01791012440913466042-6698c34678b7.log"
+      },
+      "classification": "passed",
+      "methods": 287,
+      "elapsed_seconds": 231.104,
+      "log_sha256": "3e980bfef77a505913e2f01cb5d5dad5ffd9ee7fd99ace87093b4d0421e42228"
+    },
+    {
+      "role": "gpu",
+      "id": "01791012674840690418-0f613eead23e",
+      "state": "state-routing-metrics",
+      "pod": "job-677de0ff6992-20261003152721-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-routing-metrics-v1",
+      "result": {
+        "job_id": "01791012674840690418-0f613eead23e",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791012880.6593595,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-routing-metrics/logs/01791012674840690418-0f613eead23e.log"
+      },
+      "classification": "passed",
+      "methods": 2,
+      "elapsed_seconds": 184.804,
+      "log_sha256": "4fbace1ece019d021d0f48935d38adb16dec3599d39af97490787dc74213491c"
+    },
+    {
+      "role": "monitor",
+      "id": "01791012900404934026-9e0a855ca26d",
+      "state": "state-routing-metrics",
+      "pod": "job-677de0ff6992-20261003152721-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-routing-metrics-v2",
+      "result": {
+        "job_id": "01791012900404934026-9e0a855ca26d",
+        "outcome": "failed",
+        "returncode": 1,
+        "finished_unix": 1791012995.641487,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-routing-metrics/logs/01791012900404934026-9e0a855ca26d.log"
+      },
+      "classification": "fixed single-rank monitoring assumption",
+      "methods": null,
+      "elapsed_seconds": null,
+      "log_sha256": "2b8c1ba016be061b80a95a78b175d60a6cd0817d56db9709201de02a45c9db10"
+    },
+    {
+      "role": "monitor_fixed",
+      "id": "01791013185341286649-33e77a1e10a8",
+      "state": "state-routing-metrics",
+      "pod": "job-677de0ff6992-20261003152721-master-0",
+      "frozen": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang-routing-metrics-v3",
+      "result": {
+        "job_id": "01791013185341286649-33e77a1e10a8",
+        "outcome": "completed",
+        "returncode": 0,
+        "finished_unix": 1791013451.1253068,
+        "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state-routing-metrics/logs/01791013185341286649-33e77a1e10a8.log"
+      },
+      "classification": "passed",
+      "methods": null,
+      "elapsed_seconds": null,
+      "log_sha256": "a26c0be09e835313d14feb2efaec808cc4c3e20fcc616939c9e4230cd458ee3a"
+    }
+  ],
+  "routing_cases": [
+    {
+      "tp_size": 1,
+      "pp_size": 2,
+      "routing_events": {
+        "pp0-tp0": {
+          "considered": 11,
+          "excluded": 1,
+          "sampled_out": 8,
+          "backpressure": 0,
+          "selected": 2,
+          "selection_failed": 0,
+          "attached": 2,
+          "attachment_failed": 0,
+          "bound": 2,
+          "binding_failed": 0,
+          "cancelled": 0,
+          "other": 0
+        },
+        "pp1-tp0": {
+          "considered": 0,
+          "excluded": 0,
+          "sampled_out": 0,
+          "backpressure": 0,
+          "selected": 0,
+          "selection_failed": 0,
+          "attached": 2,
+          "attachment_failed": 0,
+          "bound": 2,
+          "binding_failed": 0,
+          "cancelled": 0,
+          "other": 0
+        }
+      },
+      "requests_completed": 11,
+      "post_exit_snapshots": 3
+    },
+    {
+      "tp_size": 2,
+      "pp_size": 1,
+      "routing_events": {
+        "pp0-tp0": {
+          "considered": 11,
+          "excluded": 1,
+          "sampled_out": 8,
+          "backpressure": 0,
+          "selected": 2,
+          "selection_failed": 0,
+          "attached": 2,
+          "attachment_failed": 0,
+          "bound": 2,
+          "binding_failed": 0,
+          "cancelled": 0,
+          "other": 0
+        },
+        "pp0-tp1": {
+          "considered": 0,
+          "excluded": 0,
+          "sampled_out": 0,
+          "backpressure": 0,
+          "selected": 0,
+          "selection_failed": 0,
+          "attached": 2,
+          "attachment_failed": 0,
+          "bound": 2,
+          "binding_failed": 0,
+          "cancelled": 0,
+          "other": 0
+        }
+      },
+      "requests_completed": 11,
+      "post_exit_snapshots": 3
+    }
+  ],
+  "totals": {
+    "unit_methods": 287,
+    "backpressure_methods": 2,
+    "backpressure_requests": 22,
+    "requests_while_stalled": 16,
+    "backpressure_snapshots": 6,
+    "backpressure_objects": 102,
+    "backpressure_bytes": 1464144,
+    "monitor_requests": 144,
+    "monitor_snapshots": 96,
+    "monitor_payload_bytes": 59857920,
+    "dashboard_panels": 17,
+    "dashboard_query_checks": 42,
+    "browser_views": 3,
+    "screenshots": 54
+  },
+  "source_audit": {
+    "files": 5024,
+    "sha256": "51b633dbee1eb622428e7567fb651599c2c8cd3faea07ee1777f3c4b10efde22"
+  },
+  "monitor": {
+    "requests": 144,
+    "readback": {
+      "validated_samples": 96,
+      "manifest_bytes": 1090272,
+      "payload_bytes": 59857920,
+      "aux_payload_bytes": 3234816,
+      "payload_objects": 1920,
+      "kv_payload_bytes": 56623104
+    },
+    "final_router": {
+      "considered": 145,
+      "excluded": 1,
+      "selected": 96,
+      "attached": 96,
+      "bound": 96,
+      "sampled_out": 48
+    },
+    "final_counters": {
+      "admitted": 96,
+      "overlap_forwards": 792,
+      "eager_forwards": 24,
+      "cuda_graph_forwards": 768,
+      "sealed": 96,
+      "control_pause": 1,
+      "control_resume": 1,
+      "ready": 96
+    },
+    "observations": 36
+  },
+  "dashboard": {
+    "versions": {
+      "grafana": {
+        "database": "ok",
+        "version": "13.2.3",
+        "commit": "90ffed056f0884267356c12a0eeb72a022af53f1"
+      },
+      "prometheus": {
+        "status": "success",
+        "data": {
+          "version": "3.15.0",
+          "revision": "5241a27fe3c6983549fccc32f6e65917408c63cd",
+          "branch": "HEAD",
+          "buildUser": "root@4635dd007a60",
+          "buildDate": "20260925-07:33:45",
+          "goVersion": "go1.27.1"
+        }
+      }
+    },
+    "browser": "141.0.7390.37",
+    "window": {
+      "start": 1791013271.2017474,
+      "end": 1791013442.2082984
+    },
+    "queries": [
+      {
+        "panel": 1,
+        "refId": "A",
+        "selected": false,
+        "expr": "sglang:training_capture_sample_ratio{model_name=~\".*\",instance=~\".*\"}",
+        "series": 6,
+        "finiteValues": 516,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 1,
+        "refId": "A",
+        "selected": true,
+        "expr": "sglang:training_capture_sample_ratio{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 6,
+        "finiteValues": 516,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 2,
+        "refId": "A",
+        "selected": false,
+        "expr": "sum by (instance,tp_rank,pp_rank,event) (rate(sglang:training_capture_events_total{model_name=~\".*\",instance=~\".*\",event=~\"admitted|ready|sampled_out|adaptive_sampled_out|admission_backpressure|capture_failed|writer_failed|admission_catalog_error|lease_renew_error\"}[8s]))",
+        "series": 18,
+        "finiteValues": 1548,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 2,
+        "refId": "A",
+        "selected": true,
+        "expr": "sum by (instance,tp_rank,pp_rank,event) (rate(sglang:training_capture_events_total{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\",event=~\"admitted|ready|sampled_out|adaptive_sampled_out|admission_backpressure|capture_failed|writer_failed|admission_catalog_error|lease_renew_error\"}[8s]))",
+        "series": 18,
+        "finiteValues": 1548,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 3,
+        "refId": "A",
+        "selected": false,
+        "expr": "sglang:training_capture_reservations{model_name=~\".*\",instance=~\".*\"}",
+        "series": 10,
+        "finiteValues": 860,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 3,
+        "refId": "A",
+        "selected": true,
+        "expr": "sglang:training_capture_reservations{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 10,
+        "finiteValues": 860,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 4,
+        "refId": "A",
+        "selected": false,
+        "expr": "sglang:training_capture_host_slots{model_name=~\".*\",instance=~\".*\"}",
+        "series": 6,
+        "finiteValues": 516,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 4,
+        "refId": "A",
+        "selected": true,
+        "expr": "sglang:training_capture_host_slots{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 6,
+        "finiteValues": 516,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 5,
+        "refId": "A",
+        "selected": false,
+        "expr": "sglang:training_capture_writer_age_seconds{model_name=~\".*\",instance=~\".*\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 5,
+        "refId": "A",
+        "selected": true,
+        "expr": "sglang:training_capture_writer_age_seconds{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 5,
+        "refId": "B",
+        "selected": false,
+        "expr": "sglang:training_capture_cooldown_seconds{model_name=~\".*\",instance=~\".*\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 5,
+        "refId": "B",
+        "selected": true,
+        "expr": "sglang:training_capture_cooldown_seconds{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 6,
+        "refId": "A",
+        "selected": false,
+        "expr": "sglang:training_capture_disabled{model_name=~\".*\",instance=~\".*\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 6,
+        "refId": "A",
+        "selected": true,
+        "expr": "sglang:training_capture_disabled{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 6,
+        "refId": "B",
+        "selected": false,
+        "expr": "sglang:training_capture_admission_paused{model_name=~\".*\",instance=~\".*\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 6,
+        "refId": "B",
+        "selected": true,
+        "expr": "sglang:training_capture_admission_paused{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 7,
+        "refId": "A",
+        "selected": false,
+        "expr": "time() - sglang:training_capture_metrics_update_timestamp_seconds{model_name=~\".*\",instance=~\".*\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 7,
+        "refId": "A",
+        "selected": true,
+        "expr": "time() - sglang:training_capture_metrics_update_timestamp_seconds{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 8,
+        "refId": "A",
+        "selected": false,
+        "expr": "histogram_quantile(0.99, sum by (le,instance,is_streaming) (rate(sglang:time_to_first_token_seconds_bucket{model_name=~\".*\",instance=~\".*\"}[8s])))",
+        "series": 2,
+        "finiteValues": 98,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 8,
+        "refId": "A",
+        "selected": true,
+        "expr": "histogram_quantile(0.99, sum by (le,instance,is_streaming) (rate(sglang:time_to_first_token_seconds_bucket{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}[8s])))",
+        "series": 2,
+        "finiteValues": 98,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 8,
+        "refId": "B",
+        "selected": false,
+        "expr": "histogram_quantile(0.99, sum by (le,instance) (rate(sglang:inter_token_latency_seconds_bucket{model_name=~\".*\",instance=~\".*\"}[8s])))",
+        "series": 1,
+        "finiteValues": 50,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 8,
+        "refId": "B",
+        "selected": true,
+        "expr": "histogram_quantile(0.99, sum by (le,instance) (rate(sglang:inter_token_latency_seconds_bucket{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}[8s])))",
+        "series": 1,
+        "finiteValues": 50,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 9,
+        "refId": "A",
+        "selected": false,
+        "expr": "sglang:training_capture_host_allocated_bytes{model_name=~\".*\",instance=~\".*\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 9,
+        "refId": "A",
+        "selected": true,
+        "expr": "sglang:training_capture_host_allocated_bytes{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 10,
+        "refId": "A",
+        "selected": false,
+        "expr": "sglang:training_capture_scheduler_latency_seconds{model_name=~\".*\",instance=~\".*\"}",
+        "series": 8,
+        "finiteValues": 688,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 10,
+        "refId": "A",
+        "selected": true,
+        "expr": "sglang:training_capture_scheduler_latency_seconds{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 8,
+        "finiteValues": 688,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 11,
+        "refId": "A",
+        "selected": false,
+        "expr": "sglang:training_capture_latency_state{model_name=~\".*\",instance=~\".*\"}",
+        "series": 10,
+        "finiteValues": 860,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 11,
+        "refId": "A",
+        "selected": true,
+        "expr": "sglang:training_capture_latency_state{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 10,
+        "finiteValues": 860,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 12,
+        "refId": "A",
+        "selected": false,
+        "expr": "sum by (instance,stage) (rate(sglang:training_capture_stage_seconds_total{model_name=~\".*\",instance=~\".*\"}[8s])) / sum by (instance,stage) (rate(sglang:training_capture_stage_calls_total{model_name=~\".*\",instance=~\".*\"}[8s]))",
+        "series": 13,
+        "finiteValues": 684,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 12,
+        "refId": "A",
+        "selected": true,
+        "expr": "sum by (instance,stage) (rate(sglang:training_capture_stage_seconds_total{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}[8s])) / sum by (instance,stage) (rate(sglang:training_capture_stage_calls_total{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}[8s]))",
+        "series": 13,
+        "finiteValues": 684,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 13,
+        "refId": "A",
+        "selected": false,
+        "expr": "sum by (instance,stage) (rate(sglang:training_capture_stage_failures_total{model_name=~\".*\",instance=~\".*\"}[8s]))",
+        "series": 13,
+        "finiteValues": 1118,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 13,
+        "refId": "A",
+        "selected": true,
+        "expr": "sum by (instance,stage) (rate(sglang:training_capture_stage_failures_total{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}[8s]))",
+        "series": 13,
+        "finiteValues": 1118,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 14,
+        "refId": "A",
+        "selected": false,
+        "expr": "sglang:training_capture_device_allocated_bytes{model_name=~\".*\",instance=~\".*\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 14,
+        "refId": "A",
+        "selected": true,
+        "expr": "sglang:training_capture_device_allocated_bytes{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 14,
+        "refId": "B",
+        "selected": false,
+        "expr": "sglang:training_capture_device_limit_bytes{model_name=~\".*\",instance=~\".*\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 14,
+        "refId": "B",
+        "selected": true,
+        "expr": "sglang:training_capture_device_limit_bytes{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 15,
+        "refId": "A",
+        "selected": false,
+        "expr": "sum by (instance,destination) (rate(sglang:training_capture_kv_export_enqueued_bytes_total{model_name=~\".*\",instance=~\".*\"}[8s]))",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 15,
+        "refId": "A",
+        "selected": true,
+        "expr": "sum by (instance,destination) (rate(sglang:training_capture_kv_export_enqueued_bytes_total{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\"}[8s]))",
+        "series": 2,
+        "finiteValues": 172,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 16,
+        "refId": "A",
+        "selected": false,
+        "expr": "sum by (instance,event) (rate(sglang:training_capture_routing_events_total{model_name=~\".*\",instance=~\".*\",event=~\"considered|excluded|sampled_out|backpressure|selected|selection_failed\"}[8s]))",
+        "series": 6,
+        "finiteValues": 516,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 16,
+        "refId": "A",
+        "selected": true,
+        "expr": "sum by (instance,event) (rate(sglang:training_capture_routing_events_total{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\",event=~\"considered|excluded|sampled_out|backpressure|selected|selection_failed\"}[8s]))",
+        "series": 6,
+        "finiteValues": 516,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 17,
+        "refId": "A",
+        "selected": false,
+        "expr": "sum by (instance,tp_rank,pp_rank,event) (rate(sglang:training_capture_routing_events_total{model_name=~\".*\",instance=~\".*\",event=~\"attached|attachment_failed|bound|binding_failed|cancelled|other\"}[8s]))",
+        "series": 12,
+        "finiteValues": 1032,
+        "expectedEmpty": false
+      },
+      {
+        "panel": 17,
+        "refId": "A",
+        "selected": true,
+        "expr": "sum by (instance,tp_rank,pp_rank,event) (rate(sglang:training_capture_routing_events_total{model_name=~\"capture-monitoring-qwen3\",instance=~\"127\\\\.0\\\\.0\\\\.1:18910\",event=~\"attached|attachment_failed|bound|binding_failed|cancelled|other\"}[8s]))",
+        "series": 12,
+        "finiteValues": 1032,
+        "expectedEmpty": false
+      }
+    ],
+    "phases": [
+      {
+        "phase": "capture",
+        "start": 1791013271.2017474,
+        "end": 1791013322.060106,
+        "paused": [
+          0
+        ],
+        "ready": [
+          4,
+          44
+        ],
+        "hostBytes": [
+          393216,
+          4325376
+        ]
+      },
+      {
+        "phase": "paused",
+        "start": 1791013330.9923327,
+        "end": 1791013382.35266,
+        "paused": [
+          1
+        ],
+        "ready": [
+          48,
+          48
+        ],
+        "hostBytes": [
+          4718592,
+          4718592
+        ]
+      },
+      {
+        "phase": "resumed",
+        "start": 1791013391.1699762,
+        "end": 1791013442.2082984,
+        "paused": [
+          0
+        ],
+        "ready": [
+          52,
+          92
+        ],
+        "hostBytes": [
+          5111808,
+          9043968
+        ]
+      }
+    ],
+    "views": [
+      {
+        "name": "desktop-all",
+        "viewport": {
+          "width": 1440,
+          "height": 1000
+        },
+        "panels": 17,
+        "query_responses": 72,
+        "errors": []
+      },
+      {
+        "name": "desktop-selected",
+        "viewport": {
+          "width": 1440,
+          "height": 1000
+        },
+        "panels": 17,
+        "query_responses": 72,
+        "errors": []
+      },
+      {
+        "name": "mobile-selected",
+        "viewport": {
+          "width": 390,
+          "height": 844
+        },
+        "panels": 17,
+        "query_responses": 54,
+        "errors": []
+      }
+    ]
+  },
+  "cleanup": {
+    "time": "2026-10-03T07:50:46.919Z",
+    "temporary_allocation_deleted": true,
+    "temporary_worker_exited": true,
+    "monitoring_stack_stopped": true,
+    "resident_worker_verified_live": true,
+    "idle_load_resumed": true,
+    "queues_empty": true,
+    "absent": [
+      {
+        "resource": "pod",
+        "name": "job-677de0ff6992-20261003152721-master-0",
+        "observed": ""
+      },
+      {
+        "resource": "jobs.batch.volcano.sh",
+        "name": "job-677de0ff6992-20261003152721",
+        "observed": ""
+      },
+      {
+        "resource": "jobs.batch",
+        "name": "job-677de0ff6992-20261003152721",
+        "observed": ""
+      }
+    ],
+    "resident": {
+      "state": {
+        "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+        "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+        "pid": 1,
+        "mode": "idle_load",
+        "heartbeat_unix": 1791013846.996935,
+        "idle_pid": 55051,
+        "active_job": null,
+        "active_pid": null,
+        "queued": 0,
+        "paused": false,
+        "heartbeat_age_seconds": 0.18284392356872559
+      },
+      "ps": "PID  PPID STAT COMMAND\n    1     0 Ss   python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60\n55051     1 Rsl  /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6"
+    },
+    "monitoring": {
+      "status": "stopped",
+      "processes": {
+        "relay": {
+          "pid": 2069,
+          "command": [
+            "python3",
+            "/tmp/dspark-routing-monitor-20261003/relay.py"
+          ]
+        },
+        "prometheus": {
+          "pid": 2070,
+          "command": [
+            "/tmp/dspark-monitor-01a0ec8b/prometheus-3.15.0.linux-amd64/prometheus",
+            "--config.file=/tmp/dspark-routing-monitor-20261003/prometheus.yml",
+            "--storage.tsdb.path=/tmp/dspark-routing-monitor-20261003/prometheus-data",
+            "--storage.tsdb.retention.time=24h",
+            "--web.listen-address=127.0.0.1:19910"
+          ]
+        },
+        "grafana": {
+          "pid": 2071,
+          "command": [
+            "/tmp/dspark-monitor-01a0ec8b/grafana-13.2.3/bin/grafana",
+            "server",
+            "--homepath=/tmp/dspark-monitor-01a0ec8b/grafana-13.2.3",
+            "--config=/tmp/dspark-routing-monitor-20261003/grafana.ini"
+          ]
+        }
+      }
+    }
+  },
+  "limitations": [
+    "Qwen3-0.6B BF16 with TCP Store and HTTP TestCaptureCatalog; this is monitoring correctness, not production retention or service SLO acceptance.",
+    "The loopback relay forwards unmodified pod metrics through kubectl exec; it is a verification transport, not production service discovery.",
+    "TP2/PP2 runtime checks every rank; the TP2 monitoring driver compares TP0/PP0 status while Grafana retains all rank series.",
+    "Routing counters measure ingress decisions and local ticket events; Catalog remains the authority for complete sample counts."
+  ],
+  "artifact_archive": {
+    "path": "/gpfs/user/fuxuanwei/mooncake-lab-archive/routing-metrics-20261003",
+    "files": 239,
+    "manifest": "artifact-manifest.json",
+    "sha256": "16e5bdc0cacdf889ec826a7d415505ef3fda1292c0e916385bff4f52accfc538"
+  }
+}

@@ -18,6 +18,7 @@ from benchmark_training_capture import (
     write_json,
 )
 from prometheus_client.parser import text_string_to_metric_families
+from sglang.srt.training_capture.metrics import CaptureMetrics
 from sglang.test.test_utils import popen_launch_server
 
 
@@ -36,6 +37,11 @@ def verify_metrics(url, state, output):
         expected["kv_export_enqueued_bytes_total", destination] = state["host_pool"][
             f"kv_export_{destination}_enqueued_bytes"
         ]
+    if "request_router" in state:
+        for event in CaptureMetrics.ROUTING_EVENTS:
+            expected["routing_events_total", event] = state["request_router"].get(
+                event, 0
+            )
     deadline = time.monotonic() + 15
     while True:
         response = requests.get(url + "/metrics", timeout=10)
@@ -43,9 +49,14 @@ def verify_metrics(url, state, output):
         actual = {}
         for family in text_string_to_metric_families(response.text):
             for sample in family.samples:
+                if any(
+                    sample.labels.get(rank, "0") != "0"
+                    for rank in ("tp_rank", "pp_rank")
+                ):
+                    continue
                 key = (
                     sample.name.removeprefix("sglang:training_capture_"),
-                    sample.labels.get("destination"),
+                    sample.labels.get("destination") or sample.labels.get("event"),
                 )
                 if key in expected:
                     if key in actual:
@@ -64,13 +75,27 @@ def verify_metrics(url, state, output):
         time.sleep(0.2)
 
 
+def wait_available(url, count):
+    deadline = time.monotonic() + 60
+    while True:
+        state, _ = wait_capture_idle(url)
+        if (
+            state["states"].get("available", 0) >= count
+            and state["admission"]["effective_ratio"] == 1
+        ):
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Capture admission did not recover: {state}")
+        time.sleep(0.1)
+
+
 def run(args):
     root = args.output_dir
     url = f"http://127.0.0.1:{args.port}"
     report = {
         "status": "running",
         "config": vars(args) | {"output_dir": str(root)},
-        "scope": "Real single-rank SGLang and local TCP Mooncake; test Catalog, synthetic fixed-length traffic. Monitoring correctness, not SLO acceptance.",
+        "scope": f"Real TP{args.tp_size} SGLang and local TCP Mooncake; test Catalog, synthetic fixed-length traffic. Monitoring correctness, not SLO acceptance.",
         "observations": [],
         "requests": 0,
         "source_sha256": {},
@@ -102,6 +127,8 @@ def run(args):
                 url,
                 timeout=300,
                 other_args=[
+                    "--tp-size",
+                    str(args.tp_size),
                     "--training-capture-config",
                     str(root / "capture.json"),
                     "--enable-metrics",
@@ -127,6 +154,7 @@ def run(args):
                     "disabled",
                 ],
             )
+            wait_available(url, args.concurrency)
             start = time.monotonic()
             write_json(
                 root / "ready.json",
@@ -144,7 +172,9 @@ def run(args):
                 current = (
                     "capture"
                     if elapsed < args.hold_seconds / 3
-                    else "paused" if elapsed < 2 * args.hold_seconds / 3 else "resumed"
+                    else "paused"
+                    if elapsed < 2 * args.hold_seconds / 3
+                    else "resumed"
                 )
                 if current != phase:
                     if current != "capture":
@@ -161,6 +191,8 @@ def run(args):
                         response.raise_for_status()
                         if not response.json()["success"]:
                             raise RuntimeError(response.text)
+                        if current == "resumed":
+                            wait_available(url, args.concurrency)
                     phase = current
                 ids = [f"monitor-{step}-{row}" for row in range(args.concurrency)]
                 streaming = step % 2 == 0
@@ -290,6 +322,7 @@ def main():
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--tp-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--hold-seconds", type=float, default=180)
     parser.add_argument("--interval-seconds", type=float, default=4)
     args = parser.parse_args()

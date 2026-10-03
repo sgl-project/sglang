@@ -84,6 +84,56 @@ class TestCaptureMetrics(CustomTestCase):
         ]
         self.assertEqual(len(events), len(CaptureMetrics.EVENTS))
 
+    def test_routing_decisions_are_exported_separately_and_only_once(self):
+        self.stats["request_router"] = {
+            "considered": 13,
+            "selected": 3,
+            "sampled_out": 8,
+            "excluded": 1,
+            "backpressure": 1,
+            "attached": 3,
+            "bound": 3,
+        }
+        for _ in range(2):
+            self.metrics.update(self.stats)
+        self.assertEqual(self.value("routing_events_total", event="sampled_out"), 8)
+        self.assertEqual(self.value("routing_events_total", event="selected"), 3)
+        self.assertEqual(self.value("routing_events_total", event="backpressure"), 1)
+        self.assertEqual(self.value("events_total", event="admitted"), 2)
+        self.assertEqual(self.value("events_total", event="sampled_out"), 3)
+        self.stats["request_router"]["sampled_out"] = 0
+        self.metrics.update(self.stats)
+        self.assertEqual(self.value("routing_events_total", event="sampled_out"), 8)
+        self.stats["request_router"]["sampled_out"] = 10
+        self.metrics.update(self.stats)
+        self.assertEqual(self.value("routing_events_total", event="sampled_out"), 10)
+
+    def test_routing_labels_are_bounded_and_missing_router_has_no_samples(self):
+        self.metrics.update(self.stats)
+        self.assertIsNone(self.value("routing_events_total", event="selected"))
+        self.stats["request_router"] = {
+            f"private-request-{index}": 1 for index in range(100)
+        }
+        self.metrics.update(self.stats)
+        self.metrics.update(self.stats)
+        self.assertEqual(self.value("routing_events_total", event="other"), 100)
+        samples = [
+            s
+            for family in self.registry.collect()
+            for s in family.samples
+            if s.name == "sglang:training_capture_routing_events_total"
+        ]
+        self.assertEqual(len(samples), len(CaptureMetrics.ROUTING_EVENTS))
+        self.assertNotIn("private-", generate_latest(self.registry).decode())
+
+    def test_follower_bindings_do_not_count_as_ingress_selections(self):
+        self.stats["request_router"] = {"attached": 3, "bound": 3, "cancelled": 1}
+        self.metrics.update(self.stats)
+        self.assertEqual(self.value("routing_events_total", event="selected"), 0)
+        self.assertEqual(self.value("routing_events_total", event="considered"), 0)
+        self.assertEqual(self.value("routing_events_total", event="bound"), 3)
+        self.assertEqual(self.value("routing_events_total", event="cancelled"), 1)
+
     def test_device_arena_metrics_keep_legacy_aliases_and_clear_on_close(self):
         for allocated in (256, 0):
             self.stats["host_pool"]["device_allocated_bytes"] = allocated

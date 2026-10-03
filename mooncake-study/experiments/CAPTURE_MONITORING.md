@@ -8,6 +8,12 @@ discovery, cross-node monitoring or production Catalog behavior.
 
 ## Changes
 
+The current dashboard additionally exports cohort routing decisions and local
+ticket events, and preserves TP/PP labels on the lifecycle panel. See
+[cohort routing verification](ROUTING_METRICS.md) for the later distributed run;
+the original fifteen-panel results below remain evidence for their recorded
+source version.
+
 - `device_allocated_bytes` and `device_limit_bytes` describe the full capture
   device arena, including teacher staging and HiCache pointer/position tables.
   Existing `kv_staging_*` gauges remain aliases with corrected descriptions.
@@ -38,8 +44,16 @@ PYTHONPATH=python:test/registered/unit/training_capture \
   --model-path /models/Qwen3-0.6B \
   --source-revision "$(git rev-parse HEAD)" \
   --output-dir /tmp/capture-monitoring-runtime \
-  --port 18081 --hold-seconds 180
+--port 18081 --hold-seconds 180
 ```
+
+Add `--tp-size 2` to exercise the cohort router with two CUDA devices. The
+driver waits for admission at startup and resume, and also compares routing
+counters with the HTTP metrics endpoint. Status comparisons select TP0/PP0;
+the metrics endpoint and charts retain all ranks. The separate backpressure
+tests also verify every rank's routing series against its local state. Single-rank runs
+have no cohort router, so the browser verifier requires the two routing panels
+to show no data; a cohort run requires actual data in both panels.
 
 The driver requires the experiment helpers and local Mooncake master used by
 `benchmark_training_capture.py`. It starts a fresh Store, test Catalog and
@@ -81,11 +95,12 @@ If the monitoring hosts use authentication, supply it through a locally
 configured authenticated proxy; this fixture's verifier assumes local access.
 
 It verifies the provisioned panel definitions, Prometheus scrape continuity,
-all nineteen panel expressions with both all-instance and selected-instance
+all panel expressions with both all-instance and selected-instance
 filters, and a negative instance filter. It independently checks the pause
 gauge, stable READY/byte counts while paused, and increasing publication/export
-counts before and after the pause. Browser checks load all fifteen panels at
-desktop and mobile sizes, require nonempty Grafana datasource responses,
+counts before and after the pause. Browser checks load all current panels at
+desktop and mobile sizes, require nonempty Grafana datasource responses for
+applicable panels,
 inspect plot pixels and dimensions, and save per-panel screenshots. A missing
 streaming latency series is a failure, not a successful empty chart. Inactive
 writer stages may have NaN means; each expression must still return finite

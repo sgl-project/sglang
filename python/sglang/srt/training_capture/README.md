@@ -973,6 +973,7 @@ have bounded value sets.
 | Suffix | Type / Extra Label | Meaning |
 | --- | --- | --- |
 | `events_total` | Counter / `event` | Admission, exclusions, forwards and writer lifecycle events |
+| `routing_events_total` | Counter / `event` | Cohort ingress decisions and rank-local ticket attachment, binding and cancellation |
 | `admission_adjustments_total` | Counter / `action` | Decreases, recoveries, failures and pause transitions |
 | `sample_ratio` | Gauge / `kind` | Configured ceiling, adaptive target and effective admission probability |
 | `reservations` | Gauge / `state` | Available, active, queued, writing and pending-publication reservations |
@@ -1017,6 +1018,29 @@ writer publications in this process, excluding journal recovery and consumer
 acknowledgements. `snapshot_built` means descriptors and a manifest were prepared;
 it does not imply successful content validation or publication. Do not infer
 exact dataset completeness from a rate ratio.
+
+For TP/PP cohorts, request selection occurs in the ingress router, before the
+coordinator binds the ticket. Those decisions are exported separately through
+`routing_events_total`: `considered`, `excluded`, `sampled_out`, `backpressure`,
+`selected` and `selection_failed` increment only at ingress. `excluded` includes
+health checks and unsupported requests. `sampled_out` includes the effective
+sampling probability and cohort readiness gate, including operator pauses; it
+does not by itself identify an adaptive-pressure exclusion. `backpressure`
+means a selected request could not claim a ticket.
+
+`attached`, `attachment_failed`, `bound`, `binding_failed` and `cancelled` are
+rank-local ticket events. The same request can bind on every rank, so summing
+`bound` across ranks does not count unique requests. Unknown router event names
+are aggregated into `other`, never exposed as labels. Repeated metric refreshes
+do not count the same event again. Producers without a cohort router expose no
+samples in this family. Their existing `events_total` admission counters keep
+their existing meaning.
+
+The dashboard separates cohort ingress and ticket events, and retains TP/PP
+labels on the lifecycle panel. Cohort `admitted` remains rank-local and `ready`
+belongs to the publishing owner; neither a cross-rank sum nor a rate ratio
+establishes exact dataset completeness. Use Catalog state for that decision.
+
 `writer_age_seconds` includes queue waiting, CUDA completion, serialization and
 Catalog work; it is not RDMA latency. `host_slots{state="filling"}` includes
 spare leases, whereas `occupied_fraction` excludes them. Host bytes report
