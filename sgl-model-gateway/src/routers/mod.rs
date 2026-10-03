@@ -10,14 +10,16 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::protocols::{
-    chat::ChatCompletionRequest,
-    classify::ClassifyRequest,
+use crate::{
     completion::CompletionRequest,
-    embedding::EmbeddingRequest,
-    generate::GenerateRequest,
-    rerank::RerankRequest,
-    responses::{ResponsesGetParams, ResponsesRequest},
+    protocols::{
+        chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
 };
 
 pub mod conversations;
